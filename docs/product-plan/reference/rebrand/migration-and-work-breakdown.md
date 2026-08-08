@@ -37,7 +37,7 @@ Work is ordered by dependency, not date. Repository creation/publication and pro
 - Import the brand kit into `brand/` with manifest, rights and accessibility evidence.
 - Add canonical `automonique.fr` homepage metadata and a non-authoritative Inklura founding-sponsor acknowledgement.
 - Add the reviewed bootstrap manifest/schema, fixed toolchain/dependency/build inputs, trusted-builder/signer public identities and clean-host SH0/recovery instructions.
-- Add and test the initial `scripts/automonique-dev` plus finite seed program/coordinator; it must run from a clean private clone and cannot create/publish/merge/deploy the repository.
+- Add and test the initial `automonique-bootstrap`; it must run from a clean private clone and cannot create/publish/merge/deploy the repository.
 
 **Exit:** a clean clone builds/tests without production credentials or organization filesystem assumptions; repository remains private.
 

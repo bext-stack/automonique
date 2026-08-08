@@ -50,14 +50,13 @@ The rewrite is justified here by the desired runtime model, not by throughput or
 17. [External capability coverage ledger](../requirements/external-capability-ledger.md) records exhaustive agent-platform capability coverage and the Automonique-specific adaptation or graduation track.
 18. [AI implementation harness and commit metrics](../requirements/ai-implementation-harness.md) defines the durable author-review-fix loops, worktree/build coordination, hill-climbing objectives and per-commit evidence used to implement the program.
 19. [Self-hosting and bootstrap](../requirements/self-hosting-and-bootstrap.md) defines the trusted seed, stable/candidate topology, self-build/reload cycle, independent rebuild and externally authorized promotion.
-20. [Initial development launcher](initial-development-launcher.md) defines the one-command stage-minus-one script, finite seed program, safe first-run UX and handoff into the Rust lab. (Superseded by the implemented BOOT-001 `automonique bootstrap` command; historical.)
-21. [Operations and governance](../requirements/operations-and-governance.md) defines recovery, configuration, credentials, retention, scheduling, observability and safe-mode contracts.
-22. [TypeScript SDK](../requirements/typescript-sdk.md) defines complete typed client coverage, generated contracts, extension packages and testing utilities.
-23. [Automonique operator TUI](../requirements/operator-tui.md) defines the local terminal experience, control boundary and reload-safe interaction model.
-24. [Reload protocol](../requirements/reload-protocol.md) specifies the normal handoff and its failure paths.
-25. [Migration plan](migration-plan.md) gives the phased strangler migration from the current daemon and independently gated product expansions.
-26. [Verification and rollout](../requirements/verification-and-rollout.md) defines parity, chaos, security, provider-conformance and production gates.
-27. [Work breakdown](work-breakdown.md) turns the design into ordered implementation tickets.
+20. [Operations and governance](../requirements/operations-and-governance.md) defines recovery, configuration, credentials, retention, scheduling, observability and safe-mode contracts.
+21. [TypeScript SDK](../requirements/typescript-sdk.md) defines complete typed client coverage, generated contracts, extension packages and testing utilities.
+22. [Automonique operator TUI](../requirements/operator-tui.md) defines the local terminal experience, control boundary and reload-safe interaction model.
+23. [Reload protocol](../requirements/reload-protocol.md) specifies the normal handoff and its failure paths.
+24. [Migration plan](migration-plan.md) gives the phased strangler migration from the current daemon and independently gated product expansions.
+25. [Verification and rollout](../requirements/verification-and-rollout.md) defines parity, chaos, security, provider-conformance and production gates.
+26. [Work breakdown](work-breakdown.md) turns the design into ordered implementation tickets.
 
 Blocking decisions are recorded as accepted ADRs:
 
@@ -100,7 +99,6 @@ Blocking decisions are recorded as accepted ADRs:
 - Support explainable model routing, policy-bounded credential pools/fallbacks, auxiliary/MoA calls, media/browser/computer capabilities and multiple execution providers only through explicit capability/data-boundary gates.
 - Build `automonique-lab` first: a durable, reloadable AI implementation harness with isolated work ownership, independent adversarial reviews, centrally scheduled builds/tests, measurable objectives and compact commit-linked attestations.
 - Make the development system functionally self-hosting through explicit SH0–SH6 levels: a signed stable seed builds an isolated candidate, the candidate rebuilds/reloads itself, an independent builder verifies it and only external authority may promote it to production.
-- Provide one stable operator entry point, `./scripts/automonique-dev start`, whose temporary Bash/Bun seed path is finite, review-before-apply, resource-bounded and automatically hands ownership to the Rust bootstrap/lab.
 - Judge implementation progress by parity, correctness, failure, latency, memory, cache/prompt, safety and cost evidence—not lines, commits or agent count—and forbid a work unit from redefining the metric that judges it.
 - Retain tmux only as an optional operator view during migration; it is not the lifetime owner in the target architecture.
 - Publish immutable, checksummed releases and make rollback use the same generation handoff as upgrade.
@@ -133,7 +131,6 @@ The rewrite is complete only when this scenario passes repeatedly:
 21. Every row in the external capability ledger has an implementation owner/ticket, fixture, security/data-boundary classification and graduation or explicit safety-adapted replacement evidence.
 22. Every implementation ticket is traceable through a reproducible harness run, independent review evidence, required tests and a commit/CI metrics attestation; no skipped/deleted test, unexplained parity difference or threshold regression is hidden by aggregate progress.
 23. A clean SH0 bootstrap creates the stable lab; stable builds an immutable candidate; the candidate runs a bounded self-host fixture, rebuilds/reloads itself and falls back under failure; an independent builder verifies provenance/output; and production promotion remains an external typed action.
-24. From a clean private-upstream checkout, the initial launcher produces an exact confirmed plan, starts/detaches/resumes safely, completes the finite seed DAG and hands off once to the verified Rust lab without production secrets, remote Git effects or a second active development controller.
 
 ## Explicit non-goals
 

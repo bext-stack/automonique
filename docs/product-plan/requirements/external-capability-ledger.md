@@ -58,7 +58,6 @@ Every row must acquire implementation ticket IDs, owner, fixtures and one of: `c
 | Autonomous implementation loop | Separate `automonique-lab` work DAG with implementer, two fresh-context reviewers, fixer, bounded brokers and human merge/deploy authority | core |
 | Measurable objectives and commit evidence | Hill-climbability objective plus content-addressed correctness/performance/prompt/safety metrics attestation referenced by each commit | core |
 | Self-hosting bootstrap | Signed SH0 seed and manifest; stable builds an isolated candidate that self-builds/reloads under stable observation | core |
-| One-command development start | Audited stage-minus-one launcher with exact plan confirmation, finite seed DAG and permanent Rust-lab handoff | core |
 | Independent candidate verification | Separate builder identity, provenance/SBOM and reproducible A1/A2/A3 comparison before promotion eligibility | core |
 | Recursive self-improvement | Evidence-driven bounded proposals/loops with external review for scope, policy, metrics, privilege, release and production | core |
 | Computer-use driver | High-risk accessibility/screenshot adapter in disposable/eligible environment | optional |

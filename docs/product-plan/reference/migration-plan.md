@@ -51,7 +51,6 @@ A toy old generation can start a persistent child unit, hand service readiness t
 - Create the private `bext-stack/automonique` staging repository through the rebrand B0/B1 gates; add GPL/provenance/governance files before importing product source.
 - Define SH0–SH6 policy, `bootstrap.toml`/schema, trusted builder/signer public identities, source/environment/build fingerprints and corresponding-source rules.
 - Implement the minimal `automonique-bootstrap` inspect/plan/apply/verify/resume/recovery path with no provider or production credentials.
-- Add `scripts/automonique-dev` plus the finite Bun `tools/bootstrap-seed` coordinator so one reviewed `start` command can create SH0 before the Rust bootstrap/lab exists.
 - Check in the finite `seed-program.yaml`, seed policy/guides/scenarios and explicit Claude/Codex/opencode/Jcode probes; default to one worker and no automatic Git commit/push.
 - Split stable development and digest-named candidate state, sockets, service identities, credential audiences, workspaces, artifacts, leases and outboxes.
 - Add source-state snapshot/revalidation, build deduplication, superseded-result handling, immutable candidate publication and smoke verification.
@@ -439,6 +438,6 @@ All completion criteria in `README.md` pass in production-like and controlled pr
 | broader messaging/device catalog | independently deployed TypeScript connector packages | 8J |
 | model/media/browser/remote execution adapters | Rust or out-of-process capability SPIs | 8K |
 | batch/evaluation/trajectory and package distributions | isolated research/catalog services | 8L |
-| implementation harness, bootstrap and self-hosting | `automonique-bootstrap`, `automonique-dev-protocol`, `automonique-lab`, independent builder and development SDK | 0/0S |
+| implementation harness, bootstrap and self-hosting | `automonique-bootstrap`, `automonique-lab`, independent builder and development SDK | 0/0S |
 | interactive shells/file transfer | optional isolated `automonique-shell`, artifact APIs; `legacy-shell` is a migration alias only | 9 |
 | sandbox C and privileged broker Python | runner/broker crates | 9 |

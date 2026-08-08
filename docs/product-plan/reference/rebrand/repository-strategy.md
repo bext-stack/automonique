@@ -94,7 +94,7 @@ The first public-capable tree includes:
 - sample configuration containing no production defaults;
 - deterministic build/lock files, SBOM/provenance and dependency policy;
 - `.automonique/bootstrap/` manifest/schema, public trusted-builder/signer policy, clean-host instructions and recovery contract;
-- the audited `scripts/automonique-dev`, finite `.automonique/dev/seed-program.yaml` and temporary `tools/bootstrap-seed` source/tests needed to create SH0 without production coupling;
+- the audited `automonique-bootstrap`/`tools/automonique-lab` source/tests needed to create SH0 without production coupling;
 - changelog/versioning/deprecation policy;
 - privacy/telemetry defaults and retention documentation;
 - brand asset manifest with hashes, formats, source and accessibility guidance;

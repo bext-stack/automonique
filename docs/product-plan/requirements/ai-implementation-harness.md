@@ -19,8 +19,6 @@ The target `bext-stack/automonique` repository reserves:
 
 ```text
 tools/automonique-lab/          Rust orchestrator, CLI and optional TUI
-scripts/automonique-dev         temporary first-run entry; later forwards to Rust
-tools/bootstrap-seed/           finite Bun seed coordinator, retired after SH0
 packages/dev-harness/           generated TypeScript client and scenario DSL
 .automonique/dev/
 ├─ program.yaml                 machine-readable phase/epic/work DAG
@@ -118,7 +116,7 @@ The durable result of a loop iteration is never merely “agent says done.” It
 7. Require the harness itself to survive generation reload while workers/builds continue, before using reload as product acceptance evidence.
 8. Freeze the first passing harness as the signed SH0 seed; use it to build a digest-named candidate lab, then require candidate self-build/reload plus an independent rebuild before broader autonomous work.
 
-Steps 1–3 begin through the reviewed [initial development launcher](../reference/initial-development-launcher.md). Its finite `seed-program.yaml` cannot extend itself and relinquishes development-program ownership as soon as the verified Rust lab is ready.
+Steps 1–3 begin through the reviewed bootstrap sequence in [Self-hosting and bootstrap](self-hosting-and-bootstrap.md). Its checked seed DAG cannot extend itself and relinquishes development-program ownership as soon as the verified Rust lab is ready.
 
 The legacy Bun service keeps receiving fixes throughout. Translation and new feature work are separate queue classes so a mechanical parity unit cannot opportunistically redesign behavior.
 

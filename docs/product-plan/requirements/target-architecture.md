@@ -105,11 +105,10 @@ apps/
                             (the native desktop client is ShellDeck, in its own repository)
 
 tools/
-├─ automonique-lab/         separate AI implementation orchestrator, build/Git brokers and commit attestations
-└─ bootstrap-seed/          finite temporary Bun coordinator used only before SH0
+└─ automonique-lab/         separate AI implementation orchestrator, build/Git brokers and commit attestations
 
 scripts/
-└─ automonique-dev          stable first-run command; later forwards to the Rust bootstrap/lab
+└─ automonique-bootstrap    first-run bootstrap entry; later the Rust `automonique-bootstrap`
 ```
 
 Crate boundaries may be merged initially, but protocol, store, runner, and daemon must remain dependency boundaries. In particular, `automonique-runner` must not depend on Slack or business-routing code. If implementation starts before B3 naming lands, temporary internal legacy crate names are renamed once rather than published as a second crate family.
@@ -120,9 +119,7 @@ Crate boundaries may be merged initially, but protocol, store, runner, and daemo
 
 `automonique-bootstrap` is a small non-network-by-default verifier/installer. It reads the reviewed bootstrap manifest, verifies fixed source/toolchain/build inputs, creates the isolated development identity/state and produces or verifies the first `automonique-lab` seed. It has no provider, transport, GitHub merge, release-signing or production-deployment credential.
 
-The stable lab launches candidate lab/daemon/client components into a digest-named namespace with separate sockets, database, artifacts, workspaces, credentials and systemd units. Candidate code never loads into the stable launcher/verifier. Stable owns lifecycle and evidence observation; an independent builder owns rebuild provenance; protected external authority owns promotion. See [Self-hosting and bootstrap](self-hosting-and-bootstrap.md).
-
-Before the first Rust lab exists, `scripts/automonique-dev` launches the finite `tools/bootstrap-seed` coordinator as a resource-bounded transient user unit. It owns only the checked seed DAG and hands one development lease to the verified lab; it is not installed as a parallel permanent scheduler. See [Initial development launcher](../reference/initial-development-launcher.md).
+The stable lab launches candidate lab/daemon/client components into a digest-named namespace with separate sockets, database, artifacts, workspaces, credentials and systemd units. Candidate code never loads into the stable verifier. Stable owns lifecycle and evidence observation; an independent builder owns rebuild provenance; protected external authority owns promotion. See [Self-hosting and bootstrap](self-hosting-and-bootstrap.md).
 
 ## Application ownership
 

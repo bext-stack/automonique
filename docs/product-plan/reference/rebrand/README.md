@@ -44,8 +44,6 @@ No second writable long-lived fork is allowed. During the short transition, one 
 3. [Migration and work breakdown](migration-and-work-breakdown.md) provides phases, ordered tickets, verification and rollback gates.
 4. The [Rust rewrite plan](../corpus-index.md) remains the runtime architecture source of truth and consumes these naming/repository decisions.
 5. [Self-hosting and bootstrap](../../requirements/self-hosting-and-bootstrap.md) defines how the private upstream produces its first trusted development seed and later candidate/release evidence.
-6. [Initial development launcher](../initial-development-launcher.md) defines the first command run inside that private upstream and its one-way handoff to the Rust lab.
-7. The root [bootstrap-agent brief](../start-here.md) provides the executable stage-zero reading order, authority boundaries and portable-handoff entry point.
 
 ## Non-negotiable outcomes
 

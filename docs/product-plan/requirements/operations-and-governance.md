@@ -122,7 +122,7 @@ Candidate retention is state-based: active/promotable and last-known-good artifa
 
 Runbooks cover clean-host SH0 bootstrap, source/toolchain acquisition failure, non-reproducible rebuild, superseded source, stuck build queue, candidate crash loop, failed self-host reload, candidate boundary violation, independent-builder outage, stale promotion plan, compromised development credential/trust root and stable development-state recovery. No runbook repairs self-host state with ad hoc database edits.
 
-The stage-minus-one [initial development launcher](../reference/initial-development-launcher.md) has a narrower runbook: inspect/plan without mutation, exact start confirmation, status/attach, coordinator restart/resume, disk-pressure stop, failed Rust handoff, cleanup preview and seed-state export. Its transient user unit, XDG paths and repository worktrees are registered explicitly; cleanup never follows unresolved variables or removes unrelated source/user state.
+The `automonique-bootstrap` runbook covers inspect/plan without mutation, exact start confirmation, status/attach, restart/resume, disk-pressure stop, failed handoff, cleanup preview and state export. Its runtime directories and repository worktrees are registered explicitly; cleanup never follows unresolved variables or removes unrelated source/user state.
 
 Promotion preparation and approval are separate typed actions. The approver revalidates protected branch, source/artifact/provenance digests, required checks, current stable, compatibility, backup and rollback immediately before mutation. Candidate output cannot satisfy external-builder, signer or deployer evidence.
 

@@ -106,27 +106,6 @@ source_path = "docs/rust-rewrite/feature-parity.md"
 source_sha256 = "60dca4367b1faa29fc0835dbb9d0d1595ef2ec8cda4aab06a3504c1697de6667"
 
 [[document]]
-path = "reference/handoff-decisions.json"
-sha256 = "ff720a1e2774dec0ca4b57c18e5386e5319df43cc71e4fad1ce53fc5a72d3203"
-transfer = "sanitized"
-source_path = "bootstrap/automonique-handoff/decisions.json"
-source_sha256 = "0e9a9382134619ebd63b106f2c9992c49df5867cd8ea08fe76c8edffae6cad90"
-
-[[document]]
-path = "reference/handoff-first-agent-prompt.md"
-sha256 = "81f40ac5c613f531f7a959bc4fa869a500d4375d0ee0228e18e7f0d2b8751114"
-transfer = "byte-for-byte"
-source_path = "bootstrap/automonique-handoff/FIRST_AGENT_PROMPT.md"
-source_sha256 = "81f40ac5c613f531f7a959bc4fa869a500d4375d0ee0228e18e7f0d2b8751114"
-
-[[document]]
-path = "reference/initial-development-launcher.md"
-sha256 = "041a5f0e204d75745006b52f837ef3fce23a9da6e9a93a890706455d974aad5f"
-transfer = "sanitized"
-source_path = "docs/rust-rewrite/initial-development-launcher.md"
-source_sha256 = "49b77bee3d27dd9ccbda634aade2318bdb71763951128599ce028b333603508a"
-
-[[document]]
 path = "reference/migration-plan.md"
 sha256 = "bb1278319b3fa1af1165b4c39c34d6d1369e4e620557f65b9a968fa0ac75a4c6"
 transfer = "sanitized"
@@ -167,13 +146,6 @@ sha256 = "c3b840d39938714a3fc29cca167fb64ce98bf78bbad82e73b993b241520b5b96"
 transfer = "sanitized"
 source_path = "docs/automonique-rebrand/repository-strategy.md"
 source_sha256 = "12bae5db8cf4527df4679dfaca637d8272628efdb8a3ef67b33608866cd0b20d"
-
-[[document]]
-path = "reference/start-here.md"
-sha256 = "9424fb0f4d36e1af5f3f5c9647948d419b0e2f66a81dcc81a9398a307b002079"
-transfer = "sanitized"
-source_path = "AUTOMONIQUE_START_HERE.md"
-source_sha256 = "31ca6eda2ae7cea5116463943180a415a318f4db9c061e031d309cce9452357c"
 
 [[document]]
 path = "reference/work-breakdown.md"

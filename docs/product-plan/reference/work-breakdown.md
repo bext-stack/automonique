@@ -44,16 +44,6 @@ Each item should be a small reviewable issue/PR. IDs express dependency order, n
 - **R0-38 Promotion protocol:** exact-revision prepare/approve receipts, required external identities, protected-branch/signing/deployment exclusion and ambiguous-outcome reconciliation.
 - **R0-39 Recursive improvement policy:** bounded evidence sources, hill-climb objectives, auto-queue ceiling, oscillation/repetition stop rules and external-review classes.
 - **R0-40 Self-host recovery drill:** corrupt/crash candidate and stable development state, restore last seed/recovery bundle, reconcile repository/evidence and prove production isolation.
-- **R0-41 Initial launcher contract:** freeze commands/options, interactive/noninteractive confirmation, exit codes, XDG/runtime layout, provider selection and finite ownership boundary.
-- **R0-42 Seed program/policy:** checked finite stage-minus-one DAG mapped to R0/R1 tickets, allowed paths/commands, roles, budgets, tests, checkpoints and no self-extension.
-- **R0-43 Bash entry point:** ShellCheck-clean `scripts/automonique-dev` for preflight, locking, plan digest confirmation, transient-unit launch and Rust handoff/forwarding only.
-- **R0-44 Bun seed coordinator:** typed persistent seed run/events/status, one worktree/write lease, provider session capture, background systemd scopes and restart reconciliation.
-- **R0-45 Seed provider adapters:** capability-probed Claude/Codex/opencode/Jcode non-TTY adapters, tagged resume, explicit fallback re-plan and fake-provider conformance.
-- **R0-46 Seed Git/build safety:** exact worktree/branch creation, provider Git denial, typed optional local commits, resource-bounded build/test and no push/merge/release/deploy.
-- **R0-47 Seed operator UX:** inspect/plan/start/apply/resume/status/logs/attach/stop/doctor/handoff/cleanup plus exact printed effect and budget summary.
-- **R0-48 Seed-to-SH0 handoff:** verify Rust lab readiness, import program/evidence, transfer one development lease, write receipt, retire transient seed and make repeated start attach.
-- **R0-49 Launcher recovery/security suite:** interrupt/reboot every boundary, dirty/wrong repo, source drift, disk pressure, secret/argv/env scan, adversarial remote-effect attempts and idempotent cleanup.
-- **R0-50 Launcher retirement:** convert stable script to Rust forwarder, preserve declared recovery window/fixtures and migrate or explain every retained seed run.
 
 ## Epic R1 — workspace and shared protocol
 

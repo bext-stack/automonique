@@ -12,8 +12,6 @@ The governing rule is:
 
 This document extends the [AI implementation harness](ai-implementation-harness.md), [reload protocol](reload-protocol.md), [release architecture](target-architecture.md) and [repository migration](../reference/rebrand/README.md).
 
-The human-facing stage-minus-one command that creates SH0 before these Rust components exist is specified in [Initial development launcher](../reference/initial-development-launcher.md).
-
 ## Self-hosting levels
 
 | Level | Capability | Required authority |
@@ -104,13 +102,13 @@ The manifest contains no secret and does not grant authority. An agent cannot mo
 
 ## Fresh-host bootstrap
 
-The initial `./scripts/automonique-dev start` command hands off into `automonique-bootstrap init`, which performs an explicit, resumable sequence:
+The `automonique-bootstrap init` command performs an explicit, resumable sequence:
 
 1. Inspect platform, disk, kernel/systemd, compiler/toolchain and network policy without mutation.
 2. Verify repository identity, requested revision and bootstrap manifest signature/digest.
 3. Acquire the declared seed/toolchains/dependencies from allowlisted sources, or verify locally supplied artifacts.
 4. Create a dedicated development user/runtime/state directory and credential descriptors.
-5. Build the minimal protocol, launcher and `tools/automonique-lab` Cargo workspace member in an isolated bootstrap environment.
+5. Build the minimal protocol and `tools/automonique-lab` Cargo workspace member in an isolated bootstrap environment.
 6. Run bootstrap unit/sandbox/schema and secret scans.
 7. Initialize an empty development database and import only the machine-readable program, policies and public fixtures.
 8. Start the stable lab on a local protected socket and issue a one-time operator enrollment.
@@ -125,7 +123,7 @@ Every build references a `SourceState` containing repository ID, worktree/base r
 
 The build coordinator snapshots `SourceState` before compilation and verifies it again before publication. If source changes, the result is `superseded`, not failed or eligible. Equivalent build requests deduplicate by environment, target, profile and source fingerprint; attached watchers receive the original result.
 
-Published candidates are immutable directories addressed by artifact digest. Stable/current/candidate names are verified indirections updated only by the launcher after the required state transition.
+Published candidates are immutable directories addressed by artifact digest. Stable/current/candidate names are verified indirections updated only after the required state transition.
 
 ## Candidate lifecycle
 
