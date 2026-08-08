@@ -1,0 +1,200 @@
+schema_version = 1
+source = "docs/product-plan"
+legacy_dependencies = false
+
+[[work]]
+id = "BOOT-001"
+title = "Idempotent bootstrap and durable supervisor"
+dependencies = []
+status = "ready"
+contract = "docs/bootstrap/BOOT-001.md"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "BOOT-002"
+title = "Sandboxed worktree, path lease and typed Git broker"
+dependencies = ["BOOT-001"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "BOOT-003"
+title = "Codex author adapter with durable provider records"
+dependencies = ["BOOT-002"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "BOOT-004"
+title = "Independent reviewer, fixer and build evidence loop"
+dependencies = ["BOOT-003"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "BOOT-005"
+title = "GitHub publication and exactly-once merger broker"
+dependencies = ["BOOT-004"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "BOOT-006"
+title = "Signed self-update, generation health and rollback"
+dependencies = ["BOOT-005"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "BOOT-007"
+title = "Fault-injected autonomous development proof"
+dependencies = ["BOOT-006"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "CORE-001"
+title = "Canonical identities, revisions and authorization decisions"
+dependencies = ["BOOT-007"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "CORE-002"
+title = "Domain event journal, action receipts and fenced leases"
+dependencies = ["CORE-001"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "CORE-003"
+title = "Content-addressed artifacts and retention state"
+dependencies = ["CORE-002"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "EXEC-001"
+title = "Execution hosts, sandbox attestations and provider protocol"
+dependencies = ["CORE-003"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "EXEC-002"
+title = "Durable work graphs, attempts, budgets and cancellation"
+dependencies = ["EXEC-001"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "EXEC-003"
+title = "Workspace registry, snapshot and integration contracts"
+dependencies = ["EXEC-002"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "PROVIDER-001"
+title = "Provider capability catalog, sessions and reconnect"
+dependencies = ["EXEC-003"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "CONTROL-001"
+title = "Authenticated local API and generated domain schemas"
+dependencies = ["PROVIDER-001"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "CONTROL-002"
+title = "CLI, doctor, reconciliation and operator recovery"
+dependencies = ["CONTROL-001"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "RELOAD-001"
+title = "Overlapping generation handoff and automatic rollback"
+dependencies = ["CONTROL-002"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "SDK-001"
+title = "Generated TypeScript SDK and conformance transport"
+dependencies = ["CONTROL-001"]
+status = "blocked"
+licence = "Apache-2.0"
+
+[[work]]
+id = "CLIENT-001"
+title = "Operator TUI over shared action and event contracts"
+dependencies = ["CONTROL-002", "SDK-001"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "AUTO-001"
+title = "Automations, goals, schedules and trigger intake"
+dependencies = ["RELOAD-001"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "CONTEXT-001"
+title = "Context manifests, memory, skills and profile policy"
+dependencies = ["PROVIDER-001", "CORE-003"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "CONNECTOR-001"
+title = "Generic connector SDK, identity and outbox conformance"
+dependencies = ["SDK-001", "AUTO-001"]
+status = "blocked"
+licence = "Apache-2.0"
+
+[[work]]
+id = "PROTOCOL-001"
+title = "ACP, MCP, OpenAI and A2A projection adapters"
+dependencies = ["CONTROL-001", "EXEC-002"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "RELEASE-001"
+title = "Reproducible builds, provenance, SBOM and recovery bundle"
+dependencies = ["RELOAD-001", "BOOT-007"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "PRODUCT-001"
+title = "Capability-ledger closure and self-hosting acceptance"
+dependencies = ["CLIENT-001", "AUTO-001", "CONTEXT-001", "CONNECTOR-001", "PROTOCOL-001", "RELEASE-001"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "SEC-001"
+title = "Product threat model and security requirements document"
+dependencies = ["BOOT-007"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "CLIENT-002"
+title = "Web dashboard and browser surface specification"
+dependencies = ["CONTROL-001", "SDK-001"]
+status = "blocked"
+licence = "Elastic-2.0"
+
+[[work]]
+id = "PRODUCT-002"
+title = "End-to-end acceptance including security and dashboard specs"
+dependencies = ["PRODUCT-001", "SEC-001", "CLIENT-002"]
+status = "blocked"
+licence = "Elastic-2.0"

@@ -1,0 +1,316 @@
+schema_version = 1
+source_repository = "bext-stack/automonique-pre-genesis"
+source_revision = "562cbbfd7f407853d57ed1a19b1c39b65601ed87"
+transfer_kind = "planning-requirements-only"
+implementation_source_imported = false
+git_history_imported = false
+authorized_by = "Favre Benjamin"
+licence_class = "Elastic-2.0"
+transferred_at = "2026-08-05T10:04:47Z"
+
+# Amended documents: sha256 pins the current owner-approved content;
+# transferred_sha256 preserves the as-transferred hash; amended_per names
+# the accepted decision that authorized the amendment.
+
+[[document]]
+path = "requirements/automation-goals-and-triggers.md"
+sha256 = "1ccea4473ce5beb12a9e92a331c93291748d1c4dd1dbd93e300c022907620256"
+transfer = "byte-for-byte"
+
+[[document]]
+path = "requirements/context-memory-and-learning.md"
+sha256 = "076f732794a48b89c6137e0ed9d448ec29be80ba1351069e546e4ce097150fa0"
+transfer = "byte-for-byte"
+
+[[document]]
+path = "requirements/external-capability-ledger.md"
+sha256 = "d6ebff02d498e3252dcc67fac956f54f0d71b84991fbfacd1bf508178df4b4e0"
+transfer = "byte-for-byte"
+transferred_sha256 = "6683d41ced799a63b62f18d9f5ea358871a61900394f58ce423c427c09137a73"
+amended_at = "2026-08-06"
+amended_per = "decisions/008-shelldeck-reuse.md"
+
+[[document]]
+path = "requirements/models-media-and-execution.md"
+sha256 = "be756adb83688aa17841eea2460a341a0bdb0ee586231af5e82ba66c4b5b323e"
+transfer = "byte-for-byte"
+
+[[document]]
+path = "requirements/public-agent-protocols.md"
+sha256 = "b82e2a0c4ac5486fa076d676541a2442b9bb5dd3682a6884c05c5b83ddc3ecb9"
+transfer = "byte-for-byte"
+
+[[document]]
+path = "decisions/004-identity-and-authorization.md"
+sha256 = "79ebf42a475739c059710710cd9dd5700698654f1b95bb610e47fc03b76139fa"
+transfer = "byte-for-byte"
+
+[[document]]
+path = "decisions/005-artifact-storage.md"
+sha256 = "e419943c0f86356353f5e3c4687e3cab54d4fb85afbc7388a73e0ea7ea97d93d"
+transfer = "byte-for-byte"
+
+[[document]]
+path = "decisions/007-sandbox-enforcement.md"
+sha256 = "00e63244a4e4dd7b073fba3d00088965344e651e4a1c2d4f475aa2d83978e198"
+transfer = "byte-for-byte"
+
+
+# Second transfer (owner-authorized 2026-08-05): full sanitized plan corpus.
+corpus_transfer_kind = "full-plan-corpus-sanitized"
+corpus_source_revision = "9a262c1e0486bd68e0fe47eb65fcae3af3cbf1c1"
+corpus_transferred_at = "2026-08-05T21:53:19Z"
+corpus_authorized_by = "Favre Benjamin"
+corpus_note = "pre-genesis assistant/product names and private identifiers sanitized to neutral legacy* terms; GPL licence statements superseded by the genesis licence boundary; see reference/corpus-index.md notes"
+
+[[document]]
+path = "reference/corpus-index.md"
+sha256 = "d0d1f69847334f000d0c0c0c6e754e9ee4f1636565e149cbccd8d6920ca5858f"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/README.md"
+source_sha256 = "74584983a3d673762f92118494247af6b6e849de7b0834e299d775cf094364a1"
+
+[[document]]
+path = "decisions/001-execution-host-lifecycle.md"
+sha256 = "b3bf8744313db05480e45216fa27f482a5943354d8e87c8fa36ef2871e32751e"
+transfer = "byte-for-byte"
+source_path = "docs/rust-rewrite/decisions/001-execution-host-lifecycle.md"
+source_sha256 = "b3bf8744313db05480e45216fa27f482a5943354d8e87c8fa36ef2871e32751e"
+
+[[document]]
+path = "decisions/002-domain-event-and-action-journal.md"
+sha256 = "f7667794ba060c22d3baf97ef391ccee3d0046703c5ebdd605d4d8f380ae159d"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/decisions/002-domain-event-and-action-journal.md"
+source_sha256 = "0180c2cd62c54e1b4db1ef125ebc1c5ee524f8e01df2fcc3bf3c104a9a319957"
+
+[[document]]
+path = "decisions/003-workspace-isolation.md"
+sha256 = "0c26ada35473f1b435a11b54d207eec8165c44c100fed0484ed33f920046bb9d"
+transfer = "byte-for-byte"
+source_path = "docs/rust-rewrite/decisions/003-workspace-isolation.md"
+source_sha256 = "0c26ada35473f1b435a11b54d207eec8165c44c100fed0484ed33f920046bb9d"
+
+[[document]]
+path = "decisions/006-automonique-naming.md"
+sha256 = "0a3f895824055b32a837962704dc0513ec45458984ce9faf007232ed997dfb13"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/decisions/006-automonique-naming.md"
+source_sha256 = "65c0264d056609d4170bd2757e845779f863acb5467c95ac3d3fa809464840b8"
+
+[[document]]
+path = "reference/feature-parity.md"
+sha256 = "31c682aa735f7ac1c7da294de103dccf815b0dbd66660fd106f0929733de5ac9"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/feature-parity.md"
+source_sha256 = "60dca4367b1faa29fc0835dbb9d0d1595ef2ec8cda4aab06a3504c1697de6667"
+
+[[document]]
+path = "reference/handoff-decisions.json"
+sha256 = "ff720a1e2774dec0ca4b57c18e5386e5319df43cc71e4fad1ce53fc5a72d3203"
+transfer = "sanitized"
+source_path = "bootstrap/automonique-handoff/decisions.json"
+source_sha256 = "0e9a9382134619ebd63b106f2c9992c49df5867cd8ea08fe76c8edffae6cad90"
+
+[[document]]
+path = "reference/handoff-first-agent-prompt.md"
+sha256 = "81f40ac5c613f531f7a959bc4fa869a500d4375d0ee0228e18e7f0d2b8751114"
+transfer = "byte-for-byte"
+source_path = "bootstrap/automonique-handoff/FIRST_AGENT_PROMPT.md"
+source_sha256 = "81f40ac5c613f531f7a959bc4fa869a500d4375d0ee0228e18e7f0d2b8751114"
+
+[[document]]
+path = "reference/initial-development-launcher.md"
+sha256 = "041a5f0e204d75745006b52f837ef3fce23a9da6e9a93a890706455d974aad5f"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/initial-development-launcher.md"
+source_sha256 = "49b77bee3d27dd9ccbda634aade2318bdb71763951128599ce028b333603508a"
+
+[[document]]
+path = "reference/migration-plan.md"
+sha256 = "bb1278319b3fa1af1165b4c39c34d6d1369e4e620557f65b9a968fa0ac75a4c6"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/migration-plan.md"
+source_sha256 = "5130f1027e6f40cd46a7e5cb663568b45ebbabb0fbec7b1982f8f9978b454ff6"
+
+[[document]]
+path = "reference/plan-review.md"
+sha256 = "2a038604cbec706c351f816a1e99806ddd1c5ff1dc5791fd694eb41ce553e5b9"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/plan-review.md"
+source_sha256 = "c5634ad0518dbe71ad5409b468697a7c192b71cc61411e62cc7174eab808a3be"
+
+[[document]]
+path = "reference/rebrand/README.md"
+sha256 = "628ffa4c21a710c72f715e0d2971d5814d9cfc9fbe947334c1ad5985787ff1b5"
+transfer = "sanitized"
+source_path = "docs/automonique-rebrand/README.md"
+source_sha256 = "b23a34c720c91ab8ddb34d9785058530e7c58983d022aea73727aa40de875086"
+
+[[document]]
+path = "reference/rebrand/compatibility-contract.md"
+sha256 = "0202c72fa4ddaf230f661b9e923febad783d285ed543dc11862dcd3f125ca4a2"
+transfer = "sanitized"
+source_path = "docs/automonique-rebrand/compatibility-contract.md"
+source_sha256 = "ded654443f227372bb822473a08175a99b71ed5247cb96ef4b05927889ac5cb3"
+
+[[document]]
+path = "reference/rebrand/migration-and-work-breakdown.md"
+sha256 = "363b2174dc2b78ba726263ee52ae9d44880344b8a2a936e5d788fd751d6bb464"
+transfer = "sanitized"
+source_path = "docs/automonique-rebrand/migration-and-work-breakdown.md"
+source_sha256 = "1821cd66b32d5af2c2001b96e8d2960cbfa9a0fd94e333ef49580a56a410b753"
+
+[[document]]
+path = "reference/rebrand/repository-strategy.md"
+sha256 = "c3b840d39938714a3fc29cca167fb64ce98bf78bbad82e73b993b241520b5b96"
+transfer = "sanitized"
+source_path = "docs/automonique-rebrand/repository-strategy.md"
+source_sha256 = "12bae5db8cf4527df4679dfaca637d8272628efdb8a3ef67b33608866cd0b20d"
+
+[[document]]
+path = "reference/start-here.md"
+sha256 = "9424fb0f4d36e1af5f3f5c9647948d419b0e2f66a81dcc81a9398a307b002079"
+transfer = "sanitized"
+source_path = "AUTOMONIQUE_START_HERE.md"
+source_sha256 = "31ca6eda2ae7cea5116463943180a415a318f4db9c061e031d309cce9452357c"
+
+[[document]]
+path = "reference/work-breakdown.md"
+sha256 = "cdfebfbc71ee17192b54ad73b871561110a3981703bccb0683cf0c364cf2e787"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/work-breakdown.md"
+source_sha256 = "c27006d2ccccb54a7c72795cc8036f8d527a21563db774a5a34219c8be14ab07"
+
+[[document]]
+path = "requirements/agent-integrations.md"
+sha256 = "06e370b812560c1c9f6905dc1acd67c20f67e76ee44350aa49e5545ec35c278d"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/agent-integrations.md"
+source_sha256 = "e1470643b343b8de0c25f48b7b091f3810c44aa766af1e13839cd726f6481eed"
+
+[[document]]
+path = "requirements/ai-implementation-harness.md"
+sha256 = "e1642f61867d695924e835c551c2558a56e83dec6bcf7ead6a0d5ada2e9f2166"
+transfer = "byte-for-byte"
+source_path = "docs/rust-rewrite/ai-implementation-harness.md"
+source_sha256 = "95af7ce770952d90d7d031b5bd218dee207451f5bbf1a30b9ba5226c5e502e66"
+
+[[document]]
+path = "requirements/channel-integrations.md"
+sha256 = "7a09d3eb76c2244fc118e48bd14146dfe967f34097a4c126a101c902d038c2aa"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/channel-integrations.md"
+source_sha256 = "a2d3cdde34783596cc9e574743a4598ccc7167ffb1edfd98c5fb69d3799526ea"
+
+[[document]]
+path = "requirements/client-experience-and-surfaces.md"
+sha256 = "af20cb9c42e0241f6d1b097168ac9281ec61459db7593641a9c6c2267ecff1bd"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/client-experience-and-surfaces.md"
+source_sha256 = "1ede6bb6d41ec0d023854bec912d2e85a73387c3353469117b50d96ba53d935f"
+transferred_sha256 = "e9b5ebcb8d19dadc8967cb04b6eb8c05a2187b6958f69b67ffb404c16c42ec67"
+amended_at = "2026-08-06"
+amended_per = "decisions/008-shelldeck-reuse.md"
+
+[[document]]
+path = "requirements/connector-catalog.md"
+sha256 = "c7b2435238a3160165cb0a6b3cab3c892ec80629bd34cf4b8a4f67d0f71d512d"
+transfer = "byte-for-byte"
+source_path = "docs/rust-rewrite/connector-catalog.md"
+source_sha256 = "c7b2435238a3160165cb0a6b3cab3c892ec80629bd34cf4b8a4f67d0f71d512d"
+
+[[document]]
+path = "requirements/goals-and-invariants.md"
+sha256 = "e92690b94490c810deee78282a8b8d13228f695e2ee0539e19dbab0d1ae1bb03"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/goals-and-invariants.md"
+source_sha256 = "6bc901b79890ca350906fb3d29c358a30c82c3d7a12ab0afc3e9d1a90c909c4d"
+
+[[document]]
+path = "requirements/operations-and-governance.md"
+sha256 = "19bb215dbd5228d1dadb23ebca20f9514db718b29b668919139e90ca33e09f1f"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/operations-and-governance.md"
+source_sha256 = "f5098629e54d1adef4e74894ecc16d427eb4caec46d0fffad90a9c5e3a18d918"
+
+[[document]]
+path = "requirements/operator-tui.md"
+sha256 = "fbb01ce26f1648e7ffd388bea6e4e65e21c1e1bc86a13e199cae123603ced058"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/operator-tui.md"
+source_sha256 = "cf2c6afec4b95895a362a27e7262d608a06f9f406b4bb92872c8dd79df0890ac"
+
+[[document]]
+path = "requirements/reload-protocol.md"
+sha256 = "f53c4d2e1fdf5d628e521066b8be9003771edcd97b6603619643509b1935490e"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/reload-protocol.md"
+source_sha256 = "463f65de85e26f9799ffc9d7d7e36a1042142b3c964305ea3df5c38896647a43"
+
+[[document]]
+path = "requirements/sandbox-management.md"
+sha256 = "3b78e8a2934c3de5d4affa3a1f5d22405b74db88348b628fbc5b5b00fd6501bf"
+transfer = "byte-for-byte"
+source_path = "docs/rust-rewrite/sandbox-management.md"
+source_sha256 = "3b78e8a2934c3de5d4affa3a1f5d22405b74db88348b628fbc5b5b00fd6501bf"
+
+[[document]]
+path = "requirements/self-hosting-and-bootstrap.md"
+sha256 = "253e7facbcc699445bd4a83ed30be6d63551fe9e996c85dfae7deb27345b3b05"
+transfer = "byte-for-byte"
+source_path = "docs/rust-rewrite/self-hosting-and-bootstrap.md"
+source_sha256 = "817e8b173cb3eac3dd881953924bcee129d667ee55018742773cf539ecef9abd"
+
+[[document]]
+path = "requirements/state-and-protocols.md"
+sha256 = "b6d94e79991f28b14790f433a9cc12e22f2f8b222a455220677c855850f6c1af"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/state-and-protocols.md"
+source_sha256 = "20c34773768336905837d390ac45e6f8525fc51ec0a171610a72b0ee9225bda6"
+
+[[document]]
+path = "requirements/target-architecture.md"
+sha256 = "5ad7edfaca51d0bd01078670f43a84b2fbf4eef7fc089d901e8c2c28a1eb844b"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/target-architecture.md"
+source_sha256 = "acf6f0f7950a3346d263cf7418aee8f70cca552f42d050aaeaba4b9c7ac5134b"
+transferred_sha256 = "ae8c5f27020b39a5e6c44375f45898fa44dc6ebb01eb441ca2a6be923e6ed641"
+amended_at = "2026-08-06"
+amended_per = "decisions/008-shelldeck-reuse.md"
+
+[[document]]
+path = "requirements/tools-extensions-and-hooks.md"
+sha256 = "24cd923c0249767ff75cd13a508f502fee5d965eda347e6baeb7edebb7ab3c95"
+transfer = "byte-for-byte"
+source_path = "docs/rust-rewrite/tools-extensions-and-hooks.md"
+source_sha256 = "24cd923c0249767ff75cd13a508f502fee5d965eda347e6baeb7edebb7ab3c95"
+
+[[document]]
+path = "requirements/typescript-sdk.md"
+sha256 = "049ce1539f5d113de37a928f877619090b39425facf861940eded13690077411"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/typescript-sdk.md"
+source_sha256 = "b0035cb4297df4e3146b32694f720c95e81bd9567de0094bec55b5bbe49d79e3"
+transferred_sha256 = "e356c7470ac72886062b4bed7b896146f50c10ad7f9a8bf2f4124f656c2f259c"
+amended_at = "2026-08-06"
+amended_per = "decisions/008-shelldeck-reuse.md"
+
+[[document]]
+path = "requirements/verification-and-rollout.md"
+sha256 = "24ccc480608c6a0bec6472741fae4e85048d2a65d9bab8605acd4ab1aa51c9cc"
+transfer = "sanitized"
+source_path = "docs/rust-rewrite/verification-and-rollout.md"
+source_sha256 = "f3348e934f23a37886cde63f257fee03329e6b8109ebb12812d1105dcdf0abf6"
+
+[[document]]
+path = "crosswalk.md"
+sha256 = "4dfe1bb63346e9c4f0a18dff6d35ce9bf00567e6038ac5a71ea11b4cade9a360"
+transfer = "authored"
+source_path = "authored during the staging gap review; no legacy source"
+
+[excluded]
+implementation = "all source, tests, scripts, generated artifacts and fixtures"
+migration = "former-name, parity, deployment and repository migration plans were transferred sanitized into reference/ as historical context, not primary requirements"
+superseded = "former licence texts, temporary launcher and host observations remain historical inside reference/"
+legacy_checkout = "name withheld; identical planning tree exists in bext-stack/automonique-pre-genesis"
