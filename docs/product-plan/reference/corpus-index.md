@@ -57,7 +57,7 @@ The rewrite is justified here by the desired runtime model, not by throughput or
 24. [Verification and rollout](../requirements/verification-and-rollout.md) defines parity, chaos, security, provider-conformance and production gates.
 25. [Work breakdown](work-breakdown.md) turns the design into ordered implementation tickets.
 
-Blocking design decisions are recorded directly in the requirement documents and the work-DAG crosswalk (`crosswalk.md`).
+Blocking design decisions are recorded directly in the requirement documents.
 
 ## Directional decisions
 

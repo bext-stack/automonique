@@ -13,7 +13,7 @@ When documents disagree, use this order and stop on an unresolved conflict:
 3. this file, `architecture.md` and the checked work
    DAG;
 4. product requirements and the capability ledger in `requirements/`;
-5. historical context in `reference/` and `crosswalk.md`.
+5. historical context in `reference/`.
 
 No requirement can grant itself authority that a higher layer withholds.
 `reference/` material describes the prior product and migration; it is
@@ -24,14 +24,13 @@ higher layer.
 
 The private planning archive contained both reusable product planning and
 obsolete migration material. Eight implementation-independent requirement
-documents were transferred byte-for-byte and are identified by source hashes in
-`provenance.toml`. Favre Benjamin, as owner of the source material, authorized
+documents were transferred byte-for-byte from the source archive. Favre
+Benjamin, as owner of the source material, authorized
 their use as Automonique planning inputs under this repository's licence
 policy.
 
 A second owner-authorized transfer on 2026-08-05 brought the remainder of the
-planning corpus: 33 documents transferred as a sanitized corpus plus an
-authored `crosswalk.md` mapping every work-DAG item to its spec documents.
+planning corpus: 33 documents transferred as a sanitized corpus.
 Sanitization removed all former assistant/product names and private
 identifiers (neutral `legacy*` compatibility terms replace them) and rewrote
 the two primary GPL licence statements to the current licence boundary
@@ -76,10 +75,10 @@ reconcilable.
 
 ## How work starts
 
-Only a `ready` item in `work-dag.toml` may execute. The selected item receives
-an immutable base, leased paths, licence class, budget, verification contract
-and stop conditions. Completing an item may unlock its direct dependants after
-evidence is recorded; it never makes the whole graph implicitly ready.
+A ready work item receives an immutable base, leased paths, licence class,
+budget, verification contract and stop conditions. Completing an item may
+unlock its direct dependants after evidence is recorded; it never makes the
+whole graph implicitly ready.
 
 The first executable item is `BOOT-001`. Its contract is in
 `../bootstrap/BOOT-001.md`.

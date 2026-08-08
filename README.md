@@ -22,11 +22,8 @@ The authoritative product specification lives under `docs/product-plan/`:
   notes;
 - `docs/product-plan/architecture.md` — target architecture;
 - `docs/product-plan/requirements/` — capability and non-functional
-  requirements;
-- `docs/product-plan/work-dag.toml` — the checked work DAG that drives
-  implementation.
+  requirements.
 
-Work starts only from a `ready` item in `docs/product-plan/work-dag.toml`.
 See `docs/product-plan/README.md` for the full product intent and non-goals.
 
 ## Licensing

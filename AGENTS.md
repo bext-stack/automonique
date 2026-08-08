@@ -12,7 +12,7 @@ transferred.
 
 ## Before implementation
 
-- Select a ready work ID from `docs/product-plan/work-dag.toml`.
+- Select a ready work ID from the plan requirements.
 - Record dependency evidence, allowed paths, expected base, objective, budget,
   tests, licence class, and stop conditions.
 - Refuse work blocked by an unresolved legal, provenance, baseline, or policy
