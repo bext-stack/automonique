@@ -1,6 +1,6 @@
 # Contributing
 
-Automonique is not accepting external code contributions during genesis.
+Automonique is not yet accepting external code contributions.
 Issues, behavioral reports, and design proposals may be accepted once public
 intake and privacy terms are established.
 

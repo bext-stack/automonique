@@ -52,16 +52,16 @@ was transferred sanitized later the same day (see `provenance.toml`).
 - **PRODUCT-002** exists because durable plan imports forbid changing an
   existing item's dependencies after import; it extends PRODUCT-001 closure
   over SEC-001 and CLIENT-002 without editing PRODUCT-001.
-- `reference/work-breakdown.md` contains the detailed pre-genesis ticket
+- `reference/work-breakdown.md` contains the detailed legacy ticket
   ordering from which `work-dag.toml` was derived. The checked `work-dag.toml`
   is canonical; where they disagree, the DAG wins.
 - `reference/migration-plan.md` and `reference/feature-parity.md` describe
-  parity with the pre-genesis product. The repository's non-goals (maintaining
-  the pre-genesis application) take precedence; these docs inform capability
+  parity with the legacy product. The repository's non-goals (maintaining
+  the legacy application) take precedence; these docs inform capability
   completeness, not maintenance duty.
 - **Legacy compatibility dormancy:** `requirements/state-and-protocols.md`
   presents `legacy_*` tables and `legacy.*` protocol names as a version-1
-  compatibility surface inherited from the pre-genesis daemon. This
+  compatibility surface inherited from the legacy daemon. This
   clean-room repository does not maintain that daemon, so compatibility
   surfaces are dormant until an owner decision activates legacy migration.
 - SDK/connector docs (`typescript-sdk.md`, `channel-integrations.md`,

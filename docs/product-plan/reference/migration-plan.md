@@ -1,8 +1,8 @@
 # Migration plan
 > **Superseded decision note:** the `GPL-3.0-or-later` licence recorded in this
-> document was superseded at genesis. The binding licence boundary is product
+> document was superseded. The binding licence boundary is product
 > `Elastic-2.0` with `sdk/` and `integrations/` under `Apache-2.0` (checked-in
-> `LICENSE-POLICY.md` and `GENESIS.md`). GPL statements below remain historical.
+> `LICENSE-POLICY.md`). GPL statements below remain historical.
 
 The rewrite uses a strangler approach. Production behavior remains owned by the existing daemon until each Rust boundary passes parity and failure tests. Avoid a branch that diverges for months; merge small compatibility increments continuously.
 

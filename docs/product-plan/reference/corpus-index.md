@@ -16,9 +16,8 @@
 > a parallel CLI or daemon binary without an accepted decision.
 >
 > **Licence note:** the corpus originally recorded `GPL-3.0-or-later`; the
-> binding licence boundary established at genesis is product `Elastic-2.0`
-> with `sdk/` and `integrations/` under `Apache-2.0` (checked-in
-> `LICENSE-POLICY.md`, `GENESIS.md`).
+> binding licence boundary is product `Elastic-2.0` with `sdk/` and
+> `integrations/` under `Apache-2.0` (checked-in `LICENSE-POLICY.md`).
 
 **Status:** proposed design and implementation plan
 
@@ -32,7 +31,7 @@ The rewrite is justified here by the desired runtime model, not by throughput or
 
 ## Documents
 
-1. [Automonique rebrand and repository plan](rebrand/README.md) defines the canonical identity, new-upstream strategy and additive compatibility migration. (Largely superseded by the clean-room genesis for the new repository; retained for legacy-daemon migration context.)
+1. [Automonique rebrand and repository plan](rebrand/README.md) defines the canonical identity, new-upstream strategy and additive compatibility migration. (Largely superseded by the clean-room repository; retained for legacy-daemon migration context.)
 2. [Goals and invariants](../requirements/goals-and-invariants.md) defines what “reload in place” means and which guarantees are non-negotiable.
 3. [Plan review findings](plan-review.md) records the gaps found after checking the installed agent integration surfaces.
 4. [Target architecture](../requirements/target-architecture.md) defines the Rust processes, systemd ownership, component boundaries, and release layout.

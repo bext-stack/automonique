@@ -2,7 +2,7 @@
 
 This directory is the authoritative product specification available to
 Automonique's autonomous development control plane. The public repository does
-not fetch or mount the private pre-genesis archive at runtime.
+not fetch or mount the private planning archive at runtime.
 
 ## Decision precedence
 
@@ -17,15 +17,15 @@ When documents disagree, use this order and stop on an unresolved conflict:
 6. historical context in `reference/` and `crosswalk.md`.
 
 No requirement can grant itself authority that a higher layer withholds.
-`reference/` material describes the pre-genesis product and migration; it is
+`reference/` material describes the prior product and migration; it is
 context, never a source of new product requirements, and cannot override any
 higher layer.
 
 ## Plan transfer
 
-The pre-genesis archive contained both reusable product planning and obsolete
-migration material. Eight implementation-independent requirement documents
-were transferred byte-for-byte and are identified by source hashes in
+The private planning archive contained both reusable product planning and
+obsolete migration material. Eight implementation-independent requirement
+documents were transferred byte-for-byte and are identified by source hashes in
 `provenance.toml`. Favre Benjamin, as owner of the source material, authorized
 their use as Automonique planning inputs under this repository's licence
 policy.
@@ -33,10 +33,10 @@ policy.
 A second owner-authorized transfer on 2026-08-05 brought the remainder of the
 planning corpus: 33 documents transferred as a sanitized corpus plus an
 authored `crosswalk.md` mapping every work-DAG item to its spec documents.
-Sanitization removed all pre-genesis assistant/product names and private
-identifiers (neutral `legacy*` compatibility terms replace them), rewrote the
-two primary GPL licence statements to the genesis licence boundary
-(`LICENSE-POLICY.md`), and marked historical GPL reference documents as
+Sanitization removed all former assistant/product names and private
+identifiers (neutral `legacy*` compatibility terms replace them) and rewrote
+the two primary GPL licence statements to the current licence boundary
+(`LICENSE-POLICY.md`); historical GPL reference documents are marked
 superseded. `reference/corpus-index.md` is the former planning-tree index and
 carries the canonical-surface and licence notes.
 
@@ -47,7 +47,7 @@ goals—recovery, exactly-once effects, generation handoff, isolated
 workspaces, self-hosting and independent verification—are restated here
 without importing implementation source. Legacy compatibility surfaces
 (`legacy_*` tables, `legacy.*` protocols) are dormant: this clean-room
-repository does not maintain the pre-genesis daemon, and compatibility work
+repository does not maintain the former daemon, and compatibility work
 requires a separate owner decision.
 
 This is a specification transfer, not a Git-history or implementation-source
@@ -67,7 +67,7 @@ reconcilable.
 
 ## Non-goals
 
-- importing or maintaining the pre-genesis application;
+- importing or maintaining the former application;
 - preserving obsolete names, database layouts or deployment behavior;
 - allowing model output to become an unrestricted command line;
 - giving candidates repository-administration, signing, secret-management or

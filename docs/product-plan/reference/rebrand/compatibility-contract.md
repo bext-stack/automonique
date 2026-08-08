@@ -1,18 +1,18 @@
 # Naming and compatibility contract
 > **Superseded decision note:** the `GPL-3.0-or-later` licence recorded in this
-> document was superseded at genesis. The binding licence boundary is product
+> document was superseded. The binding licence boundary is product
 > `Elastic-2.0` with `sdk/` and `integrations/` under `Apache-2.0` (checked-in
-> `LICENSE-POLICY.md` and `GENESIS.md`). GPL statements below remain historical.
+> `LICENSE-POLICY.md`). GPL statements below remain historical.
 
 ## Principle
 
-Automonique is the public product identity. Pre-genesis identifiers are legacy compatibility coordinates, not alternate brands for new surfaces. Rename presentation early; migrate durable/runtime identifiers through an explicit compatibility window.
+Automonique is the public product identity. Legacy identifiers are legacy compatibility coordinates, not alternate brands for new surfaces. Rename presentation early; migrate durable/runtime identifiers through an explicit compatibility window.
 
 ## Target names
 
 | Surface | Canonical target | Legacy compatibility |
 |---|---|---|
-| Product | Automonique | pre-genesis product name in migration notices only |
+| Product | Automonique | legacy product name in migration notices only |
 | Assistant/persona | Monique | existing messages remain historical legacy records |
 | GitHub | `bext-stack/automonique` | private legacy repository remains recovery source |
 | npm | `@automonique/sdk`, `/node`, `/browser`, `/provider`, `/connector`, `/testing` | `@legacy/sdk*` forwarding releases for a declared window |
@@ -30,7 +30,7 @@ Automonique is the public product identity. Pre-genesis identifiers are legacy c
 
 Exact executable/crate names are finalized before the first public package release and then treated as compatibility API.
 
-Canonical naming covers source directories, Cargo package/crate/module/feature names, binary targets, package metadata, generated schemas, metrics, tracing targets, environment examples, fixtures, release archives, containers/images, systemd templates, desktop/web assets and documentation. A CI denylist rejects undocumented new pre-genesis legacy identifiers in public artifacts.
+Canonical naming covers source directories, Cargo package/crate/module/feature names, binary targets, package metadata, generated schemas, metrics, tracing targets, environment examples, fixtures, release archives, containers/images, systemd templates, desktop/web assets and documentation. A CI denylist rejects undocumented new legacy identifiers in public artifacts.
 
 Legacy names remain only in an explicit machine-readable compatibility inventory: historical database/table/event/protocol decoding, upgraded-install paths, old external commands and thin forwarding executables/packages. Each occurrence has an owner, reason and removal gate; “internal implementation detail” is not a reason to keep the old brand.
 

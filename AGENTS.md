@@ -1,6 +1,6 @@
 # Automonique agent contract
 
-This is a clean-room implementation repository. Pre-genesis implementation
+This is a clean-room implementation repository. Prior implementation
 source and Git history are outside the allowed context and must not be copied,
 mounted, searched, summarized, or used to generate code.
 

@@ -1,5 +1,5 @@
 schema_version = 1
-source_repository = "bext-stack/automonique-pre-genesis"
+source_repository = "bext-stack/automonique-archive-20260808"
 source_revision = "562cbbfd7f407853d57ed1a19b1c39b65601ed87"
 transfer_kind = "planning-requirements-only"
 implementation_source_imported = false
@@ -61,7 +61,7 @@ corpus_transfer_kind = "full-plan-corpus-sanitized"
 corpus_source_revision = "9a262c1e0486bd68e0fe47eb65fcae3af3cbf1c1"
 corpus_transferred_at = "2026-08-05T21:53:19Z"
 corpus_authorized_by = "Favre Benjamin"
-corpus_note = "pre-genesis assistant/product names and private identifiers sanitized to neutral legacy* terms; GPL licence statements superseded by the genesis licence boundary; see reference/corpus-index.md notes"
+corpus_note = "former assistant/product names and private identifiers sanitized to neutral legacy* terms; GPL licence statements superseded by the current licence boundary; see reference/corpus-index.md notes"
 
 [[document]]
 path = "reference/corpus-index.md"
@@ -313,4 +313,4 @@ source_path = "authored during the staging gap review; no legacy source"
 implementation = "all source, tests, scripts, generated artifacts and fixtures"
 migration = "former-name, parity, deployment and repository migration plans were transferred sanitized into reference/ as historical context, not primary requirements"
 superseded = "former licence texts, temporary launcher and host observations remain historical inside reference/"
-legacy_checkout = "name withheld; identical planning tree exists in bext-stack/automonique-pre-genesis"
+legacy_checkout = "name withheld; identical planning tree exists in bext-stack/automonique-archive-20260808"

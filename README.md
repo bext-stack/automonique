@@ -1,50 +1,34 @@
 # Automonique
 
-Automonique is beginning from a clean, independently governed genesis. This
-repository deliberately imports neither implementation source nor Git history
-from any pre-genesis system.
+Automonique is a durable, local-first agent control plane that can accept work,
+plan it, execute it through multiple model and tool providers, preserve state
+across failures and upgrades, expose the same authority through every client,
+and develop its own source within a sealed policy envelope.
 
-## Genesis status
+## Repository status
 
-This local tree is the verified clean-room genesis for the public Automonique
-repository. The current product specification, architecture, autonomous
-development contract and checked work DAG are under `docs/product-plan/`.
-Implementation begins with the approved `BOOT-001` bootstrap baseline.
-
-The intended public repository is:
+This repository is the public planning home for Automonique: it contains the
+product specification, architecture, autonomous development contract and the
+checked work DAG under `docs/product-plan/`. It deliberately contains no
+implementation source. The canonical repository is:
 
 <https://github.com/bext-stack/automonique>
 
-## Operating
+## Product plan
 
-```bash
-scripts/develop              # one bounded autonomous pass, then exit
-scripts/develop --loop 300   # keep running passes; Ctrl-C stops
-```
+The authoritative product specification lives under `docs/product-plan/`:
 
-One command converges everything it needs: it builds the release binary when
-stale, commissions the checked-out candidate when HEAD is not yet the
-commissioned revision (all builder gates plus two independent Claude reviews
-over a frozen worktree, assembled into a signed receipt), archives and
-re-bootstraps the durable store when it belongs to a prior lineage, and then
-runs development. Nothing persists between passes and nothing starts at boot;
-the tool works only when explicitly run. A persistent supervisor service
-remains available by bootstrapping with `--unattended`.
+- `docs/product-plan/README.md` — index, decision precedence and plan transfer
+  notes;
+- `docs/product-plan/architecture.md` — target architecture;
+- `docs/product-plan/requirements/` — capability and non-functional
+  requirements;
+- `docs/product-plan/decisions/` — accepted design decisions (ADRs);
+- `docs/product-plan/work-dag.toml` — the checked work DAG that drives
+  implementation.
 
-Each pass leases the first dependency-ready item from the checked work DAG;
-authors, two fresh independent reviewers, fixers, builders and the merger
-operate through separate durable role records inside isolated transient units
-with bounded runtime, memory and tasks. Supported worker providers are Codex,
-Claude Code and jcode, each behind the same fail-closed contract: pinned CLI
-version, schema-validated structured results, measured token usage and a
-canonical session identity on every receipt. Provider-side hard spend/token
-ceilings and local pre-dispatch reservations enforce the cumulative budget.
-
-`./automonique status` and `./automonique doctor` are read-only operator
-views. Process crashes, host restarts, ambiguous remote effects and unhealthy
-candidate generations are reconciled automatically; a failing generation is
-rolled back to the last known-good digest. Candidate health is proved before
-protected `main` can move.
+Work starts only from a `ready` item in `docs/product-plan/work-dag.toml`.
+See `docs/product-plan/README.md` for the full product intent and non-goals.
 
 ## Licensing
 

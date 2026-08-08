@@ -7,7 +7,7 @@
 
 ShellDeck (`github.com/benfavre/shelldeck`, MIT, owner-controlled) is an
 existing native Rust/GPUI desktop SSH/terminal client that already
-implements, against the pre-genesis assistant and the legacy Manage console,
+implements, against the legacy assistant and the legacy Manage console,
 working versions of several planned capabilities:
 
 - account login plus a browser device-authorization flow (localhost

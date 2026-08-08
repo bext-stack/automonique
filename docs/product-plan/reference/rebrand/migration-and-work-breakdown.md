@@ -1,8 +1,8 @@
 # Migration and work breakdown
 > **Superseded decision note:** the `GPL-3.0-or-later` licence recorded in this
-> document was superseded at genesis. The binding licence boundary is product
+> document was superseded. The binding licence boundary is product
 > `Elastic-2.0` with `sdk/` and `integrations/` under `Apache-2.0` (checked-in
-> `LICENSE-POLICY.md` and `GENESIS.md`). GPL statements below remain historical.
+> `LICENSE-POLICY.md`). GPL statements below remain historical.
 
 Work is ordered by dependency, not date. Repository creation/publication and production identity changes remain explicit owner-approved external actions.
 
@@ -133,7 +133,7 @@ Work is ordered by dependency, not date. Repository creation/publication and pro
 - **B3-06 Canonical command registry aliases for Slack/Telegram/CLI.**
 - **B3-07 Fresh-install Automonique paths, units and release layout.**
 - **B3-08 Machine-readable compatibility/deprecation manifest.**
-- **B3-09 Legacy-name CI gate:** scan source/generated/public artifacts and reject every undocumented pre-genesis legacy identifier occurrence.
+- **B3-09 Legacy-name CI gate:** scan source/generated/public artifacts and reject every undocumented legacy identifier occurrence.
 
 ### Runtime/state migration
 

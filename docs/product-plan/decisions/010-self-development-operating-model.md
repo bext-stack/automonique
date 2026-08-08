@@ -5,7 +5,7 @@
 
 ## Context
 
-Three days after genesis, zero product work items have merged. The spine
+Three days after first load, zero product work items have merged. The spine
 works — every defect this week was caught before damage — but throughput
 has not followed, for four reasons the journal makes measurable: a failed
 lineage discarded its verified work and re-authored from scratch; passes

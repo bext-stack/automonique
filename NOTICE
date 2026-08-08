@@ -8,5 +8,5 @@ declared in LICENSE-POLICY.md and their package metadata.
 Automonique names, logos, mascots, and brand assets are not licensed under the
 software licences. See TRADEMARKS.md.
 
-This clean genesis imports no implementation source or Git history from any
-pre-genesis repository.
+This repository imports no implementation source or Git history from any
+prior repository.
