@@ -6,7 +6,7 @@
 
 The rewrite uses a strangler approach. Production behavior remains owned by the existing daemon until each Rust boundary passes parity and failure tests. Avoid a branch that diverges for months; merge small compatibility increments continuously.
 
-The [Automonique rebrand and repository migration](rebrand/README.md) is a coordinated program, not an implicit phase of the rewrite. Its identity decisions and additive aliases land before public SDK/TUI releases; its service/path cutover waits for runtime compatibility evidence; and public-repository launch has its own legal/security gate. None requires deleting the private recovery repository.
+The Automonique identity and repository migration is a coordinated program, not an implicit phase of the rewrite. Its identity decisions and additive aliases land before public SDK/TUI releases; its service/path cutover waits for runtime compatibility evidence; and public-repository launch has its own legal/security gate. None requires deleting the private recovery repository.
 
 Implementation is driven through [Automonique's AI development harness](../requirements/ai-implementation-harness.md). Before broad code generation, the team freezes mechanical/security/state guidance, builds the minimal durable loop, trials three representative units and proves isolated authorship, two fresh-context adversarial reviews, bounded verification, commit attestations and restart/reload recovery. The harness accelerates the phases below; it does not change their exit gates or gain merge/deploy authority.
 
@@ -48,10 +48,10 @@ A toy old generation can start a persistent child unit, hand service readiness t
 
 ### Work
 
-- Create the private `bext-stack/automonique` staging repository through the rebrand B0/B1 gates; add GPL/provenance/governance files before importing product source.
+- Create the private `bext-stack/automonique` staging repository through the audited repository-creation gates; add GPL/provenance/governance files before importing product source.
 - Define SH0–SH6 policy, `bootstrap.toml`/schema, trusted builder/signer public identities, source/environment/build fingerprints and corresponding-source rules.
 - Implement the minimal `automonique-bootstrap` inspect/plan/apply/verify/resume/recovery path with no provider or production credentials.
-- Check in the finite `seed-program.yaml`, seed policy/guides/scenarios and explicit Claude/Codex/opencode/Jcode probes; default to one worker and no automatic Git commit/push.
+- Check in the bootstrap policy/guides/scenarios and explicit Claude/Codex/opencode/Jcode probes; default to one worker and no automatic Git commit/push.
 - Split stable development and digest-named candidate state, sockets, service identities, credential audiences, workspaces, artifacts, leases and outboxes.
 - Add source-state snapshot/revalidation, build deduplication, superseded-result handling, immutable candidate publication and smoke verification.
 - Implement the candidate lifecycle/evidence journal, self-development sessions and typed selfdev/background/evidence/promotion-proposal actions.
@@ -63,8 +63,6 @@ A toy old generation can start a persistent child unit, hand service readiness t
 ### Exit gate
 
 A clean host verifies the bootstrap manifest and creates a recoverable SH0 lab. SH0 builds an isolated candidate from an immutable source fingerprint; the candidate completes the self-host fixture, rebuilds and reloads without losing work; injected candidate failure returns to SH0; an independent builder produces authenticated comparison evidence; and the candidate has no route to stable/production credentials or promotion state.
-
-The first-run launcher must also prove plan-before-apply, exact confirmation, detach/resume/reboot recovery and one-way handoff. Repeating `start` after handoff attaches to the existing Rust lab rather than launching another seed coordinator.
 
 Broad autonomous implementation may begin after SH0 plus isolated build/review loops work. SH4 independent verification must pass before `automonique-lab` is trusted to develop its own security, promotion or bootstrap boundary.
 

@@ -5,7 +5,7 @@
 
 ## Context
 
-The legacy assistant is being rebranded to Automonique while the Rust architecture, TypeScript SDK, TUI and new channel connectors are being designed. A rename-only migration would either break deployed clients and durable state or leave public artifacts permanently fragmented between two identities.
+Automonique is the canonical product identity while the Rust architecture, TypeScript SDK, TUI and new channel connectors are being designed. Legacy assistant names remain compatibility surfaces.
 
 ## Decision
 
@@ -17,7 +17,6 @@ The legacy assistant is being rebranded to Automonique while the Rust architectu
 - Canonical configuration wins; a simultaneous conflicting legacy value fails closed with a diagnostic.
 - Legacy CLIs, SDK packages and commands forward to the same implementation and control socket. They may not launch a second daemon or maintain a divergent data store.
 - Protocol and schema changes use ordinary version negotiation and expand/migrate/contract releases. Branding alone never changes a durable identifier.
-- Public source moves through the audited new-upstream process in the [Automonique rebrand plan](../reference/rebrand/README.md); the private production repository remains a recovery source until cutover evidence is complete.
 - A compatibility surface can be removed only after telemetry and a documented release prove zero supported consumers for the stated deprecation window.
 
 ## Consequences

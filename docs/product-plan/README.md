@@ -41,7 +41,7 @@ superseded. `reference/corpus-index.md` is the former planning-tree index and
 carries the canonical-surface and licence notes.
 
 Documents tied to the former implementation were not copied as source. The
-migration, parity, rebrand and launcher documents now live under
+migration and parity documents now live under
 `reference/` as sanitized historical context; their durable design
 goals—recovery, exactly-once effects, generation handoff, isolated
 workspaces, self-hosting and independent verification—are restated here

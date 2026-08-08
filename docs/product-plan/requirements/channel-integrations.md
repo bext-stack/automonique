@@ -6,7 +6,7 @@ Automonique must be available where organizations already work without turning e
 
 They are the first implementations of the generic connector contract. Email/SMS, WhatsApp, Signal, Matrix, iMessage bridges, enterprise chat, device/notification, A2A/relay and media/meeting families are specified in the [Connector catalog](connector-catalog.md) and graduate independently through the same identity, receipt, artifact and revocation rules.
 
-`Automonique` is the target product name. Existing `legacy`, `legacy.*` and `@legacy/*` identifiers remain compatibility names until the rebrand migration assigns versioned replacements. Connectors negotiate protocol/capabilities and never depend on display names.
+`Automonique` is the target product name. Existing `legacy`, `legacy.*` and `@legacy/*` identifiers remain compatibility names. Connectors negotiate protocol/capabilities and never depend on display names.
 
 ## Architecture decision
 

@@ -25,38 +25,37 @@
 
 **Target host:** Linux with systemd 255, cgroup v2, SQLite WAL, Slack Socket Mode, Telegram long polling, optional public-HTTPS Teams/Discord connectors, and local agent CLIs.
 
-This directory is the planning source of truth for replacing the legacy Bun/TypeScript backend with the Automonique Rust daemon. Automonique is the canonical product and repository identity; legacy names remain compatibility identifiers until the additive migration in the [Automonique rebrand and repository plan](rebrand/README.md) is complete. The browser UI may remain TypeScript and be served as immutable assets by the Rust service.
+This directory is the planning source of truth for replacing the legacy Bun/TypeScript backend with the Automonique Rust daemon. Automonique is the canonical product and repository identity; legacy names remain compatibility identifiers. The browser UI may remain TypeScript and be served as immutable assets by the Rust service.
 
 The rewrite is justified here by the desired runtime model, not by throughput or development cost. Automonique should behave like Jcode's graceful server reload: a new generation becomes ready, adopts durable work, and takes ownership before the old generation exits.
 
 ## Documents
 
-1. [Automonique rebrand and repository plan](rebrand/README.md) defines the canonical identity, new-upstream strategy and additive compatibility migration. (Largely superseded by the clean-room repository; retained for legacy-daemon migration context.)
-2. [Goals and invariants](../requirements/goals-and-invariants.md) defines what “reload in place” means and which guarantees are non-negotiable.
-3. [Plan review findings](plan-review.md) records the gaps found after checking the installed agent integration surfaces.
-4. [Target architecture](../requirements/target-architecture.md) defines the Rust processes, systemd ownership, component boundaries, and release layout.
-5. [State and protocols](../requirements/state-and-protocols.md) defines the durable state model, generation leases, execution-host protocol, and compatibility rules.
-6. [Sandbox management](../requirements/sandbox-management.md) defines profiles, policy compilation, filesystem/network/process/credential enforcement, attestations and stronger-isolation gates.
-7. [Agent integrations](../requirements/agent-integrations.md) defines native Jcode, Claude Code, Codex and opencode session adapters and fallbacks.
-8. [Context, memory and learning](../requirements/context-memory-and-learning.md) defines deterministic context, compression, queue controls, typed memory, skills, profiles and the governed learning loop.
-9. [Tools, MCP, extensions and hooks](../requirements/tools-extensions-and-hooks.md) defines the canonical tool runtime, workflow RPC, MCP client/server, plugins, hooks and secret sources.
-10. [Automations, goals and triggers](../requirements/automation-goals-and-triggers.md) defines user schedules, script-only jobs, persistent goals, Kanban projection and signed inbound triggers.
-11. [Public agent protocols](../requirements/public-agent-protocols.md) defines ACP host, OpenAI-compatible, native Runs, MCP server, A2A, relay and local proxy surfaces.
-12. [Client experience and surfaces](../requirements/client-experience-and-surfaces.md) defines shared interaction semantics, CLI/TUI/web/desktop clients, themes/widgets and cross-platform lifecycle.
-13. [Models, media and execution backends](../requirements/models-media-and-execution.md) defines routing, credential pools, MoA, media/browser/computer use, LSP, remote execution and trajectory/evaluation systems.
-14. [Teams and Discord integrations](../requirements/channel-integrations.md) defines the first separately deployable TypeScript channel connectors, identity/tenancy, cards/components, permissions and rollout.
-15. [Connector catalog](../requirements/connector-catalog.md) extends that contract to the complete planned messaging, notification, meeting and relay catalog.
-16. [Current feature-parity ledger](feature-parity.md) accounts for every current product and operational surface, including companions, reconciliation and the isolated shell subsystem.
-17. [External capability coverage ledger](../requirements/external-capability-ledger.md) records exhaustive agent-platform capability coverage and the Automonique-specific adaptation or graduation track.
-18. [AI implementation harness and commit metrics](../requirements/ai-implementation-harness.md) defines the durable author-review-fix loops, worktree/build coordination, hill-climbing objectives and per-commit evidence used to implement the program.
-19. [Self-hosting and bootstrap](../requirements/self-hosting-and-bootstrap.md) defines the trusted seed, stable/candidate topology, self-build/reload cycle, independent rebuild and externally authorized promotion.
-20. [Operations and governance](../requirements/operations-and-governance.md) defines recovery, configuration, credentials, retention, scheduling, observability and safe-mode contracts.
-21. [TypeScript SDK](../requirements/typescript-sdk.md) defines complete typed client coverage, generated contracts, extension packages and testing utilities.
-22. [Automonique operator TUI](../requirements/operator-tui.md) defines the local terminal experience, control boundary and reload-safe interaction model.
-23. [Reload protocol](../requirements/reload-protocol.md) specifies the normal handoff and its failure paths.
-24. [Migration plan](migration-plan.md) gives the phased strangler migration from the current daemon and independently gated product expansions.
-25. [Verification and rollout](../requirements/verification-and-rollout.md) defines parity, chaos, security, provider-conformance and production gates.
-26. [Work breakdown](work-breakdown.md) turns the design into ordered implementation tickets.
+1. [Goals and invariants](../requirements/goals-and-invariants.md) defines what “reload in place” means and which guarantees are non-negotiable.
+2. [Plan review findings](plan-review.md) records the gaps found after checking the installed agent integration surfaces.
+3. [Target architecture](../requirements/target-architecture.md) defines the Rust processes, systemd ownership, component boundaries, and release layout.
+4. [State and protocols](../requirements/state-and-protocols.md) defines the durable state model, generation leases, execution-host protocol, and compatibility rules.
+5. [Sandbox management](../requirements/sandbox-management.md) defines profiles, policy compilation, filesystem/network/process/credential enforcement, attestations and stronger-isolation gates.
+6. [Agent integrations](../requirements/agent-integrations.md) defines native Jcode, Claude Code, Codex and opencode session adapters and fallbacks.
+7. [Context, memory and learning](../requirements/context-memory-and-learning.md) defines deterministic context, compression, queue controls, typed memory, skills, profiles and the governed learning loop.
+8. [Tools, MCP, extensions and hooks](../requirements/tools-extensions-and-hooks.md) defines the canonical tool runtime, workflow RPC, MCP client/server, plugins, hooks and secret sources.
+9. [Automations, goals and triggers](../requirements/automation-goals-and-triggers.md) defines user schedules, script-only jobs, persistent goals, Kanban projection and signed inbound triggers.
+10. [Public agent protocols](../requirements/public-agent-protocols.md) defines ACP host, OpenAI-compatible, native Runs, MCP server, A2A, relay and local proxy surfaces.
+11. [Client experience and surfaces](../requirements/client-experience-and-surfaces.md) defines shared interaction semantics, CLI/TUI/web/desktop clients, themes/widgets and cross-platform lifecycle.
+12. [Models, media and execution backends](../requirements/models-media-and-execution.md) defines routing, credential pools, MoA, media/browser/computer use, LSP, remote execution and trajectory/evaluation systems.
+13. [Teams and Discord integrations](../requirements/channel-integrations.md) defines the first separately deployable TypeScript channel connectors, identity/tenancy, cards/components, permissions and rollout.
+14. [Connector catalog](../requirements/connector-catalog.md) extends that contract to the complete planned messaging, notification, meeting and relay catalog.
+15. [Current feature-parity ledger](feature-parity.md) accounts for every current product and operational surface, including companions, reconciliation and the isolated shell subsystem.
+16. [External capability coverage ledger](../requirements/external-capability-ledger.md) records exhaustive agent-platform capability coverage and the Automonique-specific adaptation or graduation track.
+17. [AI implementation harness and commit metrics](../requirements/ai-implementation-harness.md) defines the durable author-review-fix loops, worktree/build coordination, hill-climbing objectives and per-commit evidence used to implement the program.
+18. [Self-hosting and bootstrap](../requirements/self-hosting-and-bootstrap.md) defines the trusted seed, stable/candidate topology, self-build/reload cycle, independent rebuild and externally authorized promotion.
+19. [Operations and governance](../requirements/operations-and-governance.md) defines recovery, configuration, credentials, retention, scheduling, observability and safe-mode contracts.
+20. [TypeScript SDK](../requirements/typescript-sdk.md) defines complete typed client coverage, generated contracts, extension packages and testing utilities.
+21. [Automonique operator TUI](../requirements/operator-tui.md) defines the local terminal experience, control boundary and reload-safe interaction model.
+22. [Reload protocol](../requirements/reload-protocol.md) specifies the normal handoff and its failure paths.
+23. [Migration plan](migration-plan.md) gives the phased strangler migration from the current daemon and independently gated product expansions.
+24. [Verification and rollout](../requirements/verification-and-rollout.md) defines parity, chaos, security, provider-conformance and production gates.
+25. [Work breakdown](work-breakdown.md) turns the design into ordered implementation tickets.
 
 Blocking decisions are recorded as accepted ADRs:
 
@@ -139,6 +138,5 @@ The rewrite is complete only when this scenario passes repeatedly:
 - Cross-host high availability in the first core rewrite release; remote/scale-to-zero execution is an independently gated expansion.
 - Changing Automonique's inherited approval policy, GitHub-as-ticket-truth policy, or worker persona as part of the language migration.
 - Replacing SQLite merely because the daemon is being rewritten.
-- Completing the public-repository or legal rebrand as a hidden prerequisite of the language rewrite; the two programs share compatibility gates but have separate release decisions.
 - Shipping every optional connector, media backend, desktop plugin, cloud executor or research export before core cutover; all remain planned and independently gated rather than silently omitted.
 - Claiming to eliminate trust in the operating system, compiler/toolchain, source host, dependency sources, model providers, independent builder or release authority; self-hosting makes these roots explicit rather than pretending they do not exist.

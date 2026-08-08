@@ -185,7 +185,6 @@ The suite must produce a reproducible seed and a final invariant report.
 - Reject conflicting canonical/legacy configuration and prove no secret value appears in the diagnostic.
 - Upgrade and roll back a copied legacy installation into Automonique without rewriting durable IDs, duplicating a service or losing an approval/session binding.
 - Rebuild the candidate public repository from its documented import procedure and require secret/history, license, provenance, binary-asset and private-coupling gates before visibility changes.
-- Verify the brand-kit asset inventory, source/license evidence and generated derivatives against the [rebrand verification matrix](../reference/rebrand/migration-and-work-breakdown.md#verification-matrix).
 
 ### 11. Teams and Discord connector verification
 
@@ -270,20 +269,6 @@ Teams fixtures cover personal/group/channel activities, Adaptive Cards, proactiv
 - Verify recursive improvement depth/concurrency/time/token/cost limits, unchanged/oscillating-evidence stop rules and mandatory external review for product/security/legal/metrics/privilege/release decisions.
 - Run current/previous bootstrap verifier and stable lab against the candidate schema/protocol; no self-host feature makes the only recovery controller unreadable.
 
-### 18. Initial development launcher verification
-
-- ShellCheck and Bats cover all commands/options, whitespace/metacharacter paths, exit codes, lock contention, signals and exact confirmation; redirected/non-TTY input never authorizes apply.
-- Fake tool/provider executables cover missing/incompatible versions, auth health, malformed/split/oversized events, timeout, cancellation, tagged resume and explicit fallback re-planning.
-- Clean, dirty, snapshotted, detached, wrong-remote, nested, worktree and source-changing repositories prove exact fingerprint and refusal/supersession behavior.
-- Inspect/plan is side-effect-free; apply permits only its unexpired digest and invalidates on source, policy, toolchain, provider or environment drift.
-- Scan argv, environment projection, plan, logs, systemd unit properties and evidence for secrets; prove no production database/token/config import.
-- Enforce one registered worktree/write lease, provider Git mutation denial, optional typed local commit only and absence of push/PR/merge/tag/release/deploy/repository-admin actions.
-- Kill/reboot the Bash caller, seed coordinator, provider, build and review workers at every durable boundary; resume neither loses completed evidence nor duplicates work.
-- Apply CPU/memory/PID/I/O/disk/token/cost/time limits, disk-pressure stop and complete descendant-cgroup cancellation without harming the host.
-- Complete the finite seed DAG with independent reviews, build SH0, verify lab readiness, atomically import program/evidence/lease and stop the seed coordinator.
-- Invoke `start` again after handoff and prove it attaches to the existing Rust lab. Fail the lab handoff and prove seed retains recoverable ownership without two active controllers.
-- Preview/execute cleanup against exact registered units/worktrees/state, preserving recovery/evidence and unrelated user/repository data.
-
 ## Observability required before rollout
 
 Expose these metrics/events:
@@ -346,7 +331,6 @@ A merge cannot ship when any of these fail:
 - canonical/legacy identity compatibility and clean public-source audit gates.
 - executable implementation-DAG completeness, harness policy/trial/reload tests and per-commit metrics-attestation verification.
 - clean-host bootstrap, stable/candidate isolation, self-build/reload/recovery, independent provenance/rebuild and promotion-authority conformance.
-- first-run launcher shell/provider/repository/security/recovery/handoff suite and finite seed-program completeness.
 
 ## Rollout stages
 

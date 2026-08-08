@@ -194,7 +194,6 @@
 - Bootstrap uses verified fixed artifacts and argument-vector recipes. It never treats an unsigned installer, mutable latest URL, password file or arbitrary shell string as authority.
 - An independently authenticated rebuild has no unexplained output, dependency, generated-source or behavior mismatch before promotion eligibility.
 - Recursive improvement is bounded by approved objectives, depth/concurrency/time/token/cost limits and external review for product, security, legal, metrics, privilege and production decisions.
-- The initial Bash/Bun launcher owns only a finite reviewed seed DAG, requires an exact plan confirmation, never pushes/merges/releases/deploys and transfers development ownership once to the verified Rust lab; repeated start attaches rather than duplicating control planes.
 
 ### Security
 

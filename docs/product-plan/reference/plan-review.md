@@ -117,7 +117,7 @@ A final cross-document review corrected the remaining contradictions and missing
 | Optional Teams/Discord rollout accidentally blocked core completion | Core cutover excludes disabled connectors; attached protocol incompatibility blocks reload, platform/credential outage is explicit degradation |
 | Connector processes were absent from the service topology | Add independently supervised Teams and Discord services with separate lifecycle and credentials |
 | Backup listed credential metadata but not a usable recovery path | Require encrypted ciphertext plus escrowed key or recoverable external-provider authentication, and prove descriptor resolution in restore drills |
-| Public-source, brand licensing and old-repository retirement were implicit | Give each an evidence gate; keep the private repository recoverable until cutover, never delete it as part of rebranding |
+| Public-source, brand licensing and old-repository retirement were implicit | Give each an evidence gate; keep the private repository recoverable until cutover, never delete it as part of repository migration |
 
 ## Ecosystem capability audit
 

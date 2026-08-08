@@ -120,34 +120,6 @@ source_path = "docs/rust-rewrite/plan-review.md"
 source_sha256 = "c5634ad0518dbe71ad5409b468697a7c192b71cc61411e62cc7174eab808a3be"
 
 [[document]]
-path = "reference/rebrand/README.md"
-sha256 = "628ffa4c21a710c72f715e0d2971d5814d9cfc9fbe947334c1ad5985787ff1b5"
-transfer = "sanitized"
-source_path = "docs/automonique-rebrand/README.md"
-source_sha256 = "b23a34c720c91ab8ddb34d9785058530e7c58983d022aea73727aa40de875086"
-
-[[document]]
-path = "reference/rebrand/compatibility-contract.md"
-sha256 = "0202c72fa4ddaf230f661b9e923febad783d285ed543dc11862dcd3f125ca4a2"
-transfer = "sanitized"
-source_path = "docs/automonique-rebrand/compatibility-contract.md"
-source_sha256 = "ded654443f227372bb822473a08175a99b71ed5247cb96ef4b05927889ac5cb3"
-
-[[document]]
-path = "reference/rebrand/migration-and-work-breakdown.md"
-sha256 = "363b2174dc2b78ba726263ee52ae9d44880344b8a2a936e5d788fd751d6bb464"
-transfer = "sanitized"
-source_path = "docs/automonique-rebrand/migration-and-work-breakdown.md"
-source_sha256 = "1821cd66b32d5af2c2001b96e8d2960cbfa9a0fd94e333ef49580a56a410b753"
-
-[[document]]
-path = "reference/rebrand/repository-strategy.md"
-sha256 = "c3b840d39938714a3fc29cca167fb64ce98bf78bbad82e73b993b241520b5b96"
-transfer = "sanitized"
-source_path = "docs/automonique-rebrand/repository-strategy.md"
-source_sha256 = "12bae5db8cf4527df4679dfaca637d8272628efdb8a3ef67b33608866cd0b20d"
-
-[[document]]
 path = "reference/work-breakdown.md"
 sha256 = "cdfebfbc71ee17192b54ad73b871561110a3981703bccb0683cf0c364cf2e787"
 transfer = "sanitized"
@@ -284,5 +256,5 @@ source_path = "authored during the staging gap review; no legacy source"
 [excluded]
 implementation = "all source, tests, scripts, generated artifacts and fixtures"
 migration = "former-name, parity, deployment and repository migration plans were transferred sanitized into reference/ as historical context, not primary requirements"
-superseded = "former licence texts, temporary launcher and host observations remain historical inside reference/"
+superseded = "former licence texts and host observations remain historical inside reference/"
 legacy_checkout = "name withheld; identical planning tree exists in bext-stack/automonique-archive-20260808"

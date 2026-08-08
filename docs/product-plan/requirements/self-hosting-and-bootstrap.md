@@ -10,7 +10,7 @@ The governing rule is:
 
 > A candidate may build and test itself, but it cannot be its own sole reviewer, provenance authority, release signer or production promoter.
 
-This document extends the [AI implementation harness](ai-implementation-harness.md), [reload protocol](reload-protocol.md), [release architecture](target-architecture.md) and [repository migration](../reference/rebrand/README.md).
+This document extends the [AI implementation harness](ai-implementation-harness.md), [reload protocol](reload-protocol.md) and [release architecture](target-architecture.md).
 
 ## Self-hosting levels
 

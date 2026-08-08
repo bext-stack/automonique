@@ -16,7 +16,7 @@ Each item should be a small reviewable issue/PR. IDs express dependency order, n
 - **R0-10 Baseline recovery drill:** take a consistent backup and restore it to a clean disposable host within initial RPO/RTO.
 - **R0-11 Shell decision fixture:** measure current interactive shell/file-transfer use and accept the isolated compatibility boundary or an explicit retirement decision.
 - **R0-12 Channel connector corpus:** fake/sanitized Teams Activities/Cards and Discord Interactions/Gateway/components plus manifest/permission fixtures with no live tenant/guild credentials.
-- **R0-13 Automonique identifier inventory:** classify every service, path, environment, protocol, package, command and external-platform legacy name as durable, compatibility-only or presentation-only; link each to the rebrand B-series work.
+- **R0-13 Automonique identifier inventory:** classify every service, path, environment, protocol, package, command and external-platform legacy name as durable, compatibility-only or presentation-only.
 - **R0-14 Sandbox host-capability spike:** record Landlock ABI, namespaces, cgroup controllers, systemd hardening, rootless routing and required privileged setup on the production kernel; choose rootless or minimal-launcher implementation per feature.
 - **R0-15 Provider/tool egress spike:** prove provider-control connectivity can be separated from tool, MCP, browser and extension egress for every native/fallback provider mode; reject incompatible profile/mode combinations.
 - **R0-16 External capability baseline:** turn `external-capability-ledger.md` into a machine-readable ledger keyed to capability, specification, track, owner, ticket and fixture; schedule periodic ecosystem capability review without product-comparison names in public plans.
@@ -357,7 +357,7 @@ Each item should be a small reviewable issue/PR. IDs express dependency order, n
 - **R10-16 Parity closure:** machine-readable ledger has evidence for every preserve/replace/isolate/retire decision and no unexplained item.
 - **R10-17 Cost/observability acceptance:** end-to-end traces, SLO alerts, budget/anomaly telemetry and why/explainability records under production-like load.
 - **R10-18 Channel connector acceptance:** enabled Teams/Discord installations pass `channel-integrations.md`, expose current data boundaries and have independent rollback/disable controls.
-- **R10-19 Automonique runtime cutover:** canonical and legacy entry points reach one service/state owner, copied-install upgrade/rollback passes, and the B4 rebrand migration evidence is complete.
+- **R10-19 Automonique runtime cutover:** canonical and legacy entry points reach one service/state owner, and copied-install upgrade/rollback passes.
 - **R10-20 Sandbox acceptance:** required profiles pass production-kernel escape/resource/egress/cleanup tests, provider modes publish exact profile support, runbooks/alerts are exercised and unsupported stronger-isolation work fails closed.
 - **R10-21 Core platform acceptance:** context/queue/compression/checkpoints, memory/FTS, skills/learning, tools/MCP, profiles, goals/automations/triggers and their complete SDK services pass reload, policy, redaction and rollback gates.
 
@@ -464,7 +464,6 @@ R4 event/artifact schemas + R8B SDK -> R15 batch/evaluation/ecosystem tracks
 
 R0-17..R0-22 harness foundation -> every implementation epic; each epic feeds failure and metric evidence back into the harness
 R0-23..R0-40 self-host foundation -> candidate-driven implementation; SH4 independently verified before self-modification of bootstrap/security/promotion boundaries
-R0-41..R0-50 first-run launcher -> SH0 seed -> permanent Rust lab; seed coordinator cannot schedule work beyond its finite DAG
 
 R8B connector SDK -> R8F optional Teams/Discord connectors -> R8G independent channel canaries
 

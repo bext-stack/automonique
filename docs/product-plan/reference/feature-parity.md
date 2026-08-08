@@ -63,7 +63,7 @@ Status values:
 | Manage/Factory helper | fleet/integration service | Preserve supported API boundary and remove worker possession of factory credentials |
 | Codex/worker guard hooks and sandbox launcher | versioned sandbox profiles/attestation plus runner policy bundle | Strengthen before native adapter cutover; Landlock, namespaces, cgroups, resource limits and provider/tool egress separation fail closed |
 | Dashboard live tickets, approvals, history, ignored messages, settings, memory and targets | SDK-backed dashboard | Preserve service-by-service with a zero-private-route gate |
-| Live Slack channel feed and legacy “post as the assistant” behavior | transport service rendered as Automonique/Monique after rebrand | Preserve with read/post capabilities separated and fully audited |
+| Live Slack channel feed and legacy “post as the assistant” behavior | transport service rendered as Automonique/Monique | Preserve with read/post capabilities separated and fully audited |
 | Browser desktop notifications | SDK/dashboard notification service | Preserve permission UX and server-side notification state |
 | Force ignored message into a ticket | intake/workflow service | Preserve exact original source identity and a fresh approval gate |
 | Delete ignored/user-authored Slack message | critical Slack moderation workflow | Preserve only as explicit separately authorized action; never bundle with ordinary cleanup |
@@ -102,13 +102,12 @@ New platform capabilities do not block replacement of existing legacy behavior, 
 - the complete connector catalog, identity/directory functions, attachments, meetings and proactive delivery;
 - model routing and pools, multi-model aggregation, media/voice/vision, browser/computer use, LSP, portable executors, batch trajectories and evaluation.
 - the SH0–SH6 bootstrap/self-hosting cycle, including stable/candidate isolation, candidate self-build/reload, independent provenance and external promotion.
-- the one-command initial development launcher, finite seed program and verified handoff/retirement path into the permanent Rust lab.
 
 Every row has one terminal disposition: core, independently gated optional capability, adapted replacement, or explicit rejection with owner and rationale. A label such as “plugin support” or “API compatibility” cannot close a row without protocol, safety and acceptance evidence.
 
 ## Product identity and legacy compatibility
 
-The Automonique rebrand is additive product migration, not permission to break current behavior. Current legacy service, command, environment, path, SDK and protocol surfaces are classified under [ADR 006](../decisions/006-automonique-naming.md):
+Automonique identity is additive product naming, not permission to break current behavior. Current legacy service, command, environment, path, SDK and protocol surfaces are classified under [ADR 006](../decisions/006-automonique-naming.md):
 
 - canonical Automonique and supported legacy entry points reach one implementation, state store and authorization policy;
 - Slack/Telegram commands and aliases retain deterministic command IDs, approval revisions and reply/follow-up context;
