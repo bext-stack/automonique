@@ -71,7 +71,7 @@ was transferred sanitized later the same day (see `provenance.toml`).
 ## Reading order for workers
 
 1. checked-in repository policy, governance and bootstrap contracts;
-2. `README.md` (precedence), `architecture.md`, `self-development.md`,
+2. `README.md` (precedence), `architecture.md`,
    `work-dag.toml`;
 3. the primary requirement docs listed above;
 4. `reference/` material only for legacy-compatibility context, never as a

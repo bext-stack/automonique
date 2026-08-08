@@ -10,7 +10,7 @@ When documents disagree, use this order and stop on an unresolved conflict:
 
 1. repository licensing, governance, security, provenance and agent policy;
 2. `.automonique/bootstrap/` and `policy/bootstrap*.toml`;
-3. this file, `architecture.md`, `self-development.md` and the checked work
+3. this file, `architecture.md` and the checked work
    DAG;
 4. product requirements and the capability ledger in `requirements/`;
 5. historical context in `reference/` and `crosswalk.md`.
