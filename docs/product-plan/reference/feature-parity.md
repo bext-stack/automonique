@@ -107,7 +107,7 @@ Every row has one terminal disposition: core, independently gated optional capab
 
 ## Product identity and legacy compatibility
 
-Automonique identity is additive product naming, not permission to break current behavior. Current legacy service, command, environment, path, SDK and protocol surfaces are classified under [ADR 006](../decisions/006-automonique-naming.md):
+Automonique identity is additive product naming, not permission to break current behavior. Current legacy service, command, environment, path, SDK and protocol surfaces are classified as compatibility surfaces:
 
 - canonical Automonique and supported legacy entry points reach one implementation, state store and authorization policy;
 - Slack/Telegram commands and aliases retain deterministic command IDs, approval revisions and reply/follow-up context;

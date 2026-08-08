@@ -57,15 +57,7 @@ The rewrite is justified here by the desired runtime model, not by throughput or
 24. [Verification and rollout](../requirements/verification-and-rollout.md) defines parity, chaos, security, provider-conformance and production gates.
 25. [Work breakdown](work-breakdown.md) turns the design into ordered implementation tickets.
 
-Blocking decisions are recorded as accepted ADRs:
-
-- [ADR 001: execution-host and session lifetime](../decisions/001-execution-host-lifecycle.md)
-- [ADR 002: domain-event and action journal](../decisions/002-domain-event-and-action-journal.md)
-- [ADR 003: workspace registry and isolation](../decisions/003-workspace-isolation.md)
-- [ADR 004: identity, tenancy and authorization](../decisions/004-identity-and-authorization.md)
-- [ADR 005: artifacts and attachments](../decisions/005-artifact-storage.md)
-- [ADR 006: Automonique naming and legacy compatibility](../decisions/006-automonique-naming.md)
-- [ADR 007: layered sandbox enforcement and profiles](../decisions/007-sandbox-enforcement.md)
+Blocking design decisions are recorded directly in the requirement documents and the work-DAG crosswalk (`crosswalk.md`).
 
 ## Directional decisions
 

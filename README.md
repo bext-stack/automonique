@@ -23,7 +23,6 @@ The authoritative product specification lives under `docs/product-plan/`:
 - `docs/product-plan/architecture.md` — target architecture;
 - `docs/product-plan/requirements/` — capability and non-functional
   requirements;
-- `docs/product-plan/decisions/` — accepted design decisions (ADRs);
 - `docs/product-plan/work-dag.toml` — the checked work DAG that drives
   implementation.
 

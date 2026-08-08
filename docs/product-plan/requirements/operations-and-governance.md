@@ -46,7 +46,7 @@ Prefer systemd credentials, protected descriptors or a host secret provider over
 
 Provider executables and companions are selected from immutable content-addressed release paths. Verification and execution use the same inode/descriptor or an immutable directory so a path replacement cannot defeat the recorded digest.
 
-Canonical `AUTOMONIQUE_*` configuration is resolved before legacy `LEGACY_*` fallback. Conflicting simultaneous values fail closed and are recorded without logging either secret; see [ADR 006](../decisions/006-automonique-naming.md).
+Canonical `AUTOMONIQUE_*` configuration is resolved before legacy `LEGACY_*` fallback. Conflicting simultaneous values fail closed and are recorded without logging either secret.
 
 Teams app secrets/certificates, Entra/Graph credentials, Discord bot tokens, interaction secrets and webhook URLs follow the same descriptor/rotation model. Each credential is bound to a connector installation and tenant; connector processes cannot read provider, workspace, Slack/Telegram or root-broker credentials. Rotation rehearsals cover overlapping app credentials and revocation while outstanding card/component actions remain pending.
 

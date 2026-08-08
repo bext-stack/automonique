@@ -1,6 +1,6 @@
 # Target architecture
 
-Target diagrams use Automonique names. Version-1 legacy identifiers appear only in explicitly labelled compatibility notes and the machine-readable inventory defined by [ADR 006](../decisions/006-automonique-naming.md); aliases must resolve to one runtime owner, never two services.
+Target diagrams use Automonique names. Version-1 legacy identifiers appear only in explicitly labelled compatibility notes and the machine-readable inventory; aliases must resolve to one runtime owner, never two services.
 
 ## Process model
 
@@ -33,7 +33,7 @@ root-owned
 
 The preferred first design is a self-handoff daemon inside `automonique.service`, using systemd 255 notification support. A Phase 0 spike must prove `MAINPID` transfer, `Type=notify-reload`, failure recovery, and old-process drain on this host. If systemd semantics prove too fragile, use a tiny credential-free Rust launcher as the stable parent; the application and execution-host protocols remain unchanged.
 
-Execution hosts run as separate transient user units. A full daemon restart or failed generation must not kill their cgroups. Session-scoped `automonique-agent-*` hosts may execute multiple serialized turns and retire after a configured idle TTL; attempt-scoped `automonique-run-*` hosts terminate with one attempt. systemd owns descendant cleanup and resource accounting; the Rust host owns protocol, sandbox, spool and provider child. [ADR 001](../decisions/001-execution-host-lifecycle.md) defines the lifetime boundary.
+Execution hosts run as separate transient user units. A full daemon restart or failed generation must not kill their cgroups. Session-scoped `automonique-agent-*` hosts may execute multiple serialized turns and retire after a configured idle TTL; attempt-scoped `automonique-run-*` hosts terminate with one attempt. systemd owns descendant cleanup and resource accounting; the Rust host owns protocol, sandbox, spool and provider child.
 
 `automonique-admin.socket` is owned by systemd (or the selected stable launcher), not an application generation. It queues new connections during handoff and passes accepted descriptors only to the active generation, eliminating an unlink/rebind race. Upgraded installations may retain a `legacy-admin.socket` forwarding alias during the declared compatibility window, but both names resolve to the same socket owner.
 

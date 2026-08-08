@@ -378,7 +378,7 @@ Teams and Discord then graduate independently through notification-only, persona
 
 ### Stage H — compatibility removal
 
-Remove obsolete Bun backend paths only after rollback support no longer requires them. Legacy names/tables remain until ADR 006 telemetry and deprecation gates independently authorize contraction; branding is not deletion authority.
+Remove obsolete Bun backend paths only after rollback support no longer requires them. Legacy names/tables remain until the telemetry and deprecation gates independently authorize contraction; branding is not deletion authority.
 
 ### Stage I — independent ecosystem graduation
 

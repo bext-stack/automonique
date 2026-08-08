@@ -4,7 +4,7 @@
 
 Automonique needs a first-class terminal interface for daily operation, not merely CLI subcommands or a tmux pane. The TUI is a local operator client over the durable control and event protocols. It presents the same state and performs the same typed actions as the web dashboard without owning business logic, reading SQLite directly, or connecting to agent providers.
 
-The target executable is `automonique-tui`, with `automoniquectl tui` as a convenience launcher. `legacy-tui` and `legacyctl tui` forward to the same client during the compatibility window defined by [ADR 006](../decisions/006-automonique-naming.md). It is shipped in every Rust release and works comfortably through SSH in an ordinary terminal.
+The target executable is `automonique-tui`, with `automoniquectl tui` as a convenience launcher. `legacy-tui` and `legacyctl tui` forward to the same client during the declared compatibility window. It is shipped in every Rust release and works comfortably through SSH in an ordinary terminal.
 
 ## Boundary and trust model
 

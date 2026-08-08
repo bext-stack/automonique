@@ -262,7 +262,7 @@ Every connection starts with client/server protocol negotiation containing:
 - authorized capability set and resource limits;
 - deprecations and minimum compatible SDK when applicable.
 
-The SDK must tolerate additive response/event fields and unknown read-only event variants. It refuses a mutation when its exact request schema/capability is not negotiated. Deprecated APIs remain through a documented window and emit development-time warnings without leaking data in production logs. Canonical and legacy packages negotiate identically and pass the same conformance suite; see [ADR 006](../decisions/006-automonique-naming.md).
+The SDK must tolerate additive response/event fields and unknown read-only event variants. It refuses a mutation when its exact request schema/capability is not negotiated. Deprecated APIs remain through a documented window and emit development-time warnings without leaking data in production logs. Canonical and legacy packages negotiate identically and pass the same conformance suite.
 
 SDK semantic version and Automonique application version are independent. A compatibility table and machine-readable manifest identify supported combinations. Adjacent Automonique releases must accept the SDK shipped with either release during generation overlap.
 

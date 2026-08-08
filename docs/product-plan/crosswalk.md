@@ -8,18 +8,18 @@ was transferred sanitized later the same day (see `provenance.toml`).
 | Work ID | Title (abridged) | Primary spec documents |
 |---------|------------------|------------------------|
 | BOOT-001 | Idempotent bootstrap, durable supervisor | `../bootstrap/BOOT-001.md`, requirements/self-hosting-and-bootstrap.md, requirements/ai-implementation-harness.md |
-| BOOT-002 | Sandboxed worktree, path lease, Git broker | requirements/sandbox-management.md, decisions/003-workspace-isolation.md, requirements/target-architecture.md |
+| BOOT-002 | Sandboxed worktree, path lease, Git broker | requirements/sandbox-management.md, requirements/target-architecture.md |
 | BOOT-003 | Author adapter with durable provider records | requirements/agent-integrations.md, requirements/models-media-and-execution.md *(initial transfer)* |
 | BOOT-004 | Independent reviewer/fixer/build evidence loop | requirements/ai-implementation-harness.md, requirements/verification-and-rollout.md |
 | BOOT-005 | Publication and exactly-once merger broker | requirements/operations-and-governance.md, reference/work-breakdown.md (see note below) |
 | BOOT-006 | Signed self-update, generation health, rollback | requirements/reload-protocol.md, requirements/self-hosting-and-bootstrap.md |
 | BOOT-007 | Fault-injected autonomous development proof | requirements/self-hosting-and-bootstrap.md, requirements/verification-and-rollout.md |
-| CORE-001 | Identities, revisions, authorization | decisions/004-identity-and-authorization.md *(initial transfer)*, requirements/state-and-protocols.md |
-| CORE-002 | Event journal, action receipts, fenced leases | decisions/002-domain-event-and-action-journal.md, requirements/state-and-protocols.md |
-| CORE-003 | Content-addressed artifacts, retention | decisions/005-artifact-storage.md *(initial transfer)*, requirements/state-and-protocols.md |
-| EXEC-001 | Execution hosts, sandbox attestations, provider protocol | decisions/001-execution-host-lifecycle.md, requirements/target-architecture.md, requirements/sandbox-management.md, requirements/agent-integrations.md |
+| CORE-001 | Identities, revisions, authorization | requirements/state-and-protocols.md |
+| CORE-002 | Event journal, action receipts, fenced leases | requirements/state-and-protocols.md |
+| CORE-003 | Content-addressed artifacts, retention | requirements/state-and-protocols.md |
+| EXEC-001 | Execution hosts, sandbox attestations, provider protocol | requirements/target-architecture.md, requirements/sandbox-management.md, requirements/agent-integrations.md |
 | EXEC-002 | Durable work graphs, attempts, budgets, cancellation | requirements/state-and-protocols.md, reference/work-breakdown.md |
-| EXEC-003 | Workspace registry, snapshot, integration contracts | decisions/003-workspace-isolation.md, requirements/state-and-protocols.md |
+| EXEC-003 | Workspace registry, snapshot, integration contracts | requirements/state-and-protocols.md |
 | PROVIDER-001 | Provider capability catalog, sessions, reconnect | requirements/agent-integrations.md, requirements/models-media-and-execution.md *(initial transfer)* |
 | CONTROL-001 | Authenticated local API, generated schemas | requirements/target-architecture.md, requirements/typescript-sdk.md |
 | CONTROL-002 | CLI, doctor, reconciliation, operator recovery | requirements/operations-and-governance.md, requirements/client-experience-and-surfaces.md |
@@ -73,7 +73,6 @@ was transferred sanitized later the same day (see `provenance.toml`).
 1. checked-in repository policy, governance and bootstrap contracts;
 2. `README.md` (precedence), `architecture.md`, `self-development.md`,
    `work-dag.toml`;
-3. the accepted ADR(s) listed for the work ID;
-4. the primary requirement docs listed above;
-5. `reference/` material only for legacy-compatibility context, never as a
+3. the primary requirement docs listed above;
+4. `reference/` material only for legacy-compatibility context, never as a
    source of new product requirements.

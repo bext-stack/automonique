@@ -12,9 +12,8 @@ When documents disagree, use this order and stop on an unresolved conflict:
 2. `.automonique/bootstrap/` and `policy/bootstrap*.toml`;
 3. this file, `architecture.md`, `self-development.md` and the checked work
    DAG;
-4. accepted decisions in `decisions/`;
-5. product requirements and the capability ledger in `requirements/`;
-6. historical context in `reference/` and `crosswalk.md`.
+4. product requirements and the capability ledger in `requirements/`;
+5. historical context in `reference/` and `crosswalk.md`.
 
 No requirement can grant itself authority that a higher layer withholds.
 `reference/` material describes the prior product and migration; it is

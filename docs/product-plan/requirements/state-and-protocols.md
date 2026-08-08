@@ -1,6 +1,6 @@
 # State and protocols
 
-The physical `legacy_*` tables and `legacy.*` protocol names below are the version-1 compatibility surface. Fresh public names move to Automonique only through the additive rules in [ADR 006](../decisions/006-automonique-naming.md); durable IDs are never rewritten merely for branding.
+The physical `legacy_*` tables and `legacy.*` protocol names below are the version-1 compatibility surface. Fresh public names move to Automonique only through the additive naming rules; durable IDs are never rewritten merely for branding.
 
 ## Versioning rules
 
@@ -238,7 +238,7 @@ Store bounded raw provider records in `legacy_provider_records`, keyed by host, 
 
 ### Identity, approvals and controller leases
 
-The durable authorization model follows [ADR 004](../decisions/004-identity-and-authorization.md): actors are tenant-scoped principals; external Slack, Telegram, GitHub, Support and SDK identities are mapped explicitly; role grants and policy revisions are queryable historical records.
+The durable authorization model follows the identity design: actors are tenant-scoped principals; external Slack, Telegram, GitHub, Support and SDK identities are mapped explicitly; role grants and policy revisions are queryable historical records.
 
 `legacy_approvals` stores the immutable proposal/action revision, tenant, requesting actor, eligible approver policy, decision actor, transport evidence, expiry and terminal decision. Outer work approvals and provider permission approvals use distinct kinds.
 
@@ -246,15 +246,15 @@ The durable authorization model follows [ADR 004](../decisions/004-identity-and-
 
 ### Domain events and action receipts
 
-[ADR 002](../decisions/002-domain-event-and-action-journal.md) defines the global `legacy_domain_events` and `legacy_action_receipts` tables. Every authoritative state transition and accepted mutation commits its journal row in the same transaction. Event IDs, aggregate revisions and action idempotency keys are globally resumable; transport offsets and provider cursors remain separate source checkpoints.
+The global `legacy_domain_events` and `legacy_action_receipts` tables define the journal contract. Every authoritative state transition and accepted mutation commits its journal row in the same transaction. Event IDs, aggregate revisions and action idempotency keys are globally resumable; transport offsets and provider cursors remain separate source checkpoints.
 
 Consumer cursors are durable by consumer identity and topic. A client outside the retained range receives `resync_required` and a bounded snapshot operation. Replay may rebuild projections or explain history but never drains outboxes or repeats effects.
 
 ### Workspaces, artifacts and configuration
 
-`legacy_workspaces` registers tenant, canonical source, immutable base revision/snapshot, isolation kind, writable path token, lock state and lifecycle. A run references one workspace revision; host paths are never accepted directly from API clients. See [ADR 003](../decisions/003-workspace-isolation.md).
+`legacy_workspaces` registers tenant, canonical source, immutable base revision/snapshot, isolation kind, writable path token, lock state and lifecycle. A run references one workspace revision; host paths are never accepted directly from API clients.
 
-`legacy_artifacts` records content digest, size, media type, tenant, creator, provenance, visibility, retention class, encryption/key reference and storage locator. `legacy_artifact_links` binds artifacts to inputs, work, runs, turns, approvals and publications. See [ADR 005](../decisions/005-artifact-storage.md).
+`legacy_artifacts` records content digest, size, media type, tenant, creator, provenance, visibility, retention class, encryption/key reference and storage locator. `legacy_artifact_links` binds artifacts to inputs, work, runs, turns, approvals and publications.
 
 `legacy_settings_revisions` stores validated non-secret configuration snapshots. Secret fields contain only credential descriptors and versions. `legacy_transport_offsets`, `legacy_reload_epochs`, `legacy_audit_events`, `legacy_notifications` and `legacy_raw_provider_records` have explicit schemas and retention policies rather than being hidden JSON in unrelated rows.
 

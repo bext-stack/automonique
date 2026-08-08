@@ -82,13 +82,13 @@ The detailed answers and adapter contracts live in [Agent integrations](../requi
 
 ## Whole-system review additions
 
-A second review stepped back from provider integration and found five architecture blockers plus several product/operations omissions. The accepted decisions are:
+A second review stepped back from provider integration and found five architecture blockers plus several product/operations omissions. The accepted design positions are:
 
-1. [Execution-host and session lifetime](../decisions/001-execution-host-lifecycle.md): work items, attempts, execution hosts, provider sessions and turns are separate lifecycles.
-2. [Domain-event and action journal](../decisions/002-domain-event-and-action-journal.md): authoritative state, resumable events and mutation receipts are transactionally linked.
-3. [Workspace registry and isolation](../decisions/003-workspace-isolation.md): every mutating attempt gets an isolated immutable-base worktree/snapshot and explicit promotion.
-4. [Identity, tenancy and authorization](../decisions/004-identity-and-authorization.md): transport IDs resolve to durable tenant-scoped actors/roles and revisioned policy decisions.
-5. [Artifacts and attachments](../decisions/005-artifact-storage.md): files, patches, logs and publications are content-addressed objects with provenance and retention.
+1. **Execution-host and session lifetime:** work items, attempts, execution hosts, provider sessions and turns are separate lifecycles.
+2. **Domain-event and action journal:** authoritative state, resumable events and mutation receipts are transactionally linked.
+3. **Workspace registry and isolation:** every mutating attempt gets an isolated immutable-base worktree/snapshot and explicit promotion.
+4. **Identity, tenancy and authorization:** transport IDs resolve to durable tenant-scoped actors/roles and revisioned policy decisions.
+5. **Artifacts and attachments:** files, patches, logs and publications are content-addressed objects with provenance and retention.
 
 The review also added:
 
@@ -109,9 +109,9 @@ A final cross-document review corrected the remaining contradictions and missing
 
 | Gap | Correction now owned by the plans |
 |---|---|
-| Rebrand mentioned without a repository/runtime migration | Added the dedicated Automonique plan and ADR 006: new audited upstream, additive aliases, one runtime/state owner and no branding-driven ID rewrite |
+| Rebrand mentioned without a repository/runtime migration | Added the dedicated Automonique identity plan: new audited upstream, additive aliases, one runtime/state owner and no branding-driven ID rewrite |
 | Inbox transport state mixed with approval/queue state | Inbox now ends at routing; work items own approval, capacity, queue and execution lifecycle |
-| Run schema required a host although ADR 001 permits zero before launch | `host_id` is optional until the atomic start transition and host identity carries tenant/account/workspace/boot context |
+| Run schema required a host although the lifetime design permits zero before launch | `host_id` is optional until the atomic start transition and host identity carries tenant/account/workspace/boot context |
 | Shared Jcode daemon could execute outside the host sandbox | Require security-context attestation and descendant-boundary tests, otherwise use a per-context daemon |
 | SDK package namespace was split between legacy and Automonique | Canonicalize every public package under `@automonique/sdk*`; supported `@legacy` names are forwarding-only |
 | Optional Teams/Discord rollout accidentally blocked core completion | Core cutover excludes disabled connectors; attached protocol incompatibility blocks reload, platform/credential outage is explicit degradation |

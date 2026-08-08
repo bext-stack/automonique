@@ -15,7 +15,7 @@ Implementation is driven through [Automonique's AI development harness](../requi
 ### Work
 
 - Inventory every current inbound event, durable table, external mutation, timer, agent event dialect, and operator command.
-- Inventory every legacy identifier across services, paths, environment, protocols, packages and external platforms; classify each as durable, compatibility-only or presentation-only under ADR 006.
+- Inventory every legacy identifier across services, paths, environment, protocols, packages and external platforms; classify each as durable, compatibility-only or presentation-only.
 - Complete the machine-readable [feature-parity ledger](feature-parity.md), including Inklura tenant fencing, internal/client publication, companions, learned targets, audits, notifications, operational commands, deploy webhook and ignored-message behavior.
 - Complete the neutral [external capability coverage ledger](../requirements/external-capability-ledger.md) with track, specification, owner, ticket, fixture and security/data-boundary classification for every row.
 - Generate the executable development DAG from this plan, define porting/state/security/naming guides and baseline the commit metrics contract.

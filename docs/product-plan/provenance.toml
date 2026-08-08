@@ -9,8 +9,7 @@ licence_class = "Elastic-2.0"
 transferred_at = "2026-08-05T10:04:47Z"
 
 # Amended documents: sha256 pins the current owner-approved content;
-# transferred_sha256 preserves the as-transferred hash; amended_per names
-# the accepted decision that authorized the amendment.
+# transferred_sha256 preserves the as-transferred hash.
 
 [[document]]
 path = "requirements/automation-goals-and-triggers.md"
@@ -28,7 +27,6 @@ sha256 = "d6ebff02d498e3252dcc67fac956f54f0d71b84991fbfacd1bf508178df4b4e0"
 transfer = "byte-for-byte"
 transferred_sha256 = "6683d41ced799a63b62f18d9f5ea358871a61900394f58ce423c427c09137a73"
 amended_at = "2026-08-06"
-amended_per = "decisions/008-shelldeck-reuse.md"
 
 [[document]]
 path = "requirements/models-media-and-execution.md"
@@ -38,21 +36,6 @@ transfer = "byte-for-byte"
 [[document]]
 path = "requirements/public-agent-protocols.md"
 sha256 = "b82e2a0c4ac5486fa076d676541a2442b9bb5dd3682a6884c05c5b83ddc3ecb9"
-transfer = "byte-for-byte"
-
-[[document]]
-path = "decisions/004-identity-and-authorization.md"
-sha256 = "79ebf42a475739c059710710cd9dd5700698654f1b95bb610e47fc03b76139fa"
-transfer = "byte-for-byte"
-
-[[document]]
-path = "decisions/005-artifact-storage.md"
-sha256 = "e419943c0f86356353f5e3c4687e3cab54d4fb85afbc7388a73e0ea7ea97d93d"
-transfer = "byte-for-byte"
-
-[[document]]
-path = "decisions/007-sandbox-enforcement.md"
-sha256 = "00e63244a4e4dd7b073fba3d00088965344e651e4a1c2d4f475aa2d83978e198"
 transfer = "byte-for-byte"
 
 
@@ -69,34 +52,6 @@ sha256 = "d0d1f69847334f000d0c0c0c6e754e9ee4f1636565e149cbccd8d6920ca5858f"
 transfer = "sanitized"
 source_path = "docs/rust-rewrite/README.md"
 source_sha256 = "74584983a3d673762f92118494247af6b6e849de7b0834e299d775cf094364a1"
-
-[[document]]
-path = "decisions/001-execution-host-lifecycle.md"
-sha256 = "b3bf8744313db05480e45216fa27f482a5943354d8e87c8fa36ef2871e32751e"
-transfer = "byte-for-byte"
-source_path = "docs/rust-rewrite/decisions/001-execution-host-lifecycle.md"
-source_sha256 = "b3bf8744313db05480e45216fa27f482a5943354d8e87c8fa36ef2871e32751e"
-
-[[document]]
-path = "decisions/002-domain-event-and-action-journal.md"
-sha256 = "f7667794ba060c22d3baf97ef391ccee3d0046703c5ebdd605d4d8f380ae159d"
-transfer = "sanitized"
-source_path = "docs/rust-rewrite/decisions/002-domain-event-and-action-journal.md"
-source_sha256 = "0180c2cd62c54e1b4db1ef125ebc1c5ee524f8e01df2fcc3bf3c104a9a319957"
-
-[[document]]
-path = "decisions/003-workspace-isolation.md"
-sha256 = "0c26ada35473f1b435a11b54d207eec8165c44c100fed0484ed33f920046bb9d"
-transfer = "byte-for-byte"
-source_path = "docs/rust-rewrite/decisions/003-workspace-isolation.md"
-source_sha256 = "0c26ada35473f1b435a11b54d207eec8165c44c100fed0484ed33f920046bb9d"
-
-[[document]]
-path = "decisions/006-automonique-naming.md"
-sha256 = "0a3f895824055b32a837962704dc0513ec45458984ce9faf007232ed997dfb13"
-transfer = "sanitized"
-source_path = "docs/rust-rewrite/decisions/006-automonique-naming.md"
-source_sha256 = "65c0264d056609d4170bd2757e845779f863acb5467c95ac3d3fa809464840b8"
 
 [[document]]
 path = "reference/feature-parity.md"
@@ -155,7 +110,6 @@ source_path = "docs/rust-rewrite/client-experience-and-surfaces.md"
 source_sha256 = "1ede6bb6d41ec0d023854bec912d2e85a73387c3353469117b50d96ba53d935f"
 transferred_sha256 = "e9b5ebcb8d19dadc8967cb04b6eb8c05a2187b6958f69b67ffb404c16c42ec67"
 amended_at = "2026-08-06"
-amended_per = "decisions/008-shelldeck-reuse.md"
 
 [[document]]
 path = "requirements/connector-catalog.md"
@@ -221,7 +175,6 @@ source_path = "docs/rust-rewrite/target-architecture.md"
 source_sha256 = "acf6f0f7950a3346d263cf7418aee8f70cca552f42d050aaeaba4b9c7ac5134b"
 transferred_sha256 = "ae8c5f27020b39a5e6c44375f45898fa44dc6ebb01eb441ca2a6be923e6ed641"
 amended_at = "2026-08-06"
-amended_per = "decisions/008-shelldeck-reuse.md"
 
 [[document]]
 path = "requirements/tools-extensions-and-hooks.md"
@@ -238,7 +191,6 @@ source_path = "docs/rust-rewrite/typescript-sdk.md"
 source_sha256 = "b0035cb4297df4e3146b32694f720c95e81bd9567de0094bec55b5bbe49d79e3"
 transferred_sha256 = "e356c7470ac72886062b4bed7b896146f50c10ad7f9a8bf2f4124f656c2f259c"
 amended_at = "2026-08-06"
-amended_per = "decisions/008-shelldeck-reuse.md"
 
 [[document]]
 path = "requirements/verification-and-rollout.md"

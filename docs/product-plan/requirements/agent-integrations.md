@@ -25,7 +25,7 @@ automoniqued
                  └─ opencode HTTP/SSE adapter -> opencode server process
 ```
 
-The execution host, provider process and raw event journal survive an Automonique generation reload. `automoniqued` can disconnect and later subscribe from the last committed normalized event sequence. The host's lifetime is explicit: attempt-scoped for one-shot work or session-scoped for resumable multi-turn agents, as defined by [ADR 001](../decisions/001-execution-host-lifecycle.md).
+The execution host, provider process and raw event journal survive an Automonique generation reload. `automoniqued` can disconnect and later subscribe from the last committed normalized event sequence. The host's lifetime is explicit: attempt-scoped for one-shot work or session-scoped for resumable multi-turn agents.
 
 ## Common capability model
 

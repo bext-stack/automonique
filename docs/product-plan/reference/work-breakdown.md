@@ -159,7 +159,7 @@ Each item should be a small reviewable issue/PR. IDs express dependency order, n
 - **R4-18 Typed outbox v2:** schema version, lease epoch, sent time, remote ID and reconciliation evidence with expand/contract migration.
 - **R4-19 Event replay/time travel:** rebuild and compare projections at a cursor with effects forcibly disabled.
 - **R4-20 Connector state repositories:** installations, external identities, transport conversations/messages/interactions, proactive targets, consent/intents, rate limits and connector cursors.
-- **R4-21 Inbox/work/host separation:** keep transport routing out of approval/queue states, support non-input work origins, and model a run's optional pre-launch execution-host binding consistently with ADR 001.
+- **R4-21 Inbox/work/host separation:** keep transport routing out of approval/queue states, support non-input work origins, and model a run's optional pre-launch execution-host binding consistently with the lifetime design.
 - **R4-22 Context/session state:** component manifests, reference resolutions, compression lineage, prompt-cache invalidations and durable input queues.
 - **R4-23 Memory and retrieval state:** typed/provenanced memory, supersession/deletion, FTS5 session/messages and external adapter cursors.
 - **R4-24 Skills/extensions state:** source/digest/license/capabilities, installs, scoped activation, bundles, learning proposals, curator state and revocations.
@@ -347,7 +347,7 @@ Each item should be a small reviewable issue/PR. IDs express dependency order, n
 - **R10-06 Three-concurrent-job reload and rollback exercise.**
 - **R10-07 Rust default service cutover.**
 - **R10-08 Soak review and compatibility-retention decision.**
-- **R10-09 Remove legacy backend paths only after the rollback window; remove legacy names/state only through ADR 006's separate telemetry and deprecation gate.**
+- **R10-09 Remove legacy backend paths only after the rollback window; remove legacy names/state only through the separate telemetry and deprecation gate.**
 - **R10-10 Per-provider native canaries:** graduate Jcode, Claude, Codex and opencode independently through resume, approval, cancel, reconnect and reload gates.
 - **R10-11 Provider upgrade rehearsal:** prove binary/schema upgrade and rollback without losing active sessions or silently changing capabilities.
 - **R10-12 Backup/restore automation:** consistent recovery sets, encryption/key checks, off-host retention, clean-host restore and RPO/RTO evidence.
