@@ -2,10 +2,12 @@
 
 //! Durable SQLite state for the proposal-only development harness.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
@@ -14,6 +16,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
+use sha2::{Digest, Sha256};
 
 use crate::protocol::{OpaqueId, Sha256Digest};
 use crate::workspace_lease::{
@@ -308,6 +311,43 @@ impl PersistedLease {
     }
 }
 
+/// Opaque, instance-issued evidence that an exact durable lease is active.
+/// Only [`StateStore::verify_active_lease`] can construct this value.
+#[derive(Clone, Debug)]
+pub struct VerifiedActiveLease {
+    lease_identity: Weak<()>,
+    store_binding: String,
+    attempt_id: AttemptId,
+    lease_id: LeaseId,
+    epoch: FenceEpoch,
+    base_revision: BaseRevision,
+    paths: Vec<RepoPath>,
+}
+
+impl VerifiedActiveLease {
+    pub(crate) fn lease_identity(&self) -> &Weak<()> {
+        &self.lease_identity
+    }
+    pub(crate) fn store_binding(&self) -> &str {
+        &self.store_binding
+    }
+    pub(crate) fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
+    pub(crate) fn lease_id(&self) -> &LeaseId {
+        &self.lease_id
+    }
+    pub(crate) const fn epoch(&self) -> FenceEpoch {
+        self.epoch
+    }
+    pub(crate) fn base_revision(&self) -> &BaseRevision {
+        &self.base_revision
+    }
+    pub(crate) fn paths(&self) -> &[RepoPath] {
+        &self.paths
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransitionAttempt {
     pub action_id: ActionId,
@@ -509,6 +549,7 @@ pub struct StateStore {
     connection: Connection,
     path: PathBuf,
     authority_identity: Arc<()>,
+    active_lease_identities: RefCell<BTreeMap<String, Arc<()>>>,
 }
 
 /// An unforgeable capability minted by an opened controller store.
@@ -559,6 +600,7 @@ impl StateStore {
             connection,
             path,
             authority_identity: Arc::new(()),
+            active_lease_identities: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -669,20 +711,28 @@ impl StateStore {
         }
         let revision = increment_revision(current.revision)?;
         let sequence = increment_sequence(current.last_sequence)?;
-        let released = if request.target.is_terminal() {
-            let count: i64 = map_db(tx.query_row(
-                "SELECT count(DISTINCT lease_id) FROM path_leases WHERE attempt_id = ?1",
-                [request.attempt_id.as_str()],
-                |row| row.get(0),
+        let released_lease_ids = if request.target.is_terminal() {
+            let mut statement = map_db(tx.prepare(
+                "SELECT DISTINCT lease_id FROM path_leases WHERE attempt_id = ?1 ORDER BY lease_id",
             ))?;
+            let rows = map_db(
+                statement.query_map([request.attempt_id.as_str()], |row| row.get::<_, String>(0)),
+            )?;
+            let mut lease_ids = Vec::new();
+            for row in rows {
+                lease_ids.push(map_db(row)?);
+            }
+            drop(statement);
             map_db(tx.execute(
                 "DELETE FROM path_leases WHERE attempt_id = ?1",
                 [request.attempt_id.as_str()],
             ))?;
-            u64_from_i64(count)?
+            lease_ids
         } else {
-            0
+            Vec::new()
         };
+        let released = u64::try_from(released_lease_ids.len())
+            .map_err(|_| StateError::Corrupt("lease count exceeds u64"))?;
         map_db(tx.execute("UPDATE attempts SET state = ?2, revision = ?3, last_sequence = ?4 WHERE attempt_id = ?1", params![request.attempt_id.as_str(), request.target.as_str(), i64_from_revision(revision)?, i64_from_u64(sequence)?]))?;
         let event = JournalRecord {
             attempt_id: request.attempt_id.clone(),
@@ -707,6 +757,12 @@ impl StateStore {
             released_lease_count: released,
         };
         tx.commit().map_err(classify_db)?;
+        if !released_lease_ids.is_empty() {
+            let mut identities = self.active_lease_identities.borrow_mut();
+            for lease_id in released_lease_ids {
+                identities.remove(&lease_id);
+            }
+        }
         Ok(Mutation::Applied(receipt))
     }
 
@@ -916,6 +972,57 @@ impl StateStore {
         Ok(grouped)
     }
 
+    /// Mint an opaque Git authority only after an exact active-lease lookup.
+    pub fn verify_active_lease(
+        &self,
+        authority: &BrokerAuthority,
+        attempt_id: &AttemptId,
+        lease_id: &LeaseId,
+        epoch: FenceEpoch,
+        base_revision: &BaseRevision,
+        mut paths: Vec<RepoPath>,
+    ) -> Result<VerifiedActiveLease, StateError> {
+        self.require_broker(authority)?;
+        paths.sort();
+        validate_path_set(&paths)?;
+        let attempt = require_attempt(&self.connection, attempt_id)?;
+        if &attempt.base_revision != base_revision {
+            return Err(StateError::BaseRevisionMismatch);
+        }
+        let active = self
+            .active_leases()?
+            .into_iter()
+            .find(|lease| lease.lease_id() == lease_id)
+            .ok_or(StateError::LeaseInactive)?;
+        if active.attempt_id() != attempt_id || active.paths() != paths {
+            return Err(StateError::LeaseOwnerMismatch);
+        }
+        if active.epoch() != epoch {
+            return Err(StateError::Fenced {
+                supplied: epoch,
+                active: active.epoch(),
+            });
+        }
+        let store_binding = hex::encode(Sha256::digest(self.path.as_os_str().as_encoded_bytes()));
+        let lease_identity = {
+            let mut identities = self.active_lease_identities.borrow_mut();
+            Arc::downgrade(
+                identities
+                    .entry(lease_id.as_str().to_owned())
+                    .or_insert_with(|| Arc::new(())),
+            )
+        };
+        Ok(VerifiedActiveLease {
+            lease_identity,
+            store_binding,
+            attempt_id: attempt_id.clone(),
+            lease_id: lease_id.clone(),
+            epoch,
+            base_revision: base_revision.clone(),
+            paths,
+        })
+    }
+
     pub fn record_effect_intent(
         &mut self,
         authority: &BrokerAuthority,
@@ -1115,7 +1222,10 @@ fn enforce_mode(
             "state path is not owned by the effective user",
         ));
     }
-    if metadata.mode() & 0o7777 != expected_mode {
+    if directory && metadata.mode() & 0o7777 != expected_mode {
+        return Err(StateError::UnsafePath(kind));
+    }
+    if !directory && metadata.mode() & 0o7777 != expected_mode {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(expected_mode))
             .map_err(|_| StateError::UnsafePath("private state mode cannot be enforced"))?;
     }

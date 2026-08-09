@@ -9,7 +9,7 @@ use crate::state::{
     TransitionAttempt,
 };
 use crate::workspace_lease::{
-    ActionId, AttemptId, BaseRevision, LeaseId, Mutation, RepoPath, Revision,
+    ActionId, AttemptId, BaseRevision, FenceEpoch, LeaseId, Mutation, RepoPath, Revision,
 };
 use rusqlite::Connection;
 use tempfile::tempdir;
@@ -17,6 +17,7 @@ use tempfile::tempdir;
 const BASE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 fn open_state(path: impl AsRef<std::path::Path>) -> Result<StateStore, StateError> {
+    prepare_test_state_parent(path.as_ref());
     StateStore::open(&ControllerRoot { seal: () }, path)
 }
 
@@ -24,7 +25,21 @@ fn open_state_timeout(
     path: impl AsRef<std::path::Path>,
     timeout: Duration,
 ) -> Result<StateStore, StateError> {
+    prepare_test_state_parent(path.as_ref());
     StateStore::open_with_timeout(&ControllerRoot { seal: () }, path, timeout)
+}
+
+fn prepare_test_state_parent(path: &std::path::Path) {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && let Ok(metadata) = std::fs::symlink_metadata(parent)
+        && metadata.is_dir()
+        && !metadata.file_type().is_symlink()
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .expect("test state parent becomes private");
+    }
 }
 
 fn attempt(value: &str) -> AttemptId {
@@ -53,6 +68,95 @@ fn objective(value: &str) -> OpaqueId {
 
 fn digest(byte: char) -> Sha256Digest {
     Sha256Digest::new(byte.to_string().repeat(64)).expect("test digest is valid")
+}
+
+#[test]
+fn active_lease_proof_is_exact_instance_bound_and_revoked_on_release() {
+    let directory = tempdir().expect("temporary directory");
+    let mut first = open_state(directory.path().join("first.sqlite3")).expect("first store");
+    let second = open_state(directory.path().join("second.sqlite3")).expect("second store");
+    let authority = first.broker_authority();
+    first
+        .create_attempt(
+            &authority,
+            attempt("proof-attempt"),
+            objective("proof-objective"),
+            base(),
+        )
+        .expect("attempt created");
+    let acquired = first
+        .acquire_paths(
+            &authority,
+            AcquirePaths {
+                action_id: action("proof-acquire"),
+                lease_id: lease("proof-lease"),
+                attempt_id: attempt("proof-attempt"),
+                base_revision: base(),
+                expected_revision: Revision::default(),
+                paths: vec![path("leased")],
+            },
+        )
+        .expect("lease acquired");
+    let receipt = acquired.receipt().clone();
+    first
+        .verify_active_lease(
+            &authority,
+            &attempt("proof-attempt"),
+            &lease("proof-lease"),
+            receipt.epoch,
+            &base(),
+            vec![path("leased")],
+        )
+        .expect("exact active lease verified");
+
+    let foreign_authority = second.broker_authority();
+    assert!(matches!(
+        first.verify_active_lease(
+            &foreign_authority,
+            &attempt("proof-attempt"),
+            &lease("proof-lease"),
+            receipt.epoch,
+            &base(),
+            vec![path("leased")],
+        ),
+        Err(StateError::AuthorityDenied)
+    ));
+    assert!(matches!(
+        first.verify_active_lease(
+            &authority,
+            &attempt("proof-attempt"),
+            &lease("proof-lease"),
+            FenceEpoch::from_u64(receipt.epoch.get() + 1),
+            &base(),
+            vec![path("leased")],
+        ),
+        Err(StateError::Fenced { .. })
+    ));
+
+    first
+        .transition(
+            &authority,
+            TransitionAttempt {
+                action_id: action("proof-terminal"),
+                attempt_id: attempt("proof-attempt"),
+                base_revision: base(),
+                expected_revision: receipt.revision,
+                target: AttemptState::Cancelled,
+                event_digest: digest('b'),
+            },
+        )
+        .expect("terminal transition releases lease");
+    assert!(matches!(
+        first.verify_active_lease(
+            &authority,
+            &attempt("proof-attempt"),
+            &lease("proof-lease"),
+            receipt.epoch,
+            &base(),
+            vec![path("leased")],
+        ),
+        Err(StateError::LeaseInactive)
+    ));
 }
 
 fn transition(
@@ -465,7 +569,7 @@ fn database_open_rejects_symlinked_path_components() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn private_directory_database_and_sidecar_modes_are_enforced() {
+fn permissive_directory_is_refused_without_mode_mutation() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let directory = tempdir().expect("temporary directory");
@@ -474,7 +578,22 @@ fn private_directory_database_and_sidecar_modes_are_enforced() {
     std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755))
         .expect("permissive test mode set");
     let database = private.join("state.sqlite3");
-    let mut store = open_state(&database).expect("owned directory is repaired");
+    assert!(matches!(
+        StateStore::open(&ControllerRoot { seal: () }, &database),
+        Err(StateError::UnsafePath(_))
+    ));
+    assert_eq!(
+        std::fs::metadata(&private)
+            .expect("directory metadata")
+            .mode()
+            & 0o7777,
+        0o755
+    );
+    assert!(!database.exists());
+
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
+        .expect("caller makes dedicated directory private");
+    let mut store = open_state(&database).expect("private directory opens");
     let broker = store.broker_authority();
     store
         .create_attempt(
