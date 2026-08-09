@@ -1,0 +1,416 @@
+{
+  "schema": "automonique.provider-surface/v1",
+  "provider": "opencode",
+  "capture_date": "2026-08-09",
+  "base": "972f94894dc84921454bfdde131c9fa8efa57ec2",
+  "licence": "Elastic-2.0",
+  "binary": {
+    "availability": "observed",
+    "version": "1.17.18",
+    "version_reason": null,
+    "sha256": "0cbfb6de55aa4ce3c74da12d8516376033693a88abca6238c5be32bf98130636",
+    "resolved_path": null,
+    "resolved_path_reason": "The user-local executable path is intentionally omitted to avoid recording an identity-bearing absolute path."
+  },
+  "authentication": {
+    "state": "unknown",
+    "reason": "Authentication state was not probed because the advertised provider inventory can expose provider, credential or account identifiers. Help output proves only that Basic Auth client options and provider credential management commands exist."
+  },
+  "safe_probe_argv": [
+    {
+      "argv": ["opencode", "--version"],
+      "evidence_level": "observed",
+      "result": "Version 1.17.18 returned with exit status zero."
+    },
+    {
+      "argv": ["opencode", "--pure", "--version"],
+      "evidence_level": "observed",
+      "result": "Version 1.17.18 returned with exit status zero while external plugins were disabled."
+    },
+    {
+      "argv": ["opencode", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised the root command and option surface."
+    },
+    {
+      "argv": ["opencode", "serve", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised a headless server and its bind, discovery, CORS and pure-mode options."
+    },
+    {
+      "argv": ["opencode", "acp", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised an ACP server and working-directory option."
+    },
+    {
+      "argv": ["opencode", "run", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised JSON events, session selection, fork, model, agent, directory and attach options."
+    },
+    {
+      "argv": ["opencode", "attach", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised attachment to a running server and session resume or fork options."
+    },
+    {
+      "argv": ["opencode", "session", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised session list and delete commands."
+    },
+    {
+      "argv": ["opencode", "session", "list", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised bounded session listing with table or JSON output."
+    },
+    {
+      "argv": ["opencode", "agent", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised agent create and list commands."
+    },
+    {
+      "argv": ["opencode", "agent", "list", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised agent inventory without reading it."
+    },
+    {
+      "argv": ["opencode", "mcp", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised MCP inventory, mutation and authentication commands."
+    },
+    {
+      "argv": ["opencode", "mcp", "list", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised MCP server and status inventory without reading it."
+    },
+    {
+      "argv": ["opencode", "providers", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised provider credential list, login and logout commands."
+    },
+    {
+      "argv": ["opencode", "providers", "list", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised provider and credential inventory without reading it."
+    },
+    {
+      "argv": ["opencode", "models", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised model inventory and an explicit network refresh option."
+    },
+    {
+      "argv": ["opencode", "export", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised JSON session export and sanitization without reading a session."
+    },
+    {
+      "argv": ["opencode", "stats", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised token and cost statistics without reading them."
+    },
+    {
+      "argv": ["opencode", "debug", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised debug surfaces without reading configuration, paths or private state."
+    },
+    {
+      "argv": ["opencode", "debug", "v2", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised the v2 debug catalog without establishing a stability class."
+    },
+    {
+      "argv": ["opencode", "db", "--help"],
+      "evidence_level": "help_only",
+      "result": "Advertised database query and path commands without opening the database."
+    },
+    {
+      "argv": ["opencode", "completion", "--help"],
+      "evidence_level": "help_only",
+      "result": "Returned root help instead of command-specific help; no completion behavior is inferred."
+    }
+  ],
+  "modes": [
+    {
+      "id": "http_server",
+      "role": "preferred",
+      "command": ["opencode", "--pure", "serve", "--hostname", "127.0.0.1", "--port", "<allocated-port>"],
+      "protocol": "HTTP with an OpenAPI and SSE surface expected by the product plan",
+      "transport": "loopback TCP expected by policy",
+      "schema_source": {
+        "kind": "OpenAPI 3.1",
+        "evidence_level": "product_plan_only",
+        "reason": "Installed help advertises only the headless server command and bind flags; no schema command, endpoint list or protocol version was observed."
+      },
+      "evidence_level": "help_only",
+      "capabilities": {
+        "create": {
+          "support": "unknown",
+          "reason": "Session creation is expected by the product plan but was not advertised by installed server help or exercised."
+        },
+        "resume": {
+          "support": "unknown",
+          "reason": "Server-side resume was not advertised by installed server help or exercised."
+        },
+        "observe": {
+          "support": "unknown",
+          "reason": "SSE, status, message and diff endpoints are product-plan expectations without local schema evidence."
+        },
+        "steer": {
+          "support": "unknown",
+          "reason": "Asynchronous prompt or steering semantics were not locally observed."
+        },
+        "cancel": {
+          "support": "unknown",
+          "reason": "Abort semantics were not locally observed."
+        },
+        "approval": {
+          "support": "unknown",
+          "reason": "Permission request and response semantics were not locally observed."
+        },
+        "reconnect": {
+          "support": "unknown",
+          "reason": "SSE reconnect and durable reconciliation semantics were not locally observed."
+        },
+        "model": {
+          "support": "unknown",
+          "reason": "A separate model inventory command is advertised, but server-side model discovery was not locally observed."
+        },
+        "usage": {
+          "support": "unknown",
+          "reason": "A separate statistics command is advertised, but server event or API usage reporting was not locally observed."
+        }
+      }
+    },
+    {
+      "id": "acp",
+      "role": "first_fallback",
+      "command": ["opencode", "--pure", "acp", "--cwd", "<workspace>"],
+      "protocol": "ACP; JSON-RPC stdio is expected by the product plan",
+      "transport": "unknown from installed help",
+      "schema_source": {
+        "kind": "ACP schema",
+        "evidence_level": "unavailable",
+        "reason": "Installed help exposed no schema or protocol-version command."
+      },
+      "evidence_level": "help_only",
+      "capabilities": {
+        "create": {
+          "support": "unknown",
+          "reason": "ACP server startup is advertised, but session creation semantics were not exercised."
+        },
+        "resume": {
+          "support": "unknown",
+          "reason": "No ACP resume behavior was advertised by help or exercised."
+        },
+        "observe": {
+          "support": "unknown",
+          "reason": "No ACP event behavior was advertised by help or exercised."
+        },
+        "steer": {
+          "support": "unknown",
+          "reason": "No ACP steering behavior was advertised by help or exercised."
+        },
+        "cancel": {
+          "support": "unknown",
+          "reason": "No ACP cancellation behavior was advertised by help or exercised."
+        },
+        "approval": {
+          "support": "unknown",
+          "reason": "Permission support is a product-plan expectation, not installed-probe evidence."
+        },
+        "reconnect": {
+          "support": "unknown",
+          "reason": "No reconnect or reconciliation behavior was advertised by help or exercised."
+        },
+        "model": {
+          "support": "unknown",
+          "reason": "No ACP model negotiation behavior was advertised by help or exercised."
+        },
+        "usage": {
+          "support": "unknown",
+          "reason": "No ACP usage reporting behavior was advertised by help or exercised."
+        }
+      }
+    },
+    {
+      "id": "json_run",
+      "role": "last_fallback",
+      "command": ["opencode", "--pure", "run", "--format", "json", "--dir", "<workspace>", "<message>"],
+      "protocol": "OpenCode raw JSON events",
+      "transport": "child-process standard streams",
+      "schema_source": {
+        "kind": "undocumented JSON event stream",
+        "evidence_level": "unavailable",
+        "reason": "The output format is advertised, but installed help exposes no event schema or protocol version."
+      },
+      "evidence_level": "help_only",
+      "capabilities": {
+        "create": {
+          "support": "advertised",
+          "reason": "The run command advertises a message positional and session title, but was not executed because it can consume a model call."
+        },
+        "resume": {
+          "support": "advertised",
+          "reason": "The run command advertises continue, session and fork options; semantics were not exercised."
+        },
+        "observe": {
+          "support": "advertised",
+          "reason": "The run command describes JSON format as raw JSON events; event completeness and schema were not exercised."
+        },
+        "steer": {
+          "support": "unknown",
+          "reason": "No bidirectional steering option or runtime behavior was established."
+        },
+        "cancel": {
+          "support": "unknown",
+          "reason": "No typed cancellation surface or runtime behavior was established."
+        },
+        "approval": {
+          "support": "unknown",
+          "reason": "The dangerous auto-approval option implies permissions exist but does not prove a representable approval protocol."
+        },
+        "reconnect": {
+          "support": "unknown",
+          "reason": "Advertised resume options do not prove transport reconnect or event reconciliation."
+        },
+        "model": {
+          "support": "advertised",
+          "reason": "The run command advertises explicit model and provider-specific variant options."
+        },
+        "usage": {
+          "support": "unknown",
+          "reason": "A separate statistics command exists, but usage fields in JSON events were not advertised or exercised."
+        }
+      }
+    }
+  ],
+  "unsafe_or_sensitive_methods": [
+    {
+      "method": "--auto",
+      "classification": "unsafe",
+      "evidence_level": "explicit_help_label",
+      "reason": "Help labels automatic approval of non-denied permissions as dangerous."
+    },
+    {
+      "method": "--mdns",
+      "classification": "unsafe_unprobed",
+      "evidence_level": "help_only",
+      "reason": "Help says discovery can change the default hostname to 0.0.0.0, widening network exposure."
+    },
+    {
+      "method": "--cors",
+      "classification": "security_sensitive_unprobed",
+      "evidence_level": "help_only",
+      "reason": "The option adds browser origins and requires an explicit origin policy."
+    },
+    {
+      "method": "run --share",
+      "classification": "external_side_effect_unprobed",
+      "evidence_level": "help_only",
+      "reason": "Sharing can publish session material and was not executed."
+    },
+    {
+      "method": "models --refresh",
+      "classification": "network_side_effect_unprobed",
+      "evidence_level": "help_only",
+      "reason": "Help states that the model cache is refreshed from an external service."
+    },
+    {
+      "method": "run or attach --password",
+      "classification": "forbidden_credential_transport",
+      "evidence_level": "help_only",
+      "reason": "Password-on-argv is advertised but Automonique policy requires protected environment or descriptor injection."
+    },
+    {
+      "method": "provider, MCP and account authentication mutations",
+      "classification": "authentication_mutation_unprobed",
+      "evidence_level": "help_only",
+      "reason": "Login, logout and OAuth commands are outside the inventory probe."
+    },
+    {
+      "method": "session delete, agent create, MCP add, import, plugin, upgrade, uninstall, GitHub, PR and database mutations",
+      "classification": "state_mutation_unprobed",
+      "evidence_level": "help_only",
+      "reason": "These advertised commands can alter local or remote state and were not executed."
+    },
+    {
+      "method": "provider, session, agent, MCP, export, stats and debug state reads",
+      "classification": "private_state_sensitive_unprobed",
+      "evidence_level": "help_only",
+      "reason": "These commands can disclose identifiers, configuration, transcripts, paths or usage and were not executed."
+    }
+  ],
+  "experimental_or_unknown_stability": [
+    {
+      "method": "debug v2",
+      "stability": "unknown",
+      "reason": "Help calls this a v2 debug catalog but does not label it experimental or stable."
+    },
+    {
+      "method": "HTTP OpenAPI and SSE surface",
+      "stability": "unknown",
+      "reason": "No installed schema, protocol version or stability marker was safely observed."
+    },
+    {
+      "method": "ACP surface",
+      "stability": "unknown",
+      "reason": "No installed schema, protocol version or stability marker was safely observed."
+    },
+    {
+      "method": "JSON event format",
+      "stability": "unknown",
+      "reason": "The format is advertised without a schema or stability marker."
+    }
+  ],
+  "fallbacks": [
+    {
+      "order": 1,
+      "mode": "http_server",
+      "selection": "Use only after versioned OpenAPI, lifecycle, authentication and SSE conformance succeeds.",
+      "lost_guarantees": []
+    },
+    {
+      "order": 2,
+      "mode": "acp",
+      "selection": "Use only when every requested capability remains representable and ACP conformance succeeds.",
+      "lost_guarantees": [
+        "No locally proven HTTP session history, status, diff or abort endpoints.",
+        "No locally proven permission response endpoint or SSE reconciliation.",
+        "No locally available versioned schema from the safe probe."
+      ]
+    },
+    {
+      "order": 3,
+      "mode": "json_run",
+      "selection": "Use only as an explicit last-resort compatibility mode; never silently downgrade.",
+      "lost_guarantees": [
+        "No locally proven long-lived bidirectional steering or typed cancellation.",
+        "No locally proven provider approval representation.",
+        "No locally proven reconnect and stored-event reconciliation.",
+        "No locally proven server-side provider, MCP, agent or command inventories.",
+        "No locally available versioned JSON event schema from the safe probe."
+      ]
+    }
+  ],
+  "provenance": {
+    "installed_source": "Locally installed executable discovered on PATH; identity-bearing resolved path omitted.",
+    "installed_capture": "Only version and help commands listed in safe_probe_argv were executed.",
+    "product_plan_sources": [
+      "docs/product-plan/requirements/agent-integrations.md#opencode",
+      "docs/product-plan/reference/plan-review.md#selected-native-surfaces"
+    ],
+    "forbidden_sources_used": false,
+    "sanitization": [
+      "No credential, account, provider, model, session, agent, MCP, transcript, usage or configuration inventory was read.",
+      "No absolute executable or workspace path is recorded.",
+      "No raw banner or help output is embedded; only capability-relevant summaries are retained.",
+      "Installed help claims are distinguished from observed version results and product-plan expectations."
+    ],
+    "deferred_questions": [
+      "Locate and digest the version-pinned OpenAPI schema without accepting network or authentication side effects.",
+      "Exercise create, resume, observe, steer, cancel, approval and reconnect semantics only in R0-07 fixtures with synthetic data.",
+      "Determine effective authentication state category through a redacted probe that cannot disclose provider or account identifiers.",
+      "Establish ACP transport, protocol version and capability conformance from a first-party schema or synthetic fixture.",
+      "Establish JSON event schema, completeness and usage fields without a paid or real model call."
+    ]
+  }
+}

@@ -1,0 +1,255 @@
+{
+  "schema": "automonique.provider-surface/v1",
+  "provider": "claude",
+  "capture_date": "2026-08-09",
+  "expected_base": "972f94894dc84921454bfdde131c9fa8efa57ec2",
+  "licence_class": "Elastic-2.0",
+  "binary": {
+    "command": "claude",
+    "version": {
+      "value": "2.1.226",
+      "display": "2.1.226 (Claude Code)",
+      "evidence_level": "observed"
+    },
+    "build": {
+      "value": null,
+      "reason": "The installed version and help surfaces did not expose build metadata."
+    },
+    "digest": {
+      "value": null,
+      "reason": "Executable hashing was outside this bounded provider-command probe."
+    }
+  },
+  "authentication": {
+    "category": "logged_in",
+    "evidence_level": "observed",
+    "reason": "The local no-call status command returned loggedIn=true. All identity, account, subscription and credential fields were discarded by the probe sanitizer. This does not prove a successful provider or model call."
+  },
+  "modes": [
+    {
+      "id": "stream_json",
+      "role": "preferred_long_lived_cli",
+      "transport": "stdio",
+      "protocol": "claude-stream-json",
+      "schema_version": null,
+      "schema_reason": "Installed help advertises stream-json framing but exposes neither an event schema nor a protocol version.",
+      "stability": "advertised",
+      "evidence_level": "advertised",
+      "capabilities": {
+        "create": {
+          "support": "advertised",
+          "reason": "Print mode accepts a prompt and supports a caller-supplied session UUID."
+        },
+        "resume": {
+          "support": "advertised",
+          "reason": "The CLI advertises resume, continue and fork-session options."
+        },
+        "observe": {
+          "support": "advertised",
+          "reason": "Stream-json output, partial messages, hook events and forwarded subagent text are advertised."
+        },
+        "steer": {
+          "support": "advertised",
+          "reason": "Stream-json input is described as realtime streaming input and replay-user-messages provides input acknowledgement, but active-turn semantics were not exercised."
+        },
+        "cancel": {
+          "support": "unknown",
+          "reason": "No typed cancel or interrupt operation is exposed by installed CLI help. External process termination is not provider-terminal-state proof."
+        },
+        "approval": {
+          "support": "unknown",
+          "reason": "Permission modes and tool allow or deny lists are advertised, but installed help exposes no programmatic approval request and response channel."
+        },
+        "reconnect": {
+          "support": "advertised",
+          "reason": "Resume by session identifier is advertised; survival and reconciliation across controller or process reconnect were not exercised."
+        },
+        "model": {
+          "support": "advertised",
+          "reason": "Model, fallback model and effort selection flags are advertised."
+        },
+        "usage": {
+          "support": "unknown",
+          "reason": "A maximum-dollar budget is advertised for print mode, but installed help does not define usage, token or cost event fields."
+        }
+      }
+    },
+    {
+      "id": "one_shot_stream_json",
+      "role": "fallback_cli",
+      "transport": "stdio",
+      "protocol": "claude-stream-json",
+      "schema_version": null,
+      "schema_reason": "Installed help advertises stream-json output but exposes neither an event schema nor a protocol version.",
+      "stability": "advertised",
+      "evidence_level": "advertised",
+      "capabilities": {
+        "create": {
+          "support": "advertised",
+          "reason": "Print mode accepts one prompt and exits."
+        },
+        "resume": {
+          "support": "advertised",
+          "reason": "A later one-shot process can request resume or continue."
+        },
+        "observe": {
+          "support": "advertised",
+          "reason": "Stream-json output and optional partial and lifecycle event inclusion are advertised."
+        },
+        "steer": {
+          "support": "unavailable",
+          "reason": "This fallback is defined as a single-message process and cannot retain an in-process channel for later steering."
+        },
+        "cancel": {
+          "support": "unknown",
+          "reason": "No typed cancel or interrupt operation is exposed; killing the process has unproven provider terminal semantics."
+        },
+        "approval": {
+          "support": "unknown",
+          "reason": "No programmatic approval request and response channel is exposed by installed help."
+        },
+        "reconnect": {
+          "support": "advertised",
+          "reason": "Starting another process with resume is advertised, but exact history reconciliation was not exercised."
+        },
+        "model": {
+          "support": "advertised",
+          "reason": "Model, fallback model and effort flags are accepted by print mode according to help."
+        },
+        "usage": {
+          "support": "unknown",
+          "reason": "Installed help does not define usage fields in the result envelope."
+        }
+      }
+    },
+    {
+      "id": "background_agents",
+      "role": "operator_surface_not_primary_lifecycle",
+      "transport": "local_session_store_and_cli",
+      "protocol": "claude-background-agents",
+      "schema_version": null,
+      "schema_reason": "The agents command advertises a JSON session inventory without an installed schema or protocol version.",
+      "stability": "advertised",
+      "evidence_level": "advertised",
+      "capabilities": {
+        "create": {
+          "support": "advertised",
+          "reason": "Background launch and custom agent definitions are advertised."
+        },
+        "resume": {
+          "support": "unknown",
+          "reason": "Global resume flags exist, but help does not bind them to background-agent lifecycle."
+        },
+        "observe": {
+          "support": "advertised",
+          "reason": "The agents command advertises JSON inventory for active and optionally completed sessions."
+        },
+        "steer": {
+          "support": "unknown",
+          "reason": "No noninteractive background-agent steering operation is exposed by installed help."
+        },
+        "cancel": {
+          "support": "unknown",
+          "reason": "No noninteractive background-agent cancel operation is exposed by installed help."
+        },
+        "approval": {
+          "support": "unknown",
+          "reason": "Dispatch permission defaults are configurable, but no durable approval request and response protocol is exposed."
+        },
+        "reconnect": {
+          "support": "unknown",
+          "reason": "Inventory is advertised, but adoption and reconciliation after controller restart were not exercised."
+        },
+        "model": {
+          "support": "advertised",
+          "reason": "The agent view advertises model and effort defaults for dispatched sessions."
+        },
+        "usage": {
+          "support": "unknown",
+          "reason": "No usage projection is described by the agents command help."
+        }
+      }
+    }
+  ],
+  "safe_probe_argv": [
+    ["claude", "--version"],
+    ["claude", "--help"],
+    ["claude", "agents", "--help"],
+    ["claude", "auth", "--help"],
+    ["claude", "auth", "status", "--help"],
+    ["claude", "doctor", "--help"],
+    ["claude", "auth", "status", "--json"]
+  ],
+  "unsafe_or_experimental": [
+    {
+      "method": "--dangerously-skip-permissions",
+      "label": "unsafe",
+      "reason": "Installed help explicitly says it bypasses all permission checks."
+    },
+    {
+      "method": "--allow-dangerously-skip-permissions",
+      "label": "unsafe_enabler",
+      "reason": "It makes bypass-permissions mode available to the current or dispatched session."
+    },
+    {
+      "method": "cloud, remote-control, teleport, plugin-url, file and ultrareview surfaces",
+      "label": "network_or_external_side_effect",
+      "reason": "These advertised methods can create remote sessions, fetch content or consume hosted services and were deliberately not probed."
+    }
+  ],
+  "fallbacks": {
+    "ordered": [
+      {
+        "rank": 1,
+        "mode": "stream_json",
+        "eligibility": "Only after schema fixtures and required lifecycle capabilities pass conformance."
+      },
+      {
+        "rank": 2,
+        "mode": "one_shot_stream_json",
+        "eligibility": "Only for work that does not require live steering or a provider approval pause."
+      },
+      {
+        "rank": 3,
+        "mode": "reject",
+        "eligibility": "Required when neither mode proves all capabilities required by the work."
+      }
+    ],
+    "lost_guarantees": [
+      {
+        "from": "stream_json",
+        "to": "one_shot_stream_json",
+        "losses": [
+          "bidirectional in-process steering",
+          "continuous process identity",
+          "potentially narrower event visibility"
+        ]
+      },
+      {
+        "from": "any_cli_mode",
+        "to": "external_process_supervision",
+        "losses": [
+          "typed provider cancellation",
+          "provider-reported terminal cancellation state",
+          "provider-native timeout semantics"
+        ]
+      }
+    ]
+  },
+  "deferred_questions": [
+    "What exact stream-json envelope and event schema is emitted by this binary?",
+    "Does realtime stream input steer an active turn, queue a later turn, or both?",
+    "How are approvals represented and answered programmatically?",
+    "What cancellation state is emitted after interruption or process termination?",
+    "Which usage and cost fields are authoritative?",
+    "Which session state survives process or controller restart?"
+  ],
+  "provenance": {
+    "source_kind": "locally_installed_release_binary",
+    "source_description": "Sanitized stdout and stderr from fixed version, help and local auth-status argv.",
+    "evidence_boundary": "Version and command availability were observed. Mode and capability semantics derived from help are only advertised. No prompt, model call, session mutation or runtime lifecycle test occurred.",
+    "credential_handling": "Status output was parsed by a privacy filter; only the allow-listed boolean auth category was retained.",
+    "raw_artifact": null,
+    "raw_artifact_reason": "Raw help and status output was not retained in this provider record to avoid persisting machine-local or private fields."
+  }
+}

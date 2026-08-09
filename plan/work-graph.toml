@@ -159,7 +159,7 @@ summary = "record tested versions, native protocols, schemas, capabilities, auth
 depends_on = ["BOOT-001"]
 licence = "Elastic-2.0"
 allowed_paths = ["plan/", "spikes/", ".automonique/dev/", "tools/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R0-07"

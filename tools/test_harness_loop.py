@@ -73,9 +73,9 @@ class HarnessLoopTests(unittest.TestCase):
             harness_loop.worker_argv([], packet)
 
     def test_session_packet_declares_native_bounded_delegation(self) -> None:
-        item, objective = harness_loop.select_item(
-            self.program, self.objectives, "R0-06"
-        )
+        item, objective = harness_loop.eligible_items(
+            self.program, self.objectives
+        )[0]
         config = guides.build_loop_config()
         packet = harness_loop.packet_document(
             "session_test",

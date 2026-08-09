@@ -1,0 +1,103 @@
+{
+  "capture_date": "2026-08-09",
+  "deferred_questions": [
+    "runtime lifecycle, cancellation, approval, reconnect, and usage semantics",
+    "provider event and schema compatibility under real no-op fixtures",
+    "authentication usability without recording account or credential identifiers"
+  ],
+  "deferred_to": "R0-07",
+  "immutable_base": "972f94894dc84921454bfdde131c9fa8efa57ec2",
+  "licence": "Elastic-2.0",
+  "providers": [
+    {
+      "authentication_category": "logged_in",
+      "capability_fields": [
+        "approval",
+        "cancel",
+        "create",
+        "model",
+        "observe",
+        "reconnect",
+        "resume",
+        "steer",
+        "usage"
+      ],
+      "mode_count": 3,
+      "provider": "claude",
+      "surface_file": "spikes/provider-surfaces/providers/claude.json",
+      "surface_sha256": "8f98efd8773b1a57672c516fe6ff853f482f401c38defab8bb1b8693c52ff682",
+      "version": {
+        "reason": null,
+        "value": "2.1.226"
+      }
+    },
+    {
+      "authentication_category": "configured",
+      "capability_fields": [
+        "approval",
+        "cancel",
+        "create",
+        "model",
+        "observe",
+        "reconnect",
+        "resume",
+        "steer",
+        "usage"
+      ],
+      "mode_count": 5,
+      "provider": "codex",
+      "surface_file": "spikes/provider-surfaces/providers/codex.json",
+      "surface_sha256": "abd7d9bcd2a12983ee76d97da9f28a229abea9f3e5d59702b776a7078448dfa8",
+      "version": {
+        "reason": null,
+        "value": "codex-cli 0.147.0"
+      }
+    },
+    {
+      "authentication_category": "unknown",
+      "capability_fields": [
+        "approval",
+        "cancel",
+        "create",
+        "model",
+        "observe",
+        "reconnect",
+        "resume",
+        "steer",
+        "usage"
+      ],
+      "mode_count": 4,
+      "provider": "jcode",
+      "surface_file": "spikes/provider-surfaces/providers/jcode.json",
+      "surface_sha256": "e4123c2acbb2114398ca616dc18612409074fe70a06440f970f5f7192f6e4392",
+      "version": {
+        "reason": null,
+        "value": "0.68.0"
+      }
+    },
+    {
+      "authentication_category": "unknown",
+      "capability_fields": [
+        "approval",
+        "cancel",
+        "create",
+        "model",
+        "observe",
+        "reconnect",
+        "resume",
+        "steer",
+        "usage"
+      ],
+      "mode_count": 3,
+      "provider": "opencode",
+      "surface_file": "spikes/provider-surfaces/providers/opencode.json",
+      "surface_sha256": "a7a6dc9d6392f5f61111fd19be9970636cdb6c4e09e2ed6f865af84fcf489b3a",
+      "version": {
+        "reason": null,
+        "value": "1.17.18"
+      }
+    }
+  ],
+  "raw_manifest": "spikes/provider-surfaces/raw/2026-08-09/manifest.json",
+  "schema": "automonique.provider-inventory/v1"
+}

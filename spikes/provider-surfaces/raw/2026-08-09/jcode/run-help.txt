@@ -1,0 +1,48 @@
+Run a single message and exit
+
+Usage: jcode-linux-x86_64.bin run [OPTIONS] <MESSAGE>
+
+Arguments:
+  <MESSAGE>  The message to send
+
+Options:
+      --json
+          Emit a machine-readable JSON result instead of streaming text
+  -p, --provider <PROVIDER>
+          Initial provider to use (jcode, claude, openai, openai-api, openrouter, azure, opencode, opencode-go, zai, 302ai, baseten, cortecs, comtegra, deepseek, fpt, firmware, huggingface, moonshotai, nebius, scaleway, stackit, groq, mistral, perplexity, togetherai, deepinfra, xai, nvidia-nim, lmstudio, ollama, chutes, cerebras, alibaba-coding-plan, openai-compatible, cursor, copilot, gemini, antigravity, google, or auto-detect). Interactive sessions can switch providers with /model [default: auto] [possible values: jcode, claude, anthropic-api, openai, openai-api, openrouter, bedrock, azure, opencode, opencode-go, zai, kimi, ai302, baseten, cortecs, comtegra, deepseek, fpt, firmware, hugging-face, moonshot-ai, nebius, scaleway, stackit, groq, mistral, perplexity, together-ai, deepinfra, fireworks, minimax, xai, nvidia-nim, xiaomi-mimo, celeris, lmstudio, ollama, chutes, cerebras, alibaba-coding-plan, openai-compatible, cursor, copilot, gemini, gemini-api, antigravity, google, auto]
+  -C, --cwd <CWD>
+          Working directory for the local client process
+      --ndjson
+          Emit newline-delimited JSON events while the response streams
+      --remote-working-dir <REMOTE_WORKING_DIR>
+          Working directory to send to a remote server when using --socket
+      --no-update
+          Skip the automatic update check
+      --auto-update
+          Auto-update when new version is available (default: true for release builds)
+      --trace
+          Log tool inputs/outputs and token usage to stderr
+      --quiet
+          Suppress non-error CLI/status output for scripting and wrappers
+      --resume [<RESUME>]
+          Resume a session by ID, or list sessions if no ID provided
+      --no-selfdev
+          Disable auto-detection of jcode repository and self-dev mode
+      --socket <SOCKET>
+          Custom socket path for server/client communication
+      --debug-socket
+          Enable debug socket (broadcasts all TUI state changes)
+  -m, --model <MODEL>
+          Model to use (e.g., claude-opus-4-6, gpt-5.5)
+      --provider-profile <PROVIDER_PROFILE>
+          Named provider profile from [providers.<name>] in config.toml. Implies --provider openai-compatible for OpenAI-compatible profiles
+      --tool-profile <TOOL_PROFILE>
+          Tool profile to expose to the model: full, minimal/lite, or none
+      --tools <TOOLS>
+          Comma-separated explicit allow-list of tools to expose, e.g. bash,read,write,apply_patch. Use '*' or 'all' for the unrestricted full toolset
+      --disabled-tools <DISABLED_TOOLS>
+          Comma-separated list of tools to hide after applying the selected profile
+      --disable-base-tools
+          Hide all built-in tools unless --tools or [tools].enabled opts tools back in
+  -h, --help
+          Print help

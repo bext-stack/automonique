@@ -1,0 +1,409 @@
+{
+  "schema": "automonique.provider-surface/v1",
+  "provider": "codex",
+  "capture_date": "2026-08-09",
+  "base": "972f94894dc84921454bfdde131c9fa8efa57ec2",
+  "licence": "Elastic-2.0",
+  "version": {
+    "value": "codex-cli 0.147.0",
+    "support": "observed",
+    "command": ["codex", "--version"]
+  },
+  "binary": {
+    "sha256": "cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40",
+    "path_disclosed": false
+  },
+  "authentication": {
+    "category": "configured",
+    "support": "observed",
+    "reason": "The local status command exited successfully with all output suppressed; authentication mechanism, identity, and credential values were not inspected.",
+    "command": ["codex", "login", "status"]
+  },
+  "modes": [
+    {
+      "id": "interactive_cli",
+      "protocol": "terminal-ui",
+      "transport": "local-terminal-or-remote-app-server",
+      "stability": "unlabelled",
+      "capabilities": {
+        "create": {
+          "support": "advertised",
+          "reason": "Root help accepts an optional prompt to start a session."
+        },
+        "resume": {
+          "support": "advertised",
+          "reason": "The resume command accepts a session identifier or --last."
+        },
+        "observe": {
+          "support": "advertised",
+          "reason": "The mode is advertised as an interactive terminal UI, but no machine event contract was probed."
+        },
+        "steer": {
+          "support": "unknown",
+          "reason": "Interactive steering is plausible but was not stated precisely by help or runtime-probed."
+        },
+        "cancel": {
+          "support": "unknown",
+          "reason": "No session cancellation contract was shown by the safe probes."
+        },
+        "approval": {
+          "support": "advertised",
+          "reason": "Approval policies and automatic review are exposed as CLI options."
+        },
+        "reconnect": {
+          "support": "advertised",
+          "reason": "Resume and remote app-server endpoints are exposed, without a runtime reconnect proof."
+        },
+        "model": {
+          "support": "advertised",
+          "reason": "The mode exposes model and local-provider selection."
+        },
+        "usage": {
+          "support": "unknown",
+          "reason": "Help did not specify a machine-readable usage field."
+        }
+      }
+    },
+    {
+      "id": "exec_jsonl",
+      "protocol": "process-jsonl",
+      "transport": "stdin-stdout",
+      "stability": "unlabelled",
+      "capabilities": {
+        "create": {
+          "support": "advertised",
+          "reason": "The exec command accepts a prompt argument or standard input."
+        },
+        "resume": {
+          "support": "advertised",
+          "reason": "Exec has a resume command accepting a session identifier or --last."
+        },
+        "observe": {
+          "support": "advertised",
+          "reason": "The --json option advertises events on stdout as JSONL."
+        },
+        "steer": {
+          "support": "unavailable",
+          "reason": "No mid-run steering operation is advertised for the one-shot exec process."
+        },
+        "cancel": {
+          "support": "unknown",
+          "reason": "Process termination is possible at the host layer, but no provider cancellation semantics were advertised or observed."
+        },
+        "approval": {
+          "support": "advertised",
+          "reason": "Exec exposes sandbox and approval-policy controls."
+        },
+        "reconnect": {
+          "support": "unknown",
+          "reason": "Resume is advertised after process completion; reconnecting to a running exec was not advertised."
+        },
+        "model": {
+          "support": "advertised",
+          "reason": "Exec exposes model and local-provider selection."
+        },
+        "usage": {
+          "support": "unknown",
+          "reason": "JSONL is advertised, but the safe help probe did not establish whether usage records are emitted."
+        }
+      }
+    },
+    {
+      "id": "mcp_server",
+      "protocol": "mcp",
+      "transport": "stdio",
+      "stability": "unlabelled",
+      "capabilities": {
+        "create": {
+          "support": "unknown",
+          "reason": "Help advertises a server but does not list its methods."
+        },
+        "resume": {
+          "support": "unknown",
+          "reason": "No MCP method schema was obtained."
+        },
+        "observe": {
+          "support": "unknown",
+          "reason": "No MCP resource, notification, or event schema was obtained."
+        },
+        "steer": {
+          "support": "unknown",
+          "reason": "No MCP method schema was obtained."
+        },
+        "cancel": {
+          "support": "unknown",
+          "reason": "Transport-level or task cancellation was not described by help."
+        },
+        "approval": {
+          "support": "unknown",
+          "reason": "Help exposes configuration overrides but not an MCP approval protocol."
+        },
+        "reconnect": {
+          "support": "unavailable",
+          "reason": "The advertised transport is stdio and no reconnect mechanism was shown."
+        },
+        "model": {
+          "support": "unknown",
+          "reason": "Model selection may be configurable, but no MCP method contract was probed."
+        },
+        "usage": {
+          "support": "unknown",
+          "reason": "No MCP result schema was obtained."
+        }
+      }
+    },
+    {
+      "id": "app_server",
+      "protocol": "codex-app-server",
+      "transport": "stdio-unix-websocket",
+      "stability": "experimental",
+      "runtime_status": "not_running",
+      "capabilities": {
+        "create": {
+          "support": "unknown",
+          "reason": "Server and schema generation are advertised, but task methods were not generated or invoked."
+        },
+        "resume": {
+          "support": "unknown",
+          "reason": "No generated protocol schema was captured."
+        },
+        "observe": {
+          "support": "unknown",
+          "reason": "No generated event schema was captured."
+        },
+        "steer": {
+          "support": "unknown",
+          "reason": "No generated protocol schema was captured."
+        },
+        "cancel": {
+          "support": "unknown",
+          "reason": "No generated protocol schema was captured."
+        },
+        "approval": {
+          "support": "unknown",
+          "reason": "No generated approval schema was captured."
+        },
+        "reconnect": {
+          "support": "advertised",
+          "reason": "Daemon, proxy, remote endpoints, and daemon version operations are advertised, but session continuity was not runtime-proven."
+        },
+        "model": {
+          "support": "unknown",
+          "reason": "No generated protocol schema was captured."
+        },
+        "usage": {
+          "support": "unknown",
+          "reason": "No generated protocol schema was captured."
+        }
+      }
+    },
+    {
+      "id": "exec_server",
+      "protocol": "codex-exec-server",
+      "transport": "stdio-or-websocket",
+      "stability": "experimental",
+      "capabilities": {
+        "create": {
+          "support": "unknown",
+          "reason": "The service is advertised, but its request schema was not available from help."
+        },
+        "resume": {
+          "support": "unknown",
+          "reason": "No lifecycle request schema was obtained."
+        },
+        "observe": {
+          "support": "unknown",
+          "reason": "No event schema was obtained."
+        },
+        "steer": {
+          "support": "unknown",
+          "reason": "No lifecycle request schema was obtained."
+        },
+        "cancel": {
+          "support": "unknown",
+          "reason": "No lifecycle request schema was obtained."
+        },
+        "approval": {
+          "support": "unknown",
+          "reason": "No approval schema was obtained."
+        },
+        "reconnect": {
+          "support": "unknown",
+          "reason": "WebSocket and remote registration are advertised, but reconnection semantics were not."
+        },
+        "model": {
+          "support": "unknown",
+          "reason": "No request schema was obtained."
+        },
+        "usage": {
+          "support": "unknown",
+          "reason": "No result schema was obtained."
+        }
+      }
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "installed_cli_binary",
+      "kind": "binary",
+      "evidence_level": "observed",
+      "sha256": "cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40",
+      "raw_artifact_retained": false,
+      "reason": "Only the digest and sanitized version were retained; the absolute executable path was excluded."
+    },
+    {
+      "id": "version_output",
+      "kind": "command-output",
+      "evidence_level": "observed",
+      "command": ["codex", "--version"],
+      "value": "codex-cli 0.147.0",
+      "sha256": null,
+      "raw_artifact_retained": false,
+      "reason": "The normalized value was recorded but raw command output was not persisted."
+    },
+    {
+      "id": "help_inventory",
+      "kind": "command-output-set",
+      "evidence_level": "help-advertised",
+      "sha256": null,
+      "raw_artifact_retained": false,
+      "reason": "Help output was inspected and normalized without persisting a raw artifact."
+    },
+    {
+      "id": "authentication_status",
+      "kind": "exit-status",
+      "evidence_level": "observed",
+      "command": ["codex", "login", "status"],
+      "exit_code": 0,
+      "output_retained": false,
+      "sha256": null,
+      "reason": "Output was suppressed to avoid exposing an account identifier or credential detail."
+    },
+    {
+      "id": "app_server_daemon_status",
+      "kind": "exit-status",
+      "evidence_level": "observed",
+      "command": ["codex", "app-server", "daemon", "version"],
+      "exit_code": 1,
+      "normalized_result": "local-control-socket-absent",
+      "sha256": null,
+      "raw_artifact_retained": false,
+      "reason": "The raw error contained an absolute local path and was not retained."
+    }
+  ],
+  "safe_probe_argv": [
+    ["codex", "--version"],
+    ["codex", "--help"],
+    ["codex", "exec", "--help"],
+    ["codex", "exec", "resume", "--help"],
+    ["codex", "review", "--help"],
+    ["codex", "login", "--help"],
+    ["codex", "login", "status", "--help"],
+    ["codex", "login", "status"],
+    ["codex", "mcp", "--help"],
+    ["codex", "mcp-server", "--help"],
+    ["codex", "app-server", "--help"],
+    ["codex", "app-server", "generate-json-schema", "--help"],
+    ["codex", "app-server", "generate-ts", "--help"],
+    ["codex", "app-server", "daemon", "--help"],
+    ["codex", "app-server", "daemon", "version", "--help"],
+    ["codex", "app-server", "daemon", "version"],
+    ["codex", "app-server", "proxy", "--help"],
+    ["codex", "exec-server", "--help"],
+    ["codex", "remote-control", "--help"],
+    ["codex", "features", "--help"],
+    ["codex", "features", "list", "--help"],
+    ["codex", "doctor", "--help"],
+    ["codex", "sandbox", "--help"],
+    ["codex", "debug", "--help"],
+    ["codex", "resume", "--help"],
+    ["codex", "fork", "--help"],
+    ["codex", "archive", "--help"],
+    ["codex", "delete", "--help"]
+  ],
+  "unsafe_methods": [
+    {
+      "name": "--dangerously-bypass-approvals-and-sandbox",
+      "label": "EXTREMELY DANGEROUS",
+      "used": false
+    },
+    {
+      "name": "--dangerously-bypass-hook-trust",
+      "label": "DANGEROUS",
+      "used": false
+    },
+    {
+      "name": "delete --force",
+      "label": "permanent-session-deletion",
+      "used": false
+    }
+  ],
+  "experimental_methods": [
+    "app-server",
+    "app-server generate-json-schema",
+    "app-server generate-ts",
+    "exec-server",
+    "remote-control",
+    "cloud"
+  ],
+  "fallbacks": [
+    {
+      "order": 1,
+      "mode": "exec_jsonl",
+      "when": "Use when a bounded noninteractive process is sufficient.",
+      "lost_guarantees": [
+        "No help-proven mid-run steering",
+        "No help-proven provider cancellation acknowledgement",
+        "No help-proven reconnect to a running process",
+        "No help-proven usage event"
+      ]
+    },
+    {
+      "order": 2,
+      "mode": "mcp_server",
+      "when": "Use only after a separate method-schema probe establishes the required operations.",
+      "lost_guarantees": [
+        "No captured method schema",
+        "No observed lifecycle semantics",
+        "Stdio transport has no advertised reconnect mechanism"
+      ]
+    },
+    {
+      "order": 3,
+      "mode": "interactive_cli",
+      "when": "Use for owner-supervised manual coordination when no suitable programmatic contract is proven.",
+      "lost_guarantees": [
+        "No machine event stream contract",
+        "No unattended lifecycle guarantee",
+        "No structured usage evidence"
+      ]
+    },
+    {
+      "order": 4,
+      "mode": "unavailable",
+      "when": "Stop rather than silently selecting an experimental or capability-incomplete surface.",
+      "lost_guarantees": [
+        "No provider execution"
+      ]
+    }
+  ],
+  "deferred_questions": [
+    "Does exec JSONL emit stable usage records?",
+    "Can a running exec be steered or cancelled with provider acknowledgement?",
+    "Which methods and notifications are exposed by mcp-server?",
+    "Which app-server lifecycle methods remain after experimental methods are excluded?",
+    "Does resume preserve model, approval, and sandbox state?"
+  ],
+  "provenance": {
+    "source": "locally-installed-first-party-cli",
+    "method": "non-mutating local version, help, exit-status, and binary-digest probes",
+    "help_is_runtime_proof": false,
+    "model_calls": 0,
+    "network_operations": 0,
+    "credential_values_read": false,
+    "configuration_contents_read": false,
+    "files_written_by_probe": 0,
+    "normalization": "Raw outputs were summarized; absolute paths, identities, credentials, environment values, and private configuration were excluded.",
+    "digest_recommendation": "For a future retained evidence set, serialize each sanitized {argv,exit_code,stdout,stderr} record canonically, hash each record with SHA-256, then hash the sorted digest manifest. Hash normal and experimental schema bundles separately and bind both manifests to the exact CLI binary digest."
+  }
+}

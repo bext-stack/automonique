@@ -1,0 +1,432 @@
+{
+  "artifacts": [
+    {
+      "argv": [
+        "codex",
+        "--version"
+      ],
+      "artifact": "version",
+      "evidence_level": "version_observed",
+      "exit_code": 0,
+      "path": "codex/version.txt",
+      "provider": "codex",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "2ef8ecb5518502df74e0759747eac62abe0fc7f608a11df8870e417658e15f88",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "codex",
+        "--help"
+      ],
+      "artifact": "root-help",
+      "evidence_level": "help_only",
+      "exit_code": 0,
+      "path": "codex/root-help.txt",
+      "provider": "codex",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "06753db87db629886e7900a3b05a687daa224954fa6f26bc25f8b526eaa88592",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "codex",
+        "exec",
+        "--help"
+      ],
+      "artifact": "exec-help",
+      "evidence_level": "help_only",
+      "exit_code": 0,
+      "path": "codex/exec-help.txt",
+      "provider": "codex",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "8db3cf65d9be38cee042782bdcda38924a6ad5037b37d10097a96219aa53b4df",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "codex",
+        "mcp-server",
+        "--help"
+      ],
+      "artifact": "mcp-server-help",
+      "evidence_level": "help_only",
+      "exit_code": 0,
+      "path": "codex/mcp-server-help.txt",
+      "provider": "codex",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "4dab1b85f60670ff4109dd2a9be08b6f6e1fb089387576b1efe431b76b5f351d",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "codex",
+        "app-server",
+        "--help"
+      ],
+      "artifact": "app-server-help",
+      "evidence_level": "help_only",
+      "exit_code": 0,
+      "path": "codex/app-server-help.txt",
+      "provider": "codex",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "c50484ab3be04f85c58b2b5e4f03538876c2a7055af8a5ec74c8a31632faa03c",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "claude",
+        "--version"
+      ],
+      "artifact": "version",
+      "evidence_level": "version_observed",
+      "exit_code": 0,
+      "path": "claude/version.txt",
+      "provider": "claude",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "e37ccb4dc1755e9f53a0f0aed3124d292b79d44274404a00ef7cf6997e4cbf07",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "claude",
+        "--help"
+      ],
+      "artifact": "root-help",
+      "evidence_level": "help_only",
+      "exit_code": 0,
+      "path": "claude/root-help.txt",
+      "provider": "claude",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "71ad650f59e08ae40ede14c534db4f49d8590ee5a4f92f6da2882d3a5560fea6",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "claude",
+        "agents",
+        "--help"
+      ],
+      "artifact": "agents-help",
+      "evidence_level": "help_only",
+      "exit_code": 0,
+      "path": "claude/agents-help.txt",
+      "provider": "claude",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "0c858c28609241dacb5f7360ed5fc093083c535e7d03250d447606c0416015d6",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "claude",
+        "auth",
+        "status",
+        "--help"
+      ],
+      "artifact": "auth-status-help",
+      "evidence_level": "help_only",
+      "exit_code": 0,
+      "path": "claude/auth-status-help.txt",
+      "provider": "claude",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "c93dc6b8f067eeea492bbe3b167e03fbc9e8478b8c7a9a3cc978b6edcf173e41",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "jcode",
+        "--no-update",
+        "version",
+        "--json"
+      ],
+      "artifact": "version",
+      "evidence_level": "version_observed",
+      "exit_code": 0,
+      "path": "jcode/version.txt",
+      "provider": "jcode",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "500bb1e5f27db495ed3b410c691a71b035e139550d2013357f4415df40603249",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "jcode",
+        "--no-update",
+        "--help"
+      ],
+      "artifact": "root-help",
+      "evidence_level": "help_only",
+      "exit_code": 0,
+      "path": "jcode/root-help.txt",
+      "provider": "jcode",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "f7750c0245bc278bac47c89a78586ecfc296847786df78c2f18bb4804b2046e3",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "jcode",
+        "--no-update",
+        "run",
+        "--help"
+      ],
+      "artifact": "run-help",
+      "evidence_level": "help_only",
+      "exit_code": 0,
+      "path": "jcode/run-help.txt",
+      "provider": "jcode",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "2a65cc97d3cf687489c8ccc38f991583144bd51572580c2c4bd99f6387d71ea7",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "jcode",
+        "--no-update",
+        "api-bridge",
+        "--help"
+      ],
+      "artifact": "api-bridge-help",
+      "evidence_level": "help_only",
+      "exit_code": 0,
+      "path": "jcode/api-bridge-help.txt",
+      "provider": "jcode",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "0dc09c4a8b25e9a5bd018190622817bbe9976e450dbf557d13e39fefcfd605a5",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "jcode",
+        "--no-update",
+        "acp",
+        "--help"
+      ],
+      "artifact": "acp-help",
+      "evidence_level": "help_only",
+      "exit_code": 0,
+      "path": "jcode/acp-help.txt",
+      "provider": "jcode",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "7bac1c54c518f8a75608a4b195ad8f93c82594aeac9fbb0d44597f067efe5968",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "jcode",
+        "--no-update",
+        "server",
+        "--help"
+      ],
+      "artifact": "server-help",
+      "evidence_level": "help_only",
+      "exit_code": 0,
+      "path": "jcode/server-help.txt",
+      "provider": "jcode",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "fea900fcb123e8c13565195ca619b2b18b7c370778064ad16b99f34c5dfae819",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "opencode",
+        "--pure",
+        "--version"
+      ],
+      "artifact": "version",
+      "evidence_level": "version_observed",
+      "exit_code": 0,
+      "path": "opencode/version.txt",
+      "provider": "opencode",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "7234f217eaf6a0878c3459a3f03569af8f8ebfc3d249a11686d1bff036eef8b9",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "opencode",
+        "--pure",
+        "--help"
+      ],
+      "artifact": "root-help",
+      "evidence_level": "help_only",
+      "exit_code": 0,
+      "path": "opencode/root-help.txt",
+      "provider": "opencode",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "96d09534fd355bdf1b91e310e9f4c70366833b2bfba4c976a0004beac48d79cf",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "opencode",
+        "--pure",
+        "serve",
+        "--help"
+      ],
+      "artifact": "serve-help",
+      "evidence_level": "help_only",
+      "exit_code": 0,
+      "path": "opencode/serve-help.txt",
+      "provider": "opencode",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "e5ac5f9250397c38508f338a2672c71a5c5664e68e57559564782c0b0074750a",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "opencode",
+        "--pure",
+        "acp",
+        "--help"
+      ],
+      "artifact": "acp-help",
+      "evidence_level": "help_only",
+      "exit_code": 0,
+      "path": "opencode/acp-help.txt",
+      "provider": "opencode",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "a2722780763321315b8329666d105fd6c9e0dc1e37ef813b02099deae41336f3",
+      "source": "installed_cli"
+    },
+    {
+      "argv": [
+        "opencode",
+        "--pure",
+        "run",
+        "--help"
+      ],
+      "artifact": "run-help",
+      "evidence_level": "help_only",
+      "exit_code": 0,
+      "path": "opencode/run-help.txt",
+      "provider": "opencode",
+      "sanitizers": [
+        "ansi_removed",
+        "line_endings_lf",
+        "trailing_whitespace_removed",
+        "workspace_and_home_paths_redacted",
+        "credential_like_output_refused"
+      ],
+      "sha256": "edaae1248ab4b8802c4e6fd46af36008d3272f2d56daa40d2b0c65bb84da0092",
+      "source": "installed_cli"
+    }
+  ],
+  "capture_date": "2026-08-09",
+  "immutable_base": "972f94894dc84921454bfdde131c9fa8efa57ec2",
+  "schema": "automonique.provider-probe-manifest/v1"
+}

@@ -221,6 +221,7 @@ ITEM_STATUS = {
     "R0-03": "done",
     "R0-04": "done",
     "R0-05": "done",
+    "R0-06": "done",
     "R0-17": "done",
     "R0-18": "done",
 }

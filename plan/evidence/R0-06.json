@@ -1,0 +1,67 @@
+{
+  "item": "R0-06",
+  "base": "972f94894dc84921454bfdde131c9fa8efa57ec2",
+  "checks": [
+    {
+      "name": "Versions",
+      "command": "python3 tools/provider_inventory.py verify --capture-date 2026-08-09",
+      "result": "pass",
+      "output": "Claude 2.1.226, Codex 0.147.0, Jcode 0.68.0 and OpenCode 1.17.18 were observed locally with model-free version commands"
+    },
+    {
+      "name": "Native surfaces",
+      "command": "python3 -m unittest tools/test_provider_inventory.py",
+      "result": "pass",
+      "output": "15 modes record protocol, transport, schema source or explicit unavailable reason, stability and evidence level"
+    },
+    {
+      "name": "Capabilities",
+      "command": "python3 -m unittest tools/test_provider_inventory.py",
+      "result": "pass",
+      "output": "every mode answers create, resume, observe, steer, cancel, approval, reconnect, model and usage with support class and reason"
+    },
+    {
+      "name": "Authentication",
+      "command": "normalized provider document validation",
+      "result": "pass",
+      "output": "coarse categories only: Claude logged_in, Codex configured, Jcode unknown and OpenCode unknown; no identity, credential, account or subscription value retained"
+    },
+    {
+      "name": "Fallbacks",
+      "command": "normalized provider document validation",
+      "result": "pass",
+      "output": "each provider has an ordered fallback or explicit rejection policy with lost guarantees and no silent downgrade"
+    },
+    {
+      "name": "Reproducibility",
+      "command": "python3 tools/provider_inventory.py verify --capture-date 2026-08-09",
+      "result": "pass",
+      "output": "21 sanitized raw artifacts, their manifest and the normalized inventory are byte-reproducible for unchanged installed binaries"
+    },
+    {
+      "name": "Provenance",
+      "command": "python3 tools/provider_inventory.py verify --capture-date 2026-08-09",
+      "result": "pass",
+      "output": "every retained raw artifact records provider, source class, exact argv array, exit code, evidence level, sanitizers, path and SHA-256 digest"
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "contributing_subagents": 3
+  },
+  "deferred_to_R0_07": [
+    "runtime lifecycle, typed cancellation, approval, reconnect and usage semantics",
+    "provider event and schema compatibility under real no-op fixtures",
+    "authentication usability without retaining account or credential identifiers"
+  ],
+  "safety": {
+    "model_calls": 0,
+    "server_starts": 0,
+    "authentication_mutations": 0,
+    "network_intended_commands": 0,
+    "credential_values_retained": 0,
+    "absolute_executable_paths_retained": 0
+  },
+  "notes": "Help-advertised behavior remains distinct from observed runtime behavior. Missing or unsafe-to-probe facts are unknown or unavailable with reasons; no help text is treated as lifecycle proof."
+}

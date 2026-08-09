@@ -1,0 +1,364 @@
+{
+  "schema": "automonique.provider-surface/v1",
+  "provider": "jcode",
+  "capture_date": "2026-08-09",
+  "expected_base": "972f94894dc84921454bfdde131c9fa8efa57ec2",
+  "licence_class": "Elastic-2.0",
+  "binary": {
+    "command": "jcode",
+    "version": {
+      "value": "0.68.0",
+      "display": "jcode v0.68.0 (fcf53909f)",
+      "evidence_level": "observed"
+    },
+    "build": {
+      "git_hash": "fcf53909f",
+      "git_tag": "v0.68.0",
+      "build_time": "2026-08-05 19:39:30 +0000",
+      "release_build": true,
+      "evidence_level": "observed"
+    },
+    "digest": {
+      "value": null,
+      "reason": "Executable hashing was outside this bounded provider-command probe."
+    }
+  },
+  "authentication": {
+    "category": "unknown",
+    "evidence_level": "observed_command_only",
+    "reason": "The no-call auth-status command exited successfully with JSON, but its two top-level values were deliberately redacted and it exposed no allow-listed non-sensitive configured or authenticated boolean. No usable auth state is claimed."
+  },
+  "provider_lifecycle": {
+    "daemon": "advertised",
+    "start": ["jcode", "--no-update", "server", "start", "--json"],
+    "reload": ["jcode", "--no-update", "server", "reload", "--json"],
+    "stop": ["jcode", "--no-update", "server", "stop", "--force", "--json"],
+    "evidence_level": "advertised",
+    "reason": "Installed help advertises daemon start, graceful reload preserving live sessions, and forced stop escalating from SIGTERM to SIGKILL while dropping in-flight sessions. None was executed."
+  },
+  "modes": [
+    {
+      "id": "acp",
+      "role": "preferred_interoperability_adapter",
+      "transport": "stdio_adapter_to_daemon_socket",
+      "protocol": "Agent Client Protocol",
+      "schema_version": null,
+      "schema_reason": "The installed command identifies an ACP adapter but does not expose protocol version, initialize response or schema.",
+      "stability": "advertised_public_boundary",
+      "evidence_level": "advertised",
+      "capabilities": {
+        "create": {
+          "support": "unknown",
+          "reason": "ACP mode is advertised, but create-session semantics were not exposed by help or exercised."
+        },
+        "resume": {
+          "support": "advertised",
+          "reason": "The ACP command accepts the global resume option, but exact session binding was not exercised."
+        },
+        "observe": {
+          "support": "unknown",
+          "reason": "No local ACP event schema or capability negotiation result was captured."
+        },
+        "steer": {
+          "support": "unknown",
+          "reason": "Installed help does not state whether later prompt input steers an active turn or queues another."
+        },
+        "cancel": {
+          "support": "unknown",
+          "reason": "Installed help exposes no ACP cancel operation or terminal-state contract."
+        },
+        "approval": {
+          "support": "unknown",
+          "reason": "Installed help exposes no ACP permission request and response schema."
+        },
+        "reconnect": {
+          "support": "advertised",
+          "reason": "The adapter is described as backed by a daemon selected by socket, but reconnect and reconciliation behavior were not exercised."
+        },
+        "model": {
+          "support": "advertised",
+          "reason": "Provider, provider-profile and model selection flags are accepted by the ACP command according to help."
+        },
+        "usage": {
+          "support": "unknown",
+          "reason": "No ACP usage event or response schema was exposed by installed help."
+        }
+      }
+    },
+    {
+      "id": "api_bridge",
+      "role": "stable_sdk_candidate",
+      "transport": "unix_socket",
+      "protocol": "jcode-harness-api",
+      "schema_version": null,
+      "schema_reason": "Installed help calls this the stable harness API for the TypeScript SDK but exposes no request, event or version schema.",
+      "stability": "advertised_stable",
+      "evidence_level": "advertised",
+      "capabilities": {
+        "create": {
+          "support": "unknown",
+          "reason": "The installed api-bridge help does not enumerate SDK operations."
+        },
+        "resume": {
+          "support": "unknown",
+          "reason": "The bridge help does not define persisted session identifiers or resume semantics."
+        },
+        "observe": {
+          "support": "unknown",
+          "reason": "No bridge event or subscription schema is exposed by installed help."
+        },
+        "steer": {
+          "support": "unknown",
+          "reason": "No bridge steering operation is exposed by installed help."
+        },
+        "cancel": {
+          "support": "unknown",
+          "reason": "No bridge cancellation operation or terminal-state contract is exposed by installed help."
+        },
+        "approval": {
+          "support": "unknown",
+          "reason": "No bridge approval schema is exposed by installed help."
+        },
+        "reconnect": {
+          "support": "unknown",
+          "reason": "The Unix-socket transport is advertised, but SDK reconnect and reconciliation semantics are not exposed."
+        },
+        "model": {
+          "support": "advertised",
+          "reason": "Provider, profile and model options are accepted by the bridge command according to help."
+        },
+        "usage": {
+          "support": "unknown",
+          "reason": "No usage projection is exposed by installed bridge help."
+        }
+      }
+    },
+    {
+      "id": "run_ndjson",
+      "role": "last_resort_one_shot_cli",
+      "transport": "stdio",
+      "protocol": "jcode-ndjson",
+      "schema_version": null,
+      "schema_reason": "The run command advertises JSON and NDJSON formats but exposes no result or event schema version.",
+      "stability": "advertised",
+      "evidence_level": "advertised",
+      "capabilities": {
+        "create": {
+          "support": "advertised",
+          "reason": "The run command sends one message and exits."
+        },
+        "resume": {
+          "support": "advertised",
+          "reason": "The run command accepts the global resume option, but exact identity persistence was not exercised."
+        },
+        "observe": {
+          "support": "advertised",
+          "reason": "Machine-readable single JSON and streaming NDJSON output are advertised."
+        },
+        "steer": {
+          "support": "unavailable",
+          "reason": "The command is explicitly a single-message process that exits."
+        },
+        "cancel": {
+          "support": "unknown",
+          "reason": "No typed cancellation operation is advertised; external process termination has unproven provider terminal semantics."
+        },
+        "approval": {
+          "support": "unknown",
+          "reason": "No programmatic approval request and response channel is described for run mode."
+        },
+        "reconnect": {
+          "support": "advertised",
+          "reason": "A later process can request resume, but exact history reconciliation and adoption were not exercised."
+        },
+        "model": {
+          "support": "advertised",
+          "reason": "Provider, profile and model selection are advertised."
+        },
+        "usage": {
+          "support": "unknown",
+          "reason": "Installed run help does not define usage fields in JSON or NDJSON output."
+        }
+      }
+    },
+    {
+      "id": "debug_socket",
+      "role": "diagnostics_only",
+      "transport": "local_debug_socket",
+      "protocol": "jcode-debug",
+      "schema_version": null,
+      "schema_reason": "The installed debug command gives example command names but no stable schema or version.",
+      "stability": "debug_unsafe",
+      "evidence_level": "advertised",
+      "capabilities": {
+        "create": {
+          "support": "advertised",
+          "reason": "Debug help names start and create_session commands."
+        },
+        "resume": {
+          "support": "unknown",
+          "reason": "Sessions can be targeted by identifier, but resume semantics are not described."
+        },
+        "observe": {
+          "support": "advertised",
+          "reason": "Debug help names sessions, state and history commands and can broadcast TUI state."
+        },
+        "steer": {
+          "support": "unknown",
+          "reason": "A message command is named, but its active-turn versus follow-up semantics are not described."
+        },
+        "cancel": {
+          "support": "unknown",
+          "reason": "No cancel command or terminal-state contract is listed by help."
+        },
+        "approval": {
+          "support": "unknown",
+          "reason": "A generic tool command is named, but no permission response contract is exposed."
+        },
+        "reconnect": {
+          "support": "advertised",
+          "reason": "The CLI can connect to a selected server socket and target a session, but reconciliation was not exercised."
+        },
+        "model": {
+          "support": "advertised",
+          "reason": "Provider, profile and model selection flags remain available."
+        },
+        "usage": {
+          "support": "unknown",
+          "reason": "No stable usage projection is described for the debug surface."
+        }
+      }
+    }
+  ],
+  "safe_probe_argv": [
+    ["jcode", "--version"],
+    ["jcode", "--help"],
+    ["jcode", "version", "--help"],
+    ["jcode", "serve", "--help"],
+    ["jcode", "acp", "--help"],
+    ["jcode", "run", "--help"],
+    ["jcode", "api-bridge", "--help"],
+    ["jcode", "server", "--help"],
+    ["jcode", "auth", "--help"],
+    ["jcode", "auth", "status", "--help"],
+    ["jcode", "provider", "--help"],
+    ["jcode", "session", "--help"],
+    ["jcode", "--no-update", "version", "--json"],
+    ["jcode", "--no-update", "connect", "--help"],
+    ["jcode", "--no-update", "debug", "--help"],
+    ["jcode", "--no-update", "ambient", "--help"],
+    ["jcode", "--no-update", "permissions", "--help"],
+    ["jcode", "--no-update", "model", "--help"],
+    ["jcode", "--no-update", "server", "start", "--help"],
+    ["jcode", "--no-update", "server", "reload", "--help"],
+    ["jcode", "--no-update", "server", "stop", "--help"],
+    ["jcode", "--no-update", "auth", "status", "--json"]
+  ],
+  "unsafe_or_experimental": [
+    {
+      "method": "debug and --debug-socket",
+      "label": "debug_data_exposure",
+      "reason": "Installed help labels the command as a debug socket and says debug-socket broadcasts all TUI state changes."
+    },
+    {
+      "method": "--trace",
+      "label": "sensitive_diagnostics",
+      "reason": "Installed help says it logs tool inputs, outputs and token usage."
+    },
+    {
+      "method": "self-dev",
+      "label": "canary",
+      "reason": "Installed help explicitly describes self-development as a canary session."
+    },
+    {
+      "method": "ambient trigger",
+      "label": "autonomous_side_effect",
+      "reason": "It manually triggers an ambient cycle and was deliberately not invoked."
+    },
+    {
+      "method": "server stop --force",
+      "label": "destructive_lifecycle",
+      "reason": "Installed help says it drops live sessions and escalates from SIGTERM to SIGKILL."
+    },
+    {
+      "method": "--tools '*' or all",
+      "label": "unrestricted_toolset",
+      "reason": "Installed help describes this as the unrestricted full toolset."
+    },
+    {
+      "method": "default auto-update",
+      "label": "network_and_binary_mutation",
+      "reason": "Release builds advertise automatic update checks by default; Automonique-owned invocations must pass --no-update."
+    }
+  ],
+  "fallbacks": {
+    "ordered": [
+      {
+        "rank": 1,
+        "mode": "acp",
+        "eligibility": "Preferred public interoperability boundary after protocol and lifecycle conformance."
+      },
+      {
+        "rank": 2,
+        "mode": "api_bridge",
+        "eligibility": "Candidate only after the released SDK contract and schema are approved and pinned."
+      },
+      {
+        "rank": 3,
+        "mode": "run_ndjson",
+        "eligibility": "Only for work that does not require live steering or an approval pause."
+      },
+      {
+        "rank": 4,
+        "mode": "reject",
+        "eligibility": "Required when no mode proves all capabilities required by the work."
+      }
+    ],
+    "lost_guarantees": [
+      {
+        "from": "acp",
+        "to": "api_bridge",
+        "losses": [
+          "standard protocol capability negotiation until the SDK contract is pinned",
+          "known approval and cancellation semantics until conformance is run"
+        ]
+      },
+      {
+        "from": "acp_or_api_bridge",
+        "to": "run_ndjson",
+        "losses": [
+          "live protocol control",
+          "in-process steering",
+          "typed approval pause and response",
+          "strong replay or adoption guarantees"
+        ]
+      },
+      {
+        "from": "any_programmatic_mode",
+        "to": "external_process_supervision",
+        "losses": [
+          "typed provider cancellation",
+          "provider-reported terminal cancellation state",
+          "provider-native timeout semantics"
+        ]
+      }
+    ]
+  },
+  "deferred_questions": [
+    "Which ACP protocol version and negotiated capabilities does this binary expose?",
+    "What are the stable api-bridge request, event, error and cancellation schemas?",
+    "How are session, turn, item and request identities represented in each mode?",
+    "How are permission requests paused and answered?",
+    "Does graceful daemon reload preserve and reconcile active protocol streams in practice?",
+    "Which JSON or NDJSON fields are authoritative messages, previews and usage?",
+    "Which authenticated provider categories can be reported without exposing identity?"
+  ],
+  "provenance": {
+    "source_kind": "locally_installed_release_binary",
+    "source_description": "Sanitized stdout and stderr from fixed version, help and local auth-status argv.",
+    "evidence_boundary": "Version, build metadata and command availability were observed. Mode and capability semantics derived from help are only advertised. No prompt, model call, daemon mutation or runtime lifecycle test occurred.",
+    "credential_handling": "Status output was parsed by a privacy filter; no scalar identity, account, provider-profile, credential or configuration value was retained.",
+    "raw_artifact": null,
+    "raw_artifact_reason": "Raw help and status output was not retained in this provider record to avoid persisting machine-local or private fields."
+  }
+}
