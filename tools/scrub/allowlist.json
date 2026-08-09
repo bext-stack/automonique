@@ -1,0 +1,29 @@
+{
+  "schema": "automonique.scrub-allowlist/v1",
+  "entries": [
+    {
+      "id": "product-mascot",
+      "retained": "Monique",
+      "reason": "first-party mascot and product identity",
+      "decision": "plan/contracts/BOOT-003.md#allow-list--retained-by-decision"
+    },
+    {
+      "id": "repository-organization",
+      "retained": "bext-stack",
+      "reason": "repository organization required by SECURITY.md",
+      "decision": "plan/contracts/BOOT-003.md#allow-list--retained-by-decision"
+    },
+    {
+      "id": "neutral-compatibility-prefix",
+      "retained": "legacy*",
+      "reason": "dormant compatibility identifiers are neutral by construction",
+      "decision": "plan/gates.md#gate-scrub"
+    },
+    {
+      "id": "structural-reference-names",
+      "retained": "legacy source filenames, commands, and environment names",
+      "reason": "structural references explicitly permitted by AGENTS.md",
+      "decision": "plan/gates.md#gate-scrub"
+    }
+  ]
+}

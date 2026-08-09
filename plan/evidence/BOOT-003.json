@@ -1,0 +1,71 @@
+{
+  "item": "BOOT-003",
+  "status": "partial_blocked",
+  "base": "1a116ee2473cdd6c28f9c206e612e4ed64d54b2b",
+  "checks": [
+    {
+      "name": "Clean tree",
+      "command": "python3 tools/scrub/scan.py",
+      "result": "pass",
+      "output": "all tracked/current-or-reachable blobs and one reachable commit message scanned; zero synthetic findings"
+    },
+    {
+      "name": "File content",
+      "command": "python3 -m unittest discover -s tools/scrub -p 'test_*.py'",
+      "result": "pass",
+      "output": "all four public synthetic families were detected in staged Git blobs, including binary-adjacent bytes"
+    },
+    {
+      "name": "Commit message",
+      "command": "python3 -m unittest discover -s tools/scrub -p 'test_*.py'",
+      "result": "pass",
+      "output": "a synthetic identifier in a non-tip ancestor commit message was detected"
+    },
+    {
+      "name": "Allow list",
+      "command": "python3 -m unittest discover -s tools/scrub -p 'test_*.py'",
+      "result": "pass",
+      "output": "four retained decisions have non-empty reasons and plan references; retained current-tree identifiers produced no finding and the allow list cannot suppress a protected rule"
+    },
+    {
+      "name": "Message quality",
+      "command": "python3 -m unittest discover -s tools/scrub -p 'test_*.py'",
+      "result": "pass",
+      "output": "diagnostics contain only safe rule/source/location/line fields; matching path bytes are redacted and matched values are absent"
+    },
+    {
+      "name": "Missing protected rules",
+      "command": "python3 tools/scrub/scan.py --require-protected",
+      "result": "pass",
+      "output": "exit 2 with a non-sensitive configuration error when the protected bundle or HMAC key is absent"
+    }
+  ],
+  "external_completion_check": {
+    "name": "Protected rule installation and publication scan",
+    "result": null,
+    "reason": "The scrub-publication environment and both required Actions secrets are not configured. Installing fingerprints derived from the two owner sanitization passes is outside worker authority, and no permitted input contains those private values. GATE-SCRUB remains open until the owner configures them and the protected main-branch job passes."
+  },
+  "extra_checks": [
+    {
+      "name": "Historical blob",
+      "result": "pass",
+      "output": "a synthetic value added and later deleted remains detectable in reachable Git history"
+    },
+    {
+      "name": "Shallow history",
+      "result": "pass",
+      "output": "publication scanning refuses an incomplete shallow history"
+    },
+    {
+      "name": "Protected fingerprint construction",
+      "result": "pass",
+      "output": "protected rules require complete four-family HMAC-SHA-256 metadata and a separately supplied key of at least 32 bytes"
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "advisory_subagents": 3
+  },
+  "notes": "This is truthful partial evidence, not a completion verdict. No protected value, fingerprint, HMAC key, secret identifier, customer data or private rule source is recorded. BOOT-003 is not marked done and GATE-SCRUB is not closed."
+}

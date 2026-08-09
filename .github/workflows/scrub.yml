@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+name: scrub
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  development-scrub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Prove synthetic scrub failures and redaction
+        run: python3 -m unittest discover -s tools/scrub -p 'test_*.py'
+
+      - name: Scan the complete candidate without protected material
+        run: python3 tools/scrub/scan.py
+
+  publication-scrub:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: scrub-publication
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Scan with protected fingerprints or fail closed
+        env:
+          AUTOMONIQUE_SCRUB_PROTECTED_RULES_B64: ${{ secrets.AUTOMONIQUE_SCRUB_PROTECTED_RULES_B64 }}
+          AUTOMONIQUE_SCRUB_HMAC_KEY_B64: ${{ secrets.AUTOMONIQUE_SCRUB_HMAC_KEY_B64 }}
+        run: python3 tools/scrub/scan.py --require-protected

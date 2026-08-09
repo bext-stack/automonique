@@ -1,0 +1,33 @@
+{
+  "schema": "automonique.scrub-rules/v1",
+  "rules": [
+    {
+      "id": "synthetic-legacy-name",
+      "family": "legacy-name",
+      "algorithm": "sha256",
+      "length": 26,
+      "digest": "eb1ce8c2100f8c2d1cb89ba8d6333010bcff925af984a0ad3a7b47bed490f173"
+    },
+    {
+      "id": "synthetic-third-party-product",
+      "family": "third-party-product",
+      "algorithm": "sha256",
+      "length": 34,
+      "digest": "26c17176d0dceaefbbe849ced81b5eb32e3797e2002c42cd12ff043cf9b3bd47"
+    },
+    {
+      "id": "synthetic-internal-product",
+      "family": "internal-product",
+      "algorithm": "sha256",
+      "length": 31,
+      "digest": "eb3e4269bbc4c4b3f0120fbe8c16bea6b45348b6e615cec302d30356fab14ad1"
+    },
+    {
+      "id": "synthetic-environment-name",
+      "family": "environment-name",
+      "algorithm": "sha256",
+      "length": 31,
+      "digest": "b84fd9b9ef8cf4ef69ee7e7180c692d5d019ec9fdfdc04583d36baed064e019a"
+    }
+  ]
+}
