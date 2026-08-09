@@ -274,6 +274,48 @@ class LabStateStoreTests(unittest.TestCase):
                 attempt_id, "event_nan", "worker.output", {"value": float("nan")}
             )
 
+    def test_transition_effect_is_atomic_and_idempotent(self) -> None:
+        attempt = self.create()
+        digest = hashlib.sha256(b"cancel request").hexdigest()
+        result = {"state": "cancelled"}
+        first_attempt, first_effect, applied = self.store.apply_transition_effect(
+            "action_1",
+            attempt.attempt_id,
+            "unit.cancel",
+            digest,
+            attempt.revision,
+            lab_state.AttemptState.CANCELLED,
+            reason="operator_cancel",
+            result=result,
+        )
+        self.assertTrue(applied)
+        self.assertEqual(lab_state.AttemptState.CANCELLED, first_attempt.state)
+        second_attempt, second_effect, applied = self.store.apply_transition_effect(
+            "action_1",
+            attempt.attempt_id,
+            "unit.cancel",
+            digest,
+            attempt.revision,
+            lab_state.AttemptState.CANCELLED,
+            reason="operator_cancel",
+            result=result,
+        )
+        self.assertFalse(applied)
+        self.assertEqual(first_attempt, second_attempt)
+        self.assertEqual(first_effect, second_effect)
+        self.assertEqual((), self.store.active_leases())
+        with self.assertRaises(lab_state.ConflictError):
+            self.store.apply_transition_effect(
+                "action_1",
+                attempt.attempt_id,
+                "unit.cancel",
+                hashlib.sha256(b"different").hexdigest(),
+                attempt.revision,
+                lab_state.AttemptState.CANCELLED,
+                reason="operator_cancel",
+                result=result,
+            )
+
     def test_duplicate_record_does_not_advance_sequence(self) -> None:
         attempt = self.create()
         first = self.store.append_event(

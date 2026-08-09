@@ -736,6 +736,114 @@ class LabStateStore:
             )
         return self.get_effect(effect_id)
 
+    def apply_transition_effect(
+        self,
+        effect_id: str,
+        attempt_id: str,
+        kind: str,
+        request_sha256: str,
+        expected_revision: int,
+        new_state: AttemptState,
+        *,
+        reason: str,
+        result: dict[str, Any],
+    ) -> tuple[Attempt, Effect, bool]:
+        """Atomically apply or replay one revisioned state-changing effect."""
+
+        effect_id = _bounded_id(effect_id, "effect ID")
+        attempt_id = _bounded_id(attempt_id, "attempt ID")
+        kind = _bounded_id(kind, "effect kind")
+        request_sha256 = _digest(request_sha256, "request digest")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValidationError("expected revision must be a non-negative integer")
+        try:
+            new_state = AttemptState(new_state)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("attempt state is unknown") from exc
+        reason = _bounded_id(reason, "transition reason")
+        result_json, result_sha256 = _payload_document(result, "effect result")
+        now = _utc_now()
+        applied = False
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM effects WHERE effect_id=?", (effect_id,)
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["attempt_id"] != attempt_id
+                    or existing["kind"] != kind
+                    or existing["request_sha256"] != request_sha256
+                ):
+                    raise ConflictError("effect ID belongs to a different request")
+                if existing["status"] != EffectStatus.COMPLETED.value:
+                    raise ConflictError("effect is prepared but not atomically completed")
+                if existing["result_sha256"] != result_sha256:
+                    raise ConflictError("completed effect has a different result")
+            else:
+                row = connection.execute(
+                    "SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError(f"attempt {attempt_id} does not exist")
+                old_state = AttemptState(row["state"])
+                if row["revision"] != expected_revision:
+                    raise ConflictError("attempt revision differs from expected revision")
+                if new_state not in _TRANSITIONS[old_state]:
+                    raise TransitionError(
+                        f"attempt cannot transition from {old_state.value} to {new_state.value}"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO effects(
+                        effect_id,attempt_id,kind,request_sha256,status,
+                        result_sha256,result_json,created_at,updated_at
+                    ) VALUES(?,?,?,?,'completed',?,?,?,?)
+                    """,
+                    (
+                        effect_id,
+                        attempt_id,
+                        kind,
+                        request_sha256,
+                        result_sha256,
+                        result_json,
+                        now,
+                        now,
+                    ),
+                )
+                cursor = connection.execute(
+                    """
+                    UPDATE attempts SET state=?,revision=revision+1,updated_at=?
+                    WHERE attempt_id=? AND revision=?
+                    """,
+                    (new_state.value, now, attempt_id, expected_revision),
+                )
+                if cursor.rowcount != 1:
+                    raise ConflictError("attempt revision changed during transition")
+                self._append_locked(
+                    connection,
+                    attempt_id,
+                    RecordKind.EVENT,
+                    f"state.{expected_revision + 1}",
+                    "attempt.state_changed",
+                    {
+                        "from": old_state.value,
+                        "to": new_state.value,
+                        "reason": reason,
+                    },
+                    now,
+                    None,
+                )
+                if new_state.value in TERMINAL_STATES:
+                    connection.execute(
+                        """
+                        UPDATE leases SET released_at=?
+                        WHERE attempt_id=? AND released_at IS NULL
+                        """,
+                        (now, attempt_id),
+                    )
+                applied = True
+        return self.get_attempt(attempt_id), self.get_effect(effect_id), applied
+
     def get_effect(self, effect_id: str) -> Effect:
         effect_id = _bounded_id(effect_id, "effect ID")
         row = self._connection.execute(

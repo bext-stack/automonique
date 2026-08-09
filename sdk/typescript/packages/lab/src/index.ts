@@ -9,6 +9,15 @@ export {
   type SelectInput,
 } from "./client.ts";
 export {evaluateProviderPolicy, loadProviderInventoryProjection} from "./provider-policy.ts";
+export {
+  FrameProtocolError,
+  FrameTimeoutError,
+  FramedLabTransport,
+  type FrameChannel,
+  type FrameCloseReason,
+  type FrameConnector,
+  type FramedTransportOptions,
+} from "./framed-transport.ts";
 export type {
   InventoryMode,
   PolicyDecision,
