@@ -66,6 +66,14 @@ class GitBrokerTests(unittest.TestCase):
             candidate_paths=paths,
             expected_tree=expected_tree,
             summary="Create bounded candidate",
+            attestation=git_broker.CandidateAttestation(
+                checks="safety-pass",
+                reviewers=0,
+                blocking_findings=0,
+                metrics_sha256="a" * 64,
+                completion=False,
+                evidence_sha256=None,
+            ),
         )
 
     def modify_leased_file(self) -> None:
@@ -94,6 +102,10 @@ class GitBrokerTests(unittest.TestCase):
             self.git("rev-parse", f"{receipt['commit_oid']}^{{tree}}").stdout.strip(),
         )
         self.assertEqual("M leased/a.txt", self.git("status", "--short").stdout.strip())
+        message = self.git("show", "-s", "--format=%B", receipt["commit_oid"]).stdout
+        self.assertIn("Automonique-Checks: safety-pass", message)
+        self.assertIn("Automonique-Metrics: sha256:" + "a" * 64, message)
+        self.assertIn("Automonique-Completion: partial", message)
 
     def test_forbidden_and_unknown_operations_are_denied(self) -> None:
         self.modify_leased_file()

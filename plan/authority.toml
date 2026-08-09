@@ -10,14 +10,34 @@ run_required_checks = true
 run_gate_preflight = true
 create_candidate_branch = true
 create_local_candidate_commit = true
+advance_verified_local_main = true
+publish_verified_origin_main_fast_forward = true
 
-# These remain external regardless of bootstrap mode.
+# The two integration capabilities above are deliberately narrower than a
+# generic merge or push capability. Both require the exact verified candidate,
+# expected-tip compare-and-swap, fast-forward ancestry and an idempotent receipt.
+local_main_ref = "refs/heads/main"
+publication_remote = "origin"
+publication_ref = "refs/heads/main"
+require_exact_tree_verification = true
+require_fast_forward = true
+require_expected_tip = true
+protected_control_self_certification = false
+
+# Generic or higher-impact operations remain external regardless of bootstrap
+# mode. `push = false` prohibits every push except the single configured
+# fast-forward capability above.
 push = false
 merge_protected_branch = false
 administer_repository = false
 sign_release = false
 publish_package = false
 deploy_production = false
+force_update = false
+history_rewrite = false
+edit_remote = false
+other_ref_update = false
+other_remote_update = false
 
 # Review is selected by risk while an owner is supervising. It becomes
 # independently mandatory before autonomous protected-branch integration.

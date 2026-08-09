@@ -14,16 +14,19 @@ candidate commit on an isolated candidate branch. Roles may coincide for
 routine, reversible development work when the evidence says so truthfully.
 
 The owner selects work, chooses review depth from the change's risk, and alone
-accepts or integrates candidates. Agents have no push, protected-branch merge,
-repository-administration, release-signing, publication or production-deploy
-authority.
+configures integration policy. Under the current policy, the bounded primary
+integrator may fast-forward local `main` by compare-and-swap and publish the
+same exact verified commit by a non-force fast-forward to configured
+`origin/main`. This grants no generic push, merge, force, history rewrite,
+other-ref or other-remote mutation, repository administration, release signing,
+package publication or production deployment authority.
 
 An owner's contemporaneous, explicit instruction may delegate one bounded Git
-publication operation. The repository must record the exact remote, branch,
-expected tip, snapshot and recovery reference before execution. This is a
-single-use delegation, not a change to the default authority mode. History
-rewrites additionally require compare-and-swap protection and may not touch
-unlisted refs.
+publication operation outside the configured routine fast-forward path. The
+repository must record the exact remote, branch, expected tip, snapshot and
+recovery reference before execution. This is a single-use delegation, not a
+change to the default authority mode. History rewrites additionally require
+compare-and-swap protection and may not touch unlisted refs.
 
 ### Autonomous protected integration
 
@@ -54,19 +57,40 @@ conditions for development or integration.
 
 ## Routine autonomous integration
 
-The merger service may merge a routine verified change into protected `main`
-only when:
+The bounded integrator may advance local `refs/heads/main` and then configured
+`origin/main` for a routine verified change only when:
 
-- the base revision is still current;
+- the candidate has exactly one parent and it is the recorded current local
+  base revision;
 - leased paths and licence boundaries match the reviewed plan;
 - required builds, tests, security scans, provenance checks, and any reviews
   configured for that contract passed against the exact candidate tree;
 - no unresolved blocking finding exists;
-- no force operation or history rewrite is required; and
-- an idempotent action receipt proves the merge was applied at most once.
+- local `main` advances by compare-and-swap fast-forward only;
+- the advertised configured `origin/main` tip equals the recorded expected
+  remote tip and the push is an ordinary non-force fast-forward of the same
+  local commit;
+- no merge, force operation, history rewrite, other ref or other remote is
+  involved; and
+- idempotent local and remote action receipts prove each effect was applied at
+  most once or reconciled to the exact intended commit.
 
 Conflicts, ambiguous outcomes, source drift, or missing evidence block and
 reconcile; they never trigger a blind retry.
+
+### Partial slices and completion
+
+A bounded partial slice may be committed and pushed when its exact-tree checks
+pass. Its commit, evidence and operator report must identify the slice as
+partial, list the checks actually run and retain the work item as incomplete.
+It cannot close a gate or imply that omitted contract checks passed.
+
+Full completion is a single exact-tree transaction. The final implementation,
+measured metrics, completion evidence and generated plan/status transition are
+part of the same candidate tree, and every contract check runs against that
+tree before either local or remote integration. Missing or failed evidence
+leaves the work partial; compilation or an agent's self-report is not terminal
+evidence.
 
 ## Protected policy changes
 
@@ -82,6 +106,14 @@ Candidates cannot autonomously modify or waive:
 Such a change requires an external exact-revision policy decision. The final
 repository commit may still be authored by the Automonique bot after that
 decision is durably bound to the candidate.
+
+Authority and policy changes are non-retroactive. A candidate cannot use a new
+integration rule, changed required check, changed metric, changed baseline or
+changed budget contained in its own tree to approve that tree. Automatic
+local-main advancement and routine push apply only when the governing policy
+was already integrated at the candidate's admitted base. A protected-control
+candidate needs external owner acceptance bound to its exact revision before
+integration, even when all deterministic checks pass.
 
 Release signing, package publication, commercial agreement execution, and
 production deployment use separate authorities and receipts.

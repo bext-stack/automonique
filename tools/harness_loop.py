@@ -23,11 +23,12 @@ from typing import Any
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from tools import git_broker, guides, program  # noqa: E402
+from tools import git_broker, guides, local_integration, program  # noqa: E402
+from plan import baseline as plan_baseline  # noqa: E402
 
 STATE_SCHEMA = "automonique.harness-loop-state/v1"
 PACKET_SCHEMA = "automonique.harness-objective-packet/v1"
-TERMINAL_STATUSES = frozenset({"candidate_committed", "stopped"})
+TERMINAL_STATUSES = frozenset({"integrated_and_pushed", "stopped"})
 CHECKABLE_SESSION_STATUSES = frozenset({"claimed", "candidate_ready"})
 
 
@@ -671,6 +672,10 @@ def candidate_request(
     required = ("run_id", "work_id", "base", "branch")
     if any(not isinstance(state.get(field), str) for field in required):
         raise LoopError("candidate state identity is incomplete")
+    metric_snapshot = plan_baseline.snapshot()
+    metrics_sha256 = hashlib.sha256(
+        json.dumps({"counters": metric_snapshot["counters"]}, sort_keys=True).encode()
+    ).hexdigest()
     return git_broker.CandidateRequest(
         operation=git_broker.OPERATION,
         run_id=state["run_id"],
@@ -681,6 +686,14 @@ def candidate_request(
         candidate_paths=tuple(sorted(candidate_paths)),
         expected_tree=state.get("candidate_tree", ""),
         summary=summary,
+        attestation=git_broker.CandidateAttestation(
+            checks="safety-pass",
+            reviewers=0,
+            blocking_findings=0,
+            metrics_sha256=metrics_sha256,
+            completion=False,
+            evidence_sha256=None,
+        ),
     )
 
 
@@ -738,6 +751,45 @@ def _commit_candidate_locked(summary: str) -> int:
             "candidate_ref": receipt["ref"],
             "candidate_commit": receipt["commit_oid"],
             "candidate_tree": receipt["tree_oid"],
+            "updated_at": utc_now(),
+        }
+    )
+    write_json_atomic(state_path(config), state)
+    authority_path = ROOT / "plan/authority.toml"
+    candidate_receipt = (
+        (ROOT / config["state_path"]).parent
+        / "git-candidates"
+        / state["run_id"]
+        / "receipt.json"
+    )
+    integrator = local_integration.LocalIntegration(
+        ROOT,
+        (ROOT / config["state_path"]).parent,
+        authority_path,
+        file_sha256(authority_path),
+    )
+    try:
+        integration_receipt = integrator.integrate(
+            candidate_receipt, file_sha256(candidate_receipt)
+        )
+    except local_integration.IntegrationError as exc:
+        state.update(
+            {
+                "status": "reconciliation_required",
+                "stop_reason": "integration_reconciliation_required",
+                "updated_at": utc_now(),
+            }
+        )
+        write_json_atomic(state_path(config), state)
+        raise LoopError("local or remote integration requires reconciliation") from exc
+    state.update(
+        {
+            "status": "integrated_and_pushed",
+            "stop_reason": "integrated_and_pushed",
+            "integrated_commit": integration_receipt["commit_oid"],
+            "integration_receipt_sha256": local_integration.canonical_sha256(
+                integration_receipt
+            ),
             "updated_at": utc_now(),
         }
     )
@@ -981,6 +1033,7 @@ def main() -> int:
     except (
         LoopError,
         git_broker.BrokerError,
+        local_integration.IntegrationError,
         program.ProgramError,
         OSError,
         subprocess.CalledProcessError,

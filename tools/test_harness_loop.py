@@ -138,14 +138,28 @@ class HarnessLoopTests(unittest.TestCase):
         finally:
             harness_loop.read_state = original
 
-    def test_committed_candidate_does_not_block_a_new_attempt(self) -> None:
+    def test_integrated_candidate_does_not_block_a_new_attempt(self) -> None:
         original = harness_loop.read_state
         harness_loop.read_state = lambda config: {
-            "status": "candidate_committed",
+            "status": "integrated_and_pushed",
             "driver": "codex_session",
         }
         try:
             harness_loop.refuse_active_attempt({})
+        finally:
+            harness_loop.read_state = original
+
+    def test_candidate_commit_without_integration_blocks_a_new_attempt(self) -> None:
+        original = harness_loop.read_state
+        harness_loop.read_state = lambda config: {
+            "status": "candidate_committed",
+            "driver": "codex_session",
+            "run_id": "session_test",
+            "work_id": "R0-19",
+        }
+        try:
+            with self.assertRaisesRegex(harness_loop.LoopError, "already owns"):
+                harness_loop.refuse_active_attempt({})
         finally:
             harness_loop.read_state = original
 
@@ -207,6 +221,9 @@ class HarnessLoopTests(unittest.TestCase):
         self.assertEqual(("tools/", "plan/"), request.allowed_paths)
         self.assertEqual("a" * 40, request.expected_base)
         self.assertEqual("b" * 40, request.expected_tree)
+        self.assertEqual("safety-pass", request.attestation.checks)
+        self.assertEqual(64, len(request.attestation.metrics_sha256))
+        self.assertFalse(request.attestation.completion)
 
     def test_single_worker_lock_rejects_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

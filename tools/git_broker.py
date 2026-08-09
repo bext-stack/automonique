@@ -44,10 +44,24 @@ FORBIDDEN_OPERATIONS = frozenset(
 RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 WORK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 OID = re.compile(r"^[0-9a-f]{40}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class BrokerError(Exception):
     """A candidate request cannot be performed without violating policy."""
+
+
+@dataclasses.dataclass(frozen=True)
+class CandidateAttestation:
+    checks: str
+    reviewers: int
+    blocking_findings: int
+    metrics_sha256: str
+    completion: bool
+    evidence_sha256: str | None
+
+    def document(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,6 +75,7 @@ class CandidateRequest:
     candidate_paths: tuple[str, ...]
     expected_tree: str
     summary: str
+    attestation: CandidateAttestation
 
     def document(self) -> dict[str, Any]:
         return {
@@ -73,6 +88,7 @@ class CandidateRequest:
             "candidate_paths": list(self.candidate_paths),
             "expected_tree": self.expected_tree,
             "summary": self.summary,
+            "attestation": self.attestation.document(),
         }
 
 
@@ -248,6 +264,28 @@ class CandidateBroker:
             raise BrokerError("summary must be a non-empty trimmed line of at most 100 characters")
         if any(ord(ch) < 32 for ch in request.summary):
             raise BrokerError("summary contains a control character")
+        attestation = request.attestation
+        if attestation.checks not in {"safety-pass", "contract-pass"}:
+            raise BrokerError("candidate check attestation is invalid")
+        if (
+            not isinstance(attestation.reviewers, int)
+            or attestation.reviewers < 0
+            or not isinstance(attestation.blocking_findings, int)
+            or attestation.blocking_findings < 0
+        ):
+            raise BrokerError("candidate review attestation is invalid")
+        if not SHA256.fullmatch(attestation.metrics_sha256):
+            raise BrokerError("candidate metric attestation is not full SHA-256")
+        if attestation.evidence_sha256 is not None and not SHA256.fullmatch(
+            attestation.evidence_sha256
+        ):
+            raise BrokerError("candidate evidence attestation is invalid")
+        if attestation.completion and (
+            attestation.checks != "contract-pass"
+            or attestation.blocking_findings != 0
+            or attestation.evidence_sha256 is None
+        ):
+            raise BrokerError("completed candidate lacks passing contract evidence")
         leases = tuple(_validate_path(path) for path in request.allowed_paths)
         paths = tuple(sorted({_validate_path(path) for path in request.candidate_paths}))
         if not leases or not paths:
@@ -344,6 +382,14 @@ class CandidateBroker:
             candidate_paths=candidate_paths,
             expected_tree=expected_base,
             summary="Snapshot candidate",
+            attestation=CandidateAttestation(
+                checks="safety-pass",
+                reviewers=0,
+                blocking_findings=0,
+                metrics_sha256="0" * 64,
+                completion=False,
+                evidence_sha256=None,
+            ),
         )
         request = self._validate_request(request)
         self._validate_source(request)
@@ -378,6 +424,14 @@ class CandidateBroker:
             f"{request.summary}\n\n"
             f"Automonique-Work: {request.work_id}\n"
             f"Automonique-Run: {request.run_id}\n"
+            f"Automonique-Checks: {request.attestation.checks}\n"
+            f"Automonique-Review: {request.attestation.reviewers}-pass/"
+            f"{request.attestation.blocking_findings}-blocking\n"
+            f"Automonique-Metrics: sha256:{request.attestation.metrics_sha256}\n"
+            f"Automonique-Completion: "
+            f"{'complete' if request.attestation.completion else 'partial'}\n"
+            f"Automonique-Evidence: "
+            f"{('sha256:' + request.attestation.evidence_sha256) if request.attestation.evidence_sha256 else 'null'}\n"
             f"Automonique-Tree: {tree}\n"
         )
         intent = {
@@ -412,6 +466,7 @@ class CandidateBroker:
                 candidate_paths=tuple(raw["candidate_paths"]),
                 expected_tree=raw["expected_tree"],
                 summary=raw["summary"],
+                attestation=CandidateAttestation(**raw["attestation"]),
             )
         except (KeyError, TypeError) as exc:
             raise BrokerError("candidate intent request is incomplete") from exc

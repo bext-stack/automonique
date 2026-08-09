@@ -10,10 +10,16 @@ must not have moved backwards.
 
     python3 plan/gate.py --item BOOT-001 \
         --summary "wire plan integrity into CI" \
-        --files plan/check.py .github/workflows/plan.yml
+        --files plan/check.py .github/workflows/plan.yml \
+        --dry-run
 
-    ... --commit      also stage exactly those files and commit with attestation
-    ... --dry-run     report the verdict, record nothing
+    ... --dry-run     run the complete-contract preflight and record nothing
+    ... --partial     run a non-completion preflight and record nothing
+
+``--commit`` currently refuses.  Completion is a transaction containing the
+evidence, metric baseline, history record, done status and regenerated plan
+artifacts.  Until this gate can construct and verify that exact final tree
+before committing it must not create an incomplete completion commit.
 
 Exit code is non-zero when the gate refuses, so a loop can branch on it.
 """
@@ -44,10 +50,16 @@ VERIFICATION_SECTION = re.compile(
 
 refusals: list[str] = []
 notices: list[str] = []
+FULL_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def refuse(msg: str) -> None:
     refusals.append(msg)
+
+
+def reset_diagnostics() -> None:
+    refusals.clear()
+    notices.clear()
 
 
 def git(*args: str) -> str:
@@ -138,11 +150,19 @@ def check_readiness(it: dict) -> None:
         refuse(f"{it['id']} is already marked done")
 
 
-def check_evidence(it: dict, required: list[str]) -> dict | None:
+def check_evidence(
+    it: dict, required: list[str], *, completion: bool = True
+) -> dict | None:
     path = EVIDENCE / f"{it['id']}.json"
     if not path.exists():
-        refuse(f"no evidence at plan/evidence/{it['id']}.json — "
-               f"the contract names {len(required)} check(s) that must be answered")
+        message = (
+            f"no evidence at plan/evidence/{it['id']}.json — "
+            f"the contract names {len(required)} check(s) that must be answered"
+        )
+        if completion:
+            refuse(message)
+        else:
+            notices.append(message + "; partial preflight cannot authorize completion")
         return None
     try:
         ev = json.loads(path.read_text())
@@ -161,21 +181,77 @@ def check_evidence(it: dict, required: list[str]) -> dict | None:
             continue
         result = c.get("result")
         if result == "fail":
-            refuse(f"check {name!r} failed")
+            message = f"check {name!r} failed"
+            if completion:
+                refuse(message)
+            else:
+                notices.append(message + "; partial preflight only")
         elif result is None:
-            if not c.get("reason"):
+            reason = c.get("reason")
+            if not reason:
                 refuse(f"check {name!r} has a null result with no reason — "
                        f"missing evidence is null with a reason, never absent")
+            elif completion:
+                refuse(
+                    f"check {name!r} is unmeasured and cannot authorize completion: "
+                    f"{reason}"
+                )
             else:
-                notices.append(f"check {name!r} unmeasured: {c['reason']}")
+                notices.append(
+                    f"check {name!r} unmeasured: {reason}; partial preflight only"
+                )
         elif result != "pass":
-            refuse(f"check {name!r} has unrecognized result {result!r}")
+            message = f"check {name!r} has unrecognized result {result!r}"
+            if completion:
+                refuse(message)
+            else:
+                notices.append(message + "; partial preflight only")
 
     extra = set(answered) - set(required)
     if extra:
         notices.append(f"evidence answers {len(extra)} check(s) not in the "
                        f"contract: {', '.join(sorted(extra))}")
+
+    review = ev.get("review")
+    if not isinstance(review, dict):
+        refuse("evidence review record is missing or not an object")
+    else:
+        for field in ("reviewers", "blocking_findings"):
+            value = review.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                refuse(f"evidence review {field} must be a non-negative integer")
+        blocking = review.get("blocking_findings")
+        if isinstance(blocking, int) and not isinstance(blocking, bool) and blocking > 0:
+            message = f"evidence has {blocking} unresolved blocking review finding(s)"
+            if completion:
+                refuse(message)
+            else:
+                notices.append(message + "; partial preflight only")
     return ev
+
+
+def attestation_trailers(it: dict, ev: dict, after: dict) -> list[str]:
+    """Return completion trailers only for a fully measured preflight."""
+
+    digest = after.get("digest")
+    if not isinstance(digest, str) or not FULL_SHA256.fullmatch(digest):
+        raise ValueError("metrics digest must be a full 64-hex SHA-256")
+    review = ev.get("review")
+    if not isinstance(review, dict):
+        raise ValueError("completion evidence lacks a review record")
+    reviewers = review.get("reviewers")
+    blocking = review.get("blocking_findings")
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in (reviewers, blocking)
+    ):
+        raise ValueError("completion review counts must be non-negative integers")
+    return [
+        f"Automonique-Work: {it['id']}",
+        "Automonique-Checks: pass",
+        f"Automonique-Review: {reviewers}-pass/{blocking}-blocking",
+        f"Automonique-Metrics: sha256:{digest}",
+    ]
 
 
 def check_lease(it: dict, declared: list[str]) -> list[str]:
@@ -239,14 +315,37 @@ def check_metric(allow_flat: str | None) -> tuple[dict, dict]:
 
 
 def main() -> int:
+    reset_diagnostics()
     ap = argparse.ArgumentParser()
     ap.add_argument("--item", required=True)
     ap.add_argument("--summary", required=True)
     ap.add_argument("--files", nargs="+", required=True)
     ap.add_argument("--allow-no-metric-change", metavar="REASON")
-    ap.add_argument("--commit", action="store_true")
-    ap.add_argument("--dry-run", action="store_true")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--commit", action="store_true")
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument(
+        "--partial",
+        action="store_true",
+        help="read-only partial preflight; never authorizes completion",
+    )
     args = ap.parse_args()
+
+    if args.commit:
+        print(
+            "REFUSE: --commit is disabled until baseline, history, done status "
+            "and regenerated plan artifacts can be included and verified in "
+            "one exact completion tree",
+            file=sys.stderr,
+        )
+        return 1
+    if not args.dry_run and not args.partial:
+        print(
+            "REFUSE: choose --dry-run for a full completion preflight or "
+            "--partial for a truthful non-completion preflight",
+            file=sys.stderr,
+        )
+        return 1
 
     it = load_item(args.item)
     if it is None:
@@ -255,7 +354,7 @@ def main() -> int:
 
     required = contract_checks(args.item)
     check_readiness(it)
-    ev = check_evidence(it, required)
+    ev = check_evidence(it, required, completion=not args.partial)
     files = check_lease(it, args.files)
     check_plan_integrity()
     fell, after = check_metric(args.allow_no_metric_change)
@@ -279,49 +378,17 @@ def main() -> int:
     if refusals:
         print(f"\ngate: FAIL ({len(refusals)} refusal(s))", file=sys.stderr)
         return 1
-    print("\ngate: PASS")
-
-    if args.dry_run:
-        print("(dry run — nothing recorded)")
+    if args.partial:
+        print("\npreflight: PARTIAL PASS")
+        print("(read-only — does not authorize completion, evidence, metrics or commit)")
         return 0
 
-    head = git("rev-parse", "HEAD")
-    if args.commit:
-        existing = [p for p in files if (ROOT / p).exists()]
-        if existing:
-            git("add", "--", *existing)
-        title = f"{it['epic'].lower()}({it['id']}): {args.summary}"
-        # The commit-metrics contract from ai-implementation-harness.md.
-        trailers = "\n".join([
-            f"Automonique-Work: {it['id']}",
-            "Automonique-Checks: pass",
-            f"Automonique-Review: {ev.get('review', {}).get('reviewers', 0)}-pass/"
-            f"{ev.get('review', {}).get('blocking_findings', 0)}-blocking",
-            f"Automonique-Metrics: sha256:{after['digest']}",
-        ])
-        body = f"{args.summary}\n\nSpecification debt: {after['total']}.\n\n{trailers}"
-        git("commit", "-m", title, "-m", body)
-        head = git("rev-parse", "HEAD")
-        print(f"committed {head[:10]}: {title}")
-
-    BASELINE.write_text(json.dumps(after, indent=2) + "\n")
-    with HISTORY.open("a") as fh:
-        fh.write(json.dumps({
-            "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-            "item": it["id"],
-            "epic": it["epic"],
-            "summary": args.summary,
-            "files": files,
-            "debt_total": after["total"],
-            "counters": after["counters"],
-            "digest": after["digest"],
-            "no_metric_change_reason": args.allow_no_metric_change,
-            "head": head,
-        }) + "\n")
-    print(f"recorded in plan/history.jsonl; baseline rolled forward to "
-          f"{after['total']}")
-    print(f"\nNow set status = \"done\" for {it['id']} — the gate authorized it, "
-          f"nothing else may.")
+    assert ev is not None
+    print("\ngate: PASS")
+    print("attestation")
+    for trailer in attestation_trailers(it, ev, after):
+        print(f"           {trailer}")
+    print("(dry run — complete-contract preflight only; nothing recorded)")
     return 0
 
 

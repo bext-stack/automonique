@@ -193,7 +193,10 @@ def snapshot() -> dict:
 
 def digest(snap: dict) -> str:
     payload = json.dumps({"counters": snap["counters"]}, sort_keys=True)
-    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+    # This value is written after the ``sha256:`` commit-trailer prefix.  Keep
+    # the complete digest: a truncated display token is not a SHA-256
+    # attestation and cannot safely bind completion evidence.
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def main() -> int:
