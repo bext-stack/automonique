@@ -1,0 +1,81 @@
+{
+  "item": "R0-19",
+  "base": "69db4ca85c1ab1aab7ad3fe3e9225bf0f33db055",
+  "checks": [
+    {
+      "name": "Durable resume",
+      "command": "python3 -m unittest tools.test_lab_state tools.test_lab_controller tools.test_lab_scenario",
+      "result": "pass",
+      "output": "23 tests prove queued, running and paused attempts, checkpoints, evidence, leases and monotonic journals survive database/controller/server close and reopen before an exact-checkpoint resume"
+    },
+    {
+      "name": "Lease exclusion",
+      "command": "python3 -m unittest tools.test_lab_state tools.test_lab_controller",
+      "result": "pass",
+      "output": "segment-prefix overlap is denied transactionally across two SQLite connections and two controllers; a concurrent same-path race has one winner, while terminal transitions release leases atomically"
+    },
+    {
+      "name": "Immutable base",
+      "command": "python3 -m unittest tools.test_git_broker tools.test_worktree_allocator tools.test_lab_controller",
+      "result": "pass",
+      "output": "candidate-tree, branch, HEAD, dirty-path and detached-worktree drift are refused; controller selection and resume deny repository or isolated-allocation drift before an effect"
+    },
+    {
+      "name": "Build budget",
+      "command": "python3 -W error::ResourceWarning -m unittest tools.test_build_broker",
+      "result": "pass",
+      "output": "9 tests cover fixed typed recipes, wall and CPU termination, bounded captured output, writable-file ceiling, PID pre-spawn denial, missing host accounting denial and descendant process-group cleanup"
+    },
+    {
+      "name": "Git broker",
+      "command": "python3 -m unittest tools.test_git_broker tools.test_local_integration",
+      "result": "pass",
+      "output": "leased exact paths at the admitted base produce one deterministic candidate tree and one namespaced proposal ref; exact verified candidates advance local and origin main only through expected-tip non-force CAS receipts"
+    },
+    {
+      "name": "Forbidden Git",
+      "command": "python3 -m unittest tools.test_git_broker tools.test_local_integration",
+      "result": "pass",
+      "output": "generic push, merge, force, reset, checkout, rebase, stash, tag, remote edit and history rewrite requests are absent or explicitly denied; tests use temporary local repositories and remotes"
+    },
+    {
+      "name": "Provider boundary",
+      "command": "bun test sdk/typescript/packages/lab/test/provider-policy.test.ts",
+      "result": "pass",
+      "output": "7 tests require loader-derived inventory and surface digests, bounded host policy, sufficient capability evidence, safe declared modes and explicit ordered fallbacks; unknown, debug, unsafe and experimental modes are denied"
+    },
+    {
+      "name": "Scenario client",
+      "command": "bun test sdk/typescript/packages/lab/test && npx --offline tsc -p sdk/typescript/packages/lab/tsconfig.json",
+      "result": "pass",
+      "output": "24 tests and 90 assertions cover select, observe, exact-checkpoint resume, cancel, idempotent receipts, request/response coordinates, cursors, direct bounded framing, abort and timeout; offline strict typecheck passes"
+    },
+    {
+      "name": "Recovery",
+      "command": "python3 -m unittest tools.test_git_broker tools.test_local_integration tools.test_lab_state tools.test_lab_controller tools.test_lab_scenario",
+      "result": "pass",
+      "output": "intent-only and ref-before-receipt Git windows reconcile to one commit/effect; atomic action replay has one state transition; controller/server restart resumes durable state; a live interrupted build fails closed without respawn pending external PID-identity reconciliation"
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "contributing_subagents": 3
+  },
+  "safety": {
+    "model_calls": 0,
+    "provider_starts": 0,
+    "authentication_reads_or_mutations": 0,
+    "external_network_calls_in_runtime_tests": 0,
+    "arbitrary_argv_surfaces": 0,
+    "worker_git_credentials": 0
+  },
+  "limitations": [
+    "the controller is synthetic-only; real provider modes remain denied until runtime lifecycle evidence is observed",
+    "the same-user local socket server is Linux-only, sequential and one-request-per-connection",
+    "the TypeScript framed transport uses an injected authenticated channel; Unix socket authentication belongs to the outer connector",
+    "an already-spawned build whose controller identity is lost fails closed and requires external PID-identity reconciliation rather than unsafe adoption or duplicate execution",
+    "full plan completion still requires one atomic exact-tree transaction containing this evidence, the done transition, regenerated artifacts, post-completion metrics and history"
+  ],
+  "notes": "The implementation is a proposal-only development harness and does not use the unfinished product daemon or provider credentials. Deterministic checks are not described as independent review. R0-19 must remain open until atomic completion records are landed."
+}

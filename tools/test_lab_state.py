@@ -137,6 +137,31 @@ class LabStateStoreTests(unittest.TestCase):
             restored_evidence.authority,
         )
 
+    def test_queued_and_running_attempts_survive_restart(self) -> None:
+        queued = self.create("queued_restart", ("src/",))
+        running = self.create("running_restart", ("docs/",))
+        running = self.store.transition_attempt(
+            running.attempt_id,
+            running.revision,
+            lab_state.AttemptState.RUNNING,
+            reason="admitted",
+        )
+        self.store.close()
+        self.store = lab_state.LabStateStore(self.database, self.repository)
+
+        self.assertEqual(
+            lab_state.AttemptState.QUEUED,
+            self.store.get_attempt(queued.attempt_id).state,
+        )
+        self.assertEqual(
+            lab_state.AttemptState.RUNNING,
+            self.store.get_attempt(running.attempt_id).state,
+        )
+        self.assertCountEqual(
+            [("queued_restart", "src"), ("running_restart", "docs")],
+            self.store.active_leases(),
+        )
+
     def test_segment_prefix_conflicts_across_connections(self) -> None:
         self.create(leases=("src/lib/",))
         with lab_state.LabStateStore(self.database, self.repository) as other:

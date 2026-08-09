@@ -676,6 +676,25 @@ def candidate_request(
     metrics_sha256 = hashlib.sha256(
         json.dumps({"counters": metric_snapshot["counters"]}, sort_keys=True).encode()
     ).hexdigest()
+    evidence_path = ROOT / "plan" / "evidence" / f"{state['work_id']}.json"
+    evidence_sha256: str | None = None
+    reviewers = 0
+    blocking_findings = 0
+    if evidence_path.exists():
+        evidence = load_json(evidence_path)
+        if evidence.get("item") != state["work_id"]:
+            raise LoopError("completion evidence names a different work item")
+        review = evidence.get("review")
+        if not isinstance(review, dict):
+            raise LoopError("completion evidence lacks a review record")
+        reviewers = review.get("reviewers")
+        blocking_findings = review.get("blocking_findings")
+        if any(
+            type(value) is not int or value < 0
+            for value in (reviewers, blocking_findings)
+        ):
+            raise LoopError("completion evidence review counts are invalid")
+        evidence_sha256 = file_sha256(evidence_path)
     return git_broker.CandidateRequest(
         operation=git_broker.OPERATION,
         run_id=state["run_id"],
@@ -688,11 +707,11 @@ def candidate_request(
         summary=summary,
         attestation=git_broker.CandidateAttestation(
             checks="safety-pass",
-            reviewers=0,
-            blocking_findings=0,
+            reviewers=reviewers,
+            blocking_findings=blocking_findings,
             metrics_sha256=metrics_sha256,
             completion=False,
-            evidence_sha256=None,
+            evidence_sha256=evidence_sha256,
         ),
     )
 

@@ -223,6 +223,13 @@ class HarnessLoopTests(unittest.TestCase):
         self.assertEqual("b" * 40, request.expected_tree)
         self.assertEqual("safety-pass", request.attestation.checks)
         self.assertEqual(64, len(request.attestation.metrics_sha256))
+        evidence = harness_loop.ROOT / "plan/evidence/R0-19.json"
+        self.assertEqual(
+            harness_loop.file_sha256(evidence),
+            request.attestation.evidence_sha256,
+        )
+        self.assertEqual(0, request.attestation.reviewers)
+        self.assertEqual(0, request.attestation.blocking_findings)
         self.assertFalse(request.attestation.completion)
 
     def test_single_worker_lock_rejects_overlap(self) -> None:
