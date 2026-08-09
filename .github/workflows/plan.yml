@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+name: plan
+
+# The executable plan is only load-bearing if it is enforced. This runs the
+# integrity gate, proves the graph is reproducible from its source, and proves
+# the gate can still fail. See plan/contracts/BOOT-001.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integrity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'   # tomllib is stdlib from 3.11
+
+      - name: Plan integrity and lightweight source licence policy
+        run: python3 plan/check.py --verify
+
+      - name: Graph is reproducible from the work breakdown
+        run: |
+          python3 plan/generate.py --stdout > /tmp/regenerated.toml
+          if ! diff -u plan/work-graph.toml /tmp/regenerated.toml; then
+            echo "::error::plan/work-graph.toml does not match plan/generate.py output."
+            echo "Run 'python3 plan/generate.py' and commit the result."
+            exit 1
+          fi
+
+      - name: Implementation DAG is reproducible and drift-safe
+        run: |
+          python3 tools/program.py --verify
+          python3 -m unittest tools/test_program.py
+
+      - name: Foreground lifecycle spike remains portable
+        run: python3 spikes/foreground-lifecycle/test_lifecycle.py
+
+      - name: Derived files are committed
+        run: |
+          python3 plan/check.py >/dev/null
+          python3 plan/baseline.py >/dev/null
+          if ! git diff --quiet -- plan/ready.md plan/baseline.json; then
+            echo "::error::plan/ready.md or plan/baseline.json is stale."
+            echo "Run 'python3 plan/check.py && python3 plan/baseline.py' and commit."
+            git --no-pager diff -- plan/ready.md plan/baseline.json
+            exit 1
+          fi
+
+      - name: The gate can still fail
+        run: python3 plan/selftest.py
+
+      - name: Specification debt
+        run: python3 plan/baseline.py

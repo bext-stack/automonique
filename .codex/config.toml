@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 3

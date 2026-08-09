@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://automonique.dev/schema/dev-program-v1.json",
+  "title": "Automonique development program",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "source", "items"],
+  "properties": {
+    "schema": {"const": "automonique.dev-program/v1"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["graph", "graph_sha256", "item_count"],
+      "properties": {
+        "graph": {"const": "plan/work-graph.toml"},
+        "graph_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "item_count": {"type": "integer", "minimum": 1}
+      }
+    },
+    "items": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/item"}
+    }
+  },
+  "$defs": {
+    "stringArray": {"type": "array", "items": {"type": "string"}},
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "epic", "track", "title", "summary", "depends_on",
+        "blocked_by_gates", "licence", "allowed_paths", "closes_gate",
+        "status", "contract", "runnable"
+      ],
+      "properties": {
+        "id": {"type": "string"},
+        "epic": {"type": "string"},
+        "track": {"type": "string"},
+        "title": {"type": "string"},
+        "summary": {"type": ["string", "null"]},
+        "depends_on": {"$ref": "#/$defs/stringArray"},
+        "blocked_by_gates": {"$ref": "#/$defs/stringArray"},
+        "licence": {"enum": ["Elastic-2.0", "Apache-2.0"]},
+        "allowed_paths": {"$ref": "#/$defs/stringArray"},
+        "closes_gate": {"type": ["string", "null"]},
+        "status": {"type": "string"},
+        "contract": {"type": ["string", "null"]},
+        "runnable": {"type": "boolean"}
+      }
+    }
+  }
+}

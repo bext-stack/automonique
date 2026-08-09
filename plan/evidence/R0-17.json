@@ -1,0 +1,66 @@
+{
+  "item": "R0-17",
+  "base": "a1dee042101ec2d9e4853ba051e3a6c692142602",
+  "checks": [
+    {
+      "name": "Coverage",
+      "command": "python3 tools/program.py --verify",
+      "result": "pass",
+      "output": "All 375 source graph nodes occur exactly once in the generated program."
+    },
+    {
+      "name": "Dependencies",
+      "command": "python3 -m unittest tools/test_program.py",
+      "result": "pass",
+      "output": "All 490 dependency edges and every blocking-gate list match the source graph."
+    },
+    {
+      "name": "Authority",
+      "command": "python3 -m unittest tools/test_program.py",
+      "result": "pass",
+      "output": "Track, licence, allowed paths and status match; R0-01 demonstrates that an unspecified item is non-runnable."
+    },
+    {
+      "name": "Reproducibility",
+      "command": "python3 tools/program.py --stdout | cmp - .automonique/dev/program.yaml",
+      "result": "pass",
+      "output": "Two in-memory generations and the committed artifact were byte-identical."
+    },
+    {
+      "name": "Forward drift",
+      "command": "python3 -m unittest tools.test_program.ProgramTests.test_source_node_removal_is_named tools.test_program.ProgramTests.test_source_edge_removal_is_named",
+      "result": "pass",
+      "output": "Removing a source node or edge produced an error naming the item and changed field."
+    },
+    {
+      "name": "Reverse drift",
+      "command": "python3 -m unittest tools.test_program.ProgramTests.test_generated_node_invention_is_named",
+      "result": "pass",
+      "output": "An invented generated node was rejected by its R99-99 ID."
+    },
+    {
+      "name": "Plan regression",
+      "command": "python3 plan/check.py --verify && python3 plan/selftest.py",
+      "result": "pass",
+      "output": "375 plan items passed integrity checks and all 12 negative plan cases were detected."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "owner-supervised implementation trial"
+  },
+  "extra_checks": [
+    {
+      "name": "Schema declaration",
+      "command": "python3 -m unittest tools.test_program.ProgramTests.test_schema_declares_exact_item_fields",
+      "result": "pass"
+    },
+    {
+      "name": "Python compilation",
+      "command": "python3 -m compileall -q plan tools",
+      "result": "pass"
+    }
+  ],
+  "notes": "The generated file uses JSON syntax, a YAML 1.2 subset, so generation and verification require only Python's standard library. The architecture reconciliation is separately authorized by plan/owner-decisions/2026-08-09-foreground-first-trial.md. No service, supervisor configuration, product runtime, dependency, credential, network request or model call was created."
+}

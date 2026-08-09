@@ -1,0 +1,725 @@
+{
+  "schema": "automonique.dev-objectives/v1",
+  "objectives": [
+    {
+      "id": "objective:BOOT-001",
+      "work_id": "BOOT-001",
+      "objective": "Make the executable plan self-verifying, so that every later work item can claim an immutable base and a checkable dependency set.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 6,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Integrity",
+        "Reproducibility",
+        "Drift, forward",
+        "Drift, reverse",
+        "Cycle",
+        "Contract"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached."
+      ],
+      "hill_climbability": 85,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        ".github/workflows/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/BOOT-001.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:BOOT-002",
+      "work_id": "BOOT-002",
+      "objective": "Provide verifiable identity separation for installations whose owner chooses that hardening.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 4,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Protected write boundary",
+        "Signature verifies",
+        "Declared separation",
+        "Truthful evidence"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached."
+      ],
+      "hill_climbability": 60,
+      "autonomous_eligible": false,
+      "allowed_paths": [
+        ".github/",
+        "plan/",
+        "GOVERNANCE.md",
+        "CONTRIBUTING.md",
+        "PROVENANCE.md"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/BOOT-002.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:BOOT-003",
+      "work_id": "BOOT-003",
+      "objective": "Prevent private identifiers from re-entering a repository intended to be public.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 6,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Clean tree",
+        "File content",
+        "Commit message",
+        "Allow list",
+        "Message quality",
+        "Missing protected rules"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached."
+      ],
+      "hill_climbability": 80,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        ".github/workflows/",
+        "tools/scrub/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/BOOT-003.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:BOOT-004",
+      "work_id": "BOOT-004",
+      "objective": "Let a parity oracle run against the legacy implementation without leaking that implementation into any agent's context.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 7,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Source text",
+        "Traceback",
+        "Credential",
+        "Identifier",
+        "Error path",
+        "Log path",
+        "Review record"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached."
+      ],
+      "hill_climbability": 45,
+      "autonomous_eligible": false,
+      "allowed_paths": [
+        "tools/oracle/",
+        "plan/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/BOOT-004.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:BOOT-005",
+      "work_id": "BOOT-005",
+      "objective": "Keep licence hygiene cheap during development. The existing plan check verifies that commentable source files have an SPDX identifier and that it matches the repository path: product paths are `Elastic-2.0`; `sdk/`, `integrations/`, and `connectors/` are `Apache-2.0`.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 3,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Header presence",
+        "Path mapping",
+        "Regression fixtures"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached."
+      ],
+      "hill_climbability": 95,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "LICENSE-POLICY.md",
+        "README.md",
+        "AGENTS.md",
+        "xtask/",
+        ".github/workflows/",
+        "plan/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/BOOT-005.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R0-03",
+      "work_id": "R0-03",
+      "objective": "Prove the portable control-plane lifecycle with directly launched foreground processes: readiness, replacement warm-up, failed replacement fallback, bounded drain, signal handling, and clean shutdown. No service manager, self-daemonization, persistent unit, or privileged operation is involved.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 6,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Environment",
+        "Successful handoff",
+        "Pre-ready failure",
+        "Post-ready failure",
+        "Foreground control",
+        "Cleanup"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop before mutation if isolation from unrelated processes cannot be proved, if the fixture requires privilege, or if a portable lifecycle field is missing."
+      ],
+      "hill_climbability": 92,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "spikes/foreground-lifecycle/",
+        "plan/",
+        ".github/workflows/plan.yml",
+        ".automonique/dev/program.yaml"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-03.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R0-04",
+      "work_id": "R0-04",
+      "objective": "Prove with a synthetic runner that execution-host identity is independent of a particular control-plane connection, remains discoverable after controller disconnect/reconnect, and can be cancelled with every descendant through a typed backend contract.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 6,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Environment",
+        "Reconnect",
+        "Discoverability",
+        "Cancellation",
+        "Failure",
+        "Cleanup"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop before mutation if descendant ownership cannot be bounded without privilege or if the typed backend contract would need arbitrary argv from model output."
+      ],
+      "hill_climbability": 92,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "spikes/execution-host/",
+        "plan/",
+        ".automonique/dev/program.yaml",
+        ".automonique/dev/objectives.json"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-04.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R0-05",
+      "work_id": "R0-05",
+      "objective": "Pin the foreground control-plane and execution-backend lifecycle contracts from the measured `R0-03` results. Record which guarantees the direct-process baseline provides, which require an optional supervisor adapter, and the evidence threshold that would justify making any adapter recommended.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 6,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Inputs",
+        "Baseline",
+        "Adapters",
+        "Failure behavior",
+        "Portability",
+        "Revisit rule"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop if `R0-03` evidence is missing or the proposed baseline cannot run directly in a foreground test process."
+      ],
+      "hill_climbability": 85,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        "spikes/",
+        ".automonique/dev/",
+        "tools/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-05.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R0-06",
+      "work_id": "R0-06",
+      "objective": "Create a machine-readable, date-stamped inventory for the locally available Jcode, Claude, Codex and opencode programmatic surfaces without consuming a model call or exposing credentials. Record observed versions, protocols, schemas, lifecycle commands, authentication state categories, capabilities, unsafe/experimental methods and representable fallbacks.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 7,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Versions",
+        "Native surfaces",
+        "Capabilities",
+        "Authentication",
+        "Fallbacks",
+        "Reproducibility",
+        "Provenance"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop a provider probe if it requires authentication mutation, network side effects, a model call, private data or acceptance of unreviewed terms."
+      ],
+      "hill_climbability": 85,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        "spikes/",
+        ".automonique/dev/",
+        "tools/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-06.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R0-17",
+      "work_id": "R0-17",
+      "objective": "Generate `.automonique/dev/program.yaml` as the implementation-harness view of every work item, dependency, gate, track, licence, lease and completion state, and reject drift in either direction from the executable plan.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 7,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Coverage",
+        "Dependencies",
+        "Authority",
+        "Reproducibility",
+        "Forward drift",
+        "Reverse drift",
+        "Plan regression"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop if the source graph cannot express a required harness field; report the schema gap rather than inventing authority in generated output."
+      ],
+      "hill_climbability": 95,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        "spikes/",
+        ".automonique/dev/",
+        "tools/",
+        ".github/workflows/plan.yml"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-17.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R0-18",
+      "work_id": "R0-18",
+      "objective": "Create the implementation guides and objective schema consumed by the executable DAG: clean-room porting, state machines, security boundaries, naming, test preservation and metrics. Every runnable unit must have a measurable objective, hill-climbability score and explicit stop conditions.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 6,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Guide coverage",
+        "Objective schema",
+        "Runnable coverage",
+        "Low-score refusal",
+        "Contradictions",
+        "Reproducibility"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop when a guide requires an owner policy choice not already present in the permitted specification; record the unresolved choice rather than inventing it."
+      ],
+      "hill_climbability": 88,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        "spikes/",
+        ".automonique/dev/",
+        "tools/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-18.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R0-19",
+      "work_id": "R0-19",
+      "objective": "Build a proposal-only development harness that consumes the executable DAG, persists attempts/checkpoints/evidence, allocates isolated worktree and file leases, brokers bounded builds and typed local Git operations, and exposes a minimal TypeScript scenario client. It must work without the unfinished product daemon and without protected-branch credentials.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 9,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Durable resume",
+        "Lease exclusion",
+        "Immutable base",
+        "Build budget",
+        "Git broker",
+        "Forbidden Git",
+        "Provider boundary",
+        "Scenario client",
+        "Recovery"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any requirement for protected credentials, paths outside the lease, unbounded host execution or a provider behavior absent from `R0-06` evidence."
+      ],
+      "hill_climbability": 78,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        ".automonique/dev/",
+        "tools/",
+        "rust/Cargo.toml",
+        "rust/crates/automonique-lab/",
+        "sdk/typescript/packages/lab/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-19.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R0-20",
+      "work_id": "R0-20",
+      "objective": "Run three representative synthetic units through the minimal lab under the owner-configured role policy: mechanical change, durable-state transition and provider/transport boundary. Include a zero-independent-review trial and a fresh-context-review trial, record both truthfully, correct harness policy and rerun from the same bases.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 6,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Representative units",
+        "Zero-review policy",
+        "Configured review",
+        "Fix cycle",
+        "Repeatability",
+        "No authority gain"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop a trial on private data, unbounded resource use, stale base or authority outside proposal-only mode."
+      ],
+      "hill_climbability": 86,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        "spikes/",
+        ".automonique/dev/",
+        "tools/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-20.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R0-21",
+      "work_id": "R0-21",
+      "objective": "Emit reproducible `automonique.dev-metrics/v1` manifests and compact commit trailers covering correctness, performance, prompt economics, safety and environment provenance without rewarding commits, lines, tokens or agent count.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 7,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Schema",
+        "Digest",
+        "Baseline",
+        "No reward proxy",
+        "Privacy",
+        "Reproducibility",
+        "Tamper detection"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop when a required metric lacks a lawful collection method; record `null` with reason and request an owner decision if it is promotion-critical."
+      ],
+      "hill_climbability": 92,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        "spikes/",
+        ".automonique/dev/",
+        "tools/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-21.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R0-22",
+      "work_id": "R0-22",
+      "objective": "Preserve workers, build tasks, queues, leases and evidence across harness restart; serialize owner-configured candidate integration, invalidate stale evidence after conflicts, and prove clean abandon/rollback. Protected pushes and merges remain external.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 8,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Restart",
+        "Lease recovery",
+        "Serialization",
+        "Conflict",
+        "Idempotency",
+        "Abandon",
+        "Rollback",
+        "Protected authority"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop when recovery cannot distinguish applied from unapplied state, or when progress would require a protected credential."
+      ],
+      "hill_climbability": 90,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        "spikes/",
+        ".automonique/dev/",
+        "tools/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-22.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    }
+  ]
+}

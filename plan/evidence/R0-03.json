@@ -1,0 +1,61 @@
+{
+  "item": "R0-03",
+  "base": "0b02b10564baeb2cf79864bbe88af64763c6dd07",
+  "checks": [
+    {
+      "name": "Environment",
+      "command": "python3 spikes/foreground-lifecycle/lifecycle.py --base 0b02b10564baeb2cf79864bbe88af64763c6dd07 --timeout 5",
+      "result": "pass",
+      "output": "Linux kernel 6.8.0-124-generic, Python 3.12.3, direct-foreground mode, service_manager null, five-second per-wait bound; cleanup plan recorded before execution."
+    },
+    {
+      "name": "Successful handoff",
+      "command": "python3 spikes/foreground-lifecycle/lifecycle.py --base 0b02b10564baeb2cf79864bbe88af64763c6dd07 --timeout 5",
+      "result": "pass",
+      "output": "The old generation stayed active during replacement warm-up, quiesced after readiness, and drained with exit 0 only after epoch 4 activated the new generation."
+    },
+    {
+      "name": "Pre-ready failure",
+      "command": "python3 spikes/foreground-lifecycle/lifecycle.py --base 0b02b10564baeb2cf79864bbe88af64763c6dd07 --timeout 5",
+      "result": "pass",
+      "output": "Injected candidate exited 20 before readiness; old generation remained active and the durable owner stayed at epoch 1."
+    },
+    {
+      "name": "Post-ready failure",
+      "command": "python3 spikes/foreground-lifecycle/lifecycle.py --base 0b02b10564baeb2cf79864bbe88af64763c6dd07 --timeout 5",
+      "result": "pass",
+      "output": "Injected candidate exited 21 during activation; ownership returned to the old generation at epoch 3. Critical-boundary observations found zero or one active generation, never two."
+    },
+    {
+      "name": "Foreground control",
+      "command": "python3 spikes/foreground-lifecycle/test_lifecycle.py",
+      "result": "pass",
+      "output": "Readiness, activation, probe, quiesce, drain and shutdown used bounded JSON frames over inherited socket pairs. SIGTERM shutdown completed in 116.211 ms on the recorded run. No service-manager state was queried."
+    },
+    {
+      "name": "Cleanup",
+      "command": "python3 spikes/foreground-lifecycle/test_lifecycle.py",
+      "result": "pass",
+      "output": "All four fixture processes exited, the private temporary directory was removed, and cleanup_fallbacks was empty."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "owner-supervised continuation"
+  },
+  "extra_checks": [
+    {
+      "name": "Fixture tests",
+      "command": "python3 spikes/foreground-lifecycle/test_lifecycle.py",
+      "result": "pass",
+      "output": "3 tests passed; the integration trial reported 19 true lifecycle assertions, including explicit no-dual-active observations."
+    },
+    {
+      "name": "Plan and DAG regression",
+      "command": "python3 plan/check.py --verify && python3 plan/selftest.py && python3 tools/program.py --verify",
+      "result": "pass"
+    }
+  ],
+  "notes": "The full JSON result is intentionally not committed as a runtime log. Evidence records measured environment, exit codes, state/epoch outcomes, shutdown latency and cleanup. No network, credentials, model calls, service-manager operations, persistent sockets or privileged actions were used."
+}
