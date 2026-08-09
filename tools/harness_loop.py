@@ -23,11 +23,12 @@ from typing import Any
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from tools import guides, program  # noqa: E402
+from tools import git_broker, guides, program  # noqa: E402
 
 STATE_SCHEMA = "automonique.harness-loop-state/v1"
 PACKET_SCHEMA = "automonique.harness-objective-packet/v1"
-ACTIVE_STATUSES = frozenset({"claimed", "running"})
+TERMINAL_STATUSES = frozenset({"candidate_committed", "stopped"})
+CHECKABLE_SESSION_STATUSES = frozenset({"claimed", "candidate_ready"})
 
 
 class LoopError(Exception):
@@ -64,6 +65,13 @@ def write_json_atomic(path: pathlib.Path, document: dict[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+    directory = os.open(
+        path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    )
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def file_sha256(path: pathlib.Path) -> str:
@@ -184,11 +192,51 @@ def tree_fingerprint(paths: list[str]) -> str:
     assert isinstance(diff, bytes)
     digest.update(diff)
     for relative in sorted(paths):
-        digest.update(relative.encode())
+        digest.update(os.fsencode(relative))
         path = ROOT / relative
-        if path.is_file() and not path.is_symlink():
+        try:
+            status = path.lstat()
+        except FileNotFoundError:
+            digest.update(b"missing")
+            continue
+        digest.update(str(status.st_mode).encode())
+        if path.is_symlink():
+            digest.update(os.fsencode(os.readlink(path)))
+        elif path.is_file():
             digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def candidate_snapshot_matches(
+    state: dict[str, Any], paths: list[str], digest: str, tree: str
+) -> bool:
+    expected_paths = state.get("candidate_paths")
+    expected_digest = state.get("last_tree_digest")
+    return (
+        isinstance(expected_paths, list)
+        and all(isinstance(path, str) for path in expected_paths)
+        and sorted(paths) == sorted(expected_paths)
+        and digest == expected_digest
+        and tree == state.get("candidate_tree")
+    )
+
+
+def exact_candidate_tree(
+    state: dict[str, Any], packet: dict[str, Any], config: dict[str, Any], paths: list[str]
+) -> str:
+    objective = packet.get("objective")
+    allowed_paths = objective.get("allowed_paths") if isinstance(objective, dict) else None
+    if not isinstance(allowed_paths, list) or not all(
+        isinstance(path, str) for path in allowed_paths
+    ):
+        raise LoopError("objective packet lacks a typed path lease")
+    broker = git_broker.CandidateBroker(ROOT, (ROOT / config["state_path"]).parent)
+    return broker.snapshot(
+        expected_base=state["base"],
+        expected_branch=state["branch"],
+        allowed_paths=tuple(allowed_paths),
+        candidate_paths=tuple(sorted(paths)),
+    )
 
 
 def run_check(argv: list[str]) -> bool:
@@ -423,7 +471,7 @@ def read_state(config: dict[str, Any]) -> dict[str, Any] | None:
 
 def refuse_active_attempt(config: dict[str, Any]) -> None:
     state = read_state(config)
-    if state is not None and state.get("status") in ACTIVE_STATUSES:
+    if state is not None and state.get("status") not in TERMINAL_STATUSES:
         raise LoopError(
             f"active {state.get('driver', 'unknown')} attempt {state.get('run_id')} "
             f"already owns work item {state.get('work_id')}"
@@ -518,10 +566,8 @@ def _check_session_locked() -> int:
         raise LoopError("no Codex session claim exists")
     if state.get("driver") != "codex_session":
         raise LoopError("active state does not belong to the Codex session driver")
-    if state.get("status") == "candidate_ready":
-        print(json.dumps(state, indent=2, sort_keys=True))
-        return 0
-    if state.get("status") != "claimed":
+    original_status = state.get("status")
+    if original_status not in CHECKABLE_SESSION_STATUSES:
         raise LoopError(f"Codex session claim is not active: {state.get('status')}")
     packet_path = ROOT / state["packet"]
     if file_sha256(packet_path) != state.get("packet_sha256"):
@@ -560,10 +606,31 @@ def _check_session_locked() -> int:
     outside = lease_errors(paths, packet["objective"]["allowed_paths"])
     if outside:
         raise LoopError("session changed out-of-lease paths: " + ", ".join(outside))
+    if original_status == "candidate_ready":
+        actual_digest = tree_fingerprint(paths)
+        actual_tree = exact_candidate_tree(state, packet, config, paths)
+        if not candidate_snapshot_matches(state, paths, actual_digest, actual_tree):
+            state.update(
+                {
+                    "status": "reconciliation_required",
+                    "stop_reason": "candidate_drift",
+                    "updated_at": utc_now(),
+                }
+            )
+            write_json_atomic(state_path(config), state)
+            raise LoopError("candidate changed after it was declared ready")
+        run_safety_checks(config, "candidate revalidation")
+        if exact_candidate_tree(state, packet, config, paths) != actual_tree:
+            raise LoopError("candidate changed while safety checks were running")
+        print(json.dumps(state, indent=2, sort_keys=True))
+        return 0
     if not paths:
         print(json.dumps({"status": "claimed", "candidate": "unchanged"}, indent=2))
         return 2
+    candidate_tree = exact_candidate_tree(state, packet, config, paths)
     run_safety_checks(config, "candidate")
+    if exact_candidate_tree(state, packet, config, paths) != candidate_tree:
+        raise LoopError("candidate changed while safety checks were running")
     now = utc_now()
     state.update(
         {
@@ -571,6 +638,7 @@ def _check_session_locked() -> int:
             "stop_reason": "candidate_ready",
             "candidate_paths": paths,
             "last_tree_digest": tree_fingerprint(paths),
+            "candidate_tree": candidate_tree,
             "updated_at": now,
             "checked_at": now,
         }
@@ -590,6 +658,104 @@ def check_session() -> int:
         lock.close()
 
 
+def candidate_request(
+    state: dict[str, Any], packet: dict[str, Any], summary: str
+) -> git_broker.CandidateRequest:
+    objective = packet.get("objective")
+    allowed_paths = objective.get("allowed_paths") if isinstance(objective, dict) else None
+    candidate_paths = state.get("candidate_paths")
+    if not isinstance(allowed_paths, list) or not isinstance(candidate_paths, list):
+        raise LoopError("candidate state lacks its typed path lease")
+    if not all(isinstance(path, str) for path in allowed_paths + candidate_paths):
+        raise LoopError("candidate path lease contains a non-string value")
+    required = ("run_id", "work_id", "base", "branch")
+    if any(not isinstance(state.get(field), str) for field in required):
+        raise LoopError("candidate state identity is incomplete")
+    return git_broker.CandidateRequest(
+        operation=git_broker.OPERATION,
+        run_id=state["run_id"],
+        work_id=state["work_id"],
+        expected_base=state["base"],
+        expected_branch=state["branch"],
+        allowed_paths=tuple(allowed_paths),
+        candidate_paths=tuple(sorted(candidate_paths)),
+        expected_tree=state.get("candidate_tree", ""),
+        summary=summary,
+    )
+
+
+def _commit_candidate_locked(summary: str) -> int:
+    _, _, config = load_inputs()
+    state = read_state(config)
+    if state is None or state.get("driver") != "codex_session":
+        raise LoopError("no Codex session candidate exists")
+    status = state.get("status")
+    if status == "candidate_ready":
+        _check_session_locked()
+        state = read_state(config)
+        assert state is not None
+        candidate_request(state, load_json(ROOT / state["packet"]), summary)
+        state.update(
+            {
+                "status": "commit_intent",
+                "stop_reason": "commit_intent",
+                "candidate_ref": f"refs/automonique/candidates/{state['run_id']}",
+                "candidate_summary": summary,
+                "updated_at": utc_now(),
+            }
+        )
+        write_json_atomic(state_path(config), state)
+    elif status not in {"commit_intent", "reconciliation_required"}:
+        raise LoopError(f"candidate cannot be committed from state {status}")
+
+    state = read_state(config)
+    assert state is not None
+    stored_summary = state.get("candidate_summary")
+    if not isinstance(stored_summary, str):
+        raise LoopError("commit intent lacks its candidate summary")
+    if summary != stored_summary:
+        raise LoopError("candidate summary differs from the durable commit intent")
+    packet = load_json(ROOT / state["packet"])
+    request = candidate_request(state, packet, stored_summary)
+    broker = git_broker.CandidateBroker(ROOT, (ROOT / config["state_path"]).parent)
+    try:
+        broker.prepare(request)
+        receipt = broker.reconcile(state["run_id"])
+    except git_broker.BrokerError as exc:
+        state.update(
+            {
+                "status": "reconciliation_required",
+                "stop_reason": "candidate_reconciliation_required",
+                "updated_at": utc_now(),
+            }
+        )
+        write_json_atomic(state_path(config), state)
+        raise LoopError("candidate broker requires reconciliation") from exc
+    state.update(
+        {
+            "status": "candidate_committed",
+            "stop_reason": "candidate_committed",
+            "candidate_ref": receipt["ref"],
+            "candidate_commit": receipt["commit_oid"],
+            "candidate_tree": receipt["tree_oid"],
+            "updated_at": utc_now(),
+        }
+    )
+    write_json_atomic(state_path(config), state)
+    print(json.dumps(state, indent=2, sort_keys=True))
+    return 0
+
+
+def commit_candidate(summary: str) -> int:
+    config = load_json(guides.LOOP_CONFIG)
+    lock = acquire_loop_lock(config)
+    try:
+        return _commit_candidate_locked(summary)
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
+
 def release_session(reason: str) -> int:
     config = load_json(guides.LOOP_CONFIG)
     lock = acquire_loop_lock(config)
@@ -597,8 +763,17 @@ def release_session(reason: str) -> int:
         state = read_state(config)
         if state is None or state.get("driver") != "codex_session":
             raise LoopError("no Codex session claim exists")
-        if state.get("status") != "claimed":
+        status = state.get("status")
+        if status not in {
+            "claimed",
+            "candidate_ready",
+            "reconciliation_required",
+        }:
             raise LoopError(f"Codex session claim is not active: {state.get('status')}")
+        if status == "reconciliation_required":
+            git_broker.CandidateBroker(
+                ROOT, (ROOT / config["state_path"]).parent
+            ).abandon(state["run_id"])
         state.update({"status": "stopped", "stop_reason": reason, "updated_at": utc_now()})
         write_json_atomic(state_path(config), state)
         print(json.dumps(state, indent=2, sort_keys=True))
@@ -764,6 +939,8 @@ def main() -> int:
     claim_parser = subparsers.add_parser("claim")
     claim_parser.add_argument("--item")
     subparsers.add_parser("check")
+    candidate_parser = subparsers.add_parser("candidate")
+    candidate_parser.add_argument("--summary", required=True)
     release_parser = subparsers.add_parser("release")
     release_parser.add_argument(
         "--reason", required=True, choices=("blocked", "user_cancelled", "superseded")
@@ -796,10 +973,18 @@ def main() -> int:
             return claim_session(args.item)
         if args.command == "check":
             return check_session()
+        if args.command == "candidate":
+            return commit_candidate(args.summary)
         if args.command == "release":
             return release_session(args.reason)
         return run_loop(args.item, args.worker_arg, args.max_iterations)
-    except (LoopError, program.ProgramError, OSError, subprocess.CalledProcessError) as exc:
+    except (
+        LoopError,
+        git_broker.BrokerError,
+        program.ProgramError,
+        OSError,
+        subprocess.CalledProcessError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

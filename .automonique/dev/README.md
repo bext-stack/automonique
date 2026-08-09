@@ -42,6 +42,7 @@ python3 tools/harness_loop.py next
 python3 tools/harness_loop.py status
 python3 tools/harness_loop.py claim
 python3 tools/harness_loop.py check
+python3 tools/harness_loop.py candidate --summary "Describe the bounded slice"
 ```
 
 The claim command runs admission checks and writes an ignored immutable packet
@@ -50,6 +51,15 @@ model call. The outer Codex session reads that packet, uses its native agent
 tools, and remains responsible for coordination and verification. `check`
 refuses revision, branch and path-lease drift and marks a passing diff only as
 `candidate_ready`; it does not commit or change the plan.
+
+After review, `candidate` revalidates that snapshot and asks the typed Git
+broker to create a proposal commit under
+`refs/automonique/candidates/<run-id>`. The broker uses a private index, leaves
+the current branch, `HEAD`, shared index and worktree untouched, and persists
+an idempotent intent and receipt for restart reconciliation. It has no generic
+Git argument interface and cannot push, merge, force, rewrite history, edit a
+remote, tag, release or deploy. A separate authorized merger may inspect and
+integrate the proposal later.
 
 ## Deterministic local worker
 
@@ -69,8 +79,9 @@ The loop refuses a dirty tree, low hill-climbability, stale DAG/contracts,
 out-of-lease changes, branch or revision changes, and failing safety checks. It
 stops after at most three iterations, one unchanged result, two failures, 30
 minutes total, or 20 minutes in one worker invocation. A successful iteration
-leaves only a candidate diff for review; the loop cannot stage, commit, push,
-merge, release, or deploy.
+leaves only a candidate diff for review. The optional typed candidate step may
+write a namespaced local proposal ref; neither the worker nor the loop can
+change the current branch, push, merge, release or deploy.
 
 Durable claims, counters and packet digests live below ignored
 `.automonique/state/`. Worker stdout and stderr remain attached to the invoking

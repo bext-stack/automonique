@@ -112,6 +112,21 @@ class HarnessLoopTests(unittest.TestCase):
         finally:
             harness_loop.read_state = original
 
+    def test_unreconciled_candidate_and_unknown_state_refuse_new_attempt(self) -> None:
+        original = harness_loop.read_state
+        try:
+            for status in ("candidate_ready", "commit_intent", "mystery"):
+                harness_loop.read_state = lambda config, value=status: {
+                    "status": value,
+                    "driver": "codex_session",
+                    "run_id": "session_test",
+                    "work_id": "R0-19",
+                }
+                with self.assertRaisesRegex(harness_loop.LoopError, "already owns"):
+                    harness_loop.refuse_active_attempt({})
+        finally:
+            harness_loop.read_state = original
+
     def test_stopped_claim_does_not_block_a_new_attempt(self) -> None:
         original = harness_loop.read_state
         harness_loop.read_state = lambda config: {
@@ -122,6 +137,76 @@ class HarnessLoopTests(unittest.TestCase):
             harness_loop.refuse_active_attempt({})
         finally:
             harness_loop.read_state = original
+
+    def test_committed_candidate_does_not_block_a_new_attempt(self) -> None:
+        original = harness_loop.read_state
+        harness_loop.read_state = lambda config: {
+            "status": "candidate_committed",
+            "driver": "codex_session",
+        }
+        try:
+            harness_loop.refuse_active_attempt({})
+        finally:
+            harness_loop.read_state = original
+
+    def test_candidate_snapshot_revalidation_detects_path_and_tree_drift(self) -> None:
+        state = {
+            "candidate_paths": ["tools/one.py", "plan/evidence/one.json"],
+            "last_tree_digest": "abc123",
+            "candidate_tree": "tree123",
+        }
+        self.assertTrue(
+            harness_loop.candidate_snapshot_matches(
+                state,
+                ["plan/evidence/one.json", "tools/one.py"],
+                "abc123",
+                "tree123",
+            )
+        )
+        self.assertFalse(
+            harness_loop.candidate_snapshot_matches(
+                state, ["tools/one.py"], "abc123", "tree123"
+            )
+        )
+        self.assertFalse(
+            harness_loop.candidate_snapshot_matches(
+                state,
+                ["tools/one.py", "plan/evidence/one.json"],
+                "changed",
+                "tree123",
+            )
+        )
+
+    def test_tree_fingerprint_distinguishes_untracked_symlink_targets(self) -> None:
+        with tempfile.TemporaryDirectory(dir=harness_loop.ROOT / "tools") as directory:
+            root = pathlib.Path(directory)
+            link = root / "link"
+            relative = link.relative_to(harness_loop.ROOT).as_posix()
+            link.symlink_to("first-target")
+            first = harness_loop.tree_fingerprint([relative])
+            link.unlink()
+            link.symlink_to("second-target")
+            second = harness_loop.tree_fingerprint([relative])
+            self.assertNotEqual(first, second)
+
+    def test_candidate_request_derives_git_authority_from_state_and_packet(self) -> None:
+        request = harness_loop.candidate_request(
+            {
+                "run_id": "session_test",
+                "work_id": "R0-19",
+                "base": "a" * 40,
+                "branch": "main",
+                "candidate_paths": ["tools/two.py", "tools/one.py"],
+                "candidate_tree": "b" * 40,
+            },
+            {"objective": {"allowed_paths": ["tools/", "plan/"]}},
+            "Create typed candidate",
+        )
+        self.assertEqual(harness_loop.git_broker.OPERATION, request.operation)
+        self.assertEqual(("tools/one.py", "tools/two.py"), request.candidate_paths)
+        self.assertEqual(("tools/", "plan/"), request.allowed_paths)
+        self.assertEqual("a" * 40, request.expected_base)
+        self.assertEqual("b" * 40, request.expected_tree)
 
     def test_single_worker_lock_rejects_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

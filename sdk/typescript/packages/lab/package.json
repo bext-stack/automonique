@@ -1,0 +1,14 @@
+{
+  "name": "@automonique/lab",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test ./test",
+    "typecheck": "npx --offline tsc -p ./tsconfig.json"
+  }
+}
