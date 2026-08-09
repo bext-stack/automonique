@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+[workspace]
+members = ["crates/automonique-lab"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "Elastic-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "forbid"
+todo = "forbid"
+unimplemented = "forbid"
