@@ -53,7 +53,7 @@ Each item should be a small reviewable issue/PR. IDs express dependency order, n
 - **R1-04 Unix peer authorization:** UID/PID checks and mode-0700 runtime layout.
 - **R1-05 Release manifest:** hashes, revision, schema/protocol ranges and platform requirements.
 - **R1-06 Cross-language fixtures:** Bun encoder/Rust decoder and Rust encoder/Bun decoder.
-- **R1-07 `automonique doctor`:** non-mutating host and release checks plus the `legacyctl` forwarding contract.
+- **R1-07 `automonique doctor`:** non-mutating host and release checks plus the `legacyctl` forwarding contract. Depends on R1-01.
 - **R1-08 Provider capability contract:** typed capabilities plus provider instance/session/turn/item/request identities and negotiation rules.
 - **R1-09 Provider event contract:** bounded raw envelopes, preview versus authoritative normalized events, approval records and cursor semantics.
 - **R1-10 Upstream schema pipeline:** generate/capture schemas, hash fixtures, map them to binary ranges and classify compatible versus breaking diffs.
@@ -441,7 +441,7 @@ Each item should be a small reviewable issue/PR. IDs express dependency order, n
 ## Dependency spine
 
 ```text
-R0 handoff proof + implementation harness + SH0–SH4 self-host foundation
+R0-18 supervised development contract
   -> R1 protocol/identity/events
     -> R2 execution hosts/workspaces/artifacts
       -> R3 reload skeleton
@@ -462,8 +462,8 @@ R8B connector SDK -> R13 connector families and independent canaries
 R2 sandbox/executor contract + R7 routing -> R14 media/execution providers
 R4 event/artifact schemas + R8B SDK -> R15 batch/evaluation/ecosystem tracks
 
-R0-17..R0-22 harness foundation -> every implementation epic; each epic feeds failure and metric evidence back into the harness
-R0-23..R0-40 self-host foundation -> candidate-driven implementation; SH4 independently verified before self-modification of bootstrap/security/promotion boundaries
+R0-17..R0-19 supervised harness foundation -> product implementation may begin; each epic feeds failure and metric evidence back into the harness
+R0-20..R0-40 self-host hardening -> required before self-modification of bootstrap/security/promotion boundaries, but does not block ordinary product implementation
 
 R8B connector SDK -> R8F optional Teams/Discord connectors -> R8G independent channel canaries
 

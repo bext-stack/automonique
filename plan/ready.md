@@ -6,8 +6,8 @@ An item is ready when every dependency is `done`. Selecting work means taking a 
 
 - items total: **375**
 - done: **8**
-- ready now: **4**
-- blocked: **363**
+- ready now: **5**
+- blocked: **362**
 
 ## Selectable now
 
@@ -17,6 +17,7 @@ An item is ready when every dependency is `done`. Selecting work means taking a 
 | `BOOT-003` | BOOT | Pre-publication scrub gate | Elastic-2.0 | [contract](contracts/BOOT-003.md) |
 | `BOOT-004` | BOOT | Parity-oracle boundary | Elastic-2.0 | [contract](contracts/BOOT-004.md) |
 | `R0-19` | R0 | Minimal `automonique-lab` | Elastic-2.0 | [contract](contracts/R0-19.md) |
+| `R1-01` | R1 | Cargo workspace and CI | Elastic-2.0 | [contract](contracts/R1-01.md) |
 
 ## Next to unblock
 
@@ -37,7 +38,7 @@ The first blocked items behind the current ready set:
 
 Dependency- and gate-clear, but no contract exists, so they are not selectable. Writing one of these contracts is itself useful work and lowers `contracts_missing`.
 
-  `R0-01`, `R0-08`, `R0-09`, `R0-10`, `R0-11`, `R0-12`, `R0-13`, `R0-14`, `R0-15`, `R0-16`, `R0-23`, `R0-24`, `R0-25`, `R0-26`, `R0-27`, `R0-28`, `R0-29`, `R0-30`, `R0-31`, `R0-32`, `R0-33`, `R0-34`, `R0-35`, `R0-36` …and 4 more
+  `R0-01`, `R0-08`, `R0-09`, `R0-10`, `R0-11`, `R0-12`, `R0-13`, `R0-14`, `R0-15`, `R0-16`, `R0-23`, `R0-24`, `R0-25`, `R0-26`, `R0-27`, `R0-28`, `R0-29`, `R0-30`, `R0-31`, `R0-32`, `R0-33`, `R0-34`, `R0-35`, `R0-36` …and 27 more
 
 ## Gate-blocked work
 

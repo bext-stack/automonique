@@ -3,7 +3,7 @@
   "schema": "automonique.dev-program/v1",
   "source": {
     "graph": "plan/work-graph.toml",
-    "graph_sha256": "fad06e886f4c30b710a5f2fb29b2be6b686fc8487a0db5d6a7c5a09618357426",
+    "graph_sha256": "1667afa1492c8cdc079c571e015df4548018631102e72d47de99e80fa175d6a5",
     "item_count": 375
   },
   "items": [
@@ -1018,7 +1018,7 @@
       "title": "Cargo workspace and CI",
       "summary": null,
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1026,13 +1026,15 @@
         "rust/crates/automonique-protocol/",
         "rust/crates/automonique-policy/",
         "rust/Cargo.toml",
+        "rust/Cargo.lock",
         "sdk/typescript/packages/protocol/",
-        "xtask/"
+        "xtask/",
+        ".github/workflows/rust.yml"
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-01.md",
+      "runnable": true
     },
     {
       "id": "R1-02",
@@ -1041,7 +1043,7 @@
       "title": "Bounded domain primitives",
       "summary": "IDs, bounded text, timestamps, revisions, URLs and secret wrappers.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1064,7 +1066,7 @@
       "title": "Length-delimited local protocol codec",
       "summary": "version negotiation, message limits and error mapping.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1087,7 +1089,7 @@
       "title": "Unix peer authorization",
       "summary": "UID/PID checks and mode-0700 runtime layout.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1110,7 +1112,7 @@
       "title": "Release manifest",
       "summary": "hashes, revision, schema/protocol ranges and platform requirements.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1133,7 +1135,7 @@
       "title": "Cross-language fixtures",
       "summary": "Bun encoder/Rust decoder and Rust encoder/Bun decoder.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1156,20 +1158,22 @@
       "title": "`automonique doctor`",
       "summary": "non-mutating host and release checks plus the `legacyctl` forwarding contract.",
       "depends_on": [
-        "R0-40"
+        "R0-18",
+        "R1-01"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
       "allowed_paths": [
+        "rust/crates/automonique/",
+        "rust/crates/automonique-cli/",
         "rust/crates/automonique-protocol/",
         "rust/crates/automonique-policy/",
         "rust/Cargo.toml",
-        "sdk/typescript/packages/protocol/",
-        "xtask/"
+        "rust/Cargo.lock"
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
+      "contract": "plan/contracts/R1-07.md",
       "runnable": false
     },
     {
@@ -1179,7 +1183,7 @@
       "title": "Provider capability contract",
       "summary": "typed capabilities plus provider instance/session/turn/item/request identities and negotiation rules.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1202,7 +1206,7 @@
       "title": "Provider event contract",
       "summary": "bounded raw envelopes, preview versus authoritative normalized events, approval records and cursor semantics.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1225,7 +1229,7 @@
       "title": "Upstream schema pipeline",
       "summary": "generate/capture schemas, hash fixtures, map them to binary ranges and classify compatible versus breaking diffs.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1248,7 +1252,7 @@
       "title": "TypeScript codegen spike",
       "summary": "prove Rust-derived domain/API/event schemas can generate reproducible runtime validators and clients without losing bounds, unions, branded IDs or unknown-event compatibility.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1271,7 +1275,7 @@
       "title": "Domain event/action contracts",
       "summary": "schema-versioned global journal, aggregate revisions, action receipts, consumer cursors and side-effect-free replay.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1294,7 +1298,7 @@
       "title": "Identity and policy contracts",
       "summary": "actors, tenants, external identities, roles, credentials, authorization evidence and break-glass audit.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1317,7 +1321,7 @@
       "title": "Workspace/artifact contracts",
       "summary": "registry, immutable bases, locks, provenance, visibility, retention and storage abstraction.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1340,7 +1344,7 @@
       "title": "Execution-host lifecycle contract",
       "summary": "separate work, attempt, host, provider session and turn plus idle-TTL/hibernation semantics.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1363,7 +1367,7 @@
       "title": "External connector contract",
       "summary": "installation/tenant/actor resolution, source keys, durable input, render intents, action tokens/receipts, artifact grants and conformance protocol.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1386,7 +1390,7 @@
       "title": "Canonical/legacy compatibility contract",
       "summary": "generate Automonique names plus legacy forwarding aliases from one registry, reject configuration conflicts and prove one runtime/state owner.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1409,7 +1413,7 @@
       "title": "Sandbox contracts",
       "summary": "versioned profiles, `SandboxSpec`, enforcement attestation, violations/quarantine, resource/storage budgets, provider/tool egress split and implementation capability negotiation.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1432,7 +1436,7 @@
       "title": "Canonical Rust namespace gate",
       "summary": "name every Cargo package/crate/module/feature/binary, schema, metric, tracing target, fixture and release artifact `automonique-*`/`automonique_*`; generate only explicitly inventoried legacy compatibility codecs and forwarding executables, and fail CI on undocumented legacy identifiers.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1455,7 +1459,7 @@
       "title": "Context and learning contracts",
       "summary": "context manifests/references, queues, compression lineage, memory/FTS, skills, profiles and learning proposals.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1478,7 +1482,7 @@
       "title": "Tool and extension contracts",
       "summary": "tool registry/toolsets/search, capability RPC, MCP client/server, extension manifests, hook classes and secret-source descriptors.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1501,7 +1505,7 @@
       "title": "Automation and goal contracts",
       "summary": "canonical schedules, occurrences, goals/subgoals/waits, board claims, inbound triggers and notification delivery.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1524,7 +1528,7 @@
       "title": "Public protocol contracts",
       "summary": "ACP host, OpenAI compatibility, native Runs, MCP export, A2A and relay identity/session/action mappings.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1547,7 +1551,7 @@
       "title": "Model/media/executor contracts",
       "summary": "routing/pools/auxiliaries/MoA, media/browser/computer adapters and execution-provider lifecycle/attestation.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1570,7 +1574,7 @@
       "title": "Cross-surface interaction contracts",
       "summary": "queued composer input, retry/undo/stop/compress/checkpoint semantics, context usage and UI/plugin projections.",
       "depends_on": [
-        "R0-40"
+        "R0-18"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",

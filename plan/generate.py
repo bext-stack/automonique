@@ -110,7 +110,10 @@ BOOT_IDS = [b["id"] for b in BOOT]
 # --------------------------------------------------------------------------
 EPIC_DEPS = {
     "R0": ["BOOT-001"],
-    "R1": ["R0"],
+    # Product work starts once the supervised development contract is proven.
+    # Later R0 self-host hardening remains required only for changing its own
+    # bootstrap, security and promotion boundaries.
+    "R1": ["R0-18"],
     "R2": ["R1"],
     "R3": ["R2"],
     "R4": ["R3"],
@@ -201,6 +204,16 @@ ITEM_PATHS = {
         "rust/Cargo.lock",
         "rust/crates/automonique-lab/", "sdk/typescript/packages/lab/",
     ],
+    "R1-01": [
+        "rust/crates/automonique-protocol/", "rust/crates/automonique-policy/",
+        "rust/Cargo.toml", "rust/Cargo.lock", "sdk/typescript/packages/protocol/",
+        "xtask/", ".github/workflows/rust.yml",
+    ],
+    "R1-07": [
+        "rust/crates/automonique/", "rust/crates/automonique-cli/",
+        "rust/crates/automonique-protocol/", "rust/crates/automonique-policy/",
+        "rust/Cargo.toml", "rust/Cargo.lock",
+    ],
     "R11-08": ["sdk/typescript/packages/extension/"],
     "R11-09": ["sdk/typescript/packages/ui/"],
 }
@@ -214,6 +227,7 @@ ITEM_DEPS = {
     "R0-21": ["R0-19"],
     "R0-20": ["R0-21"],
     "R0-22": ["R0-20", "R0-21"],
+    "R1-07": ["R1-01"],
 }
 
 # Completion is written here so regeneration cannot silently reopen landed
@@ -276,6 +290,7 @@ def parse_breakdown() -> tuple[list[dict], dict[str, str]]:
 
 def build() -> str:
     items, epics = parse_breakdown()
+    item_ids = {item["id"] for item in items}
     by_epic: dict[str, list[str]] = {}
     for it in items:
         by_epic.setdefault(it["epic"], []).append(it["id"])
@@ -323,6 +338,8 @@ def build() -> str:
             if pred in by_epic and by_epic[pred]:
                 deps.append(by_epic[pred][-1])
             elif pred in BOOT_IDS:
+                deps.append(pred)
+            elif pred in item_ids:
                 deps.append(pred)
         deps = sorted(set(deps))
         licence = ("Apache-2.0" if epic in APACHE_EPICS or it["id"] in APACHE_ITEMS
