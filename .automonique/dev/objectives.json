@@ -524,10 +524,10 @@
     {
       "id": "objective:R0-19",
       "work_id": "R0-19",
-      "objective": "Build a proposal-only development harness that consumes the executable DAG, persists attempts/checkpoints/evidence, allocates isolated worktree and file leases, brokers bounded builds and typed local Git operations, and exposes a minimal TypeScript scenario client. It must work without the unfinished product daemon and without protected-branch credentials.",
+      "objective": "Build the Rust `automonique-lab` workspace member as a proposal-only development harness that consumes the executable DAG, persists attempts/checkpoints/evidence, allocates isolated worktree and file leases, brokers bounded builds and typed local Git operations, and exposes a minimal TypeScript scenario client. It must work without the unfinished product daemon and without protected-branch credentials. Python bootstrap components are temporary compatibility adapters; they do not satisfy the Rust implementation requirement and must be retired as their verified Rust replacements land.",
       "metric": {
         "name": "required_contract_checks_passed",
-        "target": 9,
+        "target": 10,
         "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
       },
       "baseline": {
@@ -542,6 +542,7 @@
         "max_failures": 2
       },
       "tests": [
+        "Rust workspace",
         "Durable resume",
         "Lease exclusion",
         "Immutable base",
@@ -565,6 +566,7 @@
         ".automonique/dev/",
         "tools/",
         "rust/Cargo.toml",
+        "rust/Cargo.lock",
         "rust/crates/automonique-lab/",
         "sdk/typescript/packages/lab/"
       ],

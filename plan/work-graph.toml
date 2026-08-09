@@ -302,7 +302,7 @@ title = "Minimal `automonique-lab`"
 summary = "durable Rust orchestrator, separate dev state/credentials, execution-host provider adapters, isolated worktree/file leases, build broker, Git broker, budgets and TypeScript scenario client."
 depends_on = ["BOOT-001", "R0-06", "R0-17", "R0-18"]
 licence = "Elastic-2.0"
-allowed_paths = ["plan/", ".automonique/dev/", "tools/", "rust/Cargo.toml", "rust/crates/automonique-lab/", "sdk/typescript/packages/lab/"]
+allowed_paths = ["plan/", ".automonique/dev/", "tools/", "rust/Cargo.toml", "rust/Cargo.lock", "rust/crates/automonique-lab/", "sdk/typescript/packages/lab/"]
 status = "blocked"
 
 [[item]]

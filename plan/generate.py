@@ -198,6 +198,7 @@ ITEM_PATHS = {
     ],
     "R0-19": [
         "plan/", ".automonique/dev/", "tools/", "rust/Cargo.toml",
+        "rust/Cargo.lock",
         "rust/crates/automonique-lab/", "sdk/typescript/packages/lab/",
     ],
     "R11-08": ["sdk/typescript/packages/extension/"],

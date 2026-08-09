@@ -3,7 +3,7 @@
   "schema": "automonique.dev-program/v1",
   "source": {
     "graph": "plan/work-graph.toml",
-    "graph_sha256": "2e7992f678784030869f96dfc0b0091658ead26a783a00a1a096a7aab39497fa",
+    "graph_sha256": "fad06e886f4c30b710a5f2fb29b2be6b686fc8487a0db5d6a7c5a09618357426",
     "item_count": 375
   },
   "items": [
@@ -536,6 +536,7 @@
         ".automonique/dev/",
         "tools/",
         "rust/Cargo.toml",
+        "rust/Cargo.lock",
         "rust/crates/automonique-lab/",
         "sdk/typescript/packages/lab/"
       ],
