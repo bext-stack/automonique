@@ -136,6 +136,25 @@ class LocalIntegration:
             environment.update(additions)
         return environment
 
+    def _remote_environment(self) -> dict[str, str]:
+        """Expose configured Git authentication only to remote read/push calls."""
+
+        home = os.environ.get("HOME")
+        if not home:
+            raise IntegrationError("remote authentication home is unavailable")
+        global_config = pathlib.Path(home) / ".gitconfig"
+        environment = {
+            "HOME": home,
+            "GIT_CONFIG_GLOBAL": str(global_config) if global_config.is_file() else os.devnull,
+        }
+        minimal_url = self._git("remote", "get-url", REMOTE).stdout.strip()
+        configured_url = self._git(
+            "remote", "get-url", REMOTE, environment=environment
+        ).stdout.strip()
+        if configured_url != minimal_url:
+            raise IntegrationError("credential configuration rewrites the integration remote")
+        return environment
+
     def _git(
         self,
         *arguments: str,
@@ -232,7 +251,13 @@ class LocalIntegration:
         return oid
 
     def _remote_oid(self) -> str | None:
-        result = self._git("ls-remote", "--refs", REMOTE, REMOTE_REF)
+        result = self._git(
+            "ls-remote",
+            "--refs",
+            REMOTE,
+            REMOTE_REF,
+            environment=self._remote_environment(),
+        )
         lines = [line for line in result.stdout.splitlines() if line.strip()]
         if not lines:
             return None
@@ -465,6 +490,7 @@ class LocalIntegration:
                     "--porcelain",
                     REMOTE,
                     f"{payload['candidate_commit']}:{REMOTE_REF}",
+                    environment=self._remote_environment(),
                     check=False,
                 )
                 remote = self._remote_oid()
