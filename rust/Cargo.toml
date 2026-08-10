@@ -2,6 +2,8 @@
 
 [workspace]
 members = [
+    "crates/automonique",
+    "crates/automonique-cli",
     "crates/automonique-lab",
     "crates/automonique-policy",
     "crates/automonique-protocol",

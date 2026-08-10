@@ -2,15 +2,20 @@
 
 use automonique_protocol::{
     BoundedTextError, CheckStatus, DOCTOR_REPORT_SCHEMA_V1, DoctorCheck, DoctorCheckError,
-    DoctorReportError, DoctorReportV1, FindingCode, FindingMessage, MAX_DOCTOR_CHECKS,
-    MAX_FINDING_CODE_BYTES, MAX_FINDING_MESSAGE_BYTES, ReportStatus,
+    DoctorReason, DoctorReportError, DoctorReportV1, FindingCode, FindingMessage,
+    MAX_DOCTOR_CHECKS, MAX_FINDING_CODE_BYTES, MAX_FINDING_MESSAGE_BYTES, ReportStatus,
 };
 
 fn check(code: &str, status: CheckStatus, reason: Option<&str>) -> DoctorCheck {
     DoctorCheck::new(
         FindingCode::new(code).expect("valid test code"),
         status,
-        reason.map(|value| FindingMessage::new(value).expect("valid test reason")),
+        reason.map(|value| {
+            DoctorReason::new(
+                FindingCode::new("test.reason").expect("reason code"),
+                FindingMessage::new(value).expect("valid test reason"),
+            )
+        }),
     )
     .expect("coherent test check")
 }
@@ -73,7 +78,10 @@ fn check_reason_presence_is_truthful() {
         DoctorCheck::new(
             code.clone(),
             CheckStatus::Healthy,
-            Some(FindingMessage::new("contradiction").expect("reason")),
+            Some(DoctorReason::new(
+                FindingCode::new("test.contradiction").expect("reason code"),
+                FindingMessage::new("contradiction").expect("reason"),
+            )),
         ),
         Err(DoctorCheckError::HealthyReasonForbidden)
     );

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+[package]
+name = "automonique-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+automonique-protocol = { path = "../automonique-protocol" }
+nix.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

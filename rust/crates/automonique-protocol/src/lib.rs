@@ -197,12 +197,39 @@ impl fmt::Display for DoctorCheckError {
 
 impl Error for DoctorCheckError {}
 
+/// Stable machine-readable reason paired with a bounded explanation.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DoctorReason {
+    code: FindingCode,
+    message: FindingMessage,
+}
+
+impl DoctorReason {
+    /// Construct a typed, bounded reason.
+    #[must_use]
+    pub const fn new(code: FindingCode, message: FindingMessage) -> Self {
+        Self { code, message }
+    }
+
+    /// Stable machine-readable reason code.
+    #[must_use]
+    pub const fn code(&self) -> &FindingCode {
+        &self.code
+    }
+
+    /// Bounded human-readable explanation.
+    #[must_use]
+    pub const fn message(&self) -> &FindingMessage {
+        &self.message
+    }
+}
+
 /// One immutable doctor check.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct DoctorCheck {
     code: FindingCode,
     status: CheckStatus,
-    reason: Option<FindingMessage>,
+    reason: Option<DoctorReason>,
 }
 
 impl DoctorCheck {
@@ -210,7 +237,7 @@ impl DoctorCheck {
     pub fn new(
         code: FindingCode,
         status: CheckStatus,
-        reason: Option<FindingMessage>,
+        reason: Option<DoctorReason>,
     ) -> Result<Self, DoctorCheckError> {
         match (status, &reason) {
             (CheckStatus::Healthy, Some(_)) => {
@@ -243,7 +270,7 @@ impl DoctorCheck {
 
     /// Bounded reason for a finding or unavailable result.
     #[must_use]
-    pub const fn reason(&self) -> Option<&FindingMessage> {
+    pub const fn reason(&self) -> Option<&DoctorReason> {
         self.reason.as_ref()
     }
 }
