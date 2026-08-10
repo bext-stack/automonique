@@ -28,8 +28,34 @@ from plan import baseline as plan_baseline  # noqa: E402
 
 STATE_SCHEMA = "automonique.harness-loop-state/v1"
 PACKET_SCHEMA = "automonique.harness-objective-packet/v1"
+RECOVERY_SNAPSHOT_SCHEMA = "automonique.harness-recovery-snapshot/v1"
+RECOVERY_INTENT_SCHEMA = "automonique.harness-recovery-intent/v1"
+RECOVERY_RECEIPT_SCHEMA = "automonique.harness-recovery-receipt/v1"
 TERMINAL_STATUSES = frozenset({"integrated_and_pushed", "stopped"})
 CHECKABLE_SESSION_STATUSES = frozenset({"claimed", "candidate_ready"})
+CLAIMED_SESSION_STATE_FIELDS = frozenset(
+    {
+        "schema",
+        "run_id",
+        "driver",
+        "work_id",
+        "base",
+        "branch",
+        "status",
+        "packet",
+        "iteration",
+        "failures",
+        "unchanged_results",
+        "stop_reason",
+        "started_at",
+        "deadline_at",
+        "updated_at",
+        "packet_sha256",
+    }
+)
+RECOVERABLE_STOP_STATE_FIELDS = CLAIMED_SESSION_STATE_FIELDS | frozenset(
+    {"candidate_paths", "last_tree_digest", "candidate_tree", "checked_at"}
+)
 
 
 class LoopError(Exception):
@@ -77,6 +103,91 @@ def write_json_atomic(path: pathlib.Path, document: dict[str, Any]) -> None:
 
 def file_sha256(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def canonical_sha256(document: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def is_lower_hex(value: Any, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def parse_utc_seconds(value: Any, label: str) -> dt.datetime:
+    if not isinstance(value, str):
+        raise LoopError(f"{label} is invalid")
+    try:
+        parsed = dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S+00:00").replace(
+            tzinfo=dt.timezone.utc
+        )
+    except ValueError as exc:
+        raise LoopError(f"{label} is invalid") from exc
+    if parsed.isoformat(timespec="seconds") != value:
+        raise LoopError(f"{label} is invalid")
+    return parsed
+
+
+def valid_identifier(value: Any, maximum: int, allow_dot: bool = False) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= maximum
+        and value[0].isalnum()
+        and value[0].isascii()
+        and all(
+            character.isascii()
+            and (character.isalnum() or character in "_-" or (allow_dot and character == "."))
+            for character in value
+        )
+    )
+
+
+def valid_branch(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 255
+        and not value.startswith(("/", ".", "-"))
+        and not value.endswith(("/", "."))
+        and ".." not in value
+        and "//" not in value
+        and all(
+            character.isascii() and (character.isalnum() or character in "/._-")
+            for character in value
+        )
+    )
+
+
+def valid_repo_path(value: Any) -> bool:
+    if not isinstance(value, str) or not value or len(value.encode()) > 4096:
+        return False
+    path = pathlib.PurePosixPath(value)
+    return (
+        not path.is_absolute()
+        and value == path.as_posix()
+        and all(part not in ("", ".", "..") for part in path.parts)
+        and not value.endswith("/")
+        and not any(character == "\x00" or ord(character) < 32 for character in value)
+    )
+
+
+def require_exact_fields(
+    document: dict[str, Any], fields: frozenset[str], label: str
+) -> None:
+    actual = frozenset(document)
+    if actual != fields:
+        missing = sorted(fields - actual)
+        extra = sorted(actual - fields)
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if extra:
+            details.append("unexpected " + ", ".join(extra))
+        raise LoopError(f"{label} fields differ: {'; '.join(details)}")
 
 
 def load_inputs() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -487,6 +598,637 @@ def run_safety_checks(config: dict[str, Any], phase: str) -> None:
     for argv in config["safety_checks"]:
         if not run_check(argv):
             raise LoopError(f"{phase} safety check failed: {argv}")
+
+
+def recovery_paths(
+    config: dict[str, Any], run_id: str
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    if (
+        not run_id.startswith("session_")
+        or len(run_id) > 64
+        or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+               for character in run_id)
+    ):
+        raise LoopError("recovery run ID is invalid")
+    recovery_root = state_path(config).parent / "recoveries"
+    operation = recovery_root / run_id
+    if recovery_root.is_symlink() or operation.is_symlink():
+        raise LoopError("recovery state path is a symlink")
+    paths = (
+        operation / "stop-snapshot.json",
+        operation / "intent.json",
+        operation / "receipt.json",
+    )
+    if any(path.is_symlink() or path.with_suffix(path.suffix + ".new").is_symlink() for path in paths):
+        raise LoopError("recovery journal path is a symlink")
+    return paths
+
+
+def recovery_packet_path(state: dict[str, Any]) -> pathlib.Path:
+    relative = state.get("packet")
+    if not isinstance(relative, str):
+        raise LoopError("stopped session packet path is invalid")
+    packet_path = pathlib.Path(relative)
+    if packet_path.is_absolute() or ".." in packet_path.parts:
+        raise LoopError("stopped session packet escapes the repository")
+    resolved = (ROOT / packet_path).resolve()
+    try:
+        resolved.relative_to(ROOT.resolve())
+    except ValueError as exc:
+        raise LoopError("stopped session packet escapes the repository") from exc
+    if resolved != ROOT / packet_path:
+        raise LoopError("stopped session packet traverses a symlink")
+    expected = pathlib.Path(".automonique/state/runs") / state["run_id"] / "packet.json"
+    if packet_path != expected:
+        raise LoopError("stopped session packet path is not its admitted run packet")
+    return resolved
+
+
+def validated_safety_checks(config: dict[str, Any]) -> list[list[str]]:
+    checks = config.get("safety_checks")
+    if (
+        not isinstance(checks, list)
+        or not checks
+        or any(
+            not isinstance(argv, list)
+            or not argv
+            or any(not isinstance(argument, str) or not argument for argument in argv)
+            for argv in checks
+        )
+    ):
+        raise LoopError("recovery safety checks are not fixed explicit argument vectors")
+    return [list(argv) for argv in checks]
+
+
+def validate_recoverable_state(state: dict[str, Any]) -> None:
+    actual_fields = frozenset(state)
+    if actual_fields not in (
+        CLAIMED_SESSION_STATE_FIELDS,
+        RECOVERABLE_STOP_STATE_FIELDS,
+    ):
+        unexpected = sorted(actual_fields - RECOVERABLE_STOP_STATE_FIELDS)
+        missing = sorted(CLAIMED_SESSION_STATE_FIELDS - actual_fields)
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected " + ", ".join(unexpected))
+        if not details:
+            details.append("candidate snapshot fields are incomplete")
+        raise LoopError("stopped session state fields differ: " + "; ".join(details))
+    required_types: dict[str, type[Any]] = {
+        "schema": str,
+        "run_id": str,
+        "driver": str,
+        "work_id": str,
+        "base": str,
+        "branch": str,
+        "status": str,
+        "packet": str,
+        "iteration": int,
+        "failures": int,
+        "unchanged_results": int,
+        "stop_reason": str,
+        "started_at": str,
+        "deadline_at": str,
+        "updated_at": str,
+        "packet_sha256": str,
+    }
+    missing = [name for name in required_types if name not in state]
+    if missing:
+        raise LoopError("stopped session state is incomplete: " + ", ".join(missing))
+    for name, expected in required_types.items():
+        value = state[name]
+        if expected is int:
+            valid = type(value) is int and value >= 0
+        else:
+            valid = isinstance(value, expected)
+        if not valid:
+            raise LoopError(f"stopped session state field {name} is invalid")
+    if state["schema"] != STATE_SCHEMA:
+        raise LoopError("stopped session state schema differs")
+    if state["driver"] != "codex_session":
+        raise LoopError("stopped state does not belong to the Codex session driver")
+    if state["status"] != "stopped" or state["stop_reason"] != "wall_budget":
+        raise LoopError("only a wall-budget-stopped Codex session can be recovered")
+    if not valid_identifier(state["run_id"], 64):
+        raise LoopError("stopped session run ID is invalid")
+    if not valid_identifier(state["work_id"], 80, allow_dot=True):
+        raise LoopError("stopped session work ID is invalid")
+    if not valid_branch(state["branch"]):
+        raise LoopError("stopped session branch is invalid")
+    if any(state[name] > 1_000_000 for name in ("iteration", "failures", "unchanged_results")):
+        raise LoopError("stopped session counter exceeds its bound")
+    if not is_lower_hex(state["base"], 40):
+        raise LoopError("stopped session base is invalid")
+    for name in ("packet_sha256",):
+        value = state[name]
+        if not is_lower_hex(value, 64):
+            raise LoopError(f"stopped session {name} is invalid")
+    for name in ("started_at", "deadline_at", "updated_at"):
+        parse_utc_seconds(state[name], f"stopped session {name}")
+    if actual_fields == RECOVERABLE_STOP_STATE_FIELDS:
+        candidate_paths = state["candidate_paths"]
+        if (
+            not isinstance(candidate_paths, list)
+            or not candidate_paths
+            or len(candidate_paths) > 1024
+            or any(not isinstance(path, str) for path in candidate_paths)
+            or any(not valid_repo_path(path) for path in candidate_paths)
+            or not is_lower_hex(state["last_tree_digest"], 64)
+            or not is_lower_hex(state["candidate_tree"], 40)
+        ):
+            raise LoopError("stopped session candidate snapshot is invalid")
+        parse_utc_seconds(state["checked_at"], "stopped session checked_at")
+
+
+def validate_recovery_snapshot(snapshot: dict[str, Any]) -> None:
+    require_exact_fields(
+        snapshot,
+        frozenset(
+            {
+                "schema",
+                "run_id",
+                "captured_at",
+                "stopped_state",
+                "stopped_state_sha256",
+                "stopped_state_file_sha256",
+                "packet_sha256",
+                "guides_sha256",
+                "objectives_sha256",
+                "program_sha256",
+                "allowed_paths",
+                "safety_checks",
+                "dirty_paths",
+                "dirty_digest",
+                "dirty_tree",
+            }
+        ),
+        "recovery stop snapshot",
+    )
+    stopped = snapshot.get("stopped_state")
+    if snapshot.get("schema") != RECOVERY_SNAPSHOT_SCHEMA or not isinstance(stopped, dict):
+        raise LoopError("recovery stop snapshot schema differs")
+    validate_recoverable_state(stopped)
+    if canonical_sha256(stopped) != snapshot.get("stopped_state_sha256"):
+        raise LoopError("recovery stop snapshot state digest differs")
+    if snapshot.get("run_id") != stopped["run_id"]:
+        raise LoopError("recovery stop snapshot run ID differs")
+    string_digests = (
+        "stopped_state_file_sha256",
+        "packet_sha256",
+        "guides_sha256",
+        "objectives_sha256",
+        "program_sha256",
+        "dirty_digest",
+    )
+    if any(
+        not is_lower_hex(snapshot.get(name), 64)
+        for name in string_digests
+    ):
+        raise LoopError("recovery stop snapshot digest is invalid")
+    if not is_lower_hex(snapshot.get("dirty_tree"), 40):
+        raise LoopError("recovery stop snapshot tree is invalid")
+    parse_utc_seconds(snapshot.get("captured_at"), "recovery snapshot captured_at")
+    for name in ("allowed_paths", "dirty_paths"):
+        value = snapshot.get(name)
+        if not isinstance(value, list) or any(not isinstance(entry, str) for entry in value):
+            raise LoopError(f"recovery stop snapshot {name} is invalid")
+    validated_safety_checks({"safety_checks": snapshot.get("safety_checks")})
+
+
+def validate_recovery_intent(intent: dict[str, Any]) -> None:
+    require_exact_fields(
+        intent,
+        frozenset(
+            {
+                "schema",
+                "run_id",
+                "created_at",
+                "stop_snapshot_sha256",
+                "stopped_state_sha256",
+                "replacement_state",
+                "replacement_state_sha256",
+            }
+        ),
+        "recovery intent",
+    )
+    replacement = intent.get("replacement_state")
+    if intent.get("schema") != RECOVERY_INTENT_SCHEMA or not isinstance(replacement, dict):
+        raise LoopError("recovery intent schema differs")
+    require_exact_fields(replacement, CLAIMED_SESSION_STATE_FIELDS, "recovery replacement state")
+    if canonical_sha256(replacement) != intent.get("replacement_state_sha256"):
+        raise LoopError("recovery replacement state digest differs")
+    if (
+        replacement.get("schema") != STATE_SCHEMA
+        or replacement.get("driver") != "codex_session"
+        or replacement.get("status") != "claimed"
+        or replacement.get("stop_reason") is not None
+        or replacement.get("run_id") != intent.get("run_id")
+    ):
+        raise LoopError("recovery replacement state is invalid")
+    for name in (
+        "stop_snapshot_sha256",
+        "stopped_state_sha256",
+        "replacement_state_sha256",
+    ):
+        value = intent.get(name)
+        if (
+            not is_lower_hex(value, 64)
+        ):
+            raise LoopError(f"recovery intent {name} is invalid")
+    parse_utc_seconds(intent.get("created_at"), "recovery intent creation time")
+
+
+def validate_intent_against_snapshot(
+    intent: dict[str, Any],
+    snapshot: dict[str, Any],
+    objective: dict[str, Any],
+    snapshot_file_sha256: str,
+) -> None:
+    validate_recovery_intent(intent)
+    stopped = snapshot["stopped_state"]
+    replacement = intent["replacement_state"]
+    invariant_fields = (
+        "schema",
+        "run_id",
+        "driver",
+        "work_id",
+        "base",
+        "branch",
+        "packet",
+        "iteration",
+        "failures",
+        "unchanged_results",
+        "packet_sha256",
+    )
+    changed = [name for name in invariant_fields if replacement[name] != stopped[name]]
+    if changed:
+        raise LoopError(
+            "recovery intent changes immutable stopped-session fields: "
+            + ", ".join(changed)
+        )
+    if (
+        intent["run_id"] != stopped["run_id"]
+        or intent["stopped_state_sha256"] != snapshot["stopped_state_sha256"]
+        or intent["stop_snapshot_sha256"] != snapshot_file_sha256
+    ):
+        raise LoopError("recovery intent differs from its exact stop snapshot")
+    started = parse_utc_seconds(
+        replacement["started_at"], "recovery replacement started_at"
+    )
+    updated = parse_utc_seconds(
+        replacement["updated_at"], "recovery replacement updated_at"
+    )
+    deadline = parse_utc_seconds(
+        replacement["deadline_at"], "recovery replacement deadline_at"
+    )
+    max_wall_seconds = objective.get("budget", {}).get("max_wall_seconds")
+    if (
+        type(max_wall_seconds) is not int
+        or max_wall_seconds < 1
+        or started != updated
+        or deadline - started != dt.timedelta(seconds=max_wall_seconds)
+    ):
+        raise LoopError("recovery replacement wall budget differs from the objective")
+
+
+def validate_recovery_receipt(receipt: dict[str, Any]) -> None:
+    require_exact_fields(
+        receipt,
+        frozenset(
+            {
+                "schema",
+                "run_id",
+                "recovered_at",
+                "intent_sha256",
+                "replacement_state_sha256",
+                "status",
+            }
+        ),
+        "recovery receipt",
+    )
+    if receipt.get("schema") != RECOVERY_RECEIPT_SCHEMA or receipt.get("status") != "claimed":
+        raise LoopError("recovery receipt schema or status differs")
+    for name in ("intent_sha256", "replacement_state_sha256"):
+        value = receipt.get(name)
+        if (
+            not is_lower_hex(value, 64)
+        ):
+            raise LoopError(f"recovery receipt {name} is invalid")
+    parse_utc_seconds(receipt.get("recovered_at"), "recovery receipt recovered_at")
+
+
+def recovery_snapshot_document(
+    state: dict[str, Any], packet: dict[str, Any], config: dict[str, Any]
+) -> dict[str, Any]:
+    allowed_paths = packet["objective"]["allowed_paths"]
+    paths = sorted(porcelain_paths())
+    if len(paths) > 1024 or any(not valid_repo_path(path) for path in paths):
+        raise LoopError("recovery dirty path snapshot is invalid or exceeds its bound")
+    outside = lease_errors(paths, allowed_paths)
+    if outside:
+        raise LoopError("recovery found out-of-lease paths: " + ", ".join(outside))
+    dirty_digest = tree_fingerprint(paths)
+    dirty_tree = exact_candidate_tree(state, packet, config, paths)
+    if "candidate_paths" in state and (
+        sorted(state["candidate_paths"]) != paths
+        or state["last_tree_digest"] != dirty_digest
+        or state["candidate_tree"] != dirty_tree
+    ):
+        raise LoopError("stopped candidate snapshot differs from the exact dirty tree")
+    return {
+        "schema": RECOVERY_SNAPSHOT_SCHEMA,
+        "run_id": state["run_id"],
+        "captured_at": utc_now(),
+        "stopped_state": state,
+        "stopped_state_sha256": canonical_sha256(state),
+        "stopped_state_file_sha256": file_sha256(state_path(config)),
+        "packet_sha256": state["packet_sha256"],
+        "guides_sha256": packet["guides_sha256"],
+        "objectives_sha256": packet["objectives_sha256"],
+        "program_sha256": packet["program_sha256"],
+        "allowed_paths": allowed_paths,
+        "safety_checks": validated_safety_checks(config),
+        "dirty_paths": paths,
+        "dirty_digest": dirty_digest,
+        "dirty_tree": dirty_tree,
+    }
+
+
+def validate_recovery_inputs(
+    state: dict[str, Any],
+    program_document: dict[str, Any],
+    objectives: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    validate_recoverable_state(state)
+    packet_path = recovery_packet_path(state)
+    if file_sha256(packet_path) != state["packet_sha256"]:
+        raise LoopError("immutable stopped-session packet changed after admission")
+    packet = load_json(packet_path)
+    if packet.get("schema") != PACKET_SCHEMA:
+        raise LoopError("stopped-session packet schema differs")
+    if (
+        packet.get("run_id") != state["run_id"]
+        or packet.get("driver") != "codex_session"
+        or packet.get("immutable_base") != state["base"]
+        or packet.get("iteration") != state["iteration"]
+    ):
+        raise LoopError("stopped session and immutable packet disagree")
+    item, objective = select_item(program_document, objectives, state["work_id"])
+    if packet.get("work_item") != item or packet.get("objective") != objective:
+        raise LoopError("stopped-session objective differs from the current executable plan")
+    expected_packet = packet_document(
+        state["run_id"],
+        state["iteration"],
+        state["base"],
+        item,
+        objective,
+        config,
+        None,
+        driver="codex_session",
+    )
+    if packet != expected_packet:
+        raise LoopError("stopped-session packet differs from its closed v1 document")
+    current_digests = {
+        "guides_sha256": file_sha256(guides.GUIDE_MANIFEST),
+        "objectives_sha256": file_sha256(guides.OBJECTIVES),
+        "program_sha256": file_sha256(program.DEFAULT_PROGRAM),
+    }
+    drifted = [
+        name for name, digest in current_digests.items() if packet.get(name) != digest
+    ]
+    if drifted:
+        raise LoopError("stopped-session admission inputs changed: " + ", ".join(drifted))
+    if git("rev-parse", "HEAD") != state["base"]:
+        raise LoopError("recovery Git revision differs from the admitted base")
+    if git("branch", "--show-current") != state["branch"]:
+        raise LoopError("recovery Git branch differs from the admitted branch")
+    validated_safety_checks(config)
+    state_root = state_path(config).parent
+    effect_paths = (
+        state_root / "git-candidates" / state["run_id"] / "intent.json",
+        state_root / "git-candidates" / state["run_id"] / "receipt.json",
+        state_root / "local-integrations" / state["run_id"] / "intent.json",
+        state_root / "local-integrations" / state["run_id"] / "receipt.json",
+    )
+    existing_effects = [path for path in effect_paths if os.path.lexists(path)]
+    if existing_effects:
+        raise LoopError("recovery found an ambiguous candidate or integration effect")
+    candidate_ref = f"refs/automonique/candidates/{state['run_id']}"
+    inspected_ref = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", candidate_ref],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if inspected_ref.returncode == 0:
+        raise LoopError("recovery found an ambiguous candidate ref")
+    if inspected_ref.returncode != 1:
+        raise LoopError("recovery could not inspect the candidate ref")
+    return packet
+
+
+def snapshot_facts(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in snapshot.items() if key != "captured_at"}
+
+
+def replacement_claim(
+    stopped: dict[str, Any], objective: dict[str, Any], now: dt.datetime
+) -> dict[str, Any]:
+    max_wall_seconds = objective.get("budget", {}).get("max_wall_seconds")
+    if type(max_wall_seconds) is not int or max_wall_seconds < 1:
+        raise LoopError("recovery objective wall budget is invalid")
+    timestamp = now.isoformat(timespec="seconds")
+    deadline = now + dt.timedelta(seconds=max_wall_seconds)
+    return {
+        "schema": STATE_SCHEMA,
+        "run_id": stopped["run_id"],
+        "driver": "codex_session",
+        "work_id": stopped["work_id"],
+        "base": stopped["base"],
+        "branch": stopped["branch"],
+        "status": "claimed",
+        "packet": stopped["packet"],
+        "iteration": stopped["iteration"],
+        "failures": stopped["failures"],
+        "unchanged_results": stopped["unchanged_results"],
+        "stop_reason": None,
+        "started_at": timestamp,
+        "deadline_at": deadline.isoformat(timespec="seconds"),
+        "updated_at": timestamp,
+        "packet_sha256": stopped["packet_sha256"],
+    }
+
+
+def _write_recovery_receipt(
+    path: pathlib.Path, intent: dict[str, Any]
+) -> dict[str, Any]:
+    receipt = {
+        "schema": RECOVERY_RECEIPT_SCHEMA,
+        "run_id": intent["run_id"],
+        "recovered_at": utc_now(),
+        "intent_sha256": canonical_sha256(intent),
+        "replacement_state_sha256": intent["replacement_state_sha256"],
+        "status": "claimed",
+    }
+    write_json_atomic(path, receipt)
+    return receipt
+
+
+def _recover_session_locked() -> int:
+    program_document, objectives, config = load_inputs()
+    state = read_state(config)
+    if state is None:
+        raise LoopError("no stopped Codex session claim exists")
+    run_id = state.get("run_id")
+    if not isinstance(run_id, str):
+        raise LoopError("stopped session run ID is invalid")
+    snapshot_path, intent_path, receipt_path = recovery_paths(config, run_id)
+
+    if receipt_path.exists():
+        receipt = load_json(receipt_path)
+        validate_recovery_receipt(receipt)
+        if not intent_path.exists() or not snapshot_path.exists():
+            raise LoopError("recovery receipt exists without its durable journal")
+        intent = load_json(intent_path)
+        snapshot = load_json(snapshot_path)
+        validate_recovery_snapshot(snapshot)
+        packet = validate_recovery_inputs(
+            snapshot["stopped_state"], program_document, objectives, config
+        )
+        validate_intent_against_snapshot(
+            intent,
+            snapshot,
+            packet["objective"],
+            file_sha256(snapshot_path),
+        )
+        if (
+            receipt["run_id"] != run_id
+            or receipt["intent_sha256"] != canonical_sha256(intent)
+            or receipt["replacement_state_sha256"] != intent["replacement_state_sha256"]
+        ):
+            raise LoopError("recovery receipt differs from its durable intent")
+        if state != intent["replacement_state"]:
+            raise LoopError("wall-budget recovery was already consumed; repeat renewal is forbidden")
+        print(json.dumps(receipt, indent=2, sort_keys=True))
+        return 0
+
+    if intent_path.exists():
+        intent = load_json(intent_path)
+        validate_recovery_intent(intent)
+        if intent["run_id"] != run_id:
+            raise LoopError("recovery intent run ID differs")
+        if not snapshot_path.exists():
+            raise LoopError("recovery intent exists without its stop snapshot")
+        snapshot = load_json(snapshot_path)
+        validate_recovery_snapshot(snapshot)
+        packet = validate_recovery_inputs(
+            snapshot["stopped_state"], program_document, objectives, config
+        )
+        validate_intent_against_snapshot(
+            intent,
+            snapshot,
+            packet["objective"],
+            file_sha256(snapshot_path),
+        )
+        if state == intent["replacement_state"]:
+            receipt = _write_recovery_receipt(receipt_path, intent)
+            print(json.dumps(receipt, indent=2, sort_keys=True))
+            return 0
+        if state != snapshot["stopped_state"]:
+            raise LoopError("live session state differs from its durable recovery intent")
+
+    packet = validate_recovery_inputs(state, program_document, objectives, config)
+    current_snapshot = recovery_snapshot_document(state, packet, config)
+    if snapshot_path.exists():
+        snapshot = load_json(snapshot_path)
+        validate_recovery_snapshot(snapshot)
+        if snapshot_facts(snapshot) != snapshot_facts(current_snapshot):
+            raise LoopError("stopped session or its exact recovery snapshot changed")
+    else:
+        snapshot = current_snapshot
+        write_json_atomic(snapshot_path, snapshot)
+
+    fixed_checks = snapshot["safety_checks"]
+    run_safety_checks({"safety_checks": fixed_checks}, "recovery")
+
+    current_program, current_objectives, current_config = load_inputs()
+    if validated_safety_checks(current_config) != fixed_checks:
+        raise LoopError("recovery safety checks changed while they were running")
+    current_state = read_state(current_config)
+    if (
+        current_state is None
+        or canonical_sha256(current_state) != snapshot["stopped_state_sha256"]
+        or file_sha256(state_path(current_config))
+        != snapshot["stopped_state_file_sha256"]
+    ):
+        raise LoopError("stopped session changed before recovery compare-and-swap")
+    current_packet = validate_recovery_inputs(
+        current_state, current_program, current_objectives, current_config
+    )
+    verified_snapshot = recovery_snapshot_document(
+        current_state, current_packet, current_config
+    )
+    if snapshot_facts(verified_snapshot) != snapshot_facts(snapshot):
+        raise LoopError("recovery inputs changed while safety checks were running")
+
+    if intent_path.exists():
+        intent = load_json(intent_path)
+        validate_intent_against_snapshot(
+            intent,
+            snapshot,
+            current_packet["objective"],
+            file_sha256(snapshot_path),
+        )
+    else:
+        replacement = replacement_claim(
+            current_state,
+            current_packet["objective"],
+            dt.datetime.now(dt.timezone.utc),
+        )
+        intent = {
+            "schema": RECOVERY_INTENT_SCHEMA,
+            "run_id": run_id,
+            "created_at": utc_now(),
+            "stop_snapshot_sha256": file_sha256(snapshot_path),
+            "stopped_state_sha256": snapshot["stopped_state_sha256"],
+            "replacement_state": replacement,
+            "replacement_state_sha256": canonical_sha256(replacement),
+        }
+        write_json_atomic(intent_path, intent)
+
+    validate_intent_against_snapshot(
+        intent,
+        snapshot,
+        current_packet["objective"],
+        file_sha256(snapshot_path),
+    )
+
+    reread = read_state(current_config)
+    if (
+        reread is None
+        or canonical_sha256(reread) != intent["stopped_state_sha256"]
+        or file_sha256(state_path(current_config))
+        != snapshot["stopped_state_file_sha256"]
+    ):
+        raise LoopError("stopped session lost the recovery compare-and-swap")
+    write_json_atomic(state_path(current_config), intent["replacement_state"])
+    receipt = _write_recovery_receipt(receipt_path, intent)
+    print(json.dumps(receipt, indent=2, sort_keys=True))
+    return 0
+
+
+def recover_session() -> int:
+    config = load_json(guides.LOOP_CONFIG)
+    lock = acquire_loop_lock(config)
+    try:
+        return _recover_session_locked()
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
 
 
 def _claim_session_locked(requested: str | None) -> int:
@@ -1009,6 +1751,7 @@ def main() -> int:
     next_parser.add_argument("--item")
     claim_parser = subparsers.add_parser("claim")
     claim_parser.add_argument("--item")
+    subparsers.add_parser("recover")
     subparsers.add_parser("check")
     candidate_parser = subparsers.add_parser("candidate")
     candidate_parser.add_argument("--summary", required=True)
@@ -1042,6 +1785,8 @@ def main() -> int:
             return 0
         if args.command == "claim":
             return claim_session(args.item)
+        if args.command == "recover":
+            return recover_session()
         if args.command == "check":
             return check_session()
         if args.command == "candidate":

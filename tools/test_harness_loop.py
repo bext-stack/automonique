@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -318,6 +319,271 @@ class HarnessLoopTests(unittest.TestCase):
             budget=self.budget,
         )
         self.assertEqual("candidate_ready", reason)
+
+    def test_recovery_state_schema_rejects_ambiguous_and_non_utc_state(self) -> None:
+        state = {
+            "schema": harness_loop.STATE_SCHEMA,
+            "run_id": "session_20260810T000000Z_deadbeef",
+            "driver": "codex_session",
+            "work_id": "R0-19",
+            "base": "a" * 40,
+            "branch": "main",
+            "status": "stopped",
+            "packet": ".automonique/state/runs/session_20260810T000000Z_deadbeef/packet.json",
+            "iteration": 1,
+            "failures": 0,
+            "unchanged_results": 0,
+            "stop_reason": "wall_budget",
+            "started_at": "2026-08-10T00:00:00+00:00",
+            "deadline_at": "2026-08-10T00:30:00+00:00",
+            "updated_at": "2026-08-10T00:30:00+00:00",
+            "packet_sha256": "b" * 64,
+        }
+        harness_loop.validate_recoverable_state(state)
+        ambiguous = dict(state, candidate_ref="refs/automonique/candidates/test")
+        with self.assertRaisesRegex(harness_loop.LoopError, "unexpected candidate_ref"):
+            harness_loop.validate_recoverable_state(ambiguous)
+        naive = dict(state, updated_at="2026-08-10T00:30:00")
+        with self.assertRaisesRegex(harness_loop.LoopError, "updated_at is invalid"):
+            harness_loop.validate_recoverable_state(naive)
+
+    def test_recovery_rejects_stale_candidate_snapshot(self) -> None:
+        original_paths = harness_loop.porcelain_paths
+        original_fingerprint = harness_loop.tree_fingerprint
+        original_tree = harness_loop.exact_candidate_tree
+        with tempfile.TemporaryDirectory() as directory:
+            config = {"state_path": str(pathlib.Path(directory) / "state.json")}
+            state = {
+                "run_id": "session_20260810T000000Z_deadbeef",
+                "candidate_paths": ["tools/change.py"],
+                "last_tree_digest": "a" * 64,
+                "candidate_tree": "b" * 40,
+            }
+            pathlib.Path(config["state_path"]).write_text("{}\n")
+            try:
+                harness_loop.porcelain_paths = lambda: ["tools/change.py"]
+                harness_loop.tree_fingerprint = lambda paths: "c" * 64
+                harness_loop.exact_candidate_tree = (
+                    lambda state_value, packet, config_value, paths: "b" * 40
+                )
+                with self.assertRaisesRegex(harness_loop.LoopError, "differs"):
+                    harness_loop.recovery_snapshot_document(
+                        state,
+                        {"objective": {"allowed_paths": ["tools/"]}},
+                        config,
+                    )
+            finally:
+                harness_loop.porcelain_paths = original_paths
+                harness_loop.tree_fingerprint = original_fingerprint
+                harness_loop.exact_candidate_tree = original_tree
+
+    def test_recovery_is_durable_idempotent_and_one_shot(self) -> None:
+        original_root = harness_loop.ROOT
+        original_load_inputs = harness_loop.load_inputs
+        original_safety_checks = harness_loop.run_safety_checks
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+
+            def run_git(*args: str) -> str:
+                completed = subprocess.run(
+                    ["git", *args],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return completed.stdout.strip()
+
+            try:
+                harness_loop.ROOT = root
+                subprocess.run(
+                    ["git", "init", "--initial-branch=main"],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                )
+                run_git("config", "user.name", "Recovery Test")
+                run_git("config", "user.email", "recovery@example.invalid")
+                (root / "tools").mkdir()
+                (root / "tools/base.py").write_text("BASE = True\n")
+                (root / ".gitignore").write_text("/.automonique/state/\n")
+                run_git("add", ".gitignore", "tools/base.py")
+                run_git("commit", "-m", "test base")
+                base = run_git("rev-parse", "HEAD")
+
+                item, objective = harness_loop.select_item(
+                    self.program, self.objectives, "R0-19"
+                )
+                config = guides.build_loop_config()
+                config["safety_checks"] = [[sys.executable, "-c", "pass"]]
+                run_id = "session_20260810T000000Z_deadbeef"
+                packet = harness_loop.packet_document(
+                    run_id,
+                    1,
+                    base,
+                    item,
+                    objective,
+                    config,
+                    None,
+                    driver="codex_session",
+                )
+                packet_path = (
+                    root / ".automonique/state/runs" / run_id / "packet.json"
+                )
+                harness_loop.write_json_atomic(packet_path, packet)
+                state = {
+                    "schema": harness_loop.STATE_SCHEMA,
+                    "run_id": run_id,
+                    "driver": "codex_session",
+                    "work_id": "R0-19",
+                    "base": base,
+                    "branch": "main",
+                    "status": "stopped",
+                    "packet": packet_path.relative_to(root).as_posix(),
+                    "iteration": 1,
+                    "failures": 0,
+                    "unchanged_results": 0,
+                    "stop_reason": "wall_budget",
+                    "started_at": "2026-08-10T00:00:00+00:00",
+                    "deadline_at": "2026-08-10T00:30:00+00:00",
+                    "updated_at": "2026-08-10T00:30:00+00:00",
+                    "packet_sha256": harness_loop.file_sha256(packet_path),
+                }
+                loop_state = root / config["state_path"]
+                harness_loop.write_json_atomic(loop_state, state)
+                dirty = root / "tools/recovery-change.py"
+                dirty.write_text("RECOVERED = True\n")
+                harness_loop.load_inputs = lambda: (
+                    self.program,
+                    self.objectives,
+                    config,
+                )
+
+                self.assertEqual(
+                    1,
+                    subprocess.run(
+                        [
+                            "git",
+                            "show-ref",
+                            "--verify",
+                            "--quiet",
+                            f"refs/automonique/candidates/{run_id}",
+                        ],
+                        cwd=root,
+                        check=False,
+                    ).returncode,
+                )
+                outside = root / "outside.txt"
+                outside.write_text("not leased\n")
+                with self.assertRaisesRegex(harness_loop.LoopError, "out-of-lease"):
+                    harness_loop._recover_session_locked()
+                outside.unlink()
+
+                ambiguous_effect = (
+                    root
+                    / ".automonique/state/git-candidates"
+                    / run_id
+                    / "intent.json"
+                )
+                ambiguous_effect.parent.mkdir(parents=True)
+                ambiguous_effect.symlink_to("missing-intent")
+                with self.assertRaisesRegex(harness_loop.LoopError, "ambiguous"):
+                    harness_loop._recover_session_locked()
+                ambiguous_effect.unlink()
+                run_git(
+                    "update-ref",
+                    f"refs/automonique/candidates/{run_id}",
+                    base,
+                )
+                with self.assertRaisesRegex(harness_loop.LoopError, "candidate ref"):
+                    harness_loop._recover_session_locked()
+                run_git("update-ref", "-d", f"refs/automonique/candidates/{run_id}")
+
+                changed_packet = json.loads(json.dumps(packet))
+                changed_packet["unexpected"] = True
+                harness_loop.write_json_atomic(packet_path, changed_packet)
+                changed_state = dict(state)
+                changed_state["packet_sha256"] = harness_loop.file_sha256(packet_path)
+                harness_loop.write_json_atomic(loop_state, changed_state)
+                with self.assertRaisesRegex(harness_loop.LoopError, "closed v1"):
+                    harness_loop._recover_session_locked()
+                harness_loop.write_json_atomic(packet_path, packet)
+                harness_loop.write_json_atomic(loop_state, state)
+
+                def mutate_raw_state(config_value: dict, phase: str) -> None:
+                    original_safety_checks(config_value, phase)
+                    with loop_state.open("a") as handle:
+                        handle.write(" ")
+
+                harness_loop.run_safety_checks = mutate_raw_state
+                try:
+                    with self.assertRaisesRegex(
+                        harness_loop.LoopError, "changed before recovery compare-and-swap"
+                    ):
+                        harness_loop._recover_session_locked()
+                finally:
+                    harness_loop.run_safety_checks = original_safety_checks
+                harness_loop.write_json_atomic(loop_state, state)
+
+                self.assertEqual(0, harness_loop._recover_session_locked())
+                claimed = harness_loop.load_json(loop_state)
+                self.assertEqual("claimed", claimed["status"])
+                self.assertEqual(run_id, claimed["run_id"])
+                self.assertEqual(base, claimed["base"])
+                self.assertEqual(
+                    1800,
+                    int(
+                        (
+                            harness_loop.parse_utc_seconds(
+                                claimed["deadline_at"], "deadline"
+                            )
+                            - harness_loop.parse_utc_seconds(
+                                claimed["started_at"], "started"
+                            )
+                        ).total_seconds()
+                    ),
+                )
+                self.assertEqual("RECOVERED = True\n", dirty.read_text())
+
+                snapshot_path, intent_path, receipt_path = harness_loop.recovery_paths(
+                    config, run_id
+                )
+                self.assertTrue(snapshot_path.exists())
+                self.assertTrue(intent_path.exists())
+                self.assertTrue(receipt_path.exists())
+                intent = harness_loop.load_json(intent_path)
+                deadline = claimed["deadline_at"]
+
+                receipt_path.unlink()
+                harness_loop.write_json_atomic(loop_state, state)
+                self.assertEqual(0, harness_loop._recover_session_locked())
+                self.assertEqual(deadline, harness_loop.load_json(loop_state)["deadline_at"])
+
+                receipt_path.unlink()
+                corrupt = json.loads(json.dumps(intent))
+                corrupt["replacement_state"]["base"] = "f" * 40
+                corrupt["replacement_state_sha256"] = harness_loop.canonical_sha256(
+                    corrupt["replacement_state"]
+                )
+                harness_loop.write_json_atomic(intent_path, corrupt)
+                with self.assertRaisesRegex(
+                    harness_loop.LoopError, "immutable stopped-session fields"
+                ):
+                    harness_loop._recover_session_locked()
+
+                harness_loop.write_json_atomic(intent_path, intent)
+                self.assertEqual(0, harness_loop._recover_session_locked())
+                self.assertEqual(deadline, harness_loop.load_json(loop_state)["deadline_at"])
+
+                repeated_stop = dict(claimed)
+                repeated_stop.update(status="stopped", stop_reason="wall_budget")
+                harness_loop.write_json_atomic(loop_state, repeated_stop)
+                with self.assertRaisesRegex(harness_loop.LoopError, "already consumed"):
+                    harness_loop._recover_session_locked()
+            finally:
+                harness_loop.ROOT = original_root
+                harness_loop.load_inputs = original_load_inputs
+                harness_loop.run_safety_checks = original_safety_checks
 
 
 if __name__ == "__main__":
