@@ -7,6 +7,7 @@
 
 pub mod codec;
 pub mod primitives;
+pub mod release;
 
 use std::error::Error;
 use std::fmt;
