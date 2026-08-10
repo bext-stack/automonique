@@ -473,6 +473,302 @@
       ]
     },
     {
+      "id": "objective:R0-08",
+      "work_id": "R0-08",
+      "objective": "Turn `docs/product-plan/reference/feature-parity.md` into a machine-readable ledger keyed by row, so parity is a queryable record rather than a prose claim. Every current feature, script and companion surface carries exactly one status from the closed set, an owner, a fixture reference and an evidence reference, including the client portal, client publication, audits, live feed, notifications, targets and operational commands.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 7,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Row coverage",
+        "Status vocabulary",
+        "Required fields",
+        "Decision provenance",
+        "Drift check",
+        "Publication hygiene",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on a row that fits no status in the closed set, an unevidenced row being spelled `preserve`, a silently reclassified row, a generator that re-derives an owner decision instead of citing it, a ledger that cannot be drift-checked, a third-party comparison name or private identifier entering the generated output, an estimated count reported as measured, a licence-boundary violation, or any path outside the lease."
+      ],
+      "hill_climbability": 84,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        "spikes/",
+        ".automonique/dev/",
+        "tools/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-08.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R0-09",
+      "work_id": "R0-09",
+      "objective": "Document the identity, data and operations surface the rewrite must carry: tenants, actor mappings, roles, credentials, artifact classes, workspaces and dirty trees, retention, budgets, backup dependencies and runbooks. Each entry records what class of thing exists and who owns it, so identity and policy contracts have a measured starting point.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 7,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Section coverage",
+        "Credential safety",
+        "Scrub hygiene",
+        "Policy provenance",
+        "Restore dependencies",
+        "Runbook safety",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any credential value, token, key or secret-bearing URL appearing in any form, a private identifier, customer name, personal address, real host name or absolute home path entering the inventory, an unmarked synthetic placeholder, a recalled retention or budget number presented as policy, an executable or production-touching runbook step, a failing repository scrub, a licence-boundary violation, or any path outside the lease."
+      ],
+      "hill_climbability": 80,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        "spikes/",
+        ".automonique/dev/",
+        "tools/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-09.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R0-10",
+      "work_id": "R0-10",
+      "objective": "Prove the baseline backup and restore path by drill: take a consistent backup, restore it to a clean disposable host, and measure the result against the declared initial recovery point and recovery time objectives. The drill establishes that the objectives are real measurements rather than aspirations before any self-hosting work depends on them.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 7,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Safety refusal",
+        "Backup consistency",
+        "Clean-host restore",
+        "Objective measurement",
+        "Dependency agreement",
+        "Rerun hygiene",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any inability to prove source and target are disposable, a scenario that would read or write a production system or the live repository, a restore that silently depends on state the backup did not carry, an unmeasured or retroactively loosened objective, a declared objective missed and reported as a pass, any reachable production credential, residue left after a run, a licence-boundary violation, or any path outside the lease."
+      ],
+      "hill_climbability": 78,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        "spikes/",
+        ".automonique/dev/",
+        "tools/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-10.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R0-11",
+      "work_id": "R0-11",
+      "objective": "Measure how interactive shell access and file transfer are actually used, then record either an accepted isolated compatibility boundary or an explicit retirement decision. The point is to replace an assumption about what the shell surface is for with a measurement, so the security boundary is drawn around observed use rather than imagined use.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 7,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Usage measurement",
+        "Capture sanitization",
+        "Decision completeness",
+        "Boundary specificity",
+        "Retirement path",
+        "Offline replay",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on a recalled usage number presented as measured, a credential, personal path, customer name, private host or absolute home path entering a recorded observation, an unmarked synthetic placeholder, a usage class silently defaulting to a boundary or a retirement, a boundary described only as sandboxed, a retirement with no replacement path, a fixture that cannot replay offline, a licence-boundary violation, or any path outside the lease."
+      ],
+      "hill_climbability": 76,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        "spikes/",
+        ".automonique/dev/",
+        "tools/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-11.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R0-13",
+      "work_id": "R0-13",
+      "objective": "Classify every service, path, environment variable, protocol, package, command and external-platform legacy name as `durable`, `compatibility-only` or `presentation-only`, so the canonical Rust namespace gate and the canonical/legacy compatibility contract have one inventory to generate from rather than several hand-maintained lists.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 8,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Kind coverage",
+        "Class vocabulary",
+        "Forwarding integrity",
+        "Source citation",
+        "Clean-room provenance",
+        "Scrub hygiene",
+        "Drift check",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need to read, mount, clone or search the private archive, a structural reference being used to reconstruct behavior, a name that fits no class in the closed set, a compatibility-only entry with no durable counterpart, an uncited entry, a private identifier or absolute home path entering the inventory, an inventory that cannot be drift-checked, a licence-boundary violation, or any path outside the lease."
+      ],
+      "hill_climbability": 85,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        "spikes/",
+        ".automonique/dev/",
+        "tools/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-13.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R0-16",
+      "work_id": "R0-16",
+      "objective": "Turn `docs/product-plan/requirements/external-capability-ledger.md` into a machine-readable ledger keyed by capability, with specification, track, owner, ticket and fixture for every row, and schedule a periodic ecosystem capability review. This is the work the `capability_ledger_fields_missing` counter measures: 351 of the repository's 457 specification-debt points sit in this one ledger.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 8,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Row coverage",
+        "Required fields",
+        "Track vocabulary",
+        "Ticket resolution",
+        "Debt movement",
+        "Review schedule",
+        "Publication hygiene",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on a dropped capability row, an invented owner, ticket or fixture, a ticket that does not resolve to a real work-graph item, a debt fall caused by removing rows rather than filling fields, a track outside the closed set, a third-party comparison name or private identifier entering the generated output, a ledger that cannot be drift-checked, a review schedule that needs a network or calendar service, a licence-boundary violation, or any path outside the lease."
+      ],
+      "hill_climbability": 86,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        "spikes/",
+        ".automonique/dev/",
+        "tools/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-16.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
       "id": "objective:R0-17",
       "work_id": "R0-17",
       "objective": "Generate `.automonique/dev/program.yaml` as the implementation-harness view of every work item, dependency, gate, track, licence, lease and completion state, and reject drift in either direction from the executable plan.",

@@ -3,13 +3,13 @@
   "counters": {
     "capability_ledger_fields_missing": 351,
     "parity_ledger_fields_missing": 0,
-    "contracts_missing": 104,
+    "contracts_missing": 98,
     "gates_open": 2,
     "links_broken": 0,
     "refs_undefined": 0,
     "evidence_missing": 0
   },
-  "total": 457,
+  "total": 451,
   "context": {
     "items": 375,
     "items_done": 10
@@ -31,17 +31,17 @@
     "contracts_missing": [
       "no contract: R0-02",
       "no contract: R0-07",
-      "no contract: R0-08",
-      "no contract: R0-09",
-      "no contract: R0-10",
-      "no contract: R0-11",
       "no contract: R0-12",
-      "no contract: R0-13"
+      "no contract: R0-14",
+      "no contract: R0-15",
+      "no contract: R0-23",
+      "no contract: R0-24",
+      "no contract: R0-25"
     ],
     "gates_open": [
       "open: GATE-ORACLE",
       "open: GATE-SCRUB"
     ]
   },
-  "digest": "927496194cbcdc7be5ee415ed996ca3435645adb3f824b0a90502d3a1495e112"
+  "digest": "0adf4fbd038cc1e182225a23173ac59e5c60fda2d13e66c589fda6b6081104f0"
 }

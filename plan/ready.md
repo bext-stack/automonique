@@ -6,8 +6,8 @@ An item is ready when every dependency is `done`. Selecting work means taking a 
 
 - items total: **375**
 - done: **10**
-- ready now: **8**
-- blocked: **357**
+- ready now: **14**
+- blocked: **351**
 
 ## Selectable now
 
@@ -17,6 +17,12 @@ An item is ready when every dependency is `done`. Selecting work means taking a 
 | `BOOT-003` | BOOT | Pre-publication scrub gate | Elastic-2.0 | [contract](contracts/BOOT-003.md) |
 | `BOOT-004` | BOOT | Parity-oracle boundary | Elastic-2.0 | [contract](contracts/BOOT-004.md) |
 | `R0-01` | R0 | Current contract inventory | Elastic-2.0 | [contract](contracts/R0-01.md) |
+| `R0-08` | R0 | Machine-readable parity ledger | Elastic-2.0 | [contract](contracts/R0-08.md) |
+| `R0-09` | R0 | Identity/data/operations inventory | Elastic-2.0 | [contract](contracts/R0-09.md) |
+| `R0-10` | R0 | Baseline recovery drill | Elastic-2.0 | [contract](contracts/R0-10.md) |
+| `R0-11` | R0 | Shell decision fixture | Elastic-2.0 | [contract](contracts/R0-11.md) |
+| `R0-13` | R0 | Automonique identifier inventory | Elastic-2.0 | [contract](contracts/R0-13.md) |
+| `R0-16` | R0 | External capability baseline | Elastic-2.0 | [contract](contracts/R0-16.md) |
 | `R0-19` | R0 | Minimal `automonique-lab` | Elastic-2.0 | [contract](contracts/R0-19.md) |
 | `R0-40` | R0 | Self-host recovery drill | Elastic-2.0 | [contract](contracts/R0-40.md) |
 | `R1-07` | R1 | `automonique doctor` | Elastic-2.0 | [contract](contracts/R1-07.md) |
@@ -28,20 +34,20 @@ The first blocked items behind the current ready set:
 
 - `R0-02` Sanitized fixture corpus — waits on `R0-01`, gate `GATE-ORACLE`
 - `R0-07` Provider transcript corpus — waits on gate `GATE-ORACLE`
-- `R0-08` Machine-readable parity ledger — waits on contract
-- `R0-09` Identity/data/operations inventory — waits on contract
-- `R0-10` Baseline recovery drill — waits on contract
-- `R0-11` Shell decision fixture — waits on contract
 - `R0-12` Channel connector corpus — waits on contract
-- `R0-13` Automonique identifier inventory — waits on contract
 - `R0-14` Sandbox host-capability spike — waits on contract
 - `R0-15` Provider/tool egress spike — waits on contract
+- `R0-20` Role-policy trials — waits on `R0-21`
+- `R0-21` Commit metrics and baselines — waits on `R0-19`
+- `R0-22` Harness reload and merge train — waits on `R0-20`, `R0-21`
+- `R0-23` Self-hosting levels/policy — waits on contract
+- `R0-24` Bootstrap manifest/schema — waits on contract
 
 ## Unblocked but unspecified
 
 Dependency- and gate-clear, but no contract exists, so they are not selectable. Writing one of these contracts is itself useful work and lowers `contracts_missing`.
 
-  `R0-08`, `R0-09`, `R0-10`, `R0-11`, `R0-12`, `R0-13`, `R0-14`, `R0-15`, `R0-16`, `R0-23`, `R0-24`, `R0-25`, `R0-26`, `R0-27`, `R0-28`, `R0-29`, `R0-30`, `R0-31`, `R0-32`, `R0-33`, `R0-34`, `R0-35`, `R0-36`, `R0-37` …and 23 more
+  `R0-12`, `R0-14`, `R0-15`, `R0-23`, `R0-24`, `R0-25`, `R0-26`, `R0-27`, `R0-28`, `R0-29`, `R0-30`, `R0-31`, `R0-32`, `R0-33`, `R0-34`, `R0-35`, `R0-36`, `R0-37`, `R0-38`, `R0-39`, `R1-03`, `R1-04`, `R1-05`, `R1-06` …and 17 more
 
 ## Gate-blocked work
 
