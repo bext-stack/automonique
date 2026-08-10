@@ -1056,8 +1056,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-02.md",
+      "runnable": true
     },
     {
       "id": "R1-03",

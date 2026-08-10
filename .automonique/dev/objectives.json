@@ -774,6 +774,55 @@
       ]
     },
     {
+      "id": "objective:R1-02",
+      "work_id": "R1-02",
+      "objective": "Implement the dependency-free Rust value layer used by later protocol and policy work: domain-distinct opaque identifiers, const-bounded UTF-8 text, UTC epoch-millisecond timestamps, non-zero monotonic revisions, bounded public HTTP(S) URLs and secret-bearing wrappers. Invalid values fail at construction; validated values do not expose mutation that can break their invariant.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 6,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Identifier domains",
+        "Text bounds",
+        "Time and revision",
+        "URL safety",
+        "Secret safety",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on an unclear identifier grammar or URL security decision, any need for a new dependency or `Cargo.lock` change, a secret value in formatting/errors/test output, an unbounded ID/URL/secret representation, a missing exact/over-bound test, an empty or syntactically invalid URL host being accepted, unchecked time/revision arithmetic, silent truncation/normalization, a network or clock read, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 94,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-02.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
       "id": "objective:R1-07",
       "work_id": "R1-07",
       "objective": "Deliver the first runnable Monique product command: `automonique doctor [--json]`. It performs bounded, read-only local health checks and returns a stable typed report. It is not a service and does not start the lab.",
