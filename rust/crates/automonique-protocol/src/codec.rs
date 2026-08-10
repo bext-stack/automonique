@@ -105,6 +105,34 @@ pub enum CodecError {
         /// Field that was rejected.
         field: &'static str,
     },
+    /// The payload is not syntactically valid JSON, or not valid UTF-8.
+    MalformedJson,
+    /// The payload parses but is not in canonical form.
+    ///
+    /// Refused rather than normalized, so one message has exactly one accepted
+    /// byte spelling.
+    NonCanonicalJson,
+    /// A value is the wrong JSON type for its field, or a non-integer number.
+    InvalidJsonValue {
+        /// Field that was rejected.
+        field: &'static str,
+    },
+    /// An object contained the same key twice.
+    DuplicateKey,
+    /// Bytes remained after a complete value.
+    TrailingData,
+    /// An integer is outside the signed 64-bit range.
+    IntegerOutOfRange,
+    /// An array or object exceeded the entry ceiling.
+    TooManyEntries {
+        /// Maximum accepted entries.
+        max: usize,
+    },
+    /// A required field was absent.
+    MissingField {
+        /// The absent field.
+        field: &'static str,
+    },
 }
 
 impl CodecError {
@@ -122,6 +150,14 @@ impl CodecError {
             Self::NoVersionOverlap { .. } => "no_version_overlap",
             Self::InvertedVersionRange { .. } => "inverted_version_range",
             Self::UnknownEnumValue { .. } => "unknown_enum_value",
+            Self::MalformedJson => "malformed_json",
+            Self::NonCanonicalJson => "non_canonical_json",
+            Self::InvalidJsonValue { .. } => "invalid_json_value",
+            Self::DuplicateKey => "duplicate_key",
+            Self::TrailingData => "trailing_data",
+            Self::IntegerOutOfRange => "integer_out_of_range",
+            Self::TooManyEntries { .. } => "too_many_entries",
+            Self::MissingField { .. } => "missing_field",
         }
     }
 
@@ -142,6 +178,14 @@ impl CodecError {
             Self::NoVersionOverlap { .. } => 1007,
             Self::InvertedVersionRange { .. } => 1008,
             Self::UnknownEnumValue { .. } => 1009,
+            Self::MalformedJson => 1010,
+            Self::NonCanonicalJson => 1011,
+            Self::InvalidJsonValue { .. } => 1012,
+            Self::DuplicateKey => 1013,
+            Self::TrailingData => 1014,
+            Self::IntegerOutOfRange => 1015,
+            Self::TooManyEntries { .. } => 1016,
+            Self::MissingField { .. } => 1017,
         }
     }
 }
@@ -192,6 +236,24 @@ impl fmt::Display for CodecError {
             }
             Self::UnknownEnumValue { field } => {
                 write!(formatter, "field {field} has an undefined enum value")
+            }
+            Self::MalformedJson => formatter.write_str("payload is not valid canonical JSON text"),
+            Self::NonCanonicalJson => {
+                formatter.write_str("payload parses but is not in canonical form")
+            }
+            Self::InvalidJsonValue { field } => {
+                write!(formatter, "field {field} has the wrong JSON type")
+            }
+            Self::DuplicateKey => formatter.write_str("object contains a duplicate key"),
+            Self::TrailingData => formatter.write_str("bytes remain after a complete value"),
+            Self::IntegerOutOfRange => {
+                formatter.write_str("integer is outside the signed 64-bit range")
+            }
+            Self::TooManyEntries { max } => {
+                write!(formatter, "container exceeds {max} entries")
+            }
+            Self::MissingField { field } => {
+                write!(formatter, "required field {field} is absent")
             }
         }
     }

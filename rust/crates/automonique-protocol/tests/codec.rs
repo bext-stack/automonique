@@ -497,6 +497,14 @@ mod error_mapping {
             },
             CodecError::InvertedVersionRange { min: 4, max: 1 },
             CodecError::UnknownEnumValue { field: "decision" },
+            CodecError::MalformedJson,
+            CodecError::NonCanonicalJson,
+            CodecError::InvalidJsonValue { field: "version" },
+            CodecError::DuplicateKey,
+            CodecError::TrailingData,
+            CodecError::IntegerOutOfRange,
+            CodecError::TooManyEntries { max: 4096 },
+            CodecError::MissingField { field: "body" },
         ]
     }
 
@@ -530,7 +538,15 @@ mod error_mapping {
                 | CodecError::UnsupportedVersion { .. }
                 | CodecError::NoVersionOverlap { .. }
                 | CodecError::InvertedVersionRange { .. }
-                | CodecError::UnknownEnumValue { .. } => {}
+                | CodecError::UnknownEnumValue { .. }
+                | CodecError::MalformedJson
+                | CodecError::NonCanonicalJson
+                | CodecError::InvalidJsonValue { .. }
+                | CodecError::DuplicateKey
+                | CodecError::TrailingData
+                | CodecError::IntegerOutOfRange
+                | CodecError::TooManyEntries { .. }
+                | CodecError::MissingField { .. } => {}
             }
             assert!(error.wire_code() >= 1000);
             assert!(!error.category().is_empty());
