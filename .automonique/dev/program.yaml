@@ -3,7 +3,7 @@
   "schema": "automonique.dev-program/v1",
   "source": {
     "graph": "plan/work-graph.toml",
-    "graph_sha256": "8b135158102b049a9c94b7efef2fe5ed2f7cb3ea3e4537076b0640dc9665b682",
+    "graph_sha256": "d863524326ceabe7b2bed05cce9b2ba122b3273c0a2ab55435e140eb0569ee63",
     "item_count": 375
   },
   "items": [
@@ -288,7 +288,8 @@
         "plan/",
         "spikes/",
         ".automonique/dev/",
-        "tools/"
+        "tools/",
+        "docs/product-plan/reference/feature-parity.md"
       ],
       "closes_gate": null,
       "status": "blocked",
@@ -464,7 +465,8 @@
         "plan/",
         "spikes/",
         ".automonique/dev/",
-        "tools/"
+        "tools/",
+        "docs/product-plan/requirements/external-capability-ledger.md"
       ],
       "closes_gate": null,
       "status": "blocked",

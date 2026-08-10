@@ -181,7 +181,7 @@ title = "Machine-readable parity ledger"
 summary = "classify every current feature/script/companion as preserve, replace, isolate or retire with owner, fixture and evidence; include client-portal, client publication, audits, live feed, notifications, targets and operational commands."
 depends_on = ["BOOT-001"]
 licence = "Elastic-2.0"
-allowed_paths = ["plan/", "spikes/", ".automonique/dev/", "tools/"]
+allowed_paths = ["plan/", "spikes/", ".automonique/dev/", "tools/", "docs/product-plan/reference/feature-parity.md"]
 status = "blocked"
 
 [[item]]
@@ -269,7 +269,7 @@ title = "External capability baseline"
 summary = "turn `external-capability-ledger.md` into a machine-readable ledger keyed to capability, specification, track, owner, ticket and fixture; schedule periodic ecosystem capability review without product-comparison names in public plans."
 depends_on = ["BOOT-001"]
 licence = "Elastic-2.0"
-allowed_paths = ["plan/", "spikes/", ".automonique/dev/", "tools/"]
+allowed_paths = ["plan/", "spikes/", ".automonique/dev/", "tools/", "docs/product-plan/requirements/external-capability-ledger.md"]
 status = "blocked"
 
 [[item]]

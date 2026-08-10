@@ -513,7 +513,8 @@
         "plan/",
         "spikes/",
         ".automonique/dev/",
-        "tools/"
+        "tools/",
+        "docs/product-plan/reference/feature-parity.md"
       ],
       "licence": "Elastic-2.0",
       "sources": [
@@ -760,7 +761,8 @@
         "plan/",
         "spikes/",
         ".automonique/dev/",
-        "tools/"
+        "tools/",
+        "docs/product-plan/requirements/external-capability-ledger.md"
       ],
       "licence": "Elastic-2.0",
       "sources": [

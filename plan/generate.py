@@ -187,6 +187,18 @@ ALLOWED_PATHS = {
 # Per-item overrides where the epic default is wrong. An Apache-2.0 item may
 # not carry write access to a product path; plan/check.py enforces this.
 ITEM_PATHS = {
+    # R0-08 and R0-16 fill in the ledgers that `plan/baseline.py` counts. The
+    # epic default lease excludes docs/, so each needs write access to the one
+    # ledger file its own objective is measured against — and to no other
+    # document.
+    "R0-08": [
+        "plan/", "spikes/", ".automonique/dev/", "tools/",
+        "docs/product-plan/reference/feature-parity.md",
+    ],
+    "R0-16": [
+        "plan/", "spikes/", ".automonique/dev/", "tools/",
+        "docs/product-plan/requirements/external-capability-ledger.md",
+    ],
     "R0-03": [
         "spikes/foreground-lifecycle/", "plan/", ".github/workflows/plan.yml",
         ".automonique/dev/program.yaml",
