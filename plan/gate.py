@@ -181,8 +181,8 @@ def contract_checks(item_id: str) -> list[str]:
     return names
 
 
-def status_at_head(item_id: str) -> str | None:
-    """The item's status in the committed graph, or None if unreadable."""
+def item_at_head(item_id: str) -> dict | None:
+    """The item as the committed graph records it, or None if unreadable."""
     try:
         committed = git("show", "HEAD:plan/work-graph.toml")
     except subprocess.CalledProcessError:
@@ -193,8 +193,29 @@ def status_at_head(item_id: str) -> str | None:
         return None
     for entry in items:
         if entry.get("id") == item_id:
-            return entry.get("status")
+            return entry
     return None
+
+
+def status_at_head(item_id: str) -> str | None:
+    """The item's status in the committed graph, or None if unreadable."""
+    entry = item_at_head(item_id)
+    return entry.get("status") if entry else None
+
+
+def lease_at_head(item_id: str) -> list[str] | None:
+    """The item's lease as the committed graph records it.
+
+    Read from HEAD, never the working tree: the graph is generated, so a
+    candidate that edits `plan/generate.py` could otherwise widen its own lease
+    and be judged against the wider one in the same transaction. Widening a
+    lease is legitimate work — it just has to land first, judged on its own.
+    """
+    entry = item_at_head(item_id)
+    if entry is None:
+        return None
+    paths = entry.get("allowed_paths")
+    return list(paths) if isinstance(paths, list) else None
 
 
 def check_readiness(it: dict) -> None:
@@ -333,7 +354,20 @@ def check_lease(it: dict, declared: list[str], *, completion: bool = True) -> li
     if unknown:
         refuse("--files names paths that are not changed: " + ", ".join(unknown))
 
-    allowed = list(it.get("allowed_paths", []))
+    committed_lease = lease_at_head(it["id"])
+    if committed_lease is None:
+        allowed = list(it.get("allowed_paths", []))
+        notices.append(
+            f"{it['id']} is not in the committed graph; judging against the "
+            f"working-tree lease"
+        )
+    else:
+        allowed = committed_lease
+        if allowed != list(it.get("allowed_paths", [])):
+            refuse(
+                f"{it['id']} changes its own lease in this transaction. "
+                "Land the lease change first, judged on its own, then do the work."
+            )
     if allowed:
         permitted = list(allowed)
         if completion:

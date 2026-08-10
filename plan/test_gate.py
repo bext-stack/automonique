@@ -110,6 +110,9 @@ class CompletionLeaseTests(unittest.TestCase):
         with (
             mock.patch.object(gate, "dirty_paths", return_value=declared),
             mock.patch.object(gate, "staged_deletions", return_value=set()),
+            mock.patch.object(
+                gate, "lease_at_head", return_value=self.ITEM["allowed_paths"]
+            ),
         ):
             gate.check_lease(self.ITEM, declared, completion=completion)
 
@@ -151,6 +154,9 @@ class CompletionLeaseTests(unittest.TestCase):
                 with (
                     mock.patch.object(gate, "dirty_paths", return_value=[path]),
                     mock.patch.object(gate, "staged_deletions", return_value=set()),
+                    mock.patch.object(
+                        gate, "lease_at_head", return_value=item["allowed_paths"]
+                    ),
                 ):
                     gate.check_lease(item, [path], completion=True)
                 self.assertTrue(
@@ -164,6 +170,7 @@ class CompletionLeaseTests(unittest.TestCase):
         with (
             mock.patch.object(gate, "dirty_paths", return_value=["tools/harness_loop.py"]),
             mock.patch.object(gate, "staged_deletions", return_value=set()),
+            mock.patch.object(gate, "lease_at_head", return_value=item["allowed_paths"]),
         ):
             gate.check_lease(item, ["tools/harness_loop.py"], completion=False)
         self.assertEqual([], gate.refusals)
@@ -171,6 +178,35 @@ class CompletionLeaseTests(unittest.TestCase):
     def test_partial_slice_keeps_the_narrow_implementation_lease(self) -> None:
         self.lease(["plan/evidence/R1-02.json"], completion=False)
         self.assertTrue(any("diff touches" in value for value in gate.refusals))
+
+
+class SelfWidenedLeaseTests(unittest.TestCase):
+    """A candidate cannot widen its own lease and be judged against the wider one."""
+
+    ITEM = {"id": "R0-16", "allowed_paths": ["plan/", "tools/", "docs/"]}
+
+    def check(self, head_lease: list[str] | None) -> None:
+        gate.reset_diagnostics()
+        declared = ["docs/ledger.md"]
+        with (
+            mock.patch.object(gate, "dirty_paths", return_value=declared),
+            mock.patch.object(gate, "staged_deletions", return_value=set()),
+            mock.patch.object(gate, "lease_at_head", return_value=head_lease),
+        ):
+            gate.check_lease(dict(self.ITEM), declared, completion=True)
+
+    def test_a_lease_widened_in_this_transaction_is_refused(self) -> None:
+        self.check(["plan/", "tools/"])
+        self.assertTrue(any("changes its own lease" in v for v in gate.refusals))
+
+    def test_a_lease_already_committed_is_honoured(self) -> None:
+        self.check(["plan/", "tools/", "docs/"])
+        self.assertEqual([], gate.refusals)
+
+    def test_an_item_absent_from_head_falls_back_with_a_notice(self) -> None:
+        self.check(None)
+        self.assertEqual([], gate.refusals)
+        self.assertTrue(any("not in the committed graph" in n for n in gate.notices))
 
 
 class CompletionStatusTests(unittest.TestCase):
