@@ -544,7 +544,7 @@ title = "Cargo workspace and CI"
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "rust/Cargo.lock", "sdk/typescript/packages/protocol/", "xtask/", ".github/workflows/rust.yml"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-02"

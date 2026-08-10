@@ -3,7 +3,7 @@
   "schema": "automonique.dev-program/v1",
   "source": {
     "graph": "plan/work-graph.toml",
-    "graph_sha256": "1667afa1492c8cdc079c571e015df4548018631102e72d47de99e80fa175d6a5",
+    "graph_sha256": "29ad1b3f6f8a107cf49d6565ae27b752018916a7aa383af7ce8cc7e3df2d606c",
     "item_count": 375
   },
   "items": [
@@ -1032,9 +1032,9 @@
         ".github/workflows/rust.yml"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-01.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-02",
@@ -1174,7 +1174,7 @@
       "closes_gate": null,
       "status": "blocked",
       "contract": "plan/contracts/R1-07.md",
-      "runnable": false
+      "runnable": true
     },
     {
       "id": "R1-08",

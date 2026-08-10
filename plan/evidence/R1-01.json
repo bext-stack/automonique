@@ -1,0 +1,50 @@
+{
+  "item": "R1-01",
+  "base": "5970b6827d30ac6321507e29e26155acd1a27352",
+  "checks": [
+    {
+      "name": "Workspace",
+      "command": "cargo metadata --manifest-path rust/Cargo.toml --no-deps --offline --locked --format-version 1 && cargo test --manifest-path rust/Cargo.toml --workspace --all-targets --offline --locked",
+      "result": "pass",
+      "output": "The locked workspace contains automonique-lab, automonique-policy and automonique-protocol; 92 tests passed."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path rust/Cargo.toml --all -- --check && cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --offline --locked -- -D warnings",
+      "result": "pass",
+      "output": "Formatting and strict all-target Clippy passed without new allowances."
+    },
+    {
+      "name": "Boundary",
+      "command": "cargo tree --manifest-path rust/Cargo.toml -p automonique-protocol -p automonique-policy --offline --locked",
+      "result": "pass",
+      "output": "Both product crates are dependency-free value/evaluation libraries with no process, filesystem, network, credential, provider or harness execution surface."
+    },
+    {
+      "name": "Licence",
+      "command": "python3 plan/check.py --verify",
+      "result": "pass",
+      "output": "Path-aware licence verification passed; product Rust files declare Elastic-2.0."
+    },
+    {
+      "name": "Reproducibility",
+      "command": "cargo generate-lockfile --manifest-path rust/Cargo.toml --offline and byte comparison",
+      "result": "pass",
+      "output": "Offline lockfile regeneration was byte-identical."
+    }
+  ],
+  "review": {
+    "reviewers": 1,
+    "blocking_findings": 0,
+    "acceptance": "read-only product-slice review"
+  },
+  "extra_checks": [
+    {
+      "name": "Repository scrub",
+      "command": "python3 tools/scrub/scan.py",
+      "result": "pass",
+      "output": "Development scrub passed with four synthetic and zero protected rules."
+    }
+  ],
+  "notes": "Commit 5970b6827d30ac6321507e29e26155acd1a27352 is published on main and origin/main. The crates establish product boundaries and the doctor report contract; they do not start a service or provider."
+}
