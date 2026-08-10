@@ -80,6 +80,22 @@ For a continuation request:
    evidence and generated plan/status changes. Run every contract check against
    that same tree. If any check or required record is missing, keep the work
    partial and report the gap truthfully.
+
+   Run it with `python3 tools/harness_loop.py complete --item <ID> --summary
+   "<line>"`, adding `--reason "<why>"` when no specification-debt counter
+   moves, which is normal for an item that implements an existing contract. The
+   command flips the status, regenerates every derived artifact, appends the
+   history record, runs `plan/gate.py --dry-run` against that exact tree, and
+   commits through the typed broker only if the gate passes.
+
+   Do not commit the implementation as its own slice and complete it
+   afterwards. The completion may write the item's implementation lease plus
+   its own closing artifacts — `plan/evidence/<ID>.json`, `plan/generate.py`,
+   `plan/work-graph.toml`, `plan/ready.md`, `plan/baseline.json`,
+   `plan/history.jsonl`, `.automonique/dev/program.yaml` and
+   `.automonique/dev/objectives.json` — and nothing else. It cannot touch
+   `plan/authority.toml`, its own contract, this file or the gate, so a
+   candidate can never certify itself by widening the rule that judges it.
 7. After verification, the primary session may use the configured typed
    integrator to compare-and-swap local `main` and publish that exact commit by
    a non-force fast-forward to configured `origin/main`, whatever leased paths

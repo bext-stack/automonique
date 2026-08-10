@@ -358,7 +358,12 @@ def build_objectives(program_document: dict[str, Any]) -> dict[str, Any]:
 def build_loop_config() -> dict[str, Any]:
     return {
         "schema": LOOP_SCHEMA,
-        "integration_ceiling": "proposal_only",
+        # What the loop may do on its own, stamped into every packet. Under
+        # `autonomous-protected-integration` a verified candidate reaches
+        # `origin/main` by non-force fast-forward without owner sign-off.
+        # Release signing, package publication and production deployment stay
+        # outside this ceiling.
+        "integration_ceiling": "verified_fast_forward_main",
         "max_workers": 1,
         "default_driver": "codex_session",
         "drivers": {
