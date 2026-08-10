@@ -8,6 +8,7 @@
 pub mod codec;
 pub mod codegen;
 pub mod event;
+pub mod host;
 pub mod identity;
 pub mod journal;
 pub mod primitives;
