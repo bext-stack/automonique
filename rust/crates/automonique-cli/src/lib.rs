@@ -13,6 +13,7 @@ use std::path::{Component, Path, PathBuf};
 mod diagnostics;
 mod kernel;
 mod release;
+mod supervisor;
 
 pub use diagnostics::{
     inspect_admin_socket, inspect_database_health, inspect_foreground_generation,
@@ -23,6 +24,7 @@ pub use release::{
     MAX_RELEASE_MANIFEST_BYTES, ReleaseInspection, ReleaseInspectionStatus, ReleaseIssue,
     ReleaseManifest, VersionRange, inspect_release_manifest_structure,
 };
+pub use supervisor::inspect_supervisor_adapter;
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -88,6 +90,7 @@ fn inspect_doctor(runtime: Option<&OsStr>) -> Result<DoctorReportV1, DoctorRepor
         inspect_cgroup_v2_controllers(Path::new("/sys/fs/cgroup/cgroup.controllers")),
         inspect_max_user_namespaces(Path::new("/proc/sys/user/max_user_namespaces")),
         inspect_local_release(),
+        inspect_supervisor_adapter(),
     ])
 }
 

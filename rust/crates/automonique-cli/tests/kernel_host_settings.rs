@@ -2,7 +2,11 @@
 
 use automonique_cli::{inspect_cgroup_v2_controllers, inspect_max_user_namespaces};
 use automonique_protocol::CheckStatus;
+use std::fs::FileTimes;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::time::{Duration, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -13,12 +17,25 @@ struct Snapshot {
     len: u64,
     mode: u32,
     inode: u64,
+    atime: i64,
+    atime_nsec: i64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
 }
 
 fn snapshot(path: &Path) -> Snapshot {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOATIME | nix::libc::O_NOFOLLOW)
+        .open(path)
+        .expect("open fixture without atime mutation");
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).expect("fixture content");
     let metadata = std::fs::symlink_metadata(path).expect("fixture metadata");
     Snapshot {
-        bytes: std::fs::read(path).expect("fixture content"),
+        bytes,
         len: metadata.len(),
         #[cfg(unix)]
         mode: metadata.mode(),
@@ -28,7 +45,55 @@ fn snapshot(path: &Path) -> Snapshot {
         inode: metadata.ino(),
         #[cfg(not(unix))]
         inode: 0,
+        #[cfg(unix)]
+        atime: metadata.atime(),
+        #[cfg(not(unix))]
+        atime: 0,
+        #[cfg(unix)]
+        atime_nsec: metadata.atime_nsec(),
+        #[cfg(not(unix))]
+        atime_nsec: 0,
+        #[cfg(unix)]
+        mtime: metadata.mtime(),
+        #[cfg(not(unix))]
+        mtime: 0,
+        #[cfg(unix)]
+        mtime_nsec: metadata.mtime_nsec(),
+        #[cfg(not(unix))]
+        mtime_nsec: 0,
+        #[cfg(unix)]
+        ctime: metadata.ctime(),
+        #[cfg(not(unix))]
+        ctime: 0,
+        #[cfg(unix)]
+        ctime_nsec: metadata.ctime_nsec(),
+        #[cfg(not(unix))]
+        ctime_nsec: 0,
     }
+}
+
+#[test]
+fn kernel_reads_do_not_update_access_time() {
+    let directory = tempfile::tempdir().expect("fixtures");
+    let path = write_fixture(&directory, "atime.controllers", b"cpu io memory pids\n");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open fixture for time setup");
+    file.set_times(
+        FileTimes::new()
+            .set_accessed(UNIX_EPOCH + Duration::from_secs(1))
+            .set_modified(UNIX_EPOCH + Duration::from_secs(2)),
+    )
+    .expect("set fixture times");
+    drop(file);
+    let before = snapshot(&path);
+
+    assert_eq!(
+        inspect_cgroup_v2_controllers(&path).status(),
+        CheckStatus::Healthy
+    );
+    assert_unchanged(&path, &before);
 }
 
 fn write_fixture(directory: &tempfile::TempDir, name: &str, bytes: &[u8]) -> std::path::PathBuf {

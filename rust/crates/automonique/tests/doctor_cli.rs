@@ -55,6 +55,10 @@ fn doctor_human_mode_reports_unavailable_rpcs_for_a_private_runtime() {
     );
     assert!(stdout.contains("release.missing"), "{stdout}");
     assert!(stdout.contains("release.manifest-structure"), "{stdout}");
+    assert!(
+        stdout.contains("supervisor.configuration-unavailable"),
+        "{stdout}"
+    );
     assert!(stdout.contains("runtime"), "{stdout}");
 }
 
@@ -78,6 +82,11 @@ fn doctor_json_mode_uses_the_versioned_schema() {
     assert!(stdout.contains("\"code\":\"release.missing\""), "{stdout}");
     assert!(
         stdout.contains("\"id\":\"release.manifest-structure\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\"id\":\"supervisor.adapter\""), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"supervisor.configuration-unavailable\""),
         "{stdout}"
     );
 }

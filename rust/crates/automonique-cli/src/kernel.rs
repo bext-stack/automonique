@@ -125,7 +125,7 @@ enum ReadFailure {
 
 fn read_bounded_regular(path: &Path, limit: usize) -> Result<Vec<u8>, ReadFailure> {
     let how = OpenHow::new()
-        .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW)
+        .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NOATIME)
         .mode(Mode::empty())
         .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS);
     let descriptor = openat2(nix::libc::AT_FDCWD, path, how).map_err(|error| {
