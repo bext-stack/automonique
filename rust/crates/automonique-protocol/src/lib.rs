@@ -13,6 +13,7 @@ pub mod event;
 pub mod host;
 pub mod identity;
 pub mod journal;
+pub mod namespace;
 pub mod primitives;
 pub mod provider;
 pub mod release;
