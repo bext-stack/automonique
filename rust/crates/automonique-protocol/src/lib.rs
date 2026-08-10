@@ -6,6 +6,7 @@
 //! credential, or provider operations.
 
 pub mod codec;
+pub mod codegen;
 pub mod event;
 pub mod primitives;
 pub mod provider;

@@ -16,6 +16,10 @@
   },
   "include": [
     "src/**/*.ts",
-    "conformance/**/*.ts"
+    "conformance/**/*.ts",
+    "generated/**/*.ts"
+  ],
+  "exclude": [
+    "conformance/negative/**/*.ts"
   ]
 }
