@@ -218,6 +218,30 @@ def objective_map(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {entry["work_id"]: entry for entry in document.get("objectives", [])}
 
 
+def owner_blocked_reason(item_id: str) -> str | None:
+    """Why an item cannot be finished by a worker, from its own evidence.
+
+    An item records `external_completion_check` with a null result when the
+    last step needs something outside worker authority — an owner-held secret,
+    an external approval. Autonomous selection must route around those, or the
+    loop re-claims the same unfinishable item forever.
+    """
+    path = ROOT / "plan" / "evidence" / f"{item_id}.json"
+    if not path.exists():
+        return None
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    check = document.get("external_completion_check")
+    if not isinstance(check, dict) or check.get("result") is not None:
+        return None
+    reason = check.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        return reason.strip()
+    return "an external completion check is recorded unresolved"
+
+
 def eligible_items(
     program_document: dict[str, Any], objective_document: dict[str, Any]
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
@@ -226,6 +250,8 @@ def eligible_items(
     for item in program_document.get("items", []):
         objective = objectives.get(item.get("id"))
         if item.get("runnable") and objective and objective.get("autonomous_eligible"):
+            if owner_blocked_reason(item.get("id")):
+                continue
             eligible.append((item, objective))
     return eligible
 
@@ -256,6 +282,14 @@ def select_item(
         score = objective.get("hill_climbability")
         raise LoopError(
             f"work item {requested} score {score} is below the autonomous threshold"
+        )
+    blocked = owner_blocked_reason(requested)
+    if blocked:
+        # Explicit request still proceeds: a driver may legitimately work a
+        # blocked item's remaining slice. Only automatic selection routes away.
+        print(
+            f"note: {requested} cannot be completed by a worker — {blocked}",
+            file=sys.stderr,
         )
     return item, objective
 

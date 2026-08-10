@@ -34,7 +34,9 @@ class HarnessLoopTests(unittest.TestCase):
         expected = [
             item["id"]
             for item in self.program["items"]
-            if item["runnable"] and by_id[item["id"]]["autonomous_eligible"]
+            if item["runnable"]
+            and by_id[item["id"]]["autonomous_eligible"]
+            and not harness_loop.owner_blocked_reason(item["id"])
         ]
         self.assertEqual(expected, [item["id"] for item, _ in eligible])
         with self.assertRaisesRegex(
@@ -588,3 +590,64 @@ class HarnessLoopTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OwnerBlockedSelectionTests(unittest.TestCase):
+    """Autonomous selection must route around work a worker cannot finish."""
+
+    PROGRAM = {
+        "items": [
+            {"id": "AAA-1", "runnable": True},
+            {"id": "AAA-2", "runnable": True},
+        ]
+    }
+    OBJECTIVES = {
+        "objectives": [
+            {"work_id": "AAA-1", "autonomous_eligible": True, "hill_climbability": 90},
+            {"work_id": "AAA-2", "autonomous_eligible": True, "hill_climbability": 80},
+        ]
+    }
+
+    def evidence_root(self, directory: str, blocked: dict | None) -> pathlib.Path:
+        root = pathlib.Path(directory)
+        (root / "plan" / "evidence").mkdir(parents=True)
+        if blocked is not None:
+            (root / "plan" / "evidence" / "AAA-1.json").write_text(
+                json.dumps({"item": "AAA-1", "external_completion_check": blocked})
+            )
+        return root
+
+    def select(self, blocked: dict | None) -> str:
+        original = harness_loop.ROOT
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                harness_loop.ROOT = self.evidence_root(directory, blocked)
+                item, _ = harness_loop.select_item(self.PROGRAM, self.OBJECTIVES, None)
+                return item["id"]
+            finally:
+                harness_loop.ROOT = original
+
+    def test_unresolved_external_check_is_skipped(self) -> None:
+        self.assertEqual(
+            "AAA-2", self.select({"result": None, "reason": "owner secret missing"})
+        )
+
+    def test_resolved_external_check_stays_selectable(self) -> None:
+        self.assertEqual("AAA-1", self.select({"result": "pass"}))
+
+    def test_item_without_evidence_stays_selectable(self) -> None:
+        self.assertEqual("AAA-1", self.select(None))
+
+    def test_reason_is_reported_verbatim(self) -> None:
+        original = harness_loop.ROOT
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                harness_loop.ROOT = self.evidence_root(
+                    directory, {"result": None, "reason": "owner secret missing"}
+                )
+                self.assertEqual(
+                    "owner secret missing", harness_loop.owner_blocked_reason("AAA-1")
+                )
+                self.assertIsNone(harness_loop.owner_blocked_reason("AAA-2"))
+            finally:
+                harness_loop.ROOT = original
