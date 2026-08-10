@@ -100,6 +100,73 @@ class GateEvidenceTests(unittest.TestCase):
         self.assertTrue(any("unresolved blocking" in value for value in gate.refusals))
 
 
+class CompletionLeaseTests(unittest.TestCase):
+    """A completion may write its own closing artifacts and nothing else."""
+
+    ITEM = {"id": "R1-02", "allowed_paths": ["rust/crates/automonique-protocol/"]}
+
+    def lease(self, declared: list[str], *, completion: bool) -> None:
+        gate.reset_diagnostics()
+        with (
+            mock.patch.object(gate, "dirty_paths", return_value=declared),
+            mock.patch.object(gate, "staged_deletions", return_value=set()),
+        ):
+            gate.check_lease(self.ITEM, declared, completion=completion)
+
+    def test_completion_may_write_its_own_evidence_and_artifacts(self) -> None:
+        self.lease(
+            [
+                "rust/crates/automonique-protocol/src/primitives.rs",
+                "plan/evidence/R1-02.json",
+                "plan/generate.py",
+                "plan/work-graph.toml",
+                "plan/history.jsonl",
+                "plan/baseline.json",
+                ".automonique/dev/program.yaml",
+            ],
+            completion=True,
+        )
+        self.assertEqual([], gate.refusals)
+
+    def test_completion_may_not_write_another_items_evidence(self) -> None:
+        self.lease(["plan/evidence/R1-25.json"], completion=True)
+        self.assertTrue(any("diff touches" in value for value in gate.refusals))
+
+    def test_completion_may_not_widen_authority_or_contracts(self) -> None:
+        for path in ("plan/authority.toml", "plan/contracts/R1-02.md", "AGENTS.md",
+                     "plan/gate.py"):
+            with self.subTest(path=path):
+                self.lease([path], completion=True)
+                self.assertTrue(
+                    any("diff touches" in value for value in gate.refusals),
+                    f"{path} must stay outside a completion transaction",
+                )
+
+    def test_partial_slice_keeps_the_narrow_implementation_lease(self) -> None:
+        self.lease(["plan/evidence/R1-02.json"], completion=False)
+        self.assertTrue(any("diff touches" in value for value in gate.refusals))
+
+
+class CompletionStatusTests(unittest.TestCase):
+    """The done flip belongs to the transaction the gate is judging."""
+
+    ITEM = {"id": "R1-02", "depends_on": [], "status": "done", "_all": []}
+
+    def readiness(self, head_status: str | None) -> None:
+        gate.reset_diagnostics()
+        with mock.patch.object(gate, "status_at_head", return_value=head_status):
+            gate.check_readiness(dict(self.ITEM))
+
+    def test_uncommitted_done_flip_is_the_transaction_under_judgement(self) -> None:
+        self.readiness("blocked")
+        self.assertEqual([], gate.refusals)
+        self.assertTrue(any("flipped to done" in note for note in gate.notices))
+
+    def test_already_committed_done_is_still_refused(self) -> None:
+        self.readiness("done")
+        self.assertTrue(any("already marked done" in value for value in gate.refusals))
+
+
 class GateModeTests(unittest.TestCase):
     def argv(self, mode: str | None) -> list[str]:
         arguments = [

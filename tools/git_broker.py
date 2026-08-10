@@ -142,7 +142,7 @@ def _is_leased(path: str, leases: tuple[str, ...]) -> bool:
     return any(path.startswith(lease) if lease.endswith("/") else path == lease for lease in leases)
 
 
-def _parse_status(output: bytes) -> tuple[str, ...]:
+def parse_status(output: bytes) -> tuple[str, ...]:
     fields = output.split(b"\0")
     paths: list[str] = []
     index = 0
@@ -312,7 +312,7 @@ class CandidateBroker:
             raise BrokerError("Git HEAD differs from the expected base")
         if branch != request.expected_branch:
             raise BrokerError("Git branch differs from the expected branch")
-        actual = _parse_status(
+        actual = parse_status(
             self._git_bytes("status", "--porcelain=v1", "-z", "--untracked-files=all")
         )
         if actual != request.candidate_paths:

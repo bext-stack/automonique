@@ -16,10 +16,14 @@ must not have moved backwards.
     ... --dry-run     run the complete-contract preflight and record nothing
     ... --partial     run a non-completion preflight and record nothing
 
-``--commit`` currently refuses.  Completion is a transaction containing the
-evidence, metric baseline, history record, done status and regenerated plan
-artifacts.  Until this gate can construct and verify that exact final tree
-before committing it must not create an incomplete completion commit.
+A completion is a transaction containing the implementation, evidence, metric
+baseline, history record, done status and regenerated plan artifacts in one
+tree.  ``--dry-run`` judges exactly that tree: the item's implementation lease
+plus the completion artifacts, with the done flip still uncommitted at HEAD.
+
+``--commit`` refuses by design and is not a gap.  This gate verifies; it does
+not hold Git authority.  ``python3 tools/harness_loop.py complete`` runs this
+preflight and then commits the verified tree through the typed broker.
 
 Exit code is non-zero when the gate refuses, so a loop can branch on it.
 """
@@ -47,6 +51,30 @@ HISTORY = ROOT / "plan/history.jsonl"
 
 VERIFICATION_SECTION = re.compile(
     r"^##+ Verification contract\s*$(.*?)(?=^##+ |\Z)", re.M | re.S)
+
+# A completion transaction must carry its own evidence, measured baseline,
+# history record, done status and regenerated artifacts. Those paths are part
+# of every completion by construction, so leasing them per item would only
+# duplicate the same list 375 times. They are permitted *in addition to* the
+# item's implementation lease, and only in a completion preflight.
+COMPLETION_ARTIFACTS = (
+    "plan/generate.py",
+    "plan/work-graph.toml",
+    "plan/ready.md",
+    "plan/baseline.json",
+    "plan/history.jsonl",
+    ".automonique/dev/program.yaml",
+    ".automonique/dev/objectives.json",
+)
+
+
+def completion_paths(item_id: str) -> tuple[str, ...]:
+    """Paths a completion transaction for `item_id` may touch beyond its lease.
+
+    The evidence path is item-scoped on purpose: a completion may write its own
+    evidence and no other item's.
+    """
+    return (f"plan/evidence/{item_id}.json", *COMPLETION_ARTIFACTS)
 
 refusals: list[str] = []
 notices: list[str] = []
@@ -136,6 +164,22 @@ def contract_checks(item_id: str) -> list[str]:
     return names
 
 
+def status_at_head(item_id: str) -> str | None:
+    """The item's status in the committed graph, or None if unreadable."""
+    try:
+        committed = git("show", "HEAD:plan/work-graph.toml")
+    except subprocess.CalledProcessError:
+        return None
+    try:
+        items = tomllib.loads(committed)["item"]
+    except (tomllib.TOMLDecodeError, KeyError):
+        return None
+    for entry in items:
+        if entry.get("id") == item_id:
+            return entry.get("status")
+    return None
+
+
 def check_readiness(it: dict) -> None:
     done = {i["id"] for i in it["_all"] if i.get("status") == "done"}
     unmet = [d for d in it["depends_on"] if d not in done]
@@ -147,7 +191,16 @@ def check_readiness(it: dict) -> None:
     if open_gates:
         refuse(f"{it['id']} is blocked by open gate(s): {', '.join(open_gates)}")
     if it.get("status") == "done":
-        refuse(f"{it['id']} is already marked done")
+        # A completion transaction contains its own status flip, so the working
+        # tree legitimately reads `done` while the gate judges it. Only a status
+        # that was already committed means the item is genuinely finished.
+        if status_at_head(it["id"]) == "done":
+            refuse(f"{it['id']} is already marked done")
+        else:
+            notices.append(
+                f"{it['id']} is flipped to done by this transaction; "
+                f"HEAD still records it unfinished"
+            )
 
 
 def check_evidence(
@@ -254,7 +307,7 @@ def attestation_trailers(it: dict, ev: dict, after: dict) -> list[str]:
     ]
 
 
-def check_lease(it: dict, declared: list[str]) -> list[str]:
+def check_lease(it: dict, declared: list[str], *, completion: bool = True) -> list[str]:
     """Declared files must be really changed and inside the item's lease."""
     actually_dirty = set(dirty_paths())
     deletions = staged_deletions()
@@ -263,10 +316,13 @@ def check_lease(it: dict, declared: list[str]) -> list[str]:
     if unknown:
         refuse("--files names paths that are not changed: " + ", ".join(unknown))
 
-    allowed = it.get("allowed_paths", [])
+    allowed = list(it.get("allowed_paths", []))
     if allowed:
+        permitted = list(allowed)
+        if completion:
+            permitted.extend(completion_paths(it["id"]))
         outside = [p for p in declared
-                   if not any(p == a.rstrip("/") or p.startswith(a) for a in allowed)]
+                   if not any(p == a.rstrip("/") or p.startswith(a) for a in permitted)]
         if outside:
             refuse(f"{it['id']} leased {allowed} but the diff touches: "
                    + ", ".join(outside))
@@ -355,7 +411,7 @@ def main() -> int:
     required = contract_checks(args.item)
     check_readiness(it)
     ev = check_evidence(it, required, completion=not args.partial)
-    files = check_lease(it, args.files)
+    files = check_lease(it, args.files, completion=not args.partial)
     check_plan_integrity()
     fell, after = check_metric(args.allow_no_metric_change)
 

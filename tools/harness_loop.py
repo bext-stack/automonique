@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import signal
 import shutil
 import subprocess
@@ -25,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 from tools import git_broker, guides, local_integration, program  # noqa: E402
 from plan import baseline as plan_baseline  # noqa: E402
+from plan import gate as gate_module  # noqa: E402
 
 STATE_SCHEMA = "automonique.harness-loop-state/v1"
 PACKET_SCHEMA = "automonique.harness-objective-packet/v1"
@@ -1742,6 +1744,173 @@ def run_loop(requested: str | None, explicit_argv: list[str], limit: int | None)
         lock.close()
 
 
+COMPLETION_REGENERATORS = (
+    ("plan", "generate.py"),
+    ("tools", "program.py"),
+    ("tools", "guides.py"),
+    ("plan", "check.py"),
+    ("plan", "baseline.py"),
+)
+
+
+def _run_repo_script(*parts: str) -> None:
+    """Run a repository script by explicit argv and fail loudly."""
+    script = "/".join(parts)
+    result = subprocess.run(
+        [sys.executable, script],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise LoopError(f"{script} failed during completion: {detail}")
+
+
+def mark_item_done(item_id: str) -> bool:
+    """Add `item_id` to the generator's done set. Returns False if already there."""
+    source = ROOT / "plan" / "generate.py"
+    text = source.read_text()
+    match = re.search(r"^ITEM_STATUS = \{\n(.*?)^\}$", text, re.MULTILINE | re.DOTALL)
+    if match is None:
+        raise LoopError("plan/generate.py has no ITEM_STATUS block to update")
+    body = match.group(1)
+    entry = f'    "{item_id}": "done",\n'
+    if f'"{item_id}"' in body:
+        return False
+    updated = text[: match.start(1)] + body + entry + text[match.end(1) :]
+    source.write_text(updated)
+    return True
+
+
+def dirty_repo_paths() -> list[str]:
+    output = git("status", "--porcelain=v1", "-z", "--untracked-files=all", text=False)
+    assert isinstance(output, bytes)
+    # Reuse the broker's own parser so the declared paths and the paths the
+    # broker will validate can never disagree.
+    return sorted(git_broker.parse_status(output))
+
+
+def append_history(
+    item: dict[str, Any], summary: str, files: list[str], reason: str | None
+) -> None:
+    snapshot = plan_baseline.snapshot()
+    record: dict[str, Any] = {
+        "at": utc_now(),
+        "item": item["id"],
+        "epic": item.get("epic"),
+        "summary": summary,
+        "files": files,
+        "debt_total": snapshot["total"],
+        "counters": snapshot["counters"],
+        "digest": plan_baseline.digest(snapshot)[:16],
+        "head": git("rev-parse", "HEAD"),
+    }
+    if reason:
+        record["no_metric_change_reason"] = reason
+    history = ROOT / "plan" / "history.jsonl"
+    with history.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _complete_item_locked(item_id: str, summary: str, reason: str | None) -> int:
+    program_document, _, config = load_inputs()
+    item = next(
+        (i for i in program_document["items"] if i["id"] == item_id),
+        None,
+    )
+    if item is None:
+        raise LoopError(f"{item_id} is not in the work graph")
+    if item.get("contract") is None:
+        raise LoopError(f"{item_id} has no contract and cannot be completed")
+    evidence_path = ROOT / "plan" / "evidence" / f"{item_id}.json"
+    if not evidence_path.exists():
+        raise LoopError(f"{item_id} has no evidence at plan/evidence/{item_id}.json")
+    if load_json(evidence_path).get("item") != item_id:
+        raise LoopError("completion evidence names a different work item")
+
+    base = git("rev-parse", "HEAD")
+    branch = git("branch", "--show-current")
+    if not mark_item_done(item_id):
+        raise LoopError(f"{item_id} is already recorded done in plan/generate.py")
+    for parts in COMPLETION_REGENERATORS:
+        _run_repo_script(*parts)
+
+    files = dirty_repo_paths()
+    append_history(item, summary, files, reason)
+    files = dirty_repo_paths()
+
+    gate = [sys.executable, "plan/gate.py", "--item", item_id, "--summary", summary,
+            "--files", *files, "--dry-run"]
+    if reason:
+        gate.extend(["--allow-no-metric-change", reason])
+    verdict = subprocess.run(gate, cwd=ROOT, capture_output=True, text=True, check=False)
+    print(verdict.stdout, end="")
+    if verdict.returncode != 0:
+        print(verdict.stderr, end="", file=sys.stderr)
+        raise LoopError(f"{item_id} did not pass the landing gate; nothing was committed")
+
+    allowed = tuple(item["allowed_paths"]) + gate_module.completion_paths(item_id)
+    metric_snapshot = plan_baseline.snapshot()
+    metrics_sha256 = hashlib.sha256(
+        json.dumps({"counters": metric_snapshot["counters"]}, sort_keys=True).encode()
+    ).hexdigest()
+    evidence = load_json(evidence_path)
+    review = evidence.get("review")
+    if not isinstance(review, dict):
+        raise LoopError("completion evidence lacks a review record")
+    broker = git_broker.CandidateBroker(ROOT, (ROOT / config["state_path"]).parent)
+    run_id = f"complete_{item_id.replace('-', '_').lower()}_{base[:8]}"
+    request = git_broker.CandidateRequest(
+        operation=git_broker.OPERATION,
+        run_id=run_id,
+        work_id=item_id,
+        expected_base=base,
+        expected_branch=branch,
+        allowed_paths=allowed,
+        candidate_paths=tuple(files),
+        expected_tree=broker.snapshot(
+            expected_base=base,
+            expected_branch=branch,
+            allowed_paths=allowed,
+            candidate_paths=tuple(files),
+        ),
+        summary=summary,
+        attestation=git_broker.CandidateAttestation(
+            checks="contract-pass",
+            reviewers=review.get("reviewers", 0),
+            blocking_findings=review.get("blocking_findings", 0),
+            metrics_sha256=metrics_sha256,
+            completion=True,
+            evidence_sha256=file_sha256(evidence_path),
+        ),
+    )
+    receipt = broker.create(request)
+    authority_path = ROOT / "plan/authority.toml"
+    integrator = local_integration.LocalIntegration(
+        ROOT, (ROOT / config["state_path"]).parent, authority_path,
+        file_sha256(authority_path),
+    )
+    receipt_path = (
+        (ROOT / config["state_path"]).parent / "git-candidates" / run_id / "receipt.json"
+    )
+    integration = integrator.integrate(receipt_path, file_sha256(receipt_path))
+    print(json.dumps({"candidate": receipt, "integration": integration},
+                     indent=2, sort_keys=True))
+    return 0
+
+
+def complete_item(item_id: str, summary: str, reason: str | None) -> int:
+    _, _, config = load_inputs()
+    lock = acquire_loop_lock(config)
+    try:
+        return _complete_item_locked(item_id, summary, reason)
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1755,6 +1924,13 @@ def main() -> int:
     subparsers.add_parser("check")
     candidate_parser = subparsers.add_parser("candidate")
     candidate_parser.add_argument("--summary", required=True)
+    complete_parser = subparsers.add_parser("complete")
+    complete_parser.add_argument("--item", required=True)
+    complete_parser.add_argument("--summary", required=True)
+    complete_parser.add_argument(
+        "--reason",
+        help="honest reason no specification-debt counter moved, recorded in history",
+    )
     release_parser = subparsers.add_parser("release")
     release_parser.add_argument(
         "--reason", required=True, choices=("blocked", "user_cancelled", "superseded")
@@ -1791,6 +1967,8 @@ def main() -> int:
             return check_session()
         if args.command == "candidate":
             return commit_candidate(args.summary)
+        if args.command == "complete":
+            return complete_item(args.item, args.summary, args.reason)
         if args.command == "release":
             return release_session(args.reason)
         return run_loop(args.item, args.worker_arg, args.max_iterations)
