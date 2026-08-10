@@ -1220,6 +1220,212 @@
       ]
     },
     {
+      "id": "objective:R1-03",
+      "work_id": "R1-03",
+      "objective": "Implement the length-delimited frame codec and version negotiation used by every local Automonique socket: a bounded length prefix, a decoded envelope carrying protocol name, major version, request identifier and message kind, and a closed error vocabulary that distinguishes a malformed frame from an unsupported peer. Size and nesting limits are enforced *before* deserialization so a hostile or oversized body is rejected without ever being parsed.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 8,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Frame boundaries",
+        "Partial input",
+        "Allocation safety",
+        "Envelope negotiation",
+        "Enum discipline",
+        "Nesting and limits",
+        "Error mapping",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, an unbounded read or a length-driven allocation, newline or any in-band delimiter framing, a depth or size limit that is not a public constant, an unknown protocol or major version that decodes rather than failing, a security-sensitive enum that accepts an unknown value, an error message containing payload bytes, a non-exhaustive error-to-wire-code mapping, a clock or socket read, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 92,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-03.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-04",
+      "work_id": "R1-04",
+      "objective": "Define the peer authorization decision and the runtime directory layout rules that protect every local Automonique socket: a typed peer credential carrying the connecting UID, GID and PID, a total decision function that admits or refuses that credential against a declared policy, and the mode and ownership invariants for the runtime tree. Peer credentials are verified *before* request parsing, so an unauthorized peer never reaches the codec.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 8,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Credential construction",
+        "Decision totality",
+        "UID and GID policy",
+        "PID is not authority",
+        "Mode and ownership",
+        "Path safety",
+        "Refusal hygiene",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, a decision function that is not total, any path where an error or missing credential yields admission, a wildcard or implicit-root policy, admission keyed on PID, a mode rule that accepts a more-permissive observed mode, a filesystem or socket read inside the value layer, a refusal message containing a path or command line, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 90,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-04.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-05",
+      "work_id": "R1-05",
+      "objective": "Define the typed release manifest that describes exactly one Automonique release and the compatibility algebra a reload evaluates before it spawns a new generation: application version, source revision, build target, protocol and event ranges, database schema range, compatible TypeScript SDK range, the binary, schema, policy, persona, companion and asset digests, migration compatibility, and minimum kernel, process-control and optional supervisor-adapter requirements.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 9,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Field completeness",
+        "Schema revision",
+        "Range algebra",
+        "Digest discipline",
+        "Rollback coexistence",
+        "Capability requirements",
+        "SDK compatibility",
+        "Secret hygiene",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, a required field that defaults silently, a range comparison returning a boolean instead of a typed decision, an unknown or weakened digest algorithm being accepted, a non-constant-time digest comparison, required and optional capability failures being collapsed, a secret value or absolute host path becoming representable, a filesystem or network read, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 89,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-05.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-06",
+      "work_id": "R1-06",
+      "objective": "Build the shared fixture corpus and the two-direction conformance harness that proves the Rust and TypeScript protocol implementations agree exactly: Bun encodes and Rust decodes, Rust encodes and Bun decodes, and both directions produce byte-identical frames and identically classified rejections for every fixture. A cross-language claim that rests on one direction only proves the encoder and decoder share a bug.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 9,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Both directions run",
+        "Byte agreement",
+        "Rejection parity",
+        "Boundary coverage",
+        "Compatibility tolerance",
+        "Negotiation coverage",
+        "Offline execution",
+        "Licence split",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, a fixture edited to match observed behavior rather than the specification, a direction that is skipped or reported as passing without executing, structural comparison substituted for byte comparison, rejection parity claimed without matching error categories, a fixture generated at test time by the implementation under test, a network or daemon dependency, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 88,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-06.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
       "id": "objective:R1-07",
       "work_id": "R1-07",
       "objective": "Deliver the first runnable Monique product command: `automonique doctor [--json]`. It performs bounded, read-only local health checks and returns a stable typed report. It is not a service and does not start the lab.",
@@ -1266,6 +1472,905 @@
       "licence": "Elastic-2.0",
       "sources": [
         "plan/contracts/R1-07.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-08",
+      "work_id": "R1-08",
+      "objective": "Define the typed capability model every provider adapter declares and the negotiation rule that selects an integration mode from it: the capability groups covering sessions, turns, events, approvals, tools, telemetry and lifecycle, the `required`/`native`/`degraded` set discipline, and the distinct provider identities — instance, session, turn, item and request — that must never be compressed into one opaque string.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 9,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Capability structure",
+        "Set discipline",
+        "Fail-closed selection",
+        "Forbidden substitutions",
+        "Identity distinctness",
+        "Binding safety",
+        "Cross-boundary resume",
+        "Provenance completeness",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, a capability model keyed by unbounded strings, unknown capabilities counting as present, any path where a missing required capability yields a downgrade instead of a refusal, interconvertible provider identities, a representable unvalidated opaque session value, a binding comparison that ignores a component, a capability record constructible without binary provenance, a provider launch or probe, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 89,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-08.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-09",
+      "work_id": "R1-09",
+      "objective": "Define the normalized provider event vocabulary and the rules that keep a presentation stream from becoming a source of truth: the bounded raw provider envelope, the normalized event kinds, the three-valued authority marking every record as `preview`, `authoritative` or `synthetic`, the typed provider approval request and its idempotent response, and the cursor semantics that let a disconnected consumer resume exactly once.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 10,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Envelope bounds",
+        "Authority is required",
+        "Preview cannot authorize",
+        "Preview-drop invariance",
+        "Kind coverage",
+        "Terminal uniqueness",
+        "Cursor semantics",
+        "Approval idempotency",
+        "Retention split",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, an unbounded raw provider record, an authority field with a default or inferred value, any path where a preview record reaches terminal reporting, more than one terminal record silently accepted, a cursor gap or duplicate introduced by the value layer, an out-of-range cursor returning an empty success, a non-idempotent approval response, preview retention that can expire authoritative evidence, a network or provider read, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 90,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-09.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-10",
+      "work_id": "R1-10",
+      "objective": "Define the pipeline that turns an upstream provider's own schema output into pinned Automonique fixtures and a compatibility verdict: capture or generate the schema bundle for an exact provider binary, hash it, map that digest to the binary version range it applies to, and classify a diff against the previously pinned bundle as compatible, breaking, or unclassifiable. An upgrade whose diff is unclassifiable is not approved by default — it stops.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 10,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Bundle integrity",
+        "Range mapping",
+        "Verdict exhaustiveness",
+        "Unclassifiable is preserved",
+        "Evidence completeness",
+        "Additive rules",
+        "Security enum rule",
+        "Determinism",
+        "Offline operation",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, a bundle trusted without digest verification, overlapping ranges resolving silently, an `unclassifiable` verdict collapsing into `compatible`, a verdict without evidence paths, a new security-sensitive enum value classified compatible, non-deterministic or order-dependent classification, any network fetch or provider execution, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 86,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-10.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-11",
+      "work_id": "R1-11",
+      "objective": "Prove, on a deliberately hostile slice of the protocol, that TypeScript wire types, runtime validators and low-level clients can be generated from Rust-derived schemas reproducibly and without losing the four properties most often lost in codegen: const bounds, discriminated unions, branded identifier types, and forward compatibility with unknown events. The spike answers whether the one-source-of-truth rule is achievable before `R8B` commits the SDK to it.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 10,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Source direction",
+        "Slice difficulty",
+        "Bound preservation",
+        "Brand distinctness",
+        "Union exhaustiveness",
+        "Unknown-event tolerance",
+        "Reproducibility",
+        "Verdict quality",
+        "Licence split",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, a hand-written type standing in for a generated one, a slice narrowed to avoid a failing property, a bound that survives only in a comment, a brand that erases in the direction being tested, a generated union that is not exhaustive, an unknown event that throws or is dropped, an embedded timestamp or non-reproducible output, a verdict recorded as positive while a required property is unmeasured, a network fetch, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 80,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-11.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-12",
+      "work_id": "R1-12",
+      "objective": "Define the journal vocabulary that makes every authoritative state change resumable and explainable: schema-versioned domain events with globally ordered identifiers, per-aggregate revisions, action receipts keyed by idempotency key, durable consumer cursors by consumer identity and topic, and a replay operation that is provably free of side effects. Replay may rebuild a projection or explain history; it may never drain an outbox or repeat an effect.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 9,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Global ordering",
+        "Revision algebra",
+        "Schema independence",
+        "Outcome vocabulary",
+        "Idempotency exactness",
+        "Receipt durability",
+        "Cursor monotonicity",
+        "Replay purity",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, non-monotonic event identifiers or revisions, a revision conflict resolved by overwrite, an open-ended outcome vocabulary, transport and operation failure collapsing into one outcome, an idempotency key accepting a changed target, a receipt that cannot outlive its client, a cursor that can move backwards, any reachable effect inside replay, a database or transport call, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 91,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-12.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-13",
+      "work_id": "R1-13",
+      "objective": "Define the authorization vocabulary the whole product is judged against: tenant-scoped actors, explicitly mapped external identities, historical role grants and policy revisions, credential descriptors that never carry a secret value, the authorization evidence recorded with every decision, and the break-glass record that makes emergency access auditable rather than invisible.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 10,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Tenant scoping",
+        "External identity keys",
+        "Historical grants",
+        "Deny by default",
+        "Evaluation purity",
+        "Evidence completeness",
+        "Secret unrepresentability",
+        "Rotation and revocation",
+        "Break-glass audit",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, a representable tenant-free actor, cross-tenant comparison returning `false` instead of erroring, a mutable attribute used as an identity key, a wildcard or fall-through allow, any path where an evaluation error grants permission, a decision without evidence, a secret value becoming representable, an unbounded or silent break-glass grant, an identity-provider or database call, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 88,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-13.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-14",
+      "work_id": "R1-14",
+      "objective": "Define the workspace registry and artifact vocabulary that keeps host paths out of the API and content out of the database: registered workspaces with tenant, canonical source, immutable base revision and snapshot, isolation kind, writable path token and lock state; and content-addressed artifacts carrying digest, size, media type, creator, provenance, visibility, retention class and an abstract storage locator. A run references a workspace revision; it never receives a host path from a client.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 9,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Path unrepresentability",
+        "Base immutability",
+        "Lock exclusion",
+        "Digest addressing",
+        "Required classification",
+        "Locator abstraction",
+        "Link typing",
+        "Deletion order",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, any representable host path in a registration or API type, a mutable base revision, a blocking or reentrant lock acquire, a release without holder identity, artifact identity keyed on a locator instead of a digest, a defaulted or absent retention class, a locator embedding a path or credential, an untyped artifact link, a deletion path that skips the tombstone, cross-tenant dedup revealing possession, a filesystem or object-store call, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 89,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-14.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-15",
+      "work_id": "R1-15",
+      "objective": "Define the five distinct lifecycle identities the scheduler and reporter depend on — work, attempt, execution host, provider session and turn — together with the host state machine, its attempt-scoped versus session-scoped lifetime, the idle-TTL and hibernation semantics, and the classification that decides after a restart whether a session is resumable, hibernated, terminally interrupted or requires reconciliation. A missing local process is never called \"running\".",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 10,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Identity distinctness",
+        "Retry appends",
+        "Lifetime immutability",
+        "Boundary-bound attach",
+        "Transition legality",
+        "Host assignment atomicity",
+        "Expiry purity",
+        "Restart classification",
+        "Claim lifecycle",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, interconvertible lifecycle identities, a retry that overwrites prior evidence, mutable host lifetime, a session attach across a differing boundary component, a permissive default for an undeclared transition, an outgoing transition from a terminal state, a representable `starting` run without a host, a clock read inside the value layer, any classification path yielding `resumable` or \"running\" from absent evidence, a claim released without terminal state or verified loss, a process spawn or `/proc` read, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 90,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-15.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-16",
+      "work_id": "R1-16",
+      "objective": "Define the platform-neutral connector vocabulary that lets Teams, Discord and future channel bridges reach Automonique without leaking their own types into the core protocol: installation-to-tenant resolution, external-identity-to-actor mapping with an explicit unlinked state, stable source keys, durable input submission, outbound render intents, opaque action tokens bound to an exact target revision, and the artifact grants that replace direct file access.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 10,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Installation resolution",
+        "Identity resolution",
+        "Source-key stability",
+        "Acknowledgement split",
+        "Render intents",
+        "Action-token binding",
+        "Artifact grants",
+        "Coordinate preservation",
+        "Platform-type isolation",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, a representable global fallback tenant, an unlinked identity collapsing into an anonymous actor, a mutable handle used for authorization, a source key incorporating time or randomness, acknowledgement standing in for acceptance, a platform-specific type reaching the core protocol, an action token that survives a target revision change, an attachment path or credential-bearing URL becoming representable, a deletion that erases an audit record, a real tenant or guild identifier in a fixture, a network call, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 87,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-16.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-17",
+      "work_id": "R1-17",
+      "objective": "Define the single name registry from which both the canonical Automonique name and every legacy forwarding alias are generated, together with the rules that reject a configuration naming both, and the mechanical proof that a canonical name and its aliases resolve to exactly one runtime owner and one durable identity. Two spellings of a setting must never become two sources of truth.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 9,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Single source",
+        "Forwarding only",
+        "Conflict rejection",
+        "Deprecation observation",
+        "One owner",
+        "Authorized aliases",
+        "Identifier location",
+        "Durable identifiers unchanged",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, an alias not generated from the registry, an alias carrying behavior the canonical path lacks, a precedence rule resolving a canonical/alias conflict, a deprecation signalled only as a log line, an entry resolving to two runtime owners, an alias without an authorizing migration contract, a legacy identifier appearing outside the registry and the legacy inventory, any rewrite of a durable identifier, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 90,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-17.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-18",
+      "work_id": "R1-18",
+      "objective": "Define the sandbox vocabulary every execution decision is compiled into: versioned profiles as minimum contracts, the immutable `SandboxSpec` referenced by a `RunSpec`, the `EnforcementAttestation` a host records before provider input, the violation and quarantine outcomes, resource and storage budgets, the strictly separated provider-control and tool-workload egress policies, and the negotiation that fails closed when a required enforcement feature is absent.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 10,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Profile ordering",
+        "Spec immutability and completeness",
+        "No silent downgrade",
+        "Egress split",
+        "Attestation comparison",
+        "Narrowing-only reuse",
+        "Approval cannot widen",
+        "Budget typing",
+        "Violation dispositions",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, a mutable compiled spec, a boolean profile comparison, any path resolving a stronger profile to a weaker one, substitutable network policies, an attestation reconstructed rather than compared, host reuse under a widened request, an approval path that returns a modified spec, an unitless or uncapped budget, a violation class with no disposition or one that continues, an enforcement claim this layer cannot support, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 88,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-18.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-19",
+      "work_id": "R1-19",
+      "objective": "Enforce, in CI, that every Cargo package, crate, module, feature, binary, schema name, metric, tracing target, fixture and release artifact carries the `automonique-*` or `automonique_*` namespace, and that the only exceptions are legacy compatibility codecs and forwarding executables explicitly listed in the inventory. An undocumented legacy identifier fails the build rather than becoming permanent by accident.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 9,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Surface coverage",
+        "Namespace enforcement",
+        "Bidirectional inventory",
+        "No escape hatch",
+        "Determinism",
+        "Actionable output",
+        "The gate can fail",
+        "Authorized exceptions",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, a surface class silently unscanned, any suppression comment, separate allowlist or environment variable that disables the gate, a one-directional inventory binding, an exception without an authorizing migration contract, non-deterministic or order-dependent findings, a finding without a resolution path, a rename of a durable identifier that no migration contract authorizes, a claim of passing without the deliberate-failure demonstration, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 93,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-19.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-20",
+      "work_id": "R1-20",
+      "objective": "Define the durable vocabulary that makes prompt assembly explainable rather than an opaque concatenation: the ordered, content-addressed `ContextManifest` with per-component trust class and caps, the typed context references that replace arbitrary host paths, compression as a durable lineage-bearing operation, the tenant-scoped typed memory stores with provenance and supersession, and the `LearningProposal` that keeps model-suggested learning separate from reviewed publication.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 10,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Manifest completeness",
+        "Precedence enforcement",
+        "Rule discovery bounds",
+        "Reference typing",
+        "Compression lineage",
+        "Token honesty",
+        "Memory typing",
+        "Supersession and deletion",
+        "Proposal isolation",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, a component without trust class or digest, any path by which lower-trust content overrides policy, rule discovery reaching outside the registered workspace, a representable arbitrary host path, compression that mutates the authoritative transcript, an estimated token count recorded as measured, a memory entry without provenance or retention, a correction that mutates instead of superseding, a deletion that erases the audit trail, a model-originated proposal that can raise its own trust or auto-activate an executable skill, a network or filesystem read, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 87,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-20.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-21",
+      "work_id": "R1-21",
+      "objective": "Define the provider-independent tool and extension vocabulary: the `ToolDescriptor` with its schema, capability identity, provenance, trust and side-effect class, required approval, sandbox profile, credential audiences, egress and budgets; toolsets as intersecting policy bundles; the deferred search and describe operations that must not leak inaccessible tool names; the capability RPC a bounded workflow uses; MCP client and server descriptors; the signed extension manifest; the five hook classes with their distinct powers; and secret-source descriptors.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 10,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Descriptor completeness",
+        "Grant intersection",
+        "Search authorization",
+        "Workflow bounds",
+        "Nested causation",
+        "MCP boundaries",
+        "Manifest completeness",
+        "Hook class powers",
+        "Secret sealing",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, an optional side-effect or approval field, any grant combination other than intersection, a search result or error revealing an unauthorized tool, a toolset mutated by search, a reachable recursion or privilege path from the workflow capability, a nested call losing causation, sampling enabled by default, a raw store or credential reachable through an MCP export, a UI extension declaring backend capability, a hook class able to approve or widen, an arbitrary shell command in a secret source, a network or process call, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 88,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-21.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-22",
+      "work_id": "R1-22",
+      "objective": "Define the durable vocabulary for work that starts without a person present: canonical schedules that a natural-language expression must round-trip into, occurrence keys that make duplicate firing impossible across reload, goals with their completion contract and closed verdict set, waits bound to durable conditions, fenced board claims, inbound trigger routes with verification and replay windows, and notification delivery policy.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 12,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Canonical storage",
+        "Round-trip",
+        "Occurrence idempotency",
+        "Revision immutability",
+        "Scope authority",
+        "Job parity",
+        "Verdict closure",
+        "Evidence-bound completion",
+        "Wait resolution",
+        "Trigger routes",
+        "Fenced claims",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, a stored prose schedule, an ambiguous expression resolved by guessing, a schedule that does not round-trip, an occurrence key that permits duplicate firing, a mutable automation revision, an edit without an expected revision, an unattended effect outside declared scope, a no-agent job with weaker obligations than an agent job, an open-ended verdict set, a verdict without evidence, a `complete` verdict without the evidence its contract requires, a wake resolved from a text label, a trigger route missing verification or limits, an unfenced board claim, a label used as a tenancy control, a network or scheduler call, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 89,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-22.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-23",
+      "work_id": "R1-23",
+      "objective": "Define the mapping vocabulary that lets ACP, OpenAI-compatible, native Runs, MCP export, A2A and relay callers reach one durable domain without any of them becoming a second one: protocol client bindings to tenant actors with scopes, quotas and credential revisions; the projection of external protocol identifiers onto canonical work, run and turn identities; and the honest degradation rules for semantics a foreign protocol cannot express.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 10,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Binding completeness",
+        "Mapping injectivity",
+        "No alternate state",
+        "Effect equivalence",
+        "Approval fidelity",
+        "Honest degradation",
+        "Native escape hatch",
+        "Remote claims carry nothing",
+        "Range coexistence",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, a tenant-free or unauthenticated binding, a non-injective identifier mapping, a projection field or mutation not derived from canonical state, a protocol effect without a canonical action or idempotency key, an approval that loses its target revision, any representable global bypass, a silently dropped unsupported field, a remote agent claim granting authority, an incompatible client served a mismatched dialect, a network or endpoint call, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 88,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-23.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-24",
+      "work_id": "R1-24",
+      "objective": "Define the vocabulary for choosing a model, handling media and admitting an execution backend: the normalized model and provider catalog, durable explainable routing decisions, credential pools bounded by billing tenant and data boundary, mixture-of-agents reference outputs that are structurally untrusted, media adapter declarations with provenance and retention, and the execution-provider registration whose lifecycle evidence must be fenced rather than asserted by a vendor label.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 11,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Catalog completeness",
+        "Explainable routing",
+        "Boundary refusals",
+        "Pool containment",
+        "Fallback preservation",
+        "Untrusted advice",
+        "Media provenance",
+        "Voice is not approval",
+        "Capability separation",
+        "Executor completeness",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need for a new dependency or `Cargo.lock` change, a routing decision without rejection reasons, a silent cross-sovereignty or cross-account switch, a session-bound provider migrating for health, rotation spanning pools, a representable secret value, a fallback that weakens tools, sandbox, residency or approval, a reference output that can approve or be promoted, derived media without provenance, a voice input satisfying an approval, native OS access derivable from a browser grant, an executor registrable without full lifecycle evidence, a vendor label accepted as attestation, a network or vendor call, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 86,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-24.md",
         "docs/product-plan/reference/work-breakdown.md"
       ]
     },

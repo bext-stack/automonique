@@ -1125,8 +1125,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-03.md",
+      "runnable": true
     },
     {
       "id": "R1-04",
@@ -1148,8 +1148,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-04.md",
+      "runnable": true
     },
     {
       "id": "R1-05",
@@ -1171,8 +1171,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-05.md",
+      "runnable": true
     },
     {
       "id": "R1-06",
@@ -1194,8 +1194,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-06.md",
+      "runnable": true
     },
     {
       "id": "R1-07",
@@ -1242,8 +1242,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-08.md",
+      "runnable": true
     },
     {
       "id": "R1-09",
@@ -1265,8 +1265,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-09.md",
+      "runnable": true
     },
     {
       "id": "R1-10",
@@ -1288,8 +1288,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-10.md",
+      "runnable": true
     },
     {
       "id": "R1-11",
@@ -1311,8 +1311,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-11.md",
+      "runnable": true
     },
     {
       "id": "R1-12",
@@ -1334,8 +1334,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-12.md",
+      "runnable": true
     },
     {
       "id": "R1-13",
@@ -1357,8 +1357,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-13.md",
+      "runnable": true
     },
     {
       "id": "R1-14",
@@ -1380,8 +1380,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-14.md",
+      "runnable": true
     },
     {
       "id": "R1-15",
@@ -1403,8 +1403,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-15.md",
+      "runnable": true
     },
     {
       "id": "R1-16",
@@ -1426,8 +1426,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-16.md",
+      "runnable": true
     },
     {
       "id": "R1-17",
@@ -1449,8 +1449,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-17.md",
+      "runnable": true
     },
     {
       "id": "R1-18",
@@ -1472,8 +1472,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-18.md",
+      "runnable": true
     },
     {
       "id": "R1-19",
@@ -1495,8 +1495,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-19.md",
+      "runnable": true
     },
     {
       "id": "R1-20",
@@ -1518,8 +1518,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-20.md",
+      "runnable": true
     },
     {
       "id": "R1-21",
@@ -1541,8 +1541,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-21.md",
+      "runnable": true
     },
     {
       "id": "R1-22",
@@ -1564,8 +1564,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-22.md",
+      "runnable": true
     },
     {
       "id": "R1-23",
@@ -1587,8 +1587,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-23.md",
+      "runnable": true
     },
     {
       "id": "R1-24",
@@ -1610,8 +1610,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-24.md",
+      "runnable": true
     },
     {
       "id": "R1-25",
