@@ -20,6 +20,7 @@ pub mod provider;
 pub mod release;
 pub mod sandbox;
 pub mod schema;
+pub mod tools;
 pub mod wire;
 pub mod workspace;
 
