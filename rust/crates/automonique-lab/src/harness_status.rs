@@ -225,6 +225,12 @@ fn redact_state(value: &Value) -> Result<Value, HarnessStatusError> {
     Ok(Value::Object(output))
 }
 
+/// Validate a state value with the same closed schema used by the read-only
+/// status surface without exposing its redacted projection.
+pub(crate) fn validate_state_document(value: &Value) -> Result<(), HarnessStatusError> {
+    redact_state(value).map(|_| ())
+}
+
 fn validate_optional_fields(
     state: &Map<String, Value>,
     run_id: &str,

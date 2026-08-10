@@ -7,6 +7,7 @@ pub mod canonical_json;
 pub mod controller;
 pub mod framing;
 pub mod git;
+pub mod harness_claim;
 pub mod harness_status;
 pub mod program;
 pub mod protocol;

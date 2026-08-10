@@ -594,6 +594,43 @@ fn parse_packet(value: &Value) -> Result<AdmissionPacket, ProgramError> {
     })
 }
 
+/// Validate bytes produced by the crate-internal claim transaction against the
+/// same closed packet schema consumed by [`select_admitted`].
+pub(crate) fn validate_claim_packet(bytes: &[u8]) -> Result<(), ProgramError> {
+    if bytes.is_empty() || bytes.len() > MAX_PACKET_BYTES {
+        return Err(ProgramError::InputTooLarge);
+    }
+    let value = parse_json(bytes)?;
+    parse_packet(&value).map(|_| ())
+}
+
+/// Validate the complete generated documents selected by the claim core using
+/// the same parsers later used by [`select_admitted`].
+pub(crate) fn validate_claim_documents(
+    program_bytes: &[u8],
+    objectives_bytes: &[u8],
+    work_id: &str,
+) -> Result<(), ProgramError> {
+    if program_bytes.len() > MAX_PROGRAM_BYTES || objectives_bytes.len() > MAX_OBJECTIVES_BYTES {
+        return Err(ProgramError::InputTooLarge);
+    }
+    let program_body = program_bytes
+        .strip_prefix(PROGRAM_HEADER)
+        .ok_or(ProgramError::InvalidProgram("SPDX header"))?;
+    let program_value = parse_json(program_body)?;
+    let objectives_value = parse_json(objectives_bytes)?;
+    let (nodes, _) = parse_program(&program_value)?;
+    let objectives = parse_objectives(&objectives_value, &nodes)?;
+    let node = nodes.get(work_id).ok_or(ProgramError::UnknownWork)?;
+    let objective = objectives
+        .get(work_id)
+        .ok_or(ProgramError::ObjectiveMissing)?;
+    if !node.runnable || !objective.autonomous_eligible {
+        return Err(ProgramError::NotRunnable);
+    }
+    Ok(())
+}
+
 fn selected_document<'a>(
     root: &'a Value,
     collection: &str,
