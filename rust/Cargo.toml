@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Elastic-2.0
 
 [workspace]
-members = ["crates/automonique-lab"]
+members = [
+    "crates/automonique-lab",
+    "crates/automonique-policy",
+    "crates/automonique-protocol",
+]
 resolver = "2"
 
 [workspace.package]

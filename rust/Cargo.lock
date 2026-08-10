@@ -33,6 +33,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "automonique-policy"
+version = "0.1.0"
+
+[[package]]
+name = "automonique-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

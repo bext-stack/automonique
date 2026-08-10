@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+[package]
+name = "automonique-protocol"
+version = "0.1.0"
+edition = "2024"
+license = "Elastic-2.0"
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "forbid"
+todo = "forbid"
+unimplemented = "forbid"

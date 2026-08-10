@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+name: rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  workspace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.93.1 --component rustfmt,clippy
+          rustup default 1.93.1
+
+      - name: Locked workspace checks
+        working-directory: rust
+        run: |
+          cargo fetch --locked
+          cargo metadata --no-deps --offline --locked --format-version 1 >/dev/null
+          cargo fmt --all -- --check
+          cargo check --workspace --all-targets --offline --locked
+          cargo test --workspace --all-targets --offline --locked
+          cargo clippy --workspace --all-targets --offline --locked -- -D warnings
+
+      - name: Lockfile is reproducible offline
+        working-directory: rust
+        run: |
+          cp Cargo.lock /tmp/automonique-Cargo.lock
+          cargo generate-lockfile --offline
+          cmp /tmp/automonique-Cargo.lock Cargo.lock
