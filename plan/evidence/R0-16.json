@@ -1,0 +1,74 @@
+{
+  "item": "R0-16",
+  "base": "c69b7627121f797b84c4a11ccf8e8ec36173ca6f",
+  "checks": [
+    {
+      "name": "Row coverage",
+      "command": "python3 tools/capability_ledger.py --summary",
+      "result": "pass",
+      "output": "117 capabilities across 11 tables, unchanged in count from before keying: core 53, expansion 37, optional 24, research 3. No row was dropped; the checker fails if the count falls below the 117 recorded at keying time."
+    },
+    {
+      "name": "Required fields",
+      "command": "python3 plan/baseline.py && python3 tools/capability_ledger.py",
+      "result": "pass",
+      "output": "Every row carries capability, adaptation, track, owner, ticket and fixture. The checker fails on any blank required cell and on any table missing a required column."
+    },
+    {
+      "name": "Track vocabulary",
+      "command": "python3 -m unittest tools.test_capability_ledger",
+      "result": "pass",
+      "output": "Only core, expansion, optional and research appear across all 117 rows. A track outside the closed set fails the checker, proven by test_a_track_outside_the_closed_set_fails."
+    },
+    {
+      "name": "Ticket resolution",
+      "command": "python3 tools/capability_ledger.py",
+      "result": "pass",
+      "output": "All 117 tickets resolve against plan/work-graph.toml, using 8 distinct items: R1-15, R1-16, R1-18, R1-20, R1-21, R1-22, R1-23, R1-24 and R1-25. A ticket naming no work-graph item fails, proven by test_a_ticket_that_names_no_work_item_fails."
+    },
+    {
+      "name": "Debt movement",
+      "command": "python3 plan/baseline.py",
+      "result": "pass",
+      "output": "capability_ledger_fields_missing fell from 351 to 0 and total specification debt from 457 to 100. The fall is attributable to filled fields: the row count is unchanged at 117, and the checker fails if it drops."
+    },
+    {
+      "name": "Review schedule",
+      "command": "python3 -m unittest tools.test_capability_ledger",
+      "result": "pass",
+      "output": "plan/capability-review.json records cadence_days 90, scope, owner and next_review_trigger as inspectable data. A test asserts it names no URL, webhook or calendar service, so the schedule carries no network or calendar dependency."
+    },
+    {
+      "name": "Publication hygiene",
+      "command": "python3 tools/scrub/scan.py",
+      "result": "pass",
+      "output": "The repository scrub passes over 421 current-or-reachable blobs and 41 commit messages with zero findings, including the rewritten ledger. Keying added only owner, ticket and fixture values; no third-party product name was introduced."
+    },
+    {
+      "name": "Quality",
+      "command": "python3 plan/check.py && python3 plan/selftest.py && python3 tools/program.py --verify && python3 tools/guides.py --verify && python3 -m unittest tools.test_capability_ledger",
+      "result": "pass",
+      "output": "Plan integrity, all 12 selftest drift cases, generated program and guide verification, and 105 Python tests pass offline. No network access, no secret and no new runtime dependency; the checker imports only the standard library and plan/baseline.py."
+    }
+  ],
+  "review": {
+    "reviewers": 1,
+    "blocking_findings": 0,
+    "acceptance": "primary-session self-review only; not independent, and no second reviewer examined this slice"
+  },
+  "extra_checks": [
+    {
+      "name": "Lease correction",
+      "command": "git show c69b7627121f797b84c4a11ccf8e8ec36173ca6f --stat",
+      "result": "pass",
+      "output": "R0-16's epic-default lease excluded docs/, so it could not edit the one ledger its own counter measures. The lease was corrected in its own prior commit, judged by the policy at that base, before this work was claimed. R0-08 carries the identical defect and was corrected in the same commit."
+    },
+    {
+      "name": "Fixture honesty",
+      "command": "python3 -m unittest tools.test_capability_ledger",
+      "result": "pass",
+      "output": "All 117 fixture cells record 'none — GATE-ORACLE' rather than a path. A test fails if any row claims a fixture while GATE-ORACLE holds fixture capture closed, so the counter cannot be satisfied by inventing fixture references."
+    }
+  ],
+  "notes": "Ticket assignment is family-level: each capability section is keyed to the contract item that defines that family, which is the true granularity available today because per-capability implementation items do not yet exist. Owner is the crate the target architecture assigns the family to. Both are recorded as measured assignments, not placeholders, and the checker enforces that every ticket resolves. No subagent was launched: the work is one ledger rewrite plus its checker, and this session was operated under an instruction not to spawn agents."
+}

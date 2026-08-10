@@ -1778,12 +1778,14 @@ def run_loop(requested: str | None, explicit_argv: list[str], limit: int | None)
         lock.close()
 
 
+# Run before the gate. `plan/baseline.py` is deliberately absent: it rewrites
+# the stored baseline the gate compares against, so running it first would erase
+# the very metric movement the gate is asked to judge.
 COMPLETION_REGENERATORS = (
     ("plan", "generate.py"),
     ("tools", "program.py"),
     ("tools", "guides.py"),
     ("plan", "check.py"),
-    ("plan", "baseline.py"),
 )
 
 
@@ -1816,6 +1818,15 @@ def mark_item_done(item_id: str) -> bool:
     updated = text[: match.start(1)] + body + entry + text[match.end(1) :]
     source.write_text(updated)
     return True
+
+
+def unmark_item_done(item_id: str) -> None:
+    """Undo `mark_item_done`, so a refused completion leaves no residue."""
+    source = ROOT / "plan" / "generate.py"
+    text = source.read_text()
+    source.write_text(text.replace(f'    "{item_id}": "done",\n', "", 1))
+    for parts in COMPLETION_REGENERATORS:
+        _run_repo_script(*parts)
 
 
 def dirty_repo_paths() -> list[str]:
@@ -1871,19 +1882,25 @@ def _complete_item_locked(item_id: str, summary: str, reason: str | None) -> int
     for parts in COMPLETION_REGENERATORS:
         _run_repo_script(*parts)
 
-    files = dirty_repo_paths()
-    append_history(item, summary, files, reason)
-    files = dirty_repo_paths()
-
+    # Judge the tree while the stored baseline still describes HEAD, and before
+    # anything irreversible is written, so a refusal can be fully undone.
     gate = [sys.executable, "plan/gate.py", "--item", item_id, "--summary", summary,
-            "--files", *files, "--dry-run"]
+            "--files", *dirty_repo_paths(), "--dry-run"]
     if reason:
         gate.extend(["--allow-no-metric-change", reason])
     verdict = subprocess.run(gate, cwd=ROOT, capture_output=True, text=True, check=False)
     print(verdict.stdout, end="")
     if verdict.returncode != 0:
         print(verdict.stderr, end="", file=sys.stderr)
-        raise LoopError(f"{item_id} did not pass the landing gate; nothing was committed")
+        unmark_item_done(item_id)
+        raise LoopError(
+            f"{item_id} did not pass the landing gate; nothing was committed "
+            "and the status flip was reverted"
+        )
+
+    _run_repo_script("plan", "baseline.py")
+    append_history(item, summary, dirty_repo_paths(), reason)
+    files = dirty_repo_paths()
 
     allowed = tuple(item["allowed_paths"]) + gate_module.completion_paths(item_id)
     metric_snapshot = plan_baseline.snapshot()

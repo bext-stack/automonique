@@ -253,6 +253,7 @@ ITEM_STATUS = {
     "R0-18": "done",
     "R1-01": "done",
     "R1-02": "done",
+    "R0-16": "done",
 }
 
 # Gates block a *class* of work, not the whole graph. A gate listed here must be

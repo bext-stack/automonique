@@ -1,0 +1,9 @@
+{
+  "schema": "automonique.capability-review/v1",
+  "cadence_days": 90,
+  "scope": "Re-read docs/product-plan/requirements/external-capability-ledger.md against the current agent-platform ecosystem; add rows for capabilities that have become expected, and re-key owner, ticket and fixture for rows whose owning work item has moved.",
+  "owner": "repository owner",
+  "next_review_trigger": "90 days after the last recorded review, or immediately when an epic that owns a capability family completes",
+  "records_no_comparison": "The review adjusts Automonique's own coverage. It records no third-party product name and asserts no compatibility with another product.",
+  "reviews": []
+}

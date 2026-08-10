@@ -1,7 +1,7 @@
 {
   "schema": "automonique.spec-debt/v1",
   "counters": {
-    "capability_ledger_fields_missing": 351,
+    "capability_ledger_fields_missing": 0,
     "parity_ledger_fields_missing": 0,
     "contracts_missing": 98,
     "gates_open": 2,
@@ -9,25 +9,12 @@
     "refs_undefined": 0,
     "evidence_missing": 0
   },
-  "total": 451,
+  "total": 100,
   "context": {
     "items": 375,
-    "items_done": 10
+    "items_done": 11
   },
   "detail": {
-    "capability_ledger_fields_missing": [
-      "external-capability-ledger.md: table missing column(s) owner, ticket, fixture across 11 row(s)",
-      "external-capability-ledger.md: table missing column(s) owner, ticket, fixture across 11 row(s)",
-      "external-capability-ledger.md: table missing column(s) owner, ticket, fixture across 17 row(s)",
-      "external-capability-ledger.md: table missing column(s) owner, ticket, fixture across 8 row(s)",
-      "external-capability-ledger.md: table missing column(s) owner, ticket, fixture across 10 row(s)",
-      "external-capability-ledger.md: table missing column(s) owner, ticket, fixture across 9 row(s)",
-      "external-capability-ledger.md: table missing column(s) owner, ticket, fixture across 11 row(s)",
-      "external-capability-ledger.md: table missing column(s) owner, ticket, fixture across 14 row(s)",
-      "external-capability-ledger.md: table missing column(s) owner, ticket, fixture across 10 row(s)",
-      "external-capability-ledger.md: table missing column(s) owner, ticket, fixture across 10 row(s)",
-      "external-capability-ledger.md: table missing column(s) owner, ticket, fixture across 6 row(s)"
-    ],
     "contracts_missing": [
       "no contract: R0-02",
       "no contract: R0-07",
@@ -43,5 +30,5 @@
       "open: GATE-SCRUB"
     ]
   },
-  "digest": "0adf4fbd038cc1e182225a23173ac59e5c60fda2d13e66c589fda6b6081104f0"
+  "digest": "47aeb87ff1af8520a3afb71c8d820b19fc63fda91753e03ea9dff8fd934c6b49"
 }

@@ -3,7 +3,7 @@
   "schema": "automonique.dev-program/v1",
   "source": {
     "graph": "plan/work-graph.toml",
-    "graph_sha256": "d863524326ceabe7b2bed05cce9b2ba122b3273c0a2ab55435e140eb0569ee63",
+    "graph_sha256": "a0df589c736f585d3b7b290ff9a500b3d18e8e0efc767fa874f04185ebffadb4",
     "item_count": 375
   },
   "items": [
@@ -469,9 +469,9 @@
         "docs/product-plan/requirements/external-capability-ledger.md"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R0-16.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R0-17",

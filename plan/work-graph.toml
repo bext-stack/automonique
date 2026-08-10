@@ -270,7 +270,7 @@ summary = "turn `external-capability-ledger.md` into a machine-readable ledger k
 depends_on = ["BOOT-001"]
 licence = "Elastic-2.0"
 allowed_paths = ["plan/", "spikes/", ".automonique/dev/", "tools/", "docs/product-plan/requirements/external-capability-ledger.md"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R0-17"
