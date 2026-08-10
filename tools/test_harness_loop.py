@@ -25,6 +25,20 @@ class HarnessLoopTests(unittest.TestCase):
             "max_failures": 2,
         }
 
+    def selectable_leasing(self, path: str) -> str:
+        """An autonomously selectable item whose lease covers `path`.
+
+        Recovery needs *a* selectable item that may write the fixture path, not
+        one particular ticket. Naming a live graph ID here coupled this test to
+        the plan: when GATE-HARNESS froze the harness tail, a test about
+        recovery durability failed for reasons that had nothing to do with
+        recovery.
+        """
+        for item, _ in harness_loop.eligible_items(self.program, self.objectives):
+            if path in item.get("allowed_paths", []):
+                return item["id"]
+        raise AssertionError(f"no selectable work item leases {path}")
+
     def test_selection_is_deterministic_and_refuses_low_scores(self) -> None:
         eligible = harness_loop.eligible_items(self.program, self.objectives)
         by_id = {
@@ -413,8 +427,9 @@ class HarnessLoopTests(unittest.TestCase):
                 run_git("commit", "-m", "test base")
                 base = run_git("rev-parse", "HEAD")
 
+                work_id = self.selectable_leasing("tools/")
                 item, objective = harness_loop.select_item(
-                    self.program, self.objectives, "R0-19"
+                    self.program, self.objectives, work_id
                 )
                 config = guides.build_loop_config()
                 config["safety_checks"] = [[sys.executable, "-c", "pass"]]
@@ -437,7 +452,7 @@ class HarnessLoopTests(unittest.TestCase):
                     "schema": harness_loop.STATE_SCHEMA,
                     "run_id": run_id,
                     "driver": "codex_session",
-                    "work_id": "R0-19",
+                    "work_id": work_id,
                     "base": base,
                     "branch": "main",
                     "status": "stopped",

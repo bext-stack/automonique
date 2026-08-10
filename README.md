@@ -10,24 +10,30 @@ typed, revision-checked, journaled and reconcilable.
 
 ## Repository status
 
-**Specification and plan only — no implementation source yet.**
+**Early implementation. 11 of 375 items are done, 2 of them product.**
 
-This repository holds the product specification, the target architecture, the
-autonomous development contract, and the executable work graph that drives
-implementation. The canonical repository is
-<https://github.com/bext-stack/automonique>.
+Most of the source in this tree is the development harness, not the product.
+`rust/crates/automonique-lab/` and `tools/` build the machine that develops
+Automonique; `rust/crates/automonique-protocol/` and `-policy/` are the only
+product domain code so far. That imbalance is a known regression, recorded and
+frozen by [`GATE-HARNESS`](plan/gates.md#gate-harness) — see
+[`plan/ready.md`](plan/ready.md) § Focus ledger for the live split. The
+canonical repository is <https://github.com/bext-stack/automonique>.
 
 ```text
 plan/                    executable layer — what may be started, and when
-├─ ready.md              selectable work right now
+├─ ready.md              selectable work right now, and the focus ledger
 ├─ gates.md              blocking conditions and their closing evidence
-├─ work-graph.toml       375 items: deps, gates, licence class, allowed paths
+├─ work-graph.toml       375 items: deps, gates, track, licence, allowed paths
 └─ contracts/            per-item objective, verification and stop conditions
 
 docs/product-plan/       specification — what to build and why
 ├─ architecture.md       target architecture
 ├─ requirements/         18 capability and non-functional requirements
 └─ reference/            6 historical documents: parity, migration, review
+
+rust/crates/             product code (protocol, policy) and the frozen lab
+tools/                   Python development harness — frozen, being retired
 
 AGENTS.md                what an implementing agent may and may not do
 GOVERNANCE.md            separated roles and autonomous integration rules
@@ -65,13 +71,14 @@ python3 plan/generate.py    # rebuild plan/work-graph.toml
 python3 plan/check.py       # verify integrity, rewrite plan/ready.md
 ```
 
-`check.py` also enforces the licence boundary, rejects dependency cycles, and
-refuses any ready item that has no contract. It exits non-zero on failure so CI
-can gate on it.
+`check.py` also enforces the licence boundary, rejects dependency cycles,
+refuses any ready item that has no contract, and refuses a graph in which
+harness work has escaped `GATE-HARNESS` into the ready set. It exits non-zero
+on failure so CI can gate on it.
 
 ## Open gates
 
-Two conditions currently block classes of work. Identity separation and
+Three conditions currently block classes of work. Identity separation and
 release-grade licence review remain advisory and do not block implementation. See
 [`plan/gates.md`](plan/gates.md) for closing evidence.
 
@@ -79,6 +86,7 @@ release-grade licence review remain advisory and do not block implementation. Se
 |---|---|
 | `GATE-SCRUB` | making the repository public |
 | `GATE-ORACLE` | differential parity and fixture capture |
+| `GATE-HARNESS` | further self-host harness work (`R0-19`…`R0-40`) |
 
 The path-aware SPDX check runs with the plan workflow. Dependency notices,
 SBOMs, and distribution-specific licence review are deferred until the first

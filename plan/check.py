@@ -47,6 +47,12 @@ SKIP_SOURCE_PARTS = {
 }
 SPDX = re.compile(r"SPDX-License-Identifier:\s*([^\s*<>]+)")
 
+HARNESS_TRACK = "harness"
+HARNESS_GATE = "GATE-HARNESS"
+# Gates an owner closes by decision rather than by completing a work item. They
+# are real blocking gates; they just have no closing ticket to warn about.
+OWNER_CLOSED_GATES = {HARNESS_GATE}
+
 BREAKDOWN_ID = re.compile(r"^- \*\*([A-Z]+[0-9]+[A-Z]?-[0-9]+)\s", re.M)
 GATE_ID = re.compile(r"^### (GATE-[A-Z-]+)", re.M)
 ADVISORY_GATE = re.compile(
@@ -198,7 +204,8 @@ def check_gates(items: list[dict]) -> set[str]:
                 fail(f"{it['id']} closes the same gate that blocks it: {b}")
     closed = {it["closes_gate"] for it in items
               if it.get("closes_gate") and it.get("status") == "done"}
-    for g in sorted(known - advisory - {i.get("closes_gate") for i in items}):
+    for g in sorted(known - advisory - OWNER_CLOSED_GATES
+                    - {i.get("closes_gate") for i in items}):
         warnings.append(f"gate {g} has no item that closes it")
     return closed
 
@@ -214,6 +221,56 @@ def check_licence(items: list[dict]) -> None:
             fail(f"{it['id']} is Apache-2.0 but writes outside the SDK boundary: {paths}")
         if not apache and paths and all(p.startswith("sdk/") for p in paths):
             warnings.append(f"{it['id']} is Elastic-2.0 but only writes under sdk/")
+
+
+def focus_rank(item: dict) -> tuple[int, str]:
+    """Product first, then discovery, then harness.
+
+    The contract-writing queue is ordered by this so that the cheapest way to
+    make work selectable is always to specify product work. `tools/program.py`
+    and the harness selector apply the same ordering to eligible items.
+    """
+    if item.get("track") == HARNESS_TRACK:
+        return (2, item["id"])
+    if item.get("epic") in {"BOOT", "R0"}:
+        return (1, item["id"])
+    return (0, item["id"])
+
+
+def check_focus(items: list[dict], ready: list[dict]) -> None:
+    """GATE-HARNESS: the harness may not outrun the product it exists to build.
+
+    The repository spent its first 375-item plan building its own development
+    harness, because the harness was the only work with a contract and the
+    selector took the first eligible item in graph order. Classification alone
+    would not have stopped that — a track label nothing enforces is a comment.
+    This binds the label to the gate that makes it mechanical.
+    """
+    for it in items:
+        harness = it.get("track") == HARNESS_TRACK
+        gated = HARNESS_GATE in it.get("blocked_by_gates", [])
+        if harness and not gated:
+            fail(f"{it['id']} is on the harness track but is not blocked by "
+                 f"{HARNESS_GATE} — regenerate with plan/generate.py")
+        if gated and not harness:
+            fail(f"{it['id']} is blocked by {HARNESS_GATE} but is not on the "
+                 f"harness track; the gate freezes harness work only")
+
+    escaped = [it["id"] for it in ready if it.get("track") == HARNESS_TRACK]
+    if escaped:
+        fail("harness work reached the ready set while " + HARNESS_GATE
+             + " is open: " + ", ".join(sorted(escaped)))
+
+    frozen = sorted(it["id"] for it in items
+                    if it.get("track") == HARNESS_TRACK
+                    and it.get("status") != "done"
+                    and (CONTRACTS / f"{it['id']}.md").exists())
+    if frozen:
+        warnings.append(
+            f"{len(frozen)} harness contract(s) are written but frozen by "
+            f"{HARNESS_GATE}: " + ", ".join(frozen)
+            + " — they are kept as the record of what was specified, not as "
+              "selectable work")
 
 
 def compute_ready(items: list[dict], closed_gates: set[str]) -> list[dict]:
@@ -305,6 +362,34 @@ def write_ready(items: list[dict], ready: list[dict],
         f"- ready now: **{len(ready)}**",
         f"- blocked: **{len(items) - done - len(ready)}**",
         "",
+        "## Focus ledger",
+        "",
+        "Product work is what ships. Discovery feeds the specification. Harness "
+        f"work builds the machine that develops the product and is frozen by "
+        f"[`{HARNESS_GATE}`](gates.md#gate-harness). If the harness column "
+        "starts leading again, that is the regression this table exists to "
+        "show.",
+        "",
+        "| Class | Items | Done | Contracts | Ready |",
+        "|---|---|---|---|---|",
+    ]
+    ready_ids_for_ledger = {i["id"] for i in ready}
+    classes = [
+        ("product", lambda i: focus_rank(i)[0] == 0),
+        ("discovery", lambda i: focus_rank(i)[0] == 1),
+        ("harness", lambda i: focus_rank(i)[0] == 2),
+    ]
+    for label, pred in classes:
+        group = [i for i in items if pred(i)]
+        n_done = sum(1 for i in group if i.get("status") == "done")
+        n_contract = sum(1 for i in group
+                         if (CONTRACTS / f"{i['id']}.md").exists())
+        n_ready = sum(1 for i in group if i["id"] in ready_ids_for_ledger)
+        lines.append(
+            f"| {label} | {len(group)} | {n_done} | {n_contract} | {n_ready} |"
+        )
+    lines += [
+        "",
         "## Selectable now",
         "",
         "| ID | Epic | Title | Licence | Contract |",
@@ -339,7 +424,9 @@ def write_ready(items: list[dict], ready: list[dict],
         lines += ["", "## Unblocked but unspecified", "",
                   "Dependency- and gate-clear, but no contract exists, so they are "
                   "not selectable. Writing one of these contracts is itself useful "
-                  "work and lowers `contracts_missing`.", "",
+                  "work and lowers `contracts_missing`. **Ordered product first** "
+                  "— specifying product work is what makes product work "
+                  "selectable, and nothing else in this repository does that.", "",
                   "  " + ", ".join(f"`{i}`" for i in unspecified[:24])
                   + (f" …and {len(unspecified) - 24} more" if len(unspecified) > 24 else "")]
 
@@ -387,7 +474,10 @@ def main() -> int:
     closed = check_gates(items)
     check_licence(items)
     ready = compute_ready(items, closed)
-    unspecified = unblocked_without_contract(items, closed)
+    by_id = {i["id"]: i for i in items}
+    unspecified = sorted(unblocked_without_contract(items, closed),
+                         key=lambda i: focus_rank(by_id[i]))
+    check_focus(items, ready)
     check_evidence(items)
 
     for w in warnings:

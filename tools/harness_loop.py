@@ -242,6 +242,22 @@ def owner_blocked_reason(item_id: str) -> str | None:
     return "an external completion check is recorded unresolved"
 
 
+def selection_rank(item: dict[str, Any]) -> tuple[int, str]:
+    """Product before discovery before harness; ties keep graph order.
+
+    Automatic selection used to take the first eligible item in graph order,
+    which is BOOT, then R0, then the product. Every autonomous run therefore
+    chose harness work whenever any was eligible, and harness work is always
+    eligible first because it is what the harness knows how to specify. This
+    mirrors `plan/check.py:focus_rank`.
+    """
+    if item.get("track") == "harness":
+        return (2, item.get("id", ""))
+    if item.get("epic") in {"BOOT", "R0"}:
+        return (1, item.get("id", ""))
+    return (0, item.get("id", ""))
+
+
 def eligible_items(
     program_document: dict[str, Any], objective_document: dict[str, Any]
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
@@ -265,7 +281,7 @@ def select_item(
     if requested is None:
         if not eligible:
             raise LoopError("no score-eligible runnable work item exists")
-        return eligible[0]
+        return min(eligible, key=lambda entry: selection_rank(entry[0]))
     objectives = objective_map(objective_document)
     item = next(
         (entry for entry in program_document.get("items", []) if entry.get("id") == requested),

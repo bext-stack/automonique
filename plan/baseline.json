@@ -4,12 +4,12 @@
     "capability_ledger_fields_missing": 0,
     "parity_ledger_fields_missing": 0,
     "contracts_missing": 98,
-    "gates_open": 2,
+    "gates_open": 3,
     "links_broken": 0,
     "refs_undefined": 0,
     "evidence_missing": 0
   },
-  "total": 100,
+  "total": 101,
   "context": {
     "items": 375,
     "items_done": 11
@@ -26,9 +26,10 @@
       "no contract: R0-25"
     ],
     "gates_open": [
+      "open: GATE-HARNESS",
       "open: GATE-ORACLE",
       "open: GATE-SCRUB"
     ]
   },
-  "digest": "47aeb87ff1af8520a3afb71c8d820b19fc63fda91753e03ea9dff8fd934c6b49"
+  "digest": "beadbbe9a48227cf9e8a51f74c0308eee1b167d8bebaffe04a2d102346bea8be"
 }

@@ -6,8 +6,18 @@ An item is ready when every dependency is `done`. Selecting work means taking a 
 
 - items total: **375**
 - done: **11**
-- ready now: **13**
-- blocked: **351**
+- ready now: **11**
+- blocked: **353**
+
+## Focus ledger
+
+Product work is what ships. Discovery feeds the specification. Harness work builds the machine that develops the product and is frozen by [`GATE-HARNESS`](gates.md#gate-harness). If the harness column starts leading again, that is the regression this table exists to show.
+
+| Class | Items | Done | Contracts | Ready |
+|---|---|---|---|---|
+| product | 330 | 2 | 4 | 2 |
+| discovery | 23 | 9 | 18 | 9 |
+| harness | 22 | 0 | 5 | 0 |
 
 ## Selectable now
 
@@ -22,8 +32,6 @@ An item is ready when every dependency is `done`. Selecting work means taking a 
 | `R0-10` | R0 | Baseline recovery drill | Elastic-2.0 | [contract](contracts/R0-10.md) |
 | `R0-11` | R0 | Shell decision fixture | Elastic-2.0 | [contract](contracts/R0-11.md) |
 | `R0-13` | R0 | Automonique identifier inventory | Elastic-2.0 | [contract](contracts/R0-13.md) |
-| `R0-19` | R0 | Minimal `automonique-lab` | Elastic-2.0 | [contract](contracts/R0-19.md) |
-| `R0-40` | R0 | Self-host recovery drill | Elastic-2.0 | [contract](contracts/R0-40.md) |
 | `R1-07` | R1 | `automonique doctor` | Elastic-2.0 | [contract](contracts/R1-07.md) |
 | `R1-25` | R1 | Cross-surface interaction contracts | Elastic-2.0 | [contract](contracts/R1-25.md) |
 
@@ -36,17 +44,17 @@ The first blocked items behind the current ready set:
 - `R0-12` Channel connector corpus — waits on contract
 - `R0-14` Sandbox host-capability spike — waits on contract
 - `R0-15` Provider/tool egress spike — waits on contract
-- `R0-20` Role-policy trials — waits on `R0-21`
-- `R0-21` Commit metrics and baselines — waits on `R0-19`
-- `R0-22` Harness reload and merge train — waits on `R0-20`, `R0-21`
-- `R0-23` Self-hosting levels/policy — waits on contract
-- `R0-24` Bootstrap manifest/schema — waits on contract
+- `R0-19` Minimal `automonique-lab` — waits on gate `GATE-HARNESS`
+- `R0-20` Role-policy trials — waits on `R0-21`, gate `GATE-HARNESS`
+- `R0-21` Commit metrics and baselines — waits on `R0-19`, gate `GATE-HARNESS`
+- `R0-22` Harness reload and merge train — waits on `R0-20`, `R0-21`, gate `GATE-HARNESS`
+- `R0-23` Self-hosting levels/policy — waits on gate `GATE-HARNESS`
 
 ## Unblocked but unspecified
 
-Dependency- and gate-clear, but no contract exists, so they are not selectable. Writing one of these contracts is itself useful work and lowers `contracts_missing`.
+Dependency- and gate-clear, but no contract exists, so they are not selectable. Writing one of these contracts is itself useful work and lowers `contracts_missing`. **Ordered product first** — specifying product work is what makes product work selectable, and nothing else in this repository does that.
 
-  `R0-12`, `R0-14`, `R0-15`, `R0-23`, `R0-24`, `R0-25`, `R0-26`, `R0-27`, `R0-28`, `R0-29`, `R0-30`, `R0-31`, `R0-32`, `R0-33`, `R0-34`, `R0-35`, `R0-36`, `R0-37`, `R0-38`, `R0-39`, `R1-03`, `R1-04`, `R1-05`, `R1-06` …and 17 more
+  `R1-03`, `R1-04`, `R1-05`, `R1-06`, `R1-08`, `R1-09`, `R1-10`, `R1-11`, `R1-12`, `R1-13`, `R1-14`, `R1-15`, `R1-16`, `R1-17`, `R1-18`, `R1-19`, `R1-20`, `R1-21`, `R1-22`, `R1-23`, `R1-24`, `R0-12`, `R0-14`, `R0-15`
 
 ## Gate-blocked work
 
@@ -54,5 +62,6 @@ Items that a gate holds back independently of their dependencies:
 
 | Gate | Items |
 |---|---|
+| [`GATE-HARNESS`](gates.md#gate-harness) | `R0-19`, `R0-20`, `R0-21`, `R0-22`, `R0-23`, `R0-24` …and 16 more |
 | [`GATE-ORACLE`](gates.md#gate-oracle) | `R0-02`, `R0-07` |
 | [`GATE-SCRUB`](gates.md#gate-scrub) | `R10-01`, `R10-02`, `R10-03`, `R10-04`, `R10-05`, `R10-06` …and 15 more |

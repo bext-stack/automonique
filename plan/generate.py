@@ -127,7 +127,10 @@ EPIC_DEPS = {
     "R8E": ["R8C", "R8D"],
     "R8F": ["R8B"],
     "R8G": ["R8F"],
-    "R9": ["R0", "R1"],
+    # R9 needs the sandbox host-capability answer (R9-09 names R0-14), not the
+    # self-host harness tail. Depending on the epic resolved to R0-40, which
+    # put 55 product items behind the machine that develops the product.
+    "R9": ["R0-14", "R1"],
     "R10": ["R8A", "R9"],
     "R11": ["R8B", "R10"],
     "R12": ["R11"],
@@ -143,6 +146,19 @@ TRACK = {
     **{e: "expansion" for e in ["R8F", "R8G", "R11", "R12", "R13", "R14"]},
     "R15": "research",
 }
+
+# --------------------------------------------------------------------------
+# Self-host harness. R0-19..R0-40 build the machine that develops Automonique;
+# they do not build Automonique. They stay in the graph — plan/doctrine.md
+# forbids closing a row by deleting it — but they carry GATE-HARNESS so they
+# cannot be selected while the product is unbuilt. plan/gates.md records the
+# owner decision that reopens them.
+#
+# R0-01..R0-18 are discovery: inventories, fixtures and spikes that feed the
+# product specification. They are not harness and stay selectable.
+# --------------------------------------------------------------------------
+HARNESS_ITEMS = {f"R0-{n:02d}" for n in range(19, 41)}
+HARNESS_GATE = "GATE-HARNESS"
 
 # Apache-2.0 applies below sdk/ and integrations/ only (LICENSE-POLICY.md)
 APACHE_EPICS = {"R8B", "R8F", "R13"}
@@ -362,13 +378,16 @@ def build() -> str:
         out.append("[[item]]")
         out.append(f'id = "{it["id"]}"')
         out.append(f'epic = "{epic}"')
-        out.append(f'track = "{TRACK.get(epic, "core")}"')
+        track = "harness" if it["id"] in HARNESS_ITEMS else TRACK.get(epic, "core")
+        out.append(f'track = "{track}"')
         out.append(f'title = "{esc(it["title"])}"')
         if it["summary"]:
             out.append(f'summary = "{esc(it["summary"])}"')
         out.append(f"depends_on = {deps!r}".replace("'", '"'))
         out.append(f'licence = "{licence}"')
-        gates = ITEM_GATES.get(it["id"], EPIC_GATES.get(epic, []))
+        gates = list(ITEM_GATES.get(it["id"], EPIC_GATES.get(epic, [])))
+        if it["id"] in HARNESS_ITEMS:
+            gates.append(HARNESS_GATE)
         if gates:
             out.append(f"blocked_by_gates = {gates!r}".replace("\'", '"'))
         paths = ITEM_PATHS.get(it["id"], ALLOWED_PATHS.get(epic, []))

@@ -16,6 +16,7 @@ an unsupported assertion.
 | [`GATE-IDENTITY`](#gate-identity) | `BOOT-002` | advisory identity-hardening claim only |
 | [`GATE-SCRUB`](#gate-scrub) | `BOOT-003` | making the repository public |
 | [`GATE-ORACLE`](#gate-oracle) | `BOOT-004` | differential parity, fixture capture |
+| [`GATE-HARNESS`](#gate-harness) | owner decision | further self-host harness work (`R0-19`…`R0-40`) |
 | [`GATE-LICENCE`](#gate-licence) | first distribution contract | advisory release-readiness claim only |
 
 ---
@@ -129,6 +130,47 @@ Closing evidence:
 - oracle output is content-scanned before it reaches any agent context;
 - the configured review record or explicit owner acceptance is bound to the
   exact boundary candidate.
+
+---
+
+### GATE-HARNESS
+
+**State: open 2026-08-10 by owner decision.**
+
+`R0-19`…`R0-40` build the machine that develops Automonique: the lab, its
+brokers and leases, self-hosting levels, candidate lifecycle, promotion
+protocol and recursive-improvement policy. That work is legitimate and stays in
+the graph. It had also become the only work the repository was doing.
+
+Measured at the decision base:
+
+| | lines |
+|---|---|
+| `rust/crates/automonique-lab/` | 22,230 |
+| `tools/*.py` | 11,489 |
+| `sdk/typescript/packages/lab/` | 1,920 |
+| product domain (`automonique-protocol`, `-policy`) | 1,993 |
+
+Eleven of 375 items were done, nine of them harness or discovery. `R0-19` was
+still not complete after 22,230 lines. Twenty-plus `R1` product items were
+dependency- and gate-clear the whole time, unselectable only because nobody had
+written their contract.
+
+Blocks: starting or extending any `track = "harness"` item. It does **not**
+block using the harness that already exists, fixing it when it breaks product
+work, or `R0-01`…`R0-18` discovery.
+
+Closing evidence:
+
+- an owner decision under `plan/owner-decisions/` naming the exact revision;
+- the product milestone that justifies reopening — at minimum every `R1`
+  contract written and epic `R1` complete;
+- a statement of which specific harness items the milestone requires, so the
+  gate reopens a named subset rather than the whole tail.
+
+The gate exists because a harness measures its own progress with its own
+instruments, and always reports success. Only work outside it can say whether
+it was worth building.
 
 ---
 

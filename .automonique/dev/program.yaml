@@ -3,7 +3,7 @@
   "schema": "automonique.dev-program/v1",
   "source": {
     "graph": "plan/work-graph.toml",
-    "graph_sha256": "a0df589c736f585d3b7b290ff9a500b3d18e8e0efc767fa874f04185ebffadb4",
+    "graph_sha256": "dfd707db04941b0bdf9b67ea3fafbcd10d7a46d13bdf7d3d2d2410e4817496ed",
     "item_count": 375
   },
   "items": [
@@ -522,7 +522,7 @@
     {
       "id": "R0-19",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Minimal `automonique-lab`",
       "summary": "durable Rust orchestrator, separate dev state/credentials, execution-host provider adapters, isolated worktree/file leases, build broker, Git broker, budgets and TypeScript scenario client.",
       "depends_on": [
@@ -531,7 +531,9 @@
         "R0-17",
         "R0-18"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -545,19 +547,21 @@
       "closes_gate": null,
       "status": "blocked",
       "contract": "plan/contracts/R0-19.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R0-20",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Role-policy trials",
       "summary": "run three representative units under the owner-configured review policy, including zero-reviewer and fresh-context-review cases; rerun after harness-policy correction and compare deterministic evidence.",
       "depends_on": [
         "BOOT-001",
         "R0-21"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -573,14 +577,16 @@
     {
       "id": "R0-21",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Commit metrics and baselines",
       "summary": "emit compact Git trailers plus content-addressed `automonique.dev-metrics/v1` manifests covering correctness/parity, product performance, prompt/cache/economics, safety/maintainability and environment/sample provenance.",
       "depends_on": [
         "BOOT-001",
         "R0-19"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -596,7 +602,7 @@
     {
       "id": "R0-22",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Harness reload and merge train",
       "summary": "preserve workers, builds, queues, leases and evidence across harness reload; serialize reviewed commits, invalidate stale review after conflicts and prove clean abandon/rollback.",
       "depends_on": [
@@ -604,7 +610,9 @@
         "R0-20",
         "R0-21"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -620,13 +628,15 @@
     {
       "id": "R0-23",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Self-hosting levels/policy",
       "summary": "encode SH0–SH6, repository ceiling (`proposal_only` through `production_proposal`), role separation and forbidden candidate authority.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -642,13 +652,15 @@
     {
       "id": "R0-24",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Bootstrap manifest/schema",
       "summary": "source/toolchain/dependency/environment/build/test/output/trusted-builder contract with fixed digests and no secrets.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -664,13 +676,15 @@
     {
       "id": "R0-25",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "`automonique-bootstrap` inspector",
       "summary": "non-mutating host/repository/toolchain/sandbox/recovery plan and schema/signature verification.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -686,13 +700,15 @@
     {
       "id": "R0-26",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Fresh-host bootstrap",
       "summary": "resumable apply/verify/export-recovery flow creating the isolated development identity, state and SH0 lab from reviewed inputs.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -708,13 +724,15 @@
     {
       "id": "R0-27",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Source/build identity",
       "summary": "repository/tree/dirty-patch/dependency/generated-source fingerprints, pre/post build validation, deduplication and superseded results.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -730,13 +748,15 @@
     {
       "id": "R0-28",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Stable/candidate isolation",
       "summary": "digest-named units, UIDs/runtime paths, sockets, database/artifacts/workspaces, credentials, network and lease/outbox separation.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -752,13 +772,15 @@
     {
       "id": "R0-29",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Candidate lifecycle journal",
       "summary": "proposed-through-promoted state machine, role-owned evidence, quarantine/reject/rollback and action receipts.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -774,13 +796,15 @@
     {
       "id": "R0-30",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Self-development session/actions",
       "summary": "repository-scoped profile, stable/candidate identity, build/test/background/evidence/reload/rollback and promotion-proposal commands without generic exec.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -796,13 +820,15 @@
     {
       "id": "R0-31",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Candidate modes",
       "summary": "fixture, sanitized replay, shadow, explicit canary and bot-owned development-integration boundaries with unmistakable identity.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -818,13 +844,15 @@
     {
       "id": "R0-32",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Candidate build/publication",
       "summary": "centralized resource-bounded queue, immutable digest-addressed candidates, binary identity smoke tests and no dirty promotion.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -840,13 +868,15 @@
     {
       "id": "R0-33",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Candidate self-host fixture",
       "summary": "bounded work-DAG read, fixture unit, background build observation, same-source rebuild and exact identity reporting.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -862,13 +892,15 @@
     {
       "id": "R0-34",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Candidate generation reload",
       "summary": "stable-observed C0→C1 handoff preserving sessions/providers/builds/todos/findings/cursors/receipts plus forced-failure fallback.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -884,13 +916,15 @@
     {
       "id": "R0-35",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Reproducible builder/provenance",
       "summary": "clean source acquisition, isolated build, authenticated provenance, SBOM and vulnerability/license results; separate builder identity is optional.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -906,13 +940,15 @@
     {
       "id": "R0-36",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Reproducibility comparison",
       "summary": "A1 stable build versus A2 candidate self-build and optional A3 clean rebuild, bit-identical target and declared deterministic normalization during transition.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -928,13 +964,15 @@
     {
       "id": "R0-37",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Self-host SDK/operator views",
       "summary": "generated TypeScript services and TUI/dashboard stable/candidate topology, queues, gates, comparisons, metrics and rollback readiness.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -950,13 +988,15 @@
     {
       "id": "R0-38",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Promotion protocol",
       "summary": "exact-revision prepare/approve receipts, required external authorities, protected-branch/signing/deployment exclusion and ambiguous-outcome reconciliation.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -972,13 +1012,15 @@
     {
       "id": "R0-39",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Recursive improvement policy",
       "summary": "bounded evidence sources, hill-climb objectives, auto-queue ceiling, oscillation/repetition stop rules and owner-configured review classes.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -994,13 +1036,15 @@
     {
       "id": "R0-40",
       "epic": "R0",
-      "track": "core",
+      "track": "harness",
       "title": "Self-host recovery drill",
       "summary": "corrupt/crash candidate and stable development state, restore last seed/recovery bundle, reconcile repository/evidence and prove production isolation.",
       "depends_on": [
         "BOOT-001"
       ],
-      "blocked_by_gates": [],
+      "blocked_by_gates": [
+        "GATE-HARNESS"
+      ],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "plan/",
@@ -1011,7 +1055,7 @@
       "closes_gate": null,
       "status": "blocked",
       "contract": "plan/contracts/R0-40.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-01",
@@ -6137,7 +6181,7 @@
       "title": "Typed Rust deploy-broker request parser",
       "summary": null,
       "depends_on": [
-        "R0-40",
+        "R0-14",
         "R1-25"
       ],
       "blocked_by_gates": [],
@@ -6159,7 +6203,7 @@
       "title": "fd-relative revision/artifact/snapshot validation",
       "summary": null,
       "depends_on": [
-        "R0-40",
+        "R0-14",
         "R1-25"
       ],
       "blocked_by_gates": [],
@@ -6181,7 +6225,7 @@
       "title": "root lock, receipt and atomic deployment semantics",
       "summary": null,
       "depends_on": [
-        "R0-40",
+        "R0-14",
         "R1-25"
       ],
       "blocked_by_gates": [],
@@ -6203,7 +6247,7 @@
       "title": "installer, ownership checks and exact sudo policy",
       "summary": null,
       "depends_on": [
-        "R0-40",
+        "R0-14",
         "R1-25"
       ],
       "blocked_by_gates": [],
@@ -6225,7 +6269,7 @@
       "title": "adversarial filesystem and request tests",
       "summary": null,
       "depends_on": [
-        "R0-40",
+        "R0-14",
         "R1-25"
       ],
       "blocked_by_gates": [],
@@ -6247,7 +6291,7 @@
       "title": "independent security review and remediation",
       "summary": null,
       "depends_on": [
-        "R0-40",
+        "R0-14",
         "R1-25"
       ],
       "blocked_by_gates": [],
@@ -6269,7 +6313,7 @@
       "title": "Optional isolated shell service",
       "summary": "local-only, disabled by default, separate `shell_operator` role, dedicated unit/cgroup and no TUI byte proxy.",
       "depends_on": [
-        "R0-40",
+        "R0-14",
         "R1-25"
       ],
       "blocked_by_gates": [],
@@ -6291,7 +6335,7 @@
       "title": "Artifact-mediated file transfer",
       "summary": "upload/download grants, malware/archive checks, quotas, provenance and audit receipts instead of arbitrary host paths.",
       "depends_on": [
-        "R0-40",
+        "R0-14",
         "R1-25"
       ],
       "blocked_by_gates": [],
@@ -6313,7 +6357,7 @@
       "title": "Optional sandbox launcher",
       "summary": "if R0-14 requires privilege, implement a separate closed-schema namespace/routing launcher with prepared descriptors, no arbitrary argv and no deployment authority.",
       "depends_on": [
-        "R0-40",
+        "R0-14",
         "R1-25"
       ],
       "blocked_by_gates": [],
@@ -6335,7 +6379,7 @@
       "title": "Sandbox/egress privileged review",
       "summary": "fuzz parsers and independently review namespace setup, routing rules, cleanup, confused-deputy behavior and separation from the deploy broker.",
       "depends_on": [
-        "R0-40",
+        "R0-14",
         "R1-25"
       ],
       "blocked_by_gates": [],
@@ -6357,7 +6401,7 @@
       "title": "Strong-isolation provider contract",
       "summary": "define the same events/artifacts/credentials/cancellation/attestation boundary for a future microVM or remote executor; high-risk work remains rejected until a conformant implementation graduates.",
       "depends_on": [
-        "R0-40",
+        "R0-14",
         "R1-25"
       ],
       "blocked_by_gates": [],

@@ -153,6 +153,17 @@ universal readiness gates.
   evidence must record the actual reviewer count and may not claim independence
   that did not occur.
 - Never claim an unmeasured metric. Missing evidence is `null` with a reason.
+- Never extend the development harness to make development easier. Items
+  `R0-19`…`R0-40` — the lab, its brokers and leases, self-hosting levels,
+  candidate lifecycle, promotion and recursive improvement — are frozen by
+  `GATE-HARNESS`. Building the tool that builds the product always feels like
+  progress and is always measurable by the tool's own instruments; that is why
+  this repository produced 35,000 lines of harness against 2,000 lines of
+  product before anyone noticed. Fixing the harness so it stops blocking a
+  product item is permitted and should be the smallest change that unblocks it.
+  Improving the harness for its own sake is not. If a product item is
+  unselectable because it has no contract, write that contract — that, not more
+  tooling, is what makes product work startable.
 - Product files use `Elastic-2.0`; `sdk/`, `integrations/`, and `connectors/`
   use `Apache-2.0`. Moving product code across that boundary requires owner
   review before distribution.
