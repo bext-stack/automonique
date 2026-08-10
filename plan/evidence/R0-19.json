@@ -1,66 +1,74 @@
 {
   "item": "R0-19",
-  "base": "69db4ca85c1ab1aab7ad3fe3e9225bf0f33db055",
+  "base": "9cae42e419789fdd35b121fa6c4c09dd2ab8b007",
+  "completion": "partial",
   "checks": [
     {
-      "name": "Durable resume",
-      "command": "python3 -m unittest tools.test_lab_state tools.test_lab_controller tools.test_lab_scenario",
+      "name": "Rust workspace",
+      "command": "cargo test --manifest-path rust/Cargo.toml --workspace --all-targets --offline --locked",
       "result": "pass",
-      "output": "23 tests prove queued, running and paused attempts, checkpoints, evidence, leases and monotonic journals survive database/controller/server close and reopen before an exact-checkpoint resume"
+      "output": "142 locked offline Rust workspace tests passed; all-target Clippy with -D warnings and rustfmt verification passed"
+    },
+    {
+      "name": "Durable resume",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --offline --locked state_restart recovery_faults",
+      "result": "pass",
+      "output": "durable state, journal, checkpoint, lease, candidate intent and receipt tests reopen and replay without accepting worker self-report as terminal evidence"
     },
     {
       "name": "Lease exclusion",
-      "command": "python3 -m unittest tools.test_lab_state tools.test_lab_controller",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --offline --locked workspace_lease worktree_allocator",
       "result": "pass",
-      "output": "segment-prefix overlap is denied transactionally across two SQLite connections and two controllers; a concurrent same-path race has one winner, while terminal transitions release leases atomically"
+      "output": "sealed active leases reject overlapping attempts and distinct runs; allocation derives its run from the verified attempt and authority revocation fences later Git effects"
     },
     {
       "name": "Immutable base",
-      "command": "python3 -m unittest tools.test_git_broker tools.test_worktree_allocator tools.test_lab_controller",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --offline --locked program_selection program_cli worktree_allocator git_candidate",
       "result": "pass",
-      "output": "candidate-tree, branch, HEAD, dirty-path and detached-worktree drift are refused; controller selection and resume deny repository or isolated-allocation drift before an effect"
+      "output": "fixed active state and packet hashes bind HEAD, run, work item, program, objectives, guides and actual graph bytes; dirty, alternate-base and drift cases are denied"
     },
     {
       "name": "Build budget",
-      "command": "python3 -W error::ResourceWarning -m unittest tools.test_build_broker",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --test build_limits --offline --locked",
       "result": "pass",
-      "output": "9 tests cover fixed typed recipes, wall and CPU termination, bounded captured output, writable-file ceiling, PID pre-spawn denial, missing host accounting denial and descendant process-group cleanup"
+      "output": "closed synthetic recipes exercise wall, CPU, file, output, PID and descendant cleanup bounds with fail-closed host capability handling"
     },
     {
       "name": "Git broker",
-      "command": "python3 -m unittest tools.test_git_broker tools.test_local_integration",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --test git_candidate --test recovery_faults --offline --locked",
       "result": "pass",
-      "output": "leased exact paths at the admitted base produce one deterministic candidate tree and one namespaced proposal ref; exact verified candidates advance local and origin main only through expected-tip non-force CAS receipts"
+      "output": "sealed leased paths at the admitted base produce deterministic proposal-only candidate refs and recover intent, commit and ref fault windows without duplicate effects"
     },
     {
       "name": "Forbidden Git",
-      "command": "python3 -m unittest tools.test_git_broker tools.test_local_integration",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --test git_candidate --offline --locked",
       "result": "pass",
-      "output": "generic push, merge, force, reset, checkout, rebase, stash, tag, remote edit and history rewrite requests are absent or explicitly denied; tests use temporary local repositories and remotes"
+      "output": "the Rust broker exposes fixed candidate-only Git recipes and no push, merge, force, remote-edit or history-rewrite request surface"
     },
     {
       "name": "Provider boundary",
-      "command": "bun test sdk/typescript/packages/lab/test/provider-policy.test.ts",
-      "result": "pass",
-      "output": "7 tests require loader-derived inventory and surface digests, bounded host policy, sufficient capability evidence, safe declared modes and explicit ordered fallbacks; unknown, debug, unsafe and experimental modes are denied"
+      "command": null,
+      "result": null,
+      "reason": "inventory execution remains deliberately deny-only until a trusted Rust inventory loader and observed lifecycle adapter are connected"
     },
     {
       "name": "Scenario client",
       "command": "bun test sdk/typescript/packages/lab/test && npx --offline tsc -p sdk/typescript/packages/lab/tsconfig.json",
-      "result": "pass",
-      "output": "24 tests and 90 assertions cover select, observe, exact-checkpoint resume, cancel, idempotent receipts, request/response coordinates, cursors, direct bounded framing, abort and timeout; offline strict typecheck passes"
+      "result": null,
+      "reason": "29 SDK tests and offline typecheck pass, but Bun Unix half-close behavior is not yet interoperable with the Rust server EOF requirement"
     },
     {
       "name": "Recovery",
-      "command": "python3 -m unittest tools.test_git_broker tools.test_local_integration tools.test_lab_state tools.test_lab_controller tools.test_lab_scenario",
-      "result": "pass",
-      "output": "intent-only and ref-before-receipt Git windows reconcile to one commit/effect; atomic action replay has one state transition; controller/server restart resumes durable state; a live interrupted build fails closed without respawn pending external PID-identity reconciliation"
+      "command": null,
+      "result": null,
+      "reason": "state, Git and worktree fault recovery are measured, but the live controller does not yet compose packet selection, sealed lease acquisition, allocation and candidate creation end to end"
     }
   ],
   "review": {
-    "reviewers": 0,
+    "reviewers": 3,
     "blocking_findings": 0,
-    "contributing_subagents": 3
+    "contributing_subagents": 3,
+    "independent_reviewers": 0
   },
   "safety": {
     "model_calls": 0,
@@ -71,11 +79,11 @@
     "worker_git_credentials": 0
   },
   "limitations": [
-    "the controller is synthetic-only; real provider modes remain denied until runtime lifecycle evidence is observed",
-    "the same-user local socket server is Linux-only, sequential and one-request-per-connection",
-    "the TypeScript framed transport uses an injected authenticated channel; Unix socket authentication belongs to the outer connector",
-    "an already-spawned build whose controller identity is lost fails closed and requires external PID-identity reconciliation rather than unsafe adoption or duplicate execution",
-    "full plan completion still requires one atomic exact-tree transaction containing this evidence, the done transition, regenerated artifacts, post-completion metrics and history"
+    "this is a partial R0-19 slice and does not mark the work item done",
+    "the concrete Bun Unix connector is bounded but does not yet complete a request against the Rust EOF-delimited server",
+    "program selection and worktree allocation are verified libraries and commands but are not yet composed into the live controller claim/status/check path",
+    "real provider execution remains denied pending trusted inventory loading and observed lifecycle evidence",
+    "Python compatibility adapters remain because no complete Rust runtime path replaces them yet"
   ],
-  "notes": "The implementation is a proposal-only development harness and does not use the unfinished product daemon or provider credentials. Deterministic checks are not described as independent review. R0-19 must remain open until atomic completion records are landed."
+  "notes": "Three same-team agents contributed implementation and cross-review. Independent identity was not claimed. This evidence authorizes only a truthful partial candidate."
 }

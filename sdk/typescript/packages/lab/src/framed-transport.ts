@@ -32,6 +32,7 @@ export class FrameTimeoutError extends Error {
 const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
 const ABSOLUTE_MAX_FRAME_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_CHUNKS = 4096;
+export const DEFAULT_LAB_REQUEST_TIMEOUT_MS = 30_000;
 
 function boundedPositive(value: number, label: string, maximum: number): number {
   if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
@@ -167,12 +168,12 @@ async function decodeOneFrame(
 export class FramedLabTransport implements LabTransport {
   private readonly maxFrameBytes: number;
   private readonly maxChunks: number;
-  private readonly timeoutMs: number | undefined;
+  private readonly timeoutMs: number;
 
   constructor(private readonly connector: FrameConnector, options: FramedTransportOptions = {}) {
     this.maxFrameBytes = boundedPositive(options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES, "maxFrameBytes", ABSOLUTE_MAX_FRAME_BYTES);
     this.maxChunks = boundedPositive(options.maxChunks ?? DEFAULT_MAX_CHUNKS, "maxChunks", 1_000_000);
-    this.timeoutMs = options.timeoutMs === undefined ? undefined : boundedPositive(options.timeoutMs, "timeoutMs", 86_400_000);
+    this.timeoutMs = boundedPositive(options.timeoutMs ?? DEFAULT_LAB_REQUEST_TIMEOUT_MS, "timeoutMs", 86_400_000);
   }
 
   async request(request: LabRequest, options?: {readonly signal?: AbortSignal}): Promise<unknown> {

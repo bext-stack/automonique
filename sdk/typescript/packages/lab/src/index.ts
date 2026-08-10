@@ -10,6 +10,7 @@ export {
 } from "./client.ts";
 export {evaluateProviderPolicy, loadProviderInventoryProjection} from "./provider-policy.ts";
 export {
+  DEFAULT_LAB_REQUEST_TIMEOUT_MS,
   FrameProtocolError,
   FrameTimeoutError,
   FramedLabTransport,
@@ -18,6 +19,11 @@ export {
   type FrameConnector,
   type FramedTransportOptions,
 } from "./framed-transport.ts";
+export {
+  BunUnixSocketConnector,
+  BunUnixSocketError,
+  type BunUnixSocketConnectorOptions,
+} from "./bun-unix-connector.ts";
 export type {
   InventoryMode,
   PolicyDecision,
