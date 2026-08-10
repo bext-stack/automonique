@@ -7,6 +7,7 @@
 
 pub mod codec;
 pub mod codegen;
+pub mod compat;
 pub mod connector;
 pub mod event;
 pub mod host;
