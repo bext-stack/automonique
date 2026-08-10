@@ -10,6 +10,7 @@ pub mod event;
 pub mod primitives;
 pub mod provider;
 pub mod release;
+pub mod schema;
 pub mod wire;
 
 use std::error::Error;
