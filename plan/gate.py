@@ -68,6 +68,23 @@ COMPLETION_ARTIFACTS = (
 )
 
 
+# The machinery that judges and performs a completion. A candidate must never
+# change these in the same transaction that completes it, even when its lease
+# happens to cover them: the tree would then be judged by rules it wrote itself.
+# Change them first, in their own commit, judged by the policy already in place.
+COMPLETION_FORBIDDEN = (
+    "plan/gate.py",
+    "plan/baseline.py",
+    "plan/check.py",
+    "plan/selftest.py",
+    "plan/authority.toml",
+    "tools/harness_loop.py",
+    "tools/git_broker.py",
+    "tools/local_integration.py",
+    "AGENTS.md",
+)
+
+
 def completion_paths(item_id: str) -> tuple[str, ...]:
     """Paths a completion transaction for `item_id` may touch beyond its lease.
 
@@ -326,6 +343,15 @@ def check_lease(it: dict, declared: list[str], *, completion: bool = True) -> li
         if outside:
             refuse(f"{it['id']} leased {allowed} but the diff touches: "
                    + ", ".join(outside))
+
+    if completion:
+        machinery = [p for p in declared if p in COMPLETION_FORBIDDEN]
+        if machinery:
+            refuse(
+                "a completion cannot also change the machinery that judges it: "
+                + ", ".join(sorted(machinery))
+                + " — commit that separately first"
+            )
 
     undeclared = sorted(actually_dirty - set(declared))
     if undeclared:

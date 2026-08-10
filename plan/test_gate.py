@@ -142,6 +142,32 @@ class CompletionLeaseTests(unittest.TestCase):
                     f"{path} must stay outside a completion transaction",
                 )
 
+    def test_completion_may_not_change_the_machinery_that_judges_it(self) -> None:
+        """Even inside the lease. R0-16 leases tools/, which covers the harness."""
+        item = {"id": "R0-16", "allowed_paths": ["plan/", "tools/"]}
+        for path in gate.COMPLETION_FORBIDDEN:
+            with self.subTest(path=path):
+                gate.reset_diagnostics()
+                with (
+                    mock.patch.object(gate, "dirty_paths", return_value=[path]),
+                    mock.patch.object(gate, "staged_deletions", return_value=set()),
+                ):
+                    gate.check_lease(item, [path], completion=True)
+                self.assertTrue(
+                    any("machinery that judges it" in v for v in gate.refusals),
+                    f"{path} must not ride along in a completion",
+                )
+
+    def test_a_partial_slice_may_still_change_the_machinery(self) -> None:
+        item = {"id": "R0-16", "allowed_paths": ["tools/"]}
+        gate.reset_diagnostics()
+        with (
+            mock.patch.object(gate, "dirty_paths", return_value=["tools/harness_loop.py"]),
+            mock.patch.object(gate, "staged_deletions", return_value=set()),
+        ):
+            gate.check_lease(item, ["tools/harness_loop.py"], completion=False)
+        self.assertEqual([], gate.refusals)
+
     def test_partial_slice_keeps_the_narrow_implementation_lease(self) -> None:
         self.lease(["plan/evidence/R1-02.json"], completion=False)
         self.assertTrue(any("diff touches" in value for value in gate.refusals))
