@@ -18,7 +18,16 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
 
 const PROGRAM_SCHEMA: &str = "automonique.dev-program/v1";
 const OBJECTIVES_SCHEMA: &str = "automonique.dev-objectives/v1";
@@ -29,6 +38,21 @@ const MAX_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ITEMS: usize = 1_024;
 const MAX_PACKET_BYTES: usize = 64 * 1024;
 const MAX_STATE_BYTES: usize = 32 * 1024;
+const MAX_PROGRAM_BYTES: usize = 512 * 1024;
+const MAX_OBJECTIVES_BYTES: usize = 128 * 1024;
+const MAX_GUIDES_BYTES: usize = 128 * 1024;
+const MAX_LOOP_BYTES: usize = 32 * 1024;
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const GIT_WALL_LIMIT: Duration = Duration::from_secs(10);
+const CHECK_WALL_LIMIT: Duration = Duration::from_secs(30);
+const GIT_OUTPUT_LIMIT: usize = 4 * 1024;
+const CHECK_OUTPUT_LIMIT: usize = 256 * 1024;
+const PROGRAM_RELATIVE: &str = ".automonique/dev/program.yaml";
+const OBJECTIVES_RELATIVE: &str = ".automonique/dev/objectives.json";
+const GUIDES_RELATIVE: &str = ".automonique/dev/guides/manifest.json";
+const LOOP_RELATIVE: &str = ".automonique/dev/loop.json";
+const STATE_RELATIVE: &str = ".automonique/state";
+static CLAIM_NONCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const EXISTING_STATE_FIELDS: &[&str] = &[
     "base",
     "branch",
@@ -117,6 +141,32 @@ pub enum ClaimError {
     InjectedFault,
 }
 
+/// Closed failure classes for the fixed operational claim composition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationalClaimError {
+    RepositoryUnavailable,
+    GitUnavailable,
+    DirtyWorktree,
+    UnsafeInput,
+    InputChanged,
+    PlanCheckFailed,
+    ProgramCheckFailed,
+    GuidesCheckFailed,
+    CheckTimeout,
+    CheckOutputLimit,
+    StateUnavailable,
+    ClockUnavailable,
+    Claim(ClaimError),
+}
+
+impl fmt::Display for OperationalClaimError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "operational claim denied: {self:?}")
+    }
+}
+
+impl Error for OperationalClaimError {}
+
 impl fmt::Display for ClaimError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "claim denied: {self:?}")
@@ -130,6 +180,489 @@ pub struct ClaimDocuments<'a> {
     pub(crate) objectives: &'a [u8],
     pub(crate) guide_manifest: &'a [u8],
     pub(crate) loop_config: &'a [u8],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OwnedClaimDocuments {
+    program: Vec<u8>,
+    objectives: Vec<u8>,
+    guide_manifest: Vec<u8>,
+    loop_config: Vec<u8>,
+}
+
+impl OwnedClaimDocuments {
+    fn borrowed(&self) -> ClaimDocuments<'_> {
+        ClaimDocuments {
+            program: &self.program,
+            objectives: &self.objectives,
+            guide_manifest: &self.guide_manifest,
+            loop_config: &self.loop_config,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SafetyCheck {
+    Plan,
+    Program,
+    Guides,
+}
+
+impl SafetyCheck {
+    const ALL: [Self; 3] = [Self::Plan, Self::Program, Self::Guides];
+
+    const fn arguments(self) -> [&'static str; 2] {
+        match self {
+            Self::Plan => ["plan/check.py", "--verify"],
+            Self::Program => ["tools/program.py", "--verify"],
+            Self::Guides => ["tools/guides.py", "--verify"],
+        }
+    }
+
+    const fn failure(self) -> OperationalClaimError {
+        match self {
+            Self::Plan => OperationalClaimError::PlanCheckFailed,
+            Self::Program => OperationalClaimError::ProgramCheckFailed,
+            Self::Guides => OperationalClaimError::GuidesCheckFailed,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProcessResult {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessError {
+    Unavailable,
+    Timeout,
+    OutputLimit,
+}
+
+/// Claim one score-eligible item using only repository-fixed inputs and checks.
+///
+/// This is an operational Rust alternative to the bootstrap claim command. It
+/// does not alter the configured authority mode or replace the existing driver.
+/// The only caller-selected value is an optional work identifier; paths,
+/// checks, process limits, and the selected objective's budget are sealed here.
+pub fn publish_current_claim(
+    requested_item: Option<&str>,
+) -> Result<ClaimReceipt, OperationalClaimError> {
+    let repository = discover_repository()?;
+    verify_state_is_ignored(&repository)?;
+    let initial_snapshot = inspect_git(&repository)?;
+    if !initial_snapshot.clean {
+        return Err(OperationalClaimError::DirtyWorktree);
+    }
+    let initial_documents = read_operational_documents(&repository)?;
+    let max_wall_seconds = operational_budget(&initial_documents, requested_item)?;
+
+    for check in SafetyCheck::ALL {
+        run_safety_check(&repository, check)?;
+    }
+
+    let final_documents = read_operational_documents(&repository)?;
+    let final_snapshot = inspect_git(&repository)?;
+    if !final_snapshot.clean {
+        return Err(OperationalClaimError::DirtyWorktree);
+    }
+    if final_snapshot != initial_snapshot || final_documents != initial_documents {
+        return Err(OperationalClaimError::InputChanged);
+    }
+    if operational_budget(&final_documents, requested_item)? != max_wall_seconds {
+        return Err(OperationalClaimError::InputChanged);
+    }
+
+    let state_root = ensure_private_state_root(&repository)?;
+    let coordinates = current_coordinates(max_wall_seconds)?;
+    publish_claim(
+        &state_root,
+        final_documents.borrowed(),
+        requested_item,
+        &final_snapshot,
+        &coordinates,
+        None,
+    )
+    .map_err(OperationalClaimError::Claim)
+}
+
+fn discover_repository() -> Result<PathBuf, OperationalClaimError> {
+    let current =
+        std::env::current_dir().map_err(|_| OperationalClaimError::RepositoryUnavailable)?;
+    let output = fixed_git(&current, &["rev-parse", "--show-toplevel"])?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| OperationalClaimError::RepositoryUnavailable)?;
+    let untrusted = text.trim_end_matches(['\r', '\n']);
+    if untrusted.is_empty() || untrusted.as_bytes().contains(&0) {
+        return Err(OperationalClaimError::RepositoryUnavailable);
+    }
+    let repository = PathBuf::from(untrusted)
+        .canonicalize()
+        .map_err(|_| OperationalClaimError::RepositoryUnavailable)?;
+    if !repository.is_absolute() {
+        return Err(OperationalClaimError::RepositoryUnavailable);
+    }
+    reject_symlink_components(&repository)
+        .map_err(|_| OperationalClaimError::RepositoryUnavailable)?;
+    Ok(repository)
+}
+
+fn inspect_git(repository: &Path) -> Result<GitSnapshot, OperationalClaimError> {
+    let head = git_line(repository, &["rev-parse", "--verify", "HEAD"])?;
+    let branch = git_line(repository, &["branch", "--show-current"])?;
+    let status = fixed_git(
+        repository,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+        ],
+    )?;
+    let snapshot = GitSnapshot {
+        head,
+        branch,
+        clean: status.stdout.is_empty(),
+    };
+    validate_snapshot(&snapshot).map_err(|_| OperationalClaimError::GitUnavailable)?;
+    Ok(snapshot)
+}
+
+fn git_line(repository: &Path, arguments: &[&str]) -> Result<String, OperationalClaimError> {
+    let output = fixed_git(repository, arguments)?;
+    let text =
+        std::str::from_utf8(&output.stdout).map_err(|_| OperationalClaimError::GitUnavailable)?;
+    let line = text.trim_end_matches(['\r', '\n']);
+    if line.is_empty() || line.contains(['\r', '\n', '\0']) {
+        return Err(OperationalClaimError::GitUnavailable);
+    }
+    Ok(line.to_owned())
+}
+
+fn verify_state_is_ignored(repository: &Path) -> Result<(), OperationalClaimError> {
+    let result = fixed_git_allow_failure(
+        repository,
+        &["check-ignore", "-q", ".automonique/state/harness-loop.json"],
+    )?;
+    if result.status.success() && result.stdout.is_empty() {
+        Ok(())
+    } else {
+        Err(OperationalClaimError::StateUnavailable)
+    }
+}
+
+fn fixed_git(
+    repository: &Path,
+    arguments: &[&str],
+) -> Result<ProcessResult, OperationalClaimError> {
+    let result = fixed_git_allow_failure(repository, arguments)?;
+    if result.status.success() {
+        Ok(result)
+    } else {
+        Err(OperationalClaimError::GitUnavailable)
+    }
+}
+
+fn fixed_git_allow_failure(
+    repository: &Path,
+    arguments: &[&str],
+) -> Result<ProcessResult, OperationalClaimError> {
+    let mut command = Command::new("/usr/bin/git");
+    command
+        .current_dir(repository)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args([
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .args(arguments);
+    run_bounded(&mut command, GIT_WALL_LIMIT, GIT_OUTPUT_LIMIT).map_err(|error| match error {
+        ProcessError::Unavailable | ProcessError::Timeout | ProcessError::OutputLimit => {
+            OperationalClaimError::GitUnavailable
+        }
+    })
+}
+
+fn read_operational_documents(
+    repository: &Path,
+) -> Result<OwnedClaimDocuments, OperationalClaimError> {
+    Ok(OwnedClaimDocuments {
+        program: read_fixed_input(repository, PROGRAM_RELATIVE, MAX_PROGRAM_BYTES)?,
+        objectives: read_fixed_input(repository, OBJECTIVES_RELATIVE, MAX_OBJECTIVES_BYTES)?,
+        guide_manifest: read_fixed_input(repository, GUIDES_RELATIVE, MAX_GUIDES_BYTES)?,
+        loop_config: read_fixed_input(repository, LOOP_RELATIVE, MAX_LOOP_BYTES)?,
+    })
+}
+
+fn read_fixed_input(
+    repository: &Path,
+    relative: &str,
+    maximum: usize,
+) -> Result<Vec<u8>, OperationalClaimError> {
+    let path = repository.join(relative);
+    reject_symlink_components(&path).map_err(|_| OperationalClaimError::UnsafeInput)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|_| OperationalClaimError::UnsafeInput)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| OperationalClaimError::UnsafeInput)?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(OperationalClaimError::UnsafeInput);
+    }
+    let mut bytes = Vec::new();
+    file.take((maximum + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| OperationalClaimError::UnsafeInput)?;
+    if bytes.is_empty() || bytes.len() > maximum {
+        return Err(OperationalClaimError::UnsafeInput);
+    }
+    Ok(bytes)
+}
+
+fn operational_budget(
+    documents: &OwnedClaimDocuments,
+    requested_item: Option<&str>,
+) -> Result<u64, OperationalClaimError> {
+    let program =
+        parse_document(&documents.program).map_err(|_| OperationalClaimError::UnsafeInput)?;
+    let objectives =
+        parse_document(&documents.objectives).map_err(|_| OperationalClaimError::UnsafeInput)?;
+    let loop_config =
+        parse_document(&documents.loop_config).map_err(|_| OperationalClaimError::UnsafeInput)?;
+    validate_operational_config(&loop_config)?;
+    let (_, _, _, max_wall_seconds) = select(&program, &objectives, &loop_config, requested_item)
+        .map_err(|_| OperationalClaimError::UnsafeInput)?;
+    Ok(max_wall_seconds)
+}
+
+fn validate_operational_config(value: &Value) -> Result<(), OperationalClaimError> {
+    let object = value
+        .as_object()
+        .ok_or(OperationalClaimError::UnsafeInput)?;
+    if object.get("state_path").and_then(Value::as_str)
+        != Some(".automonique/state/harness-loop.json")
+        || object.get("max_workers").and_then(Value::as_u64) != Some(1)
+        || object.get("safety_checks")
+            != Some(&json!([
+                ["python3", "plan/check.py", "--verify"],
+                ["python3", "tools/program.py", "--verify"],
+                ["python3", "tools/guides.py", "--verify"]
+            ]))
+    {
+        return Err(OperationalClaimError::UnsafeInput);
+    }
+    Ok(())
+}
+
+fn run_safety_check(repository: &Path, check: SafetyCheck) -> Result<(), OperationalClaimError> {
+    let mut command = Command::new("/usr/bin/python3");
+    command
+        .current_dir(repository)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("PYTHONHASHSEED", "0")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("PYTHONNOUSERSITE", "1")
+        .args(check.arguments());
+    let result = run_bounded(&mut command, CHECK_WALL_LIMIT, CHECK_OUTPUT_LIMIT).map_err(
+        |error| match error {
+            ProcessError::Unavailable => check.failure(),
+            ProcessError::Timeout => OperationalClaimError::CheckTimeout,
+            ProcessError::OutputLimit => OperationalClaimError::CheckOutputLimit,
+        },
+    )?;
+    if result.status.success() {
+        Ok(())
+    } else {
+        Err(check.failure())
+    }
+}
+
+fn run_bounded(
+    command: &mut Command,
+    wall_limit: Duration,
+    output_limit: usize,
+) -> Result<ProcessResult, ProcessError> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|_| ProcessError::Unavailable)?;
+    let group = Pid::from_raw(i32::try_from(child.id()).map_err(|_| ProcessError::Unavailable)?);
+    let stdout = child.stdout.take().ok_or(ProcessError::Unavailable)?;
+    let stderr = child.stderr.take().ok_or(ProcessError::Unavailable)?;
+    let captured = Arc::new(AtomicUsize::new(0));
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_reader = bounded_capture(
+        stdout,
+        output_limit,
+        Arc::clone(&captured),
+        Arc::clone(&exceeded),
+    );
+    let stderr_reader = bounded_capture(stderr, output_limit, captured, Arc::clone(&exceeded));
+    let deadline = Instant::now() + wall_limit;
+    let mut forced = None;
+    let status = loop {
+        if exceeded.load(Ordering::Acquire) {
+            forced = Some(ProcessError::OutputLimit);
+            break terminate_process(&mut child, group)?;
+        }
+        if Instant::now() >= deadline {
+            forced = Some(ProcessError::Timeout);
+            break terminate_process(&mut child, group)?;
+        }
+        if let Some(status) = child.try_wait().map_err(|_| ProcessError::Unavailable)? {
+            cleanup_process_group(group);
+            break status;
+        }
+        thread::sleep(PROCESS_POLL_INTERVAL);
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| ProcessError::Unavailable)??;
+    stderr_reader
+        .join()
+        .map_err(|_| ProcessError::Unavailable)??;
+    if let Some(error) = forced {
+        return Err(error);
+    }
+    Ok(ProcessResult { status, stdout })
+}
+
+fn bounded_capture(
+    mut input: impl Read + Send + 'static,
+    maximum: usize,
+    captured: Arc<AtomicUsize>,
+    exceeded: Arc<AtomicBool>,
+) -> thread::JoinHandle<Result<Vec<u8>, ProcessError>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 8_192];
+        loop {
+            let read = input
+                .read(&mut chunk)
+                .map_err(|_| ProcessError::Unavailable)?;
+            if read == 0 {
+                return Ok(bytes);
+            }
+            let start = captured.fetch_add(read, Ordering::AcqRel);
+            let remaining = maximum.saturating_sub(start);
+            bytes.extend_from_slice(&chunk[..read.min(remaining)]);
+            if read > remaining {
+                exceeded.store(true, Ordering::Release);
+            }
+        }
+    })
+}
+
+fn terminate_process(
+    child: &mut std::process::Child,
+    group: Pid,
+) -> Result<ExitStatus, ProcessError> {
+    let _ = killpg(group, Signal::SIGTERM);
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().map_err(|_| ProcessError::Unavailable)? {
+            cleanup_process_group(group);
+            return Ok(status);
+        }
+        thread::sleep(PROCESS_POLL_INTERVAL);
+    }
+    let _ = killpg(group, Signal::SIGKILL);
+    let status = child.wait().map_err(|_| ProcessError::Unavailable)?;
+    cleanup_process_group(group);
+    Ok(status)
+}
+
+fn cleanup_process_group(group: Pid) {
+    let _ = killpg(group, Signal::SIGKILL);
+}
+
+fn ensure_private_state_root(repository: &Path) -> Result<PathBuf, OperationalClaimError> {
+    let automonique = repository.join(".automonique");
+    let metadata =
+        fs::symlink_metadata(&automonique).map_err(|_| OperationalClaimError::StateUnavailable)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(OperationalClaimError::StateUnavailable);
+    }
+    let state = repository.join(STATE_RELATIVE);
+    match fs::DirBuilder::new().mode(0o700).create(&state) {
+        Ok(()) => {
+            sync_directory(&automonique).map_err(|_| OperationalClaimError::StateUnavailable)?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err(OperationalClaimError::StateUnavailable),
+    }
+    require_private_directory(&state).map_err(|_| OperationalClaimError::StateUnavailable)?;
+    reject_symlink_components(&state).map_err(|_| OperationalClaimError::StateUnavailable)?;
+    Ok(state)
+}
+
+fn current_coordinates(max_wall_seconds: u64) -> Result<ClaimCoordinates, OperationalClaimError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| OperationalClaimError::ClockUnavailable)?;
+    let started_seconds =
+        i64::try_from(duration.as_secs()).map_err(|_| OperationalClaimError::ClockUnavailable)?;
+    let wall_seconds =
+        i64::try_from(max_wall_seconds).map_err(|_| OperationalClaimError::ClockUnavailable)?;
+    let deadline_seconds = started_seconds
+        .checked_add(wall_seconds)
+        .ok_or(OperationalClaimError::ClockUnavailable)?;
+    let sequence = CLAIM_NONCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut nonce_input = Vec::with_capacity(36);
+    nonce_input.extend_from_slice(&duration.as_nanos().to_le_bytes());
+    nonce_input.extend_from_slice(&std::process::id().to_le_bytes());
+    nonce_input.extend_from_slice(&sequence.to_le_bytes());
+    let nonce_digest = hex::encode(Sha256::digest(&nonce_input));
+    Ok(ClaimCoordinates {
+        started_at: format_utc_timestamp(started_seconds)
+            .ok_or(OperationalClaimError::ClockUnavailable)?,
+        deadline_at: format_utc_timestamp(deadline_seconds)
+            .ok_or(OperationalClaimError::ClockUnavailable)?,
+        nonce: nonce_digest[..8].to_owned(),
+    })
+}
+
+fn format_utc_timestamp(epoch_seconds: i64) -> Option<String> {
+    let days = epoch_seconds.div_euclid(86_400);
+    let seconds = epoch_seconds.rem_euclid(86_400);
+    let shifted = days.checked_add(719_468)?;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    if !(1..=9_999).contains(&year) {
+        return None;
+    }
+    let hour = seconds / 3_600;
+    let minute = (seconds % 3_600) / 60;
+    let second = seconds % 60;
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}+00:00"
+    ))
 }
 
 /// Publish a claim from coordinates sealed inside this crate's trusted

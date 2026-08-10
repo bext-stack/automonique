@@ -13,6 +13,7 @@ use std::time::Duration;
 use automonique_lab::build::BuildBroker;
 use automonique_lab::controller::{LabController, UnavailableBuildBroker};
 use automonique_lab::framing::FrameLimits;
+use automonique_lab::harness_claim::publish_current_claim;
 use automonique_lab::harness_status;
 use automonique_lab::program::select_admitted;
 use automonique_lab::protocol::GitSha1;
@@ -62,6 +63,12 @@ where
         .is_some_and(|value| value == "harness-status")
     {
         return run_harness_status(&arguments, &mut output);
+    }
+    if arguments
+        .first()
+        .is_some_and(|value| value == "harness-claim")
+    {
+        return run_harness_claim(&arguments, &mut output);
     }
     run_serve_once(&arguments)
 }
@@ -176,6 +183,31 @@ fn run_harness_status<W: Write>(
     output
         .write_all(b"\n")
         .map_err(|_| "could not write harness status")
+}
+
+fn run_harness_claim<W: Write>(arguments: &[OsString], output: &mut W) -> Result<(), &'static str> {
+    let requested = match arguments {
+        [command] if command == "harness-claim" => None,
+        [command, option, item] if command == "harness-claim" && option == "--item" => {
+            Some(item.to_str().ok_or("work item must be UTF-8")?)
+        }
+        _ => return Err("usage: automonique-lab harness-claim [--item WORK_ID]"),
+    };
+    let receipt = publish_current_claim(requested).map_err(|_| "harness claim denied")?;
+    let document = serde_json::json!({
+        "schema": "automonique.lab-harness-claim/v1",
+        "status": "claimed",
+        "driver": "codex_session",
+        "runId": receipt.run_id,
+        "workId": receipt.work_id,
+        "packetPath": receipt.packet_relative,
+        "packetSha256": receipt.packet_sha256,
+        "integrationCeiling": "proposal_only"
+    });
+    serde_json::to_writer(&mut *output, &document).map_err(|_| "could not encode harness claim")?;
+    output
+        .write_all(b"\n")
+        .map_err(|_| "could not write harness claim")
 }
 
 fn run_admit_worktree<W: Write>(
