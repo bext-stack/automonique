@@ -10,6 +10,20 @@ use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
+mod diagnostics;
+mod kernel;
+mod release;
+
+pub use diagnostics::{
+    inspect_admin_socket, inspect_database_health, inspect_foreground_generation,
+    inspect_process_control,
+};
+pub use kernel::{inspect_cgroup_v2_controllers, inspect_max_user_namespaces};
+pub use release::{
+    MAX_RELEASE_MANIFEST_BYTES, ReleaseInspection, ReleaseInspectionStatus, ReleaseIssue,
+    ReleaseManifest, VersionRange, inspect_release_manifest_structure,
+};
+
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
@@ -40,7 +54,8 @@ where
         }
     };
 
-    let report = match inspect_runtime(std::env::var_os("XDG_RUNTIME_DIR").as_deref()) {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR");
+    let report = match inspect_doctor(runtime.as_deref()) {
         Ok(report) => report,
         Err(_) => {
             let _ = stderr.write_all(b"automonique doctor could not construct its report\n");
@@ -60,6 +75,73 @@ where
     } else {
         1
     }
+}
+
+fn inspect_doctor(runtime: Option<&OsStr>) -> Result<DoctorReportV1, DoctorReportError> {
+    let admin_socket = inspect_admin_socket(runtime);
+    DoctorReportV1::new([
+        runtime_check(runtime),
+        admin_socket.clone(),
+        inspect_process_control(),
+        inspect_database_health(&admin_socket),
+        inspect_foreground_generation(&admin_socket),
+        inspect_cgroup_v2_controllers(Path::new("/sys/fs/cgroup/cgroup.controllers")),
+        inspect_max_user_namespaces(Path::new("/proc/sys/user/max_user_namespaces")),
+        inspect_local_release(),
+    ])
+}
+
+fn inspect_local_release() -> DoctorCheck {
+    let Some(path) = std::env::current_exe().ok().and_then(|executable| {
+        executable
+            .parent()?
+            .parent()
+            .map(|root| root.join("manifest.json"))
+    }) else {
+        return typed_check(
+            "release.manifest-structure",
+            CheckStatus::Unavailable,
+            "release.location-unavailable",
+            "Release manifest location is unavailable",
+        );
+    };
+    match inspect_release_manifest_structure(&path) {
+        ReleaseInspection::Structured(_) => DoctorCheck::new(
+            FindingCode::new("release.manifest-structure").expect("constant check code is valid"),
+            CheckStatus::Healthy,
+            None,
+        )
+        .expect("constant healthy check is coherent"),
+        ReleaseInspection::Finding(issue) => typed_check(
+            "release.manifest-structure",
+            CheckStatus::Finding,
+            issue.code(),
+            issue.message(),
+        ),
+        ReleaseInspection::Unavailable(issue) => typed_check(
+            "release.manifest-structure",
+            CheckStatus::Unavailable,
+            issue.code(),
+            issue.message(),
+        ),
+    }
+}
+
+fn typed_check(
+    check_code: &str,
+    status: CheckStatus,
+    reason_code: &str,
+    message: &str,
+) -> DoctorCheck {
+    DoctorCheck::new(
+        FindingCode::new(check_code).expect("constant check code is valid"),
+        status,
+        Some(DoctorReason::new(
+            FindingCode::new(reason_code).expect("constant reason code is valid"),
+            FindingMessage::new(message).expect("constant reason message is valid"),
+        )),
+    )
+    .expect("constant non-healthy check is coherent")
 }
 
 /// Inspect only `$XDG_RUNTIME_DIR/automonique` without following links or mutating it.
