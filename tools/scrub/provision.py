@@ -61,6 +61,7 @@ MAX_VALUE_BYTES = 4096
 def parse_values(text: str) -> list[tuple[str, bytes]]:
     """Parse `family: value` lines into ordered (family, value-bytes) pairs."""
     entries: list[tuple[str, bytes]] = []
+    blanks: list[str] = []
     for number, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -73,13 +74,28 @@ def parse_values(text: str) -> list[tuple[str, bytes]]:
         if family not in REQUIRED_FAMILIES:
             raise ScrubError(f"line {number} names an unknown family")
         if not value:
-            raise ScrubError(f"line {number} has an empty value")
+            # An unfilled template line, not a typo. Collect rather than raise,
+            # so a fresh template reports the whole job instead of its first line.
+            blanks.append(f"line {number} ({family})")
+            continue
         encoded = value.encode("utf-8")
         if len(encoded) > MAX_VALUE_BYTES:
             raise ScrubError(f"line {number} exceeds {MAX_VALUE_BYTES} bytes")
         entries.append((family, encoded))
     if not entries:
+        if blanks:
+            raise ScrubError(
+                "no values filled in yet — every family line is still blank: "
+                + ", ".join(blanks)
+                + ". Type your own identifiers after each colon and re-run."
+            )
         raise ScrubError("the values file contains no rules")
+    if blanks:
+        raise ScrubError(
+            "these lines are still blank: "
+            + ", ".join(blanks)
+            + ". Fill them in, or delete the line if that family needs no value."
+        )
     present = {family for family, _ in entries}
     missing = REQUIRED_FAMILIES - present
     if missing:

@@ -47,11 +47,30 @@ class ParseValuesTests(unittest.TestCase):
         with self.assertRaisesRegex(scan.ScrubError, "environment-name"):
             provision.parse_values(self.text(lines))
 
-    def test_unknown_family_and_empty_value_are_refused(self) -> None:
+    def test_unknown_family_is_refused(self) -> None:
         with self.assertRaisesRegex(scan.ScrubError, "unknown family"):
             provision.parse_values("not-a-family: x\n")
-        with self.assertRaisesRegex(scan.ScrubError, "empty value"):
-            provision.parse_values("legacy-name:\n")
+
+    def test_untouched_template_names_every_blank_line(self) -> None:
+        """A fresh template must report the whole job, not just its first line."""
+        blank = self.text([f"{family}:" for family in sorted(scan.REQUIRED_FAMILIES)])
+        with self.assertRaises(scan.ScrubError) as caught:
+            provision.parse_values(blank)
+        message = str(caught.exception)
+        self.assertIn("no values filled in yet", message)
+        for family in scan.REQUIRED_FAMILIES:
+            self.assertIn(family, message)
+
+    def test_a_partly_filled_template_names_the_remaining_blanks(self) -> None:
+        lines = [f"{f}: {v.decode()}" for f, v in entries()][:-1]
+        lines.append("environment-name:")
+        with self.assertRaises(scan.ScrubError) as caught:
+            provision.parse_values(self.text(lines))
+        message = str(caught.exception)
+        self.assertIn("still blank", message)
+        self.assertIn("environment-name", message)
+        for value in SYNTHETIC.values():
+            self.assertNotIn(value.decode(), message)
 
     def test_line_without_a_separator_is_refused(self) -> None:
         with self.assertRaisesRegex(scan.ScrubError, "line 1"):
@@ -121,6 +140,15 @@ class BundleTests(unittest.TestCase):
 
 
 class LiveValueTests(unittest.TestCase):
+    def absent(self) -> bytes:
+        """A value assembled at run time.
+
+        The joined bytes appear contiguously in no tracked file — including this
+        one — which is the condition being asserted. A literal would be tracked
+        the moment this test is committed and could never satisfy it.
+        """
+        return b"-".join([b"synthetic", b"absent", b"from", b"every", b"blob"])
+
     def test_a_value_still_in_the_tree_is_reported_by_family_only(self) -> None:
         # AGENTS.md is tracked, so a phrase from it stands in for an unscrubbed
         # value without this test needing a real private identifier.
@@ -129,8 +157,10 @@ class LiveValueTests(unittest.TestCase):
         )
         self.assertEqual(["legacy-name"], live)
 
-    def test_a_scrubbed_value_is_not_reported(self) -> None:
-        self.assertEqual([], provision.unscrubbed(entries(), provision.ROOT))
+    def test_a_value_absent_from_the_tree_is_not_reported(self) -> None:
+        self.assertEqual(
+            [], provision.unscrubbed([("legacy-name", self.absent())], provision.ROOT)
+        )
 
 
 class ValuesFileLocationTests(unittest.TestCase):
