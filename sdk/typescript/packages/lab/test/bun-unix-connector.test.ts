@@ -50,7 +50,7 @@ afterEach(() => {
 });
 
 describe("BunUnixSocketConnector", () => {
-  test("round-trips exactly one canonical frame over a real Unix socket", async () => {
+  test("resolves one canonical frame without requiring Unix-socket EOF", async () => {
     const {socketPath} = temporarySocket();
     const received: Uint8Array[] = [];
     const listener = Bun.listen({
@@ -59,7 +59,7 @@ describe("BunUnixSocketConnector", () => {
       socket: {
         data(socket, data) {
           received.push(data.slice());
-          socket.end(framed({answer: true}));
+          socket.write(framed({answer: true}));
         },
       },
     });

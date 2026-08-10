@@ -66,6 +66,14 @@ fn exchange(socket: &std::path::Path, bytes: &[u8]) -> Vec<u8> {
     response
 }
 
+fn exchange_without_request_eof(socket: &std::path::Path, bytes: &[u8]) -> Vec<u8> {
+    let mut client = UnixStream::connect(socket).unwrap();
+    client.write_all(bytes).unwrap();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    response
+}
+
 #[test]
 fn same_uid_one_frame_round_trip_has_private_socket() {
     let directory = tempfile::tempdir().unwrap();
@@ -103,7 +111,7 @@ fn same_uid_one_frame_round_trip_has_private_socket() {
     let request = request();
     let frame = encode_frame(&encode_request(&request).unwrap(), limits).unwrap();
     let join = std::thread::spawn(move || server.serve_once().unwrap());
-    let response = exchange(&socket, &frame);
+    let response = exchange_without_request_eof(&socket, &frame);
     join.join().unwrap();
     let payload = decode_frame(&response, limits).unwrap();
     let response = decode_response_for(payload, &request).unwrap();
@@ -283,7 +291,7 @@ fn partial_oversize_and_read_timeout_never_reach_handler() {
     let frame = encode_frame(&encode_request(&request()).unwrap(), limits).unwrap();
     let join = thread::spawn(move || server.serve_once().unwrap());
     let mut client = UnixStream::connect(socket).unwrap();
-    client.write_all(&frame).unwrap();
+    client.write_all(&frame[..frame.len() - 1]).unwrap();
     let mut response = Vec::new();
     client.read_to_end(&mut response).unwrap();
     join.join().unwrap();
@@ -293,7 +301,64 @@ fn partial_oversize_and_read_timeout_never_reach_handler() {
 }
 
 #[test]
-fn delayed_trailing_byte_is_denied_before_handler_mutation() {
+fn immediate_and_delayed_trailing_bytes_are_denied_before_handler_mutation() {
+    let complete = {
+        let limits = FrameLimits::new(4096).unwrap();
+        encode_frame(&encode_request(&request()).unwrap(), limits).unwrap()
+    };
+    for (name, delay) in [
+        ("immediate-trailing", Duration::ZERO),
+        ("delayed-trailing", Duration::from_millis(50)),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        privatize(&directory);
+        let limits = FrameLimits::new(4096).unwrap();
+        let (socket, mut server, count) =
+            counting_server(&directory, limits, Duration::from_millis(500));
+        let join = thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || server.serve_once().unwrap())
+            .unwrap();
+        let mut client = UnixStream::connect(socket).unwrap();
+        client.write_all(&complete).unwrap();
+        thread::sleep(delay);
+        client.write_all(b"x").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        join.join().unwrap();
+        let error = decode_transport_error(decode_frame(&response, limits).unwrap()).unwrap();
+        assert_eq!(error.code(), TransportErrorCode::ExtraData);
+        assert_eq!(count.load(Ordering::Acquire), 0);
+    }
+}
+
+#[test]
+fn a_complete_frame_can_arrive_in_chunks_without_request_eof() {
+    let directory = tempfile::tempdir().unwrap();
+    privatize(&directory);
+    let limits = FrameLimits::new(4096).unwrap();
+    let (socket, mut server, count) =
+        counting_server(&directory, limits, Duration::from_millis(500));
+    let frame = encode_frame(&encode_request(&request()).unwrap(), limits).unwrap();
+    let join = thread::spawn(move || server.serve_once().unwrap());
+    let mut client = UnixStream::connect(socket).unwrap();
+    client.write_all(&frame[..2]).unwrap();
+    thread::sleep(Duration::from_millis(10));
+    client.write_all(&frame[2..9]).unwrap();
+    thread::sleep(Duration::from_millis(10));
+    client.write_all(&frame[9..]).unwrap();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    join.join().unwrap();
+    let decoded =
+        decode_response_for(decode_frame(&response, limits).unwrap(), &request()).unwrap();
+    assert!(matches!(decoded, LabResponse::Denied(_)));
+    assert_eq!(count.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn one_connection_dispatches_once_and_writes_exactly_one_response() {
     let directory = tempfile::tempdir().unwrap();
     privatize(&directory);
     let limits = FrameLimits::new(4096).unwrap();
@@ -303,15 +368,34 @@ fn delayed_trailing_byte_is_denied_before_handler_mutation() {
     let join = thread::spawn(move || server.serve_once().unwrap());
     let mut client = UnixStream::connect(socket).unwrap();
     client.write_all(&frame).unwrap();
-    thread::sleep(Duration::from_millis(50));
-    client.write_all(b"x").unwrap();
-    client.shutdown(Shutdown::Write).unwrap();
     let mut response = Vec::new();
     client.read_to_end(&mut response).unwrap();
     join.join().unwrap();
-    let error = decode_transport_error(decode_frame(&response, limits).unwrap()).unwrap();
-    assert_eq!(error.code(), TransportErrorCode::ExtraData);
-    assert_eq!(count.load(Ordering::Acquire), 0);
+    let decoded =
+        decode_response_for(decode_frame(&response, limits).unwrap(), &request()).unwrap();
+    assert!(matches!(decoded, LabResponse::Denied(_)));
+    assert_eq!(count.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn socket_can_restart_after_one_request() {
+    let directory = tempfile::tempdir().unwrap();
+    privatize(&directory);
+    let limits = FrameLimits::new(4096).unwrap();
+    let frame = encode_frame(&encode_request(&request()).unwrap(), limits).unwrap();
+
+    for _ in 0..2 {
+        let (socket, mut server, count) =
+            counting_server(&directory, limits, Duration::from_millis(500));
+        let join = thread::spawn(move || server.serve_once().unwrap());
+        let response = exchange_without_request_eof(&socket, &frame);
+        join.join().unwrap();
+        let decoded =
+            decode_response_for(decode_frame(&response, limits).unwrap(), &request()).unwrap();
+        assert!(matches!(decoded, LabResponse::Denied(_)));
+        assert_eq!(count.load(Ordering::Acquire), 1);
+        assert!(!socket.exists());
+    }
 }
 
 #[test]

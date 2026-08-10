@@ -11,7 +11,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::sys::socket::{getsockopt, sockopt};
 use nix::unistd::Uid;
@@ -25,6 +25,10 @@ use crate::framing::{FRAME_PREFIX_BYTES, FrameLimits, decode_frame, encode_frame
 use crate::protocol::{LabRequest, LabResponse};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+// A complete request does not require EOF. Before dispatch, keep observing the
+// connection for at most this long (and never longer than `io_timeout`); any
+// byte observed in that window is trailing data and denies the whole request.
+const TRAILING_DATA_GRACE: Duration = Duration::from_millis(100);
 
 pub trait LabHandler {
     fn handle_request(&mut self, request: LabRequest) -> Result<LabResponse, ControllerError>;
@@ -145,7 +149,11 @@ impl<H: LabHandler> UnixLabServer<H> {
             return Ok(());
         }
 
-        let frame = match read_one_frame(&mut stream, self.config.frame_limits) {
+        let frame = match read_one_frame(
+            &mut stream,
+            self.config.frame_limits,
+            self.config.io_timeout.min(TRAILING_DATA_GRACE),
+        ) {
             Ok(value) => value,
             Err(ReadFrameError::TooLarge) => {
                 write_transport_error(
@@ -179,7 +187,7 @@ impl<H: LabHandler> UnixLabServer<H> {
                     &mut stream,
                     self.config.frame_limits,
                     TransportErrorCode::InvalidRequest,
-                    "request write was not closed",
+                    "request frame was incomplete before deadline",
                 )?;
                 return Ok(());
             }
@@ -249,7 +257,11 @@ enum ReadFrameError {
     Io(io::Error),
 }
 
-fn read_one_frame(stream: &mut UnixStream, limits: FrameLimits) -> Result<Vec<u8>, ReadFrameError> {
+fn read_one_frame(
+    stream: &mut UnixStream,
+    limits: FrameLimits,
+    trailing_data_grace: Duration,
+) -> Result<Vec<u8>, ReadFrameError> {
     let mut prefix = [0_u8; FRAME_PREFIX_BYTES];
     stream
         .read_exact(&mut prefix)
@@ -265,13 +277,44 @@ fn read_one_frame(stream: &mut UnixStream, limits: FrameLimits) -> Result<Vec<u8
         .read_exact(&mut payload)
         .map_err(classify_read_error)?;
     frame.extend_from_slice(&payload);
-    let mut extra = [0_u8; 1];
-    match stream.read(&mut extra) {
-        Ok(0) => {}
-        Ok(_) => return Err(ReadFrameError::ExtraData),
-        Err(error) => return Err(classify_read_error(error)),
-    }
+    reject_trailing_data(stream, trailing_data_grace)?;
     Ok(frame)
+}
+
+fn reject_trailing_data(
+    stream: &mut UnixStream,
+    trailing_data_grace: Duration,
+) -> Result<(), ReadFrameError> {
+    stream
+        .set_read_timeout(Some(trailing_data_grace))
+        .map_err(ReadFrameError::Io)?;
+    let deadline = Instant::now()
+        .checked_add(trailing_data_grace)
+        .ok_or_else(|| ReadFrameError::Io(io::Error::other("invalid trailing-data deadline")))?;
+    let mut extra = [0_u8; 1];
+    loop {
+        match stream.read(&mut extra) {
+            Ok(0) => return Ok(()),
+            Ok(_) => return Err(ReadFrameError::ExtraData),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return Ok(());
+                };
+                stream
+                    .set_read_timeout(Some(remaining))
+                    .map_err(ReadFrameError::Io)?;
+            }
+            Err(error) => return Err(ReadFrameError::Io(error)),
+        }
+    }
 }
 
 fn classify_read_error(error: io::Error) -> ReadFrameError {

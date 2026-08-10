@@ -10,6 +10,7 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::canonical_json::encode_request;
+use crate::program::RunnableProposal;
 use crate::protocol::{
     ActionCoordinates, ActionOperation, ActionOutcome, ActionReceipt, ActionResponse, ActionStatus,
     DeniedResponse, EventType, Execution, GitSha1, LabBudget, LabEvent, LabRequest, LabResponse,
@@ -23,6 +24,9 @@ use crate::state::{
 use crate::workspace_lease::{
     ActionId, AttemptId, BaseRevision, LeaseId, Mutation, RepoPath, Revision,
 };
+use crate::worktree::{WorktreeAllocator, WorktreeError, WorktreeReceipt, WorktreeRequest};
+
+const ADMITTED_WORKTREE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Coordinates for one idempotent, fixed synthetic build operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,6 +182,8 @@ pub enum ControllerError {
     State(StateError),
     Domain(crate::protocol::ValidationError),
     InvalidCoordinate,
+    Program(crate::program::ProgramError),
+    Worktree(WorktreeError),
     InjectedFault(ControllerFault),
 }
 
@@ -206,6 +212,38 @@ impl From<crate::protocol::ValidationError> for ControllerError {
     }
 }
 
+impl From<crate::program::ProgramError> for ControllerError {
+    fn from(value: crate::program::ProgramError) -> Self {
+        Self::Program(value)
+    }
+}
+
+impl From<WorktreeError> for ControllerError {
+    fn from(value: WorktreeError) -> Self {
+        Self::Worktree(value)
+    }
+}
+
+/// Durable result of binding an admitted packet to an isolated checkout.
+#[derive(Clone, Debug)]
+pub struct AdmittedSelection {
+    proposal: RunnableProposal,
+    attempt: AttemptSnapshot,
+    worktree: WorktreeReceipt,
+}
+
+impl AdmittedSelection {
+    pub fn proposal(&self) -> &RunnableProposal {
+        &self.proposal
+    }
+    pub fn attempt(&self) -> &AttemptSnapshot {
+        &self.attempt
+    }
+    pub fn worktree(&self) -> &WorktreeReceipt {
+        &self.worktree
+    }
+}
+
 /// One durable controller instance. Reopening the same database reconstructs
 /// all protocol-visible state from the journal.
 pub struct LabController<B> {
@@ -214,6 +252,7 @@ pub struct LabController<B> {
     expected_base: BaseRevision,
     allowed_paths: Vec<RepoPath>,
     broker: B,
+    admitted_attempt: Option<(OpaqueId, AttemptId)>,
 }
 
 struct ActionTransition<'a> {
@@ -249,11 +288,134 @@ impl<B: SyntheticBuildBroker> LabController<B> {
             expected_base,
             allowed_paths,
             broker,
+            admitted_attempt: None,
         })
     }
 
     pub fn handle(&mut self, request: LabRequest) -> Result<LabResponse, ControllerError> {
         self.handle_with_fault(request, None)
+    }
+
+    /// Bind the fixed current harness claim to durable state and one worktree.
+    pub fn select_admitted_worktree(
+        &mut self,
+        repository: &Path,
+        worktree_state: &Path,
+    ) -> Result<AdmittedSelection, ControllerError> {
+        if repository.canonicalize().ok()
+            != std::env::current_dir()
+                .ok()
+                .and_then(|path| path.canonicalize().ok())
+        {
+            return Err(ControllerError::InvalidCoordinate);
+        }
+        let proposal = crate::program::select_admitted()?;
+        if proposal.immutable_base().as_str() != self.expected_base.as_str() {
+            return Err(ControllerError::InvalidCoordinate);
+        }
+        let proposal_paths = proposal
+            .allowed_paths()
+            .iter()
+            .map(|path| RepoPath::parse(path.as_str().trim_end_matches('/')))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ControllerError::InvalidCoordinate)?;
+        if proposal_paths != self.allowed_paths {
+            return Err(ControllerError::InvalidCoordinate);
+        }
+        let attempt_id = AttemptId::parse(proposal.run_id().as_str().to_owned())
+            .map_err(|_| ControllerError::InvalidCoordinate)?;
+        self.store.create_attempt(
+            &self.authority,
+            attempt_id.clone(),
+            proposal.objective_id().clone(),
+            self.expected_base.clone(),
+        )?;
+        let admission_id = stable_id("admission", proposal.packet_digest().as_str());
+        if !self.has_record(&attempt_id, &admission_id)? {
+            let current = self.require_attempt(&attempt_id)?;
+            self.append(
+                &current,
+                &admission_id,
+                JournalKind::Evidence,
+                proposal.packet_digest().clone(),
+            )?;
+        }
+        let lease_id = LeaseId::parse(stable_id("lease", proposal.packet_digest().as_str()))
+            .map_err(|_| ControllerError::InvalidCoordinate)?;
+        let acquire_id = ActionId::parse(stable_id(
+            "lease-acquire",
+            proposal.packet_digest().as_str(),
+        ))
+        .map_err(|_| ControllerError::InvalidCoordinate)?;
+        let acquired = self.store.acquire_paths(
+            &self.authority,
+            AcquirePaths {
+                action_id: acquire_id,
+                lease_id: lease_id.clone(),
+                attempt_id: attempt_id.clone(),
+                base_revision: self.expected_base.clone(),
+                expected_revision: Revision::from_u64(1),
+                paths: proposal_paths.clone(),
+            },
+        )?;
+        let epoch = acquired.receipt().epoch;
+        let verified = self.store.verify_active_lease(
+            &self.authority,
+            &attempt_id,
+            &lease_id,
+            epoch,
+            &self.expected_base,
+            proposal_paths,
+        )?;
+        let current = self.require_attempt(&attempt_id)?;
+        if current.state() == AttemptState::Queued {
+            self.transition(
+                &current,
+                AttemptState::Running,
+                &stable_id("admitted-start", proposal.packet_digest().as_str()),
+            )?;
+        }
+        let allocator = WorktreeAllocator::open(repository, worktree_state)?;
+        let request = WorktreeRequest::new(verified, ADMITTED_WORKTREE_BYTES)?;
+        let worktree = allocator.allocate(&request)?;
+        let evidence_id = stable_id("allocation-evidence", proposal.packet_digest().as_str());
+        if !self.has_record(&attempt_id, &evidence_id)? {
+            let current = self.require_attempt(&attempt_id)?;
+            self.append(
+                &current,
+                &evidence_id,
+                JournalKind::Evidence,
+                digest(worktree.request_digest()),
+            )?;
+        }
+        let checkpoint_id = stable_id("allocation-checkpoint", proposal.packet_digest().as_str());
+        if !self.has_record(&attempt_id, &checkpoint_id)? {
+            let current = self.require_attempt(&attempt_id)?;
+            self.append(
+                &current,
+                &checkpoint_id,
+                JournalKind::Checkpoint,
+                digest(&format!(
+                    "{}:{}",
+                    proposal.packet_digest().as_str(),
+                    worktree.request_digest()
+                )),
+            )?;
+        }
+        let current = self.require_attempt(&attempt_id)?;
+        if current.state() == AttemptState::Running {
+            self.transition(
+                &current,
+                AttemptState::Paused,
+                &stable_id("admitted-pause", proposal.packet_digest().as_str()),
+            )?;
+        }
+        self.admitted_attempt = Some((proposal.objective_id().clone(), attempt_id.clone()));
+        Ok(AdmittedSelection {
+            proposal,
+            attempt: self.require_attempt(&attempt_id)?,
+            worktree,
+        })
     }
 
     pub fn handle_with_fault(
@@ -666,6 +828,11 @@ impl<B: SyntheticBuildBroker> LabController<B> {
     ) -> Result<AttemptId, ControllerError> {
         if objective != unit {
             return Err(ControllerError::InvalidCoordinate);
+        }
+        if let Some((admitted_objective, attempt_id)) = &self.admitted_attempt
+            && objective == admitted_objective
+        {
+            return Ok(attempt_id.clone());
         }
         AttemptId::parse(objective.as_str().to_owned())
             .map_err(|_| ControllerError::InvalidCoordinate)

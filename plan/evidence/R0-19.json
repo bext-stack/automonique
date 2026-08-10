@@ -1,67 +1,67 @@
 {
   "item": "R0-19",
-  "base": "9cae42e419789fdd35b121fa6c4c09dd2ab8b007",
+  "base": "a4edf57e7bd1eca650b54b5db9fd90b55f9f410c",
   "completion": "partial",
   "checks": [
     {
       "name": "Rust workspace",
       "command": "cargo test --manifest-path rust/Cargo.toml --workspace --all-targets --offline --locked",
       "result": "pass",
-      "output": "142 locked offline Rust workspace tests passed; all-target Clippy with -D warnings and rustfmt verification passed"
+      "output": "147 locked offline Rust workspace tests passed; strict all-target Clippy and rustfmt verification passed"
     },
     {
       "name": "Durable resume",
-      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --offline --locked state_restart recovery_faults",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --offline --locked controller_scenario state_restart recovery_faults",
       "result": "pass",
-      "output": "durable state, journal, checkpoint, lease, candidate intent and receipt tests reopen and replay without accepting worker self-report as terminal evidence"
+      "output": "packet admission, attempt state, checkpoints, leases and evidence survive controller/process reopen; a fresh admitted server restores objective-to-run mapping before observe or resume"
     },
     {
       "name": "Lease exclusion",
-      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --offline --locked workspace_lease worktree_allocator",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --offline --locked workspace_lease worktree_allocator controller_scenario",
       "result": "pass",
-      "output": "sealed active leases reject overlapping attempts and distinct runs; allocation derives its run from the verified attempt and authority revocation fences later Git effects"
+      "output": "packet paths enter one atomic durable lease; sealed authority and a deterministic repository runtime namespace deny overlapping or alternate-root allocation"
     },
     {
       "name": "Immutable base",
       "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --offline --locked program_selection program_cli worktree_allocator git_candidate",
       "result": "pass",
-      "output": "fixed active state and packet hashes bind HEAD, run, work item, program, objectives, guides and actual graph bytes; dirty, alternate-base and drift cases are denied"
+      "output": "fixed active state binds packet, HEAD, run, work, generated inputs and graph bytes; admitted CLI derives rather than accepts base or lease coordinates"
     },
     {
       "name": "Build budget",
       "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --test build_limits --offline --locked",
       "result": "pass",
-      "output": "closed synthetic recipes exercise wall, CPU, file, output, PID and descendant cleanup bounds with fail-closed host capability handling"
+      "output": "closed recipes enforce wall, CPU, output, file and PID bounds; admitted worktree materialization uses a fixed 64 MiB hard cap because the packet has no byte-budget field"
     },
     {
       "name": "Git broker",
-      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --test git_candidate --test recovery_faults --offline --locked",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --test git_candidate --test recovery_faults --test worktree_allocator --offline --locked",
       "result": "pass",
-      "output": "sealed leased paths at the admitted base produce deterministic proposal-only candidate refs and recover intent, commit and ref fault windows without duplicate effects"
+      "output": "sealed leased paths create deterministic proposal candidates and isolated worktrees; exact intent, phase and receipt recovery does not duplicate Git effects"
     },
     {
       "name": "Forbidden Git",
       "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --test git_candidate --offline --locked",
       "result": "pass",
-      "output": "the Rust broker exposes fixed candidate-only Git recipes and no push, merge, force, remote-edit or history-rewrite request surface"
+      "output": "Rust exposes fixed candidate/worktree recipes and no push, merge, force, remote-edit or history-rewrite request surface"
     },
     {
       "name": "Provider boundary",
       "command": null,
       "result": null,
-      "reason": "inventory execution remains deliberately deny-only until a trusted Rust inventory loader and observed lifecycle adapter are connected"
+      "reason": "inventory execution remains deliberately denied until a trusted Rust inventory loader and observed provider lifecycle adapter are connected"
     },
     {
       "name": "Scenario client",
-      "command": "bun test sdk/typescript/packages/lab/test && npx --offline tsc -p sdk/typescript/packages/lab/tsconfig.json",
-      "result": null,
-      "reason": "29 SDK tests and offline typecheck pass, but Bun Unix half-close behavior is not yet interoperable with the Rust server EOF requirement"
+      "command": "AUTOMONIQUE_RUN_RUST_INTEROP=1 AUTOMONIQUE_LAB_BIN=<prebuilt> bun test sdk/typescript/packages/lab/test/rust-interop.test.ts",
+      "result": "pass",
+      "output": "29 SDK unit tests plus one real Bun-to-Rust process test select, resume, cancel and observe one durable unit across four Rust server restarts; offline TypeScript checking passes"
     },
     {
       "name": "Recovery",
-      "command": null,
-      "result": null,
-      "reason": "state, Git and worktree fault recovery are measured, but the live controller does not yet compose packet selection, sealed lease acquisition, allocation and candidate creation end to end"
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --offline --locked recovery_faults controller_scenario worktree_allocator",
+      "result": "pass",
+      "output": "state, candidate and worktree fault windows reconcile exact durable operations; admitted CLI replay returns the same request digest and revision and a fresh server observes the paused attempt"
     }
   ],
   "review": {
@@ -80,10 +80,10 @@
   },
   "limitations": [
     "this is a partial R0-19 slice and does not mark the work item done",
-    "the concrete Bun Unix connector is bounded but does not yet complete a request against the Rust EOF-delimited server",
-    "program selection and worktree allocation are verified libraries and commands but are not yet composed into the live controller claim/status/check path",
-    "real provider execution remains denied pending trusted inventory loading and observed lifecycle evidence",
-    "Python compatibility adapters remain because no complete Rust runtime path replaces them yet"
+    "real inventory-selected provider execution remains denied pending trusted inventory loading and observed lifecycle evidence",
+    "the admitted controller uses a fixed 64 MiB materialization ceiling because the current packet schema has no byte-budget coordinate",
+    "the local admitted server handles one bounded request per process; callers restart it against the same durable state for subsequent requests",
+    "Python claim/check/candidate integration remains until the corresponding Rust commands are implemented and exercised by the supervised loop"
   ],
-  "notes": "Three same-team agents contributed implementation and cross-review. Independent identity was not claimed. This evidence authorizes only a truthful partial candidate."
+  "notes": "Three same-team agents contributed implementation and cross-review; independent identity was not claimed. This exact evidence authorizes only a truthful partial candidate."
 }

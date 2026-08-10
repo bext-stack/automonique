@@ -129,19 +129,13 @@ async function decodeOneFrame(
 ): Promise<unknown> {
   let buffer: Uint8Array = new Uint8Array();
   let expected: number | undefined;
-  let decoded: unknown;
-  let complete = false;
   for (let chunks = 0; chunks < maxChunks; chunks += 1) {
     const chunk = await abortable(channel.read({signal}), signal);
     if (chunk === null) {
-      if (!complete) {
-        const part = expected === undefined ? "prefix" : "payload";
-        throw new FrameProtocolError(`response ended with a partial ${part}`);
-      }
-      return decoded;
+      const part = expected === undefined ? "prefix" : "payload";
+      throw new FrameProtocolError(`response ended with a partial ${part}`);
     }
     if (!(chunk instanceof Uint8Array)) throw new FrameProtocolError("channel returned a non-byte chunk");
-    if (complete && chunk.byteLength > 0) throw new FrameProtocolError("response contains trailing data or a second frame");
     if (chunk.byteLength === 0) continue;
     buffer = append(buffer, chunk);
     if (expected === undefined && buffer.byteLength >= 4) {
@@ -155,14 +149,45 @@ async function decodeOneFrame(
         let body: string;
         try { body = new TextDecoder("utf-8", {fatal: true}).decode(buffer); }
         catch { throw new FrameProtocolError("response payload is not valid UTF-8"); }
+        let decoded: unknown;
         try { decoded = JSON.parse(body) as unknown; }
         catch { throw new FrameProtocolError("response payload is not valid JSON"); }
-        complete = true;
-        buffer = new Uint8Array();
+
+        // A complete frame is the response boundary. Do not require the peer to
+        // half-close or close its socket. Still reject bytes that the channel
+        // has already queued, which catches coalesced/trivially pipelined frames
+        // without adding an EOF wait to the protocol.
+        for (let probes = chunks + 1; probes < maxChunks; probes += 1) {
+          const trailing = await immediatelyAvailable(channel);
+          if (!trailing.available || trailing.value === null) return decoded;
+          if (trailing.value.byteLength > 0) {
+            throw new FrameProtocolError("response contains trailing data or a second frame");
+          }
+        }
+        throw new FrameProtocolError(`response exceeded the ${maxChunks}-chunk bound`);
       }
     }
   }
   throw new FrameProtocolError(`response exceeded the ${maxChunks}-chunk bound`);
+}
+
+type ImmediateRead =
+  | {readonly available: false}
+  | {readonly available: true; readonly value: Uint8Array | null};
+
+async function immediatelyAvailable(channel: FrameChannel): Promise<ImmediateRead> {
+  const controller = new AbortController();
+  const read = channel.read({signal: controller.signal}).then(
+    (value): ImmediateRead => ({available: true, value}),
+    (error: unknown): ImmediateRead => {
+      if (controller.signal.aborted) return {available: false};
+      throw error;
+    },
+  );
+  const notQueued = Promise.resolve().then((): ImmediateRead => ({available: false}));
+  const result = await Promise.race([read, notQueued]);
+  if (!result.available) controller.abort();
+  return result;
 }
 
 export class FramedLabTransport implements LabTransport {

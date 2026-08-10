@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 import tempfile
@@ -228,8 +229,12 @@ class HarnessLoopTests(unittest.TestCase):
             harness_loop.file_sha256(evidence),
             request.attestation.evidence_sha256,
         )
-        self.assertEqual(0, request.attestation.reviewers)
-        self.assertEqual(0, request.attestation.blocking_findings)
+        review = json.loads(evidence.read_text())["review"]
+        self.assertEqual(review["reviewers"], request.attestation.reviewers)
+        self.assertEqual(
+            review["blocking_findings"],
+            request.attestation.blocking_findings,
+        )
         self.assertFalse(request.attestation.completion)
 
     def test_single_worker_lock_rejects_overlap(self) -> None:

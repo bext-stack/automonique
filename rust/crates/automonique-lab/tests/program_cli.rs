@@ -1,9 +1,17 @@
 // SPDX-License-Identifier: Elastic-2.0
 
+use automonique_lab::canonical_json::{decode_response_for, encode_request};
+use automonique_lab::framing::{FrameLimits, decode_frame, encode_frame};
+use automonique_lab::protocol::{LabRequest, LabResponse, ObserveRequest, OpaqueId, UnitState};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::Duration;
 
 const RUN: &str = "session_cli_fixture_001";
 
@@ -30,6 +38,8 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().expect("fixture");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private fixture");
         let root = directory.path().join("repo");
         let source = repository_root();
         std::fs::create_dir_all(&root).expect("root");
@@ -43,6 +53,18 @@ impl Fixture {
             let target = root.join(relative);
             std::fs::create_dir_all(target.parent().expect("parent")).expect("dirs");
             std::fs::copy(source.join(relative), target).expect("copy generated input");
+        }
+        for relative in [
+            "tools/fixture.txt",
+            "rust/Cargo.toml",
+            "rust/Cargo.lock",
+            "rust/crates/automonique-lab/fixture.txt",
+            "sdk/typescript/packages/lab/fixture.txt",
+        ] {
+            let target = root.join(relative);
+            std::fs::create_dir_all(target.parent().expect("fixture parent"))
+                .expect("fixture dirs");
+            std::fs::write(target, b"fixture\n").expect("leased fixture");
         }
         let program_bytes =
             std::fs::read(root.join(".automonique/dev/program.yaml")).expect("program");
@@ -115,6 +137,26 @@ impl Fixture {
             .arg("program-select")
             .output()
             .expect("lab command")
+    }
+
+    fn admit(&self) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_automonique-lab"))
+            .current_dir(&self.root)
+            .arg("admit-worktree")
+            .output()
+            .expect("lab admission command")
+    }
+
+    fn runtime_root(&self) -> PathBuf {
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let canonical = self.root.canonicalize().expect("repository");
+        let repository_id = hex::encode(Sha256::digest(std::os::unix::ffi::OsStrExt::as_bytes(
+            canonical.as_os_str(),
+        )));
+        PathBuf::from("/run/user")
+            .join(uid.to_string())
+            .join("automonique/l")
+            .join(repository_id)
     }
 }
 
@@ -190,4 +232,106 @@ fn wrong_digest_and_arbitrary_input_api_are_redacted_denials() {
         .expect("old API");
     assert!(!old.status.success());
     assert!(old.stdout.is_empty());
+}
+
+#[test]
+fn admitted_cli_allocates_and_replays_the_packet_bound_worktree() {
+    let fixture = Fixture::new();
+    let runtime = fixture.runtime_root();
+    let _ = std::fs::remove_dir_all(&runtime);
+    let applied = fixture.admit();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert!(applied.stderr.is_empty());
+    let applied: Value = serde_json::from_slice(&applied.stdout).expect("admission JSON");
+    assert_eq!(applied["schema"], "automonique.lab-admission/v1");
+    assert_eq!(applied["runId"], RUN);
+    assert_eq!(applied["workId"], "R0-19");
+    assert_eq!(applied["attempt"]["state"], "paused");
+    assert_eq!(applied["worktree"]["state"], "allocated");
+    assert_eq!(applied["worktree"]["reconciliation"], "applied");
+
+    let replayed = fixture.admit();
+    assert!(
+        replayed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replayed.stderr)
+    );
+    let replayed: Value = serde_json::from_slice(&replayed.stdout).expect("replay JSON");
+    assert_eq!(
+        replayed["attempt"]["revision"],
+        applied["attempt"]["revision"]
+    );
+    assert_eq!(
+        replayed["worktree"]["requestDigest"],
+        applied["worktree"]["requestDigest"]
+    );
+    assert_eq!(replayed["worktree"]["reconciliation"], "replayed");
+
+    let mut server = Command::new(env!("CARGO_BIN_EXE_automonique-lab"))
+        .current_dir(&fixture.root)
+        .arg("serve-admitted-once")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("admitted server");
+    let socket = runtime.join("s");
+    for _ in 0..500 {
+        if socket.exists() {
+            break;
+        }
+        assert!(server.try_wait().expect("server status").is_none());
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(socket.exists());
+    let request = LabRequest::Observe(
+        ObserveRequest::new(
+            OpaqueId::new("admitted-observe").expect("request ID"),
+            OpaqueId::new("objective:R0-19").expect("objective ID"),
+            OpaqueId::new("objective:R0-19").expect("unit ID"),
+            0,
+            64,
+        )
+        .expect("observe request"),
+    );
+    let limits = FrameLimits::new(1024 * 1024).expect("frame limits");
+    let payload = encode_request(&request).expect("request payload");
+    let frame = encode_frame(&payload, limits).expect("request frame");
+    let mut stream = UnixStream::connect(&socket).expect("admitted socket");
+    stream.write_all(&frame).expect("request write");
+    let mut prefix = [0_u8; 4];
+    stream.read_exact(&mut prefix).expect("response prefix");
+    let mut response_frame = prefix.to_vec();
+    let mut response_payload = vec![0_u8; u32::from_be_bytes(prefix) as usize];
+    stream
+        .read_exact(&mut response_payload)
+        .expect("response payload");
+    response_frame.extend_from_slice(&response_payload);
+    let response_payload = decode_frame(&response_frame, limits).expect("response frame");
+    let response = decode_response_for(response_payload, &request).expect("response document");
+    assert_eq!(
+        match response {
+            LabResponse::Observed(value) => value.unit().state(),
+            _ => panic!("unexpected admitted response"),
+        },
+        UnitState::Paused
+    );
+    assert!(server.wait().expect("server wait").success());
+
+    let alternate = fixture._directory.path().join("alternate-runtime");
+    let denied = Command::new(env!("CARGO_BIN_EXE_automonique-lab"))
+        .current_dir(&fixture.root)
+        .args([
+            "admit-worktree",
+            "--state",
+            alternate.to_str().expect("alternate path"),
+        ])
+        .output()
+        .expect("alternate admission");
+    assert!(!denied.status.success());
+    assert!(!alternate.exists());
+    std::fs::remove_dir_all(runtime).expect("runtime cleanup");
 }
