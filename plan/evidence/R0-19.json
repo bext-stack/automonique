@@ -1,13 +1,13 @@
 {
   "item": "R0-19",
-  "base": "a4edf57e7bd1eca650b54b5db9fd90b55f9f410c",
+  "base": "1db523e97a24e9c565c0416d0055d7c6f93ebc1e",
   "completion": "partial",
   "checks": [
     {
       "name": "Rust workspace",
       "command": "cargo test --manifest-path rust/Cargo.toml --workspace --all-targets --offline --locked",
       "result": "pass",
-      "output": "147 locked offline Rust workspace tests passed; strict all-target Clippy and rustfmt verification passed"
+      "output": "160 locked offline Rust workspace tests passed; strict all-target Clippy and rustfmt verification passed"
     },
     {
       "name": "Durable resume",
@@ -47,9 +47,9 @@
     },
     {
       "name": "Provider boundary",
-      "command": null,
-      "result": null,
-      "reason": "inventory execution remains deliberately denied until a trusted Rust inventory loader and observed provider lifecycle adapter are connected"
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-lab --test provider_boundary --offline --locked",
+      "result": "pass",
+      "output": "8 tests bind the pinned raw R0-06 inventory and linked surface digest, require machine-safe capability evidence and host budgets, deny all 15 modes at Observed create evidence, and permit one Advertised codex exec_jsonl recording dispatch; no provider process starts"
     },
     {
       "name": "Scenario client",
@@ -80,10 +80,11 @@
   },
   "limitations": [
     "this is a partial R0-19 slice and does not mark the work item done",
-    "real inventory-selected provider execution remains denied pending trusted inventory loading and observed lifecycle evidence",
+    "the provider boundary proves sealed policy-gated host dispatch from actual R0-06 artifacts; real provider lifecycle remains deferred to R0-07 and no provider process was started",
     "the admitted controller uses a fixed 64 MiB materialization ceiling because the current packet schema has no byte-budget coordinate",
     "the local admitted server handles one bounded request per process; callers restart it against the same durable state for subsequent requests",
-    "Python claim/check/candidate integration remains until the corresponding Rust commands are implemented and exercised by the supervised loop"
+    "Rust harness-status provides a verified read-only alternative, while the supervised loop still invokes Python status/claim/check/candidate until those Rust commands are integrated into the driver",
+    "the current bootstrap gate cannot yet bind done status, final evidence, baseline, history and generated plan artifacts into one exact completion tree, so this evidence remains partial despite all ten checks being measured"
   ],
-  "notes": "Three same-team agents contributed implementation and cross-review; independent identity was not claimed. This exact evidence authorizes only a truthful partial candidate."
+  "notes": "Three same-team agents contributed implementation and risk-based cross-review; independent identity was not claimed. This exact evidence authorizes only a truthful partial candidate."
 }

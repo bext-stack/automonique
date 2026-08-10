@@ -13,6 +13,7 @@ use std::time::Duration;
 use automonique_lab::build::BuildBroker;
 use automonique_lab::controller::{LabController, UnavailableBuildBroker};
 use automonique_lab::framing::FrameLimits;
+use automonique_lab::harness_status;
 use automonique_lab::program::select_admitted;
 use automonique_lab::protocol::GitSha1;
 use automonique_lab::server::{UnixLabServer, UnixServerConfig};
@@ -55,6 +56,12 @@ where
         .is_some_and(|value| value == "serve-admitted-once")
     {
         return run_serve_admitted_once(&arguments);
+    }
+    if arguments
+        .first()
+        .is_some_and(|value| value == "harness-status")
+    {
+        return run_harness_status(&arguments, &mut output);
     }
     run_serve_once(&arguments)
 }
@@ -154,6 +161,21 @@ fn run_program_select<W: Write>(
     output
         .write_all(b"\n")
         .map_err(|_| "could not write proposal")
+}
+
+fn run_harness_status<W: Write>(
+    arguments: &[OsString],
+    output: &mut W,
+) -> Result<(), &'static str> {
+    if arguments.len() != 1 || arguments[0] != "harness-status" {
+        return Err("usage: automonique-lab harness-status");
+    }
+    let document = harness_status::current_document().map_err(|_| "harness status unavailable")?;
+    serde_json::to_writer(&mut *output, &document)
+        .map_err(|_| "could not encode harness status")?;
+    output
+        .write_all(b"\n")
+        .map_err(|_| "could not write harness status")
 }
 
 fn run_admit_worktree<W: Write>(
