@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod peer;
+
 /// How strongly a policy rule affects aggregate health.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Importance {
