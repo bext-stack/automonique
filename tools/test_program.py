@@ -32,9 +32,12 @@ class ProgramTests(unittest.TestCase):
             self.assertEqual(source["status"], actual["status"])
 
     def test_unspecified_item_is_not_runnable(self) -> None:
-        item = next(item for item in self.committed["items"] if item["id"] == "R0-01")
-        self.assertIsNone(item["contract"])
-        self.assertFalse(item["runnable"])
+        # Holds for every unspecified item rather than one named example, so
+        # writing that example's contract cannot retire the invariant.
+        unspecified = [i for i in self.committed["items"] if i["contract"] is None]
+        self.assertTrue(unspecified, "no unspecified item remains to prove the rule")
+        for item in unspecified:
+            self.assertFalse(item["runnable"], f"{item['id']} is runnable without a contract")
 
     def test_generation_is_byte_reproducible(self) -> None:
         self.assertEqual(program.generate(), program.generate())

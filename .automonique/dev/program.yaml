@@ -132,8 +132,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R0-01.md",
+      "runnable": true
     },
     {
       "id": "R0-02",
@@ -1008,8 +1008,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R0-40.md",
+      "runnable": true
     },
     {
       "id": "R1-01",
@@ -1587,8 +1587,8 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
-      "runnable": false
+      "contract": "plan/contracts/R1-25.md",
+      "runnable": true
     },
     {
       "id": "R2-01",

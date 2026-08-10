@@ -6,8 +6,8 @@ An item is ready when every dependency is `done`. Selecting work means taking a 
 
 - items total: **375**
 - done: **9**
-- ready now: **6**
-- blocked: **360**
+- ready now: **9**
+- blocked: **357**
 
 ## Selectable now
 
@@ -16,15 +16,17 @@ An item is ready when every dependency is `done`. Selecting work means taking a 
 | `BOOT-002` | BOOT | Optional integration identity hardening | Elastic-2.0 | [contract](contracts/BOOT-002.md) |
 | `BOOT-003` | BOOT | Pre-publication scrub gate | Elastic-2.0 | [contract](contracts/BOOT-003.md) |
 | `BOOT-004` | BOOT | Parity-oracle boundary | Elastic-2.0 | [contract](contracts/BOOT-004.md) |
+| `R0-01` | R0 | Current contract inventory | Elastic-2.0 | [contract](contracts/R0-01.md) |
 | `R0-19` | R0 | Minimal `automonique-lab` | Elastic-2.0 | [contract](contracts/R0-19.md) |
+| `R0-40` | R0 | Self-host recovery drill | Elastic-2.0 | [contract](contracts/R0-40.md) |
 | `R1-02` | R1 | Bounded domain primitives | Elastic-2.0 | [contract](contracts/R1-02.md) |
 | `R1-07` | R1 | `automonique doctor` | Elastic-2.0 | [contract](contracts/R1-07.md) |
+| `R1-25` | R1 | Cross-surface interaction contracts | Elastic-2.0 | [contract](contracts/R1-25.md) |
 
 ## Next to unblock
 
 The first blocked items behind the current ready set:
 
-- `R0-01` Current contract inventory — waits on contract
 - `R0-02` Sanitized fixture corpus — waits on `R0-01`, gate `GATE-ORACLE`
 - `R0-07` Provider transcript corpus — waits on gate `GATE-ORACLE`
 - `R0-08` Machine-readable parity ledger — waits on contract
@@ -34,12 +36,13 @@ The first blocked items behind the current ready set:
 - `R0-12` Channel connector corpus — waits on contract
 - `R0-13` Automonique identifier inventory — waits on contract
 - `R0-14` Sandbox host-capability spike — waits on contract
+- `R0-15` Provider/tool egress spike — waits on contract
 
 ## Unblocked but unspecified
 
 Dependency- and gate-clear, but no contract exists, so they are not selectable. Writing one of these contracts is itself useful work and lowers `contracts_missing`.
 
-  `R0-01`, `R0-08`, `R0-09`, `R0-10`, `R0-11`, `R0-12`, `R0-13`, `R0-14`, `R0-15`, `R0-16`, `R0-23`, `R0-24`, `R0-25`, `R0-26`, `R0-27`, `R0-28`, `R0-29`, `R0-30`, `R0-31`, `R0-32`, `R0-33`, `R0-34`, `R0-35`, `R0-36` …and 26 more
+  `R0-08`, `R0-09`, `R0-10`, `R0-11`, `R0-12`, `R0-13`, `R0-14`, `R0-15`, `R0-16`, `R0-23`, `R0-24`, `R0-25`, `R0-26`, `R0-27`, `R0-28`, `R0-29`, `R0-30`, `R0-31`, `R0-32`, `R0-33`, `R0-34`, `R0-35`, `R0-36`, `R0-37` …and 23 more
 
 ## Gate-blocked work
 

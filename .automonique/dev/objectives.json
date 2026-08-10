@@ -231,6 +231,55 @@
       ]
     },
     {
+      "id": "objective:R0-01",
+      "work_id": "R0-01",
+      "objective": "Produce the machine-readable inventory of every behavioral contract the legacy system exposes — inputs, state transitions, timers, side effects, commands, backend events and operational scripts — where each entry carries a named target owner and a parity fixture plan. This is the evidence base the sanitized fixture corpus and the parity ledger are built from, so an unowned or unplannable entry is a finding rather than an omission.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 7,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Surface coverage",
+        "Owner assignment",
+        "Fixture plan",
+        "Source citation",
+        "Clean-room provenance",
+        "Drift check",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any need to read, mount, clone or search the private archive, a structural reference being used to reconstruct behavior, an entry that cannot be classified into the closed class set, an invented target owner, a fixture plan requiring a secret, live network or production write, an uncited entry, a generated inventory that cannot be drift-checked, an estimated count reported as measured, a licence-boundary violation, or any path outside the lease."
+      ],
+      "hill_climbability": 86,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        "spikes/",
+        ".automonique/dev/",
+        "tools/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-01.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
       "id": "objective:R0-03",
       "work_id": "R0-03",
       "objective": "Prove the portable control-plane lifecycle with directly launched foreground processes: readiness, replacement warm-up, failed replacement fallback, bounded drain, signal handling, and clean shutdown. No service manager, self-daemonization, persistent unit, or privileged operation is involved.",
@@ -724,6 +773,56 @@
       ]
     },
     {
+      "id": "objective:R0-40",
+      "work_id": "R0-40",
+      "objective": "Prove the self-hosting recovery boundary by drill rather than assertion: deliberately corrupt or crash candidate development state and, separately, stable development state; restore from the last seed or recovery bundle; reconcile repository heads against evidence; and demonstrate that neither failure nor recovery can reach production. The drill is executable and rerunnable, so the recovery path is exercised routinely instead of first being tried during a real incident.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 8,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Safety refusal",
+        "Candidate corruption",
+        "Stable corruption",
+        "Crash boundary",
+        "Bundle restore",
+        "Reconciliation",
+        "Production isolation",
+        "Rerun hygiene"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on any inability to prove the drill targets disposable fixture state, a scenario that would touch the live repository, configured remote or a production path, candidate damage propagating into stable, candidate activation before reconciliation, a partially applied effect or lost receipt after a crash, an unverifiable recovery bundle used as a fallback, an ambiguous reconciliation resolved by retry, any reachable production credential, residue left after a run, a licence-boundary violation, or any path outside the lease."
+      ],
+      "hill_climbability": 80,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "plan/",
+        "spikes/",
+        ".automonique/dev/",
+        "tools/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R0-40.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
       "id": "objective:R1-01",
       "work_id": "R1-01",
       "objective": "Add the first product workspace members and deterministic offline checks without adding another harness layer. The protocol and policy crates are product code; the existing lab remains a development adapter.",
@@ -869,6 +968,57 @@
       "licence": "Elastic-2.0",
       "sources": [
         "plan/contracts/R1-07.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
+    },
+    {
+      "id": "objective:R1-25",
+      "work_id": "R1-25",
+      "objective": "Define the shared Rust value layer every client surface uses to express interaction: durably identified queued composer input, the retry, undo, stop, compress and checkpoint intents, per-turn context usage, and the read-only projections that UI and plugin extensions observe. One typed vocabulary serves CLI, TUI, dashboard, desktop and messaging clients so a presentation shortcut can never become a new authority.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 8,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Queue identity",
+        "Attempt lineage",
+        "Idempotent intents",
+        "Checkpoint identity",
+        "Compression lineage",
+        "Context usage",
+        "Projection authority",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on an unclear interaction or authority decision, any need for a new dependency or `Cargo.lock` change, a projection that can mutate observed state, an action that does not name its authority, a value that can rewrite an authoritative transcript, an in-memory queue representation without durable identity, a retry that addresses prior evidence, a non-idempotent stop or undo, an unqualified checkpoint restore, a silently defaulted token count, an unbounded payload, a cross-namespace projection read, per-surface parsing entering the value layer, a network or clock read, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+      ],
+      "hill_climbability": 88,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-protocol/",
+        "rust/crates/automonique-policy/",
+        "rust/Cargo.toml",
+        "sdk/typescript/packages/protocol/",
+        "xtask/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R1-25.md",
         "docs/product-plan/reference/work-breakdown.md"
       ]
     }
