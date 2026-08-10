@@ -16,6 +16,7 @@ pub mod journal;
 pub mod primitives;
 pub mod provider;
 pub mod release;
+pub mod sandbox;
 pub mod schema;
 pub mod wire;
 pub mod workspace;
