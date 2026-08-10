@@ -1,7 +1,7 @@
 {
   "item": "BOOT-003",
   "status": "partial_blocked",
-  "base": "1a116ee2473cdd6c28f9c206e612e4ed64d54b2b",
+  "base": "e0638a0beb1a3767b91551697b084d83d03f24c5",
   "checks": [
     {
       "name": "Clean tree",
@@ -43,7 +43,7 @@
   "external_completion_check": {
     "name": "Protected rule installation and publication scan",
     "result": null,
-    "reason": "The scrub-publication environment and both required Actions secrets are not configured. Installing fingerprints derived from the two owner sanitization passes is outside worker authority, and no permitted input contains those private values. GATE-SCRUB remains open until the owner configures them and the protected main-branch job passes."
+    "reason": "The scrub-publication environment exists but holds zero Actions secrets, so neither the protected rule bundle nor the HMAC key is installed and the publication job fails closed by design. Installing fingerprints derived from the two owner sanitization passes is outside worker authority, and no permitted input contains those private values. GATE-SCRUB remains open until the owner configures both secrets and the protected main-branch job passes."
   },
   "extra_checks": [
     {
@@ -67,5 +67,5 @@
     "blocking_findings": 0,
     "advisory_subagents": 3
   },
-  "notes": "This is truthful partial evidence, not a completion verdict. No protected value, fingerprint, HMAC key, secret identifier, customer data or private rule source is recorded. BOOT-003 is not marked done and GATE-SCRUB is not closed."
+  "notes": "Re-measured at base e0638a0beb1a3767b91551697b084d83d03f24c5: 11 scrub tests pass and the scanner reports zero findings across 409 current-or-reachable Git blobs and 36 commit messages with 4 synthetic and 0 protected rules. This is truthful partial evidence, not a completion verdict. No protected value, fingerprint, HMAC key, secret identifier, customer data or private rule source is recorded. BOOT-003 is not marked done and GATE-SCRUB is not closed."
 }
