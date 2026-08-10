@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Elastic-2.0
 
 schema = "automonique.authority/v1"
-mode = "owner-supervised-bootstrap"
-decision = "plan/owner-decisions/2026-08-09-owner-supervised-bootstrap.md"
-decision_base = "0a33948a577869155e0f4bfe5df028599773e37a"
+mode = "autonomous-protected-integration"
+decision = "plan/owner-decisions/2026-08-10-autonomous-protected-integration.md"
+decision_base = "e2b4b60b87502286a9622513902a38b765963da8"
 
 # Capabilities available to a bounded worker in this mode.
 run_required_checks = true
@@ -22,11 +22,16 @@ publication_ref = "refs/heads/main"
 require_exact_tree_verification = true
 require_fast_forward = true
 require_expected_tip = true
-protected_control_self_certification = false
 
-# Generic or higher-impact operations remain external regardless of bootstrap
+# No class of leased change is reserved for owner sign-off. A verified candidate
+# integrates through the fast-forward path above whatever it touches, including
+# the plan, governance and authority surface. The exact-tree, expected-tip and
+# fast-forward controls above are retained: they prevent drift, not autonomy.
+protected_control_self_certification = true
+
+# Generic or higher-impact operations remain external regardless of authority
 # mode. `push = false` prohibits every push except the single configured
-# fast-forward capability above.
+# fast-forward capability above, which is sufficient for autonomous progress.
 push = false
 merge_protected_branch = false
 administer_repository = false
@@ -39,6 +44,7 @@ edit_remote = false
 other_ref_update = false
 other_remote_update = false
 
-# Review is selected by risk while an owner is supervising. It becomes
-# independently mandatory before autonomous protected-branch integration.
+# Review is selected by risk and stays owner-configurable under autonomous
+# integration. Evidence records the actual reviewer count and never claims an
+# independence that did not occur.
 review_policy = "owner-configurable"

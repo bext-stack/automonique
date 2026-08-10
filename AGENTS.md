@@ -37,12 +37,17 @@ and ask rather than proceeding.
   tests, licence class, and stop conditions.
 - Refuse work blocked by an unresolved gate in `plan/gates.md`.
 
-Owner-requested contract or policy preparation is the bootstrap exception to
-the first bullet: it may start without a pre-existing ready ID when a decision
-under `plan/owner-decisions/` first records the immutable base, allowed paths,
-objective, budget, checks, licence class and stop conditions. This exception
-cannot implement product behavior or waive a gate; it exists to avoid requiring
-a contract in order to write the contract.
+Contract and policy preparation is the exception to the first bullet: it may
+start without a pre-existing ready ID, because requiring a contract in order to
+write the contract is circular. It does not need a per-contract owner decision.
+Record the immutable base, allowed paths, objective, budget, checks, licence
+class and stop conditions in the candidate's own report; add a file under
+`plan/owner-decisions/` only when the change is a policy or authority change.
+This exception cannot implement product behavior or waive a gate.
+
+Writing a contract for an unblocked-but-unspecified item is ordinary,
+self-selectable work: it lowers `contracts_missing` and makes the item
+selectable on the next pass.
 
 ## Codex session driver
 
@@ -77,9 +82,9 @@ For a continuation request:
    partial and report the gap truthfully.
 7. After verification, the primary session may use the configured typed
    integrator to compare-and-swap local `main` and publish that exact commit by
-   a non-force fast-forward to configured `origin/main`. Stop on local or remote
-   tip drift, ambiguity, a non-fast-forward, or a protected-control change that
-   lacks exact-revision owner acceptance.
+   a non-force fast-forward to configured `origin/main`, whatever leased paths
+   the candidate touches. Stop on local or remote tip drift, ambiguity, or a
+   non-fast-forward.
 8. Use `python3 tools/harness_loop.py release --reason blocked` (or
    `user_cancelled`) if the attempt cannot continue safely.
 
@@ -90,15 +95,18 @@ may proceed alone but must say why in its completion evidence.
 
 ## Authority modes
 
-`plan/authority.toml` selects the repository's current mode.
+`plan/authority.toml` selects the repository's current mode. The repository is
+in `autonomous-protected-integration`.
 
-In `owner-supervised-bootstrap`, a bounded worker may run required checks and a
-gate preflight, create an isolated candidate branch or worktree from the
-expected base, and create a local candidate commit containing only leased
-paths. The primary session may automatically advance local `main` to an exact
-verified routine candidate by fast-forward compare-and-swap and may publish the
-same commit only as a non-force fast-forward to the configured `origin/main`.
-Review is risk-based and an owner may accept routine reversible work.
+In this mode, a bounded worker may run required checks and a gate preflight,
+create an isolated candidate branch or worktree from the expected base, and
+create a local candidate commit containing only leased paths. The primary
+session may automatically advance local `main` to an exact verified candidate by
+fast-forward compare-and-swap and may publish the same commit only as a
+non-force fast-forward to the configured `origin/main`. No class of leased
+change is reserved for owner sign-off: plan, contract, governance and authority
+candidates integrate by the same path as implementation candidates. Review is
+risk-based and owner-configurable.
 
 This narrow integration authority grants no generic push, merge, force,
 history rewrite, other-ref or other-remote mutation, repository administration,
@@ -118,14 +126,14 @@ universal readiness gates.
   changed rule to certify the same candidate.
 - Never delete, skip, ignore, or weaken a test; add a stub; bulk-refresh a
   golden; or widen unsafe/lint allowances to pass a gate.
-- Never use a candidate's changes to governance, authority, licensing,
-  security, required checks, integration credentials, branch rules, or the
-  metric, baseline or budget judging that candidate to certify or integrate the
-  same candidate. Routine exact-tree fast-forward integration is allowed under
-  the pre-existing owner-configured policy; protected-control changes require
-  external exact-revision owner acceptance. Release, package publication and
-  production deployment always remain separate authorities. Self-review and
-  deterministic gate preflight are allowed in owner-supervised bootstrap, but
+- A candidate may change governance, authority, required checks, branch rules,
+  or the metric, baseline or budget — but it is judged by those rules as they
+  stand at its own admitted base, never by the version it introduces. A
+  candidate that edits a check must still pass that check as written before its
+  change. Exact-tree fast-forward integration is allowed for every leased
+  change, including this class; no external acceptance step is required.
+  Release, package publication and production deployment always remain separate
+  authorities. Self-review and deterministic gate preflight are allowed, but
   evidence must record the actual reviewer count and may not claim independence
   that did not occur.
 - Never claim an unmeasured metric. Missing evidence is `null` with a reason.
@@ -136,9 +144,8 @@ universal readiness gates.
 ## Git authority
 
 Workers use typed stage/commit operations for leased paths at an expected base.
-In owner-supervised bootstrap they may create a candidate branch or worktree
-and a local candidate commit. Only the primary session's bounded integrator may
-then:
+They may create a candidate branch or worktree and a local candidate commit.
+Only the primary session's bounded integrator may then:
 
 - fast-forward local `refs/heads/main` from the recorded expected local tip to
   the exact verified candidate using compare-and-swap; and
@@ -157,7 +164,9 @@ their partial scope and actual checks. Full completion requires the
 implementation, all contract checks, measured metrics, completion evidence and
 plan/status transition to be bound to one exact-tree completion transaction.
 The policy judging a tree is the policy already integrated at its admitted
-base; a candidate cannot make new authority retroactive to itself.
+base; a candidate cannot make new authority retroactive to itself. This is the
+one control the autonomous mode keeps: a candidate may widen authority for the
+work that follows it, never for itself.
 
 A contemporaneous owner instruction may delegate one exact publication or
 history-rewrite operation outside the narrow configured fast-forward path
