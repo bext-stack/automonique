@@ -170,6 +170,17 @@ universal readiness gates.
 
 ## Git authority
 
+Every commit is authored **and** committed as
+`Automonique Candidate <candidate@automonique.invalid>`, the identity
+`tools/git_broker.py` sets. No commit carries an assistant attribution trailer,
+a personal name or a personal email address. A commit made outside the broker
+sets `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME` and
+`GIT_COMMITTER_EMAIL` explicitly rather than inheriting the ambient Git
+configuration; a fresh clone sets the same values in its local repository
+configuration before its first commit. Attribution is provenance here, not
+etiquette: the repository's own record of who produced a candidate is wrong if a
+human or a tool signs one.
+
 Workers use typed stage/commit operations for leased paths at an expected base.
 They may create a candidate branch or worktree and a local candidate commit.
 Only the primary session's bounded integrator may then:
