@@ -7,6 +7,7 @@
 
 pub mod codec;
 pub mod primitives;
+pub mod provider;
 pub mod release;
 pub mod wire;
 
