@@ -5,6 +5,7 @@
 //! The crate contains values only. It performs no process, filesystem, network,
 //! credential, or provider operations.
 
+pub mod codec;
 pub mod primitives;
 
 use std::error::Error;
