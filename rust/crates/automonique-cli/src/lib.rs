@@ -21,8 +21,8 @@ pub use diagnostics::{
 };
 pub use kernel::{inspect_cgroup_v2_controllers, inspect_max_user_namespaces};
 pub use release::{
-    MAX_RELEASE_MANIFEST_BYTES, ReleaseInspection, ReleaseInspectionStatus, ReleaseIssue,
-    ReleaseManifest, VersionRange, inspect_release_manifest_structure,
+    InspectedRelease, InspectedVersionRange, MAX_RELEASE_MANIFEST_BYTES, ReleaseInspection,
+    ReleaseInspectionStatus, ReleaseIssue, inspect_release_manifest_structure,
 };
 pub use supervisor::inspect_supervisor_adapter;
 

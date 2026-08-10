@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 //! Bounded, read-only inspection of a caller-selected release manifest.
+//!
+//! These types describe what the doctor could *observe* in a file, which is a
+//! strict subset of a release. The canonical product manifest and its
+//! compatibility algebra live in `automonique_protocol::release`; this module
+//! deliberately does not construct one, because a partial observation must not
+//! be presentable as a validated release description.
 
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
@@ -88,24 +94,24 @@ impl ReleaseIssue {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VersionRange {
+pub struct InspectedVersionRange {
     pub minimum: u64,
     pub maximum: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReleaseManifest {
+pub struct InspectedRelease {
     pub application_version: String,
     pub git_revision: String,
     pub build_target: String,
-    pub protocol_range: VersionRange,
-    pub database_schema_range: VersionRange,
+    pub protocol_range: InspectedVersionRange,
+    pub database_schema_range: InspectedVersionRange,
     pub minimum_kernel: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReleaseInspection {
-    Structured(ReleaseManifest),
+    Structured(InspectedRelease),
     Finding(ReleaseIssue),
     Unavailable(ReleaseIssue),
 }
@@ -294,8 +300,8 @@ fn parse_manifest(bytes: &[u8]) -> ReleaseInspection {
     }
 }
 
-fn manifest_from_object(object: &Map<String, Value>) -> Result<ReleaseManifest, ReleaseIssue> {
-    Ok(ReleaseManifest {
+fn manifest_from_object(object: &Map<String, Value>) -> Result<InspectedRelease, ReleaseIssue> {
+    Ok(InspectedRelease {
         application_version: required_token(object, "application_version")?,
         git_revision: required_revision(object)?,
         build_target: required_token(object, "build_target")?,
@@ -334,7 +340,10 @@ fn required_revision(object: &Map<String, Value>) -> Result<String, ReleaseIssue
     Ok(revision)
 }
 
-fn required_range(object: &Map<String, Value>, name: &str) -> Result<VersionRange, ReleaseIssue> {
+fn required_range(
+    object: &Map<String, Value>,
+    name: &str,
+) -> Result<InspectedVersionRange, ReleaseIssue> {
     let range = object
         .get(name)
         .ok_or(ReleaseIssue::RequiredFieldMissing)?
@@ -351,7 +360,7 @@ fn required_range(object: &Map<String, Value>, name: &str) -> Result<VersionRang
     if minimum > maximum {
         return Err(ReleaseIssue::RequiredFieldInvalid);
     }
-    Ok(VersionRange { minimum, maximum })
+    Ok(InspectedVersionRange { minimum, maximum })
 }
 
 struct Descriptor(RawFd);
