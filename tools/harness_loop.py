@@ -1947,6 +1947,21 @@ def _complete_item_locked(item_id: str, summary: str, reason: str | None) -> int
         (ROOT / config["state_path"]).parent / "git-candidates" / run_id / "receipt.json"
     )
     integration = integrator.integrate(receipt_path, file_sha256(receipt_path))
+
+    # The item is done, so any claim on it is spent. Leaving it open blocks the
+    # next claim and makes the loop look busy on finished work.
+    state = read_state(config)
+    if state is not None and state.get("work_id") == item_id:
+        state.update(
+            {
+                "status": "integrated_and_pushed",
+                "stop_reason": "completed",
+                "integrated_commit": integration["commit_oid"],
+                "updated_at": utc_now(),
+            }
+        )
+        write_json_atomic(state_path(config), state)
+
     print(json.dumps({"candidate": receipt, "integration": integration},
                      indent=2, sort_keys=True))
     return 0
