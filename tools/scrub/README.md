@@ -52,3 +52,26 @@ for releasing protected material to the scanner revision in the pending job;
 the workflow does not make candidate code intrinsically trusted. Until the
 environment, protection and secrets are installed and an approved publication
 job passes, `BOOT-003` and `GATE-SCRUB` remain open.
+
+## Installing the protected rules
+
+`tools/scrub/provision.py` derives the protected bundle from the private values
+and installs both secrets, so the owner never has to hand-compute a fingerprint
+or paste a value into a browser. The values file lives outside the repository
+and is refused if it does not:
+
+```sh
+python3 tools/scrub/provision.py --values ~/private/scrub-values.txt --dry-run
+python3 tools/scrub/provision.py --values ~/private/scrub-values.txt --upload
+```
+
+One `family: value` per line, covering all four families. The tool generates a
+fresh 32-byte HMAC key, fingerprints each value under it, validates the bundle
+against the scanner's own schema, and passes both secrets to `gh` on stdin
+rather than argv. No value is printed, written into the repository, or placed on
+a command line; `--dry-run` reports only rule IDs, families and byte lengths.
+
+If a submitted value is still present in the tracked tree the tool refuses and
+names the family alone, never the value: that value has not been scrubbed yet,
+and the correct response is a separate scrub item rather than an allow-list
+entry.
