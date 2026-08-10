@@ -1,0 +1,315 @@
+{
+  "envelope_ids": [
+    "envelope-minimal",
+    "envelope-with-body",
+    "envelope-unknown-additive-field",
+    "envelope-missing-protocol",
+    "envelope-wrong-type",
+    "envelope-version-zero",
+    "envelope-kind-grammar"
+  ],
+  "fixtures": [
+    {
+      "bytes_hex": "6e756c6c",
+      "id": "scalar-null",
+      "note": "the null literal",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "74727565",
+      "id": "scalar-true",
+      "note": "boolean true",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "66616c7365",
+      "id": "scalar-false",
+      "note": "boolean false",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "30",
+      "id": "integer-zero",
+      "note": "zero has one spelling",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "2d3432",
+      "id": "integer-negative",
+      "note": "negative integer",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "39323233333732303336383534373735383037",
+      "id": "integer-i64-max",
+      "note": "exact signed 64-bit ceiling",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "2d39323233333732303336383534373735383038",
+      "id": "integer-i64-min",
+      "note": "exact signed 64-bit floor",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "2222",
+      "id": "string-empty",
+      "note": "empty string",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "2271756f74655c2220736c6173685c5c207461625c74206e6c5c6e2063725c722062735c622066665c6622",
+      "id": "string-escapes",
+      "note": "every named short escape",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "225c753030303122",
+      "id": "string-control-escape",
+      "note": "non-named control uses \\u00xx",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "22c3a9e4b8adf09f988022",
+      "id": "string-multibyte",
+      "note": "multibyte UTF-8 at two, three and four bytes",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "22612f6222",
+      "id": "string-solidus-raw",
+      "note": "a forward slash is not escaped",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "5b5d",
+      "id": "array-empty",
+      "note": "empty array",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b7d",
+      "id": "object-empty",
+      "note": "empty object",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b22616c706861223a312c2262657461223a327d",
+      "id": "object-sorted-keys",
+      "note": "keys already in byte order",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b2261223a312c226131223a322c2262223a337d",
+      "id": "object-key-ordering-digits",
+      "note": "byte order puts a before a1 before b",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b2261223a5b312c7b2262223a6e756c6c7d5d2c2263223a747275657d",
+      "id": "nested-mixed",
+      "note": "nesting across both container kinds",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22737562736372696265222c2270726f746f636f6c223a226175746f6d6f6e697175652e72756e6e6572222c22726571756573745f6964223a227265712d31222c2276657273696f6e223a317d",
+      "id": "envelope-minimal",
+      "note": "the smallest complete envelope",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b2261667465725f6576656e745f6964223a34322c22746f70696373223a5b22776f726b222c2272756e73225d7d2c226b696e64223a22737562736372696265222c2270726f746f636f6c223a226175746f6d6f6e697175652e72756e6e6572222c22726571756573745f6964223a227265712d32222c2276657273696f6e223a317d",
+      "id": "envelope-with-body",
+      "note": "envelope carrying a structured body",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b2261667465725f6576656e745f6964223a312c226675747572655f6669656c64223a22746f6c657261746564227d2c226b696e64223a22737562736372696265222c2270726f746f636f6c223a226175746f6d6f6e697175652e72756e6e6572222c22726571756573745f6964223a227265712d33222c2276657273696f6e223a317d",
+      "id": "envelope-unknown-additive-field",
+      "note": "an unknown additive body field decodes",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b227374617465223a2268696265726e61746564227d",
+      "id": "read-only-enum-unknown",
+      "note": "an unrecognized read-only enum value is retained",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b2262657461223a322c22616c706861223a317d",
+      "category": "non_canonical_json",
+      "id": "noncanonical-key-order",
+      "note": "keys out of byte order",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b2261223a20317d",
+      "category": "non_canonical_json",
+      "id": "noncanonical-space-after-colon",
+      "note": "insignificant whitespace",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "5b312c20325d",
+      "category": "non_canonical_json",
+      "id": "noncanonical-space-in-array",
+      "note": "insignificant whitespace",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "3031",
+      "category": "non_canonical_json",
+      "id": "noncanonical-leading-zero",
+      "note": "a leading zero is a second spelling",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "2d30",
+      "category": "non_canonical_json",
+      "id": "noncanonical-negative-zero",
+      "note": "negative zero is a second spelling of zero",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "22615c2f6222",
+      "category": "non_canonical_json",
+      "id": "noncanonical-escaped-solidus",
+      "note": "an escaped solidus is a second spelling",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "225c753030304122",
+      "category": "non_canonical_json",
+      "id": "noncanonical-uppercase-hex-escape",
+      "note": "uppercase hex and a long form where \\n exists are second spellings",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b2261223a312c2261223a327d",
+      "category": "duplicate_key",
+      "id": "duplicate-key",
+      "note": "which duplicate wins is a security question",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b7d7b7d",
+      "category": "trailing_data",
+      "id": "trailing-value",
+      "note": "bytes remain after a complete value",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "39323233333732303336383534373735383038",
+      "category": "integer_out_of_range",
+      "id": "integer-overflow",
+      "note": "one past the signed 64-bit ceiling",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "312e35",
+      "category": "invalid_json_value",
+      "id": "float-fraction",
+      "note": "floating point is not carried",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "316533",
+      "category": "invalid_json_value",
+      "id": "float-exponent",
+      "note": "exponent notation is not carried",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "",
+      "category": "malformed_json",
+      "id": "malformed-empty",
+      "note": "no value at all",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b",
+      "category": "malformed_json",
+      "id": "malformed-unclosed-object",
+      "note": "unterminated object",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "22616263",
+      "category": "malformed_json",
+      "id": "malformed-unterminated-string",
+      "note": "unterminated string",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "5b312c5d",
+      "category": "malformed_json",
+      "id": "malformed-trailing-comma",
+      "note": "a trailing comma has no value",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "747275",
+      "category": "malformed_json",
+      "id": "malformed-bare-word",
+      "note": "an incomplete literal",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "22610a6222",
+      "category": "malformed_json",
+      "id": "malformed-raw-control-in-string",
+      "note": "a raw control character inside a string",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "22fffe22",
+      "category": "malformed_json",
+      "id": "malformed-invalid-utf8",
+      "note": "input that is not valid UTF-8",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22737562736372696265222c22726571756573745f6964223a2272222c2276657273696f6e223a317d",
+      "category": "missing_field",
+      "id": "envelope-missing-protocol",
+      "note": "a required envelope field is absent",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22737562736372696265222c2270726f746f636f6c223a312c22726571756573745f6964223a2272222c2276657273696f6e223a317d",
+      "category": "invalid_json_value",
+      "id": "envelope-wrong-type",
+      "note": "protocol is not a string",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22737562736372696265222c2270726f746f636f6c223a226175746f6d6f6e697175652e72756e6e6572222c22726571756573745f6964223a2272222c2276657273696f6e223a307d",
+      "category": "field_invalid",
+      "id": "envelope-version-zero",
+      "note": "zero is not a major version",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22537562736372696265222c2270726f746f636f6c223a226175746f6d6f6e697175652e72756e6e6572222c22726571756573745f6964223a2272222c2276657273696f6e223a317d",
+      "category": "field_grammar",
+      "id": "envelope-kind-grammar",
+      "note": "message kinds are lowercase",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d",
+      "category": "nesting_too_deep",
+      "id": "nesting-one-past-ceiling",
+      "note": "one level beyond the depth ceiling",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d",
+      "id": "nesting-at-ceiling",
+      "note": "exactly at the depth ceiling",
+      "outcome": "accept"
+    }
+  ],
+  "note": "Checked-in corpus. Rust is the wire source of truth; a disagreement is fixed in the implementation, never in this file.",
+  "schema": "automonique.wire-fixtures/v1"
+}

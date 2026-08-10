@@ -1,0 +1,14 @@
+{
+  "name": "@automonique/protocol",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "conformance": "bun run ./conformance/run.ts",
+    "typecheck": "npx --offline tsc -p ./tsconfig.json"
+  }
+}
