@@ -15,6 +15,7 @@ pub mod provider;
 pub mod release;
 pub mod schema;
 pub mod wire;
+pub mod workspace;
 
 use std::error::Error;
 use std::fmt;
