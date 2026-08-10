@@ -3,13 +3,13 @@
   "counters": {
     "capability_ledger_fields_missing": 351,
     "parity_ledger_fields_missing": 0,
-    "contracts_missing": 108,
+    "contracts_missing": 104,
     "gates_open": 2,
     "links_broken": 0,
     "refs_undefined": 0,
     "evidence_missing": 0
   },
-  "total": 461,
+  "total": 457,
   "context": {
     "items": 375,
     "items_done": 9
@@ -29,19 +29,19 @@
       "external-capability-ledger.md: table missing column(s) owner, ticket, fixture across 6 row(s)"
     ],
     "contracts_missing": [
-      "no contract: R0-01",
       "no contract: R0-02",
       "no contract: R0-07",
       "no contract: R0-08",
       "no contract: R0-09",
       "no contract: R0-10",
       "no contract: R0-11",
-      "no contract: R0-12"
+      "no contract: R0-12",
+      "no contract: R0-13"
     ],
     "gates_open": [
       "open: GATE-ORACLE",
       "open: GATE-SCRUB"
     ]
   },
-  "digest": "e6eda9b8a011cbe783f10df8c84630e0f042057da46939335f23d79c8f7f61e0"
+  "digest": "927496194cbcdc7be5ee415ed996ca3435645adb3f824b0a90502d3a1495e112"
 }

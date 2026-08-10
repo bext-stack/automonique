@@ -1,0 +1,62 @@
+{
+  "item": "R1-02",
+  "base": "cea6f2a90ff4b43b5346329c91e7d7d45bd6108a",
+  "checks": [
+    {
+      "name": "Identifier domains",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test primitives",
+      "result": "pass",
+      "output": "A zero MAX_BYTES ceiling fails with zero_bound. The exact eight-byte boundary round-trips for ASCII and for a two-character eight-byte UTF-8 value; one byte over fails with too_long carrying max_bytes and actual_bytes. Empty, NUL, newline and U+007F values fail. Four control-free spellings stay opaque and uninterpreted. Unlike domains are separate types: the compile_fail doctest on OpaqueId is rejected with E0308 mismatched types."
+    },
+    {
+      "name": "Text bounds",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test primitives",
+      "result": "pass",
+      "output": "Zero ceiling, empty, exact-boundary and one-byte-over cases are covered. A decomposed 'e + U+0301' is preserved byte-for-byte and is not normalized to U+00E9; a value one byte over the ceiling is rejected rather than truncated. Tab, carriage return, newline and U+009F are rejected."
+    },
+    {
+      "name": "Time and revision",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test primitives",
+      "result": "pass",
+      "output": "Negative, zero and positive epoch instants decompose with a non-negative 0..=999 remainder, so -1 ms yields (-1, 999) and -1001 ms yields (-2, 999). Eight instants round-trip through decomposition. A 1000 ms remainder fails with millisecond_out_of_range; i64::MAX seconds, i64::MAX + 1 ms, i64::MIN - 1 ms and an overflowing difference all fail with overflow. Revision rejects zero, starts at 1, and u64::MAX successor fails with overflow rather than wrapping."
+    },
+    {
+      "name": "URL safety",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test primitives",
+      "result": "pass",
+      "output": "11 URLs accepted and 32 rejected, all offline with no DNS lookup or socket. Accepted: DNS names, IPv4, bracketed IPv6 including ::1, optional ports and paths; the exact 32-byte ceiling passes and 33 bytes fails. Rejected with their own categories: ftp/file/javascript/no scheme and uppercase HTTP (scheme), 'http://' and 'http://:443' and 'http://:443/path' (empty_host), userinfo forms (user_info), fragment, backslash, whitespace, non-ASCII host, leading-dash and empty-label hosts (host), unclosed and malformed IPv6 brackets, port 0, 65536, empty, non-decimal, signed and leading-zero ports (port), and a control character."
+    },
+    {
+      "name": "Secret safety",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test primitives && cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --doc",
+      "result": "pass",
+      "output": "Zero ceiling, empty and one-byte-over inputs fail; the exact eight-byte UTF-8 boundary passes. Debug renders a constant '<redacted>' and two secrets of different lengths render identically, so length is not inferable. Four rejection paths were rendered through both Display and Debug and none contained the synthetic value. Compile-fail coverage passes and was confirmed to fail for the intended reasons: E0277 for absent Display, the same absence removing to_string, and E0616 for the private field. Every secret used is a synthetic literal invented for the test."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path rust/Cargo.toml --all -- --check && cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --offline -- -D warnings && cargo test --manifest-path rust/Cargo.toml --workspace --offline",
+      "result": "pass",
+      "output": "Formatting is clean, strict all-target Clippy exits 0 with zero warnings, and 204 workspace tests pass offline. No allowance was added, no dependency was added, and rust/Cargo.toml and rust/Cargo.lock are unchanged by this work."
+    }
+  ],
+  "review": {
+    "reviewers": 1,
+    "blocking_findings": 0,
+    "acceptance": "primary-session self-review only; not independent, and no second reviewer examined this slice"
+  },
+  "extra_checks": [
+    {
+      "name": "Error category coverage",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test primitives every_rejection_has_a_stable_category",
+      "result": "pass",
+      "output": "16 distinct stable error categories are asserted: zero_bound, empty, too_long, control_character, non_ascii, whitespace, scheme, user_info, fragment, backslash, empty_host, host, port, millisecond_out_of_range, overflow and zero_revision."
+    },
+    {
+      "name": "Compile-fail intent",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test scratch_check",
+      "result": "pass",
+      "output": "A temporary scratch test compiled the three forbidden expressions and produced exactly E0277 (SecretText has no Display), E0616 (private field) and E0308 (OpaqueId domains not interchangeable), proving the compile_fail doctests fail for their intended reasons rather than incidentally. The scratch file was removed and is not part of the candidate."
+    }
+  ],
+  "notes": "Implementation is commit cea6f2a90ff4b43b5346329c91e7d7d45bd6108a on main and origin/main, admitted at base 7e5cbadd58efe95571121ecee5a689349e7dd03f under run session_20260810T153558Z_268c0dd3. No TypeScript fixtures were added under sdk/typescript/packages/protocol/, so no cross-language parity is claimed. The value layer performs no I/O, reads no clock, resolves no name and generates no identifier. No subagent was launched: the slice is a single coherent value module whose paths could not be split without concurrent writers sharing one file, and this session was operated under an instruction not to spawn agents."
+}
