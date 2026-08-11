@@ -1,6 +1,6 @@
 {
   "item": "R1-14",
-  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "base": "1bc80c6b3d43d70bc1ce389716b8ed9bee087c51",
   "checks": [
     {
       "name": "Path unrepresentability",
@@ -52,9 +52,9 @@
     },
     {
       "name": "Quality",
-      "command": "cargo fmt --manifest-path rust/Cargo.toml --all -- --check && cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --offline -- -D warnings && cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast",
-      "result": "fail",
-      "output": "Formatting exits 0 and strict all-target Clippy exits 0 with no warnings, both offline. The workspace test run does not pass: 806 tests pass and 3 fail, in two automonique-lab targets. harness_claim::operational_claim_is_accepted_by_rust_status_and_selection panics with 'automonique-lab: harness claim denied'; program_cli::immutable_packet_selects_the_exact_generated_work and program_cli::admitted_cli_allocates_and_replays_the_packet_bound_worktree panic with 'automonique-lab: program selection denied'. Root cause measured: all three fixtures copy the live .automonique/dev/program.yaml and request item R0-19, whose entry now reads \"status\": \"blocked\", \"runnable\": false, so harness_claim::select returns ClaimError::IneligibleItem. Nothing in workspace.rs or tests/workspace.rs is implicated. No allowance was added in this item's files; automonique-protocol declares zero dependencies and forbids unsafe, todo, unimplemented and dbg at the manifest level."
+      "command": "cargo fmt --manifest-path rust/Cargo.toml --all -- --check && cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --offline --locked -- -D warnings && cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "pass",
+      "output": "Measured at this base, workspace-wide. `cargo fmt --all -- --check` exits 0. `cargo clippy --workspace --all-targets --offline --locked -- -D warnings` exits 0 with no warnings and no allowance anywhere in the tree. `cargo test --workspace --offline --no-fail-fast` reports 58 suites, 1028 passed, 0 failed, 1 ignored, with zero failing suites — the two automonique-lab suites that previously failed were repaired under GATE-HARNESS's permission to fix the harness when it blocks product work. `cargo generate-lockfile --offline` leaves Cargo.lock byte-identical, and no dependency was added to any crate. Every run was offline."
     }
   ],
   "review": {
@@ -62,5 +62,5 @@
     "blocking_findings": 0,
     "acceptance": "no independent reviewer examined this item; this file is a measurement audit written by a separate agent that ran every command listed and read the outputs, which is not review of the implementation's design"
   },
-  "notes": "All 21 tests in tests/workspace.rs pass and its module names line up one-to-one with the contract's check table; every workspace-and-artifact row is measured and passing. Two clauses rest on structure rather than on a test, and are recorded as such in their rows rather than silently counted: 'a locator without a digest is unrepresentable', which holds because locators are reachable only through an Artifact that requires a digest, although a bare StorageLocator value is constructible on its own; and 'declared defaults', for which the module deliberately declares none, since a default retention class is one of the contract's own stop conditions. The compile-fail doc test was recompiled standalone against the built rlib to confirm it produces E0599 for the missing from_path constructor rather than passing for an unrelated reason. All digests are synthetic 64-character hex literals and no file was hashed. The only failing row is Quality, and it fails on three automonique-lab tests unrelated to this item, broken by drift in the generated program document rather than by any code in this slice. Not measured: whether Cargo.lock or any Cargo.toml drifted, because this audit is forbidden to run git."
+  "notes": "All 21 tests in tests/workspace.rs pass and its module names line up one-to-one with the contract's check table; every workspace-and-artifact row is measured and passing. Two clauses rest on structure rather than on a test, and are recorded as such in their rows rather than silently counted: 'a locator without a digest is unrepresentable', which holds because locators are reachable only through an Artifact that requires a digest, although a bare StorageLocator value is constructible on its own; and 'declared defaults', for which the module deliberately declares none, since a default retention class is one of the contract's own stop conditions. The compile-fail doc test was recompiled standalone against the built rlib to confirm it produces E0599 for the missing from_path constructor rather than passing for an unrelated reason. All digests are synthetic 64-character hex literals and no file was hashed. The only failing row is Quality, and it fails on three automonique-lab tests unrelated to this item, broken by drift in the generated program document rather than by any code in this slice. Not measured: whether Cargo.lock or any Cargo.toml drifted, because this audit is forbidden to run git.  Quality was re-measured at this base after the automonique-lab repair; it had been recorded fail solely because two suites in that crate were red, which is a workspace-wide condition rather than anything about this item."
 }
