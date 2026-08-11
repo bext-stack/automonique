@@ -9,7 +9,7 @@ It also refuses a graph with dangling dependencies, cycles, unknown gates, a
 licence-boundary violation, or an item marked done without gate evidence.
 
     python3 plan/check.py            # verify, rewrite plan/ready.md
-    python3 plan/check.py --verify   # verify only, write nothing (CI mode)
+    python3 plan/check.py --verify   # verify only; refuses if ready.md is stale (CI mode)
 
 Exit code is non-zero on any failure, so CI can gate on it directly.
 """
@@ -504,8 +504,8 @@ def check_evidence(items: list[dict]) -> None:
             warnings.append(f"{orphan} is done but never passed through the gate")
 
 
-def write_ready(items: list[dict], ready: list[dict],
-                unspecified: list[str]) -> None:
+def render_ready(items: list[dict], ready: list[dict],
+                 unspecified: list[str]) -> str:
     done = sum(1 for i in items if i.get("status") == "done")
     lines = [
         "# Ready set",
@@ -605,13 +605,13 @@ def write_ready(items: list[dict], ready: list[dict],
             more = f" …and {len(ids) - 6} more" if len(ids) > 6 else ""
             lines.append(f"| [`{g}`](gates.md#{g.lower()}) | {shown}{more} |")
 
-    READY.write_text("\n".join(lines) + "\n")
+    return "\n".join(lines) + "\n"
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--verify", action="store_true",
-                    help="verify only; do not rewrite ready.md")
+                    help="verify only; refuse if ready.md is stale, rewrite nothing")
     args = ap.parse_args()
 
     if not GRAPH.exists():
@@ -649,13 +649,30 @@ def main() -> int:
         print(f"\n{len(errors)} integrity failure(s)", file=sys.stderr)
         return 1
 
+    rendered = render_ready(items, ready, unspecified)
     if not args.verify:
-        write_ready(items, ready, unspecified)
+        # Atomically, because a reader in a parallel run must never observe a
+        # half-written ready set.
+        staging = READY.with_suffix(".md.staging")
+        staging.write_text(rendered)
+        staging.replace(READY)
         print(f"ok — {len(items)} items, {len(ready)} ready, "
               f"{len(unspecified)} unblocked-but-unspecified; wrote plan/ready.md")
-    else:
-        print(f"ok — {len(items)} items, {len(ready)} ready, "
-              f"{len(unspecified)} unblocked-but-unspecified")
+        return 0
+
+    # CI mode writes nothing, but silence is not the same as agreement. A commit
+    # that moved the graph and ran only --verify used to leave a stale ready.md
+    # checked in, and nothing said so: the plan advertised finished work as
+    # selectable. Same class of defect as .automonique/dev/program.yaml going
+    # stale against the graph, and the same cure — compare, do not assume.
+    current = READY.read_text() if READY.exists() else ""
+    if current != rendered:
+        print("FAIL: plan/ready.md is stale — regenerate it with "
+              "`python3 plan/check.py` and commit the result", file=sys.stderr)
+        print("\n1 integrity failure(s)", file=sys.stderr)
+        return 1
+    print(f"ok — {len(items)} items, {len(ready)} ready, "
+          f"{len(unspecified)} unblocked-but-unspecified")
     return 0
 
 

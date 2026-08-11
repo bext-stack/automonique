@@ -168,12 +168,15 @@ universal readiness gates.
   use `Apache-2.0`. Moving product code across that boundary requires owner
   review before distribution.
 - Changing `plan/work-graph.toml` means regenerating everything derived from it
-  in the same commit: `python3 tools/program.py` then `python3 tools/guides.py`.
-  `.automonique/dev/program.yaml` records the graph's digest, so a graph that
-  moves without it leaves the harness refusing to select any work — correctly,
-  but with a message (`program selection denied`) that says nothing about why.
-  `plan/check.py --verify` passes in that state; only the lab suite catches it.
-  Run the lab suite after touching the graph.
+  in the same commit: `python3 plan/check.py` (writes `plan/ready.md`), then
+  `python3 tools/program.py`, then `python3 tools/guides.py`, then
+  `python3 plan/baseline.py`. `.automonique/dev/program.yaml` records the
+  graph's digest, so a graph that moves without it leaves the harness refusing
+  to select any work — correctly, but with a message (`program selection
+  denied`) that says nothing about why. Only the lab suite catches that one, so
+  run it after touching the graph. `plan/check.py --verify` now refuses a stale
+  `plan/ready.md` rather than passing over it, which is how a commit shipped a
+  ready set advertising finished work as selectable.
 - A test fixture must never restate the constant it is checking. Every fixture
   in `automonique-lab` hard-coded `integration_ceiling` to the same literal as
   the validator, so the two agreed for a year while the actual producer,
