@@ -16,23 +16,45 @@ export const MAX_JSON_ENTRIES = 4096;
 export const MAX_PROTOCOL_NAME_BYTES = 64;
 export const MAX_REQUEST_ID_BYTES = 128;
 export const MAX_MESSAGE_KIND_BYTES = 64;
+export const MAX_ENUM_VALUE_BYTES = 64;
+export const LENGTH_PREFIX_BYTES = 4;
+export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
 const I64_MIN = -(2n ** 63n);
 const I64_MAX = 2n ** 63n - 1n;
 
-/** Stable refusal categories, byte-identical to the Rust `CodecError` set. */
-export type WireCategory =
-  | "malformed_json"
-  | "non_canonical_json"
-  | "invalid_json_value"
-  | "duplicate_key"
-  | "trailing_data"
-  | "integer_out_of_range"
-  | "too_many_entries"
-  | "missing_field"
-  | "nesting_too_deep"
-  | "field_invalid"
-  | "field_grammar";
+/**
+ * Stable refusal categories, spelled exactly as Rust's `CodecError::category`.
+ *
+ * The union below is derived from this array rather than written twice, so a
+ * category cannot exist as a type without existing as a value the conformance
+ * runner can compare a corpus entry against.
+ */
+export const WIRE_CATEGORIES = [
+  "duplicate_key",
+  "empty_frame",
+  "field_grammar",
+  "field_invalid",
+  "frame_too_large",
+  "integer_out_of_range",
+  "invalid_json_value",
+  "malformed_json",
+  "missing_field",
+  "nesting_too_deep",
+  "non_canonical_json",
+  "too_many_entries",
+  "trailing_data",
+  "unknown_enum_value",
+  "unknown_protocol",
+  "unsupported_version",
+] as const;
+
+export type WireCategory = (typeof WIRE_CATEGORIES)[number];
+
+/** Whether a spelling names a category this implementation can produce. */
+export function isWireCategory(value: string): value is WireCategory {
+  return (WIRE_CATEGORIES as readonly string[]).includes(value);
+}
 
 export class WireError extends Error {
   readonly category: WireCategory;
@@ -160,12 +182,88 @@ export function toCanonicalBytes(value: JsonValue): Uint8Array {
   return Uint8Array.from(out);
 }
 
-function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+export function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
   if (left.length !== right.length) return false;
   for (let index = 0; index < left.length; index += 1) {
     if (left[index] !== right[index]) return false;
   }
   return true;
+}
+
+// Length-delimited framing, mirroring `rust/crates/automonique-protocol/src/codec.rs`.
+//
+// The prefix is fixed-width and big-endian. Newline framing is deliberately
+// absent: a delimiter that can appear inside a payload is not a delimiter.
+
+/** Outcome of decoding one frame from a byte slice. */
+export type FrameDecode =
+  | {
+      /** A complete frame was available. */
+      readonly kind: "frame";
+      /** Payload bytes, borrowed from the input. */
+      readonly payload: Uint8Array;
+      /** Bytes the caller should consume, including the length prefix. */
+      readonly consumed: number;
+    }
+  | {
+      /** The frame is incomplete; nothing was consumed. */
+      readonly kind: "need_more";
+      /** Further bytes required before the frame can be decoded. */
+      readonly additional: number;
+    };
+
+/**
+ * Append a length-delimited frame.
+ *
+ * Throws `empty_frame` for an empty payload and `frame_too_large` above
+ * `MAX_FRAME_BYTES`.
+ */
+export function encodeFrame(payload: Uint8Array): Uint8Array {
+  if (payload.length === 0) {
+    throw new WireError("empty_frame", "frame declares a zero-length payload");
+  }
+  if (payload.length > MAX_FRAME_BYTES) {
+    throw new WireError("frame_too_large", `maximum is ${MAX_FRAME_BYTES}`);
+  }
+  const out = new Uint8Array(LENGTH_PREFIX_BYTES + payload.length);
+  const length = payload.length;
+  out[0] = (length >>> 24) & 0xff;
+  out[1] = (length >>> 16) & 0xff;
+  out[2] = (length >>> 8) & 0xff;
+  out[3] = length & 0xff;
+  out.set(payload, LENGTH_PREFIX_BYTES);
+  return out;
+}
+
+/**
+ * Decode the first frame without consuming a partial one.
+ *
+ * The declared length is validated against `MAX_FRAME_BYTES` before it is used
+ * for anything, and the payload is a view rather than a copy, so an oversized
+ * prefix can never drive an allocation.
+ */
+export function decodeFrame(input: Uint8Array): FrameDecode {
+  if (input.length < LENGTH_PREFIX_BYTES) {
+    return {kind: "need_more", additional: LENGTH_PREFIX_BYTES - input.length};
+  }
+  // Big-endian, and the top byte is scaled rather than shifted because a shift
+  // would be evaluated as a signed 32-bit operation.
+  const declared =
+    (input[0] ?? 0) * 0x1000000 +
+    ((input[1] ?? 0) << 16) +
+    ((input[2] ?? 0) << 8) +
+    (input[3] ?? 0);
+  if (declared === 0) {
+    throw new WireError("empty_frame", "frame declares a zero-length payload");
+  }
+  if (declared > MAX_FRAME_BYTES) {
+    throw new WireError("frame_too_large", `declared ${declared}, maximum ${MAX_FRAME_BYTES}`);
+  }
+  const total = LENGTH_PREFIX_BYTES + declared;
+  if (input.length < total) {
+    return {kind: "need_more", additional: total - input.length};
+  }
+  return {kind: "frame", payload: input.subarray(LENGTH_PREFIX_BYTES, total), consumed: total};
 }
 
 class Parser {
@@ -458,32 +556,139 @@ function requiredString(value: JsonValue, field: string, maxBytes: number): stri
   return entry.value;
 }
 
+const CONTROL_CHARACTER = /\p{Cc}/u;
+
+/**
+ * The shared bounded-value rules, mirroring Rust's `validate_bounded_field`.
+ *
+ * These precede every field grammar, exactly as they do in Rust: an empty or
+ * control-bearing spelling is a bounded-value refusal (`field_invalid`), and
+ * only a spelling that clears the shared rules is judged against its grammar.
+ */
+export function validateBoundedField(value: string, maxBytes: number, field: string): void {
+  if (maxBytes === 0) throw new WireError("field_invalid", `${field}: zero byte ceiling`);
+  if (value.length === 0) throw new WireError("field_invalid", `${field}: empty`);
+  if (utf8(value).length > maxBytes) throw new WireError("field_invalid", `${field}: too long`);
+  if (CONTROL_CHARACTER.test(value)) {
+    throw new WireError("field_invalid", `${field}: control character`);
+  }
+}
+
+/** A closed enum whose values select behaviour with a security consequence. */
+export interface EnumSpec<T extends string> {
+  /** Field name reported when a value is refused or retained. */
+  readonly field: string;
+  /** Every spelling this build defines. */
+  readonly known: readonly T[];
+}
+
+/** A read-only enum value, which may be one this build does not define. */
+export type ReadOnlyValue<T extends string> =
+  | {readonly kind: "known"; readonly value: T}
+  | {readonly kind: "unknown"; readonly spelling: string};
+
+/**
+ * Decode a security-sensitive enum, failing closed on an undefined value.
+ *
+ * Throws `unknown_enum_value` rather than guessing a default. The return type
+ * is the union of defined spellings, so a caller cannot receive a value this
+ * build does not understand.
+ */
+export function decodeSecurityEnum<T extends string>(value: string, spec: EnumSpec<T>): T {
+  const known = spec.known.find((candidate) => candidate === value);
+  if (known === undefined) throw new WireError("unknown_enum_value", spec.field);
+  return known;
+}
+
+/**
+ * Decode a read-only enum, retaining an undefined spelling rather than failing.
+ *
+ * An unknown value keeps its spelling for display and logging without acquiring
+ * meaning: the `unknown` branch carries no defined variant. The spelling is
+ * still bounded, so an unbounded value cannot be retained.
+ */
+export function decodeReadOnlyEnum<T extends string>(
+  value: string,
+  spec: EnumSpec<T>,
+): ReadOnlyValue<T> {
+  const known = spec.known.find((candidate) => candidate === value);
+  if (known !== undefined) return {kind: "known", value: known};
+  validateBoundedField(value, MAX_ENUM_VALUE_BYTES, spec.field);
+  return {kind: "unknown", spelling: value};
+}
+
 const PROTOCOL_GRAMMAR = /^[a-z][a-z0-9.]*$/;
 const KIND_GRAMMAR = /^[a-z][a-z0-9_]*$/;
 const REQUEST_ID_GRAMMAR = /^[A-Za-z0-9\-_.:]+$/;
 
 export function decodeMessage(payload: Uint8Array): Message {
   const value = parseCanonical(payload);
+  // The order below is the order Rust settles these fields in, because the
+  // category a peer receives for a message with two faults must not depend on
+  // which implementation refused it.
   const protocol = requiredString(value, "protocol", MAX_PROTOCOL_NAME_BYTES);
   const requestId = requiredString(value, "request_id", MAX_REQUEST_ID_BYTES);
   const kind = requiredString(value, "kind", MAX_MESSAGE_KIND_BYTES);
   const versionValue = objectField(value, "version");
   if (versionValue.kind !== "integer") throw new WireError("invalid_json_value", "version");
+  // Outside u32 the value is not a version number at all, which is a type
+  // refusal; zero is a u32 that is not a version, which is a value refusal.
+  if (versionValue.value < 0n || versionValue.value > 0xffff_ffffn) {
+    throw new WireError("invalid_json_value", "version");
+  }
   const body = objectField(value, "body");
 
-  if (versionValue.value <= 0n || versionValue.value > 0xffff_ffffn) {
-    throw new WireError("field_invalid", "version");
-  }
+  validateBoundedField(protocol, MAX_PROTOCOL_NAME_BYTES, "protocol");
   if (!PROTOCOL_GRAMMAR.test(protocol) || protocol.endsWith(".") || protocol.includes("..")) {
     throw new WireError("field_grammar", "protocol");
   }
+  if (versionValue.value === 0n) throw new WireError("field_invalid", "version");
+  validateBoundedField(requestId, MAX_REQUEST_ID_BYTES, "request_id");
   if (!REQUEST_ID_GRAMMAR.test(requestId)) throw new WireError("field_grammar", "request_id");
+  validateBoundedField(kind, MAX_MESSAGE_KIND_BYTES, "kind");
   if (!KIND_GRAMMAR.test(kind)) throw new WireError("field_grammar", "kind");
 
   return {
     envelope: {protocol, version: Number(versionValue.value), requestId, kind},
     body,
   };
+}
+
+/** One protocol this peer implements, with its supported major-version range. */
+export interface SupportedProtocol {
+  readonly protocol: string;
+  readonly minVersion: number;
+  readonly maxVersion: number;
+}
+
+/**
+ * Decode a message and admit it against the protocols this peer implements.
+ *
+ * Shape is settled first, so a peer is never told its protocol is unimplemented
+ * when its JSON is what is broken. Negotiation then fails closed on either
+ * axis, and the axes stay distinct: `unknown_protocol` for a name no entry
+ * carries, `unsupported_version` for a name that is carried at another major.
+ * An empty `supported` list implements nothing and admits nothing.
+ */
+export function decodeMessageAdmitted(
+  payload: Uint8Array,
+  supported: readonly SupportedProtocol[],
+): Message {
+  const message = decodeMessage(payload);
+  const offered = message.envelope.version;
+  let refusal: WireCategory = "unknown_protocol";
+  for (const entry of supported) {
+    if (entry.protocol !== message.envelope.protocol) continue;
+    if (entry.minVersion <= offered && offered <= entry.maxVersion) return message;
+    if (refusal === "unknown_protocol") refusal = "unsupported_version";
+  }
+  // No detail carries a peer-supplied spelling, so a refusal is safe to log.
+  throw new WireError(
+    refusal,
+    refusal === "unknown_protocol"
+      ? "no implemented protocol carries this name"
+      : "major version is outside the supported range",
+  );
 }
 
 export function encodeMessage(message: Message): Uint8Array {

@@ -17,9 +17,11 @@ Exit code is non-zero on any failure, so CI can gate on it directly.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import pathlib
 import json
 import re
+import subprocess
 import sys
 import tomllib
 
@@ -46,6 +48,87 @@ SKIP_SOURCE_PARTS = {
     "__pycache__", "node_modules", "target", "third_party",
 }
 SPDX = re.compile(r"SPDX-License-Identifier:\s*([^\s*<>]+)")
+
+
+def repository_files() -> list[pathlib.Path]:
+    """Every file that is part of the repository, and nothing that is not.
+
+    Both whole-tree scans below used `ROOT.rglob("*")` against a hand-kept skip
+    list. A skip list only knows what someone remembered to add, and what it did
+    not know about was `.claude/worktrees/`, where the agent tooling checks the
+    repository out again: 154 licence failures, every one of them a nested copy
+    whose `sdk/` files land at a path whose first component is no longer `sdk`
+    and so are judged against the wrong licence.
+
+    Git already knows the answer, so ask it. `--cached --others
+    --exclude-standard` is tracked files plus new ones that are not ignored, so
+    a file added but not yet staged is still checked — which matters, since this
+    gate runs before the commit — while anything `.gitignore` or
+    `.git/info/exclude` rules out is not part of the repository and is not
+    scanned. `SKIP_SOURCE_PARTS` stays as the fallback for a non-git checkout
+    and as a second line for directories git does track but nothing should scan.
+    """
+    try:
+        listed = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files", "-z",
+             "--cached", "--others", "--exclude-standard"],
+            capture_output=True, check=True,
+        ).stdout
+        candidates = [ROOT / name.decode() for name in listed.split(b"\0") if name]
+    except (OSError, subprocess.CalledProcessError, UnicodeDecodeError):
+        # Not a git checkout, or git is unavailable. Fall back to the walk; the
+        # skip list is weaker than git's answer but better than refusing to run.
+        candidates = sorted(ROOT.rglob("*"))
+    return [
+        path for path in candidates
+        if path.is_file()
+        and not any(part in SKIP_SOURCE_PARTS
+                    for part in path.relative_to(ROOT).parts)
+    ]
+
+# --- Legacy identifier location (R1-17, GATE-SCRUB) -------------------------
+#
+# `plan/gates.md#gate-scrub` and `plan/contracts/R1-17.md` say the same thing
+# from two directions: a legacy identifier belongs in the classified inventory
+# and in the name registry the compatibility surface is generated from, and
+# nowhere else. Everywhere else prose uses the neutral description.
+LEGACY_INVENTORY = "docs/product-plan/reference/legacy-inventory.md"
+NAME_REGISTRY = "rust/crates/automonique-protocol/src/compat.rs"
+GENERATED_REGISTRY = "rust/crates/automonique-protocol/src/compat/generated.rs"
+
+# Every place a legacy identifier may appear, with the authority that permits
+# it. Adding a row here widens the rule and is the reviewable act.
+LEGACY_IDENTIFIER_HOMES = {
+    LEGACY_INVENTORY: "the sanctioned inventory (plan/gates.md#gate-scrub)",
+    NAME_REGISTRY: "the name registry (plan/contracts/R1-17.md)",
+    GENERATED_REGISTRY: "generated from the name registry (plan/contracts/R1-17.md)",
+    "plan/gates.md": "the location rule itself, which names its own example",
+}
+
+# Fingerprints rather than spellings, so this file does not itself become a
+# place a legacy identifier appears. `length` is carried so that only words of
+# that length are hashed, which is what keeps a full-tree scan cheap; it is the
+# same shape `tools/scrub/synthetic-rules.json` uses.
+LEGACY_TOKEN_FINGERPRINTS = (
+    {
+        "length": 4,
+        "digest": "4ff17bc8ee5f240c792b8a41bfa2c58af726d83b925cf696af0c811627714c85",
+        "reason": "the predecessor system's identifier prefix",
+    },
+)
+
+# The compatibility spelling the product uses for a legacy environment or
+# configuration name — `docs/product-plan/requirements/operations-and-governance.md`
+# writes it `LEGACY_*`. In shipped Rust source it may only be written by the
+# registry and by what the registry generates; anywhere else it is a
+# hand-written alias with no authorizing entry. The lowercase command and
+# binary spellings (`legacyctl`, `legacy-shell`) are the namespace gate's
+# surface, not this one — `automonique_protocol::namespace` refuses any
+# identifier segment starting with `legacy` unless an inventory entry names
+# the contract that authorized it.
+ALIAS_LITERAL = re.compile(r'"(LEGACY_[A-Z0-9_]+)"')
+SHIPPED_RUST = re.compile(r"rust/crates/[^/]+/src/")
+WORD = re.compile(r"[A-Za-z][A-Za-z0-9]*")
 
 HARNESS_TRACK = "harness"
 HARNESS_GATE = "GATE-HARNESS"
@@ -116,12 +199,8 @@ def check_authority() -> None:
 
 def check_source_licences() -> None:
     """Apply the small development-time path/SPDX invariant."""
-    for path in sorted(ROOT.rglob("*")):
-        if not path.is_file():
-            continue
+    for path in repository_files():
         relative = path.relative_to(ROOT)
-        if any(part in SKIP_SOURCE_PARTS for part in relative.parts):
-            continue
         if path.name not in SOURCE_NAMES and path.suffix.lower() not in SOURCE_SUFFIXES:
             continue
         expected = (
@@ -137,6 +216,86 @@ def check_source_licences() -> None:
         elif identifiers != [expected]:
             actual = ", ".join(identifiers)
             fail(f"{label} has SPDX identifier {actual}; expected {expected} from its path")
+
+
+def readable_text(path: pathlib.Path) -> str | None:
+    """The file's text, or `None` if it is not text at all."""
+    try:
+        return path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def check_legacy_identifier_location() -> None:
+    """A legacy identifier lives in the inventory and the registry, nowhere else.
+
+    `plan/contracts/R1-17.md` makes this a check row and `plan/gates.md`
+    makes it a scan failure: the identifier is permitted inside the two
+    sanctioned files precisely so that it can be classified and generated from,
+    and permitted nowhere else because every other occurrence is a copy that
+    nothing will ever retire.
+
+    Two rules, because a legacy identifier reaches this tree two ways.
+
+    1. The predecessor system's own prefix, matched by fingerprint so that
+       enforcing the rule does not violate it. The failure names the file and
+       line and never the value.
+    2. `LEGACY_*`, the product's compatibility spelling for an environment or
+       configuration name, written as a string literal in shipped Rust source.
+       That is a hand-written alias unless it is in the registry or in what the
+       registry generates, and a hand-written alias has no authorizing entry.
+
+    Both are guarded against being vacuous: rule 1 must still match inside the
+    sanctioned inventory, and rule 2 must still have a generated spelling to be
+    about. A rule that matches nothing measures nothing.
+    """
+    lengths = {rule["length"] for rule in LEGACY_TOKEN_FINGERPRINTS}
+    reasons = {rule["digest"]: rule["reason"] for rule in LEGACY_TOKEN_FINGERPRINTS}
+    sanctioned_occurrences = 0
+    generated_spellings = 0
+
+    for path in repository_files():
+        relative = path.relative_to(ROOT)
+        text = readable_text(path)
+        if text is None:
+            continue
+        label = relative.as_posix()
+        permitted = label in LEGACY_IDENTIFIER_HOMES
+        shipped_rust = SHIPPED_RUST.match(label) is not None
+
+        for number, line in enumerate(text.splitlines(), start=1):
+            for word in WORD.findall(line):
+                if len(word) not in lengths:
+                    continue
+                digest = hashlib.sha256(word.lower().encode()).hexdigest()
+                reason = reasons.get(digest)
+                if reason is None:
+                    continue
+                if label == LEGACY_INVENTORY:
+                    sanctioned_occurrences += 1
+                if not permitted:
+                    fail(f"{label}:{number} names a legacy identifier ({reason}); "
+                         f"it is permitted only in " + ", ".join(sorted(LEGACY_IDENTIFIER_HOMES))
+                         + " — use the neutral description here")
+            if not shipped_rust:
+                continue
+            for alias in ALIAS_LITERAL.findall(line):
+                if label == GENERATED_REGISTRY:
+                    generated_spellings += 1
+                elif not permitted:
+                    fail(f"{label}:{number} writes the legacy spelling {alias} by hand; "
+                         f"a compatibility spelling is generated from the registry in "
+                         f"{NAME_REGISTRY}, and one that is not in it has no authorizing "
+                         f"entry")
+
+    if not sanctioned_occurrences:
+        fail(f"the legacy-identifier fingerprints match nothing in {LEGACY_INVENTORY}, "
+             f"so the rule proves nothing: either the identifier left the inventory "
+             f"and the rule should go with it, or the fingerprints have rotted")
+    if not generated_spellings:
+        fail(f"{GENERATED_REGISTRY} generates no LEGACY_* spelling, so the "
+             f"hand-written-alias rule has nothing to be about; regenerate it, or "
+             f"drop the rule with the registry entry it guarded")
 
 
 def check_bidirectional(items: list[dict]) -> None:
@@ -464,6 +623,7 @@ def main() -> int:
 
     check_authority()
     check_source_licences()
+    check_legacy_identifier_location()
 
     if data.get("item_count") != len(items):
         fail(f"item_count says {data.get('item_count')} but the file has {len(items)}")

@@ -281,6 +281,8 @@ ITEM_STATUS = {
     # fails-if-removed. Read plan/evidence/<id>.json before relying on one.
     "R1-03": "done",
     "R1-04": "done",
+    "R1-05": "done",
+    "R1-06": "done",
     "R1-07": "done",
     "R1-08": "done",
     "R1-09": "done",
@@ -291,7 +293,11 @@ ITEM_STATUS = {
     "R1-13": "done",
     "R1-14": "done",
     "R1-15": "done",
+    # R1-12 and R1-17 stay open on purpose. R1-12 needs owner acceptance of the
+    # two contract amendments it proposes; R1-17's last row is blocked on R0-13,
+    # which does not exist yet. Neither may be closed on the work done here.
     "R1-16": "done",  # (*)
+    "R1-18": "done",
     "R1-19": "done",  # (*)
     "R1-20": "done",  # (*)
     "R1-21": "done",  # (*)

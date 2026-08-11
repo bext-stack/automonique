@@ -8,7 +8,7 @@
 
 use automonique_protocol::codec::{
     CodecError, Envelope, FrameDecode, MAX_NESTING_DEPTH, MajorVersion, MessageKind, ProtocolName,
-    RequestId, decode_frame, encode_frame,
+    RequestId, SupportedProtocol, VersionRange, decode_frame, encode_frame,
 };
 use automonique_protocol::wire::{JsonValue, MAX_JSON_ENTRIES, Message, parse_canonical};
 
@@ -318,6 +318,20 @@ mod envelope_decoding {
     }
 
     #[test]
+    fn an_envelope_body_survives_a_field_this_build_does_not_define() {
+        let payload = br#"{"body":{"after":1,"future_field":"tolerated"},"kind":"subscribe","protocol":"automonique.runner","request_id":"r","version":1}"#;
+        let decoded = Message::from_canonical_bytes(payload).expect("additive fields decode");
+        assert_eq!(
+            decoded
+                .body()
+                .get("future_field")
+                .and_then(JsonValue::as_str),
+            Some("tolerated")
+        );
+        assert_eq!(decoded.to_canonical_bytes(), payload);
+    }
+
+    #[test]
     fn no_refusal_echoes_the_payload() {
         let secret = "s3cr3t-token";
         let payload = format!(
@@ -325,5 +339,166 @@ mod envelope_decoding {
         );
         let error = Message::from_canonical_bytes(payload.as_bytes()).expect_err("bad kind");
         assert!(!error.to_string().contains(secret));
+    }
+}
+
+/// Admission: what a peer implements, decided after the message is understood
+/// and never guessed.
+mod envelope_admission {
+    use super::*;
+
+    fn supported(name: &str, min: u32, max: u32) -> SupportedProtocol {
+        SupportedProtocol::new(
+            ProtocolName::new(name).expect("valid name"),
+            VersionRange::new(
+                MajorVersion::new(min).expect("valid"),
+                MajorVersion::new(max).expect("valid"),
+            )
+            .expect("range is not inverted"),
+        )
+    }
+
+    fn envelope_payload(protocol: &str, version: u32) -> String {
+        format!(
+            r#"{{"body":{{}},"kind":"subscribe","protocol":"{protocol}","request_id":"r","version":{version}}}"#
+        )
+    }
+
+    #[test]
+    fn an_implemented_protocol_at_a_supported_version_is_admitted() {
+        let payload = envelope_payload("automonique.runner", 2);
+        let decoded = Message::from_canonical_bytes_admitted(
+            payload.as_bytes(),
+            &[supported("automonique.runner", 1, 3)],
+        )
+        .expect("admitted");
+        assert_eq!(decoded.envelope().protocol().as_str(), "automonique.runner");
+        assert_eq!(decoded.envelope().version().get(), 2);
+    }
+
+    #[test]
+    fn a_protocol_this_peer_does_not_implement_is_refused() {
+        let payload = envelope_payload("automonique.unimplemented", 1);
+        assert_eq!(
+            Message::from_canonical_bytes_admitted(
+                payload.as_bytes(),
+                &[supported("automonique.runner", 1, 1)],
+            )
+            .expect_err("unimplemented protocol"),
+            CodecError::UnknownProtocol
+        );
+    }
+
+    #[test]
+    fn a_major_version_outside_the_range_is_refused_naming_the_range() {
+        let payload = envelope_payload("automonique.runner", 4);
+        assert_eq!(
+            Message::from_canonical_bytes_admitted(
+                payload.as_bytes(),
+                &[supported("automonique.runner", 1, 3)],
+            )
+            .expect_err("unsupported major"),
+            CodecError::UnsupportedVersion {
+                supported_min: 1,
+                supported_max: 3,
+                offered: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn the_two_negotiation_axes_stay_distinct() {
+        // A version refusal must not be reported as an unknown protocol, and an
+        // unknown protocol must not be reported as a version mismatch: a peer
+        // upgrades in response to one and not the other.
+        let unknown = envelope_payload("automonique.other", 1);
+        let outdated = envelope_payload("automonique.runner", 9);
+        let peer = [supported("automonique.runner", 1, 3)];
+        assert_eq!(
+            Message::from_canonical_bytes_admitted(unknown.as_bytes(), &peer)
+                .expect_err("unknown")
+                .category(),
+            "unknown_protocol"
+        );
+        assert_eq!(
+            Message::from_canonical_bytes_admitted(outdated.as_bytes(), &peer)
+                .expect_err("outdated")
+                .category(),
+            "unsupported_version"
+        );
+    }
+
+    #[test]
+    fn an_empty_supported_set_implements_nothing() {
+        let payload = envelope_payload("automonique.runner", 1);
+        assert_eq!(
+            Message::from_canonical_bytes_admitted(payload.as_bytes(), &[])
+                .expect_err("nothing is implemented"),
+            CodecError::UnknownProtocol
+        );
+    }
+
+    #[test]
+    fn another_entry_does_not_mask_a_version_refusal() {
+        // The entry that carries the name owns the verdict, wherever it sits in
+        // the list; entries that do not carry it must not turn a version
+        // refusal back into an unknown protocol.
+        let payload = envelope_payload("automonique.runner", 9);
+        for peer in [
+            [
+                supported("automonique.other", 1, 1),
+                supported("automonique.runner", 1, 3),
+            ],
+            [
+                supported("automonique.runner", 1, 3),
+                supported("automonique.other", 1, 1),
+            ],
+        ] {
+            assert_eq!(
+                Message::from_canonical_bytes_admitted(payload.as_bytes(), &peer)
+                    .expect_err("unsupported major"),
+                CodecError::UnsupportedVersion {
+                    supported_min: 1,
+                    supported_max: 3,
+                    offered: 9,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn shape_is_settled_before_negotiation() {
+        // Every one of these names an unimplemented protocol as well as being
+        // malformed. A peer told its protocol is unknown when its message is
+        // what is broken would change the wrong thing.
+        for (payload, expected) in [
+            (
+                r#"{"body":{},"kind":"subscribe","protocol":"automonique.unimplemented","request_id":"r"}"#,
+                "missing_field",
+            ),
+            (
+                r#"{"body":{},"kind":"Subscribe","protocol":"automonique.unimplemented","request_id":"r","version":1}"#,
+                "field_grammar",
+            ),
+            (
+                r#"{"body":{},"kind":"subscribe","protocol":"automonique.unimplemented","request_id":"r","version":0}"#,
+                "field_invalid",
+            ),
+            (
+                r#"{"body":{}, "kind":"subscribe","protocol":"automonique.unimplemented","request_id":"r","version":1}"#,
+                "non_canonical_json",
+            ),
+        ] {
+            assert_eq!(
+                Message::from_canonical_bytes_admitted(
+                    payload.as_bytes(),
+                    &[supported("automonique.runner", 1, 1)],
+                )
+                .expect_err("shape refusal")
+                .category(),
+                expected,
+                "{payload}"
+            );
+        }
     }
 }

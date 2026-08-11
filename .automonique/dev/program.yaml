@@ -3,7 +3,7 @@
   "schema": "automonique.dev-program/v1",
   "source": {
     "graph": "plan/work-graph.toml",
-    "graph_sha256": "35b269fc55c749458ec8be9c4e1ebab5dbed2a24b00e79f82b3fc7e0744b214d",
+    "graph_sha256": "e68c4e6b8da3322d6a2a5794dd27433a39965ed7e1df300bd5b7915a5b94a617",
     "item_count": 375
   },
   "items": [
@@ -1170,9 +1170,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-05.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-06",
@@ -1193,9 +1193,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-06.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-07",
@@ -1471,9 +1471,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-18.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-19",

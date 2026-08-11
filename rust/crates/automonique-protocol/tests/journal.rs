@@ -612,27 +612,118 @@ mod cursor_monotonicity {
         ));
     }
 
-    /// A cursor above the retained window resumes live.
+    /// The one position outside the retained window that is still live.
     ///
-    /// This is the implemented reading of the contract sentence "a cursor
-    /// outside the retained range yields `resync_required`": `resume_within`
-    /// reads "outside" as "below". Under the literal reading, position 401 is
-    /// outside `100..=400` and would resync, so this test encodes the opposite
-    /// of the contract's wording and does so deliberately — `position` is the
-    /// *next* position the consumer will receive, so `last + 1` is the ordinary
-    /// caught-up state and resyncing it would demand a snapshot of history the
-    /// consumer already has. `event::resolve_subscription` applies the same
-    /// rule. The evidence file records the Cursor monotonicity row as not
-    /// closed on account of the difference rather than treating this test as
-    /// settling it.
+    /// `caught_up` is `last + 1`: the position of a consumer that has received
+    /// everything retained. It is outside `100..=400` and resumes live anyway,
+    /// which is the single point where this differs from reading the contract
+    /// sentence "a cursor outside the retained range yields `resync_required`"
+    /// literally. The difference is forced rather than chosen — a cursor names
+    /// the boundary before the next event it will receive, so the resumable set
+    /// is one larger than the retained set — and resyncing this consumer would
+    /// hand it a snapshot of history it already has, then leave it at the same
+    /// position, forever. Recorded as amendment A2 in `plan/contracts/R1-12.md`
+    /// rather than treated as settled by this test.
     #[test]
-    fn a_caught_up_cursor_is_live_rather_than_a_resync() {
+    fn the_caught_up_position_is_live_and_is_the_only_such_position() {
         let retained = RetainedRange::new(100, 400).expect("ordered window");
-        let cursor = JournalCursor::new("projector", "work", 401).expect("valid");
+        assert_eq!(retained.caught_up(), 401);
+
+        let caught_up = JournalCursor::new("projector", "work", 401).expect("valid");
         assert_eq!(
-            cursor.resume_within(retained),
+            caught_up.resume_within(retained),
             CursorResume::Live { from: 401 }
         );
+
+        // One position further on is not caught up, it is ahead of the topic.
+        let ahead = JournalCursor::new("projector", "work", 402).expect("valid");
+        assert_eq!(
+            ahead.resume_within(retained),
+            CursorResume::ResyncRequired {
+                snapshot_from: 100,
+                snapshot_to: 400,
+            }
+        );
+    }
+
+    #[test]
+    fn a_cursor_ahead_of_the_topic_resyncs_rather_than_skipping_silently() {
+        let retained = RetainedRange::new(100, 400).expect("ordered window");
+        // Reachable after a topic is truncated or rebuilt behind a durable
+        // cursor. Serving these live would begin delivery at a position the
+        // topic has not reached, silently skipping everything written between
+        // 401 and the cursor.
+        for position in [402, 500, 10_000, u64::MAX] {
+            let ahead = JournalCursor::new("projector", "work", position).expect("valid");
+            let resume = ahead.resume_within(retained);
+            assert_eq!(
+                resume,
+                CursorResume::ResyncRequired {
+                    snapshot_from: 100,
+                    snapshot_to: 400,
+                },
+                "a cursor at {position} is ahead of 100..=400 and must be told \
+                 where to catch up from"
+            );
+            assert_eq!(
+                resume.outcome().expect("terminal outcome").as_str(),
+                "resync_required"
+            );
+        }
+    }
+
+    #[test]
+    fn the_resumable_window_is_first_through_caught_up_inclusive() {
+        let retained = RetainedRange::new(100, 400).expect("ordered window");
+        for position in [0, 1, 98, 99] {
+            let cursor = JournalCursor::new("projector", "work", position).expect("valid");
+            assert!(
+                matches!(
+                    cursor.resume_within(retained),
+                    CursorResume::ResyncRequired { .. }
+                ),
+                "{position} is below the window and must resync"
+            );
+        }
+        for position in [100, 101, 250, 399, 400, 401] {
+            let cursor = JournalCursor::new("projector", "work", position).expect("valid");
+            assert_eq!(
+                cursor.resume_within(retained),
+                CursorResume::Live { from: position },
+                "{position} is resumable and must stream live from itself"
+            );
+        }
+        for position in [402, 403] {
+            let cursor = JournalCursor::new("projector", "work", position).expect("valid");
+            assert!(
+                matches!(
+                    cursor.resume_within(retained),
+                    CursorResume::ResyncRequired { .. }
+                ),
+                "{position} is above the window and must resync"
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_ending_at_the_last_representable_position_does_not_overflow() {
+        // `caught_up` is `last + 1`, which has nowhere to go here. It saturates
+        // rather than wrapping to 0 (which would resync every cursor) or
+        // panicking in a debug build.
+        let retained = RetainedRange::new(u64::MAX - 2, u64::MAX).expect("ordered window");
+        assert_eq!(retained.caught_up(), u64::MAX);
+        for position in [u64::MAX - 2, u64::MAX - 1, u64::MAX] {
+            let cursor = JournalCursor::new("projector", "work", position).expect("valid");
+            assert_eq!(
+                cursor.resume_within(retained),
+                CursorResume::Live { from: position }
+            );
+        }
+        let stale = JournalCursor::new("projector", "work", u64::MAX - 3).expect("valid");
+        assert!(matches!(
+            stale.resume_within(retained),
+            CursorResume::ResyncRequired { .. }
+        ));
     }
 
     #[test]
@@ -647,7 +738,23 @@ mod cursor_monotonicity {
     }
 }
 
+/// What replay hands a projection, and the limit on what that proves.
+///
+/// The type-level half of this row lives in `src/journal.rs` as four paired
+/// compile-fail cases: `replay` takes no second argument (E0061), `apply`
+/// cannot be widened to receive a handle (E0050) or ask for the event by `&mut`
+/// (E0053), and an `Outbox` cannot be obtained from this crate by naming its
+/// field (E0451) or by the conventional constructor (E0599).
+///
+/// The tests here pin the behavioural half — replay shows a projection the
+/// journal's own events, once each, in order, and shows it nothing else — and
+/// then demonstrate the limit: a projection that brought its own channel emits
+/// through it during replay. That last test asserts the counterexample rather
+/// than the guarantee, deliberately, so this file and the documentation cannot
+/// drift into claiming an enforcement that safe Rust cannot perform.
 mod replay_purity {
+    use std::sync::mpsc;
+
     use super::*;
 
     #[derive(Default)]
@@ -659,6 +766,37 @@ mod replay_purity {
         fn apply(&mut self, event: &DomainEvent) {
             self.seen.push(event.event_id());
         }
+    }
+
+    /// Records every event it is shown, whole, in the order it saw them.
+    #[derive(Default)]
+    struct Recorder {
+        shown: Vec<DomainEvent>,
+    }
+
+    impl Projection for Recorder {
+        fn apply(&mut self, event: &DomainEvent) {
+            self.shown.push(event.clone());
+        }
+    }
+
+    /// A projection that brought its own effect handle.
+    struct Emitter {
+        sink: mpsc::Sender<u64>,
+    }
+
+    impl Projection for Emitter {
+        fn apply(&mut self, event: &DomainEvent) {
+            self.sink.send(event.event_id()).expect("receiver alive");
+        }
+    }
+
+    fn journal_of_three() -> Journal {
+        let mut journal = Journal::new();
+        journal.append(event(1, "w-1", 1, 1)).expect("first");
+        journal.append(event(2, "w-2", 1, 1)).expect("second");
+        journal.append(event(3, "w-1", 2, 1)).expect("third");
+        journal
     }
 
     #[test]
@@ -684,6 +822,68 @@ mod replay_purity {
             journal.replay(&mut projection);
             assert_eq!(projection.seen, vec![1]);
         }
+        // Stated rather than relied on: this assertion cannot fail, because
+        // `replay` takes `&self` and `Journal` has no interior mutability. The
+        // type carries it; the assertion only documents it.
         assert_eq!(journal, before, "replay mutated the journal");
+    }
+
+    #[test]
+    fn replay_shows_the_projection_the_journals_own_events_and_nothing_else() {
+        let journal = journal_of_three();
+        let mut recorder = Recorder::default();
+        journal.replay(&mut recorder);
+
+        // Not just the ids: the whole event, once each, in the journal's own
+        // order. A replay that fabricated, dropped, duplicated or reordered an
+        // event would differ here.
+        assert_eq!(recorder.shown.as_slice(), journal.events());
+        assert_eq!(recorder.shown.len(), 3);
+    }
+
+    #[test]
+    fn every_replay_of_one_journal_shows_the_same_events() {
+        let journal = journal_of_three();
+        let mut runs: Vec<Vec<DomainEvent>> = Vec::new();
+        for _ in 0..3 {
+            let mut recorder = Recorder::default();
+            journal.replay(&mut recorder);
+            runs.push(recorder.shown);
+        }
+        // Replay is a function of the journal alone: three runs of the same
+        // journal are indistinguishable. This would catch a replay that
+        // consulted a clock, a counter or any state outside the journal to
+        // decide what to show; it does not, and cannot, catch one that
+        // performed a constant effect on the way past.
+        assert_eq!(runs[0], runs[1]);
+        assert_eq!(runs[1], runs[2]);
+        assert_eq!(runs[0].as_slice(), journal.events());
+    }
+
+    /// The named limit, asserted as the counterexample it is.
+    ///
+    /// Replay hands out nothing, and this projection needed nothing handed to
+    /// it: it was constructed holding a channel, so it emits through it inside
+    /// `apply`. Rust has no effect system and no signature on `replay` or
+    /// `Projection` can prevent this, so the contract row's "no effect is
+    /// reachable inside replay" is not enforceable and is not claimed. If this
+    /// test ever fails, the module documentation in `src/journal.rs` is what
+    /// has to change, not this test.
+    #[test]
+    fn a_projection_emits_during_replay_through_a_handle_it_brought() {
+        let (sink, received) = mpsc::channel();
+        let mut emitter = Emitter { sink };
+        let journal = journal_of_three();
+
+        journal.replay(&mut emitter);
+
+        drop(emitter);
+        let emitted: Vec<u64> = received.iter().collect();
+        assert_eq!(
+            emitted,
+            vec![1, 2, 3],
+            "an effect crossed the replay boundary, which is the limit this \
+             row records rather than a regression"
+        );
     }
 }

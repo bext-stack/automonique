@@ -1,4 +1,87 @@
 {
+  "enum_fixtures": [
+    {
+      "bytes_hex": "7b226465636973696f6e223a22616c6c6f77227d",
+      "decoded": "known:allow",
+      "enum": "approval_decision",
+      "id": "enum-security-known",
+      "note": "a defined security-sensitive value decodes to its known variant",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b226465636973696f6e223a22616c6c6f775f616c77617973227d",
+      "category": "unknown_enum_value",
+      "enum": "approval_decision",
+      "id": "enum-security-unknown",
+      "note": "an undefined security-sensitive value is refused, never defaulted",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b227374617465223a2272756e6e696e67227d",
+      "decoded": "known:running",
+      "enum": "run_state",
+      "id": "enum-read-only-known",
+      "note": "a defined read-only value decodes to its known variant",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b227374617465223a2268696265726e61746564227d",
+      "decoded": "unknown:hibernated",
+      "enum": "run_state",
+      "id": "enum-read-only-unknown-value",
+      "note": "an undefined read-only value is tolerated and keeps its spelling",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b227374617465223a2278787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878227d",
+      "decoded": "unknown:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "enum": "run_state",
+      "id": "enum-read-only-unknown-at-max-bytes",
+      "note": "an undefined read-only value at exactly MAX_ENUM_VALUE_BYTES is retained",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b227374617465223a227878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878227d",
+      "category": "field_invalid",
+      "enum": "run_state",
+      "id": "enum-read-only-unknown-one-past-max-bytes",
+      "note": "an undefined read-only value one byte over the ceiling is refused, not truncated",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b227374617465223a22227d",
+      "category": "field_invalid",
+      "enum": "run_state",
+      "id": "enum-read-only-unknown-empty",
+      "note": "an empty spelling is not a value to retain",
+      "outcome": "reject"
+    }
+  ],
+  "enums": [
+    {
+      "field": "decision",
+      "id": "approval_decision",
+      "kind": "security_sensitive",
+      "known": [
+        "allow",
+        "ask",
+        "deny"
+      ],
+      "note": "an undefined value selects behaviour with a security consequence and is refused"
+    },
+    {
+      "field": "state",
+      "id": "run_state",
+      "kind": "read_only",
+      "known": [
+        "failed",
+        "queued",
+        "running",
+        "succeeded"
+      ],
+      "note": "an undefined value is displayed, never interpreted, so it is retained"
+    }
+  ],
   "envelope_ids": [
     "envelope-minimal",
     "envelope-with-body",
@@ -6,7 +89,21 @@
     "envelope-missing-protocol",
     "envelope-wrong-type",
     "envelope-version-zero",
-    "envelope-kind-grammar"
+    "envelope-kind-grammar",
+    "envelope-unknown-protocol",
+    "envelope-unsupported-major",
+    "envelope-protocol-at-max-bytes",
+    "envelope-protocol-one-past-max-bytes",
+    "envelope-request-id-at-max-bytes",
+    "envelope-request-id-one-past-max-bytes",
+    "envelope-kind-at-max-bytes",
+    "envelope-kind-one-past-max-bytes",
+    "envelope-protocol-empty",
+    "envelope-protocol-control-character",
+    "envelope-request-id-empty",
+    "envelope-kind-empty",
+    "envelope-version-negative",
+    "envelope-version-past-u32"
   ],
   "fixtures": [
     {
@@ -308,8 +405,349 @@
       "id": "nesting-at-ceiling",
       "note": "exactly at the depth ceiling",
       "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22737562736372696265222c2270726f746f636f6c223a226175746f6d6f6e697175652e756e696d706c656d656e746564222c22726571756573745f6964223a227265712d6e65676f74696174652d31222c2276657273696f6e223a317d",
+      "category": "unknown_protocol",
+      "id": "envelope-unknown-protocol",
+      "note": "well-formed envelope naming a protocol this peer does not implement",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22737562736372696265222c2270726f746f636f6c223a226175746f6d6f6e697175652e72756e6e6572222c22726571756573745f6964223a227265712d6e65676f74696174652d32222c2276657273696f6e223a327d",
+      "category": "unsupported_version",
+      "id": "envelope-unsupported-major",
+      "note": "major version outside the supported range of a known protocol",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22737562736372696265222c2270726f746f636f6c223a226175746f6d6f6e697175652e626f756e646172792e61616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c22726571756573745f6964223a227265712d626f756e642d31222c2276657273696f6e223a317d",
+      "id": "envelope-protocol-at-max-bytes",
+      "note": "protocol name at exactly MAX_PROTOCOL_NAME_BYTES",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22737562736372696265222c2270726f746f636f6c223a226175746f6d6f6e697175652e626f756e646172792e6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c22726571756573745f6964223a227265712d626f756e642d32222c2276657273696f6e223a317d",
+      "category": "field_invalid",
+      "id": "envelope-protocol-one-past-max-bytes",
+      "note": "protocol name one byte past MAX_PROTOCOL_NAME_BYTES",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22737562736372696265222c2270726f746f636f6c223a226175746f6d6f6e697175652e72756e6e6572222c22726571756573745f6964223a227272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272222c2276657273696f6e223a317d",
+      "id": "envelope-request-id-at-max-bytes",
+      "note": "request identifier at exactly MAX_REQUEST_ID_BYTES",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22737562736372696265222c2270726f746f636f6c223a226175746f6d6f6e697175652e72756e6e6572222c22726571756573745f6964223a22727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272727272222c2276657273696f6e223a317d",
+      "category": "field_invalid",
+      "id": "envelope-request-id-one-past-max-bytes",
+      "note": "request identifier one byte past MAX_REQUEST_ID_BYTES",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a226b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b222c2270726f746f636f6c223a226175746f6d6f6e697175652e72756e6e6572222c22726571756573745f6964223a227265712d626f756e642d33222c2276657273696f6e223a317d",
+      "id": "envelope-kind-at-max-bytes",
+      "note": "message kind at exactly MAX_MESSAGE_KIND_BYTES",
+      "outcome": "accept"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a226b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b222c2270726f746f636f6c223a226175746f6d6f6e697175652e72756e6e6572222c22726571756573745f6964223a227265712d626f756e642d34222c2276657273696f6e223a317d",
+      "category": "field_invalid",
+      "id": "envelope-kind-one-past-max-bytes",
+      "note": "message kind one byte past MAX_MESSAGE_KIND_BYTES",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22737562736372696265222c2270726f746f636f6c223a22222c22726571756573745f6964223a227265712d626f756e642d35222c2276657273696f6e223a317d",
+      "category": "field_invalid",
+      "id": "envelope-protocol-empty",
+      "note": "an empty protocol name is a bounded-value refusal, not a grammar one",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22737562736372696265222c2270726f746f636f6c223a225c7530303031222c22726571756573745f6964223a227265712d626f756e642d36222c2276657273696f6e223a317d",
+      "category": "field_invalid",
+      "id": "envelope-protocol-control-character",
+      "note": "an escaped control character is a bounded-value refusal, checked before grammar",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22737562736372696265222c2270726f746f636f6c223a226175746f6d6f6e697175652e72756e6e6572222c22726571756573745f6964223a22222c2276657273696f6e223a317d",
+      "category": "field_invalid",
+      "id": "envelope-request-id-empty",
+      "note": "an empty request identifier is a bounded-value refusal",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22222c2270726f746f636f6c223a226175746f6d6f6e697175652e72756e6e6572222c22726571756573745f6964223a227265712d626f756e642d37222c2276657273696f6e223a317d",
+      "category": "field_invalid",
+      "id": "envelope-kind-empty",
+      "note": "an empty message kind is a bounded-value refusal",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22737562736372696265222c2270726f746f636f6c223a226175746f6d6f6e697175652e72756e6e6572222c22726571756573745f6964223a227265712d626f756e642d38222c2276657273696f6e223a2d317d",
+      "category": "invalid_json_value",
+      "id": "envelope-version-negative",
+      "note": "a negative major version is not a u32 and never reaches the version rule",
+      "outcome": "reject"
+    },
+    {
+      "bytes_hex": "7b22626f6479223a7b7d2c226b696e64223a22737562736372696265222c2270726f746f636f6c223a226175746f6d6f6e697175652e72756e6e6572222c22726571756573745f6964223a227265712d626f756e642d39222c2276657273696f6e223a343239343936373239367d",
+      "category": "invalid_json_value",
+      "id": "envelope-version-past-u32",
+      "note": "one past the u32 ceiling is a type refusal, not an unsupported version",
+      "outcome": "reject"
     }
   ],
-  "note": "Checked-in corpus. Rust is the wire source of truth; a disagreement is fixed in the implementation, never in this file.",
-  "schema": "automonique.wire-fixtures/v1"
+  "frame_fixtures": [
+    {
+      "decode": {
+        "consumed": 6,
+        "outcome": "frame",
+        "payload_bytes": 2
+      },
+      "encode": {
+        "outcome": "accept",
+        "payload": [
+          {
+            "literal_hex": "7b7d"
+          }
+        ]
+      },
+      "id": "frame-minimal",
+      "input": [
+        {
+          "literal_hex": "00000002"
+        },
+        {
+          "literal_hex": "7b7d"
+        }
+      ],
+      "note": "the smallest frame that carries a payload"
+    },
+    {
+      "decode": {
+        "category": "empty_frame",
+        "outcome": "reject"
+      },
+      "encode": {
+        "category": "empty_frame",
+        "outcome": "reject",
+        "payload": []
+      },
+      "id": "frame-zero-length",
+      "input": [
+        {
+          "literal_hex": "00000000"
+        }
+      ],
+      "note": "a zero-length prefix carries no envelope and is refused on both paths"
+    },
+    {
+      "decode": {
+        "consumed": 8388612,
+        "outcome": "frame",
+        "payload_bytes": 8388608
+      },
+      "encode": {
+        "outcome": "accept",
+        "payload": [
+          {
+            "count": 8388608,
+            "repeat_hex": "61"
+          }
+        ]
+      },
+      "id": "frame-at-max-bytes",
+      "input": [
+        {
+          "literal_hex": "00800000"
+        },
+        {
+          "count": 8388608,
+          "repeat_hex": "61"
+        }
+      ],
+      "note": "a payload of exactly MAX_FRAME_BYTES, expressed as a generator rule so the corpus stays reviewable"
+    },
+    {
+      "decode": {
+        "category": "frame_too_large",
+        "outcome": "reject"
+      },
+      "encode": {
+        "category": "frame_too_large",
+        "outcome": "reject",
+        "payload": [
+          {
+            "count": 8388609,
+            "repeat_hex": "61"
+          }
+        ]
+      },
+      "id": "frame-one-past-max-bytes",
+      "input": [
+        {
+          "literal_hex": "00800001"
+        }
+      ],
+      "note": "one byte over the ceiling is refused from the prefix alone, before any allocation"
+    },
+    {
+      "decode": {
+        "additional": 2,
+        "outcome": "need_more"
+      },
+      "id": "frame-need-more-prefix",
+      "input": [
+        {
+          "literal_hex": "0000"
+        }
+      ],
+      "note": "a partial length prefix asks for the missing prefix bytes and consumes nothing"
+    },
+    {
+      "decode": {
+        "additional": 3,
+        "outcome": "need_more"
+      },
+      "id": "frame-need-more-payload",
+      "input": [
+        {
+          "literal_hex": "00000005"
+        },
+        {
+          "literal_hex": "7b7d"
+        }
+      ],
+      "note": "a partial payload asks for exactly the outstanding bytes"
+    },
+    {
+      "decode": {
+        "additional": 8388607,
+        "outcome": "need_more"
+      },
+      "id": "frame-need-more-at-max-bytes",
+      "input": [
+        {
+          "literal_hex": "00800000"
+        },
+        {
+          "literal_hex": "61"
+        }
+      ],
+      "note": "a maximal declared length with one payload byte waits rather than allocating"
+    },
+    {
+      "decode": {
+        "consumed": 6,
+        "outcome": "frame",
+        "payload_bytes": 2
+      },
+      "id": "frame-trailing-bytes-are-not-consumed",
+      "input": [
+        {
+          "literal_hex": "00000002"
+        },
+        {
+          "literal_hex": "7b7d"
+        },
+        {
+          "literal_hex": "00000002"
+        }
+      ],
+      "note": "a second frame's prefix is left in the buffer"
+    }
+  ],
+  "generated_fixtures": [
+    {
+      "id": "string-at-json-string-ceiling",
+      "note": "a string of exactly MAX_JSON_STRING_BYTES UTF-8 bytes",
+      "outcome": "accept",
+      "segments": [
+        {
+          "literal_hex": "22"
+        },
+        {
+          "count": 65536,
+          "repeat_hex": "61"
+        },
+        {
+          "literal_hex": "22"
+        }
+      ]
+    },
+    {
+      "category": "field_invalid",
+      "id": "string-one-past-json-string-ceiling",
+      "note": "one byte past MAX_JSON_STRING_BYTES is refused rather than truncated",
+      "outcome": "reject",
+      "segments": [
+        {
+          "literal_hex": "22"
+        },
+        {
+          "count": 65537,
+          "repeat_hex": "61"
+        },
+        {
+          "literal_hex": "22"
+        }
+      ]
+    },
+    {
+      "id": "array-at-entry-ceiling",
+      "note": "an array of exactly MAX_JSON_ENTRIES integers",
+      "outcome": "accept",
+      "segments": [
+        {
+          "literal_hex": "5b"
+        },
+        {
+          "count": 4095,
+          "repeat_hex": "312c"
+        },
+        {
+          "literal_hex": "315d"
+        }
+      ]
+    },
+    {
+      "category": "too_many_entries",
+      "id": "array-one-past-entry-ceiling",
+      "note": "one entry past MAX_JSON_ENTRIES is refused",
+      "outcome": "reject",
+      "segments": [
+        {
+          "literal_hex": "5b"
+        },
+        {
+          "count": 4096,
+          "repeat_hex": "312c"
+        },
+        {
+          "literal_hex": "315d"
+        }
+      ]
+    }
+  ],
+  "note": "Checked-in corpus. Rust is the wire source of truth; a disagreement is fixed in the implementation, never in this file. Fixtures whose bytes are too large to review as a hex literal are expressed as generator segments; both implementations build the same bytes from the rule and exchange them as files so the comparison stays byte-for-byte.",
+  "schema": "automonique.wire-fixtures/v1",
+  "supported_protocols": [
+    {
+      "max_version": 1,
+      "min_version": 1,
+      "note": "the protocol every accepted envelope fixture names",
+      "protocol": "automonique.runner"
+    },
+    {
+      "max_version": 1,
+      "min_version": 1,
+      "note": "declared so the exact-ceiling protocol name is admitted rather than unknown",
+      "protocol": "automonique.boundary.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ]
 }

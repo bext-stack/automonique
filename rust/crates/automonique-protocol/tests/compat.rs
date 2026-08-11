@@ -5,10 +5,17 @@
 //! Each module corresponds to one row of the check table in
 //! `plan/contracts/R1-17.md`.
 
+use std::path::PathBuf;
+
 use automonique_protocol::compat::{
-    CompatError, IdentifierClass, LegacyAlias, MigrationContract, NameEntry, NameRegistry,
-    SpellingResolution,
+    CanonicalName, CompatError, IdentifierClass, LegacyAlias, LegacyName, MigrationContract,
+    NameEntry, NameRegistry, SpellingResolution, automonique_registry, emit_registry_module,
 };
+
+/// The checked-in module the registry generates.
+fn generated_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/compat/generated.rs")
+}
 
 fn contract() -> MigrationContract {
     MigrationContract::new("plan/contracts/R1-17.md").expect("valid contract")
@@ -86,6 +93,192 @@ mod single_source {
             CompatError::DuplicateSpelling {
                 spelling: "LEGACY_DB".to_owned(),
             }
+        );
+    }
+}
+
+mod generated_from_the_registry {
+    use super::*;
+
+    /// The registry the crate ships, as opposed to the one-entry fixture above.
+    #[test]
+    fn the_declared_registry_is_accepted_by_its_own_rules() {
+        let registry = automonique_registry();
+        assert!(
+            registry.entries().len() >= 4,
+            "the registry is the seed for every canonical name; it cannot be empty"
+        );
+        for entry in registry.entries() {
+            assert!(
+                !entry.aliases().is_empty(),
+                "{} declares no alias, so it has nothing to generate a compatibility \
+                 surface from",
+                entry.canonical()
+            );
+            for alias in entry.aliases() {
+                assert!(!alias.authorized_by().as_str().is_empty());
+                assert!(!alias.retire_after().is_empty());
+            }
+        }
+        // One owner and one durable identity per canonical name, over the real
+        // registry rather than the fixture. Every spelling is a row: the table
+        // is the proof, so a spelling missing from it would be a spot check.
+        let spellings: usize = registry
+            .entries()
+            .iter()
+            .map(|entry| 1 + entry.aliases().len())
+            .sum();
+        let table = registry.owner_table();
+        assert_eq!(table.len(), spellings);
+        println!(
+            "one-owner table: {} entries, {spellings} spellings, {} aliases",
+            registry.entries().len(),
+            registry.generated_aliases().len()
+        );
+        for row in table {
+            let resolved = match registry.resolve(&row.spelling) {
+                SpellingResolution::Canonical { entry } => entry,
+                SpellingResolution::Alias { entry, .. } => entry,
+                SpellingResolution::Unknown => panic!("{} resolves to nothing", row.spelling),
+            };
+            assert_eq!(row.owner, resolved.owner());
+            assert_eq!(row.durable_identity, resolved.durable_identity());
+        }
+    }
+
+    /// The drift check. `emit_registry_module` is the only writer of
+    /// `src/compat/generated.rs`, and this fails while the checked-in copy and
+    /// the registry disagree in either direction: a registry entry that was
+    /// never generated, and a spelling written into the generated file by hand.
+    #[test]
+    fn the_checked_in_module_is_what_the_registry_generates() {
+        let expected = emit_registry_module(&automonique_registry());
+        let path = generated_path();
+        if std::env::var_os("AUTOMONIQUE_REGENERATE_COMPAT").is_some() {
+            // Write atomically: a plain write leaves the file momentarily
+            // zero-length, and `tests/codegen.rs` records that racing a reader
+            // in the same parallel run turns the workspace red for reasons
+            // unrelated to the code under test.
+            let staging = path.with_extension("rs.staging");
+            std::fs::write(&staging, &expected).expect("stage the generated module");
+            std::fs::rename(&staging, &path).expect("publish the generated module");
+        }
+        let actual = std::fs::read_to_string(&path).expect("the generated module is checked in");
+        // Name the first difference rather than printing two whole modules: the
+        // failure a reader needs is which line drifted.
+        let difference = actual
+            .lines()
+            .zip(expected.lines())
+            .enumerate()
+            .find(|(_, (checked_in, generated))| checked_in != generated)
+            .map(|(index, (checked_in, generated))| {
+                format!(
+                    "line {}: checked in {checked_in:?}, registry generates {generated:?}",
+                    index + 1
+                )
+            });
+        assert_eq!(
+            difference, None,
+            "src/compat/generated.rs no longer matches the registry — regenerate with \
+             AUTOMONIQUE_REGENERATE_COMPAT=1 cargo test -p automonique-protocol --test compat"
+        );
+        assert_eq!(
+            actual.lines().count(),
+            expected.lines().count(),
+            "src/compat/generated.rs has a different number of lines from what the \
+             registry generates"
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn generation_is_deterministic() {
+        let first = emit_registry_module(&automonique_registry());
+        for _ in 0..8 {
+            assert_eq!(emit_registry_module(&automonique_registry()), first);
+        }
+    }
+
+    /// Every generated constant is a registry spelling, and every registry
+    /// spelling has a constant. A set difference in either direction is drift.
+    #[test]
+    fn the_generated_constants_and_the_registry_name_the_same_spellings() {
+        let registry = automonique_registry();
+
+        let generated_canonical: Vec<&str> = CanonicalName::ALL
+            .iter()
+            .map(|name| name.spelling())
+            .collect();
+        let declared_canonical: Vec<&str> = registry
+            .entries()
+            .iter()
+            .map(NameEntry::canonical)
+            .collect();
+        assert_eq!(generated_canonical, declared_canonical);
+
+        let generated_aliases: Vec<String> = LegacyName::ALL
+            .iter()
+            .map(|name| name.spelling().to_owned())
+            .collect();
+        let mut sorted = generated_aliases.clone();
+        sorted.sort();
+        assert_eq!(sorted, registry.generated_aliases());
+
+        // An alias constant forwards to the same entry the registry resolves it
+        // to, so the generated table cannot claim a different owner.
+        for alias in LegacyName::ALL {
+            let SpellingResolution::Alias { entry, observation } =
+                registry.resolve(alias.spelling())
+            else {
+                panic!("{} is not an alias in the registry", alias.spelling());
+            };
+            assert_eq!(alias.canonical().spelling(), entry.canonical());
+            assert_eq!(alias.canonical().owner(), entry.owner());
+            assert_eq!(
+                alias.canonical().durable_identity(),
+                entry.durable_identity()
+            );
+            assert_eq!(alias.retire_after(), observation.retire_after());
+        }
+    }
+
+    /// The generated names are distinct, so no two spellings collapse onto one
+    /// constant and quietly lose an entry.
+    #[test]
+    fn the_generated_constants_are_distinct() {
+        let generated = emit_registry_module(&automonique_registry());
+        let mut names: Vec<&str> = generated
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("pub const "))
+            .filter_map(|line| line.split_once(": Self = "))
+            .map(|(name, _)| name)
+            .collect();
+        let total = names.len();
+        assert_eq!(
+            total,
+            CanonicalName::ALL.len() + LegacyName::ALL.len(),
+            "every constant is one registry spelling"
+        );
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "two spellings produced one constant");
+    }
+
+    /// A hand-written alias is not merely undeclared, it is unnameable: the
+    /// paired doctests on `automonique_registry` compile the declared constant
+    /// and fail to compile an undeclared one. This is the runtime half — the
+    /// registry is the only thing that answers what a spelling means.
+    #[test]
+    fn an_undeclared_spelling_resolves_to_nothing() {
+        let registry = automonique_registry();
+        assert_eq!(
+            registry.resolve("LEGACY_RUNNER_OLD"),
+            SpellingResolution::Unknown
+        );
+        assert!(
+            !registry
+                .generated_aliases()
+                .contains(&"LEGACY_RUNNER_OLD".to_owned())
         );
     }
 }

@@ -6,6 +6,17 @@
 //! install one: nothing here performs I/O, hashes a real artifact, selects a
 //! release, spawns a generation or runs a migration.
 //!
+//! A manifest reaches a typed value by exactly two routes:
+//! [`ReleaseManifest::from_canonical_bytes`] for a manifest *document*, and
+//! [`ReleaseManifestBuilder`] for a programmatic assembly. Both end in the same
+//! validation, so a document and an assembly cannot disagree about what a valid
+//! manifest is. The document reader is [`crate::wire::parse_canonical`]; this
+//! module adds no second JSON parser.
+//!
+//! Every string a manifest can hold is a [`ManifestText`]. Its constructor is
+//! the only way to obtain one, so the bound, the control-character rule and the
+//! absolute-host-path refusal cannot be forgotten by a field added later.
+//!
 //! Version ranges reuse [`crate::codec::VersionRange`], so the protocol, event
 //! and database-schema ranges share one algebra with wire negotiation rather
 //! than growing a second, subtly different one.
@@ -15,6 +26,7 @@ use std::error::Error;
 
 use crate::codec::{CodecError, MajorVersion, VersionRange};
 use crate::primitives::ValueError;
+use crate::wire::{JsonValue, parse_canonical};
 
 /// Manifest schema revision this build writes and understands.
 pub const MANIFEST_SCHEMA_REVISION: u32 = 1;
@@ -27,6 +39,26 @@ pub const MAX_MANIFEST_FIELD_BYTES: usize = 128;
 
 /// Maximum number of retained unknown fields.
 pub const MAX_UNKNOWN_FIELDS: usize = 64;
+
+/// Document keys this build interprets, in canonical order.
+///
+/// A key outside this set is retained as an unknown field and never
+/// reinterpreted. The set is public so a coverage table can be checked against
+/// it rather than restated.
+pub const KNOWN_MANIFEST_FIELDS: [&str; 12] = [
+    "build_target",
+    "capabilities",
+    "credentials",
+    "database_schema",
+    "digests",
+    "events",
+    "protocol",
+    "rollback",
+    "schema_revision",
+    "sdk",
+    "source_revision",
+    "version",
+];
 
 /// Which artifact a digest covers.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -56,6 +88,23 @@ impl ArtifactKind {
             Self::Persona => "persona",
             Self::Companion => "companion",
             Self::Asset => "asset",
+        }
+    }
+
+    /// Map a wire spelling to an artifact this build defines.
+    ///
+    /// Returns `None` for anything else, so a document cannot introduce an
+    /// artifact kind by naming one.
+    #[must_use]
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "binary" => Some(Self::Binary),
+            "schema_bundle" => Some(Self::SchemaBundle),
+            "policy" => Some(Self::Policy),
+            "persona" => Some(Self::Persona),
+            "companion" => Some(Self::Companion),
+            "asset" => Some(Self::Asset),
+            _ => None,
         }
     }
 }
@@ -111,6 +160,11 @@ impl DigestAlgorithm {
 /// No variant carries artifact contents, a credential value or a host path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManifestError {
+    /// The bytes are not a canonical manifest document.
+    Document {
+        /// Refusal the canonical reader returned.
+        error: CodecError,
+    },
     /// The manifest declares a schema revision this build cannot interpret.
     UnsupportedSchemaRevision {
         /// Highest revision this build understands.
@@ -121,6 +175,11 @@ pub enum ManifestError {
     /// A required field was absent. Nothing defaults silently.
     MissingField {
         /// The absent field.
+        field: &'static str,
+    },
+    /// A field was present with the wrong JSON type.
+    FieldType {
+        /// The rejected field.
         field: &'static str,
     },
     /// A bounded field violated the shared value rules.
@@ -136,6 +195,11 @@ pub enum ManifestError {
         field: &'static str,
         /// Range violation.
         error: CodecError,
+    },
+    /// A closed enumeration received a spelling this build does not define.
+    UnknownEnumValue {
+        /// The rejected field.
+        field: &'static str,
     },
     /// The digest algorithm is unknown or weakened.
     UnacceptableDigestAlgorithm,
@@ -162,7 +226,7 @@ pub enum ManifestError {
         /// The rollback target's database schema range.
         rollback_max: u32,
     },
-    /// A field that must be a relative path was absolute.
+    /// A field that must be a relative value held an absolute host path.
     AbsolutePath {
         /// The rejected field.
         field: &'static str,
@@ -179,10 +243,13 @@ impl ManifestError {
     #[must_use]
     pub const fn category(&self) -> &'static str {
         match self {
+            Self::Document { .. } => "malformed_document",
             Self::UnsupportedSchemaRevision { .. } => "unsupported_schema_revision",
             Self::MissingField { .. } => "missing_field",
+            Self::FieldType { .. } => "field_type",
             Self::Field { .. } => "field_invalid",
             Self::Range { .. } => "range_invalid",
+            Self::UnknownEnumValue { .. } => "unknown_enum_value",
             Self::UnacceptableDigestAlgorithm => "unacceptable_digest_algorithm",
             Self::MalformedDigest { .. } => "malformed_digest",
             Self::DigestMismatch { .. } => "digest_mismatch",
@@ -196,6 +263,9 @@ impl ManifestError {
 impl fmt::Display for ManifestError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Document { error } => {
+                write!(formatter, "manifest document is not canonical: {error}")
+            }
             Self::UnsupportedSchemaRevision {
                 supported_max,
                 declared,
@@ -204,8 +274,15 @@ impl fmt::Display for ManifestError {
                 "manifest schema revision {declared} exceeds the supported {supported_max}"
             ),
             Self::MissingField { field } => write!(formatter, "required field {field} is absent"),
+            Self::FieldType { field } => {
+                write!(formatter, "field {field} has the wrong JSON type")
+            }
             Self::Field { field, error } => write!(formatter, "field {field}: {error}"),
             Self::Range { field, error } => write!(formatter, "field {field}: {error}"),
+            Self::UnknownEnumValue { field } => write!(
+                formatter,
+                "field {field} names a value this build does not define"
+            ),
             Self::UnacceptableDigestAlgorithm => {
                 formatter.write_str("digest algorithm is unknown or weakened")
             }
@@ -230,7 +307,7 @@ impl fmt::Display for ManifestError {
                  the rollback target's {rollback_min}..={rollback_max}"
             ),
             Self::AbsolutePath { field } => {
-                write!(formatter, "field {field} must be a relative path")
+                write!(formatter, "field {field} must not be an absolute host path")
             }
             Self::TooManyUnknownFields { max } => {
                 write!(formatter, "more than {max} unknown fields were supplied")
@@ -240,6 +317,109 @@ impl fmt::Display for ManifestError {
 }
 
 impl Error for ManifestError {}
+
+/// A bounded string a manifest may hold.
+///
+/// Every manifest string field is this type — application version, source
+/// revision, build target, credential name, capability identifier, rollback
+/// version and both halves of a retained unknown field. The rules are enforced
+/// by [`ManifestText::new`], which is the only way to obtain a value:
+///
+/// - non-empty;
+/// - at most [`MAX_MANIFEST_FIELD_BYTES`] UTF-8 bytes;
+/// - free of Unicode control characters;
+/// - not an absolute host path.
+///
+/// Locating the rules in the type rather than at a call site is deliberate. A
+/// field added to the manifest later is declared as a `ManifestText` and
+/// therefore cannot opt out of any of them; the previous arrangement checked
+/// the absolute-path rule at one call site, and every other field silently
+/// missed it.
+///
+/// An absolute host path is a syntactic judgement made offline: a leading `/`,
+/// a leading `\`, or a drive-letter prefix such as `C:\` or `C:/`. Nothing is
+/// resolved, canonicalized or opened. A `~`-prefixed spelling is home-relative
+/// rather than absolute and is not refused by this rule.
+///
+/// The inner value is private, so the constructor cannot be bypassed:
+///
+/// ```compile_fail
+/// use automonique_protocol::release::ManifestText;
+/// let text = ManifestText {
+///     value: "/etc/automonique/secret.pem".to_owned(),
+/// };
+/// ```
+///
+/// The same string through the constructor — the one difference — compiles, and
+/// is refused at run time instead:
+///
+/// ```
+/// use automonique_protocol::release::ManifestText;
+/// let refusal = ManifestText::new("/etc/automonique/secret.pem", "any_field")
+///     .expect_err("an absolute host path is refused");
+/// assert_eq!(refusal.category(), "absolute_path");
+/// ```
+///
+/// A relative value of the same shape is accepted:
+///
+/// ```
+/// use automonique_protocol::release::ManifestText;
+/// let text = ManifestText::new("x86_64-unknown-linux-gnu", "build_target")
+///     .expect("a relative value");
+/// assert_eq!(text.as_str(), "x86_64-unknown-linux-gnu");
+/// ```
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ManifestText {
+    value: String,
+}
+
+impl ManifestText {
+    /// Validate and construct a bounded manifest string.
+    ///
+    /// `field` names the position being filled and appears in the refusal; it
+    /// is not part of the value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestError::Field`] when the value is empty, over
+    /// [`MAX_MANIFEST_FIELD_BYTES`], or contains a control character, and
+    /// [`ManifestError::AbsolutePath`] when it is an absolute host path.
+    pub fn new(value: &str, field: &'static str) -> Result<Self, ManifestError> {
+        let bound = if value.is_empty() {
+            Some(ValueError::Empty)
+        } else if value.len() > MAX_MANIFEST_FIELD_BYTES {
+            Some(ValueError::TooLong {
+                max_bytes: MAX_MANIFEST_FIELD_BYTES,
+                actual_bytes: value.len(),
+            })
+        } else if value.chars().any(char::is_control) {
+            Some(ValueError::ControlCharacter)
+        } else {
+            None
+        };
+        if let Some(error) = bound {
+            return Err(ManifestError::Field { field, error });
+        }
+        if is_absolute_host_path(value) {
+            return Err(ManifestError::AbsolutePath { field });
+        }
+        Ok(Self {
+            value: value.to_owned(),
+        })
+    }
+
+    /// Return the validated string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+}
+
+impl fmt::Display for ManifestText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.value)
+    }
+}
 
 /// A content digest with its named algorithm.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -333,9 +513,17 @@ impl ArtifactDigest {
 /// // A descriptor cannot carry the credential it describes.
 /// let descriptor = CredentialDescriptor::new("database", 3, "s3cret").unwrap();
 /// ```
+///
+/// The same call without the value — the one difference — compiles:
+///
+/// ```
+/// use automonique_protocol::release::CredentialDescriptor;
+/// let descriptor = CredentialDescriptor::new("database", 3).unwrap();
+/// assert_eq!(descriptor.name(), "database");
+/// ```
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CredentialDescriptor {
-    name: String,
+    name: ManifestText,
     version: u32,
 }
 
@@ -344,12 +532,11 @@ impl CredentialDescriptor {
     ///
     /// # Errors
     ///
-    /// Returns [`ManifestError::Field`] when the name violates the shared
-    /// bounded-value rules.
+    /// Returns the [`ManifestText`] refusal when the name violates the shared
+    /// bounded-value rules or is an absolute host path.
     pub fn new(name: &str, version: u32) -> Result<Self, ManifestError> {
-        bounded(name, "credential_name")?;
         Ok(Self {
-            name: name.to_owned(),
+            name: ManifestText::new(name, "credential_name")?,
             version,
         })
     }
@@ -357,7 +544,7 @@ impl CredentialDescriptor {
     /// Credential name.
     #[must_use]
     pub fn name(&self) -> &str {
-        &self.name
+        self.name.as_str()
     }
 
     /// Expected credential version.
@@ -370,7 +557,7 @@ impl CredentialDescriptor {
 /// A host capability the release needs, and whether it is mandatory.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CapabilityRequirement {
-    id: String,
+    id: ManifestText,
     required: bool,
 }
 
@@ -379,11 +566,10 @@ impl CapabilityRequirement {
     ///
     /// # Errors
     ///
-    /// Returns [`ManifestError::Field`] for an invalid identifier.
+    /// Returns the [`ManifestText`] refusal for an invalid identifier.
     pub fn required(id: &str) -> Result<Self, ManifestError> {
-        bounded(id, "capability_id")?;
         Ok(Self {
-            id: id.to_owned(),
+            id: ManifestText::new(id, "capability_id")?,
             required: true,
         })
     }
@@ -392,11 +578,10 @@ impl CapabilityRequirement {
     ///
     /// # Errors
     ///
-    /// Returns [`ManifestError::Field`] for an invalid identifier.
+    /// Returns the [`ManifestText`] refusal for an invalid identifier.
     pub fn optional(id: &str) -> Result<Self, ManifestError> {
-        bounded(id, "capability_id")?;
         Ok(Self {
-            id: id.to_owned(),
+            id: ManifestText::new(id, "capability_id")?,
             required: false,
         })
     }
@@ -404,7 +589,7 @@ impl CapabilityRequirement {
     /// Capability identifier.
     #[must_use]
     pub fn id(&self) -> &str {
-        &self.id
+        self.id.as_str()
     }
 
     /// Whether the capability is mandatory.
@@ -479,7 +664,7 @@ impl SdkCompatibility {
 /// A previously released version this release may roll back to.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RollbackTarget {
-    version: String,
+    version: ManifestText,
     database_schema: VersionRange,
 }
 
@@ -488,11 +673,10 @@ impl RollbackTarget {
     ///
     /// # Errors
     ///
-    /// Returns [`ManifestError::Field`] for an invalid version string.
+    /// Returns the [`ManifestText`] refusal for an invalid version string.
     pub fn new(version: &str, database_schema: VersionRange) -> Result<Self, ManifestError> {
-        bounded(version, "rollback_version")?;
         Ok(Self {
-            version: version.to_owned(),
+            version: ManifestText::new(version, "rollback_version")?,
             database_schema,
         })
     }
@@ -500,7 +684,7 @@ impl RollbackTarget {
     /// Target version.
     #[must_use]
     pub fn version(&self) -> &str {
-        &self.version
+        self.version.as_str()
     }
 
     /// Target database schema range.
@@ -514,9 +698,9 @@ impl RollbackTarget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReleaseManifest {
     schema_revision: u32,
-    version: String,
-    source_revision: String,
-    build_target: String,
+    version: ManifestText,
+    source_revision: ManifestText,
+    build_target: ManifestText,
     protocol: VersionRange,
     events: VersionRange,
     database_schema: VersionRange,
@@ -525,10 +709,137 @@ pub struct ReleaseManifest {
     capabilities: Vec<CapabilityRequirement>,
     credentials: Vec<CredentialDescriptor>,
     rollback: Option<RollbackTarget>,
-    unknown_fields: Vec<(String, String)>,
+    unknown_fields: Vec<(ManifestText, JsonValue)>,
 }
 
 impl ReleaseManifest {
+    /// Parse a manifest document from canonical bytes.
+    ///
+    /// The reader is [`crate::wire::parse_canonical`], so input that parses but
+    /// is not already canonical is refused rather than normalized. Every
+    /// required field is enforced here and every bound applies on the way in:
+    /// the result is a fully typed manifest or there is no value at all.
+    ///
+    /// The schema revision is read and compared before any other field is
+    /// interpreted, so a document written by a future incompatible writer is
+    /// refused without this build reading the rest of it.
+    ///
+    /// Keys outside [`KNOWN_MANIFEST_FIELDS`] are retained verbatim as unknown
+    /// fields: their structure is preserved and never reinterpreted, and at
+    /// most [`MAX_UNKNOWN_FIELDS`] of them are kept. Preservation is not an
+    /// exemption from the string rules, though — every string inside a retained
+    /// value, at any nesting depth, must still be a valid [`ManifestText`], so
+    /// an empty, over-long, control-bearing or absolute-path string is refused
+    /// there exactly as it would be in a known field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestError::Document`] when the bytes are not a canonical
+    /// JSON document, [`ManifestError::FieldType`] when a field is present with
+    /// the wrong JSON type, [`ManifestError::UnknownEnumValue`] for an artifact
+    /// name this build does not define, and otherwise every refusal
+    /// [`ReleaseManifestBuilder::build`] can return.
+    pub fn from_canonical_bytes(payload: &[u8]) -> Result<Self, ManifestError> {
+        let document =
+            parse_canonical(payload).map_err(|error| ManifestError::Document { error })?;
+        let JsonValue::Object(entries) = &document else {
+            return Err(ManifestError::FieldType { field: "manifest" });
+        };
+
+        // Read and compare the schema revision before interpreting anything
+        // else, so a future writer's document is refused on its revision rather
+        // than on whichever other field this build happens to disagree with.
+        let schema_revision = as_unsigned(
+            member(&document, "schema_revision", "schema_revision")?,
+            "schema_revision",
+        )?;
+        if schema_revision > MAX_SUPPORTED_MANIFEST_SCHEMA {
+            return Err(ManifestError::UnsupportedSchemaRevision {
+                supported_max: MAX_SUPPORTED_MANIFEST_SCHEMA,
+                declared: schema_revision,
+            });
+        }
+
+        let mut builder = ReleaseManifestBuilder::new().schema_revision(schema_revision);
+
+        if let Some(value) = document.get("version") {
+            builder = builder.version(as_text(value, "version")?);
+        }
+        if let Some(value) = document.get("source_revision") {
+            builder = builder.source_revision(as_text(value, "source_revision")?);
+        }
+        if let Some(value) = document.get("build_target") {
+            builder = builder.build_target(as_text(value, "build_target")?);
+        }
+        if let Some(value) = document.get("protocol") {
+            builder = builder.protocol(decode_range(
+                value,
+                "protocol",
+                "protocol_min",
+                "protocol_max",
+            )?);
+        }
+        if let Some(value) = document.get("events") {
+            builder = builder.events(decode_range(value, "events", "events_min", "events_max")?);
+        }
+        if let Some(value) = document.get("database_schema") {
+            builder = builder.database_schema(decode_range(
+                value,
+                "database_schema",
+                "database_schema_min",
+                "database_schema_max",
+            )?);
+        }
+        if let Some(value) = document.get("sdk") {
+            builder = builder.sdk(decode_sdk(value)?);
+        }
+        if let Some(value) = document.get("digests") {
+            let JsonValue::Object(declared) = value else {
+                return Err(ManifestError::FieldType { field: "digests" });
+            };
+            for (name, spec) in declared {
+                let kind = ArtifactKind::from_wire(name)
+                    .ok_or(ManifestError::UnknownEnumValue { field: "digests" })?;
+                builder = builder.digest(
+                    kind,
+                    decode_digest(spec, "digest", "digest_algorithm", "digest_hex")?,
+                );
+            }
+        }
+        if let Some(value) = document.get("capabilities") {
+            let JsonValue::Array(declared) = value else {
+                return Err(ManifestError::FieldType {
+                    field: "capabilities",
+                });
+            };
+            for item in declared {
+                builder = builder.capability(decode_capability(item)?);
+            }
+        }
+        if let Some(value) = document.get("credentials") {
+            let JsonValue::Array(declared) = value else {
+                return Err(ManifestError::FieldType {
+                    field: "credentials",
+                });
+            };
+            for item in declared {
+                builder = builder.credential(decode_credential(item)?);
+            }
+        }
+        if let Some(value) = document.get("rollback") {
+            builder = builder.rollback(decode_rollback(value)?);
+        }
+
+        for (key, value) in entries {
+            if KNOWN_MANIFEST_FIELDS.contains(&key.as_str()) {
+                continue;
+            }
+            builder = builder.unknown_json_field(key, value.clone());
+        }
+
+        builder.build()
+    }
+
     /// Manifest schema revision.
     #[must_use]
     pub const fn schema_revision(&self) -> u32 {
@@ -538,19 +849,19 @@ impl ReleaseManifest {
     /// Application version.
     #[must_use]
     pub fn version(&self) -> &str {
-        &self.version
+        self.version.as_str()
     }
 
     /// Exact source revision.
     #[must_use]
     pub fn source_revision(&self) -> &str {
-        &self.source_revision
+        self.source_revision.as_str()
     }
 
     /// Build target triple.
     #[must_use]
     pub fn build_target(&self) -> &str {
-        &self.build_target
+        self.build_target.as_str()
     }
 
     /// Supported wire protocol range.
@@ -584,8 +895,10 @@ impl ReleaseManifest {
     }
 
     /// Retained unknown fields, in supplied order.
+    ///
+    /// The value is the JSON this build did not interpret, preserved exactly.
     #[must_use]
-    pub fn unknown_fields(&self) -> &[(String, String)] {
+    pub fn unknown_fields(&self) -> &[(ManifestText, JsonValue)] {
         &self.unknown_fields
     }
 
@@ -617,9 +930,9 @@ impl ReleaseManifest {
                 continue;
             }
             if capability.required {
-                missing_required.push(capability.id.clone());
+                missing_required.push(capability.id.as_str().to_owned());
             } else {
-                missing_optional.push(capability.id.clone());
+                missing_optional.push(capability.id.as_str().to_owned());
             }
         }
         if !missing_required.is_empty() {
@@ -665,7 +978,7 @@ pub struct ReleaseManifestBuilder {
     capabilities: Vec<CapabilityRequirement>,
     credentials: Vec<CredentialDescriptor>,
     rollback: Option<RollbackTarget>,
-    unknown_fields: Vec<(String, String)>,
+    unknown_fields: Vec<(String, JsonValue)>,
 }
 
 impl ReleaseManifestBuilder {
@@ -759,10 +1072,16 @@ impl ReleaseManifestBuilder {
         self
     }
 
-    /// Retain one field this build does not understand.
+    /// Retain one string-valued field this build does not understand.
     #[must_use]
-    pub fn unknown_field(mut self, key: &str, value: &str) -> Self {
-        self.unknown_fields.push((key.to_owned(), value.to_owned()));
+    pub fn unknown_field(self, key: &str, value: &str) -> Self {
+        self.unknown_json_field(key, JsonValue::String(value.to_owned()))
+    }
+
+    /// Retain one field of any JSON shape this build does not understand.
+    #[must_use]
+    pub fn unknown_json_field(mut self, key: &str, value: JsonValue) -> Self {
+        self.unknown_fields.push((key.to_owned(), value));
         self
     }
 
@@ -785,17 +1104,15 @@ impl ReleaseManifestBuilder {
             });
         }
 
-        let version = required(self.version, "version")?;
-        bounded(&version, "version")?;
-        let source_revision = required(self.source_revision, "source_revision")?;
-        bounded(&source_revision, "source_revision")?;
-        let build_target = required(self.build_target, "build_target")?;
-        bounded(&build_target, "build_target")?;
-        if build_target.starts_with('/') {
-            return Err(ManifestError::AbsolutePath {
-                field: "build_target",
-            });
-        }
+        let version = ManifestText::new(&required(self.version, "version")?, "version")?;
+        let source_revision = ManifestText::new(
+            &required(self.source_revision, "source_revision")?,
+            "source_revision",
+        )?;
+        let build_target = ManifestText::new(
+            &required(self.build_target, "build_target")?,
+            "build_target",
+        )?;
 
         let protocol = required(self.protocol, "protocol")?;
         let events = required(self.events, "events")?;
@@ -830,9 +1147,11 @@ impl ReleaseManifestBuilder {
                 max: MAX_UNKNOWN_FIELDS,
             });
         }
-        for (key, value) in &self.unknown_fields {
-            bounded(key, "unknown_field_key")?;
-            bounded(value, "unknown_field_value")?;
+        let mut unknown_fields = Vec::with_capacity(self.unknown_fields.len());
+        for (key, value) in self.unknown_fields {
+            let key = ManifestText::new(&key, "unknown_field_key")?;
+            validate_unknown_value(&value)?;
+            unknown_fields.push((key, value));
         }
 
         Ok(ReleaseManifest {
@@ -848,7 +1167,7 @@ impl ReleaseManifestBuilder {
             capabilities: self.capabilities,
             credentials: self.credentials,
             rollback: self.rollback,
-            unknown_fields: self.unknown_fields,
+            unknown_fields,
         })
     }
 }
@@ -857,21 +1176,160 @@ fn required<T>(value: Option<T>, field: &'static str) -> Result<T, ManifestError
     value.ok_or(ManifestError::MissingField { field })
 }
 
-fn bounded(value: &str, field: &'static str) -> Result<(), ManifestError> {
-    let error = if value.is_empty() {
-        Some(ValueError::Empty)
-    } else if value.len() > MAX_MANIFEST_FIELD_BYTES {
-        Some(ValueError::TooLong {
-            max_bytes: MAX_MANIFEST_FIELD_BYTES,
-            actual_bytes: value.len(),
-        })
-    } else if value.chars().any(char::is_control) {
-        Some(ValueError::ControlCharacter)
-    } else {
-        None
-    };
-    match error {
-        Some(error) => Err(ManifestError::Field { field, error }),
-        None => Ok(()),
+/// Whether a value spells an absolute host path.
+///
+/// Syntactic and offline: nothing is resolved, canonicalized or opened.
+fn is_absolute_host_path(value: &str) -> bool {
+    match value.as_bytes() {
+        [b'/', ..] | [b'\\', ..] => true,
+        [drive, b':', b'/' | b'\\', ..] => drive.is_ascii_alphabetic(),
+        _ => false,
     }
+}
+
+/// Apply the manifest string rules to every string inside a retained value.
+///
+/// An unknown field is preserved and never reinterpreted, but it is not a hole
+/// in the hygiene rule: a host path nested inside one is refused exactly as a
+/// known field's would be.
+fn validate_unknown_value(value: &JsonValue) -> Result<(), ManifestError> {
+    match value {
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Integer(_) => Ok(()),
+        JsonValue::String(text) => {
+            ManifestText::new(text, "unknown_field_value")?;
+            Ok(())
+        }
+        JsonValue::Array(items) => items.iter().try_for_each(validate_unknown_value),
+        JsonValue::Object(entries) => entries.iter().try_for_each(|(key, nested)| {
+            ManifestText::new(key, "unknown_field_key")?;
+            validate_unknown_value(nested)
+        }),
+    }
+}
+
+fn member<'a>(
+    object: &'a JsonValue,
+    key: &str,
+    field: &'static str,
+) -> Result<&'a JsonValue, ManifestError> {
+    object.get(key).ok_or(ManifestError::MissingField { field })
+}
+
+fn as_object<'a>(
+    value: &'a JsonValue,
+    field: &'static str,
+) -> Result<&'a JsonValue, ManifestError> {
+    match value {
+        JsonValue::Object(_) => Ok(value),
+        _ => Err(ManifestError::FieldType { field }),
+    }
+}
+
+fn as_text<'a>(value: &'a JsonValue, field: &'static str) -> Result<&'a str, ManifestError> {
+    value.as_str().ok_or(ManifestError::FieldType { field })
+}
+
+fn as_unsigned(value: &JsonValue, field: &'static str) -> Result<u32, ManifestError> {
+    let raw = value
+        .as_integer()
+        .ok_or(ManifestError::FieldType { field })?;
+    u32::try_from(raw).map_err(|_| ManifestError::FieldType { field })
+}
+
+fn as_boolean(value: &JsonValue, field: &'static str) -> Result<bool, ManifestError> {
+    match value {
+        JsonValue::Bool(flag) => Ok(*flag),
+        _ => Err(ManifestError::FieldType { field }),
+    }
+}
+
+fn decode_major(value: &JsonValue, field: &'static str) -> Result<MajorVersion, ManifestError> {
+    MajorVersion::new(as_unsigned(value, field)?)
+        .map_err(|error| ManifestError::Range { field, error })
+}
+
+fn decode_range(
+    value: &JsonValue,
+    field: &'static str,
+    min_field: &'static str,
+    max_field: &'static str,
+) -> Result<VersionRange, ManifestError> {
+    let object = as_object(value, field)?;
+    let min = decode_major(member(object, "min", min_field)?, min_field)?;
+    let max = decode_major(member(object, "max", max_field)?, max_field)?;
+    VersionRange::new(min, max).map_err(|error| ManifestError::Range { field, error })
+}
+
+fn decode_digest(
+    value: &JsonValue,
+    field: &'static str,
+    algorithm_field: &'static str,
+    hex_field: &'static str,
+) -> Result<ArtifactDigest, ManifestError> {
+    let object = as_object(value, field)?;
+    let algorithm = as_text(
+        member(object, "algorithm", algorithm_field)?,
+        algorithm_field,
+    )?;
+    let hex = as_text(member(object, "hex", hex_field)?, hex_field)?;
+    ArtifactDigest::new(algorithm, hex)
+}
+
+fn decode_sdk(value: &JsonValue) -> Result<SdkCompatibility, ManifestError> {
+    let object = as_object(value, "sdk")?;
+    let protocol = decode_range(
+        member(object, "protocol", "sdk_protocol")?,
+        "sdk_protocol",
+        "sdk_protocol_min",
+        "sdk_protocol_max",
+    )?;
+    let schema_digest = decode_digest(
+        member(object, "schema_digest", "sdk_schema_digest")?,
+        "sdk_schema_digest",
+        "sdk_schema_digest_algorithm",
+        "sdk_schema_digest_hex",
+    )?;
+    Ok(SdkCompatibility::new(protocol, schema_digest))
+}
+
+fn decode_capability(value: &JsonValue) -> Result<CapabilityRequirement, ManifestError> {
+    let object = as_object(value, "capabilities")?;
+    let id = as_text(member(object, "id", "capability_id")?, "capability_id")?;
+    let required = as_boolean(
+        member(object, "required", "capability_required")?,
+        "capability_required",
+    )?;
+    if required {
+        CapabilityRequirement::required(id)
+    } else {
+        CapabilityRequirement::optional(id)
+    }
+}
+
+fn decode_credential(value: &JsonValue) -> Result<CredentialDescriptor, ManifestError> {
+    let object = as_object(value, "credentials")?;
+    let name = as_text(
+        member(object, "name", "credential_name")?,
+        "credential_name",
+    )?;
+    let version = as_unsigned(
+        member(object, "version", "credential_version")?,
+        "credential_version",
+    )?;
+    CredentialDescriptor::new(name, version)
+}
+
+fn decode_rollback(value: &JsonValue) -> Result<RollbackTarget, ManifestError> {
+    let object = as_object(value, "rollback")?;
+    let version = as_text(
+        member(object, "version", "rollback_version")?,
+        "rollback_version",
+    )?;
+    let database_schema = decode_range(
+        member(object, "database_schema", "rollback_database_schema")?,
+        "rollback_database_schema",
+        "rollback_database_schema_min",
+        "rollback_database_schema_max",
+    )?;
+    RollbackTarget::new(version, database_schema)
 }

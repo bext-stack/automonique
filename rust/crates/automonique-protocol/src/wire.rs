@@ -18,7 +18,7 @@
 
 use crate::codec::{
     CodecError, DepthGuard, Envelope, MAX_MESSAGE_KIND_BYTES, MAX_PROTOCOL_NAME_BYTES,
-    MAX_REQUEST_ID_BYTES, MajorVersion, MessageKind, ProtocolName, RequestId,
+    MAX_REQUEST_ID_BYTES, MajorVersion, MessageKind, ProtocolName, RequestId, SupportedProtocol,
 };
 
 /// Maximum UTF-8 byte length of one JSON string.
@@ -491,6 +491,49 @@ impl Message {
             ),
             body,
         })
+    }
+
+    /// Decode a message and admit it against the protocols this peer implements.
+    ///
+    /// Shape is settled first: a payload that is not a well-formed envelope is
+    /// refused with its own category, so a peer is never told its protocol is
+    /// unimplemented when its JSON is what is broken. Negotiation then fails
+    /// closed on either axis, and the two axes stay distinct: an unimplemented
+    /// name and an out-of-range major version are different refusals and
+    /// neither is downgraded, guessed or defaulted into the other.
+    ///
+    /// `supported` carries one entry per implemented protocol name. When two
+    /// entries share a name the first that admits the envelope wins and the
+    /// first version refusal is the one reported.
+    ///
+    /// # Errors
+    ///
+    /// Returns the decode refusal, [`CodecError::UnknownProtocol`] when no
+    /// declared protocol carries the envelope's name, or
+    /// [`CodecError::UnsupportedVersion`] when one does and the major version
+    /// lies outside its range. An empty `supported` slice implements nothing
+    /// and admits nothing.
+    pub fn from_canonical_bytes_admitted(
+        payload: &[u8],
+        supported: &[SupportedProtocol],
+    ) -> Result<Self, CodecError> {
+        let message = Self::from_canonical_bytes(payload)?;
+        let mut refusal = CodecError::UnknownProtocol;
+        for protocol in supported {
+            match protocol.admit(message.envelope()) {
+                Ok(()) => return Ok(message),
+                // A name mismatch leaves the default refusal in place; a
+                // version refusal came from the entry that owns this name, so
+                // it outranks it and is kept.
+                Err(CodecError::UnknownProtocol) => {}
+                Err(version) => {
+                    if refusal == CodecError::UnknownProtocol {
+                        refusal = version;
+                    }
+                }
+            }
+        }
+        Err(refusal)
     }
 }
 

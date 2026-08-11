@@ -2,19 +2,44 @@
 
 //! The domain journal: events, aggregate revisions, action receipts and replay.
 //!
-//! Replay may rebuild a projection or explain history. It confers no effect
-//! capability: [`Journal::replay`] passes a projection nothing but a borrowed
-//! event, and [`Outbox`] has no public constructor, so no outbox, notification
-//! or transport handle can be *obtained* inside a replay callback. The
-//! compile-fail below pins that.
+//! # What replay enforces, and the one thing it cannot
 //!
-//! It does not say a projection is pure, and this module should not be read as
-//! claiming it. Rust has no effect system: a projection owns its own fields, so
-//! one constructed holding a channel, a socket or a file handle can still use
-//! it inside `apply`, because it brought it. The enforced property is "replay
-//! hands out nothing", not "a callback cannot have brought something".
+//! Replay may rebuild a projection or explain history. Four properties are
+//! enforced by types and each is pinned by a compile-fail below, every one of
+//! them paired with a passing case differing only in the rejected construct:
 //!
-//! A projection over replay compiles:
+//! 1. **Replay grants no second channel.** [`Journal::replay`] takes one
+//!    argument, the projection. There is no parameter through which an effect,
+//!    outbox, notification or transport could be handed in.
+//! 2. **The callback interface cannot be widened.** [`Projection::apply`] takes
+//!    `&mut self` and `&DomainEvent`; an implementer that asks for a handle
+//!    alongside the event does not implement the trait.
+//! 3. **Replay grants no write access either.** `apply` receives a *shared*
+//!    event borrow, so an implementer cannot ask to mutate what it is shown,
+//!    and [`Journal::replay`] itself takes `&self`.
+//! 4. **This crate hands out no effect sink.** [`Outbox`]'s field is private
+//!    and it has no constructor, so one cannot be obtained here. Two routes are
+//!    pinned: naming the field, and `Outbox::default()`. That those two fail is
+//!    measured; that no *other* route exists is read off the `impl` block,
+//!    which no test can do for a method nobody has written.
+//!
+//! Together: *replay hands a projection nothing it did not already own.*
+//!
+//! ## The named limit: projection-owned handles
+//!
+//! Not enforced, and irreducible in safe Rust: **a projection can bring its own
+//! handle.** Rust has no effect system. A projection owns its fields, so one
+//! constructed holding a channel, socket or file handle can use it inside
+//! `apply`, because it brought it, and no signature can prevent that. This
+//! module must not be read as claiming a projection is pure; the enforced
+//! property is the four points above, and "no effect happens during replay" is
+//! a discipline on the caller, not a guarantee of this API.
+//!
+//! `tests/journal.rs::replay_purity` demonstrates that limit with a working
+//! counterexample rather than asserting it away, so the claim here and the
+//! measurable behaviour cannot drift apart.
+//!
+//! A projection over replay compiles, and `replay` takes it alone:
 //!
 //! ```
 //! use automonique_protocol::journal::{Journal, Projection, DomainEvent};
@@ -39,7 +64,57 @@
 //! assert_eq!(counter.0, 1);
 //! ```
 //!
-//! Obtaining an effect handle from this crate inside one does not:
+//! Handing `replay` anything alongside the projection does not compile. The
+//! only difference from the case above is the second argument:
+//!
+//! ```compile_fail
+//! use automonique_protocol::journal::{Journal, Projection, DomainEvent};
+//! #[derive(Default)]
+//! struct Counter(usize);
+//! impl Projection for Counter {
+//!     fn apply(&mut self, _event: &DomainEvent) { self.0 += 1; }
+//! }
+//!
+//! let journal = Journal::new();
+//! let mut counter = Counter::default();
+//! let mut sink: Vec<String> = Vec::new();
+//! journal.replay(&mut counter, &mut sink);
+//! ```
+//!
+//! A projection may implement the interface as declared:
+//!
+//! ```
+//! use automonique_protocol::journal::{DomainEvent, Projection};
+//! struct Emitter;
+//! impl Projection for Emitter {
+//!     fn apply(&mut self, _event: &DomainEvent) {}
+//! }
+//! ```
+//!
+//! It may not widen it to receive a handle. The only difference from the case
+//! above is the extra parameter:
+//!
+//! ```compile_fail
+//! use automonique_protocol::journal::{DomainEvent, Outbox, Projection};
+//! struct Emitter;
+//! impl Projection for Emitter {
+//!     fn apply(&mut self, _event: &DomainEvent, _outbox: &mut Outbox) {}
+//! }
+//! ```
+//!
+//! It may not ask to mutate what it is shown either. The only difference from
+//! the implementable case is `&mut`:
+//!
+//! ```compile_fail
+//! use automonique_protocol::journal::{DomainEvent, Projection};
+//! struct Rewriter;
+//! impl Projection for Rewriter {
+//!     fn apply(&mut self, _event: &mut DomainEvent) {}
+//! }
+//! ```
+//!
+//! Obtaining an effect handle from this crate inside a projection does not
+//! compile either, by either route. Naming the field:
 //!
 //! ```compile_fail
 //! use automonique_protocol::journal::{DomainEvent, Outbox, Projection};
@@ -52,6 +127,22 @@
 //!         outbox.enqueue("notify");
 //!     }
 //! }
+//! ```
+//!
+//! A type this crate does hand out constructs the ordinary way:
+//!
+//! ```
+//! use automonique_protocol::journal::Journal;
+//! let journal = Journal::default();
+//! assert!(journal.events().is_empty());
+//! ```
+//!
+//! [`Outbox`] does not. The only difference from the case above is the type:
+//!
+//! ```compile_fail
+//! use automonique_protocol::journal::Outbox;
+//! let outbox = Outbox::default();
+//! assert!(outbox.pending().is_empty());
 //! ```
 
 use core::fmt;
@@ -356,8 +447,15 @@ impl DomainEvent {
 
 /// Something rebuilt by reading history.
 ///
-/// The only argument is a borrowed event. A projection has no transport, no
-/// store and no effect handle, because none is passed to it.
+/// The only argument is a shared borrow of one event. A projection is passed no
+/// transport, no store and no effect handle, and the signature cannot be
+/// widened to receive one: an implementation that takes a second parameter, or
+/// that asks for the event by `&mut`, does not implement this trait. The
+/// module-level compile-fail cases pin both.
+///
+/// That is a statement about what this trait hands over, not about what an
+/// implementation may already hold — see the named limit in the module
+/// documentation.
 pub trait Projection {
     /// Fold one event into the projection.
     fn apply(&mut self, event: &DomainEvent);
@@ -367,13 +465,19 @@ pub trait Projection {
 ///
 /// Deliberately unconstructable: the field is private and there is no
 /// constructor, no `Default` and no `From`. A [`Projection`] therefore cannot
-/// obtain one from this crate, so replay hands out no way to emit. That is a
-/// statement about what replay confers, not about what a projection may
-/// already own — a projection that closes over its own channel or file handle
-/// can still use it, and no Rust signature can stop that.
+/// obtain one from this crate, so replay hands out no way to emit. The
+/// module-level compile-fail cases pin two routes — naming the private field,
+/// and `Outbox::default()` — rather than only the first; that there is no third
+/// is read off this `impl` block rather than pinned by a test.
 ///
-/// A transaction layer that legitimately owns effects will receive one from
-/// the store, which is why nothing here hands them out.
+/// That is a statement about what replay confers, not about what a projection
+/// may already own: a projection that closes over its own channel or file
+/// handle can still use it, and no Rust signature can stop that.
+///
+/// Stated rather than implied: nothing in this workspace constructs an `Outbox`
+/// today, so this type is a declared boundary rather than a load-bearing part
+/// of a delivery path. A transaction layer that legitimately owns effects will
+/// receive one from the store, which is why nothing here hands them out.
 #[derive(Debug)]
 pub struct Outbox {
     pending: Vec<String>,
@@ -453,8 +557,14 @@ impl Journal {
 
     /// Rebuild a projection from history.
     ///
-    /// Takes a projection and nothing else. There is no parameter through which
-    /// an effect, outbox, notification or transport could be supplied.
+    /// Takes a projection and nothing else, by `&self`. There is no parameter
+    /// through which an effect, outbox, notification or transport could be
+    /// supplied, and the journal is read rather than drained: every event stays
+    /// where it was and the same replay run again observes the same events.
+    ///
+    /// The projection is shown each event once, in global order, and is shown
+    /// nothing else. What it does with them is its own business — see the named
+    /// limit in the module documentation.
     pub fn replay<P: Projection>(&self, projection: &mut P) {
         for event in &self.events {
             projection.apply(event);
@@ -686,8 +796,17 @@ impl ActionReceipt {
 /// re-outcoming one in place has no route — reusing a key has to go back
 /// through [`ActionLedger::record`], where divergence is a typed conflict. The
 /// compile-fail below pins the obvious route, `find_mut`; it pins that one name
-/// rather than the absence of every accessor a future edit might add. The only
-/// difference from the case above is `find_mut`, which does not exist:
+/// rather than the absence of every accessor a future edit might add.
+///
+/// The residual is exact and irreducible: a mutable accessor under another
+/// name, paired with a setter on [`ActionReceipt`], would reopen in-place
+/// retargeting, and both would have to be written *into this module*, because
+/// Rust's privacy boundary is the module — nothing declared here can be
+/// protected from code added here, and no test can observe the absence of a
+/// method nobody has written. Outside this module the fields are unreachable
+/// and the property holds by type. Inside it, the property is review's.
+///
+/// The only difference from the case above is `find_mut`, which does not exist:
 ///
 /// ```compile_fail
 /// use automonique_protocol::journal::{ActionLedger, ActionOutcome};
@@ -853,6 +972,23 @@ impl RetainedRange {
     pub const fn last(self) -> u64 {
         self.last
     }
+
+    /// The position a consumer that has received everything retained holds
+    /// next: one past [`RetainedRange::last`].
+    ///
+    /// A cursor names the boundary *before* the next event it will receive, so
+    /// the positions a topic can resume a consumer at are
+    /// `first ..= caught_up` — one more position than the window retains. This
+    /// is the off-by-one that separates "resumable" from "retained", and it is
+    /// named here rather than left implicit in a comparison.
+    ///
+    /// Saturates: a window ending at `u64::MAX` reports `u64::MAX`, which is
+    /// still the highest position any cursor can hold, so nothing is
+    /// misclassified and nothing overflows.
+    #[must_use]
+    pub const fn caught_up(self) -> u64 {
+        self.last.saturating_add(1)
+    }
 }
 
 /// Where a consumer may resume on a topic.
@@ -905,6 +1041,13 @@ impl CursorResume {
 /// method that writes it, so no route to a rewind exists that does not produce
 /// the typed error. The compile-fail below pins the direct-write route; it pins
 /// that route rather than the absence of every setter a future edit might add.
+///
+/// The residual is exact and irreducible, and is the same one [`ActionLedger`]
+/// carries: an unchecked `set_position` would have to be written into this
+/// module, module privacy cannot defend a module against itself, and no test
+/// can observe the absence of a method nobody has written. Outside this module
+/// the position moves only forward, by type.
+///
 /// The only difference from the case above is writing the position directly:
 ///
 /// ```compile_fail
@@ -956,24 +1099,39 @@ impl JournalCursor {
 
     /// Where this consumer may resume, given what the topic still retains.
     ///
-    /// A cursor below the retained window has fallen off the back of retention:
-    /// the positions it is waiting for are gone, so it yields
-    /// [`CursorResume::ResyncRequired`] carrying the bounded snapshot
-    /// coordinates it must catch up from — never a silent partial stream and
-    /// never an empty success.
+    /// The resumable positions are exactly
+    /// `retained.first() ..= retained.caught_up()`. Anything outside that set
+    /// yields [`CursorResume::ResyncRequired`] carrying bounded snapshot
+    /// coordinates — never a silent partial stream and never an empty success.
+    /// There are three regions and each has a different failure to avoid:
     ///
-    /// A cursor at or above the retained window is caught up rather than stale:
-    /// nothing it is waiting for has been discarded, so it resumes live.
+    /// - **Below `first`** — the cursor has fallen off the back of retention.
+    ///   The positions it is waiting for have been discarded, so streaming from
+    ///   here would silently skip them. Resync.
+    /// - **`first ..= caught_up`** — resumable. `caught_up` is `last + 1`, the
+    ///   ordinary state of a consumer that has received everything: resyncing
+    ///   it would demand a snapshot of history it already has, forever.
+    /// - **Above `caught_up`** — the cursor names a position the topic has
+    ///   never reached. That is not caught up, it is ahead: streaming from here
+    ///   would silently skip every position between `caught_up` and the cursor
+    ///   once those are written. It is reachable after a topic is truncated or
+    ///   rebuilt behind a durable cursor, so it is classified rather than
+    ///   assumed away. Resync.
     ///
-    /// That reads "outside the retained range" as "below it", which is narrower
-    /// than the words allow. It is deliberate: `position` is the *next*
-    /// position the consumer will receive, so a consumer at `last + 1` is in
-    /// the ordinary caught-up state and resyncing it would demand a snapshot of
-    /// history it already has. `event::resolve_subscription` applies the same
-    /// rule to the parallel cursor type there.
+    /// The one place this differs from reading "outside the retained range"
+    /// literally is `caught_up` itself, which is outside the retained window
+    /// and is nonetheless live. That is forced: a cursor names the boundary
+    /// before the next event it will receive, so the resumable set is always
+    /// one larger than the retained set, whichever end the convention is
+    /// anchored to. `plan/contracts/R1-12.md` records it as amendment A2.
+    ///
+    /// Not consistent with `event::resolve_subscription`, which classifies only
+    /// the below-window case and returns live for everything above. That module
+    /// is outside this item's lease; the divergence is recorded in the evidence
+    /// rather than fixed here or copied.
     #[must_use]
     pub const fn resume_within(&self, retained: RetainedRange) -> CursorResume {
-        if self.position < retained.first() {
+        if self.position < retained.first() || self.position > retained.caught_up() {
             CursorResume::ResyncRequired {
                 snapshot_from: retained.first(),
                 snapshot_to: retained.last(),

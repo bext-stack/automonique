@@ -3919,9 +3919,31 @@ pub struct NativeOsGrantParts<'a> {
 /// #     CapturePolicy, IsolationIdentity, NativeOsGrant, NativeOsGrantParts,
 /// # };
 /// # use automonique_protocol::primitives::EpochMillis;
-/// # use automonique_protocol::sandbox::EnforcementAttestation;
-/// # let attestation =
-/// #     EnforcementAttestation::new("ns", "cg", "boot", "ll", "sc", "eg").unwrap();
+/// # use automonique_protocol::sandbox::{
+/// #     CgroupId, CredentialDelivery, EgressPolicyDigest, EnforcementAttestation,
+/// #     EnforcementAttestationParts, ExecutionBackendId, KernelBootId, LandlockAbi,
+/// #     LandlockAttestation, LandlockRulesetDigest, NamespaceIdentity, NamespaceKind,
+/// #     ProcessGroupId, SandboxPath, SeccompDigest, SupervisorProperty,
+/// # };
+/// # let digest = |seed: u8| format!("sha256:{seed:064x}");
+/// # let attestation = EnforcementAttestation::record(EnforcementAttestationParts {
+/// #     resolved_paths: &[SandboxPath::new("/workspace/attempt-1").unwrap()],
+/// #     namespaces: &[NamespaceIdentity::new(NamespaceKind::Mount, 4_026_531_840).unwrap()],
+/// #     process_group: ProcessGroupId::new(4242).unwrap(),
+/// #     cgroup: CgroupId::new("/automonique.slice/run-1.scope").unwrap(),
+/// #     backend: ExecutionBackendId::new("scope-1").unwrap(),
+/// #     kernel_boot: KernelBootId::new("boot-1").unwrap(),
+/// #     supervisor_properties: &[SupervisorProperty::NoNewPrivileges],
+/// #     landlock: LandlockAttestation::new(
+/// #         LandlockAbi::new(3).unwrap(),
+/// #         LandlockRulesetDigest::parse(&digest(1)).unwrap(),
+/// #     ),
+/// #     seccomp_digest: SeccompDigest::parse(&digest(2)).unwrap(),
+/// #     egress_digest: EgressPolicyDigest::parse(&digest(3)).unwrap(),
+/// #     credential_delivery: CredentialDelivery::SealedDescriptor,
+/// #     external_daemon: None,
+/// # })
+/// # .unwrap();
 /// let native = NativeOsGrant::declare(NativeOsGrantParts {
 ///     display: ":1",
 ///     isolation: IsolationIdentity::new("acme", "run-1", "desktop").unwrap(),
@@ -3941,9 +3963,31 @@ pub struct NativeOsGrantParts<'a> {
 /// #     BrowserGrant, BrowserGrantParts, CapturePolicy, IsolationIdentity, NativeOsGrant,
 /// # };
 /// # use automonique_protocol::primitives::EpochMillis;
-/// # use automonique_protocol::sandbox::EnforcementAttestation;
-/// # let attestation =
-/// #     EnforcementAttestation::new("ns", "cg", "boot", "ll", "sc", "eg").unwrap();
+/// # use automonique_protocol::sandbox::{
+/// #     CgroupId, CredentialDelivery, EgressPolicyDigest, EnforcementAttestation,
+/// #     EnforcementAttestationParts, ExecutionBackendId, KernelBootId, LandlockAbi,
+/// #     LandlockAttestation, LandlockRulesetDigest, NamespaceIdentity, NamespaceKind,
+/// #     ProcessGroupId, SandboxPath, SeccompDigest, SupervisorProperty,
+/// # };
+/// # let digest = |seed: u8| format!("sha256:{seed:064x}");
+/// # let attestation = EnforcementAttestation::record(EnforcementAttestationParts {
+/// #     resolved_paths: &[SandboxPath::new("/workspace/attempt-1").unwrap()],
+/// #     namespaces: &[NamespaceIdentity::new(NamespaceKind::Mount, 4_026_531_840).unwrap()],
+/// #     process_group: ProcessGroupId::new(4242).unwrap(),
+/// #     cgroup: CgroupId::new("/automonique.slice/run-1.scope").unwrap(),
+/// #     backend: ExecutionBackendId::new("scope-1").unwrap(),
+/// #     kernel_boot: KernelBootId::new("boot-1").unwrap(),
+/// #     supervisor_properties: &[SupervisorProperty::NoNewPrivileges],
+/// #     landlock: LandlockAttestation::new(
+/// #         LandlockAbi::new(3).unwrap(),
+/// #         LandlockRulesetDigest::parse(&digest(1)).unwrap(),
+/// #     ),
+/// #     seccomp_digest: SeccompDigest::parse(&digest(2)).unwrap(),
+/// #     egress_digest: EgressPolicyDigest::parse(&digest(3)).unwrap(),
+/// #     credential_delivery: CredentialDelivery::SealedDescriptor,
+/// #     external_daemon: None,
+/// # })
+/// # .unwrap();
 /// # let browser = BrowserGrant::declare(BrowserGrantParts {
 /// #     origins: &["https://example.test"],
 /// #     capture: CapturePolicy::RedactedScreenshots,
@@ -4200,9 +4244,31 @@ impl EvidenceKind {
 ///
 /// ```
 /// # use automonique_protocol::models::LifecycleEvidence;
-/// # use automonique_protocol::sandbox::EnforcementAttestation;
-/// let attestation =
-///     EnforcementAttestation::new("ns", "cg", "boot", "ll", "sc", "eg").unwrap();
+/// # use automonique_protocol::sandbox::{
+/// #     CgroupId, CredentialDelivery, EgressPolicyDigest, EnforcementAttestation,
+/// #     EnforcementAttestationParts, ExecutionBackendId, KernelBootId, LandlockAbi,
+/// #     LandlockAttestation, LandlockRulesetDigest, NamespaceIdentity, NamespaceKind,
+/// #     ProcessGroupId, SandboxPath, SeccompDigest, SupervisorProperty,
+/// # };
+/// # let digest = |seed: u8| format!("sha256:{seed:064x}");
+/// # let attestation = EnforcementAttestation::record(EnforcementAttestationParts {
+/// #     resolved_paths: &[SandboxPath::new("/workspace/attempt-1").unwrap()],
+/// #     namespaces: &[NamespaceIdentity::new(NamespaceKind::Mount, 4_026_531_840).unwrap()],
+/// #     process_group: ProcessGroupId::new(4242).unwrap(),
+/// #     cgroup: CgroupId::new("/automonique.slice/run-1.scope").unwrap(),
+/// #     backend: ExecutionBackendId::new("scope-1").unwrap(),
+/// #     kernel_boot: KernelBootId::new("boot-1").unwrap(),
+/// #     supervisor_properties: &[SupervisorProperty::NoNewPrivileges],
+/// #     landlock: LandlockAttestation::new(
+/// #         LandlockAbi::new(3).unwrap(),
+/// #         LandlockRulesetDigest::parse(&digest(1)).unwrap(),
+/// #     ),
+/// #     seccomp_digest: SeccompDigest::parse(&digest(2)).unwrap(),
+/// #     egress_digest: EgressPolicyDigest::parse(&digest(3)).unwrap(),
+/// #     credential_delivery: CredentialDelivery::SealedDescriptor,
+/// #     external_daemon: None,
+/// # })
+/// # .unwrap();
 /// let evidence = LifecycleEvidence::signed("builder-1", "sha256:sig", attestation).unwrap();
 /// assert_eq!(evidence.kind().as_str(), "signed");
 /// ```

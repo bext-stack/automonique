@@ -610,7 +610,7 @@ summary = "hashes, revision, schema/protocol ranges and platform requirements."
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-06"
@@ -621,7 +621,7 @@ summary = "Bun encoder/Rust decoder and Rust encoder/Bun decoder."
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-07"
@@ -753,7 +753,7 @@ summary = "versioned profiles, `SandboxSpec`, enforcement attestation, violation
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-19"

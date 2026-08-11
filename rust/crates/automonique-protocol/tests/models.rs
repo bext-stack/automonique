@@ -28,7 +28,12 @@ use automonique_protocol::models::{
     with_credential_pool,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision, ValueError};
-use automonique_protocol::sandbox::{EnforcementAttestation, NetworkAccess};
+use automonique_protocol::sandbox::{
+    CgroupId, CredentialDelivery, EgressPolicyDigest, EnforcementAttestation,
+    EnforcementAttestationParts, ExecutionBackendId, KernelBootId, LandlockAbi,
+    LandlockAttestation, LandlockRulesetDigest, NamespaceIdentity, NamespaceKind, NetworkAccess,
+    ProcessGroupId, SandboxPath, SeccompDigest, SupervisorProperty,
+};
 
 fn model(provider: &str, name: &str) -> ModelRef {
     ModelRef::new(provider, name).expect("valid model reference")
@@ -47,15 +52,37 @@ fn pricing() -> Pricing {
     Pricing::new("EUR", PricingUnit::MillionTokens, 3_000_000, 15_000_000).expect("valid pricing")
 }
 
+/// A digest body carrying `label` verbatim, so distinct labels stay distinct.
+fn labelled_digest(label: &str) -> String {
+    let mut hex: String = label.bytes().map(|byte| format!("{byte:02x}")).collect();
+    assert!(hex.len() <= 64, "label is too long to encode");
+    while hex.len() < 64 {
+        hex.push('0');
+    }
+    format!("sha256:{hex}")
+}
+
 fn attestation(seccomp: &str) -> EnforcementAttestation {
-    EnforcementAttestation::new(
-        "ns-1",
-        "cgroup-1",
-        "boot-1",
-        "landlock-1",
-        seccomp,
-        "egress-1",
-    )
+    EnforcementAttestation::record(EnforcementAttestationParts {
+        resolved_paths: &[SandboxPath::new("/workspace/attempt-1").expect("valid path")],
+        namespaces: &[
+            NamespaceIdentity::new(NamespaceKind::Mount, 4_026_531_840).expect("valid namespace")
+        ],
+        process_group: ProcessGroupId::new(4242).expect("valid process group"),
+        cgroup: CgroupId::new("/automonique.slice/run-1.scope").expect("valid cgroup"),
+        backend: ExecutionBackendId::new("scope-1").expect("valid backend"),
+        kernel_boot: KernelBootId::new("boot-1").expect("valid kernel boot"),
+        supervisor_properties: &[SupervisorProperty::NoNewPrivileges],
+        landlock: LandlockAttestation::new(
+            LandlockAbi::new(3).expect("valid abi"),
+            LandlockRulesetDigest::parse(&labelled_digest("landlock-1")).expect("valid digest"),
+        ),
+        seccomp_digest: SeccompDigest::parse(&labelled_digest(seccomp)).expect("valid digest"),
+        egress_digest: EgressPolicyDigest::parse(&labelled_digest("egress-1"))
+            .expect("valid digest"),
+        credential_delivery: CredentialDelivery::SealedDescriptor,
+        external_daemon: None,
+    })
     .expect("valid attestation")
 }
 
