@@ -566,7 +566,11 @@ def packet_document(
         "guides_sha256": guides_digest,
         "objectives_sha256": objectives_digest,
         "program_sha256": program_digest,
-        "integration_ceiling": config["integration_ceiling"],
+        # The session ceiling, not the repository one. Reading the wrong key
+        # here is what made every packet this loop wrote unreadable by
+        # program.rs, and the key no longer exists under the old name, so the
+        # mistake now raises KeyError instead of producing a rejected packet.
+        "integration_ceiling": config["session_integration_ceiling"],
         "prior_iteration": prior,
     }
     if driver == "codex_session":

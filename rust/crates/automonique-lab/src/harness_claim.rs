@@ -33,6 +33,24 @@ const PROGRAM_SCHEMA: &str = "automonique.dev-program/v1";
 const OBJECTIVES_SCHEMA: &str = "automonique.dev-objectives/v1";
 const LOOP_SCHEMA: &str = "automonique.dev-loop/v1";
 const PACKET_SCHEMA: &str = "automonique.harness-objective-packet/v1";
+/// What a candidate *session* may do with the work it is handed. Stamped into
+/// every objective packet, and required by [`crate::program`] when one is read
+/// back.
+///
+/// This is a different question from [`REPOSITORY_INTEGRATION_CEILING`] and has
+/// a different answer. Both were once spelled `integration_ceiling`, and
+/// `tools/harness_loop.py` consequently stamped the repository answer into the
+/// packet field that asks the session question — so every packet the loop wrote
+/// was refused by `program.rs`. The suite did not notice, because every fixture
+/// hard-coded the same literal as the validator it was checking. Two names, and
+/// the loop config below is checked against them, so the two halves can no
+/// longer disagree quietly.
+pub const SESSION_INTEGRATION_CEILING: &str = "proposal_only";
+/// What the loop may do to the *repository* once a candidate is verified. Under
+/// `autonomous-protected-integration` that reaches `origin/main` by non-force
+/// fast-forward without owner sign-off. Release signing, package publication and
+/// production deployment stay outside it.
+pub const REPOSITORY_INTEGRATION_CEILING: &str = "verified_fast_forward_main";
 const STATE_SCHEMA: &str = "automonique.harness-loop-state/v1";
 const MAX_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ITEMS: usize = 1_024;
@@ -126,6 +144,10 @@ pub struct ClaimReceipt {
     pub work_id: String,
     pub packet_relative: String,
     pub packet_sha256: String,
+    /// Read back out of the packet that was just written, not re-stated from a
+    /// literal. A receipt that names the ceiling independently of the packet is
+    /// a receipt that can be wrong about it.
+    pub integration_ceiling: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -715,7 +737,7 @@ pub fn publish_claim(
         "driver": "codex_session",
         "guides_sha256": guides_sha,
         "immutable_base": snapshot.head,
-        "integration_ceiling": "proposal_only",
+        "integration_ceiling": SESSION_INTEGRATION_CEILING,
         "iteration": 1,
         "objective": objective,
         "objectives_sha256": objectives_sha,
@@ -783,11 +805,24 @@ pub fn publish_claim(
         verify_prior_unchanged(&state_path, prior)?;
     }
     publish_state(state_root, &state_path, &coordinates.nonce, &state_bytes)?;
+    // Read back out of the bytes that were validated and made durable above.
+    // Re-stating the constant here would let the receipt and the packet disagree,
+    // which is the failure this whole rename exists to prevent.
+    let integration_ceiling = serde_json::from_slice::<Value>(&packet_bytes)
+        .ok()
+        .and_then(|document| {
+            document
+                .get("integration_ceiling")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .ok_or(ClaimError::InvalidInput)?;
     Ok(ClaimReceipt {
         run_id,
         work_id: work_id.to_owned(),
         packet_relative,
         packet_sha256: packet_sha,
+        integration_ceiling,
     })
 }
 
@@ -806,8 +841,14 @@ fn select<'a>(
         return Err(ClaimError::InvalidInput);
     }
     let loop_config = loop_config.as_object().ok_or(ClaimError::InvalidInput)?;
+    // Both ceilings are checked against the constants above rather than merely
+    // read. That is what closes the loop: `tools/harness_loop.py` stamps the
+    // packet from `session_integration_ceiling`, this refuses a config whose
+    // value is not the one `program.rs` will demand, so the Python producer and
+    // the Rust validator cannot drift apart without the claim failing loudly.
     if string(loop_config, "schema")? != LOOP_SCHEMA
-        || string(loop_config, "integration_ceiling")? != "verified_fast_forward_main"
+        || string(loop_config, "repository_integration_ceiling")? != REPOSITORY_INTEGRATION_CEILING
+        || string(loop_config, "session_integration_ceiling")? != SESSION_INTEGRATION_CEILING
         || string(loop_config, "default_driver")? != "codex_session"
     {
         return Err(ClaimError::InvalidInput);
@@ -1426,8 +1467,9 @@ mod tests {
                     "integration_owner": "primary_session", "max_concurrent_subagents": 3,
                     "native_subagents": true, "recursive_agent_trees": false}},
                 "hill_climbability_threshold": 70,
-                "integration_ceiling": "verified_fast_forward_main",
-                "schema": LOOP_SCHEMA
+                "repository_integration_ceiling": REPOSITORY_INTEGRATION_CEILING,
+                "schema": LOOP_SCHEMA,
+                "session_integration_ceiling": SESSION_INTEGRATION_CEILING
             }))
             .expect("loop config");
             Self {

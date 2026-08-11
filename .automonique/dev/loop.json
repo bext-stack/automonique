@@ -1,6 +1,7 @@
 {
   "schema": "automonique.dev-loop/v1",
-  "integration_ceiling": "verified_fast_forward_main",
+  "repository_integration_ceiling": "verified_fast_forward_main",
+  "session_integration_ceiling": "proposal_only",
   "max_workers": 1,
   "default_driver": "codex_session",
   "drivers": {

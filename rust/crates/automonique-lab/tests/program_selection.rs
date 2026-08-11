@@ -350,3 +350,89 @@ fn symlinked_parent_and_oversize_packet_are_rejected() {
     fixture.write_state();
     assert_eq!(fixture.select(), Err(ProgramError::InputTooLarge));
 }
+
+/// The packet's `integration_ceiling` and the loop config's are two different
+/// questions. They were once spelled with one name, so `tools/harness_loop.py`
+/// stamped the repository answer — `verified_fast_forward_main` — into the field
+/// that asks what a *session* may do, and every packet the loop wrote was
+/// refused here. Nothing caught it, because every fixture in this crate
+/// hard-coded the same literal as the validator it was exercising, so the
+/// producer was never compared against the validator at all.
+///
+/// These tests compare them.
+mod integration_ceiling_drift {
+    use super::*;
+
+    fn rewrite_ceiling(fixture: &Fixture, ceiling: &str) {
+        let mut packet: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.packet).expect("packet bytes"))
+                .expect("packet document");
+        packet["integration_ceiling"] = json!(ceiling);
+        std::fs::write(
+            &fixture.packet,
+            serde_json::to_vec_pretty(&packet).expect("packet JSON"),
+        )
+        .expect("packet");
+        fixture.write_state();
+    }
+
+    /// The positive control. Without it, the negative below could pass because
+    /// the fixture is broken in some unrelated way.
+    #[test]
+    fn the_session_ceiling_is_accepted() {
+        let fixture = Fixture::new();
+        rewrite_ceiling(
+            &fixture,
+            automonique_lab::harness_claim::SESSION_INTEGRATION_CEILING,
+        );
+        fixture
+            .select()
+            .expect("a packet at the session ceiling selects");
+    }
+
+    #[test]
+    fn the_repository_ceiling_in_a_packet_is_refused() {
+        let fixture = Fixture::new();
+        rewrite_ceiling(
+            &fixture,
+            automonique_lab::harness_claim::REPOSITORY_INTEGRATION_CEILING,
+        );
+        assert_eq!(fixture.select(), Err(ProgramError::InvalidPacket("header")));
+    }
+
+    /// The two constants must not collapse into one value. If they ever did,
+    /// both tests above would pass while proving nothing.
+    #[test]
+    fn the_two_ceilings_are_distinct() {
+        assert_ne!(
+            automonique_lab::harness_claim::SESSION_INTEGRATION_CEILING,
+            automonique_lab::harness_claim::REPOSITORY_INTEGRATION_CEILING
+        );
+    }
+
+    /// The shipped loop config is what `tools/harness_loop.py` reads. Pinning it
+    /// against the constants closes the chain: Python stamps the packet from
+    /// `session_integration_ceiling`, this asserts that key holds the value
+    /// `program.rs` demands, and the claim path refuses a config where it does
+    /// not. The ambiguous old name must be gone, so that reading it raises
+    /// `KeyError` in Python rather than silently producing a rejected packet.
+    #[test]
+    fn the_shipped_loop_config_agrees_with_both_constants() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.automonique/dev/loop.json");
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("loop.json")).expect("loop config");
+        assert_eq!(
+            config["session_integration_ceiling"],
+            json!(automonique_lab::harness_claim::SESSION_INTEGRATION_CEILING)
+        );
+        assert_eq!(
+            config["repository_integration_ceiling"],
+            json!(automonique_lab::harness_claim::REPOSITORY_INTEGRATION_CEILING)
+        );
+        assert!(
+            config.get("integration_ceiling").is_none(),
+            "the ambiguous name is back in loop.json; harness_loop.py can read it again"
+        );
+    }
+}

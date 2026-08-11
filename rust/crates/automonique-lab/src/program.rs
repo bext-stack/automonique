@@ -476,7 +476,8 @@ fn parse_packet(value: &Value) -> Result<AdmissionPacket, ProgramError> {
     )?;
     if packet_string(root, "schema")? != "automonique.harness-objective-packet/v1"
         || packet_string(root, "driver")? != "codex_session"
-        || packet_string(root, "integration_ceiling")? != "proposal_only"
+        || packet_string(root, "integration_ceiling")?
+            != crate::harness_claim::SESSION_INTEGRATION_CEILING
         || packet_uint(root, "iteration")? == 0
     {
         return Err(ProgramError::InvalidPacket("header"));

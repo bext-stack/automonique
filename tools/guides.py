@@ -358,12 +358,20 @@ def build_objectives(program_document: dict[str, Any]) -> dict[str, Any]:
 def build_loop_config() -> dict[str, Any]:
     return {
         "schema": LOOP_SCHEMA,
-        # What the loop may do on its own, stamped into every packet. Under
+        # Two ceilings, because they answer two questions. Both used to be
+        # called `integration_ceiling`, and this comment used to say "stamped
+        # into every packet" of the repository one — which is how the loop came
+        # to write packets that `program.rs` refused on sight.
+        #
+        # What the loop may do to the repository: under
         # `autonomous-protected-integration` a verified candidate reaches
         # `origin/main` by non-force fast-forward without owner sign-off.
         # Release signing, package publication and production deployment stay
         # outside this ceiling.
-        "integration_ceiling": "verified_fast_forward_main",
+        "repository_integration_ceiling": "verified_fast_forward_main",
+        # What a candidate session may do with its own work. This is the one
+        # stamped into every packet, and `program.rs` requires exactly it.
+        "session_integration_ceiling": "proposal_only",
         "max_workers": 1,
         "default_driver": "codex_session",
         "drivers": {

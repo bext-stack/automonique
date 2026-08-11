@@ -202,7 +202,7 @@ fn run_harness_claim<W: Write>(arguments: &[OsString], output: &mut W) -> Result
         "workId": receipt.work_id,
         "packetPath": receipt.packet_relative,
         "packetSha256": receipt.packet_sha256,
-        "integrationCeiling": "proposal_only"
+        "integrationCeiling": receipt.integration_ceiling
     });
     serde_json::to_writer(&mut *output, &document).map_err(|_| "could not encode harness claim")?;
     output

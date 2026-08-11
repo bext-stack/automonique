@@ -3,7 +3,7 @@
   "schema": "automonique.dev-program/v1",
   "source": {
     "graph": "plan/work-graph.toml",
-    "graph_sha256": "dfd707db04941b0bdf9b67ea3fafbcd10d7a46d13bdf7d3d2d2410e4817496ed",
+    "graph_sha256": "58982b6d825dba90cab27485a7eb2b6efa3a32881861057473a896d2e95a0b0f",
     "item_count": 375
   },
   "items": [
@@ -1124,9 +1124,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-03.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-04",
@@ -1147,9 +1147,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-04.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-05",
@@ -1218,9 +1218,9 @@
         "rust/Cargo.lock"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-07.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-08",
@@ -1241,9 +1241,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-08.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-09",
@@ -1264,9 +1264,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-09.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-10",
@@ -1356,9 +1356,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-13.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-14",
@@ -1379,9 +1379,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-14.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-15",
@@ -1402,9 +1402,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-15.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-16",
@@ -1425,9 +1425,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-16.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-17",
@@ -1494,9 +1494,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-19.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-20",
@@ -1517,9 +1517,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-20.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-21",
@@ -1540,9 +1540,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-21.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-22",
@@ -1563,9 +1563,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-22.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-23",
@@ -1586,9 +1586,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-23.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-24",
@@ -1609,9 +1609,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-24.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-25",
@@ -1632,9 +1632,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-25.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R2-01",
