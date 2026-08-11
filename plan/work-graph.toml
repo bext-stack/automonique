@@ -588,7 +588,7 @@ summary = "version negotiation, message limits and error mapping."
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-04"
@@ -599,7 +599,7 @@ summary = "UID/PID checks and mode-0700 runtime layout."
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-05"
@@ -632,7 +632,7 @@ summary = "non-mutating host and release checks plus the `legacyctl` forwarding 
 depends_on = ["R0-18", "R1-01"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique/", "rust/crates/automonique-cli/", "rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "rust/Cargo.lock"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-08"
@@ -643,7 +643,7 @@ summary = "typed capabilities plus provider instance/session/turn/item/request i
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-09"
@@ -654,7 +654,7 @@ summary = "bounded raw envelopes, preview versus authoritative normalized events
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-10"
@@ -698,7 +698,7 @@ summary = "actors, tenants, external identities, roles, credentials, authorizati
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-14"
@@ -709,7 +709,7 @@ summary = "registry, immutable bases, locks, provenance, visibility, retention a
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-15"
@@ -720,7 +720,7 @@ summary = "separate work, attempt, host, provider session and turn plus idle-TTL
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-16"
@@ -731,7 +731,7 @@ summary = "installation/tenant/actor resolution, source keys, durable input, ren
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-17"
@@ -764,7 +764,7 @@ summary = "name every Cargo package/crate/module/feature/binary, schema, metric,
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-20"
@@ -775,7 +775,7 @@ summary = "context manifests/references, queues, compression lineage, memory/FTS
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-21"
@@ -786,7 +786,7 @@ summary = "tool registry/toolsets/search, capability RPC, MCP client/server, ext
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-22"
@@ -797,7 +797,7 @@ summary = "canonical schedules, occurrences, goals/subgoals/waits, board claims,
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-23"
@@ -808,7 +808,7 @@ summary = "ACP host, OpenAI compatibility, native Runs, MCP export, A2A and rela
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-24"
@@ -819,7 +819,7 @@ summary = "routing/pools/auxiliaries/MoA, media/browser/computer adapters and ex
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-25"
@@ -830,7 +830,7 @@ summary = "queued composer input, retry/undo/stop/compress/checkpoint semantics,
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R2-01"

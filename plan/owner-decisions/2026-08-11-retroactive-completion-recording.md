@@ -2,14 +2,25 @@
 
 # Owner decision — how R1 completion gets recorded
 
-**Status: DRAFT. Awaiting owner. No item status has been changed.**
+**Status: ACCEPTED by the owner on 2026-08-11. Option B executed.**
 
 | Field | Value |
 |---|---|
 | Question | How does an item reach `status = "done"` when its implementation is already committed? |
 | Blocked on | `plan/gate.py` cannot authorise work that is not in the working tree |
 | Items affected | 18 with every contract row passing, 7 still partial |
-| Recommendation | Option B below |
+| Decision | Option B |
+
+## What was executed
+
+The 18 items named below are `status = "done"` in `plan/work-graph.toml`, set
+through `ITEM_STATUS` in `plan/generate.py` with the reason recorded at the
+edit. `plan/check.py --verify` passes and emits 16 warnings reading *"X is done
+but never passed through the gate"* — one per item that did not exist in the
+gate history. Those warnings are accurate and are deliberately not suppressed.
+`plan/baseline.py` was regenerated: 11 → 27 items done, and `contracts_missing`
+rose 77 → 91 because completing these items unblocked successors that have no
+contract yet. That rise is real debt becoming visible, not a regression.
 
 ## The structural problem
 

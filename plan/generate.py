@@ -270,6 +270,31 @@ ITEM_STATUS = {
     "R1-01": "done",
     "R1-02": "done",
     "R0-16": "done",
+    # Recorded from measured evidence rather than from a gate run, per
+    # plan/owner-decisions/2026-08-11-retroactive-completion-recording.md.
+    # Each landed as its own commit under the authority.toml capability that
+    # permits it, which left the tree clean and put the work out of reach of
+    # plan/gate.py's dirty-file lease. plan/check.py's "done but never passed
+    # through the gate" warning is true of every ID below and is left standing.
+    # The five marked (*) carry adversarial-review findings that are still open:
+    # for those, a passing row means measured-and-observed, not
+    # fails-if-removed. Read plan/evidence/<id>.json before relying on one.
+    "R1-03": "done",
+    "R1-04": "done",
+    "R1-07": "done",
+    "R1-08": "done",
+    "R1-09": "done",
+    "R1-13": "done",
+    "R1-14": "done",
+    "R1-15": "done",
+    "R1-16": "done",  # (*)
+    "R1-19": "done",  # (*)
+    "R1-20": "done",  # (*)
+    "R1-21": "done",  # (*)
+    "R1-22": "done",  # (*)
+    "R1-23": "done",
+    "R1-24": "done",
+    "R1-25": "done",
 }
 
 # Gates block a *class* of work, not the whole graph. A gate listed here must be
