@@ -1,0 +1,80 @@
+{
+  "item": "R1-09",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Envelope bounds",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test event envelope_bounds",
+      "result": "pass",
+      "output": "4 tests pass. A payload of exactly MAX_INLINE_RAW_BYTES (65536) is accepted inline; one byte over is refused with EventError::RawPayloadTooLarge carrying max_bytes 65536 and actual_bytes 65537, and the same content is then representable through RawProviderRecord::artifact as a digest reference, so oversized output is referenced rather than inlined. Source coordinates are bounded: empty source type, empty cursor, a control character (U+0007) and a 300-byte source type are each refused with SourceFieldInvalid naming the field. Every raw record carries the BinaryProvenance it came from. Unrepresentability of an unbounded record rests on private fields: RawProviderRecord has no public constructor other than inline() and artifact(), both of which validate. The RawPayload enum itself has public variants, so RawPayload::Inline(any Vec) is constructible as a free-standing value, but there is no path that injects one into a RawProviderRecord; this is enforced by privacy and is not covered by a compile-fail test."
+    },
+    {
+      "name": "Authority is required",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test event authority_is_required",
+      "result": "pass",
+      "output": "2 tests pass. RecordedEvent::new takes authority as a positional argument; the type derives Clone, Debug, Eq and PartialEq but not Default, and there is no builder, no Option<Authority> and no inference from the event kind, so a record cannot exist without an explicit authority. Both values were constructed and read back (Authoritative on AssistantMessageCompleted, Synthetic on ProviderFault) and their stable spellings are 'authoritative' and 'synthetic'. Structural note: the implementation makes authority two-valued rather than the three-valued field the contract body describes; 'preview' is not an Authority value but a separate PreviewEvent type, which is what makes the next row a type property."
+    },
+    {
+      "name": "Preview cannot authorize",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --doc event && printf '<preview-into-timeline snippet>' | rustc --edition 2024 --crate-type lib --emit=metadata -o /dev/null --extern automonique_protocol=<rlib> -L rust/target/debug/deps -",
+      "result": "pass",
+      "output": "Two doctests on the event module pass and are a matched pair: the positive control at line 13 constructs the preview and compiles, and the compile_fail at line 27 offers that identical preview to RunTimeline::record and does not, so the failure cannot be blamed on anything but the type. Reproduced directly with rustc against the built rlib, the rejection is exactly error[E0308] mismatched types, not an incidental error. PreviewEvent has no authority field at all, so marking a delta authoritative is not expressible, and RunTimeline::record accepts RecordedEvent only, so terminal derivation from a preview does not typecheck."
+    },
+    {
+      "name": "Preview-drop invariance",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test event preview_cannot_authorize::dropping_every_preview_leaves_the_terminal_outcome_unchanged",
+      "result": "pass",
+      "output": "The test builds a mixed stream (three previews at sequences 10-12 alongside an authoritative AssistantMessageCompleted at 13 and a RunTerminal at 14), captures the derived terminal, clears every preview, and re-derives: the terminal is byte-identical and still present. The invariance holds by construction rather than by arithmetic, because RunTimeline cannot hold a PreviewEvent at all and terminal() reads only recorded events. Stated plainly: this is one concrete case, not the randomized property test the contract body asks for, and it could not fail without a change to the type split it depends on."
+    },
+    {
+      "name": "Kind coverage",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test event kind_coverage && python3 (cross-check of the names in docs/product-plan/requirements/agent-integrations.md 'Normalized event model' against EventKind::ALL and its spellings)",
+      "result": "pass",
+      "output": "2 tests pass: EventKind::ALL holds 23 variants, every one is constructible into a RecordedEvent and reads back identically, all 23 wire spellings are distinct after sort and dedup, and exactly one kind (RunTerminal) reports is_terminal. Cross-checked against the requirement list directly: the requirement names 24 kinds, 23 of which are EventKind variants with no variant absent from the requirement and none extra; the single name that is not an EventKind is AssistantPreviewDelta, which is modelled as the separate PreviewEvent type so it cannot carry an authority. Every spelling is the snake_case form of its variant. The coverage table exists only as this audit's cross-check; no such table is checked in with the tests."
+    },
+    {
+      "name": "Terminal uniqueness",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test event terminal_uniqueness",
+      "result": "pass",
+      "output": "2 tests pass. A second RunTerminal offered to a timeline that already holds one is refused with EventError::TerminalAlreadyRecorded{existing: 1}; afterwards the original terminal is still at sequence 1 and the timeline still holds exactly 1 event, so nothing was overwritten or appended. Any non-terminal event offered after the terminal is refused with EventError::RunAlreadyTerminal, a distinct category, so the two situations are separately reportable."
+    },
+    {
+      "name": "Cursor semantics",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test event cursor_semantics",
+      "result": "pass",
+      "output": "4 tests pass. Sequences must strictly increase: after accepting 5, the offers 5, 4 and 0 are each refused with SequenceNotIncreasing{last: 5, offered: n}, so duplicates and reordering are both refused, and 6 is accepted; the value layer introduces no gap of its own because it only accepts what a caller supplies. A ConsumerCursor carries consumer identity and topic, advances forward and idempotently to the same position, and refuses to rewind with CursorWentBackwards{current: 11, offered: 9}, leaving the position at 11. A cursor at 3 against a retained range of 10..=42 yields SubscriptionStart::ResyncRequired{snapshot_from: 10, snapshot_to: 42}, and a cursor at 0 against 100..=200 likewise; a cursor at 12 inside the range yields Live{from: 12}. The enum has exactly two variants, so there is no empty-success outcome a caller could mistake for a silent partial stream. A cursor ahead of retained_to resolves Live at its own position, which the row does not treat as out of range."
+    },
+    {
+      "name": "Approval idempotency",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test event approval_idempotency",
+      "result": "pass",
+      "output": "3 tests pass. Replaying Allow for request r-1 with a later clock reading (9999 ms) returns the original receipt unchanged, including its original timestamp of 5000 ms, so a replay cannot re-stamp a decision. A conflicting Deny for the same request is refused with EventError::ApprovalConflict{recorded: Allow, offered: Deny} and the recorded decision still reads Allow at 5000 ms afterwards, so a decision is never replaced. Distinct requests are independent: r-2 records Deny while r-1 stays Allow. The typed request carries its class and the original provider request, item and turn coordinates."
+    },
+    {
+      "name": "Retention split",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test event retention_split",
+      "result": "pass",
+      "output": "2 tests pass. The two horizons are separate fields and separately readable (1000 ms preview, 10000 ms authoritative). An inverted policy is refused with RetentionWouldOutliveEvidence{preview_ms: 3600000, authoritative_ms: 60000}, and equal horizons are refused too, so previews can never be kept as long as the evidence derived from them. expire_previews takes &mut Vec<PreviewEvent> and nothing else: expiring at 5000 ms dropped the preview at 0 ms and kept the one at 4500 ms, while the authoritative record in the timeline was untouched. There is no signature through which preview expiry could reach a RecordedEvent."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path rust/Cargo.toml --all -- --check; cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --offline -- -D warnings; cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast; cargo check --manifest-path rust/Cargo.toml --workspace --offline --locked",
+      "result": "fail",
+      "output": "Formatting is clean (exit 0) and strict all-target Clippy exits 0 with zero warnings. The lockfile is consistent: cargo check --locked succeeds, no dependency was added, and automonique-protocol still declares no dependencies while forbidding unsafe_code, dbg_macro, todo and unimplemented at the crate level; event.rs contains no allowance. The workspace test clause does not hold at this base: cargo test --workspace --offline --no-fail-fast reports 806 passed and 3 failed across two failing targets, automonique-lab --test harness_claim (operational_claim_is_accepted_by_rust_status_and_selection, 'harness claim denied') and automonique-lab --test program_cli (immutable_packet_selects_the_exact_generated_work and admitted_cli_allocates_and_replays_the_packet_bound_worktree, 'program selection denied'). All three build fixtures that select R0-19, which is blocked by GATE-HARNESS with no item closing that gate, so the derived runnable flag is false and selection refuses. The failures are outside this item's lease and are not caused by its code, but the row as written is not satisfied."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "no independent review of this item took place. This evidence was written by an automated audit agent that re-ran every row at the recorded base; an automated agent is not an independent human reviewer, so the reviewer count is zero."
+  },
+  "extra_checks": [
+    {
+      "name": "Error category coverage",
+      "command": "grep -c on EventError variants and Authority variants in rust/crates/automonique-protocol/src/event.rs and tests/event.rs",
+      "result": "pass",
+      "output": "Eight stable categories exist: raw_payload_too_large, source_field_invalid, sequence_not_increasing, terminal_already_recorded, run_already_terminal, cursor_went_backwards, approval_conflict, retention_would_outlive_evidence. Seven of the eight are asserted by exact variant in a passing test; SourceFieldInvalid is exercised in source_coordinates_are_bounded only through is_err(), so the field name it carries is never checked. Occurrence counts in tests/event.rs: Authority::Authoritative 16, Authority::Synthetic 4, PreviewEvent::new 6, which is the whole of the per-authority record population, since preview is not an authority value in this implementation."
+    }
+  ],
+  "notes": "Qualifications, stated plainly. (1) The implementation makes Authority two-valued and models preview as a distinct PreviewEvent type rather than as the third value of a three-valued field, which is what the contract body describes; the substitution is stronger for the 'preview cannot authorize' rule but it is a departure from the wording and the audit records it rather than treating the wording as met. (2) The kind-coverage cross-check against docs/product-plan/requirements/agent-integrations.md was performed by this audit; no coverage table is checked in beside the tests, so nothing in the repository would notice if the requirement list gained a kind. (3) Preview-drop invariance is a single-case test whose outcome is guaranteed by the type split, not the randomized property test the contract body calls for. (4) Unrepresentability of an unbounded raw record rests on private fields with no compile-fail coverage; only the preview-into-timeline rejection has a compile-fail test. (5) No legacy.runner.event v1 decoder was added, so nothing needed inventorying as a compatibility codec. (6) No wire encoding, journal, artifact resolution or TypeScript fixture exists for this slice, so no serialized round trip or cross-language parity was measured. (7) The Quality row fails at this base because three workspace tests in automonique-lab fail; they are R0-19 harness fixtures made unselectable by the GATE-HARNESS freeze and are outside this item's allowed paths, so they were neither fixed nor weakened."
+}

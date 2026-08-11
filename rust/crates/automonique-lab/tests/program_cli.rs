@@ -33,6 +33,9 @@ struct Fixture {
     packet_digest: String,
     root: PathBuf,
     base: String,
+    /// The work item this fixture selected, resolved at build time rather than
+    /// named, so a plan change cannot break a worktree test.
+    selected_id: String,
 }
 
 impl Fixture {
@@ -76,20 +79,43 @@ impl Fixture {
             &std::fs::read(root.join(".automonique/dev/objectives.json")).expect("objectives"),
         )
         .expect("objectives JSON");
+        // Any runnable item with a validated objective. Naming one coupled this
+        // fixture to the plan: when GATE-HARNESS froze the harness tail, tests
+        // about worktree allocation failed for reasons unrelated to worktrees.
+        let objectives_list = objectives["objectives"].as_array().expect("objectives");
         let work = program["items"]
             .as_array()
             .expect("items")
             .iter()
-            .find(|item| item["id"] == "R0-19")
-            .expect("work")
+            .find(|item| {
+                item["runnable"] == true
+                    && objectives_list.iter().any(|objective| {
+                        objective["work_id"] == item["id"]
+                            && objective["autonomous_eligible"] == true
+                    })
+            })
+            .expect("a runnable, autonomous-eligible work item")
             .clone();
-        let objective = objectives["objectives"]
-            .as_array()
-            .expect("objectives")
+        let selected_id = work["id"].as_str().expect("work id").to_owned();
+        let objective = objectives_list
             .iter()
-            .find(|item| item["work_id"] == "R0-19")
+            .find(|item| item["work_id"] == selected_id.as_str())
             .expect("objective")
             .clone();
+        // Materialise the selected item's own lease rather than one item's
+        // paths, so the fixture follows the selection instead of pinning it.
+        for path in work["allowed_paths"].as_array().expect("allowed paths") {
+            let relative = path.as_str().expect("lease path");
+            let target = if relative.ends_with('/') {
+                root.join(relative).join("fixture.txt")
+            } else {
+                root.join(relative)
+            };
+            std::fs::create_dir_all(target.parent().expect("lease parent")).expect("lease dirs");
+            if !target.exists() {
+                std::fs::write(&target, b"fixture\n").expect("leased fixture");
+            }
+        }
         let program_sha = digest(&root.join(".automonique/dev/program.yaml"));
         let objectives_sha = digest(&root.join(".automonique/dev/objectives.json"));
         let guides_sha = digest(&root.join(".automonique/dev/guides/manifest.json"));
@@ -116,7 +142,7 @@ impl Fixture {
         )
         .expect("packet");
         let packet_digest = digest(&packet);
-        let state = json!({"base":base,"branch":"master","deadline_at":"2099-01-01T00:00:00+00:00","driver":"codex_session","failures":0,"iteration":1,"packet":format!(".automonique/state/runs/{RUN}/packet.json"),"packet_sha256":packet_digest,"run_id":RUN,"schema":"automonique.harness-loop-state/v1","started_at":"2026-01-01T00:00:00+00:00","status":"claimed","stop_reason":null,"unchanged_results":0,"updated_at":"2026-01-01T00:00:00+00:00","work_id":"R0-19"});
+        let state = json!({"base":base,"branch":"master","deadline_at":"2099-01-01T00:00:00+00:00","driver":"codex_session","failures":0,"iteration":1,"packet":format!(".automonique/state/runs/{RUN}/packet.json"),"packet_sha256":packet_digest,"run_id":RUN,"schema":"automonique.harness-loop-state/v1","started_at":"2026-01-01T00:00:00+00:00","status":"claimed","stop_reason":null,"unchanged_results":0,"updated_at":"2026-01-01T00:00:00+00:00","work_id":selected_id});
         std::fs::write(
             root.join(".automonique/state/harness-loop.json"),
             serde_json::to_vec_pretty(&state).expect("state"),
@@ -128,6 +154,7 @@ impl Fixture {
             packet_digest,
             root,
             base,
+            selected_id,
         }
     }
 
@@ -200,7 +227,7 @@ fn immutable_packet_selects_the_exact_generated_work() {
     assert_eq!(proposal["schema"], "automonique.lab-proposal/v1");
     assert_eq!(proposal["immutableBase"], fixture.base);
     assert_eq!(proposal["runId"], RUN);
-    assert_eq!(proposal["workId"], "R0-19");
+    assert_eq!(proposal["workId"], fixture.selected_id.as_str());
     assert_eq!(proposal["packetSha256"], fixture.packet_digest);
     assert!(
         proposal["graphSha256"]
@@ -249,7 +276,7 @@ fn admitted_cli_allocates_and_replays_the_packet_bound_worktree() {
     let applied: Value = serde_json::from_slice(&applied.stdout).expect("admission JSON");
     assert_eq!(applied["schema"], "automonique.lab-admission/v1");
     assert_eq!(applied["runId"], RUN);
-    assert_eq!(applied["workId"], "R0-19");
+    assert_eq!(applied["workId"], fixture.selected_id.as_str());
     assert_eq!(applied["attempt"]["state"], "paused");
     assert_eq!(applied["worktree"]["state"], "allocated");
     assert_eq!(applied["worktree"]["reconciliation"], "applied");

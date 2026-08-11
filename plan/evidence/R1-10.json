@@ -1,0 +1,72 @@
+{
+  "item": "R1-10",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Bundle integrity",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test schema bundle_integrity range_mapping",
+      "result": "fail",
+      "output": "What holds: PinnedBundle::load refuses when its two digest arguments differ, returning SchemaError::DigestMismatch, and refuses an empty provider or an empty declared digest. What does not hold: no digest is ever derived from the document, so 'a bundle whose document digest does not match its declared digest fails to load' is not the check being performed. load() compares two caller-supplied strings, declared_digest and computed_digest, and never reads the document while doing so; the module doc states this openly ('Digests are compared, never computed: this crate has no dependencies and therefore no hash implementation'). The consequence is demonstrated by an existing passing test: range_mapping::overlapping_ranges_for_one_provider_are_a_conflict_at_load loads four bundles that all carry the identical baseline() document under four different declared digests (sha256:a, sha256:b, sha256:c, sha256:d) and all four load successfully. A caller that passes the same literal twice satisfies the check regardless of what the document contains, so the declared digest is in fact trusted independently of the document, which is what this row forbids."
+    },
+    {
+      "name": "Range mapping",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test schema range_mapping",
+      "result": "pass",
+      "output": "2 tests pass. Inserting a second bundle for provider 'codex' covering 3..=7 while 1..=3 is already registered is refused with SchemaError::OverlappingRanges{provider: \"codex\"}, so ranges that merely touch at one version are a conflict at load rather than a silent choice; a disjoint 4..=7 for the same provider and any range for a different provider ('opencode' 1..=3) are accepted. Lookup never guesses: with codex pinned at 1..=3 and 10..=12, version 5 (between the two ranges), version 99 (above both) and an unknown provider all resolve to Resolution::Unpinned, while version 2 resolves to the sha256:a bundle and version 12 to the sha256:b bundle. Resolution has exactly two variants, so there is no nearest-neighbour outcome to return."
+    },
+    {
+      "name": "Verdict exhaustiveness",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test schema verdict_exhaustiveness",
+      "result": "pass",
+      "output": "2 tests pass. classify() returns a Verdict holding one VerdictKind, so exactly one of the three is structurally guaranteed; the test drives one document per verdict against the same baseline and observes Compatible (identical documents), Breaking (a removed field) and Unclassifiable (a changed unmodelled construct), and every kind has a non-empty stable spelling. Across the whole suite the classifier's five input constructs each have covering cases: fields (removed, added optional, added required, type changed, requirement tightened, requirement relaxed), enums (removed, added, value removed, value added under each sensitivity, sensitivity changed), message kinds (added, removed), endpoints (added, removed) and unmodelled entries (changed, removed, added). The verdict distribution over the fixture corpus, counted as expected-verdict occurrences across the 23 classify() call sites in tests/schema.rs, is 6 Compatible, 12 Breaking and 3 Unclassifiable. Stated plainly: exhaustiveness is a property of the return type plus this enumeration of covering cases, not a machine-checked proof over the construct space."
+    },
+    {
+      "name": "Unclassifiable is preserved",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test schema unclassifiable_is_preserved",
+      "result": "pass",
+      "output": "2 tests pass. A document that adds an optional field (purely additive) while also reshaping an unmodelled vendor block classifies Unclassifiable, not Compatible, and names at least one change, so an additive change cannot launder an unmodelled one. Precedence is Breaking over Unclassifiable over Compatible: a document that removes a field and reshapes the unmodelled block classifies Breaking, which is the more actionable answer. The collapse the row forbids is unreachable in the code: the Compatible branch is taken only when both the breaking and the unclassifiable lists are empty."
+    },
+    {
+      "name": "Evidence completeness",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test schema evidence_completeness",
+      "result": "pass",
+      "output": "3 tests pass. A Breaking verdict names the path that broke ('turn.id') with the reason 'field removed'. A Compatible verdict names what was added: exactly one change, path 'turn.label', reason 'optional field added'. Emptying the document entirely yields Breaking with non-empty evidence, and changing only the unmodelled entry yields Unclassifiable with non-empty evidence, so neither of those two kinds is ever evidence-free. Verdict has private fields and classify() is its only constructor, so a verdict carrying no reason for its kind cannot be fabricated, though that privacy is not covered by a compile-fail test. One documented exception: classifying a document against itself returns Compatible with empty evidence, which the source comments acknowledge and the test asserts; when nothing changed there is no changed path to name."
+    },
+    {
+      "name": "Additive rules",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test schema additive_rules",
+      "result": "pass",
+      "output": "5 tests pass, one per rule direction. Compatible: a new optional field, a new message kind ('turn_steered'), a new endpoint ('/v1/runs') and a relaxed requirement (required to optional, evidence reason 'field became optional'), plus a new value in a read-only enum from the security_enum_rule module. Breaking: a new required field ('turn.tenant'), a type change (string to integer), a tightened requirement (optional to required), a removed message kind and a removed endpoint. Each case was classified against the same baseline document, and the reasons recorded by the classifier are the ones the rule table names."
+    },
+    {
+      "name": "Security enum rule",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test schema security_enum_rule",
+      "result": "pass",
+      "output": "3 tests pass. Adding 'allow_always' to the security-sensitive approval.decision enum classifies Breaking with the reason 'value added to a security-sensitive enum', matching the R1-03 rule that such an enum rejects unknown values, so a change that would make an existing reader fail closed is not compatible merely because it is an addition. Adding 'hibernated' to the read-only run.state enum classifies Compatible. Removing a value from either enum is Breaking, and changing an enum's sensitivity is Breaking with the reason 'enum sensitivity changed'."
+    },
+    {
+      "name": "Determinism",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test schema determinism",
+      "result": "pass",
+      "output": "2 tests pass. Classifying the same pair of documents nine times (one baseline plus eight repeats) yields verdicts that compare equal, including their evidence vectors, so a diff of two runs is empty. Order independence is proved at both ends: two documents built from the same parts in forward and reversed order compare equal, because SchemaDocument::new sorts fields and enums by path and sorts and dedups kinds, endpoints and unmodelled entries; and the verdicts derived from each compare equal. Evidence is canonically ordered: the returned change paths were already in sorted order, and classify() sorts and dedups the evidence before returning it."
+    },
+    {
+      "name": "Offline operation",
+      "command": "cat rust/crates/automonique-protocol/Cargo.toml; grep -rn \"std::net|std::process|std::fs|Command::new|SystemTime|Instant::now|reqwest|TcpStream|UnixStream|include_str|include_bytes|env::\" rust/crates/automonique-protocol/src/; cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline",
+      "result": "pass",
+      "output": "automonique-protocol declares no dependencies at all (its Cargo.toml has no [dependencies] section) and forbids unsafe_code, dbg_macro, todo and unimplemented at the crate level, so there is no client, no process spawn and no hash implementation to reach a registry with. A grep across the whole crate for network, process, filesystem, clock, embedded-file and environment access returns exactly one hit, std::net::{Ipv4Addr, Ipv6Addr} in primitives.rs, which are address parsing types and open no socket; there is no std::process, no std::fs, no Command::new, no SystemTime or Instant, and no env:: use. schema.rs itself imports only core::fmt, std::error::Error and the crate's own codec module. Documents are supplied as values by the caller: no function in the module takes a path or a URL. The entire suite builds and runs with --offline."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path rust/Cargo.toml --all -- --check; cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --offline -- -D warnings; cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast; cargo check --manifest-path rust/Cargo.toml --workspace --offline --locked",
+      "result": "fail",
+      "output": "Formatting is clean (exit 0) and strict all-target Clippy exits 0 with zero warnings. The lockfile is consistent: cargo check --locked succeeds, no dependency was added, and schema.rs contains no allowance. The workspace test clause does not hold at this base: cargo test --workspace --offline --no-fail-fast reports 806 passed and 3 failed across two failing targets, automonique-lab --test harness_claim (operational_claim_is_accepted_by_rust_status_and_selection, 'harness claim denied') and automonique-lab --test program_cli (immutable_packet_selects_the_exact_generated_work and admitted_cli_allocates_and_replays_the_packet_bound_worktree, 'program selection denied'). All three build fixtures that select R0-19, which is blocked by GATE-HARNESS in plan/work-graph.toml and .automonique/dev/program.yaml with no item closing that gate, so the derived runnable flag is false and selection refuses. The failures are outside this item's lease and are not caused by its code, but the row as written is not satisfied."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "no independent review of this item took place. This evidence was written by an automated audit agent that re-ran every row at the recorded base; an automated agent is not an independent human reviewer, so the reviewer count is zero and the bundle-integrity finding is recorded as a failed check rather than as a review finding."
+  },
+  "notes": "Two rows do not pass. (1) Bundle integrity: the layer never hashes a document, so nothing binds a bundle's declared digest to its content; load() only requires two caller-supplied strings to agree, and an existing passing test registers four bundles carrying the same document under four different digests. The design is documented rather than concealed, and the stated cause is the no-dependency rule, but the check as the contract words it is not performed and the tests could not detect a bundle whose digest is unrelated to its document. Closing it needs either a digest implementation inside the crate or a typed carrier that computes the digest from the same bytes the document is decoded from; both are larger than an audit and neither was attempted here. (2) Quality: three workspace tests in automonique-lab fail at this base, all R0-19 harness fixtures made unselectable by the GATE-HARNESS freeze; they are outside this item's allowed paths and were neither fixed nor weakened. Other qualifications: verdict exhaustiveness rests on the return type plus an enumeration of covering cases rather than a machine-checked proof; a Compatible verdict is empty when the two documents are identical, which is the one representable evidence-free verdict; capture is defined only as a fixture format, no provider binary was invoked and no real captured schema was checked in, so the corpus is entirely synthetic; and the full classifier rule table the Compatibility section asks to record exists only as the covering cases listed under Additive rules, Security enum rule and Unclassifiable is preserved, not as a checked-in table."
+}

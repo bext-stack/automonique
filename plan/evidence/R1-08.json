@@ -1,0 +1,74 @@
+{
+  "item": "R1-08",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Capability structure",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test provider capability_structure",
+      "result": "pass",
+      "output": "3 tests pass. An UnknownCapability declared by a newer adapter is retained with its exact spelling ('future_capability') and is not reachable through the defined-capability lookup: asking for a Capability with the same name in any group returns CapabilityState::Unprobed, never Present. The three states are distinguishable on one declaration: a capability in the degraded set is Absent, a capability in neither set is Unprobed, and a capability in the native set is Present, so probed-absent and never-probed are separate answers. Capability names are bounded: empty, a control character (U+0007) and 200 bytes over the 128-byte ceiling are all rejected. Round-trip here means retention through construction and accessor; this slice has no wire encoding, so no serialized round trip was measured. 6 of the 7 capability groups appear in tests (Sessions, Turns, Events, Approvals, Tools, Telemetry); Lifecycle is representable but appears in no test."
+    },
+    {
+      "name": "Set discipline",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test provider set_discipline",
+      "result": "pass",
+      "output": "2 tests pass. A mode naming 'approval_response' in both its required and its degraded set fails at ModeDeclaration::new with ProviderError::RequiredCapabilityIsDegraded carrying the offending capability name, so a mode that is simultaneously mandatory and absent cannot be constructed. The declaration ceiling is enforced: 129 capabilities across the four lists fail with category 'too_many_capabilities' against MAX_CAPABILITIES = 128. Stated plainly: required and native are not disjoint and cannot be, because ModeDeclaration::state() defines Present as membership in native, so a selectable mode must have required as a subset of native; the reference declaration in the test has required = {approval_response, resume} inside native and constructs successfully. Only the required-versus-degraded overlap is a construction error, which is the rule the contract body and the upstream requirement actually define."
+    },
+    {
+      "name": "Fail-closed selection",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test provider fail_closed_selection",
+      "result": "pass",
+      "output": "4 tests pass. A mode whose three required capabilities include two that are not present refuses with ProviderError::RequiredCapabilitiesMissing listing every missing name in declaration order (['approval_response', 'steer']), not just the first. A required capability that was never probed refuses rather than being assumed present. A satisfied mode returns a Selection naming the mode and exposing its degraded set (['cost']) for a client or policy to act on. No path converts a refusal into a downgrade: Selection has private fields plus a PhantomData marker and ModeDeclaration::select is its only constructor; compiling the struct-literal form outside the crate fails with 'cannot construct Selection with struct literal syntax due to private fields' (verified with rustc, see extra_checks)."
+    },
+    {
+      "name": "Forbidden substitutions",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test provider fail_closed_selection::the_forbidden_substitutions_are_only_expressible_as_refusals",
+      "result": "pass",
+      "output": "The test iterates both named substitutions exhaustively. Removing 'approval_response' from native yields RequiredCapabilitiesMissing{missing: ['approval_response']} and removing 'resume' yields RequiredCapabilitiesMissing{missing: ['resume']}; neither returns a Selection. There is no API surface returning a weaker selection: select() returns Result<Selection, ProviderError> and the only Ok path requires every required capability to be Present, so approval-aware to auto-approval and resumable-session to fresh-run are representable only as this refusal. The refusal set for the whole module is five categories: required_capability_is_degraded, required_capabilities_missing, binding_mismatch, value_invalid, too_many_capabilities."
+    },
+    {
+      "name": "Identity distinctness",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --doc provider && for each ordered pair: printf '<assignment snippet>' | rustc --edition 2024 --crate-type lib --emit=metadata -o /dev/null --extern automonique_protocol=rust/target/debug/deps/libautomonique_protocol-f9919e2c7dee2777.rlib -L rust/target/debug/deps -",
+      "result": "pass",
+      "output": "3 compile_fail doctests on the provider module pass. Beyond the 2 identity pairs they cover (turn to session, instance to request), all 20 ordered pairs of the five identity types were compiled directly with rustc against the built rlib: 20 rejected with E0308 mismatched types, 0 rejected for another reason, 0 compiled. The five types are OpaqueId<Domain, 128> over five distinct zero-sized domain markers, so the same spelling in two domains stays two different values: ProviderTurnId::new(\"t-1\") and ProviderSessionId::new(\"t-1\") both succeed and are not interchangeable."
+    },
+    {
+      "name": "Binding safety",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test provider binding_safety",
+      "result": "pass",
+      "output": "3 tests pass. SessionBinding::new takes tenant, backend, provider_account, provider_namespace and a typed ProviderSessionId, and validates each string component, so an unvalidated opaque session value has no constructor: an empty tenant is refused with ProviderError::Value. Equality is component-wise: confirm_same walks tenant, backend, provider_account, provider_namespace and then session, and each of the 5 single-component differences returns ProviderError::BindingMismatch naming exactly that component. A binding identical in all five components confirms. A partial match is never an equality; there is no accessor that yields the session identity in a form that would let a caller compare only part of the binding."
+    },
+    {
+      "name": "Cross-boundary resume",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test provider binding_safety::a_binding_differing_in_any_component_names_it",
+      "result": "pass",
+      "output": "Four cross-boundary cases are each refused with the differing component named: tenant-a to tenant-b returns BindingMismatch{component: \"tenant\"}, codex to claude returns \"backend\", account-1 to account-2 returns \"provider_account\", and default to other returns \"provider_namespace\". The fifth case, a different session id under an identical boundary, returns \"session\". The check is ordered, so the first differing component is the one named; no case returned Ok."
+    },
+    {
+      "name": "Provenance completeness",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test provider provenance_completeness",
+      "result": "pass",
+      "output": "3 tests pass. BinaryProvenance::new requires a non-empty bounded version and digest: an empty version and an empty digest are both refused, and the optional schema digest is validated when present. ModeDeclaration::new takes a BinaryProvenance by value, so a capability record without binary version and digest cannot be constructed. Staleness is detectable by digest comparison alone: matches() compares binary digest and schema digest, so a rebuilt binary (sha256:aaaa to sha256:cccc) and an unchanged binary with a changed schema digest (sha256:bbbb to sha256:dddd) are both reported as not matching, while an identical observation matches."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path rust/Cargo.toml --all -- --check; cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --offline -- -D warnings; cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast; cargo check --manifest-path rust/Cargo.toml --workspace --offline --locked",
+      "result": "fail",
+      "output": "Formatting is clean (exit 0) and strict all-target Clippy exits 0 with zero warnings. The lockfile is consistent: cargo check --locked succeeds, no dependency was added, and automonique-protocol still declares no dependencies at all while forbidding unsafe_code, dbg_macro, todo and unimplemented at the crate level. No allowance was added by this item: the only #[allow] in the crate is a pre-existing clippy::redundant_closure_call inside a codec.rs macro, and none exists in provider.rs. The workspace test clause does not hold at this base: cargo test --workspace --offline --no-fail-fast reports 806 passed and 3 failed across two failing targets, automonique-lab --test harness_claim (operational_claim_is_accepted_by_rust_status_and_selection, 'harness claim denied') and automonique-lab --test program_cli (immutable_packet_selects_the_exact_generated_work and admitted_cli_allocates_and_replays_the_packet_bound_worktree, 'program selection denied'). All three build fixtures that select R0-19, which is blocked by GATE-HARNESS in plan/work-graph.toml and .automonique/dev/program.yaml with no item closing that gate, so the lab's derived runnable flag is false and selection refuses. The failures are outside this item's lease and are not caused by its code, but the row as written is not satisfied."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "no independent review of this item took place. This evidence was written by an automated audit agent that re-ran every row at the recorded base; an automated agent is not an independent human reviewer, so the reviewer count is zero."
+  },
+  "extra_checks": [
+    {
+      "name": "Compile-fail intent",
+      "command": "printf '<snippet>' | rustc --edition 2024 --crate-type lib --emit=metadata -o /dev/null --extern automonique_protocol=<rlib> -L rust/target/debug/deps -",
+      "result": "pass",
+      "output": "The three compile_fail doctests were reproduced directly to confirm they fail for their intended reasons rather than incidentally: assigning a ProviderTurnId to a ProviderSessionId and a ProviderInstanceId to a ProviderRequestId each produce exactly error[E0308] mismatched types, and the Selection struct literal produces 'error: cannot construct Selection with struct literal syntax due to private fields'. Nothing was written to the repository; rustc read the snippets from stdin and emitted metadata to /dev/null."
+    }
+  ],
+  "notes": "Row-level qualifications, stated plainly. (1) The 'Set discipline' row's phrase 'required, native and degraded are disjoint as declared' is satisfied only in the narrow sense the contract body and the upstream requirement define, namely that the three sets are declared separately and a required-versus-degraded overlap is a construction error. Full three-way set disjointness is not enforced and cannot be: selection defines Present as membership in native, so a mode is only selectable when required is a subset of native, and the reference declaration in the tests relies on that. This is a contract-wording question for the owner, not a defect I could fix inside this lease. (2) 'Round-trip' for unknown capabilities was measured as retention through construction and accessor; this slice defines no wire encoding, so no serialized round trip exists to measure and no TypeScript fixture was added under sdk/typescript/packages/protocol. (3) The capability-group coverage the Compatibility section asks to record is 6 of 7: Lifecycle is representable and has a stable spelling but appears in no test, and CapabilityGroup::as_str is asserted for no group. (4) The Quality row fails at this base because three workspace tests in automonique-lab fail; they are R0-19 harness fixtures made unselectable by the GATE-HARNESS freeze and are outside this item's allowed paths, so they were neither fixed nor weakened. (5) No provider binary was launched, probed or read; the crate contains no std::process, std::fs or socket use, and the only std::net import in the crate is Ipv4Addr/Ipv6Addr for address parsing in primitives.rs."
+}

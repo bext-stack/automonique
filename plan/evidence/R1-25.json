@@ -1,0 +1,60 @@
+{
+  "item": "R1-25",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Queue identity",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test interaction queue_identity::",
+      "result": "pass",
+      "output": "10 tests pass. The five request kinds (Steer, Retry, Reorder, Cancel, Undo) are not interchangeable -- assigning a CancelRequest to a SteerRequest is a doctest compile_fail, and so is assigning a String to a SteerRequest. A queued item carries its own opaque identity and session reference rather than an in-memory prompt string, and an item cannot be smuggled into another session's queue. Empty, over-bound and duplicate-identity queues each fail with their own category; appending assigns the next position and refuses a repeated identity; position arithmetic is checked with no wrapping successor. Reorder preserves exactly the identities the receiver held, cannot invent one or address a slot that is not there, the last rank is addressable and the next one is refused, and a destination is a rank in the current order rather than a stored position."
+    },
+    {
+      "name": "Attempt lineage",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test interaction attempt_lineage::",
+      "result": "pass",
+      "output": "3 tests pass: a retry names its immediate predecessor and the original attempt, a retry of a retry records both references rather than collapsing to one, and no constructor addresses or mutates prior evidence -- a retry produces a successor attempt intent and has no parameter naming an evidence record."
+    },
+    {
+      "name": "Idempotent intents",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test interaction idempotent_intents:: review_regressions::",
+      "result": "pass",
+      "output": "4 + 2 tests pass. A repeated stop and a repeated undo each yield one typed outcome and one effect; idempotency is keyed by request identity rather than by request shape, and the regression tests confirm that reusing one request identity for a different request is reported as a collision rather than silently treated as a replay. An irreversible undo target fails with its own category instead of succeeding silently."
+    },
+    {
+      "name": "Checkpoint identity",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test interaction checkpoint_identity:: && rustc --edition 2024 --emit=metadata --extern automonique_protocol=rust/target/debug/libautomonique_protocol.rlib -L dependency=rust/target/debug/deps - (RestoreCheckpoint::latest())",
+      "result": "pass",
+      "output": "4 tests pass: create, list and restore are distinct typed operations, a restore requires the exact content digest and revision, a digest identifies at most one restore point, and an unknown target fails. I compiled `RestoreCheckpoint::latest()` and rustc rejected it with error[E0599] (no function named latest), so an unqualified restore is unrepresentable and that compile_fail fails for its intended reason; passing a CreateCheckpoint to restore is a second compile_fail in the doc suite."
+    },
+    {
+      "name": "Compression lineage",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test interaction compression_lineage:: && rustc --edition 2024 --emit=metadata ... - (entry.digest = ...)",
+      "result": "pass",
+      "output": "9 tests pass: every lineage component is recorded (source range, compressor provider and model identity, prompt/template digest, output digest, protected facts, verification status), a missing or over-bound component is refused, an over-long or control-bearing component is refused, the range needs both endpoints and may not run backwards but may cover exactly one revision, a range the transcript does not hold is refused, verification status is explicit rather than inferred from absence, and a compression is a derived view that never replaces an authoritative entry at its own revision. I compiled a direct field write `entry.digest = ContentDigest::new(\"sha256:rewritten\")` and rustc rejected it with error[E0616] (private field), so no value can express a transcript rewrite."
+    },
+    {
+      "name": "Context usage",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test interaction context_usage::",
+      "result": "pass",
+      "output": "4 tests pass. ContextComponentClass::ALL has exactly 8 members with distinct spellings and a stable index order, lookup answers for the class asked about, a breakdown missing a class fails with missing_component_class naming it and a repeated class fails with duplicate_component_class. Estimated and provider-reported counts are independently nullable across all four combinations; a null provider count carries one of the typed MissingCountReason values, reports None for its token count against a positive control that reads back 4242 when the provider did report it, and the estimate stays on its own side -- the reported total for a breakdown with one unreported class is 7*20 and that class is named in `unreported()` rather than filled in from its 1000-token estimate. Assigning an EstimatedTokens into the provider-reported slot is a doctest compile_fail."
+    },
+    {
+      "name": "Projection authority",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test interaction projection_authority:: quality:: && rustc --edition 2024 --emit=metadata ... - (projection.set_surface(...) and an AuthorizedIntent struct literal)",
+      "result": "pass",
+      "output": "5 + 4 tests pass. A projection exposes observed state and changes none of it, every action it offers names the authority it requires, a presentation shortcut is not a new authority, a namespaced projection cannot name, read or address another extension's namespace, and one command vocabulary serves every surface with no per-surface parsing. I compiled two escapes: `projection.set_surface(SurfaceKind::Cli)` was rejected with error[E0599] (no such method) and an `AuthorizedIntent { .. }` struct literal was rejected with error[E0451] (private fields), so a shortcut cannot fabricate an authority. `CommandInvocation::parse(\"/undo\")` is a further doctest compile_fail: there is no per-surface parser, alias table or regular expression in the value layer. The quality module additionally checks that every published byte bound and collection bound is the edge a real rejection uses and that every published error category is reachable and distinct."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path rust/Cargo.toml --all -- --check && cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --offline -- -D warnings && cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "fail",
+      "output": "Formatting is clean (exit 0) and strict all-target Clippy exits 0 with no warnings. Workspace tests are 806 passed, 3 failed, all three in automonique-lab: harness_claim::operational_claim_is_accepted_by_rust_status_and_selection ('harness claim denied') and program_cli::{immutable_packet_selects_the_exact_generated_work, admitted_cli_allocates_and_replays_the_packet_bound_worktree} ('program selection denied'). Root cause is drift between the generated operational documents and the lab code, outside this item's lease: harness_claim.rs:810 requires .automonique/dev/loop.json integration_ceiling == \"proposal_only\" but the checked-in loop.json declares \"verified_fast_forward_main\", and .automonique/dev/program.yaml marks R0-19 blocked / runnable false behind GATE-HARNESS. Everything in automonique-protocol passes: 45 interaction tests and 69 doctests. No new allowance in the crate (its only one is the pre-existing #[allow(clippy::redundant_closure_call)] at codec.rs:436), no todo!/unimplemented!/dbg!/unsafe, rust/Cargo.toml and rust/Cargo.lock unmodified, all commands ran --offline."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "no reviewer examined this item. This file is an after-the-fact audit by a separate agent session that read the contract, ran the checks and wrote no implementation; that is not independent review and no human read the diff. The tests/interaction.rs module named review_regressions records that some earlier review produced findings, but nothing in the repository records who performed it, so it is not counted here."
+  },
+  "notes": "Verdict: partial, on the Quality row alone. All 7 substantive rows are measured and passing across 45 tests in tests/interaction.rs against src/interaction.rs (2712 lines), and four of the module's nine compile_fail doctests were re-compiled outside the doctest harness and confirmed to fail with E0599, E0599, E0451 and E0616 rather than for an incidental reason. The single gap is that `cargo test --workspace` is not green because of three automonique-lab failures unrelated to this item. Measurement caveat: the working tree was not byte-identical to base e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7. src/interaction.rs and tests/interaction.rs both carried uncommitted edits made at 01:35-01:36 UTC on 2026-08-11 by another session (+39 lines of source, +508 lines of tests over the committed version), so the passing results describe the working tree, not the commit named as base. The source edits I read were doc-comment work distinguishing a queue position from a reorder rank, plus one added error category, duplicate_transcript_entry, taking InteractionError::CATEGORIES from 19 to 20; the queue_identity rank test and the review_regressions module that exercise those are part of the uncommitted test additions. Probe programs were compiled with rustc against rust/target/debug/libautomonique_protocol.rlib and written to this session's scratchpad outside the repository; no repository file was written except this evidence file. No TypeScript fixtures exist under sdk/typescript/packages/protocol/ for interaction values, so no cross-language parity is claimed and the contract's licence-split requirement does not apply. The value layer performs no I/O, reads no clock and runs no compression."
+}

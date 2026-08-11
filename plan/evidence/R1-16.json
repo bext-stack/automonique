@@ -1,0 +1,87 @@
+{
+  "item": "R1-16",
+  "status": "partial",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Installation resolution",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test connector installation_resolution",
+      "result": "pass",
+      "output": "3 tests executed and passed. A bound installation (platform teams, application app-1, owner ext-tenant-1) resolves to TenantResolution::Resolved{tenant:\"acme\"}. An empty registry and a registry bound to a different owner both return TenantResolution::InstallationRequired. TenantResolution has exactly two variants, so there is no Default/Fallback variant to land on. Rebinding the same key replaces rather than appending (resolve returns globex after a second bind)."
+    },
+    {
+      "name": "Identity resolution",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test connector identity_resolution && cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test identity external_identity_keys",
+      "result": "pass",
+      "output": "connector: 2 tests pass. IdentityResolution has exactly two variants, Linked{actor} and Unlinked{link_prompt}; the unlinked case carries a link prompt and never yields an Actor. identity: 3 tests pass, including every_mutable_attribute_is_refused_as_a_key, which iterates all 5 MutableAttribute values (email, display_name, username, and two more) and gets IdentityError::MutableAttributeAsKey for each. The mutable-handle half of this row is enforced in src/identity.rs (R1-13's module), not in src/connector.rs: connector.rs has no path from an external handle to an IdentityResolution at all, so the connector layer contributes the enum and the identity layer contributes the refusal."
+    },
+    {
+      "name": "Source-key stability",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test connector source_key_stability; then 5 separate OS processes of a scratch binary linking libautomonique_protocol.rlib and printing SourceKey::derive(teams/app-1/ext-tenant-1, \"evt-1\"); then rustc compile probe passing a timestamp as a third argument",
+      "result": "pass",
+      "output": "3 in-crate tests pass (10 in-process derivations agree; different event id, different installation owner and different platform each give a different key). Cross-process: five independent process invocations each printed exactly `teams:app-1:ext-tenant-1:evt-1` (uniq -c reported 5 of one value), so stability across restarts and connector instances is measured, not asserted. SourceKey::derive takes exactly 2 arguments: adding a third (a millisecond timestamp) fails to compile with E0061 \"this function takes 2 arguments but 3 arguments were supplied\", so no clock, random value or process identity has an argument to enter through."
+    },
+    {
+      "name": "Acknowledgement split",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test connector acknowledgement_split; then rustc compile probe assigning an Acknowledgement to a BusinessAcceptance binding",
+      "result": "pass",
+      "output": "2 tests pass: Acknowledgement::immediate/deferred are distinguishable, BusinessAcceptance::for_input(\"input-1\") succeeds and for_input(\"\") is refused, so acceptance requires a durable input identity. The substitution probe fails to compile with E0308 \"mismatched types: expected BusinessAcceptance, found Acknowledgement\", so an acknowledgement cannot be returned where an acceptance is required."
+    },
+    {
+      "name": "Render intents",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test connector render_intents platform_type_isolation::outbound_content_is_an_intent_rather_than_a_payload; then a scratch binary calling RenderIntent::terminal with an Adaptive-Card-shaped string",
+      "result": "fail",
+      "output": "The typed-variant half holds: 3 tests pass, all four variants (progress, clarification, approval, terminal) carry structured fields, empty and 5000-byte summaries are refused. Two clauses of the row do not hold. (1) \"pre-rendered markup is unrepresentable\" is false as measured: RenderIntent::terminal(\"<AdaptiveCard><TextBlock>done</TextBlock></AdaptiveCard>\", true) returned Ok and the string round-tripped byte-for-byte out of the Terminal variant's summary field; bounded_text only rejects empty, >4096 bytes and control characters, so markup passes. (2) \"derived from durable events\" is not represented: no constructor or conversion in src/connector.rs takes an event, a journal record or a SourceMessageEvent, so nothing prevents a connector inventing an intent, and nothing measures derivation."
+    },
+    {
+      "name": "Action-token binding",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test connector action_token_binding",
+      "result": "pass",
+      "output": "5 tests pass. stored_form() does not contain the minted secret, starts with the marker 'h:' and is deterministic. resolve() at the bound revision succeeds; at revision 4 it returns ConnectorError::TargetRevisionChanged{bound_to:3,current:4} rather than re-targeting; at or past expiry it returns TokenExpired; for a different actor id and for a same-id actor in another tenant it returns ActorNotEligible; expired.category() != ineligible.category() (token_expired vs actor_not_eligible). Caveat recorded rather than hidden: stored_form is a 64-bit FNV-1a fold that the module doc itself calls \"a non-cryptographic stand-in for the real digest\", so \"stored hashed\" holds only in the weak sense that the stored value is not the token; it is not preimage- or collision-resistant."
+    },
+    {
+      "name": "Artifact grants",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test connector artifact_grants; then rustc compile probe passing a filesystem path as a fifth argument to ArtifactGrant::issue",
+      "result": "pass",
+      "output": "2 tests pass: a grant carries direction, an ArtifactDigest, a byte ceiling and an expiry, and is invalid at its expiry instant. MAX_GRANT_BYTES (536870912) is accepted and MAX_GRANT_BYTES+1 is refused with category grant_too_large, so an unbounded payload is unrepresentable. Adding a path argument fails to compile with E0061 \"this function takes 4 arguments but 5 arguments were supplied\"; the struct has no String field at all, and its only non-numeric field is ArtifactDigest, whose constructor (src/release.rs) rejects anything that is not a known algorithm plus exactly hex_len lowercase hex characters, so neither a filesystem path nor a credential-bearing URL can be smuggled through it."
+    },
+    {
+      "name": "Coordinate preservation",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test connector coordinate_preservation; then rustc compile probe reading back locale and installation from ConversationCoordinates",
+      "result": "fail",
+      "output": "3 tests pass for the clauses they cover: conversation, thread (Some and None) and message round-trip, was_mentioned round-trips, and SourceMessageEvent::Revised{revision} and Tombstoned{at} are distinct variants neither of which carries an approved action. The round-trip clause fails for three of the seven named coordinates: ConversationCoordinates stores installation and locale but exposes no accessor for either, so platform, installation and locale go in and cannot come back out. Measured: `c.locale()` and `c.installation()` both fail to compile with E0599 \"private field, not a method\". The only accessors are conversation(), thread(), message() and was_mentioned()."
+    },
+    {
+      "name": "Platform-type isolation",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test connector platform_type_isolation::no_platform_specific_type_is_declared_in_the_core_protocol",
+      "result": "pass",
+      "output": "Passes. The test reads every .rs file in crates/automonique-protocol/src (24 files present; the test asserts at least 10 were scanned) and looks for `struct|enum|type|trait` declarations of 10 platform names: AdaptiveCard, TeamsActivity, Activity, DiscordInteraction, InteractionResponse, MessageComponent, ActionRow, SlashCommand, EmbedBuilder, BotFrameworkActivity. Zero findings. Note the scan is over declaration text in the crate's sources, not over an enumeration of the exported public API, so a platform type re-exported from elsewhere under a different spelling would not be caught; nothing of that kind exists today because the crate has no dependencies."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml --all -- --check; cargo clippy --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml --workspace --all-targets --offline -- -D warnings; cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "fail",
+      "output": "fmt exits 0 with no diff. Strict all-target Clippy exits 0 with zero warnings. Workspace tests do NOT pass: 806 passed, 3 failed. The three failures are all in automonique-lab, a crate outside this item's lease: harness_claim::operational_claim_is_accepted_by_rust_status_and_selection (stderr \"automonique-lab: harness claim denied\") and program_cli::immutable_packet_selects_the_exact_generated_work / program_cli::admitted_cli_allocates_and_replays_the_packet_bound_worktree (stderr \"automonique-lab: program selection denied\"). Both fixtures copy the real plan/work-graph.toml and .automonique/dev/program.yaml and then select work item R0-19, which the current generated program marks status \"blocked\", runnable false, blocked_by_gates [GATE-HARNESS] — so selection is refused. This is a pre-existing red workspace unrelated to connector.rs, but the row as written measures the workspace and the workspace fails. -p automonique-protocol alone is green: 620 passed, 0 failed. The protocol crate contains exactly one #[allow] (src/codec.rs:436, clippy::redundant_closure_call) and it is not in connector.rs; no todo!/unimplemented!/dbg!/unsafe appears in the crate, which sets unsafe_code = \"forbid\". Lockfile drift could not be checked: this audit is not permitted to run git."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "No independent reviewer examined this item. This file is a third-party audit written by an agent that read the contract, the implementation and the tests and re-ran every command; it is not a human review and it is not the implementer's self-review."
+  },
+  "extra_checks": [
+    {
+      "name": "Conformance obligation list",
+      "command": "grep -rn \"conformance\" /home/infra-sj278/automonique/rust/crates/automonique-protocol/src/connector.rs /home/infra-sj278/automonique/rust/crates/automonique-protocol/tests/connector.rs",
+      "result": "fail",
+      "output": "Zero matches. The objective's last bullet — \"the conformance obligations are declared as a checkable list so a connector can be judged against the same contract regardless of platform, including restart resumption without replaying an external effect\" — has no representation in the module or its tests. The verification table has no row for it, so it does not gate this item, but it is part of the objective and is recorded here rather than left implied."
+    },
+    {
+      "name": "TypeScript connector surface",
+      "command": "find /home/infra-sj278/automonique/sdk -type f",
+      "result": "fail",
+      "output": "sdk/typescript/packages/protocol contains only canonical.ts, index.ts, the conformance runner and the R1-11 spike output; there is no connector surface. The contract cites § TypeScript SDK connector surface as a source but the verification table has no cross-language row, so no parity is claimed here."
+    }
+  ],
+  "notes": "Grading rule used throughout: a row is \"pass\" only when every clause of its Expected column was exercised by a command that actually ran; a clause this layer cannot express is reported rather than waved through. Two rows fail on a measured clause (Render intents: markup is representable inside a bounded summary string, and no intent is derived from an event; Coordinate preservation: platform, installation and locale have no accessors and cannot round-trip) and Quality fails on three pre-existing automonique-lab failures outside the lease. Everything else passes. Commands are recorded with absolute manifest paths; they were run with cwd /home/infra-sj278. Compile probes were built with rustc --edition 2024 --extern automonique_protocol=<rust/target/debug/deps/libautomonique_protocol-f9919e2c7dee2777.rlib> against scratch files under /tmp; no file in the repository was created or modified by this audit other than this evidence file. Fixtures use teams/discord, app-1, ext-tenant-1/2, acme and globex only; no real tenant, guild, team, channel or user identifier appears. GATE-SCRUB's protected rule bundle is not installed (see plan/evidence/BOOT-003.json), so no scrub scan was run as part of this audit."
+}

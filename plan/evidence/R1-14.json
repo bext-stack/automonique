@@ -1,0 +1,66 @@
+{
+  "item": "R1-14",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Path unrepresentability",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test workspace path_unrepresentability && cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --doc && rustc --edition 2024 --extern automonique_protocol=rust/target/debug/libautomonique_protocol.rlib <scratch copy of the compile_fail body>",
+      "result": "pass",
+      "output": "Two tests pass. Six path-shaped spellings are refused with category 'path_shaped_token': /srv/work, srv/work, ..\\\\escape, ../escape, C:tmp and ~/home, covering absolute, relative, parent-escaping, drive-letter and home-relative forms. An opaque token round-trips (wt-3f9a) and the registration exposes only the token. The compile-fail case at workspace.rs line 17 passes as one of 42 doc tests and was recompiled standalone against the built rlib to confirm its reason: WorkspaceToken::from_path(PathBuf::from(\"/srv/work\")) produces 'error[E0599]: no function or associated item named `from_path` found for struct `WorkspaceToken`'. The positive doc test above it compiles and runs, so the failure is attributable to the missing path constructor. WorkspaceRegistration::new takes a WorkspaceToken and no path-typed argument."
+    },
+    {
+      "name": "Base immutability",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test workspace base_immutability",
+      "result": "pass",
+      "output": "Two tests pass. set_base_revision(8) on a registration at base 7 fails with WorkspaceError::BaseIsImmutable { revision: 7 } and leaves base_revision 7 and snapshot 'snap-1' untouched. A changed base requires a new registration: at_new_base(8, \"snap-2\", token) returns a fresh registration at revision 8 / snap-2 carrying the same tenant and isolation kind, while the original still reads revision 7 / snap-1, so evidence attached to the old base stays true."
+    },
+    {
+      "name": "Lock exclusion",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test workspace lock_exclusion && grep -n 'pub fn acquire\\|pub fn release\\|blocking' rust/crates/automonique-protocol/src/workspace.rs",
+      "result": "pass",
+      "output": "Four tests pass. Acquiring a held key from a second holder fails with WorkspaceError::LockHeld { holder: \"run-1\" }, naming the current holder, and holder_of still reports run-1. A reentrant acquire by the same holder is the identical conflict, so nothing silently succeeds. Release by a non-holder fails with WorkspaceError::NotLockHolder { holder: \"run-1\", attempted_by: \"run-2\" } and the lock stays held; release by the holder frees the key and a different holder can then acquire it. Releasing a key nobody holds is an error rather than a silent success. The API surface confirms there is no blocking acquire: LockRegistry exposes exactly acquire(&mut self, key, holder) -> Result<(), WorkspaceError>, release(&mut self, key, holder) -> Result<(), WorkspaceError> and holder_of, with no wait, timeout or blocking variant anywhere in the module."
+    },
+    {
+      "name": "Digest addressing",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test workspace digest_addressing",
+      "result": "pass",
+      "output": "Two tests pass. Two artifacts built from the same sha-256 digest, one carrying one locator and one carrying two, compare is_same_content true, while an artifact from a different digest compares false, so identity is the digest and the locator count is irrelevant. Weakened or unknown algorithms are refused at construction by the shared release::ArtifactDigest rule rather than restated here: md5, sha-1 and crc32 all error."
+    },
+    {
+      "name": "Required classification",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test workspace required_classification && grep -n 'DEFAULT\\|impl Default' rust/crates/automonique-protocol/src/workspace.rs",
+      "result": "pass",
+      "output": "Two tests pass. Artifact::new takes visibility and retention as required positional arguments with no builder, no Option and no fallback, so an artifact without either is not constructible. Both vocabularies are closed and pairwise distinct: Visibility has exactly Private, Tenant and Published; RetentionClass has exactly Ephemeral, Standard, Audit and LegalHold. On defaults: workspace.rs contains no 'impl Default' and no DEFAULT constant for either enum, so nothing silently defaults to keep-forever, which is what the contract's stop condition on 'a defaulted or absent retention class' requires; the per-class default TTLs the requirements describe live in operations-and-governance.md and are not values this slice declares."
+    },
+    {
+      "name": "Locator abstraction",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test workspace locator_abstraction && grep -n 'pub struct StorageLocator' -A 6 rust/crates/automonique-protocol/src/workspace.rs && grep -n 'with_locator\\|pub fn locators' rust/crates/automonique-protocol/src/workspace.rs",
+      "result": "pass",
+      "output": "Two tests pass. Five dereferenceable or path-bearing keys are refused with category 'locator_not_opaque': /var/lib/objects/aa, https://bucket.example.invalid/aa, s3://bucket/aa, user:secret@host/aa and C:\\\\objects\\\\aa, covering filesystem paths, credential-bearing URLs and bucket URLs. An opaque locator names a backend and a key only ('local' / 'objects.aa11'). On the digest clause: StorageLocator holds backend and key and carries no digest of its own, and the guarantee is structural rather than tested - the only place a locator can be recorded is Artifact::locators, reachable solely through Artifact::with_locator on an Artifact whose constructor requires an ArtifactDigest, so no recorded locator can exist without a digest. A bare StorageLocator value is nevertheless constructible on its own, and no test covers this clause directly."
+    },
+    {
+      "name": "Link typing",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test workspace link_typing",
+      "result": "pass",
+      "output": "Two tests pass. LinkRelation::ALL has exactly 6 members with 6 distinct spellings and the enum has no catch-all, covering precisely the relations the contract names: Input, Work, Run, Turn, Approval and Publication. An ArtifactLink is constructible for every relation and reports back the relation it was built with, so 'referenced by an approval' is distinguishable from 'produced by a run'. A link carries the artifact digest rather than a locator: ArtifactLink::new takes an ArtifactDigest and link.digest().matches(...) confirms it."
+    },
+    {
+      "name": "Deletion order",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test workspace deletion_order",
+      "result": "pass",
+      "output": "Five tests pass. The three steps are separately expressible and ordered: Live -> remove_access -> AccessRemoved -> tombstone -> Tombstoned -> permit_collection -> Collectable. Collection is refused both from Live and from AccessRemoved, so bytes can never become collectable before the tombstone is durable. Steps cannot be repeated or reordered: a second remove_access errors and a tombstone without prior access removal errors. LegalHold refuses all three steps. Cross-tenant deduplication neither blocks nor reveals: two tenants holding identical bytes are separate Artifact values that compare is_same_content true, deleting acme's copy succeeds and reaches AccessRemoved, and globex's copy is unaffected at DeletionState::Live, so one tenant's deletion is neither prevented by nor visible to the other."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path rust/Cargo.toml --all -- --check && cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --offline -- -D warnings && cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "fail",
+      "output": "Formatting exits 0 and strict all-target Clippy exits 0 with no warnings, both offline. The workspace test run does not pass: 806 tests pass and 3 fail, in two automonique-lab targets. harness_claim::operational_claim_is_accepted_by_rust_status_and_selection panics with 'automonique-lab: harness claim denied'; program_cli::immutable_packet_selects_the_exact_generated_work and program_cli::admitted_cli_allocates_and_replays_the_packet_bound_worktree panic with 'automonique-lab: program selection denied'. Root cause measured: all three fixtures copy the live .automonique/dev/program.yaml and request item R0-19, whose entry now reads \"status\": \"blocked\", \"runnable\": false, so harness_claim::select returns ClaimError::IneligibleItem. Nothing in workspace.rs or tests/workspace.rs is implicated. No allowance was added in this item's files; automonique-protocol declares zero dependencies and forbids unsafe, todo, unimplemented and dbg at the manifest level."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "no independent reviewer examined this item; this file is a measurement audit written by a separate agent that ran every command listed and read the outputs, which is not review of the implementation's design"
+  },
+  "notes": "All 21 tests in tests/workspace.rs pass and its module names line up one-to-one with the contract's check table; every workspace-and-artifact row is measured and passing. Two clauses rest on structure rather than on a test, and are recorded as such in their rows rather than silently counted: 'a locator without a digest is unrepresentable', which holds because locators are reachable only through an Artifact that requires a digest, although a bare StorageLocator value is constructible on its own; and 'declared defaults', for which the module deliberately declares none, since a default retention class is one of the contract's own stop conditions. The compile-fail doc test was recompiled standalone against the built rlib to confirm it produces E0599 for the missing from_path constructor rather than passing for an unrelated reason. All digests are synthetic 64-character hex literals and no file was hashed. The only failing row is Quality, and it fails on three automonique-lab tests unrelated to this item, broken by drift in the generated program document rather than by any code in this slice. Not measured: whether Cargo.lock or any Cargo.toml drifted, because this audit is forbidden to run git."
+}

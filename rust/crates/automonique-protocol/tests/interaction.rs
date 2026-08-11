@@ -10,14 +10,16 @@ use automonique_protocol::interaction::{
     CommandId, CommandInvocation, CommandParameter, ComponentUsage, CompressionOperation,
     CompressionParts, ContentDigest, ContextComponentClass, CreateCheckpoint, Delivery,
     EstimatedTokens, ExtensionId, InputQueue, IntentEffect, IntentLedger, InteractionError,
-    InteractionText, ListCheckpoints, MAX_PROTECTED_FACTS, MAX_QUEUED_ITEMS, MissingCountReason,
+    InteractionText, ListCheckpoints, MAX_CHECKPOINTS, MAX_COMMAND_PARAMETERS,
+    MAX_INTERACTION_ID_BYTES, MAX_INTERACTION_TEXT_BYTES, MAX_PROJECTION_ACTIONS,
+    MAX_PROJECTION_ENTRIES, MAX_PROTECTED_FACTS, MAX_QUEUED_ITEMS, MissingCountReason,
     NamespacedKey, NamespacedProjection, ProjectionAction, QueueItemId, QueuePosition, QueuedInput,
     ReorderRequest, ReportedCount, ReportedTokens, RequestKind, RequestRef, RequiredAuthority,
     RestoreCheckpoint, RetryRequest, SessionRef, SteerRequest, SurfaceKind, SurfaceProjection,
     Transcript, TranscriptEntry, TranscriptEntryId, TranscriptRange, TurnContextUsage, TurnRef,
     UndoRequest, UndoTarget, UndoTargetKind, VerificationStatus, authorize, derive_view,
 };
-use automonique_protocol::primitives::{EpochMillis, Revision};
+use automonique_protocol::primitives::{EpochMillis, Revision, ValueError};
 
 fn session() -> SessionRef {
     SessionRef::new("s-1").expect("valid session")
@@ -128,7 +130,7 @@ mod queue_identity {
                 AttemptRef::new("a-2").expect("valid attempt"),
                 text("provider timed out"),
             )),
-            RequestKind::Reorder(ReorderRequest::new(item("q-a"), QueuePosition::FIRST)),
+            RequestKind::Reorder(ReorderRequest::new(item("q-a"), QueuePosition::new(2))),
             RequestKind::Cancel(CancelRequest::new(
                 RequestRef::new("r-1").expect("valid request"),
                 CancelScope::Turn,
@@ -142,21 +144,49 @@ mod queue_identity {
         let spellings: Vec<&str> = kinds.iter().map(RequestKind::kind).collect();
         assert_eq!(spellings, RequestKind::KINDS);
 
-        // Each payload is reachable only through its own variant: a cancel does
-        // not answer a steer's accessor, and nothing turns one into the other.
-        for kind in &kinds {
-            let steering = matches!(kind, RequestKind::Steer(_));
-            let cancelling = matches!(kind, RequestKind::Cancel(_));
-            assert!(
-                !(steering && cancelling),
-                "a request kind answered to two payloads"
-            );
-        }
+        // Each payload is reachable only through its own variant, and each
+        // variant answers with the payload it was built from. Asserting that no
+        // value matches two patterns at once would be a tautology: the check
+        // that can fail is that every accessor returns its own field.
+        let RequestKind::Steer(steering) = &kinds[0] else {
+            panic!("the first kind is a steer");
+        };
+        assert_eq!(steering.text().as_str(), "prefer the smaller diff");
+
+        let RequestKind::Retry(retry) = &kinds[1] else {
+            panic!("the second kind is a retry");
+        };
+        assert_eq!(retry.original().as_str(), "a-1");
+        assert_eq!(retry.predecessor().as_str(), "a-1");
+        assert_eq!(
+            retry.successor().as_str(),
+            "a-2",
+            "the successor is the attempt produced, not the one derived from"
+        );
+        assert_eq!(retry.reason().as_str(), "provider timed out");
+
+        let RequestKind::Reorder(reorder) = &kinds[2] else {
+            panic!("the third kind is a reorder");
+        };
+        assert_eq!(reorder.item().as_str(), "q-a");
+        assert_eq!(
+            reorder.to(),
+            QueuePosition::new(2),
+            "the destination is the rank the request named"
+        );
+
         let RequestKind::Cancel(cancel) = &kinds[3] else {
             panic!("the fourth kind is a cancel");
         };
         assert_eq!(cancel.scope(), CancelScope::Turn);
         assert_eq!(cancel.request().as_str(), "r-1");
+
+        let RequestKind::Undo(undo) = &kinds[4] else {
+            panic!("the fifth kind is an undo");
+        };
+        assert_eq!(undo.request().as_str(), "r-2");
+        assert_eq!(undo.target().kind(), UndoTargetKind::FileEdit);
+        assert_eq!(undo.target().identity().as_str(), "src/main.rs");
     }
 
     #[test]
@@ -200,8 +230,95 @@ mod queue_identity {
 
         let outside = queue
             .reorder(&ReorderRequest::new(item("q-a"), QueuePosition::new(9)))
-            .expect_err("position 9 is outside a two-item queue");
+            .expect_err("rank 9 is outside a two-item queue");
         assert_eq!(outside.category(), "position_out_of_range");
+    }
+
+    #[test]
+    fn the_last_rank_a_queue_has_is_addressable_and_the_next_one_is_refused() {
+        let queue = queue_of(&["q-a", "q-b"]);
+
+        // A two-item queue has ranks 0 and 1. The last one is a real slot.
+        let to_last = queue
+            .reorder(&ReorderRequest::new(item("q-a"), QueuePosition::new(1)))
+            .expect("rank 1 is the last slot of a two-item queue");
+        assert_eq!(identities(&to_last), ["q-b", "q-a"]);
+
+        // One past it is refused rather than inserted past the end. Accepting
+        // it would reach `Vec::insert` with an index the vector does not have.
+        let past_end = queue
+            .reorder(&ReorderRequest::new(item("q-a"), QueuePosition::new(2)))
+            .expect_err("rank 2 is one past the last slot of a two-item queue");
+        assert_eq!(
+            past_end,
+            InteractionError::PositionOutOfRange {
+                length: 2,
+                requested: 2,
+            }
+        );
+
+        // The same edge one item further out, so the bound is read from the
+        // queue's length rather than from a constant that happens to be 2.
+        let longer = queue_of(&["q-a", "q-b", "q-c"]);
+        let to_last = longer
+            .reorder(&ReorderRequest::new(item("q-a"), QueuePosition::new(2)))
+            .expect("rank 2 is the last slot of a three-item queue");
+        assert_eq!(identities(&to_last), ["q-b", "q-c", "q-a"]);
+        let past_end = longer
+            .reorder(&ReorderRequest::new(item("q-a"), QueuePosition::new(3)))
+            .expect_err("rank 3 is one past the last slot of a three-item queue");
+        assert_eq!(
+            past_end,
+            InteractionError::PositionOutOfRange {
+                length: 3,
+                requested: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn a_reorder_destination_is_a_rank_and_never_a_stored_position() {
+        // A queue's positions must strictly increase; they need not be dense.
+        let sparse = InputQueue::new(
+            session(),
+            vec![
+                queued("q-a", 0, steer("go")),
+                queued("q-b", 7, steer("go")),
+                queued("q-c", 9, steer("go")),
+            ],
+        )
+        .expect("strictly increasing positions need not be dense");
+        assert_eq!(sparse.items()[1].position(), QueuePosition::new(7));
+
+        // So the two readings of a `QueuePosition` differ here, and a
+        // destination is the rank: 1 is the second slot, whatever position the
+        // item sitting there stores.
+        let moved = sparse
+            .reorder(&ReorderRequest::new(item("q-c"), QueuePosition::new(1)))
+            .expect("rank 1 is the second slot");
+        assert_eq!(identities(&moved), ["q-a", "q-c", "q-b"]);
+        assert_eq!(
+            moved
+                .items()
+                .iter()
+                .map(|entry| entry.position().get())
+                .collect::<Vec<u32>>(),
+            [0, 1, 2],
+            "a reorder renumbers densely, so rank and position coincide after one"
+        );
+
+        // 7 is a position this queue stores and is still refused: the queue has
+        // three ranks, not ten.
+        let refused = sparse
+            .reorder(&ReorderRequest::new(item("q-a"), QueuePosition::new(7)))
+            .expect_err("a stored position is not a rank");
+        assert_eq!(
+            refused,
+            InteractionError::PositionOutOfRange {
+                length: 3,
+                requested: 7,
+            }
+        );
     }
 
     #[test]
@@ -616,15 +733,24 @@ mod compression_lineage {
     #[test]
     fn verification_status_is_explicit_rather_than_inferred_from_absence() {
         let facts = ["a fact"];
+        let transcript = transcript_of(&[1, 2, 3]);
         for status in VerificationStatus::ALL {
             let mut parts = compression_parts(range(), &facts);
             parts.verification = status;
             let compression =
                 CompressionOperation::record(parts).expect("every status is recordable");
             assert_eq!(compression.verification(), status);
+
+            // Comparing two distinct variants would be a tautology. The claim
+            // that can fail is that the status survives the derivation instead
+            // of being replaced by a default the caller never stated.
+            let view = derive_view(&transcript, &compression).expect("the range is covered");
+            assert_eq!(
+                view.verification(),
+                status,
+                "a derived view carries the status recorded, not a default"
+            );
         }
-        assert_ne!(VerificationStatus::NotRun, VerificationStatus::Verified);
-        assert_ne!(VerificationStatus::Rejected, VerificationStatus::NotRun);
     }
 
     #[test]
@@ -668,6 +794,140 @@ mod compression_lineage {
         let error =
             derive_view(&transcript, &compression).expect_err("revision 3 was never recorded");
         assert_eq!(error.category(), "unknown_transcript_range");
+    }
+
+    #[test]
+    fn a_derived_view_needs_both_endpoints_and_not_merely_the_end() {
+        let facts = ["a fact"];
+        let compression = CompressionOperation::record(compression_parts(range(), &facts))
+            .expect("a complete compression");
+
+        // The end is recorded and the start is not. Checking only the end would
+        // derive a view over a range the transcript never began.
+        let missing_start = transcript_of(&[2, 3]);
+        let error =
+            derive_view(&missing_start, &compression).expect_err("revision 1 was never recorded");
+        assert_eq!(
+            error,
+            InteractionError::UnknownTranscriptRange { from: 1, to: 3 }
+        );
+
+        // The mirror case: the start is recorded and the end is not.
+        let missing_end = transcript_of(&[1, 2]);
+        let error =
+            derive_view(&missing_end, &compression).expect_err("revision 3 was never recorded");
+        assert_eq!(
+            error,
+            InteractionError::UnknownTranscriptRange { from: 1, to: 3 }
+        );
+
+        // Neither endpoint recorded.
+        let neither = transcript_of(&[4, 5]);
+        let error = derive_view(&neither, &compression).expect_err("neither endpoint is recorded");
+        assert_eq!(
+            error,
+            InteractionError::UnknownTranscriptRange { from: 1, to: 3 }
+        );
+
+        // Both recorded, so the view derives.
+        let whole = transcript_of(&[1, 2, 3]);
+        let view = derive_view(&whole, &compression).expect("both endpoints are recorded");
+        assert_eq!(view.source().from(), revision(1));
+        assert_eq!(view.source().to(), revision(3));
+    }
+
+    #[test]
+    fn a_range_may_cover_exactly_one_revision_and_may_not_run_backwards() {
+        // Equal endpoints are a range of one revision, not an inverted range.
+        let single = TranscriptRange::new(revision(2), revision(2))
+            .expect("a range whose endpoints are equal covers one revision");
+        assert_eq!(single.from(), revision(2));
+        assert_eq!(single.to(), revision(2));
+
+        // And it is usable: a compression over it derives a view.
+        let facts = ["a fact"];
+        let compression = CompressionOperation::record(compression_parts(single, &facts))
+            .expect("a complete compression");
+        let view =
+            derive_view(&transcript_of(&[1, 2, 3]), &compression).expect("revision 2 is recorded");
+        assert_eq!(view.source().from(), revision(2));
+        assert_eq!(view.source().to(), revision(2));
+
+        // One revision the other way is inverted.
+        let inverted = TranscriptRange::new(revision(3), revision(2))
+            .expect_err("a range cannot end before it begins");
+        assert_eq!(inverted, InteractionError::RangeInverted { from: 3, to: 2 });
+    }
+
+    #[test]
+    fn an_over_long_or_control_bearing_lineage_component_is_refused() {
+        let facts = ["a fact"];
+        let at_bound = "a".repeat(MAX_INTERACTION_TEXT_BYTES);
+        let over_bound = "a".repeat(MAX_INTERACTION_TEXT_BYTES + 1);
+
+        let mut parts = compression_parts(range(), &facts);
+        parts.compressor_provider = &at_bound;
+        let accepted =
+            CompressionOperation::record(parts).expect("exactly at the ceiling is accepted");
+        assert_eq!(
+            accepted.compressor_provider().len(),
+            MAX_INTERACTION_TEXT_BYTES
+        );
+
+        let mut parts = compression_parts(range(), &facts);
+        parts.compressor_provider = &over_bound;
+        let too_long = CompressionOperation::record(parts).expect_err("one byte past the ceiling");
+        assert_eq!(
+            too_long,
+            InteractionError::Field {
+                field: "compressor_provider",
+                error: ValueError::TooLong {
+                    max_bytes: MAX_INTERACTION_TEXT_BYTES,
+                    actual_bytes: MAX_INTERACTION_TEXT_BYTES + 1,
+                },
+            }
+        );
+
+        let mut parts = compression_parts(range(), &facts);
+        parts.compressor_model = "model\u{7}a";
+        let control = CompressionOperation::record(parts)
+            .expect_err("a control character is not lineage text");
+        assert_eq!(
+            control,
+            InteractionError::Field {
+                field: "compressor_model",
+                error: ValueError::ControlCharacter,
+            }
+        );
+
+        // Every bounded component is checked, not only the first two.
+        let control_fact = ["a fact", "a\u{0}fact"];
+        let mut parts = compression_parts(range(), &facts);
+        parts.protected_facts = &control_fact;
+        let fact = CompressionOperation::record(parts)
+            .expect_err("a protected fact carries a control character");
+        assert_eq!(
+            fact,
+            InteractionError::Field {
+                field: "protected_fact",
+                error: ValueError::ControlCharacter,
+            }
+        );
+
+        let long_fact = [at_bound.as_str(), over_bound.as_str()];
+        let mut parts = compression_parts(range(), &facts);
+        parts.protected_facts = &long_fact;
+        let fact = CompressionOperation::record(parts).expect_err("a protected fact is over long");
+        assert_eq!(
+            fact,
+            InteractionError::Field {
+                field: "protected_fact",
+                error: ValueError::TooLong {
+                    max_bytes: MAX_INTERACTION_TEXT_BYTES,
+                    actual_bytes: MAX_INTERACTION_TEXT_BYTES + 1,
+                },
+            }
+        );
     }
 
     #[test]
@@ -784,7 +1044,13 @@ mod context_usage {
                 ReportedCount::Absent(reason),
             );
             assert_eq!(usage.reported().tokens(), None, "no count is invented");
-            assert_ne!(usage.reported().tokens(), Some(4_242));
+            // The positive control: the same number is readable when the
+            // provider did report it, so `None` above is the absence being
+            // reported rather than an accessor that never answers.
+            assert_eq!(
+                ReportedCount::Reported(ReportedTokens::new(4_242)).tokens(),
+                Some(4_242)
+            );
             assert_eq!(usage.reported().missing_reason(), Some(reason));
             assert!(!reason.as_str().is_empty());
             assert_eq!(
@@ -1067,6 +1333,15 @@ mod quality {
                 digest("sha256:rewritten"),
             ))
             .expect_err("revision 2 is recorded");
+        // Advancing revision, identity already recorded: the append is refused
+        // for the identity rather than for the revision.
+        let duplicate_entry = transcript
+            .append(TranscriptEntry::new(
+                TranscriptEntryId::new("e-1").expect("valid entry id"),
+                revision(3),
+                digest("sha256:rewritten"),
+            ))
+            .expect_err("e-1 is already recorded");
         let compression = CompressionOperation::record(compression_parts(range, &facts))
             .expect("a complete compression");
         let unknown_range =
@@ -1123,6 +1398,7 @@ mod quality {
             revision_mismatch.category(),
             inverted.category(),
             not_advancing.category(),
+            duplicate_entry.category(),
             unknown_range.category(),
             missing_class.category(),
             duplicate_class.category(),
@@ -1157,11 +1433,55 @@ mod quality {
     }
 
     #[test]
-    fn every_bound_is_a_public_constant_a_fixture_can_read() {
+    fn every_published_byte_bound_is_the_edge_a_real_rejection_uses() {
+        assert_eq!(MAX_INTERACTION_ID_BYTES, 128);
+        assert_eq!(MAX_INTERACTION_TEXT_BYTES, 4096);
+
+        let id_at_bound = "q".repeat(MAX_INTERACTION_ID_BYTES);
+        let id_over_bound = "q".repeat(MAX_INTERACTION_ID_BYTES + 1);
+        let accepted = QueueItemId::new(id_at_bound.clone()).expect("exactly at the id ceiling");
+        assert_eq!(accepted.as_str().len(), MAX_INTERACTION_ID_BYTES);
+        assert_eq!(
+            QueueItemId::new(id_over_bound.clone()).expect_err("one byte past the id ceiling"),
+            ValueError::TooLong {
+                max_bytes: MAX_INTERACTION_ID_BYTES,
+                actual_bytes: MAX_INTERACTION_ID_BYTES + 1,
+            }
+        );
+        // Every interaction identity shares the one ceiling.
+        SessionRef::new(id_at_bound).expect("exactly at the id ceiling");
+        assert_eq!(
+            SessionRef::new(id_over_bound).expect_err("one byte past the id ceiling"),
+            ValueError::TooLong {
+                max_bytes: MAX_INTERACTION_ID_BYTES,
+                actual_bytes: MAX_INTERACTION_ID_BYTES + 1,
+            }
+        );
+
+        let text_at_bound = "t".repeat(MAX_INTERACTION_TEXT_BYTES);
+        let text_over_bound = "t".repeat(MAX_INTERACTION_TEXT_BYTES + 1);
+        let accepted = InteractionText::new(text_at_bound).expect("exactly at the text ceiling");
+        assert_eq!(accepted.as_str().len(), MAX_INTERACTION_TEXT_BYTES);
+        assert_eq!(
+            InteractionText::new(text_over_bound).expect_err("one byte past the text ceiling"),
+            ValueError::TooLong {
+                max_bytes: MAX_INTERACTION_TEXT_BYTES,
+                actual_bytes: MAX_INTERACTION_TEXT_BYTES + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn every_published_collection_bound_is_the_edge_a_real_rejection_uses() {
         assert_eq!(MAX_QUEUED_ITEMS, 256);
         assert_eq!(MAX_PROTECTED_FACTS, 64);
+        assert_eq!(MAX_COMMAND_PARAMETERS, 32);
+        assert_eq!(MAX_PROJECTION_ACTIONS, 64);
+        assert_eq!(MAX_PROJECTION_ENTRIES, 64);
+        assert_eq!(MAX_CHECKPOINTS, 512);
 
-        // The bound is the edge the rejection uses, not a separate number.
+        // Queued items, at construction and again at append: the bound is the
+        // edge the rejection uses, not a separate number.
         let mut items = Vec::with_capacity(MAX_QUEUED_ITEMS);
         for index in 0..MAX_QUEUED_ITEMS {
             let position = u32::try_from(index).expect("index fits a position");
@@ -1169,6 +1489,16 @@ mod quality {
         }
         let at_bound = InputQueue::new(session(), items.clone()).expect("exactly at the bound");
         assert_eq!(at_bound.items().len(), MAX_QUEUED_ITEMS);
+        assert_eq!(
+            at_bound
+                .append(item("q-over"), steer("go"))
+                .expect_err("a full queue takes no more"),
+            InteractionError::TooMany {
+                field: "queued_items",
+                max: MAX_QUEUED_ITEMS,
+                actual: MAX_QUEUED_ITEMS + 1,
+            }
+        );
 
         let position = u32::try_from(MAX_QUEUED_ITEMS).expect("index fits a position");
         items.push(queued("q-over", position, steer("go")));
@@ -1179,6 +1509,145 @@ mod quality {
                 field: "queued_items",
                 max: MAX_QUEUED_ITEMS,
                 actual: MAX_QUEUED_ITEMS + 1,
+            }
+        );
+
+        // Observed identities in a projection answer to the same bound.
+        let observed: Vec<QueueItemId> = (0..MAX_QUEUED_ITEMS)
+            .map(|index| item(&format!("q-{index}")))
+            .collect();
+        SurfaceProjection::new(SurfaceKind::Cli, session(), observed.clone(), Vec::new())
+            .expect("exactly at the bound");
+        let mut over_observed = observed;
+        over_observed.push(item("q-over"));
+        assert_eq!(
+            SurfaceProjection::new(SurfaceKind::Cli, session(), over_observed, Vec::new())
+                .expect_err("one past the bound"),
+            InteractionError::TooMany {
+                field: "observed_items",
+                max: MAX_QUEUED_ITEMS,
+                actual: MAX_QUEUED_ITEMS + 1,
+            }
+        );
+
+        // Protected facts.
+        let range = TranscriptRange::new(revision(1), revision(3)).expect("a forward range");
+        let facts = vec!["a fact"; MAX_PROTECTED_FACTS];
+        let recorded = CompressionOperation::record(compression_parts(range, &facts))
+            .expect("exactly at the bound");
+        assert_eq!(recorded.protected_facts().len(), MAX_PROTECTED_FACTS);
+        let over_facts = vec!["a fact"; MAX_PROTECTED_FACTS + 1];
+        let mut parts = compression_parts(range, &facts);
+        parts.protected_facts = &over_facts;
+        assert_eq!(
+            CompressionOperation::record(parts).expect_err("one past the bound"),
+            InteractionError::TooMany {
+                field: "protected_facts",
+                max: MAX_PROTECTED_FACTS,
+                actual: MAX_PROTECTED_FACTS + 1,
+            }
+        );
+
+        // Command parameters.
+        let command = CommandId::new("automonique.interaction.retry").expect("valid command");
+        let mut parameters: Vec<CommandParameter> = (0..MAX_COMMAND_PARAMETERS)
+            .map(|index| CommandParameter::new(text(&format!("p-{index}")), text("v")))
+            .collect();
+        let invocation =
+            CommandInvocation::new(command.clone(), SurfaceKind::Cli, parameters.clone())
+                .expect("exactly at the bound");
+        assert_eq!(invocation.parameters().len(), MAX_COMMAND_PARAMETERS);
+        parameters.push(CommandParameter::new(text("p-over"), text("v")));
+        assert_eq!(
+            CommandInvocation::new(command, SurfaceKind::Cli, parameters)
+                .expect_err("one past the bound"),
+            InteractionError::TooMany {
+                field: "command_parameters",
+                max: MAX_COMMAND_PARAMETERS,
+                actual: MAX_COMMAND_PARAMETERS + 1,
+            }
+        );
+
+        // Projection actions.
+        let offered = |index: usize| {
+            ProjectionAction::new(
+                CommandId::new(format!("automonique.interaction.a-{index}"))
+                    .expect("valid command"),
+                RequiredAuthority::Observe,
+                text("Do the thing"),
+            )
+        };
+        let mut actions: Vec<ProjectionAction> = (0..MAX_PROJECTION_ACTIONS).map(offered).collect();
+        let projected =
+            SurfaceProjection::new(SurfaceKind::Cli, session(), Vec::new(), actions.clone())
+                .expect("exactly at the bound");
+        assert_eq!(projected.actions().len(), MAX_PROJECTION_ACTIONS);
+        actions.push(offered(MAX_PROJECTION_ACTIONS));
+        assert_eq!(
+            SurfaceProjection::new(SurfaceKind::Cli, session(), Vec::new(), actions)
+                .expect_err("one past the bound"),
+            InteractionError::TooMany {
+                field: "projection_actions",
+                max: MAX_PROJECTION_ACTIONS,
+                actual: MAX_PROJECTION_ACTIONS + 1,
+            }
+        );
+
+        // Namespaced projection entries.
+        let extension = ExtensionId::new("ext-a").expect("valid extension");
+        let mut namespaced = NamespacedProjection::new(
+            extension.clone(),
+            SurfaceProjection::new(SurfaceKind::Cli, session(), Vec::new(), Vec::new())
+                .expect("a valid projection"),
+        );
+        for index in 0..MAX_PROJECTION_ENTRIES {
+            namespaced = namespaced
+                .with_entry(
+                    NamespacedKey::new(extension.clone(), text(&format!("k-{index}"))),
+                    text("v"),
+                )
+                .expect("within the bound");
+        }
+        assert_eq!(namespaced.entries().len(), MAX_PROJECTION_ENTRIES);
+        assert_eq!(
+            namespaced
+                .with_entry(NamespacedKey::new(extension, text("k-over")), text("v"))
+                .expect_err("one past the bound"),
+            InteractionError::TooMany {
+                field: "projection_entries",
+                max: MAX_PROJECTION_ENTRIES,
+                actual: MAX_PROJECTION_ENTRIES + 1,
+            }
+        );
+
+        // Checkpoints.
+        let mut log = CheckpointLog::new();
+        for index in 0..MAX_CHECKPOINTS {
+            log.record(CreateCheckpoint::new(
+                session(),
+                CheckpointRef::new(digest(&format!("sha256:{index}")), revision(1)),
+                text("before edit"),
+                EpochMillis::EPOCH,
+            ))
+            .expect("within the bound");
+        }
+        assert_eq!(
+            log.list(&ListCheckpoints::new(session(), MAX_CHECKPOINTS))
+                .len(),
+            MAX_CHECKPOINTS
+        );
+        assert_eq!(
+            log.record(CreateCheckpoint::new(
+                session(),
+                CheckpointRef::new(digest("sha256:over"), revision(1)),
+                text("before edit"),
+                EpochMillis::EPOCH,
+            ))
+            .expect_err("one past the bound"),
+            InteractionError::TooMany {
+                field: "checkpoints",
+                max: MAX_CHECKPOINTS,
+                actual: MAX_CHECKPOINTS + 1,
             }
         );
     }
@@ -1232,6 +1701,7 @@ mod quality {
         distinct(vec![
             Delivery::FirstObservation.as_str(),
             Delivery::Replay.as_str(),
+            Delivery::RequestIdentityCollision.as_str(),
         ]);
     }
 }

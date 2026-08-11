@@ -1,0 +1,66 @@
+{
+  "item": "R1-12",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Global ordering",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test journal global_ordering",
+      "result": "pass",
+      "output": "Two tests pass. After appending event ids 1 and 2, offering 2, 1 and 0 each fails with JournalError::EventIdNotIncreasing { last: 2, offered }, and 3 is accepted, leaving three events. A refused append is not partially applied: appending a duplicate id 5 to a one-event journal errors and journal.events().len() stays 1."
+    },
+    {
+      "name": "Revision algebra",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test journal revision_algebra",
+      "result": "pass",
+      "output": "Four tests pass. Revisions 1, 2, 3 append in order and revision_of reports 3. A gap (offering 3 after 1) errors with JournalError::RevisionConflict { expected: 2, observed: 3 } and a repeat (offering 1 after 1) with { expected: 2, observed: 1 }, so both directions name expected and observed. A first event at revision 7 on a fresh aggregate errors with { expected: 1, observed: 7 }. Revisions are per aggregate: w-1 reaches 2 while w-2 is at 1 and an unknown aggregate reports None."
+    },
+    {
+      "name": "Schema independence",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test journal schema_independence",
+      "result": "pass",
+      "output": "Three tests pass. DomainEvent::decodable_within takes a codec::VersionRange supplied by the reader, entirely separate from any table schema range: with a declared readable range of 2..=4, versions 2, 3 and 4 decode and versions 1 and 5 fail closed with JournalError::EventSchemaOutOfRange { supported_min: 2, supported_max: 4, offered }. EventSchemaVersion::new(0) is refused with category 'field_invalid', so a zero event schema version is not constructible."
+    },
+    {
+      "name": "Outcome vocabulary",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test journal outcome_vocabulary",
+      "result": "pass",
+      "output": "Three tests pass. ActionOutcome::ALL has exactly 6 members with 6 distinct wire spellings (accepted, completed, rejected, conflict, unknown, resync_required) and the enum has no catch-all variant, so the set is closed. Operation failure and transport failure are distinct and cannot be conflated: Rejected.states_no_effect() and Conflict.states_no_effect() are true while Unknown.states_no_effect() is false, and Accepted != Completed with neither stating that no effect occurred."
+    },
+    {
+      "name": "Idempotency exactness",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test journal idempotency_exactness && grep -n 'pub fn record' -A 8 rust/crates/automonique-protocol/src/journal.rs",
+      "result": "fail",
+      "output": "The target half passes: replaying key-1 against the same target returns the byte-identical original receipt even when the replay supplies a different action id and outcome (the stored receipt keeps action_id 'a-1' and outcome Accepted), and the same key against target work/w-2 fails with JournalError::IdempotencyConflict { recorded_target: \"work/w-1\", offered_target: \"work/w-2\" } while the original recording stands. Distinct keys stay independent. The payload half is not measurable: ActionLedger::record takes (action_id, target, idempotency_key, expected_revision, outcome) and ActionReceipt stores exactly those five fields, so an action payload is not part of this layer and 'the same key with a different payload is a typed conflict' has no code path and no test. A second observation from the same run: a replay carrying a different action_id and a different outcome is accepted silently as a replay rather than being treated as a changed request."
+    },
+    {
+      "name": "Receipt durability",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test journal receipt_durability && grep -n 'pub struct ActionReceipt' -A 8 rust/crates/automonique-protocol/src/journal.rs",
+      "result": "pass",
+      "output": "Two tests pass. A receipt recorded inside a scope that stands in for a client connection is still queryable by key after that scope ends, returning target work/w-1 and outcome Completed. Ownership is pinned by compilation rather than by assertion: the second test clones the receipt, drops the whole ActionLedger and then reads idempotency_key and action_id, which would not compile if ActionReceipt borrowed from the ledger. The declaration confirms it: ActionReceipt has no lifetime parameter and holds owned String, Option<Revision> and ActionOutcome fields. Correction to a comment in the test file: it says the compile-fail case 'lives in the library doc tests'; journal.rs contains exactly one compile_fail block and it is the replay-purity one, so no separate compile-fail case for receipt borrowing exists."
+    },
+    {
+      "name": "Cursor monotonicity",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test journal cursor_monotonicity && grep -rn 'resync\\|snapshot' rust/crates/automonique-protocol/src/journal.rs",
+      "result": "fail",
+      "output": "The monotonicity half passes: JournalCursor::new(consumer, topic, position) rejects an empty consumer and an empty topic, advance_to(15) from 10 succeeds, advance_to(15) again is idempotent, and advance_to(14) fails with JournalError::CursorWentBackwards { current: 15, offered: 14 } while position() stays 15. The resync half is absent from this item's cursor: journal.rs contains no occurrence of the word 'snapshot', and its only 'resync' occurrence is the ActionOutcome::ResyncRequired enum variant and its spelling, which no cursor operation produces. JournalCursor has no notion of a retained range and no way to yield resync_required with snapshot coordinates. That behaviour exists elsewhere in the crate, on a different type: event.rs defines ConsumerCursor plus resolve_subscription(cursor, retained_from, retained_to) returning SubscriptionStart::ResyncRequired { snapshot_from, snapshot_to }, covered by tests/event.rs::an_out_of_range_cursor_yields_resync_with_snapshot_coordinates, which passes. So the crate has two parallel cursor types and only the event-stream one implements the retained-range rule this row states."
+    },
+    {
+      "name": "Replay purity",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test journal replay_purity && cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --doc && rustc --edition 2024 --extern automonique_protocol=rust/target/debug/libautomonique_protocol.rlib <scratch copy of the compile_fail body>",
+      "result": "pass",
+      "output": "Two behavioural tests pass: replay drives a projection over event ids 1, 2, 3 in global order across two aggregates, and three consecutive replays leave the journal equal to a clone taken beforehand, so replay mutates nothing. The compile-fail case at journal.rs line 37 is one of 42 passing doc tests. It was additionally compiled standalone against the built rlib to confirm it fails for its intended reason and not incidentally: the exact body produces 'error[E0451]: field `pending` of struct `Outbox` is private', so a Projection::apply implementation cannot construct an Outbox and therefore cannot reach an effect from inside replay. The positive doc test on the same page, showing a Counter projection replaying successfully, also passes, so the compile failure is attributable to the effect rather than to a broken example."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path rust/Cargo.toml --all -- --check && cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --offline -- -D warnings && cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "fail",
+      "output": "Formatting exits 0 and strict all-target Clippy exits 0 with no warnings, both offline. The workspace test run does not pass: 806 tests pass and 3 fail, in two automonique-lab targets. harness_claim::operational_claim_is_accepted_by_rust_status_and_selection panics with 'automonique-lab: harness claim denied'; program_cli::immutable_packet_selects_the_exact_generated_work and program_cli::admitted_cli_allocates_and_replays_the_packet_bound_worktree panic with 'automonique-lab: program selection denied'. Root cause measured: all three fixtures copy the live .automonique/dev/program.yaml and request item R0-19, whose entry now reads \"status\": \"blocked\", \"runnable\": false, so harness_claim::select returns ClaimError::IneligibleItem. Nothing in journal.rs or tests/journal.rs is implicated. No allowance was added in this item's files; grep for #[allow], todo!, unimplemented!, dbg! and unsafe over automonique-protocol src/ and tests/ finds only one pre-existing #[allow(clippy::redundant_closure_call)] in codec.rs, which is another item's module. automonique-protocol declares zero dependencies."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "no independent reviewer examined this item; this file is a measurement audit written by a separate agent that ran every command listed and read the outputs, which is not review of the implementation's design"
+  },
+  "notes": "The 21 tests in tests/journal.rs all pass and its module names line up one-to-one with the contract's check table. Two rows still do not pass. Cursor monotonicity: JournalCursor implements forward-only advance but has no retained range, so it can never produce resync_required with snapshot coordinates; the crate implements that rule on a second, separate cursor type in event.rs, which means the property exists in the codebase but not on the type this contract defines. Idempotency exactness: only target divergence is modelled, because neither ActionLedger::record nor ActionReceipt carries a payload, so payload divergence is neither representable nor testable here. Both are reported as failing rows rather than as passes with a footnote. Not measured: whether Cargo.lock or any Cargo.toml drifted, because this audit is forbidden to run git. Also not measured and correctly out of lease: table-level transactionality, which the contract itself defers to R4 - this slice opens no store, so the paired write can only be expressed, not enforced."
+}

@@ -1979,8 +1979,9 @@ impl<'pool> Rotation<'pool> {
     ///
     /// Returns [`ModelError::RotationToSelf`] when both handles name the same
     /// account, and [`ModelError::RotationTargetUnavailable`] when the target
-    /// cannot serve traffic. Crossing pools is not an error variant because it
-    /// does not compile.
+    /// cannot serve traffic, naming the observation that disqualified it — an
+    /// account observed available but out of quota is reported as exhausted.
+    /// Crossing pools is not an error variant because it does not compile.
     pub fn plan(
         source: PoolMember<'pool>,
         target: PoolMember<'pool>,
@@ -1992,9 +1993,18 @@ impl<'pool> Rotation<'pool> {
             });
         }
         if target.state != AccountState::Available || target.exhausted {
+            // An account can be observed available and still be out of quota.
+            // Reaching here with an available state means quota is what
+            // disqualified the target, so reporting "available" as the reason
+            // it was refused would contradict the refusal.
+            let state = if target.state == AccountState::Available {
+                AccountState::Exhausted.as_str()
+            } else {
+                target.state.as_str()
+            };
             return Err(ModelError::RotationTargetUnavailable {
                 account: target.account.as_str().to_owned(),
-                state: target.state.as_str(),
+                state,
             });
         }
         Ok(Self {
@@ -2626,8 +2636,16 @@ impl UsageRecord {
 
 /// A reference model's output.
 ///
-/// The wrapper exists so that reading advice is greppable and so that advice
-/// has no `Display` and no conversion into any authoritative text.
+/// The wrapper has no `Display` and no conversion into an authoritative
+/// record: an [`AggregateResult`] is reachable only through
+/// [`Aggregator::conclude`].
+///
+/// What it does not do is keep the words out of a result.
+/// [`Self::expose_untrusted`] hands back a `&str`, which
+/// [`Aggregator::conclude`] would accept. That step is deliberately explicit
+/// and greppable, and what the types still hold is authorship rather than
+/// wording: a result repeating advice verbatim is authored by the aggregator,
+/// counted as its own usage, and keeps the advice labelled as advice.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UntrustedAdvice(String);
 

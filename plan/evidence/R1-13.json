@@ -1,0 +1,72 @@
+{
+  "item": "R1-13",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Tenant scoping",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test identity tenant_scoping",
+      "result": "pass",
+      "output": "Two tests pass. Actor::new(\"\", \"alice\") and Actor::new(\"acme\", \"\") both error, so a tenant-free actor is not constructible and the tenant is not an optional field. Cross-tenant comparison errors instead of answering: acme/alice compared with globex/alice returns IdentityError::CrossTenantComparison { left: \"acme\", right: \"globex\" } rather than false, while same-tenant comparison still answers normally in both directions (true for acme/alice, false for acme/bob)."
+    },
+    {
+      "name": "External identity keys",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test identity external_identity_keys",
+      "result": "pass",
+      "output": "Three tests pass. ExternalIdentityKey::new takes exactly the four immutable coordinates (platform, application, external tenant/installation, immutable user id) and rejects an empty value in each of the four positions. MutableAttribute::ALL has 5 members and every one of them is refused as a key with IdentityError::MutableAttributeAsKey { attribute }, matching the five the contract names: UPN, email, display name, username and roles. There is no constructor that accepts a mutable attribute as a key coordinate."
+    },
+    {
+      "name": "Historical grants",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test identity historical_grants",
+      "result": "pass",
+      "output": "Three tests pass over a synthetic revision history in which alice holds 'operator' from revision 2 until revision 5. 'Was this permitted at revision N' is answered directly from the record: denied at 1, allowed at 2, 3 and 4, denied at 5, and re-asking about revision 3 after asking about later revisions still allows, so an old decision stays explainable. An out-of-window request denies with its own reason, DenyReason::GrantNotInForce, distinct from an unmatched request. A grant records granted_by (owner), reason ('on call') and role, and an open-ended grant is still in force at revision 99."
+    },
+    {
+      "name": "Deny by default",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test identity deny_by_default && rustc --edition 2024 --extern automonique_protocol=rust/target/debug/libautomonique_protocol.rlib <scratch wildcard probe>",
+      "result": "pass",
+      "output": "Four tests pass. An unmatched actor denies with DenyReason::NoMatchingGrant; a held role that does not carry the requested permission denies with the same typed reason; a same-named actor in another tenant denies with DenyReason::WrongTenant rather than merely being unmatched; an empty PolicyLedger denies run:start, run:cancel and 'anything'. No fall-through to allow exists because PolicyLedger::evaluate returns Decision, not Result, so there is no error channel that could yield permission; a cross-tenant comparison error inside the loop is handled with 'let Ok(same) = ... else { continue }', which skips the grant in the deny direction. Wildcards were probed directly: a ledger that allows the role the permissions \"*\", \"**\" and \"run:*\" still denies run:start, run:cancel and 'anything' with NoMatchingGrant, and allows only the literal permission \"*\", so matching is string equality with no glob semantics. The empty permission \"\" is refused at allow_role."
+    },
+    {
+      "name": "Evaluation purity",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test identity evaluation_purity",
+      "result": "pass",
+      "output": "Two tests pass. The same actor, permission and revision evaluated 17 times returns an equal Decision every time, including the evidence fields, not merely the same boolean. Evaluating revisions 1 through 6 forwards and then backwards yields the same sequence of outcomes once reversed, so the answer does not depend on evaluation order. Evaluate takes &self and reads no clock: the whole automonique-protocol crate contains no SystemTime, Instant::now, std::time or UNIX_EPOCH reference."
+    },
+    {
+      "name": "Evidence completeness",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test identity evidence_completeness && grep -n 'pub struct Decision' -A 6 rust/crates/automonique-protocol/src/identity.rs",
+      "result": "pass",
+      "output": "Three tests pass. An allow carries DecisionOutcome::Allow { role: \"operator\" } naming the matched grant's role, plus actor id, actor tenant, requested permission and policy revision. Both an allow and a deny carry tenant, permission and revision. The three deny reasons (NoMatchingGrant, GrantNotInForce, WrongTenant) have distinct spellings. A decision without evidence is unrepresentable structurally: Decision has four private fields (actor, permission, policy_revision, outcome), no public constructor and no public field, so the only way to obtain one is PolicyLedger::evaluate, which fills all four."
+    },
+    {
+      "name": "Secret unrepresentability",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --doc && rustc --edition 2024 --extern automonique_protocol=rust/target/debug/libautomonique_protocol.rlib <scratch copies of both compile_fail bodies>",
+      "result": "pass",
+      "output": "Both compile-fail doc tests in identity.rs (lines 22 and 30) pass as part of 42 passing doc tests, and both were recompiled standalone against the built rlib to confirm they fail for their intended reasons rather than incidentally. Passing a seventh argument 'sacred-literal' to CredentialRecord::new produces 'error[E0061]: this function takes 6 arguments but 7 arguments were supplied', so no constructor accepts a secret value. Calling record.secret() produces 'error[E0599]: no method named `secret` found for struct `CredentialRecord`', so no accessor returns one. The positive doc test on the same page compiles and runs, so the two failures are attributable to the secret rather than to a broken example. The runtime test confirms the descriptor is a record and not the credential: it exposes name, version, owner, purpose, audience, expiry and health only."
+    },
+    {
+      "name": "Rotation and revocation",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test identity credential_hygiene",
+      "result": "pass",
+      "output": "Four tests pass. rotating_to(4) returns an outgoing version 3 and an incoming version 4 that are both CredentialHealth::RotationOverlap and both grant a capability at the same instant, so an overlap window is expressible. revoked() sets CredentialHealth::Revoked and grants_capability is false immediately at instant 0 and still false at i64::MAX, so revocation has no grace period to opt into. Expiry is separate from revocation and is exclusive: a record expiring at 1000 grants at 999 and not at 1000 or 1001."
+    },
+    {
+      "name": "Break-glass audit",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test identity break_glass_audit",
+      "result": "pass",
+      "output": "Three tests pass. BreakGlassGrant::new with expiry None fails with IdentityError::BreakGlassNeedsExpiry, so an unbounded elevation is not constructible. An empty reason is refused, so an elevation cannot be silent. A valid grant records actor, reason ('incident 42'), role and expiry, and is_active_at is exclusive at the expiry instant (active at 4999, not at 5000). Durability is shown as a value property: the grant is cloned, the original dropped, and the copy still answers is_active_at, which is what 'restarting does not clear it' means at a layer with no process state."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path rust/Cargo.toml --all -- --check && cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --offline -- -D warnings && cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "fail",
+      "output": "Formatting exits 0 and strict all-target Clippy exits 0 with no warnings, both offline. The workspace test run does not pass: 806 tests pass and 3 fail, in two automonique-lab targets. harness_claim::operational_claim_is_accepted_by_rust_status_and_selection panics with 'automonique-lab: harness claim denied'; program_cli::immutable_packet_selects_the_exact_generated_work and program_cli::admitted_cli_allocates_and_replays_the_packet_bound_worktree panic with 'automonique-lab: program selection denied'. Root cause measured: all three fixtures copy the live .automonique/dev/program.yaml and request item R0-19, whose entry now reads \"status\": \"blocked\", \"runnable\": false, so harness_claim::select returns ClaimError::IneligibleItem. Nothing in identity.rs or tests/identity.rs is implicated. No allowance was added in this item's files; automonique-protocol declares zero dependencies and forbids unsafe, todo, unimplemented and dbg at the manifest level."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "no independent reviewer examined this item; this file is a measurement audit written by a separate agent that ran every command listed and read the outputs, which is not review of the implementation's design"
+  },
+  "notes": "All 24 tests in tests/identity.rs pass and its module names line up one-to-one with the contract's check table; every identity-and-policy row is measured and passing. Two clauses that the tests do not cover were measured directly instead of inferred: the absence of wildcard matching (a scratch program compiled against the built rlib showed that granting \"*\", \"**\" or \"run:*\" permits nothing but its own literal spelling) and the absence of an error channel in evaluate (its return type is Decision, not Result). The two compile-fail doc tests were recompiled standalone to confirm they produce E0061 and E0599 rather than passing for an unrelated reason. Every fixture identity is synthetic: acme, globex, alice, bob, carol, owner, teams/app-1/ext-tenant/immutable-1; no real workspace, tenant or account name appears. The only failing row is Quality, and it fails on three automonique-lab tests that are unrelated to this item and broken by drift in the generated program document rather than by any code in this slice. Not measured: whether Cargo.lock or any Cargo.toml drifted, because this audit is forbidden to run git. The automonique-policy crate was also run (23 tests plus 1 compile-fail doc test, all passing) but it holds peer-credential admission policy from another item, not this item's authorization vocabulary, which lives entirely in automonique-protocol::identity."
+}

@@ -1,0 +1,80 @@
+{
+  "item": "R1-06",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Both directions run",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test cross_language -- --nocapture",
+      "result": "pass",
+      "output": "The run executed under bun 1.3.13 and reported '46 fixtures; rust->bun {\"pass\":46,\"fail\":0,\"gap\":0}; bun->rust {\"pass\":46,\"fail\":0,\"gap\":0}' with zero gaps and zero xfails. The honest breakdown behind those totals, read out of the runner's results artifact: the corpus holds 22 accept and 24 reject fixtures. For the 22 accept fixtures both directions genuinely execute - Rust encodes each one and bun decodes and re-encodes it, and bun emits bun_encoded_hex for exactly 22 fixtures which the Rust test then decodes and compares. For the 24 reject fixtures there is nothing to encode on either side, so the runner decodes the corpus bytes once in bun and records that single verdict under both direction keys (sdk/typescript/packages/protocol/conformance/run.ts:96-102 says so explicitly). The per-direction tally of 46 therefore counts 22 real round trips plus 24 single decodes recorded twice. The gap path exists and is not decorative: a fixture for which Rust produced no artifact is written as status 'gap', never 'pass'."
+    },
+    {
+      "name": "Byte agreement",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test cross_language both_directions_agree_across_languages -- --nocapture",
+      "result": "pass",
+      "output": "Comparison is byte-for-byte on hex-encoded frames, not structural. In the bun-decode direction the runner re-encodes what Rust produced and compares the hex string against the fixture's bytes_hex: 22 of 22 identical. In the Rust-decode direction the Rust test decodes bun's bun_encoded_hex and compares the re-encoded hex against the fixture bytes: 22 of 22 identical. The corpus pins the properties that make this meaningful - object key ordering by byte value (object-sorted-keys, object-key-ordering-digits), exact i64 bounds (integer-i64-max, integer-i64-min, carried as bigint on the TypeScript side), one spelling per string (string-escapes, string-solidus-raw, string-control-escape) - and eight non-canonical spellings are refused rather than normalized, so absent-versus-null and whitespace variants cannot both be accepted."
+    },
+    {
+      "name": "Rejection parity",
+      "command": "bun run sdk/typescript/packages/protocol/conformance/run.ts rust/crates/automonique-protocol/fixtures/wire-v1.json <rust-encoded.json> <results.json>",
+      "result": "pass",
+      "output": "All 24 rejecting fixtures fail in both languages with the same category; comparing the runner's observed_category against the corpus category gives zero mismatches. Per-category counts, identical on both sides: non_canonical_json 7, malformed_json 7, invalid_json_value 3, duplicate_key 1, trailing_data 1, integer_out_of_range 1, missing_field 1, field_invalid 1, field_grammar 1, nesting_too_deep 1. Rust's own agreement test independently asserts its category equals the corpus for each, so the two implementations are compared against the same declared category rather than against each other's behaviour."
+    },
+    {
+      "name": "Boundary coverage",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test cross_language the_corpus_covers_the_declared_edges && python3 -c 'inventory rust/crates/automonique-protocol/fixtures/wire-v1.json'",
+      "result": "fail",
+      "output": "Present and passing: empty payloads (string-empty, array-empty, object-empty), multibyte UTF-8 at the 2-, 3- and 4-byte boundaries in one string (string-multibyte), nesting exactly at MAX_NESTING_DEPTH = 32 (nesting-at-ceiling, accept) and one level beyond (nesting-one-past-ceiling, reject nesting_too_deep), and the exact i64 ceiling and floor with a one-past-the-ceiling rejection. Absent: the corpus contains no length-delimited frame at all. Every one of the 46 fixtures is a bare canonical-JSON payload with no 4-byte big-endian prefix, so there is no exact-limit frame (MAX_FRAME_BYTES = 8388608), no one-byte-over frame, no zero-length frame and no maximal payload fixture; the largest fixture is 140 bytes. The TypeScript side has no frame codec to compare against - sdk/typescript/packages/protocol/src/canonical.ts exports no decodeFrame, encodeFrame, LENGTH_PREFIX or MAX_FRAME constant - so these edges could not be covered by adding fixtures alone. Also absent: the contract's corpus minimum requires every R1-02 primitive at its exact and over-limit bound, and no fixture exercises OpaqueId, BoundedText, Url, SecretText, Instant or Revision."
+    },
+    {
+      "name": "Compatibility tolerance",
+      "command": "python3 -c 'inventory rust/crates/automonique-protocol/fixtures/wire-v1.json' && grep -nE 'unknown_enum_value|ReadOnly|SecuritySensitive' sdk/typescript/packages/protocol/src/canonical.ts",
+      "result": "fail",
+      "output": "Unknown additive fields pass: envelope-unknown-additive-field carries a future_field inside the body and is accepted and byte-identical in both languages. The other two clauses are not covered. There is no unknown security-sensitive enum fixture in the corpus, and the TypeScript implementation has no security-sensitive enum concept at all: grep for unknown_enum_value, SecuritySensitive and ReadOnly in canonical.ts returns nothing, and its WireCategory union lists 11 categories that do not include unknown_enum_value. The read-only clause is only nominally covered: the fixture read-only-enum-unknown is the object {\"state\":\"hibernated\"}, it is not in envelope_ids, and both sides decode it with the generic value parser - Rust's decode_read_only_enum and the ReadOnly::Unknown representation are never invoked by the harness and have no TypeScript counterpart - so what is proved is that an object with an arbitrary string value round-trips, not that an unrecognized read-only value decodes to `unknown` identically in both languages."
+    },
+    {
+      "name": "Negotiation coverage",
+      "command": "python3 -c 'inventory rust/crates/automonique-protocol/fixtures/wire-v1.json' && grep -n 'fn from_canonical_bytes' -A 30 rust/crates/automonique-protocol/src/wire.rs && sed -n '465,490p' sdk/typescript/packages/protocol/src/canonical.ts",
+      "result": "fail",
+      "output": "The corpus has 7 envelope fixtures and none of them is an unknown protocol name or an unsupported major version. The four rejecting envelope fixtures are envelope-missing-protocol (missing_field), envelope-wrong-type (invalid_json_value, protocol is an integer), envelope-version-zero (field_invalid, zero is not a version) and envelope-kind-grammar (field_grammar, uppercase kind) - all shape and grammar checks, not negotiation outcomes. The gap is structural, not an oversight in the fixture list: neither Message::from_canonical_bytes in wire.rs nor decodeMessage in canonical.ts consults a supported protocol set or a supported version range, so neither implementation can reject a well-formed envelope naming an unimplemented protocol or an out-of-range major. Rust has that logic in SupportedProtocol::admit (R1-03, categories unknown_protocol and unsupported_version), the harness never calls it, and TypeScript has no equivalent."
+    },
+    {
+      "name": "Offline execution",
+      "command": "strace -f -qq -e trace=%network -o net.trace bun run sdk/typescript/packages/protocol/conformance/run.ts <corpus> <rust-encoded> <out> ; strace -f -qq -e trace=%network -o net2.trace rust/target/debug/deps/cross_language-<hash> --nocapture ; env -i PATH=<empty dir> rust/target/debug/deps/cross_language-<hash> --nocapture both_directions",
+      "result": "pass",
+      "output": "Measured rather than argued: tracing all network syscalls during the bun conformance run produced an empty trace file (0 socket, connect, sendto or recvfrom calls), and tracing the Rust cross-language test binary, which forks bun, produced 2 lines, both SIGCHLD notifications and no socket call of any family. No daemon is started and nothing reads a Unix socket; the runner's only import is node:fs plus a relative module. The missing-runtime path was exercised, not assumed: with PATH pointing at an empty directory the test prints 'GAP: no JavaScript runtime; cross-language conformance is unmeasured' and writes a results artifact containing \"measured\":false with a reason. Recorded as a caveat: in that state the cargo test itself still reports ok, so a green suite alone does not prove the cross-language claim was measured - the gap is visible only in stderr and the artifact. A third state was also observed: with bun absent but node v20.19.2 present the runner cannot load a .ts file (ERR_UNKNOWN_FILE_EXTENSION) and the test fails loudly rather than passing silently."
+    },
+    {
+      "name": "Licence split",
+      "command": "python3 plan/check.py --verify && grep -rn SPDX sdk/typescript/packages/protocol/ && cat sdk/typescript/packages/protocol/package.json",
+      "result": "pass",
+      "output": "Path-aware licence verification exits 0 ('ok - 375 items, 32 ready'). All 11 TypeScript-side files under sdk/typescript/packages/protocol/ carry 'SPDX-License-Identifier: Apache-2.0', including the harness conformance/run.ts and the implementation src/canonical.ts and src/index.ts, and package.json declares \"license\": \"Apache-2.0\", which matches LICENSE-POLICY.md's rule that content under sdk/ is Apache-2.0 including its tests. The Rust-side files carry 'SPDX-License-Identifier: Elastic-2.0': tests/cross_language.rs, src/wire.rs and src/codec.rs. The shared corpus is checked in at rust/crates/automonique-protocol/fixtures/wire-v1.json, under the Elastic-2.0 root; being JSON it carries no comment header and so no inline SPDX line."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path rust/Cargo.toml --all -- --check && cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --offline -- -D warnings && cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "fail",
+      "output": "Formatting exits 0. Strict all-target Clippy exits 0 with zero warnings, re-run from a cold CARGO_TARGET_DIR so the result is not a cache artifact. The workspace test run does NOT pass: 58 test binaries, 806 passed, 3 failed, exit 101, all three in the harness crate automonique-lab (harness_claim 'harness claim denied'; program_cli x2 'program selection denied'), outside this item's lease and traceable to the live plan graph freezing R0-19 under GATE-HARNESS. The item's own suite is green: tests/cross_language.rs 4/4 and tests/wire.rs 19/19. No dependency was added, no node_modules or lockfile was created by the run, and rust/Cargo.toml and rust/Cargo.lock are unmodified in the working tree."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "No independent review. This file is an automated read-only audit written by a subagent that ran the commands above; it is not a reviewer's verdict and no human examined this item for this record. Failing rows are recorded as failing checks, not as review findings."
+  },
+  "extra_checks": [
+    {
+      "name": "Fixtures are checked in, not generated",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test cross_language the_corpus_covers_the_declared_edges the_runner_and_corpus_are_present",
+      "result": "pass",
+      "output": "The corpus is a checked-in file at rust/crates/automonique-protocol/fixtures/wire-v1.json holding 46 fixtures, each with a stable id, explicit bytes_hex, a note and an outcome of accept or a named rejection category; ids are asserted unique and a floor of 40 fixtures plus 10 named ids is asserted so the corpus cannot silently shrink. Nothing is generated at test time by the implementation under test: both languages read the same hex literals. The corpus header records 'Rust is the wire source of truth; a disagreement is fixed in the implementation, never in this file.'"
+    },
+    {
+      "name": "Toolchain versions used by the run",
+      "command": "bun --version ; node --version ; cargo --version ; rustc --version",
+      "result": "pass",
+      "output": "bun 1.3.13 (the runtime the Rust harness selected, since javascript_runtime() prefers bun), node v25.7.0 on PATH and node v20.19.2 at /usr/bin/node, cargo 1.93.1 (083ac5135 2025-12-15), rustc 1.93.1 (01f6ddf75 2026-02-11). Recorded discrepancy: the results artifact stamps runtime as 'node v24.3.0' because it reads process.version, which bun reports as its Node compatibility version, so the artifact does not name bun or its real version."
+    }
+  ],
+  "notes": "Base e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7 was taken from the task instruction and not verified against the repository: this session was instructed never to run git, so no commit lookup was performed. A JavaScript runtime WAS available for this audit (bun 1.3.13), so the cross-language claim is measured, not unmeasured: 22 accept fixtures agree byte-for-byte in both directions and 24 reject fixtures agree on category, with zero mismatches and zero gaps. Five of the nine contract rows are measured and passing. Three fail on corpus coverage rather than on any disagreement between the implementations: no length-delimited frame fixtures exist at all (so exact-limit, one-byte-over, zero-length and maximal-payload frames are uncovered, and the TypeScript side has no frame codec to compare against), no unknown security-sensitive enum fixture exists and TypeScript has no such concept, the read-only-unknown fixture never reaches a read-only-enum decoder on either side, and no unknown-protocol-name or unsupported-major-version fixture exists because neither message decoder consults a supported protocol set or version range. The R1-02 primitives are also absent from the corpus although the contract lists them in the minimum coverage. The ninth row, Quality, fails on three pre-existing automonique-lab failures outside this item's lease. Offline execution was measured with strace rather than asserted. No source, test, fixture or plan file was modified by this audit; the only writes were this evidence file and files under the session scratch directory."
+}

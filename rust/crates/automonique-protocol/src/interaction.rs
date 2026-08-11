@@ -258,7 +258,8 @@ impl InteractionError {
     ///
     /// Published as a constant so generated SDK fixtures can enforce the same
     /// edges without duplicating hidden policy.
-    pub const CATEGORIES: [&'static str; 19] = [
+    pub const CATEGORIES: [&'static str; 20] = [
+        "duplicate_transcript_entry",
         "field_invalid",
         "too_many",
         "queue_empty",
@@ -439,6 +440,17 @@ impl SurfaceKind {
 
 /// A monotonic position within a composer queue.
 ///
+/// A position is an **ordering key**, not an index. [`InputQueue::new`] requires
+/// only that positions strictly increase, so `0, 7, 9` is as valid a queue as
+/// `0, 1, 2` and the item storing position `7` sits at rank `1`. The two
+/// coincide in every queue [`InputQueue::reorder`] returns, because reordering
+/// renumbers densely from [`QueuePosition::FIRST`].
+///
+/// [`ReorderRequest::to`] is the one place the type carries a **rank** instead:
+/// a destination names a 0-based slot in the receiving queue's current order, so
+/// it is bounded by that queue's length rather than by the positions its items
+/// store.
+///
 /// Every advance is checked; there is no wrapping successor.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct QueuePosition(u32);
@@ -591,7 +603,11 @@ impl RetryRequest {
     }
 }
 
-/// A move of one identified queue item to an explicit position.
+/// A move of one identified queue item to an explicit destination rank.
+///
+/// The destination is a 0-based rank in the receiving queue's current order —
+/// the slot the item lands in — and never one of the positions that queue's
+/// items happen to store. [`QueuePosition`] records why the two can differ.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReorderRequest {
     item: QueueItemId,
@@ -599,7 +615,7 @@ pub struct ReorderRequest {
 }
 
 impl ReorderRequest {
-    /// Name the item to move and where it goes.
+    /// Name the item to move and the rank it goes to.
     #[must_use]
     pub const fn new(item: QueueItemId, to: QueuePosition) -> Self {
         Self { item, to }
@@ -611,7 +627,7 @@ impl ReorderRequest {
         &self.item
     }
 
-    /// The destination position.
+    /// The destination rank: a 0-based slot in the receiving queue's order.
     #[must_use]
     pub const fn to(&self) -> QueuePosition {
         self.to
@@ -889,6 +905,9 @@ impl InputQueue {
     /// [`InteractionError::PositionNotMonotonic`] for positions that do not
     /// strictly increase, and [`InteractionError::DuplicateIdentity`] for a
     /// repeated identity.
+    ///
+    /// Positions must increase but need not be dense, so an item's stored
+    /// position is an ordering key rather than its rank in the queue.
     pub fn new(session: SessionRef, items: Vec<QueuedInput>) -> Result<Self, InteractionError> {
         if items.is_empty() {
             return Err(InteractionError::QueueEmpty);
@@ -984,16 +1003,22 @@ impl InputQueue {
         })
     }
 
-    /// Move one identified item to an explicit position.
+    /// Move one identified item to an explicit destination rank.
+    ///
+    /// [`ReorderRequest::to`] is a 0-based rank in this queue's current order,
+    /// so exactly `0..self.items().len()` is addressable: a two-item queue has
+    /// ranks `0` and `1` whatever positions its items store.
     ///
     /// The result holds exactly the identities the receiver held: reordering
-    /// cannot invent, drop or duplicate one.
+    /// cannot invent, drop or duplicate one. Every item in the result is
+    /// renumbered densely from [`QueuePosition::FIRST`], so rank and stored
+    /// position coincide in the queue returned.
     ///
     /// # Errors
     ///
     /// Returns [`InteractionError::UnknownIdentity`] when the queue does not
     /// hold the named item, [`InteractionError::PositionOutOfRange`] for a
-    /// destination outside the queue, and
+    /// destination at or past the queue's length, and
     /// [`InteractionError::PositionOverflow`] when renumbering is not
     /// representable.
     pub fn reorder(&self, request: &ReorderRequest) -> Result<Self, InteractionError> {

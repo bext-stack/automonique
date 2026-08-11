@@ -12,9 +12,147 @@ use automonique_protocol::protocols::{
     Admission, AliasRecord, ApprovalDecision, ApprovalTarget, CanonicalActionKind, CanonicalId,
     CanonicalKind, CanonicalWork, ClientBinding, ClientBindingParts, ExternalOperation,
     ExternalRef, ExternalRequest, HostApprovalDecision, IdentityMap, MappedApproval,
-    ProjectedSemantic, Projection, ProtocolDialect, ProtocolError, ProtocolRange, ProtocolSemantic,
-    ProtocolVersion, Quotas, RemoteAgentClaim, Scope, SemanticSupport, commit,
+    MutationAuthority, ProjectedSemantic, Projection, ProtocolDialect, ProtocolError,
+    ProtocolRange, ProtocolSemantic, ProtocolVersion, Quotas, RemoteAgentClaim, Scope,
+    SemanticSupport, commit,
 };
+
+/// The operation-to-action mapping, written out rather than read back.
+///
+/// Surjectivity onto [`CanonicalActionKind::ALL`] survives any permutation of
+/// the mapping, so a coverage check cannot see one. These rows can.
+const DECLARED_ACTIONS: [(ExternalOperation, CanonicalActionKind); 7] = [
+    (
+        ExternalOperation::OpenSession,
+        CanonicalActionKind::CreateWork,
+    ),
+    (
+        ExternalOperation::SendPrompt,
+        CanonicalActionKind::AppendTurn,
+    ),
+    (
+        ExternalOperation::CancelPrompt,
+        CanonicalActionKind::CancelRun,
+    ),
+    (
+        ExternalOperation::RespondToPermission,
+        CanonicalActionKind::RespondToApproval,
+    ),
+    (ExternalOperation::CallTool, CanonicalActionKind::InvokeTool),
+    (ExternalOperation::CreateRun, CanonicalActionKind::StartRun),
+    (ExternalOperation::StopRun, CanonicalActionKind::CancelRun),
+];
+
+/// The action-to-scope mapping, written out rather than read back.
+///
+/// A guard that derives the scope it withholds from `required_scope()` moves
+/// both sides together and pins nothing. Every scope assertion below comes from
+/// this table instead.
+const DECLARED_SCOPES: [(CanonicalActionKind, Scope); 6] = [
+    (CanonicalActionKind::CreateWork, Scope::WriteWork),
+    (CanonicalActionKind::StartRun, Scope::StartRun),
+    (CanonicalActionKind::AppendTurn, Scope::WriteTurn),
+    (CanonicalActionKind::CancelRun, Scope::CancelRun),
+    (
+        CanonicalActionKind::RespondToApproval,
+        Scope::RespondToApproval,
+    ),
+    (CanonicalActionKind::InvokeTool, Scope::InvokeTool),
+];
+
+/// Every declared capability cell: six dialects by ten semantics.
+///
+/// Spot-checking a handful of calls leaves the rest of the matrix free to move.
+/// All sixty cells are named here, in dialect-then-semantic order.
+const DECLARED_SUPPORT: [(ProtocolDialect, ProtocolSemantic, SemanticSupport); 60] = {
+    use ProtocolDialect::{A2a, Acp, McpExport, NativeRuns, OpenAiCompatible, Relay};
+    use ProtocolSemantic::{
+        ApprovalPrompt, CursorResumption, ExactRevision, FileDiff, ModelSelection, StreamingText,
+        TerminalEvent, ThoughtSummary, ToolActivity, WorkGraph,
+    };
+    use SemanticSupport::{BoundedText, Native, Unsupported};
+
+    [
+        // The editor host represents everything it streams, but cannot carry an
+        // exact aggregate revision and renders the work graph as text.
+        (Acp, StreamingText, Native),
+        (Acp, ThoughtSummary, Native),
+        (Acp, ToolActivity, Native),
+        (Acp, FileDiff, Native),
+        (Acp, TerminalEvent, Native),
+        (Acp, ModelSelection, Native),
+        (Acp, ApprovalPrompt, Native),
+        (Acp, CursorResumption, Native),
+        (Acp, ExactRevision, Unsupported),
+        (Acp, WorkGraph, BoundedText),
+        // The OpenAI-compatible surface has no diff, terminal or reasoning
+        // shape, and no revision or graph at all.
+        (OpenAiCompatible, StreamingText, Native),
+        (OpenAiCompatible, ThoughtSummary, BoundedText),
+        (OpenAiCompatible, ToolActivity, Native),
+        (OpenAiCompatible, FileDiff, BoundedText),
+        (OpenAiCompatible, TerminalEvent, BoundedText),
+        (OpenAiCompatible, ModelSelection, Native),
+        (OpenAiCompatible, ApprovalPrompt, Native),
+        (OpenAiCompatible, CursorResumption, Native),
+        (OpenAiCompatible, ExactRevision, Unsupported),
+        (OpenAiCompatible, WorkGraph, Unsupported),
+        // The native surface is the reference point: nothing degrades in it.
+        (NativeRuns, StreamingText, Native),
+        (NativeRuns, ThoughtSummary, Native),
+        (NativeRuns, ToolActivity, Native),
+        (NativeRuns, FileDiff, Native),
+        (NativeRuns, TerminalEvent, Native),
+        (NativeRuns, ModelSelection, Native),
+        (NativeRuns, ApprovalPrompt, Native),
+        (NativeRuns, CursorResumption, Native),
+        (NativeRuns, ExactRevision, Native),
+        (NativeRuns, WorkGraph, Native),
+        // The MCP export is a tool surface: tool activity and approvals
+        // directly, a few shapes as text, the rest not at all.
+        (McpExport, StreamingText, BoundedText),
+        (McpExport, ThoughtSummary, Unsupported),
+        (McpExport, ToolActivity, Native),
+        (McpExport, FileDiff, BoundedText),
+        (McpExport, TerminalEvent, BoundedText),
+        (McpExport, ModelSelection, Unsupported),
+        (McpExport, ApprovalPrompt, Native),
+        (McpExport, CursorResumption, Unsupported),
+        (McpExport, ExactRevision, Unsupported),
+        (McpExport, WorkGraph, Unsupported),
+        // The A2a peer streams and resumes; it decides nothing.
+        (A2a, StreamingText, Native),
+        (A2a, ThoughtSummary, BoundedText),
+        (A2a, ToolActivity, BoundedText),
+        (A2a, FileDiff, BoundedText),
+        (A2a, TerminalEvent, Unsupported),
+        (A2a, ModelSelection, Unsupported),
+        (A2a, ApprovalPrompt, Unsupported),
+        (A2a, CursorResumption, Native),
+        (A2a, ExactRevision, Unsupported),
+        (A2a, WorkGraph, BoundedText),
+        // The relay carries the native shapes bar reasoning and the graph.
+        (Relay, StreamingText, Native),
+        (Relay, ThoughtSummary, BoundedText),
+        (Relay, ToolActivity, Native),
+        (Relay, FileDiff, Native),
+        (Relay, TerminalEvent, Native),
+        (Relay, ModelSelection, Native),
+        (Relay, ApprovalPrompt, Native),
+        (Relay, CursorResumption, Native),
+        (Relay, ExactRevision, Native),
+        (Relay, WorkGraph, BoundedText),
+    ]
+};
+
+/// The scope [`DECLARED_SCOPES`] names for an action.
+fn declared_scope(kind: CanonicalActionKind) -> Scope {
+    DECLARED_SCOPES
+        .into_iter()
+        .find(|(declared, _)| *declared == kind)
+        .map(|(_, scope)| scope)
+        .expect("every canonical action is declared exactly once")
+}
 
 fn actor() -> Actor {
     Actor::new("acme", "svc-1").expect("valid actor")
@@ -60,8 +198,31 @@ fn binding_for(tenant: &str, client_id: &str) -> ClientBinding {
     .expect("valid binding")
 }
 
+/// A fully scoped binding for an actor named by the caller.
+fn binding_for_actor(actor: Actor) -> ClientBinding {
+    ClientBinding::bind(ClientBindingParts {
+        dialect: ProtocolDialect::Acp,
+        client_id: "zed-1",
+        actor,
+        scopes: &Scope::ALL,
+        quotas: quotas(),
+        credential_revision: Revision::new(7).expect("non-zero revision"),
+        supported_range: range(1, 2),
+    })
+    .expect("valid binding")
+}
+
 fn full_binding(dialect: ProtocolDialect) -> ClientBinding {
     binding_with(dialect, &Scope::ALL)
+}
+
+/// The mutation authority of an in-range client of this binding.
+fn authority_for<'a>(binding: &'a ClientBinding, work: &'a CanonicalWork) -> MutationAuthority<'a> {
+    let projection = Projection::of(binding, work).expect("read scope");
+    let Admission::Mutating(authority) = projection.admit(ProtocolVersion::new(1)) else {
+        panic!("version 1 is inside the declared range");
+    };
+    authority
 }
 
 fn canonical(kind: CanonicalKind, id: &str) -> CanonicalId {
@@ -447,6 +608,141 @@ mod no_alternate_state {
         }
     }
 
+    /// Every action requires the one scope the table names, and a different
+    /// one.
+    ///
+    /// A body that answered `Scope::InvokeTool` for everything satisfies any
+    /// check that asks `required_scope()` what to withhold. It does not satisfy
+    /// this one, because the expected scope is written down.
+    #[test]
+    fn each_canonical_action_requires_the_scope_it_declares() {
+        assert_eq!(DECLARED_SCOPES.len(), CanonicalActionKind::ALL.len());
+        for (kind, expected) in DECLARED_SCOPES {
+            assert_eq!(
+                kind.required_scope(),
+                expected,
+                "{} requires {}, not the declared {}",
+                kind.as_str(),
+                kind.required_scope().as_str(),
+                expected.as_str()
+            );
+        }
+        for kind in CanonicalActionKind::ALL {
+            assert_eq!(
+                DECLARED_SCOPES
+                    .into_iter()
+                    .filter(|(declared, _)| *declared == kind)
+                    .count(),
+                1,
+                "{} is not declared exactly once",
+                kind.as_str()
+            );
+        }
+
+        // No scope stands in for another: six actions, six distinct scopes.
+        let mut required: Vec<Scope> = CanonicalActionKind::ALL
+            .into_iter()
+            .map(CanonicalActionKind::required_scope)
+            .collect();
+        required.sort_unstable();
+        required.dedup();
+        assert_eq!(
+            required.len(),
+            CanonicalActionKind::ALL.len(),
+            "two canonical actions collapsed onto one scope"
+        );
+        // Reading is not what any mutation is authorized by.
+        assert!(!required.contains(&Scope::ReadCanonicalState));
+    }
+
+    /// Withholding the declared scope is what refuses each operation, and
+    /// holding it is what serves it.
+    ///
+    /// Both halves matter. The refusal half alone passes for a mapping that
+    /// sent every action to one scope; the grant half fails immediately, since
+    /// a binding holding only `WriteWork` would then be served nothing.
+    #[test]
+    fn every_operation_is_gated_by_the_scope_its_action_declares() {
+        let work = work("w-1");
+        for (operation, kind) in DECLARED_ACTIONS {
+            let scope = declared_scope(kind);
+
+            let minimal = binding_with(ProtocolDialect::Relay, &[Scope::ReadCanonicalState, scope]);
+            let plan = authority_for(&minimal, &work)
+                .plan(&request(
+                    operation,
+                    canonical(CanonicalKind::Work, "w-1"),
+                    "key-1",
+                ))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{} was refused while holding its declared scope {}: {error}",
+                        operation.as_str(),
+                        scope.as_str()
+                    )
+                });
+            assert_eq!(
+                plan.kind(),
+                kind,
+                "{} reached {} rather than its declared action",
+                operation.as_str(),
+                plan.kind().as_str()
+            );
+
+            let others: Vec<Scope> = Scope::ALL
+                .into_iter()
+                .filter(|held| *held != scope)
+                .collect();
+            let starved = binding_with(ProtocolDialect::Relay, &others);
+            assert_eq!(
+                authority_for(&starved, &work)
+                    .plan(&request(
+                        operation,
+                        canonical(CanonicalKind::Work, "w-1"),
+                        "key-1",
+                    ))
+                    .expect_err("every other scope is held"),
+                ProtocolError::ScopeNotGranted {
+                    action: kind.as_str(),
+                    scope: scope.as_str(),
+                },
+                "{} was not gated by {}",
+                operation.as_str(),
+                scope.as_str()
+            );
+        }
+    }
+
+    /// A projection is its two shared borrows and nothing else.
+    ///
+    /// The `compile_fail` in the module documentation states the lifetime tie
+    /// only. A projection that cached its dialect beside the binding would
+    /// still compile, still borrow, and still answer `dialect()` — and would be
+    /// a second store of something the canonical record already holds. The
+    /// width of the type is what refuses it.
+    #[test]
+    fn a_projection_is_exactly_the_two_borrows_it_documents() {
+        assert_eq!(
+            size_of::<Projection<'static>>(),
+            size_of::<&ClientBinding>() + size_of::<&CanonicalWork>(),
+            "a projection grew a field beyond the two borrows it is documented to hold"
+        );
+        assert_eq!(
+            size_of::<MutationAuthority<'static>>(),
+            size_of::<Projection<'static>>(),
+            "a mutation authority grew a field beyond the projection it borrows"
+        );
+
+        // And what it answers is the binding's, for every dialect.
+        let work = work("w-1");
+        for dialect in ProtocolDialect::ALL {
+            let binding = full_binding(dialect);
+            let projection = Projection::of(&binding, &work).expect("read scope");
+            assert_eq!(projection.dialect(), dialect);
+            assert_eq!(projection.dialect(), projection.binding().dialect());
+        }
+    }
+
     #[test]
     fn a_binding_that_cannot_read_canonical_state_cannot_project_it() {
         let binding = binding_with(ProtocolDialect::McpExport, &[Scope::InvokeTool]);
@@ -488,6 +784,47 @@ mod effect_equivalence {
             ExternalOperation::CancelPrompt.canonical_action(),
             ExternalOperation::StopRun.canonical_action()
         );
+    }
+
+    /// Each operation reaches the action the table names.
+    ///
+    /// The coverage check above is blind to a permutation: swapping two
+    /// operations' actions leaves the mapping onto
+    /// [`CanonicalActionKind::ALL`] surjective and every assertion there true.
+    /// These rows name which action, not merely how many.
+    #[test]
+    fn each_operation_reaches_the_canonical_action_it_declares() {
+        assert_eq!(DECLARED_ACTIONS.len(), ExternalOperation::ALL.len());
+        for (operation, expected) in DECLARED_ACTIONS {
+            assert_eq!(
+                operation.canonical_action(),
+                expected,
+                "{} reaches {}, not the declared {}",
+                operation.as_str(),
+                operation.canonical_action().as_str(),
+                expected.as_str()
+            );
+        }
+        for operation in ExternalOperation::ALL {
+            assert_eq!(
+                DECLARED_ACTIONS
+                    .into_iter()
+                    .filter(|(declared, _)| *declared == operation)
+                    .count(),
+                1,
+                "{} is not declared exactly once",
+                operation.as_str()
+            );
+        }
+        // Cancelling a prompt and stopping a run are the one effect they are
+        // documented to be; nothing else doubles up.
+        let mut reached: Vec<&str> = DECLARED_ACTIONS
+            .into_iter()
+            .map(|(_, kind)| kind.as_str())
+            .collect();
+        reached.sort_unstable();
+        reached.dedup();
+        assert_eq!(reached.len(), CanonicalActionKind::ALL.len());
     }
 
     #[test]
@@ -730,6 +1067,82 @@ mod honest_degradation {
         }
     }
 
+    /// Every one of the sixty cells is the cell that was reviewed.
+    ///
+    /// Totality says each pair has an answer; it does not say which. A cell
+    /// flipped in either direction — a dialect claiming a fidelity it lacks, or
+    /// disclaiming one it has — changes what a client is told and what
+    /// [`Projection::project`] returns, and only a written-down matrix sees it.
+    #[test]
+    fn every_declared_capability_cell_is_the_one_under_review() {
+        assert_eq!(
+            DECLARED_SUPPORT.len(),
+            ProtocolDialect::ALL.len() * ProtocolSemantic::ALL.len(),
+            "the matrix is not one row per dialect per semantic"
+        );
+        for (dialect, semantic, expected) in DECLARED_SUPPORT {
+            assert_eq!(
+                dialect.support(semantic),
+                expected,
+                "{} declares {} as {}, not the reviewed {}",
+                dialect.as_str(),
+                semantic.as_str(),
+                dialect.support(semantic).as_str(),
+                expected.as_str()
+            );
+        }
+        // Every pair is named exactly once, so a dropped row cannot free a cell.
+        for dialect in ProtocolDialect::ALL {
+            for semantic in ProtocolSemantic::ALL {
+                assert_eq!(
+                    DECLARED_SUPPORT
+                        .into_iter()
+                        .filter(|(declared, named, _)| *declared == dialect && *named == semantic)
+                        .count(),
+                    1,
+                    "{} declares {} other than exactly once",
+                    dialect.as_str(),
+                    semantic.as_str()
+                );
+            }
+        }
+    }
+
+    /// A flipped cell changes what a client actually receives.
+    ///
+    /// The matrix above pins the declaration; this pins that the declaration is
+    /// what `project` obeys, so the two cannot drift apart.
+    #[test]
+    fn the_declared_cell_is_the_outcome_the_client_receives() {
+        let work = work("w-1");
+        for (dialect, semantic, expected) in DECLARED_SUPPORT {
+            let binding = full_binding(dialect);
+            let projection = Projection::of(&binding, &work).expect("read scope");
+            let outcome = projection.project(semantic, "a summary of what happened");
+            match expected {
+                SemanticSupport::Native => assert!(
+                    matches!(outcome, Ok(ProjectedSemantic::Native { .. })),
+                    "{} was declared native for {} and returned {outcome:?}",
+                    dialect.as_str(),
+                    semantic.as_str()
+                ),
+                SemanticSupport::BoundedText => assert!(
+                    matches!(outcome, Ok(ProjectedSemantic::Degraded(_))),
+                    "{} was declared bounded text for {} and returned {outcome:?}",
+                    dialect.as_str(),
+                    semantic.as_str()
+                ),
+                SemanticSupport::Unsupported => assert_eq!(
+                    outcome.expect_err("an unsupported semantic is refused"),
+                    ProtocolError::UnsupportedSemantic {
+                        dialect: dialect.as_str(),
+                        semantic: semantic.as_str(),
+                    }
+                ),
+            }
+        }
+    }
+
     #[test]
     fn only_the_native_surface_represents_everything() {
         for dialect in ProtocolDialect::ALL {
@@ -819,16 +1232,67 @@ mod honest_degradation {
         );
     }
 
+    /// A whole degradation sweep leaves the authoritative record readable and
+    /// unchanged, and every outcome still points at it.
+    ///
+    /// Comparing the record with a clone of itself is nearly free: a
+    /// [`CanonicalWork`] has no interior mutability, so no `project` call could
+    /// have altered it. What the sweep is worth pinning is that it happened at
+    /// all and that each outcome is the class the dialect declares — otherwise
+    /// deleting the loop leaves the comparison passing over an untouched value.
+    /// The outcomes are therefore collected and asserted, and the record is
+    /// re-read through the projection after every step.
     #[test]
     fn the_authoritative_record_stays_intact_across_degradation() {
         let binding = full_binding(ProtocolDialect::McpExport);
         let work = work("w-1");
         let before = work.clone();
         let projection = Projection::of(&binding, &work).expect("read scope");
+
+        let mut observed: Vec<(ProtocolSemantic, SemanticSupport)> = Vec::new();
         for semantic in ProtocolSemantic::ALL {
-            let _ = projection.project(semantic, "a summary of what happened");
+            let class = match projection.project(semantic, "a summary of what happened") {
+                Ok(ProjectedSemantic::Native { authoritative, .. }) => {
+                    assert_eq!(authoritative.path(), "/native/v1/work/w-1");
+                    SemanticSupport::Native
+                }
+                Ok(ProjectedSemantic::Degraded(degradation)) => {
+                    assert_eq!(degradation.authoritative().path(), "/native/v1/work/w-1");
+                    assert_eq!(
+                        degradation.rendering().text(),
+                        "a summary of what happened",
+                        "the degradation rewrote the summary it was given"
+                    );
+                    SemanticSupport::BoundedText
+                }
+                Err(ProtocolError::UnsupportedSemantic { .. }) => SemanticSupport::Unsupported,
+                Err(other) => panic!("{} refused unexpectedly: {other}", semantic.as_str()),
+            };
+            assert_eq!(
+                projection.work(),
+                &before,
+                "the record read back through the projection changed while projecting {}",
+                semantic.as_str()
+            );
+            observed.push((semantic, class));
+        }
+
+        assert_eq!(
+            observed.len(),
+            ProtocolSemantic::ALL.len(),
+            "the sweep did not project every semantic"
+        );
+        for (semantic, class) in observed {
+            assert_eq!(
+                class,
+                ProtocolDialect::McpExport.support(semantic),
+                "{} left by a route the dialect does not declare",
+                semantic.as_str()
+            );
         }
         assert_eq!(work, before, "projecting altered the canonical record");
+        assert_eq!(work.title(), "ship the adapter");
+        assert_eq!(work.revision(), Revision::FIRST);
     }
 }
 
@@ -1114,6 +1578,119 @@ mod idempotency_scoping {
         assert_ne!(
             first, second,
             "globex's request must not be answered with acme's receipt"
+        );
+    }
+
+    /// A separator inside a tenant cannot forge another tenant's ledger key.
+    ///
+    /// `Actor::new` accepts any bounded text, and bounded text may contain a
+    /// `/`. So `("a", "b/c")` and `("a/b", "c")` are two actors in two
+    /// different tenants whose components, joined raw, spell one key: the
+    /// ledger then answers the second tenant's request with the first tenant's
+    /// receipt and records no second effect. That is the collision the scoping
+    /// exists to prevent, reached through the separator rather than through a
+    /// shared key.
+    #[test]
+    fn a_separator_in_a_tenant_cannot_forge_another_tenants_ledger_key() {
+        let work = work("w-1");
+        let split_tenant = binding_for_actor(Actor::new("a", "b/c").expect("valid actor"));
+        let split_actor = binding_for_actor(Actor::new("a/b", "c").expect("valid actor"));
+        assert_ne!(
+            split_tenant.actor().tenant(),
+            split_actor.actor().tenant(),
+            "the two bindings must belong to different tenants for this to mean anything"
+        );
+
+        let external = request(
+            ExternalOperation::CreateRun,
+            canonical(CanonicalKind::Run, "r-1"),
+            "k",
+        );
+        let first_plan = authority_for(&split_tenant, &work)
+            .plan(&external)
+            .expect("start_run granted");
+        let second_plan = authority_for(&split_actor, &work)
+            .plan(&external)
+            .expect("start_run granted");
+        assert_ne!(
+            first_plan.scoped_idempotency_key(),
+            second_plan.scoped_idempotency_key(),
+            "two tenants collapsed onto one ledger key"
+        );
+
+        let mut ledger = ActionLedger::new();
+        let first = commit(&first_plan, &mut ledger).expect("the first tenant recorded");
+        let second = commit(&second_plan, &mut ledger).expect("the second tenant recorded");
+        assert_ne!(
+            first, second,
+            "the second tenant was answered with the first tenant's receipt"
+        );
+        assert_eq!(
+            ledger.find(&first_plan.scoped_idempotency_key()),
+            Some(&first)
+        );
+        assert_eq!(
+            ledger.find(&second_plan.scoped_idempotency_key()),
+            Some(&second)
+        );
+    }
+
+    /// Nor can a separator inside the caller's own key.
+    ///
+    /// The actor `b` with the key `acp/start_run/k` and the actor
+    /// `b/acp/start_run` with the key `k` are a different caller asking a
+    /// different question. Joined raw they are one string.
+    #[test]
+    fn a_separator_in_a_key_cannot_forge_another_actors_ledger_key() {
+        let work = work("w-1");
+        let plain = binding_for_actor(Actor::new("a", "b").expect("valid actor"));
+        let padded = binding_for_actor(Actor::new("a", "b/acp/start_run").expect("valid actor"));
+        assert_ne!(plain.actor().id(), padded.actor().id());
+
+        let target = canonical(CanonicalKind::Run, "r-1");
+        let crafted = authority_for(&plain, &work)
+            .plan(&request(
+                ExternalOperation::CreateRun,
+                target.clone(),
+                "acp/start_run/k",
+            ))
+            .expect("start_run granted");
+        let ordinary = authority_for(&padded, &work)
+            .plan(&request(ExternalOperation::CreateRun, target, "k"))
+            .expect("start_run granted");
+        assert_ne!(
+            crafted.scoped_idempotency_key(),
+            ordinary.scoped_idempotency_key(),
+            "two callers collapsed onto one ledger key"
+        );
+
+        let mut ledger = ActionLedger::new();
+        let first = commit(&crafted, &mut ledger).expect("the crafted key recorded");
+        let second = commit(&ordinary, &mut ledger).expect("the ordinary key recorded");
+        assert_ne!(
+            first, second,
+            "one caller was answered with another caller's receipt"
+        );
+    }
+
+    /// Escaping costs the ordinary key nothing.
+    ///
+    /// A component carrying no separator is spelled exactly as before, so the
+    /// fix above is not a rename of every key in the ledger.
+    #[test]
+    fn a_key_with_no_separator_keeps_its_spelling() {
+        let work = work("w-1");
+        let binding = binding_for("acme", "svc-1");
+        let plan = authority_for(&binding, &work)
+            .plan(&request(
+                ExternalOperation::SendPrompt,
+                canonical(CanonicalKind::Turn, "t-1"),
+                "idem-7",
+            ))
+            .expect("write_turn granted");
+        assert_eq!(
+            plan.scoped_idempotency_key(),
+            "acme/svc-1/acp/append_turn/idem-7"
         );
     }
 

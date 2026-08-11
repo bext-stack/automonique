@@ -1,0 +1,72 @@
+{
+  "item": "R1-15",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Identity distinctness",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --doc && rustc --edition 2024 --extern automonique_protocol=rust/target/debug/libautomonique_protocol.rlib <five scratch cross-assignment probes plus one positive>",
+      "result": "pass",
+      "output": "The compile-fail doc test at host.rs line 8 passes as one of 42 doc tests and was recompiled standalone to confirm it produces 'error[E0308]: mismatched types' for AttemptId -> HostId. Because that doc test covers only one of the ten pairs, all five identities were probed directly against the built rlib: WorkId -> AttemptId, AttemptId -> HostId, HostId -> ProviderSessionId, ProviderSessionId -> ProviderTurnId and ProviderTurnId -> WorkId each fail with E0308, while a positive program constructing all five from the same spelling \"x-1\" compiles and runs. The mechanism is a phantom domain: host.rs declares WorkDomain/AttemptDomain/HostDomain via a macro producing type aliases over OpaqueId<Domain, MAX_HOST_ID_BYTES>, and provider.rs declares the session and turn domains the same way, so no pair interconverts and none is a bare String."
+    },
+    {
+      "name": "Retry appends",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test host retry_appends",
+      "result": "pass",
+      "output": "Two tests pass. AttemptLog::retry returns a new log rather than mutating: the retried log holds two attempts, its latest is number 2 with retry_of pointing at a-1, attempts()[0] is still addressable as a-1, and the original log still holds exactly one attempt. Over a chain of five retries the attempt numbers are exactly [1, 2, 3, 4, 5] and the work identity is carried through. There is no setter or index-assignment path that could overwrite a prior attempt: attempts() returns &[Attempt] and retry takes &self."
+    },
+    {
+      "name": "Lifetime immutability",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test host lifetime_immutability",
+      "result": "pass",
+      "output": "Two tests pass. set_lifetime on a Session-scoped host fails with HostError::LifetimeIsImmutable { lifetime: Session } and the host still reports Session. Both lifetimes are constructible and both refuse a change: an Attempt-scoped host reports Attempt and refuses set_lifetime(Session). Lifetime is fixed by ExecutionHost::new and there is no other write path."
+    },
+    {
+      "name": "Boundary-bound attach",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test host boundary_bound_attach",
+      "result": "pass",
+      "output": "Two tests pass. An identical HostBoundary (tenant acme, provider account account-1, workspace context ws-hash-1, boot identity boot-1) attaches. Each of the four components was varied independently and every one is refused with HostError::BoundaryMismatch { component } naming the differing component: 'tenant' for globex, 'provider_account' for account-2, 'workspace_context' for ws-hash-2 and 'boot_id' for boot-2. A merely different boundary is refused exactly as a weaker one would be, so there is no partial-match acceptance."
+    },
+    {
+      "name": "Transition legality",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test host transition_legality",
+      "result": "pass",
+      "output": "Four tests pass. HostState::ALL has exactly the nine states the contract names (Starting, Ready, Busy, Idle, Hibernated, Stopping, Stopped, Failed, Lost) with nine distinct wire spellings. The full 9x9 matrix is driven: for every ordered pair, transition_to succeeds if and only if legal_successors contains the target, and every undeclared edge returns HostError::IllegalTransition { from, to } rather than a permissive default. Terminal states are terminal: for each state where is_terminal() holds, legal_successors is empty and transition_to fails for all nine targets. A representative lifecycle also runs end to end: starting -> ready -> busy -> idle -> hibernated -> ready -> stopping -> stopped, ending in a terminal state."
+    },
+    {
+      "name": "Host assignment atomicity",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test host host_assignment_atomicity && grep -n 'pub enum RunPlacement' -A 20 rust/crates/automonique-protocol/src/host.rs",
+      "result": "pass",
+      "output": "Two tests pass. RunPlacement is a closed four-variant enum: Pending, AdmissionBlocked and PreLaunchCancelled carry no host and are the only variants for which host() returns None, and Running { host: HostId } is the sole launched variant and always carries its host. The only constructor that reaches Running is start_on(host: HostId), which takes the host by value, so leaving pre-launch and acquiring a host are the same operation and a launched placement without a host is not representable. Absent host identity is legal exactly in the three pre-launch cases the contract allows."
+    },
+    {
+      "name": "Expiry purity",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test host expiry_purity && grep -rn 'SystemTime\\|Instant::now\\|std::time\\|UNIX_EPOCH' rust/crates/automonique-protocol/src/",
+      "result": "pass",
+      "output": "Two tests pass. IdleDeadline::new(last_active, ttl_ms) and is_expired_at(now) are both const fns over supplied EpochMillis: a window of 500 ms from 1000 is not expired at 1499, is expired at 1500 (inclusive) and at 9999, and eight repeated evaluations at the same instant never differ. A backwards clock does not wrap into an expiry: a window opened at 5000 is not expired when evaluated at 0, because the difference saturates. No clock is read anywhere in the value layer: the grep over the whole automonique-protocol src/ tree returns no SystemTime, Instant::now, std::time or UNIX_EPOCH occurrence. Recorded observation: IdleDeadline is the only deadline value in the module and the tests exercise the idle TTL only; hibernation expiry has no separately named type or test, and would today be expressed with the same (last_active, ttl) shape."
+    },
+    {
+      "name": "Restart classification",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test host restart_classification",
+      "result": "pass",
+      "output": "Five tests pass. classify_restart is total over its evidence: all 30 combinations of recorded_state (None plus the nine states) and provider_reports_resumable (None, Some(true), Some(false)) were driven and each returned exactly one of the four outcomes. Absent evidence is always ReconciliationRequired, including when the provider claims resumable, and an ambiguous provider answer (recorded Busy, provider None) is also ReconciliationRequired. Resumable requires an authoritative provider answer: Busy plus Some(true) is Resumable, Hibernated plus Some(true) is Hibernated, Busy plus Some(false) is TerminallyInterrupted. A terminal recorded state stays TerminallyInterrupted for all three provider answers. The evidence struct has only those two fields, so process presence is not an input and no path can return a 'running' answer - RestartClassification has no such variant."
+    },
+    {
+      "name": "Claim lifecycle",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test host claim_lifecycle && grep -n 'pub fn claim\\|pub fn mark_releasable\\|pub fn release\\|pub fn transfer_ownership' -A 10 rust/crates/automonique-protocol/src/host.rs",
+      "result": "pass",
+      "output": "Four tests pass. Releasing a claim whose work is still active fails with HostError::ClaimStillActive { work: \"w-1\" } and the holder is unchanged. Release succeeds only after mark_releasable, after which the key becomes available to a second work item. A second work item cannot take a held claim: it gets the same ClaimStillActive naming the current holder. A reload transfers ownership without deleting the claim: transfer_ownership(\"gen-2\") rewrites the holder to contain gen-2, the key is still held, and a third work item is still refused, so a paused old generation cannot find the key free. Recorded observation: mark_releasable(key) takes no evidence argument and sets a boolean unconditionally, so 'terminal work state or verified host loss' is a documented precondition on the caller rather than a typed one - unlike replay purity in the neighbouring journal module, which is enforced by reachability."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path rust/Cargo.toml --all -- --check && cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --offline -- -D warnings && cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "fail",
+      "output": "Formatting exits 0 and strict all-target Clippy exits 0 with no warnings, both offline. The workspace test run does not pass: 806 tests pass and 3 fail, in two automonique-lab targets. harness_claim::operational_claim_is_accepted_by_rust_status_and_selection panics with 'automonique-lab: harness claim denied'; program_cli::immutable_packet_selects_the_exact_generated_work and program_cli::admitted_cli_allocates_and_replays_the_packet_bound_worktree panic with 'automonique-lab: program selection denied'. Root cause measured: all three fixtures copy the live .automonique/dev/program.yaml and request item R0-19, whose entry now reads \"status\": \"blocked\", \"runnable\": false, so harness_claim::select returns ClaimError::IneligibleItem. Nothing in host.rs or tests/host.rs is implicated. No allowance was added in this item's files; automonique-protocol declares zero dependencies and forbids unsafe, todo, unimplemented and dbg at the manifest level."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "no independent reviewer examined this item; this file is a measurement audit written by a separate agent that ran every command listed and read the outputs, which is not review of the implementation's design"
+  },
+  "notes": "All 24 tests in tests/host.rs pass and its module names line up one-to-one with the contract's check table; every lifecycle row is measured and passing. Identity distinctness needed extra work to be honest about: host.rs defines only three of the five identities (work, attempt, host) and its single compile-fail doc test covers one pair, so the remaining pairs, including the two that cross into provider.rs (ProviderSessionId, ProviderTurnId), were compiled standalone against the built rlib and all produce E0308. Two observations are recorded inside their rows rather than being smoothed over: there is no separately named hibernation expiry type or test, only IdleDeadline exercised as an idle TTL; and ClaimRegistry::mark_releasable accepts no evidence, so the 'terminal work state or verified loss' precondition is documentary rather than typed. Neither contradicts what its row asserts, but both are places where a later layer could drift. No test spawns a process, reads /proc, opens a socket or starts a timer, and the whole crate contains no clock read. The only failing row is Quality, and it fails on three automonique-lab tests unrelated to this item, broken by drift in the generated program document rather than by any code in this slice. Not measured: whether Cargo.lock or any Cargo.toml drifted, because this audit is forbidden to run git."
+}

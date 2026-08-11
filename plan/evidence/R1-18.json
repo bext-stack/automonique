@@ -1,0 +1,74 @@
+{
+  "item": "R1-18",
+  "status": "partial",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Profile ordering",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test sandbox profile_ordering",
+      "result": "pass",
+      "output": "2 tests pass. compare() returns a four-valued ProfileOrdering, never a bool: observe vs observe = Identical, observe vs workspace-offline = Narrower, the reverse = Wider, workspace-offline vs workspace-egress = Narrower. Incomparable is reachable and symmetric: a profile with WritableWithGrants+Denied against ReadOnlySnapshot+BrokeredAny returns Incomparable in both directions, and evaluate_reuse preserves it by routing Incomparable to RequiresNewHost rather than collapsing it to \"not narrower\"."
+    },
+    {
+      "name": "Spec immutability and completeness",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test sandbox spec_completeness; then rustc compile probes assigning to spec.tenant and calling ten spec accessors named by the contract",
+      "result": "fail",
+      "output": "Immutability holds and is measured: `spec.tenant = \"globex\".to_owned()` fails to compile with E0616 \"field tenant of struct SandboxSpec is private\", and the type exposes no setter. Completeness does not hold. The contract's field list names roughly 16 groups; SandboxSpecParts carries 9 (profile identity+version, policy digest, tenant, workspace context, the two egress policies, required features, budgets, prohibited capabilities). A compile probe naming the contract's other fields produced 10 E0599 errors on SandboxSpec: actor, provider_account, workspace_context (stored but with no accessor), base_revision, path_grants, tool_allowlist, credential_descriptors, nested_isolation, approval_revision, enforcement_implementation_digests. So actor, provider account, immutable base revision, readable/writable path grants, executable/interpreter/tool/MCP/companion allowlists, credential descriptors with their permitted process class, accepted enforcement implementation digests, nested isolation requirements and the approval/policy revision are all absent; the workspace security context is a plain bounded string rather than a hash. There is also no coverage table against the requirement anywhere in the crate or its tests, which the row requires by name. The two tests that do run assert 8 fields and one empty-field rejection (category field_invalid)."
+    },
+    {
+      "name": "No silent downgrade",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test sandbox no_silent_downgrade",
+      "result": "pass",
+      "output": "2 tests pass. A spec requiring [cgroup_v2, landlock_abi_3] admitted on a host offering only cgroup_v2 fails with SandboxError::RequiredEnforcementMissing{feature:\"landlock_abi_3\"} — the feature is named. Negotiation is exhausted over the two-feature power set: all three incomplete host sets ([], [cgroup_v2], [landlock_abi_3]) refuse with category required_enforcement_missing and the complete set admits. admit_on returns Result<(), SandboxError>, so its success type carries no profile at all and there is no value in which a weaker resolution could be returned."
+    },
+    {
+      "name": "Egress split",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test sandbox egress_split; cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --doc; then rustc on the doctest body to capture its error code",
+      "result": "pass",
+      "output": "The integration test passes: a compiled spec carries BrokeredNamed on the control plane and Denied for tool workload simultaneously, so the two are independent values. The compile-fail proof executes: 42 doctests pass including 'src/sandbox.rs - sandbox (line 10) - compile fail'. Compiling that snippet's body directly confirms it fails for the intended reason and not incidentally: E0308 \"mismatched types: expected ToolWorkloadEgress, found ProviderControlEgress\". Recorded caveat: CI's rust.yml runs `cargo test --workspace --all-targets`, and --all-targets excludes doctests, so this compile-fail proof is not exercised by CI as configured; it was exercised here."
+    },
+    {
+      "name": "Attestation comparison",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test sandbox attestation_comparison; then rustc compile probe calling attestation accessors named by the contract",
+      "result": "unmeasured",
+      "reason": "The clause \"quarantined permitting only observation, reconciliation or cancellation\" has no representation in this layer, so no command could exercise it.",
+      "output": "Measured and passing: 2 tests cover all five adoption cases. adopt_host(Some(a), Some(a)) = Adopted; a differing seccomp digest, Some/None, None/Some and None/None all = Quarantined. Adoption is a comparison of the recorded value against the observed one (`recorded == observed` over all six fields), never a reconstruction — there is no constructor path from an observation to an adopted state. Not measured: AdoptionOutcome::Quarantined is a bare enum variant with no associated permitted-operation set, and nothing in the crate or its tests expresses or checks that only observation, reconciliation or cancellation are allowed; the restriction exists solely as a doc comment. Also recorded: EnforcementAttestation carries 6 of the roughly 12 fields the contract lists and has no accessors at all — resolved_paths, process_group, credential_delivery_mode and landlock_abi all fail with E0599."
+    },
+    {
+      "name": "Narrowing-only reuse",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test sandbox narrowing_only_reuse",
+      "result": "pass",
+      "output": "5 tests pass. Identical and narrower requests return ReuseOutcome::Reuse. Wider, incomparable, a different tenant, and a widened provider-control egress (BrokeredNamed -> BrokeredAny with an otherwise identical profile) all return ReuseOutcome::RequiresNewHost. evaluate_reuse takes two &SandboxSpec and returns an enum, so it has no path that mutates either spec in place."
+    },
+    {
+      "name": "Approval cannot widen",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test sandbox approval_cannot_widen; cargo test ... --doc; then rustc on the doctest body to capture its error code",
+      "result": "pass",
+      "output": "ApprovalRequest exposes exactly class() and description(); the integration test passes. The compile-fail proof executes as 'src/sandbox.rs - sandbox (line 20) - compile fail'. Compiling that body directly gives E0599 \"no method named widened_spec found for struct ApprovalRequest\", confirming the failure is the absence of a spec-returning accessor rather than an unrelated compile error. Same CI caveat as the egress split: --all-targets skips doctests."
+    },
+    {
+      "name": "Budget typing",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test sandbox budget_typing violation_dispositions::exhaustion_and_violation_are_distinct_outcomes",
+      "result": "pass",
+      "output": "2 budget tests plus the distinctness test pass. Budget::new takes a BudgetUnit by value, so a unitless budget has no constructor. All four units (milliseconds, memory_bytes, processes, temp_bytes) accept exactly their ceiling (86400000, 68719476736, 4096, 549755813888) and reject ceiling+1 with category budget_out_of_range and a message naming the unit. Exhaustion and violation are distinct: ViolationClass::BudgetExhaustion != PolicyViolation and their dispositions differ (terminate_run_and_record vs terminate_run). Recorded gap that belongs to the completeness row rather than this one: the contract's budget list names cgroup, rlimit, timeout, temporary storage, spool and artifact budgets, and only four units exist."
+    },
+    {
+      "name": "Violation dispositions",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test sandbox violation_dispositions",
+      "result": "pass",
+      "output": "4 tests pass. ViolationClass::ALL has exactly the 4 contract classes (policy_violation, budget_exhaustion, enforcement_loss, attestation_mismatch), each has a disposition, all four spellings are distinct, and every disposition is one of TerminateRun, TerminateRunAndRecord or Quarantine. The Disposition enum has exactly three variants and no Continue, so \"continue\" is unrepresentable rather than merely unused. EnforcementLoss and AttestationMismatch both map to Quarantine."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml --all -- --check; cargo clippy --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml --workspace --all-targets --offline -- -D warnings; cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "fail",
+      "output": "fmt exits 0, strict all-target Clippy exits 0 with zero warnings, but workspace tests fail: 806 passed, 3 failed, all in automonique-lab and all outside this item's lease (harness_claim::operational_claim_is_accepted_by_rust_status_and_selection, program_cli::immutable_packet_selects_the_exact_generated_work, program_cli::admitted_cli_allocates_and_replays_the_packet_bound_worktree). Their fixtures select work item R0-19, which the generated program marks status \"blocked\", runnable false, blocked_by_gates [GATE-HARNESS], so selection is denied. -p automonique-protocol alone is green: 620 passed, 0 failed, of which 21 are the sandbox integration tests and 42 are doctests. The protocol crate has exactly one #[allow] (src/codec.rs:436) and none in sandbox.rs; no todo!/unimplemented!/dbg!/unsafe, and the crate sets unsafe_code = \"forbid\". Lockfile drift could not be checked: this audit is not permitted to run git."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "No independent reviewer examined this item. This file is a third-party audit written by an agent that read the contract, the implementation and the tests and re-ran every command; it is not a human review and it is not the implementer's self-review."
+  },
+  "notes": "No enforcement was tested and none is claimed. This slice creates no namespace, loads no seccomp filter, applies no Landlock ruleset and allocates no cgroup; every result above is a property of values, comparisons and the type system, measured by running tests, doctests and rustc compile probes. Two rows do not pass: Spec immutability and completeness fails on completeness (10 contract-named fields have no accessor and roughly 10 of 16 field groups are absent; no coverage table exists), and Attestation comparison is unmeasured for its permitted-operations clause. Quality fails on three pre-existing automonique-lab failures outside the lease. Commands are recorded with absolute manifest paths; they were run with cwd /home/infra-sj278. Compile probes were built with rustc --edition 2024 against rust/target/debug/deps/libautomonique_protocol-f9919e2c7dee2777.rlib using scratch files under /tmp; no repository file was created or modified by this audit other than this evidence file."
+}

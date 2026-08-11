@@ -1,0 +1,67 @@
+{
+  "item": "R1-19",
+  "status": "partial",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Surface coverage",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test namespace surface_coverage; then a scratch binary that replicates tests/namespace.rs::workspace_identifiers over rust/crates and prints GateReport::scanned_per_surface and unscanned_surfaces",
+      "result": "fail",
+      "output": "Scanned-versus-total per surface class, measured against the real tree: package 5, module 44, crate 0, feature 0, binary 0, schema 0, metric 0, tracing_target 0, fixture 0, release_artifact 0 — 49 identifiers, 2 of 10 classes scanned, 8 reported by unscanned_surfaces() as [crate, feature, binary, schema, metric, tracing_target, fixture, release_artifact]. The row's second clause holds: the gate does report unscanned classes as an explicit gap rather than as a pass, and the in-crate test an_unscanned_class_is_reported_as_a_gap_not_a_pass proves it (scanning only packages leaves 9 gaps). The first clause does not hold: only Cargo package directory names and per-crate module file stems are ever collected from the repository. The passing test every_declared_surface_class_is_covered feeds the gate ten synthetic identifiers it constructs itself, one per class, so it demonstrates the gate can accept ten classes, not that ten classes are scanned. Features, binaries, schema and protocol names, metrics, tracing targets, fixture identifiers and release artifact names are never enumerated from the tree by anything."
+    },
+    {
+      "name": "Namespace enforcement",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test namespace namespace_enforcement",
+      "result": "pass",
+      "output": "3 tests pass. \"automonique\", \"automonique-lab\" and \"automonique_protocol\" are accepted. A metric named legacy_runs_total produces exactly one Finding carrying identifier=legacy_runs_total, location=rust/Cargo.toml and surface=Metric, and report.passed() is false. Four near-miss spellings (automoniqu-lab, auto_monique, Automonique-lab, xautomonique-lab) each produce a finding, so the prefix check is not a loose substring match. These tests run under `cargo test --workspace` in .github/workflows/rust.yml, so a violation on a scanned surface does fail CI; the reach of that guarantee is limited to the two surface classes the Surface coverage row records as actually scanned."
+    },
+    {
+      "name": "Bidirectional inventory",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test namespace bidirectional_inventory",
+      "result": "pass",
+      "output": "4 tests pass. An inventoried binary named legacyctl passes the gate. When that binary no longer appears among the scanned identifiers the report has zero findings but orphaned_inventory == [\"legacyctl\"] and passed() is false, so a dead permission cannot accumulate. The two directions are separate fields on GateReport and a run with one un-namespaced metric plus one vanished inventory entry reports 1 finding and 1 orphan independently. An inventory entry is scoped to its surface class: the same spelling on a different surface still produces a finding."
+    },
+    {
+      "name": "No escape hatch",
+      "command": "a scratch binary that runs NamespaceGate over the real workspace plus a deliberately injected 'legacy-runner' crate, first plainly, then with AUTOMONIQUE_NAMESPACE_GATE, AUTOMONIQUE_GATE, NAMESPACE_GATE, AUTOMONIQUE_NAMESPACE_ALLOWLIST, RUSTFLAGS and CI all set to 0, and again from a directory containing namespace-allowlist.json, .namespace-allowlist, allowlist.json, .automonique-namespace-gate.toml and namespace-gate.toml each declaring {\"allow\":[\"legacy-runner\"]}",
+      "result": "pass",
+      "output": "Attempted rather than asserted. With six plausible disabling environment variables set the report still contained 1 finding and passed() was false. Run from a directory seeded with five plausible allowlist files, the report was byte-identical: 1 finding, passed() false. The gate performs no environment read and no filesystem read — its only input is the caller-supplied &[ScannedIdentifier] — so there is nothing to point an allowlist file or variable at, and no suppression comment can reach it because it never reads source text. That last property is also why the Surface coverage row fails: not reading the tree is what removes the escape hatch and what limits the scan. Recorded honestly: the repository's own test suite has no module for this row, so these attempts were made by this audit, not by a committed test."
+    },
+    {
+      "name": "Determinism",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test namespace determinism; plus the scratch binary run repeatedly",
+      "result": "pass",
+      "output": "2 tests pass. A three-identifier input and its exact reverse produce equal GateReports, and the findings come out in sorted order (alpha_total, mid_crate, zeta_total). Eight repeated runs over the same ten-identifier input produce identical reports. run() sorts and dedups findings, orphans and the per-surface counts before returning, so filesystem iteration order cannot leak into the output; the scratch binary reproduced the same 49-identifier, 0-finding report on every invocation. Everything ran with --offline and the gate makes no network call — it has no dependencies and no I/O of any kind."
+    },
+    {
+      "name": "Actionable output",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test namespace actionable_output",
+      "result": "pass",
+      "output": "1 test passes. Finding::resolutions() returns exactly two strings: a rename path naming the identifier and both canonical prefixes, and an inventory path naming the identifier, its surface class and \"migration contract\". Display renders identifier, surface class, location and both resolutions in one line — verified to contain legacy_total, metric and rust/Cargo.toml. resolutions() returns [String; 2], so a finding cannot exist with fewer than two resolution paths."
+    },
+    {
+      "name": "The gate can fail",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test namespace the_gate_can_fail",
+      "result": "pass",
+      "output": "2 tests pass against the real tree, not a fixture. workspace_identifiers() collects 49 identifiers from rust/crates (5 packages, 44 modules) and the gate reports zero findings on them. Injecting one deliberately non-namespaced crate name, legacy-runner, makes passed() false and the finding names legacy-runner. Reproduced independently by the scratch binary: 0 findings before injection, 1 after."
+    },
+    {
+      "name": "Authorized exceptions",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test namespace authorized_exceptions",
+      "result": "pass",
+      "output": "2 tests pass. InventoryEntry::new takes a MigrationContract by value, so an entry without one has no constructor; the fixture entry reports authorized_by()=\"plan/contracts/R1-19.md\". MigrationContract::new(\"\") is an error, so an unauthorized exception cannot be minted to satisfy the type. Counts for the record: the gate ships with an empty inventory (NamespaceGate::new() holds zero entries) and the real workspace needs none, so 0 exceptions exist, 0 without a contract."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml --all -- --check; cargo clippy --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml --workspace --all-targets --offline -- -D warnings; cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "fail",
+      "output": "fmt exits 0, strict all-target Clippy exits 0 with zero warnings, but workspace tests fail: 806 passed, 3 failed, all in automonique-lab and all outside this item's lease (harness_claim::operational_claim_is_accepted_by_rust_status_and_selection, program_cli::immutable_packet_selects_the_exact_generated_work, program_cli::admitted_cli_allocates_and_replays_the_packet_bound_worktree). Their fixtures select work item R0-19, which the generated program marks status \"blocked\", runnable false, blocked_by_gates [GATE-HARNESS]; the binaries print \"program selection denied\" / \"harness claim denied\". Because .github/workflows/rust.yml runs the same `cargo test --workspace`, CI on main is red for reasons unrelated to this item. -p automonique-protocol alone is green: 620 passed, 0 failed, 17 of them the namespace tests. The protocol crate has exactly one #[allow] (src/codec.rs:436) and none in namespace.rs; no todo!/unimplemented!/dbg!/unsafe. Lockfile drift could not be checked: this audit is not permitted to run git."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "No independent reviewer examined this item. This file is a third-party audit written by an agent that read the contract, the implementation and the tests and re-ran every command; it is not a human review and it is not the implementer's self-review."
+  },
+  "notes": "The gate exists and works, but it is a library that judges a caller-supplied list rather than a scanner over the tree, and only one caller ever supplies real data: tests/namespace.rs::workspace_identifiers, which collects Cargo package directory names and per-crate module file stems. Measured coverage is therefore 2 of 10 surface classes (49 identifiers: 5 packages, 44 modules), and Surface coverage is recorded as failing rather than as a pass with a footnote — the contract explicitly asks for scanned-versus-total per class so that partial coverage is visible. No escape hatch is recorded as passing on the strength of attempts made by this audit (six environment variables, five allowlist files, all with no effect); the repository carries no test for that row, which is a real gap in the item's own evidence even though the property holds. Quality fails on three pre-existing automonique-lab failures outside the lease. Commands are recorded with absolute manifest paths; they were run with cwd /home/infra-sj278. The scratch binary was compiled with rustc --edition 2024 against rust/target/debug/deps/libautomonique_protocol-f9919e2c7dee2777.rlib from a file under /tmp; no repository file was created or modified by this audit other than this evidence file."
+}

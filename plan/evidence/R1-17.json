@@ -1,0 +1,69 @@
+{
+  "item": "R1-17",
+  "status": "partial",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Single source",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test compat single_source; then find /home/infra-sj278/automonique/rust -name build.rs -not -path './target/*' and grep -rn 'NameRegistry|generated_aliases' over rust/crates excluding src/compat.rs and tests/compat.rs",
+      "result": "fail",
+      "output": "The in-crate half passes: 3 tests. One NameEntry produces both spellings (owner_table yields exactly [AUTOMONIQUE_DB, LEGACY_DB]); generated_aliases() returns [LEGACY_DB]; a set difference against a hand-declared list [LEGACY_DB, LEGACY_DB_OLD] isolates LEGACY_DB_OLD; a second entry claiming LEGACY_DB is refused with CompatError::DuplicateSpelling. What does not exist is the other half of the row. There is no build script anywhere in the workspace (the only build.rs is crates/automonique-lab/src/build.rs, an ordinary module, and no Cargo.toml declares `build =`), and NameRegistry / generated_aliases have zero references outside src/compat.rs and tests/compat.rs. So no canonical name or alias in this repository is generated from the registry, and no build step compares declared aliases against it: the drift comparison is performed by the test on its own fixture data, not by the build. \"A hand-written alias absent from the registry fails the build\" was not measured because there is nothing that could fail."
+    },
+    {
+      "name": "Forwarding only",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test compat forwarding_only",
+      "result": "pass",
+      "output": "2 tests pass. Resolving AUTOMONIQUE_DB yields SpellingResolution::Canonical and resolving LEGACY_DB yields SpellingResolution::Alias, and both hand back the same NameEntry: identical canonical(), owner() and durable_identity(). An unknown spelling yields SpellingResolution::Unknown. LegacyAlias has exactly three fields (spelling, authorized_by, retire_after) and no behavior-carrying field or method, so an alias can only forward; a codec boundary is permitted by the contract but none is represented here, which is consistent with \"forwarding or codec\"."
+    },
+    {
+      "name": "Conflict rejection",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test compat conflict_rejection",
+      "result": "pass",
+      "output": "3 tests pass. Setting AUTOMONIQUE_DB=/new and LEGACY_DB=/old returns CompatError::CanonicalAndAliasBothSet naming both spellings and both values; the rendered message contains /new, /old and the word \"precedence\". Reversing declaration order gives the same category and still names both values. Two identical values under both spellings are still an error, so agreeing by accident is not tolerated. resolve_configuration has no precedence branch: every duplicate canonical target returns Err."
+    },
+    {
+      "name": "Deprecation observation",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test compat deprecation_observation",
+      "result": "pass",
+      "output": "2 tests pass. Setting only LEGACY_DB=/old succeeds and returns one row (canonical AUTOMONIQUE_DB, value /old) carrying Some(DeprecationObservation) whose alias()=LEGACY_DB, canonical()=AUTOMONIQUE_DB and retire_after()=0.9.0. The observation is a returned value in the Vec, not a log line, so a caller can enumerate every alias still in use. Setting only the canonical spelling returns None for the observation."
+    },
+    {
+      "name": "One owner",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test compat one_owner",
+      "result": "pass",
+      "output": "2 tests pass. owner_table() emits one row per spelling (2 rows for the fixture, sorted by spelling), every row agrees on owner and durable_identity, and exactly one row is flagged canonical. Inserting a second NameEntry with canonical AUTOMONIQUE_DB and owner \"another-service\" is refused with CompatError::TwoOwners{canonical, first: settings-service, second: another-service}. The table is generated from the registry over all entries rather than spot-checked. Scale caveat: the fixture registry holds one entry and two spellings, because no production registry is populated anywhere in the repository."
+    },
+    {
+      "name": "Authorized aliases",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test compat authorized_aliases",
+      "result": "pass",
+      "output": "2 tests pass. The fixture alias reports authorized_by()=\"plan/contracts/R1-17.md\" and retire_after()=\"0.9.0\", so every alias declares both a contract and a window. An unauthorized alias cannot be built: MigrationContract::new(\"\") is an error, and since LegacyAlias::new takes a MigrationContract by value there is no way to construct an alias without one. LegacyAlias::new(\"\", ...) and LegacyAlias::new(\"LEGACY_DB\", contract, \"\") are also errors. Counts for the record: 1 alias in the fixture registry, 1 with an authorizing contract, 0 without."
+    },
+    {
+      "name": "Identifier location",
+      "command": "grep -rn 'legacy-inventory' --include=*.py --include=*.rs --include=*.yml over the repository; grep -n legacy /home/infra-sj278/automonique/plan/check.py; grep -rn legacy /home/infra-sj278/automonique/tools/scrub/*.py",
+      "result": "unmeasured",
+      "reason": "No scan implementing this rule exists, so there is no command whose output could show it passing or failing.",
+      "output": "Nothing in the repository enforces \"legacy identifiers appear only in the registry and docs/product-plan/reference/legacy-inventory.md\". plan/check.py contains no occurrence of \"legacy\". tools/scrub/scan.py has a \"legacy-name\" rule family, but it is a synthetic/protected-value scrub for the real predecessor product name, keyed to an HMAC fingerprint bundle that is not installed (plan/evidence/BOOT-003.json records GATE-SCRUB as open with 0 protected rules), and it has no notion of \"permitted only in these two files\". No source file references legacy-inventory.md. This row is therefore not measured, and it must not be read as passing."
+    },
+    {
+      "name": "Durable identifiers unchanged",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test compat durable_identifiers_unchanged; then ls /home/infra-sj278/automonique/docs/product-plan/reference and grep -rln 'R0-13' over the repository",
+      "result": "unmeasured",
+      "reason": "The R0-13 identifier inventory this row compares against does not exist yet, so the comparison could not be performed.",
+      "output": "What was measured and passes: 2 tests show renamed_to(\"AUTOMONIQUE_DATABASE\") changes canonical() only — durable_identity() and owner() are unchanged, the alias survives and still forwards — and renamed_to takes no durable-identity parameter, so a rename has no argument through which a durable identity could move. What could not be measured is the row's actual requirement, \"proven by comparing the generated set against the R0-13 inventory\": R0-13 (Automonique identifier inventory) is still listed as selectable-but-not-done in plan/ready.md (11 items done, R0-13 among the 32 ready), and no R0-13 output exists under plan/, spikes/, .automonique/dev/ or tools/. docs/product-plan/reference/legacy-inventory.md is prose about the predecessor system, not a machine-readable classified identifier inventory. There is also no generated set to compare, since nothing is generated from the registry (see Single source)."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml --all -- --check; cargo clippy --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml --workspace --all-targets --offline -- -D warnings; cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "fail",
+      "output": "fmt exits 0, strict all-target Clippy exits 0 with zero warnings, but workspace tests fail: 806 passed, 3 failed. All three are in automonique-lab, outside this item's lease: harness_claim::operational_claim_is_accepted_by_rust_status_and_selection and program_cli::{immutable_packet_selects_the_exact_generated_work, admitted_cli_allocates_and_replays_the_packet_bound_worktree}. Their fixtures copy the real plan/work-graph.toml and .automonique/dev/program.yaml and then select R0-19, which the generated program now marks status \"blocked\", runnable false, blocked_by_gates [GATE-HARNESS]; selection is refused and the binaries print \"program selection denied\" / \"harness claim denied\". -p automonique-protocol alone is green (620 passed, 0 failed) and 17 of those are the compat tests. The protocol crate has exactly one #[allow] (src/codec.rs:436) and none in compat.rs; no todo!/unimplemented!/dbg!/unsafe. Lockfile drift could not be checked: this audit is not permitted to run git."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "No independent reviewer examined this item. This file is a third-party audit written by an agent that read the contract, the implementation and the tests and re-ran every command; it is not a human review and it is not the implementer's self-review."
+  },
+  "notes": "Three rows do not pass. Single source fails because the registry is a value type that nothing generates from and no build step consults — measured by the absence of any build script and zero references to NameRegistry outside src/compat.rs and tests/compat.rs. Identifier location is unmeasured because no scan implementing the two-location rule exists. Durable identifiers unchanged is unmeasured because R0-13 has not been done, so there is no inventory to compare a generated set against; the local rename-preserves-durable-identity property was measured and does hold. Quality fails on three pre-existing automonique-lab failures outside the lease. The six passing rows are all exercised on a one-entry, two-spelling fixture registry, which is the only registry that exists. Commands are recorded with absolute manifest paths; they were run with cwd /home/infra-sj278. No repository file was created or modified by this audit other than this evidence file."
+}

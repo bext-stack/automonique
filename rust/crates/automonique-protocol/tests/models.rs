@@ -15,18 +15,19 @@ use automonique_protocol::models::{
     CredentialReference, DataPolicy, Elimination, EnvironmentState, EventCursor, EvidenceKind,
     ExecutorClass, ExecutorRegistration, ExecutorRegistrationParts, FallbackChain, FallbackClass,
     FallbackHop, FallbackRegistry, GeneratedMedia, HopSemantics, ImmutableSpecAcceptance,
-    IsolationIdentity, LifecycleEvidence, MediaAdapterDeclaration, MediaAdapterParts,
-    MediaDeployment, MediaFamily, MediaProvenance, MediaRetention, MediaVisibility,
-    MinimizedContext, Modality, ModelCatalogEntry, ModelError, ModelRef, NativeOsGrant,
-    NativeOsGrantParts, PendingApproval, PersistentEnvironment, PlatformDerivative, PoolAccount,
-    PoolAccountParts, Pricing, PricingUnit, PromptRetention, ProtectedOriginal, ProviderAccountId,
-    Quota, ReasoningControl, ReferenceCall, RemoteCoordinate, Rotation, RotationTrigger,
-    RoutingConstraint, RoutingDecision, SandboxContainment, SessionBinding, SessionModel,
-    SnapshotRef, SpokenConfirmation, StructuredOutputSupport, SwitchReason, SwitchRefusal,
-    SwitchRequest, ToolSupport, TrainingUse, TurnContext, UsageClass, VendorSandboxLabel,
-    WakeWordDetection, WorkspaceTransfer, admit_allocation, with_credential_pool,
+    IsolationIdentity, LifecycleEvidence, MAX_MODEL_FIELD_BYTES, MediaAdapterDeclaration,
+    MediaAdapterParts, MediaDeployment, MediaFamily, MediaProvenance, MediaRetention,
+    MediaVisibility, MinimizedContext, Modality, ModelCatalogEntry, ModelError, ModelRef,
+    NativeOsGrant, NativeOsGrantParts, PendingApproval, PersistentEnvironment, PlatformDerivative,
+    PoolAccount, PoolAccountParts, Pricing, PricingUnit, PromptRetention, ProtectedOriginal,
+    ProviderAccountId, Quota, ReasoningControl, ReferenceCall, ReferenceOutput, RemoteCoordinate,
+    Rotation, RotationTrigger, RoutingConstraint, RoutingDecision, SandboxContainment,
+    SessionBinding, SessionModel, SnapshotRef, SpokenConfirmation, StructuredOutputSupport,
+    SwitchReason, SwitchRefusal, SwitchRequest, ToolSupport, TrainingUse, TurnContext, UsageClass,
+    VendorSandboxLabel, WakeWordDetection, WorkspaceTransfer, admit_allocation,
+    with_credential_pool,
 };
-use automonique_protocol::primitives::{EpochMillis, Revision};
+use automonique_protocol::primitives::{EpochMillis, Revision, ValueError};
 use automonique_protocol::sandbox::{EnforcementAttestation, NetworkAccess};
 
 fn model(provider: &str, name: &str) -> ModelRef {
@@ -184,39 +185,96 @@ mod catalog_completeness {
 
     #[test]
     fn an_entry_is_not_declarable_with_a_missing_field() {
-        let cases: [(&str, CatalogEntryParts<'_>); 4] = [
+        // Every bounded field is checked, and the refusal names the field it
+        // rejected: a check that fires under another field's name would leave
+        // the entry as unexplained as no check at all.
+        let overlong = "n".repeat(MAX_MODEL_FIELD_BYTES + 1);
+        let cases: [(ModelError, CatalogEntryParts<'_>); 8] = [
             (
-                "field_invalid",
+                ModelError::Field {
+                    field: "display_name",
+                    error: ValueError::Empty,
+                },
+                CatalogEntryParts {
+                    display_name: "",
+                    ..parts()
+                },
+            ),
+            (
+                ModelError::Field {
+                    field: "display_name",
+                    error: ValueError::TooLong {
+                        max_bytes: MAX_MODEL_FIELD_BYTES,
+                        actual_bytes: MAX_MODEL_FIELD_BYTES + 1,
+                    },
+                },
+                CatalogEntryParts {
+                    display_name: overlong.as_str(),
+                    ..parts()
+                },
+            ),
+            (
+                ModelError::Field {
+                    field: "region",
+                    error: ValueError::Empty,
+                },
                 CatalogEntryParts {
                     region: "",
                     ..parts()
                 },
             ),
             (
-                "limit_required",
+                ModelError::Field {
+                    field: "sovereignty_zone",
+                    error: ValueError::Empty,
+                },
+                CatalogEntryParts {
+                    sovereignty_zone: "",
+                    ..parts()
+                },
+            ),
+            (
+                ModelError::Field {
+                    field: "sovereignty_zone",
+                    error: ValueError::ControlCharacter,
+                },
+                CatalogEntryParts {
+                    sovereignty_zone: "eu\u{7}",
+                    ..parts()
+                },
+            ),
+            (
+                ModelError::LimitRequired {
+                    field: "modalities",
+                },
                 CatalogEntryParts {
                     modalities: &[],
                     ..parts()
                 },
             ),
             (
-                "limit_required",
+                ModelError::LimitRequired {
+                    field: "context_limit_tokens",
+                },
                 CatalogEntryParts {
                     context_limit_tokens: 0,
                     ..parts()
                 },
             ),
             (
-                "limit_required",
+                ModelError::LimitRequired {
+                    field: "max_output_tokens",
+                },
                 CatalogEntryParts {
                     max_output_tokens: 0,
                     ..parts()
                 },
             ),
         ];
-        for (category, case) in cases {
+        for (expected, case) in cases {
             let refused = ModelCatalogEntry::declare(case).expect_err("incomplete entry");
-            assert_eq!(refused.category(), category);
+            assert_eq!(refused.category(), expected.category());
+            assert_eq!(refused, expected, "the refusal names the rejected field");
         }
     }
 
@@ -550,6 +608,119 @@ mod boundary_refusals {
         assert_eq!(unchanged.cache(), CacheConsequence::Preserved);
         assert_eq!(unchanged.context(), ContextConsequence::Retained);
     }
+
+    fn session_at(turn_revision: Revision, binding: SessionBinding) -> SessionModel {
+        SessionModel::new(
+            account("acct-eu-1"),
+            model("anthropic", "opus"),
+            "eu",
+            binding,
+            turn_revision,
+        )
+        .expect("valid session")
+    }
+
+    fn request(account_id: &str, name: &str, zone: &str, reason: SwitchReason) -> SwitchRequest {
+        SwitchRequest::new(
+            account(account_id),
+            model("anthropic", name),
+            zone,
+            200_000,
+            reason,
+        )
+        .expect("valid request")
+    }
+
+    #[test]
+    fn a_switch_with_no_successor_turn_revision_is_a_typed_refusal() {
+        let permitted = request("acct-eu-1", "haiku", "eu", SwitchReason::ActorDirected);
+
+        // One revision below the ceiling the switch still records itself.
+        let last = session_at(revision(u64::MAX - 1), SessionBinding::Portable);
+        assert_eq!(
+            last.switch(&permitted, 1_000)
+                .expect("one revision remains")
+                .turn_revision(),
+            revision(u64::MAX)
+        );
+
+        // At the ceiling there is no revision left to record the switch in, so
+        // the switch does not happen rather than happening unrecorded.
+        let exhausted = session_at(revision(u64::MAX), SessionBinding::Portable);
+        let refusal = exhausted
+            .switch(&permitted, 1_000)
+            .expect_err("no successor revision");
+        assert_eq!(refusal, SwitchRefusal::RevisionExhausted);
+        assert_eq!(refusal.category(), "revision_exhausted");
+        assert_eq!(
+            exhausted.turn_revision(),
+            revision(u64::MAX),
+            "a refused switch leaves the session where it was"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_revision_space_never_masks_a_boundary_crossing() {
+        // Both conditions hold at once. A boundary crossing must still be
+        // reported as the crossing it is: answering "out of revisions" would
+        // hide which boundary the caller tried to cross.
+        let portable = session_at(revision(u64::MAX), SessionBinding::Portable);
+        assert_eq!(
+            portable
+                .switch(
+                    &request("acct-eu-1", "opus", "us", SwitchReason::ActorDirected),
+                    1_000
+                )
+                .expect_err("crosses zones"),
+            SwitchRefusal::SovereigntyBoundary {
+                from: "eu".to_owned(),
+                to: "us".to_owned(),
+            }
+        );
+        assert_eq!(
+            portable
+                .switch(
+                    &request("acct-eu-9", "opus", "eu", SwitchReason::PolicyDirected),
+                    1_000
+                )
+                .expect_err("crosses accounts"),
+            SwitchRefusal::ProviderAccountBoundary {
+                from: "acct-eu-1".to_owned(),
+                to: "acct-eu-9".to_owned(),
+            }
+        );
+
+        let bound = session_at(revision(u64::MAX), SessionBinding::SessionBound);
+        assert_eq!(
+            bound
+                .switch(
+                    &SwitchRequest::new(
+                        account("acct-eu-1"),
+                        model("openai", "gpt"),
+                        "eu",
+                        200_000,
+                        SwitchReason::ActorDirected,
+                    )
+                    .expect("valid request"),
+                    1_000
+                )
+                .expect_err("session-bound"),
+            SwitchRefusal::SessionBoundMigration {
+                provider: "anthropic".to_owned(),
+            }
+        );
+        assert_eq!(
+            bound
+                .switch(
+                    &request("acct-eu-1", "haiku", "eu", SwitchReason::HealthOnly),
+                    1_000
+                )
+                .expect_err("health alone"),
+            SwitchRefusal::HealthAloneInsufficient {
+                provider: "anthropic".to_owned(),
+            }
+        );
+    }
 }
 
 mod pool_containment {
@@ -592,29 +763,102 @@ mod pool_containment {
 
     #[test]
     fn a_rotation_to_self_or_to_an_unusable_target_is_refused() {
-        let categories = with_credential_pool(
+        let (refused, permitted) = with_credential_pool(
             pool_parts(
                 "pool-eu",
                 vec![
                     pool_account("acct-eu-1", AccountState::Available, Quota::Remaining(500)),
                     pool_account("acct-eu-2", AccountState::Exhausted, Quota::Remaining(0)),
+                    pool_account("acct-eu-3", AccountState::Available, Quota::Remaining(0)),
+                    pool_account(
+                        "acct-eu-4",
+                        AccountState::RateLimited,
+                        Quota::Remaining(500),
+                    ),
+                    pool_account("acct-eu-5", AccountState::Available, Quota::Unmetered),
                 ],
             ),
             |pool| {
-                let first = pool.member("acct-eu-1").expect("in pool");
-                let again = pool.member("acct-eu-1").expect("in pool");
-                let exhausted = pool.member("acct-eu-2").expect("in pool");
-                let to_self = Rotation::plan(first.clone(), again, RotationTrigger::AuthFailure)
-                    .expect_err("same account");
-                let to_exhausted = Rotation::plan(first, exhausted, RotationTrigger::Exhausted)
-                    .expect_err("target is out of quota");
-                (to_self.category(), to_exhausted.category())
+                let member = |id: &str| pool.member(id).expect("in pool");
+                let refused: Vec<ModelError> = vec![
+                    Rotation::plan(
+                        member("acct-eu-1"),
+                        member("acct-eu-1"),
+                        RotationTrigger::AuthFailure,
+                    )
+                    .expect_err("same account"),
+                    Rotation::plan(
+                        member("acct-eu-1"),
+                        member("acct-eu-2"),
+                        RotationTrigger::Exhausted,
+                    )
+                    .expect_err("target is out of quota and says so"),
+                    Rotation::plan(
+                        member("acct-eu-1"),
+                        member("acct-eu-3"),
+                        RotationTrigger::Exhausted,
+                    )
+                    .expect_err("target has no quota left"),
+                    Rotation::plan(
+                        member("acct-eu-1"),
+                        member("acct-eu-4"),
+                        RotationTrigger::RateLimited,
+                    )
+                    .expect_err("target cannot serve traffic"),
+                ];
+                let permitted = Rotation::plan(
+                    member("acct-eu-1"),
+                    member("acct-eu-5"),
+                    RotationTrigger::ScheduledReview,
+                )
+                .expect("target is available and has quota")
+                .target()
+                .account()
+                .as_str()
+                .to_owned();
+                (refused, permitted)
             },
         )
         .expect("valid pool");
+
+        assert_eq!(
+            refused,
+            vec![
+                ModelError::RotationToSelf {
+                    account: "acct-eu-1".to_owned(),
+                },
+                ModelError::RotationTargetUnavailable {
+                    account: "acct-eu-2".to_owned(),
+                    state: "exhausted",
+                },
+                // Observed available, but out of quota: quota alone disqualifies
+                // a target, and the refusal names what disqualified it rather
+                // than repeating a state that would contradict the refusal.
+                ModelError::RotationTargetUnavailable {
+                    account: "acct-eu-3".to_owned(),
+                    state: "exhausted",
+                },
+                // Metered quota remains, but the state alone disqualifies it.
+                ModelError::RotationTargetUnavailable {
+                    account: "acct-eu-4".to_owned(),
+                    state: "rate_limited",
+                },
+            ],
+            "each refusal names the target and the observation that refused it"
+        );
+        let categories: Vec<&str> = refused.iter().map(ModelError::category).collect();
         assert_eq!(
             categories,
-            ("rotation_to_self", "rotation_target_unavailable")
+            [
+                "rotation_to_self",
+                "rotation_target_unavailable",
+                "rotation_target_unavailable",
+                "rotation_target_unavailable",
+            ]
+        );
+        assert_eq!(
+            permitted, "acct-eu-5",
+            "a target that is available and has quota is rotated to"
         );
     }
 
@@ -627,6 +871,9 @@ mod pool_containment {
                     pool_account("acct-eu-1", AccountState::Available, Quota::Remaining(500)),
                     pool_account("acct-eu-2", AccountState::Exhausted, Quota::Remaining(0)),
                     pool_account("acct-eu-3", AccountState::Available, Quota::Unmetered),
+                    pool_account("acct-eu-4", AccountState::Available, Quota::Remaining(0)),
+                    pool_account("acct-eu-5", AccountState::Exhausted, Quota::Remaining(500)),
+                    pool_account("acct-eu-6", AccountState::RateLimited, Quota::Remaining(20)),
                 ],
             ),
             |pool| {
@@ -635,57 +882,211 @@ mod pool_containment {
                     .iter()
                     .map(|found| found.id().as_str().to_owned())
                     .collect();
+                let members: Vec<(String, AccountState, bool)> = pool
+                    .accounts()
+                    .iter()
+                    .map(|held| {
+                        let member = pool.member(held.id().as_str()).expect("in pool");
+                        (
+                            member.account().as_str().to_owned(),
+                            member.state(),
+                            member.is_exhausted(),
+                        )
+                    })
+                    .collect();
                 let first = &pool.accounts()[0];
+                let usage = first.usage();
                 (
                     exhausted,
-                    first.usage().requests(),
-                    first.usage().input_tokens(),
-                    first.usage().output_tokens(),
-                    first.usage().quota(),
-                    first.credential_reference().as_str().to_owned(),
-                    pool.member("acct-eu-2").expect("in pool").is_exhausted(),
+                    members,
+                    (
+                        first.id().as_str().to_owned(),
+                        first.owner_organization().to_owned(),
+                        first.billing_tenant().to_owned(),
+                        first.data_boundary().to_owned(),
+                        first.credential_reference().as_str().to_owned(),
+                        first.state(),
+                    ),
+                    (
+                        usage.requests(),
+                        usage.input_tokens(),
+                        usage.output_tokens(),
+                        usage.quota(),
+                    ),
                 )
             },
         )
         .expect("valid pool");
+        let (exhausted, members, identity, usage) = observed;
 
-        assert_eq!(observed.0, ["acct-eu-2"], "exhaustion is visible");
-        assert_eq!(observed.1, 3);
-        assert_eq!(observed.2, 900);
-        assert_eq!(observed.3, 300);
-        assert_eq!(observed.4, Quota::Remaining(500));
         assert_eq!(
-            observed.5, "vault://acme/eu/key",
+            exhausted,
+            ["acct-eu-2", "acct-eu-4", "acct-eu-5"],
+            "an observed exhausted state and a spent quota each exhaust an \
+             account on their own"
+        );
+        assert_eq!(
+            members,
+            vec![
+                ("acct-eu-1".to_owned(), AccountState::Available, false),
+                ("acct-eu-2".to_owned(), AccountState::Exhausted, true),
+                ("acct-eu-3".to_owned(), AccountState::Available, false),
+                ("acct-eu-4".to_owned(), AccountState::Available, true),
+                ("acct-eu-5".to_owned(), AccountState::Exhausted, true),
+                ("acct-eu-6".to_owned(), AccountState::RateLimited, false),
+            ],
+            "a pool handle carries the account's own observed state and \
+             exhaustion, not a default"
+        );
+        assert_eq!(
+            identity,
+            (
+                "acct-eu-1".to_owned(),
+                "acme".to_owned(),
+                "acme-eu".to_owned(),
+                "eu".to_owned(),
+                "vault://acme/eu/key".to_owned(),
+                AccountState::Available,
+            ),
             "the account holds a lookup coordinate, not a credential"
         );
-        assert!(observed.6);
+        assert_eq!(usage, (3, 900, 300, Quota::Remaining(500)));
+    }
+
+    #[test]
+    fn a_pool_carries_the_identity_and_policy_it_was_declared_with() {
+        let declared = with_credential_pool(
+            pool_parts(
+                "pool-eu",
+                vec![pool_account(
+                    "acct-eu-1",
+                    AccountState::Available,
+                    Quota::Remaining(500),
+                )],
+            ),
+            |pool| {
+                (
+                    pool.id().to_owned(),
+                    pool.owner_organization().to_owned(),
+                    pool.billing_tenant().to_owned(),
+                    pool.data_boundary().to_owned(),
+                    pool.accounts().len(),
+                )
+            },
+        )
+        .expect("valid pool");
+        assert_eq!(
+            declared,
+            (
+                "pool-eu".to_owned(),
+                "acme".to_owned(),
+                "acme-eu".to_owned(),
+                "eu".to_owned(),
+                1
+            ),
+            "the pool reports the policy every member was checked against"
+        );
+    }
+
+    #[test]
+    fn a_pools_own_fields_are_bounded_and_the_refusal_names_them() {
+        let cases: [(&str, CredentialPoolParts<'_>); 4] = [
+            (
+                "pool_id",
+                CredentialPoolParts {
+                    id: "",
+                    ..pool_parts("pool-eu", Vec::new())
+                },
+            ),
+            (
+                "owner_organization",
+                CredentialPoolParts {
+                    owner_organization: "",
+                    ..pool_parts("pool-eu", Vec::new())
+                },
+            ),
+            (
+                "billing_tenant",
+                CredentialPoolParts {
+                    billing_tenant: "",
+                    ..pool_parts("pool-eu", Vec::new())
+                },
+            ),
+            (
+                "data_boundary",
+                CredentialPoolParts {
+                    data_boundary: "",
+                    ..pool_parts("pool-eu", Vec::new())
+                },
+            ),
+        ];
+        for (field, parts) in cases {
+            let refused = with_credential_pool(parts, |pool| pool.id().to_owned())
+                .expect_err("a pool field is missing");
+            assert_eq!(
+                refused,
+                ModelError::Field {
+                    field,
+                    error: ValueError::Empty,
+                },
+                "a pool whose own policy is unnamed groups nothing"
+            );
+        }
     }
 
     #[test]
     fn a_pool_refuses_an_account_whose_policy_differs() {
-        let foreign = PoolAccount::declare(PoolAccountParts {
-            id: account("acct-us-1"),
-            owner_organization: "acme",
-            billing_tenant: "acme-us",
-            data_boundary: "us",
-            credential: CredentialReference::new("vault://acme/us/key").expect("valid"),
-            usage: AccountUsage::new(0, 0, 0, Quota::Unmetered),
-            state: AccountState::Available,
-        })
-        .expect("valid account");
+        let foreign = |owner: &str, tenant: &str, boundary: &str| {
+            PoolAccount::declare(PoolAccountParts {
+                id: account("acct-us-1"),
+                owner_organization: owner,
+                billing_tenant: tenant,
+                data_boundary: boundary,
+                credential: CredentialReference::new("vault://acme/us/key").expect("valid"),
+                usage: AccountUsage::new(0, 0, 0, Quota::Unmetered),
+                state: AccountState::Available,
+            })
+            .expect("valid account")
+        };
+        let place = |held: PoolAccount| {
+            with_credential_pool(pool_parts("pool-eu", vec![held]), |pool| {
+                pool.accounts().len()
+            })
+        };
 
-        let refused = with_credential_pool(pool_parts("pool-eu", vec![foreign]), |pool| {
-            pool.id().to_owned()
-        })
-        .expect_err("policy differs");
-        assert_eq!(refused.category(), "pool_policy_mismatch");
+        // Each axis is enforced on its own: the pool's guarantee is that all
+        // three agree, so any one of them differing must refuse the pool.
+        for (axis, differing) in [
+            ("owner_organization", foreign("globex", "acme-eu", "eu")),
+            ("billing_tenant", foreign("acme", "acme-us", "eu")),
+            ("data_boundary", foreign("acme", "acme-eu", "us")),
+        ] {
+            let refused = place(differing).expect_err("policy differs");
+            assert_eq!(refused.category(), "pool_policy_mismatch");
+            assert_eq!(
+                refused,
+                ModelError::PoolPolicyMismatch {
+                    account: "acct-us-1".to_owned(),
+                    axis,
+                },
+                "the refusal names the account and the axis that differs"
+            );
+        }
+
+        let two_axes = place(foreign("acme", "acme-us", "us")).expect_err("policy differs");
         assert_eq!(
-            refused,
+            two_axes,
             ModelError::PoolPolicyMismatch {
                 account: "acct-us-1".to_owned(),
                 axis: "billing_tenant",
             },
             "the first differing axis is named"
+        );
+
+        assert_eq!(
+            place(foreign("acme", "acme-eu", "eu")).expect("policies agree"),
+            1,
+            "an account agreeing on every axis is grouped"
         );
     }
 
@@ -700,14 +1101,17 @@ mod pool_containment {
                     Quota::Unmetered,
                 )],
             ),
-            |pool| {
-                pool.member("acct-us-1")
-                    .expect_err("not in pool")
-                    .category()
-            },
+            |pool| pool.member("acct-us-1").expect_err("not in pool"),
         )
         .expect("valid pool");
-        assert_eq!(refused, "unknown_account");
+        assert_eq!(refused.category(), "unknown_account");
+        assert_eq!(
+            refused,
+            ModelError::UnknownAccount {
+                account: "acct-us-1".to_owned(),
+            },
+            "the refusal names the account that was asked for"
+        );
     }
 }
 
@@ -784,7 +1188,7 @@ mod fallback_preservation {
                 FallbackClass::PrimaryTurn,
                 vec![
                     hop("acct-eu-1", "opus", requested_semantics()),
-                    hop("acct-eu-2", "sonnet", weakened),
+                    hop("acct-eu-2", "sonnet", weakened.clone()),
                 ],
             )
             .expect_err("the chain weakens a requested semantic");
@@ -794,7 +1198,106 @@ mod fallback_preservation {
                 "the refusal names the axis and the hop"
             );
             assert_eq!(refused.category(), "fallback_weakens");
+
+            // The same weakening further down the chain reports its own
+            // position: an index that is right only for the hop after the head
+            // would send an operator to the wrong hop.
+            let deeper = FallbackChain::declare(
+                FallbackClass::PrimaryTurn,
+                vec![
+                    hop("acct-eu-1", "opus", requested_semantics()),
+                    hop("acct-eu-2", "sonnet", requested_semantics()),
+                    hop("acct-eu-3", "haiku", requested_semantics()),
+                    hop("acct-eu-4", "micro", weakened),
+                ],
+            )
+            .expect_err("the chain weakens a requested semantic");
+            assert_eq!(
+                deeper,
+                ModelError::FallbackWeakens { axis, hop: 3 },
+                "the refusal names the offending hop's own position"
+            );
         }
+    }
+
+    #[test]
+    fn the_first_hop_that_weakens_is_the_one_named() {
+        let refused = FallbackChain::declare(
+            FallbackClass::PrimaryTurn,
+            vec![
+                hop("acct-eu-1", "opus", requested_semantics()),
+                hop("acct-eu-2", "sonnet", requested_semantics()),
+                hop(
+                    "acct-eu-3",
+                    "haiku",
+                    semantics(
+                        &["read_file"],
+                        SandboxContainment::IsolatedWorkspace,
+                        "eu",
+                        ApprovalSemantics::ReviewRequired,
+                    ),
+                ),
+                hop(
+                    "acct-eu-4",
+                    "micro",
+                    semantics(
+                        &["read_file", "run_tests"],
+                        SandboxContainment::HostDirect,
+                        "eu",
+                        ApprovalSemantics::ReviewRequired,
+                    ),
+                ),
+            ],
+        )
+        .expect_err("two hops weaken");
+        assert_eq!(
+            refused,
+            ModelError::FallbackWeakens {
+                axis: "tools",
+                hop: 2
+            }
+        );
+    }
+
+    #[test]
+    fn every_hop_is_measured_against_the_head_rather_than_its_predecessor() {
+        // Hop 1 strengthens containment; hop 2 returns to exactly what the head
+        // requested. Nothing the head asked for is weakened, so the chain is
+        // declarable — a chain compared pairwise would refuse this.
+        let chain = FallbackChain::declare(
+            FallbackClass::Vision,
+            vec![
+                hop("acct-eu-1", "opus", requested_semantics()),
+                hop(
+                    "acct-eu-2",
+                    "sonnet",
+                    semantics(
+                        &["read_file", "run_tests"],
+                        SandboxContainment::SealedOffline,
+                        "eu",
+                        ApprovalSemantics::DualControl,
+                    ),
+                ),
+                hop("acct-eu-3", "haiku", requested_semantics()),
+            ],
+        )
+        .expect("no hop weakens what the head requested");
+        assert_eq!(chain.hops().len(), 3);
+        assert_eq!(
+            chain.hops()[2].semantics().containment(),
+            SandboxContainment::IsolatedWorkspace
+        );
+        assert_eq!(chain.hops()[2].account().as_str(), "acct-eu-3");
+        assert_eq!(chain.hops()[2].model().model(), "haiku");
+        assert_eq!(
+            chain.hops()[1].semantics().approval(),
+            ApprovalSemantics::DualControl
+        );
+        assert_eq!(
+            chain.hops()[0].semantics().tools(),
+            ["read_file", "run_tests"]
+        );
+        assert_eq!(chain.hops()[0].semantics().residency_zone(), "eu");
     }
 
     #[test]
@@ -860,13 +1363,9 @@ mod untrusted_advice {
         ])
     }
 
-    fn reference(
-        id: &str,
-        name: &str,
-        advice: &str,
-    ) -> automonique_protocol::models::ReferenceOutput {
+    fn reference_for(tenant: &str, id: &str, name: &str, advice: &str) -> ReferenceOutput {
         ReferenceCall::new(
-            "acme",
+            tenant,
             account(id),
             model("openai", name),
             MinimizedContext::minimize(&turn_context()),
@@ -874,6 +1373,20 @@ mod untrusted_advice {
         .expect("valid call")
         .respond(advice, 100, 40)
         .expect("valid advice")
+    }
+
+    fn reference(id: &str, name: &str, advice: &str) -> ReferenceOutput {
+        reference_for("acme", id, name, advice)
+    }
+
+    fn aggregator(tools: &[&str]) -> Aggregator {
+        Aggregator::new(
+            "acme",
+            account("acct-eu-1"),
+            model("anthropic", "opus"),
+            tools,
+        )
+        .expect("valid aggregator")
     }
 
     #[test]
@@ -902,14 +1415,9 @@ mod untrusted_advice {
 
     #[test]
     fn only_the_aggregator_produces_the_result_and_advice_stays_advice() {
-        let aggregator = Aggregator::new(
-            "acme",
-            account("acct-eu-1"),
-            model("anthropic", "opus"),
-            &["read_file", "run_tests"],
-        )
-        .expect("valid aggregator");
-        assert_eq!(aggregator.tools().len(), 2);
+        let aggregator = aggregator(&["read_file", "run_tests"]);
+        assert_eq!(aggregator.tools(), ["read_file", "run_tests"]);
+        assert_eq!(aggregator.model(), &model("anthropic", "opus"));
 
         let advice = reference("acct-ref-1", "reference", "prefer the cached plan");
         assert_eq!(
@@ -924,10 +1432,15 @@ mod untrusted_advice {
         assert_eq!(result.author(), &model("anthropic", "opus"));
         assert_eq!(result.text(), "apply the migration");
         assert_eq!(result.references().len(), 1);
-        assert_ne!(
-            result.text(),
+        assert_eq!(
+            result.references()[0].model(),
+            &model("openai", "reference"),
+            "the advice stays attributed to the model that gave it"
+        );
+        assert_eq!(
             result.references()[0].advice().expose_untrusted(),
-            "the authoritative text is the aggregator's own"
+            "prefer the cached plan",
+            "the aggregator retains the advice it considered, still labelled"
         );
         assert_eq!(
             result.references()[0].usage().class(),
@@ -939,18 +1452,104 @@ mod untrusted_advice {
     }
 
     #[test]
+    fn repeating_advice_verbatim_is_still_the_aggregators_own_record() {
+        // What the types enforce is authorship, not wording. `expose_untrusted`
+        // hands back a `&str`, and nothing stops a caller passing it straight
+        // to `conclude` — so this pins what survives that: the result is
+        // authored, classed and counted as the aggregator's, and the advice it
+        // repeats is still carried as advice from the model that gave it.
+        let aggregator = aggregator(&["read_file"]);
+        let advice = reference("acct-ref-1", "reference", "prefer the cached plan");
+        let repeated = advice.advice().expose_untrusted().to_owned();
+
+        let result = aggregator
+            .conclude(&repeated, vec![advice], 400, 120)
+            .expect("valid result");
+        assert_eq!(result.text(), "prefer the cached plan");
+        assert_eq!(
+            result.author(),
+            &model("anthropic", "opus"),
+            "authorship follows the acting model, never the wording"
+        );
+        assert_eq!(
+            result.references()[0].model(),
+            &model("openai", "reference")
+        );
+        let classes: Vec<UsageClass> = result
+            .usage_records()
+            .iter()
+            .map(|record| record.class())
+            .collect();
+        assert_eq!(
+            classes,
+            [UsageClass::Reference, UsageClass::Aggregation],
+            "repeating the words does not reclass the reference call"
+        );
+    }
+
+    #[test]
+    fn advice_and_result_text_are_bounded_before_they_are_recorded() {
+        let call = || {
+            ReferenceCall::new(
+                "acme",
+                account("acct-ref-1"),
+                model("openai", "reference"),
+                MinimizedContext::minimize(&turn_context()),
+            )
+            .expect("valid call")
+        };
+        assert_eq!(
+            call().respond("", 10, 5).expect_err("empty advice"),
+            ModelError::Field {
+                field: "advice",
+                error: ValueError::Empty,
+            }
+        );
+        assert_eq!(
+            call()
+                .respond("prefer\u{7}the cache", 10, 5)
+                .expect_err("control character"),
+            ModelError::Field {
+                field: "advice",
+                error: ValueError::ControlCharacter,
+            }
+        );
+
+        let aggregator = aggregator(&["read_file"]);
+        assert_eq!(
+            aggregator
+                .conclude("", Vec::new(), 40, 20)
+                .expect_err("empty result text"),
+            ModelError::Field {
+                field: "result_text",
+                error: ValueError::Empty,
+            }
+        );
+        let overlong = "p".repeat(MAX_MODEL_FIELD_BYTES + 1);
+        assert_eq!(
+            aggregator
+                .conclude(&overlong, Vec::new(), 40, 20)
+                .expect_err("over the ceiling"),
+            ModelError::Field {
+                field: "result_text",
+                error: ValueError::TooLong {
+                    max_bytes: MAX_MODEL_FIELD_BYTES,
+                    actual_bytes: MAX_MODEL_FIELD_BYTES + 1,
+                },
+            }
+        );
+    }
+
+    #[test]
     fn every_reference_call_is_a_counted_usage_record() {
-        let aggregator = Aggregator::new(
-            "acme",
-            account("acct-eu-1"),
-            model("anthropic", "opus"),
-            &[],
-        )
-        .expect("valid aggregator");
+        let aggregator = aggregator(&[]);
         let references = vec![
             reference("acct-ref-1", "reference-a", "one"),
             reference("acct-ref-2", "reference-b", "two"),
-            reference("acct-ref-3", "reference-c", "three"),
+            // A reference call made for another tenant, so that "counted
+            // against the tenant" is checked against a record that could have
+            // named a different one.
+            reference_for("acme-eu", "acct-ref-3", "reference-c", "three"),
         ];
         let result = aggregator
             .conclude("the plan", references, 400, 120)
@@ -958,9 +1557,34 @@ mod untrusted_advice {
 
         let records = result.usage_records();
         assert_eq!(records.len(), 4, "three references plus the aggregator");
-        assert!(
-            records.iter().all(|record| record.tenant() == "acme"),
-            "every call counts against the tenant"
+        let tenants: Vec<&str> = records.iter().map(|record| record.tenant()).collect();
+        assert_eq!(
+            tenants,
+            ["acme", "acme", "acme-eu", "acme"],
+            "each record counts against the tenant of the call that made it"
+        );
+        let accounts: Vec<&str> = records
+            .iter()
+            .map(|record| record.account().as_str())
+            .collect();
+        assert_eq!(
+            accounts,
+            ["acct-ref-1", "acct-ref-2", "acct-ref-3", "acct-eu-1"],
+            "each record names the account it bills"
+        );
+        let models: Vec<String> = records
+            .iter()
+            .map(|record| record.model().to_string())
+            .collect();
+        assert_eq!(
+            models,
+            [
+                "openai/reference-a",
+                "openai/reference-b",
+                "openai/reference-c",
+                "anthropic/opus"
+            ],
+            "each record names the model that was called"
         );
         let classes: Vec<UsageClass> = records.iter().map(|record| record.class()).collect();
         assert_eq!(
@@ -974,6 +1598,8 @@ mod untrusted_advice {
         );
         let input: u64 = records.iter().map(|record| record.input_tokens()).sum();
         assert_eq!(input, 700);
+        let output: u64 = records.iter().map(|record| record.output_tokens()).sum();
+        assert_eq!(output, 240, "three references at 40 plus the aggregator");
     }
 }
 
@@ -1138,21 +1764,63 @@ mod media_provenance {
 
     #[test]
     fn generated_media_carries_provenance() {
-        let provenance = MediaProvenance::new(
-            ArtifactDigest::new("sha256:prompt").expect("valid"),
-            "image-gen",
-            model("openai", "images"),
-            "2026-02",
-            instant(5),
-        )
-        .expect("valid provenance");
+        let provenance = || {
+            MediaProvenance::new(
+                ArtifactDigest::new("sha256:prompt").expect("valid"),
+                "image-gen",
+                model("openai", "images"),
+                "2026-02",
+                instant(5),
+            )
+            .expect("valid provenance")
+        };
         let generated = GeneratedMedia::record(
             ArtifactDigest::new("sha256:generated").expect("valid"),
-            provenance,
+            provenance(),
         )
         .expect("valid generated media");
         assert_eq!(generated.provenance().source().as_str(), "sha256:prompt");
+        assert_eq!(generated.provenance().adapter(), "image-gen");
+        assert_eq!(generated.provenance().model(), &model("openai", "images"));
+        assert_eq!(generated.provenance().model_version(), "2026-02");
+        assert_eq!(generated.provenance().produced_at(), instant(5));
         assert_eq!(generated.digest().as_str(), "sha256:generated");
+    }
+
+    #[test]
+    fn generated_media_that_names_itself_as_its_own_input_is_refused() {
+        // A record whose output digest is its input digest claims a model
+        // produced the artifact it was given, which is a provenance chain that
+        // closes on itself rather than reaching a source.
+        let refused = GeneratedMedia::record(
+            ArtifactDigest::new("sha256:prompt").expect("valid"),
+            MediaProvenance::new(
+                ArtifactDigest::new("sha256:prompt").expect("valid"),
+                "image-gen",
+                model("openai", "images"),
+                "2026-02",
+                instant(5),
+            )
+            .expect("valid provenance"),
+        )
+        .expect_err("the generated digest is its own source");
+        assert_eq!(refused, ModelError::DerivativeNotDistinct);
+        assert_eq!(refused.category(), "derivative_not_distinct");
+
+        // One byte of difference is enough to be a distinct artifact, so the
+        // refusal is about identity rather than about similarity.
+        GeneratedMedia::record(
+            ArtifactDigest::new("sha256:prompt-2").expect("valid"),
+            MediaProvenance::new(
+                ArtifactDigest::new("sha256:prompt").expect("valid"),
+                "image-gen",
+                model("openai", "images"),
+                "2026-02",
+                instant(5),
+            )
+            .expect("valid provenance"),
+        )
+        .expect("a distinct digest records");
     }
 }
 
@@ -1337,15 +2005,65 @@ mod capability_separation {
         })
         .expect("valid grant");
 
+        // Every field of the native grant is the one it was declared with: the
+        // desktop driver's authority is its own reviewed evidence rather than
+        // anything carried across from the browser session.
         assert_eq!(native.display(), ":1");
+        assert_eq!(native.isolation().tenant(), "acme");
+        assert_eq!(native.isolation().run(), "run-1");
         assert_eq!(native.isolation().profile(), "desktop-profile");
-        assert_eq!(native.reviewer(), "grace");
-        assert_ne!(
+        assert_eq!(native.capture(), CapturePolicy::RedactedScreenshots);
+        assert_eq!(
             native.attestation(),
-            grant.attestation(),
-            "the desktop driver attests separately from the browser session"
+            &attestation("seccomp-desktop"),
+            "the desktop driver attests to what it enforced"
         );
-        assert_ne!(native.isolation().profile(), grant.isolation().profile());
+        assert_eq!(native.reviewer(), "grace");
+        assert_eq!(native.reviewed_at(), instant(2_000));
+
+        // The browser grant declared alongside it keeps its own reviewed
+        // evidence, so neither record is derived from the other.
+        assert_eq!(grant.attestation(), &attestation("seccomp-browser"));
+        assert_eq!(grant.isolation().profile(), "browser-profile");
+        assert_eq!(grant.reviewer(), "ada");
+        assert_eq!(grant.reviewed_at(), instant(1_000));
+
+        // A native grant is bounded like any other reviewed record: it names a
+        // display and a reviewer, or it is not declarable.
+        for (field, parts) in [
+            (
+                "display",
+                NativeOsGrantParts {
+                    display: "",
+                    isolation: IsolationIdentity::new("acme", "run-1", "desktop-profile")
+                        .expect("valid identity"),
+                    capture: CapturePolicy::NoCapture,
+                    attestation: attestation("seccomp-desktop"),
+                    reviewer: "grace",
+                    reviewed_at: instant(2_000),
+                },
+            ),
+            (
+                "reviewer",
+                NativeOsGrantParts {
+                    display: ":1",
+                    isolation: IsolationIdentity::new("acme", "run-1", "desktop-profile")
+                        .expect("valid identity"),
+                    capture: CapturePolicy::NoCapture,
+                    attestation: attestation("seccomp-desktop"),
+                    reviewer: "",
+                    reviewed_at: instant(2_000),
+                },
+            ),
+        ] {
+            assert_eq!(
+                NativeOsGrant::declare(parts).expect_err("an unnamed grant"),
+                ModelError::Field {
+                    field,
+                    error: ValueError::Empty,
+                }
+            );
+        }
         // The compile-fail proof that a browser grant does not convert into a
         // native grant lives in the library doc tests, where it executes.
     }
@@ -1531,7 +2249,6 @@ mod executor_completeness {
 
 mod quality {
     use super::*;
-    use automonique_protocol::primitives::ValueError;
 
     /// The toolchain half of this row — offline workspace tests, strict Clippy
     /// and formatting with no new allowance, dependency or lockfile change — is

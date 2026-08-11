@@ -1,0 +1,73 @@
+{
+  "item": "R1-20",
+  "status": "partial",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Manifest completeness",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test context precedence_enforcement::a_manifest_keeps_the_two_kinds_apart; then a rustc compile probe calling ContextManifest::policy_revision() and token_budget()",
+      "result": "fail",
+      "output": "The component half partly holds: SuppliedComponent::new requires a source, a trust class, a digest and a byte cap, and rejects an empty source or digest, so a supplied component without a trust class or digest has no constructor. The manifest half fails as measured: `m.policy_revision()` and `m.token_budget()` both fail with E0599 \"no method named ... found for struct ContextManifest\". ContextManifest has exactly two fields, Vec<PolicyComponent> and Vec<SuppliedComponent>, and its constructor takes nothing else, so the manifest carries neither its policy revision nor its token budget — a per-component Revision lives on PolicyComponent instead, and no token budget exists anywhere in the module. Nor is there a token cap on any component: SuppliedComponent carries byte_cap only, and PolicyComponent carries no caps at all. The manifest is also not explicitly ordered or content-addressed as a whole; ordering is whatever the caller's two Vecs happen to be."
+    },
+    {
+      "name": "Precedence enforcement",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test context precedence_enforcement; cargo test ... --offline --doc; then rustc on the doctest body to capture its error code",
+      "result": "pass",
+      "output": "4 tests pass. A SuppliedComponent that requests TrustClass::Policy is constructed as ActorSupplied instead, and all four requested classes stay strictly below Policy. In a manifest holding one policy component and two supplied components, highest_supplied_trust() < Policy and the policy component reports Policy. The trust order Untrusted < Compatibility < ActorSupplied < Policy holds and all four spellings are distinct. The compile-fail proof executes as 'src/context.rs - context (line 13) - compile fail' among 42 passing doctests, and compiling its body directly confirms the intended reason: E0308 \"mismatched types: expected PolicyComponent, found SuppliedComponent\" — the manifest's policy slot cannot receive supplied content. CI caveat: rust.yml runs --all-targets, which excludes doctests, so this proof is not exercised by CI as configured."
+    },
+    {
+      "name": "Rule discovery bounds",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test context reference_typing::references_outside_the_workspace_are_refused precedence_enforcement::trust_classes_are_ordered_and_distinctly_spelled",
+      "result": "pass",
+      "output": "The bounds hold: /etc/passwd is refused with rule \"absolute path\", ~/secrets with \"home-relative path\", and ../outside and ../../etc/passwd with \"traversal above the workspace root\" — all category outside_workspace. A traversal that stays inside (src/a/../b) is accepted, so the check counts depth rather than banning \"..\" outright. TrustClass::Compatibility is a distinct variant documented as provider-specific rule files, ordered strictly between Untrusted and ActorSupplied, and the ordering test exercises it. Stated plainly rather than implied: there is no rule-discovery routine in this module, so nothing assigns Compatibility to a provider-specific rule file — the class exists and is distinct, and applying it is left to a caller that does not exist yet."
+    },
+    {
+      "name": "Reference typing",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test context reference_typing; then a rustc compile probe naming the seven contract reference kinds absent from the enum",
+      "result": "fail",
+      "output": "What passes: 4 tests. Six kinds construct with distinct spellings (file, folder, diff, url, session, artifact); absolute, home-relative and traversal paths are refused; src//main.rs, src/./main.rs and an embedded NUL are refused with category reference_refused. What fails: the row requires every listed kind. The contract lists 14 (file with line range and artifact digest, folder with bounded depth and filter, diff, staged, commit, branch, url, session, turn, run, ticket, artifact, workspace) and the enum has 6. A compile probe produced 7 E0599 errors — no variant named Staged, Commit, Branch, Turn, Run, Ticket or Workspace. The File variant carries only path and digest, so there is no line range; the Folder variant carries only path and depth, so there is no filter. References also carry no resolved size and no provenance, and three of the four named rejection classes are absent: nothing detects binary confusion, nothing detects secrets, and nothing represents a change of authorization."
+    },
+    {
+      "name": "Compression lineage",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test context compression_lineage; then a rustc compile probe importing a fork type from the module",
+      "result": "fail",
+      "output": "The record itself is complete against the row's own list and 2 tests pass: source_range() returns (10, 42), compressor_model(), template_digest and output_digest are required non-empty strings, protected_facts round-trips, and is_verified() carries verification status. The authoritative transcript is unreachable — CompressionRecord has no field holding it, so a compression cannot mutate or delete it. The row's final clause fails: fork-before-compression is not expressible. `use automonique_protocol::context::ContextFork` fails with E0432 \"no ContextFork in context\", and grep for \"fork\" across the crate's sources matches only one doc comment in src/provider.rs. The contract also asks the record to carry the compressor provider as well as the model; only the model is present."
+    },
+    {
+      "name": "Token honesty",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test context token_honesty",
+      "result": "pass",
+      "output": "2 tests pass. TokenCount::Measured{tokens:100}.measured() is Some(100); Estimated{tokens:100}.measured() and Unavailable{reason}.measured() are both None, so the only accessor that yields a number treats an estimate as absent and an estimate cannot be read out as a measurement. Unavailable carries a non-empty &'static str reason, which is this layer's spelling of \"null with a reason\". Recorded precisely: these are three variants of one enum rather than three distinct types, so a caller can still pattern-match and copy the estimate's number by hand; what is prevented is silent substitution through the measured() accessor. Per-component-class accounting is not represented — TokenCount is a standalone value not attached to any manifest component."
+    },
+    {
+      "name": "Memory typing",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test context memory_typing; then a rustc compile probe calling MemoryEntry::sensitivity()",
+      "result": "fail",
+      "output": "What passes: MemoryStore::ALL has all 6 classes (user_profile, workspace, team, task, episodic_index, external_provider) with distinct spellings, an entry constructs in each, every entry requires a bounded tenant, an empty provenance is refused with category classification_required, and visibility and review_by round-trip. What fails: the row requires entries to carry sensitivity as well as visibility. `entry.sensitivity()` fails with E0599 \"no method named sensitivity found for struct MemoryEntry\", and grep for sensitivity across the crate matches only schema.rs/codegen.rs's unrelated EnumSensitivity. MemoryEntry has 7 fields and no sensitivity among them. Retention is also thin: review_by is an Option, so an entry with neither expiry nor review date is representable. Confidence is an unvalidated u8."
+    },
+    {
+      "name": "Supersession and deletion",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test context memory_typing::a_correction_supersedes_rather_than_mutating; then a rustc compile probe importing a tombstone type and grep -rln Tombstone over the crate's sources",
+      "result": "fail",
+      "output": "Supersession passes: superseded_by(\"mem-2\") returns a new entry whose supersedes() is Some(\"mem-2\") while the original still reports None, and provenance and confidence are carried across, so a correction does not mutate the original and the audit trail survives. Deletion is absent. `use automonique_protocol::context::MemoryTombstone` fails with E0432 \"no MemoryTombstone in context\"; grep finds Tombstone only in src/workspace.rs and src/connector.rs, neither of which is a memory tombstone. There is no delete operation, no tombstone value and no retention rule in this module, so \"deletion leaves a tombstone and preserves the audit trail\" could not be exercised because deletion is not representable at all."
+    },
+    {
+      "name": "Proposal isolation",
+      "command": "cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml -p automonique-protocol --offline --test context proposal_isolation",
+      "result": "pass",
+      "output": "3 tests pass. For all three kinds (Memory, SkillPatch, NewSkill) LearningProposal::trust() returns TrustClass::Untrusted; trust() is a const fn with no parameters returning a constant and there is no setter, so a proposal has no path to raise its own trust. may_auto_activate() is false for SkillPatch and NewSkill and true only for the non-executable Memory kind, and it takes no policy argument, so no caller can flip the answer for an executable skill. A proposal with empty evidence is refused. LearningProposal is a separate type from MemoryEntry, so a proposal is not published state."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml --all -- --check; cargo clippy --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml --workspace --all-targets --offline -- -D warnings; cargo test --manifest-path /home/infra-sj278/automonique/rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "fail",
+      "output": "fmt exits 0, strict all-target Clippy exits 0 with zero warnings, but workspace tests fail: 806 passed, 3 failed, all in automonique-lab and all outside this item's lease (harness_claim::operational_claim_is_accepted_by_rust_status_and_selection, program_cli::immutable_packet_selects_the_exact_generated_work, program_cli::admitted_cli_allocates_and_replays_the_packet_bound_worktree). Their fixtures select work item R0-19, which the generated program marks status \"blocked\", runnable false, blocked_by_gates [GATE-HARNESS], so selection is denied. -p automonique-protocol alone is green: 620 passed, 0 failed, 19 of them the context integration tests. The protocol crate has exactly one #[allow] (src/codec.rs:436) and none in context.rs; no todo!/unimplemented!/dbg!/unsafe. Lockfile drift could not be checked: this audit is not permitted to run git."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "No independent reviewer examined this item. This file is a third-party audit written by an agent that read the contract, the implementation and the tests and re-ran every command; it is not a human review and it is not the implementer's self-review."
+  },
+  "notes": "This is the weakest item in the batch: 4 of 10 rows pass. The prompt-injection boundary the objective calls central — lower-trust content cannot become policy — is genuinely built and proven, including an executing compile-fail doctest whose failure reason was confirmed to be E0308 on PolicyComponent vs SuppliedComponent, and proposal isolation holds. The surrounding vocabulary is materially incomplete against the contract: the manifest carries no policy revision and no token budget, 7 of 14 reference kinds and both sub-fields (line range, folder filter) are absent along with binary-confusion, secret and authorization-change rejection, fork-before-compression is unrepresentable, memory entries have no sensitivity, and there is no deletion or tombstone at all. Every one of those was measured by a rustc compile probe returning E0599 or E0432 rather than inferred from reading. Six of the crate's nine non-Quality rows have a matching test module; Manifest completeness, Rule discovery bounds and Supersession-and-deletion have none of their own and are covered incidentally. Quality fails on three pre-existing automonique-lab failures outside the lease. Commands are recorded with absolute manifest paths; they were run with cwd /home/infra-sj278. Probes were compiled with rustc --edition 2024 against rust/target/debug/deps/libautomonique_protocol-f9919e2c7dee2777.rlib from files under /tmp; all fixture content is synthetic (acme, session-12, sha256:c, mem-2) and no real workspace rules, session text or memory content appears. No repository file was created or modified by this audit other than this evidence file."
+}

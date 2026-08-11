@@ -1,0 +1,81 @@
+{
+  "item": "R1-05",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Field completeness",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test release field_completeness && grep -nE 'pub fn (from|parse|decode|read)' rust/crates/automonique-protocol/src/release.rs",
+      "result": "unmeasured",
+      "reason": "the crate exports no manifest decoder from bytes or text, so the row's 'enforced at parse' clause has no parse step to exercise; only typed construction was measurable",
+      "output": "What was measured and passes: the required-field table has 9 entries and each omission is refused naming exactly that field - schema_revision, version, source_revision, build_target, protocol, events, database_schema, sdk, binary_digest - and the test asserts the table length so a silent shrink fails. An empty builder fails with MissingField{field: \"schema_revision\"} rather than producing defaults. Bounded fields refuse empty, control-character and 200-byte values with category field_invalid. What could not be measured: `grep -nE 'pub fn (from|parse|decode|read)' release.rs` returns exactly one hit, DigestAlgorithm::from_wire; there is no ReleaseManifest::from_canonical_bytes, from_str, parse or decode, so a serialized manifest document cannot be parsed by this layer at all and 'enforced at parse' was exercised only through ReleaseManifestBuilder::build(). Separately, coverage of the declared field set is partial in a second way: docs/product-plan/requirements/target-architecture.md:351 lists minimum kernel/process requirements and the six artifact hashes, but capabilities, credentials, rollback and every non-binary digest are optional and a manifest with none of them builds, so 'no required field defaults silently' holds only for the 9 enforced fields. (A separate, unrelated JSON manifest parser with a required minimum_kernel field exists at rust/crates/automonique-cli/src/release.rs and produces its own InspectedRelease type, not ReleaseManifest; it is outside this item's lease.)"
+    },
+    {
+      "name": "Schema revision",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test release schema_revision",
+      "result": "pass",
+      "output": "A builder that declares MAX_SUPPORTED_MANIFEST_SCHEMA + 1 = 2 and supplies no other field at all fails with UnsupportedSchemaRevision{supported_max: 1, declared: 2}, not with MissingField, which pins that the revision is interpreted before any other field. Reading the source confirms the ordering: build() reads schema_revision and compares it before touching version, source_revision, ranges, digests or rollback. Within a supported revision, two unknown fields are retained in supplied order and are never reinterpreted."
+    },
+    {
+      "name": "Range algebra",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test release range_algebra",
+      "result": "pass",
+      "output": "VersionRange::new(6, 4) fails at construction. Four overlap cases resolve as declared through negotiate_protocol, which returns a typed MajorVersion or a typed ManifestError rather than a boolean: overlapping 1..=4 against 3..=7 yields 4, identical 1..=4 yields 4, touching-at-one-version 1..=4 against 4..=9 yields 4, and disjoint 1..=4 against 6..=9 yields category range_invalid whose rendering contains both operands, '1..=4' and '6..=9'. The 'empty ranges fail at construction' clause has nothing to observe: MajorVersion wraps NonZeroU32 and the range is inclusive, so an empty range is unrepresentable rather than refused."
+    },
+    {
+      "name": "Digest discipline",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test release digest_discipline",
+      "result": "pass",
+      "output": "Six algorithm spellings are refused at construction with UnacceptableDigestAlgorithm: md5, sha-1, sha1, crc32, the empty string, and the uppercase SHA-256. Only sha-256 and sha-512 are accepted, with hex lengths 64 and 128 enforced; a 4-character sha-256 digest fails with MalformedDigest{expected_len: 64, actual_len: 4} and an uppercase 64-character hex string fails with malformed_digest, so digests have one spelling. A mismatch yields DigestMismatch{artifact: SchemaBundle}, whose rendering contains 'schema_bundle' and neither digest body. Digests of different algorithms never compare equal. Constant-timeness is established by reading ArtifactDigest::matches, not by a timing measurement, and that limit is stated here deliberately: the compare loop XOR-accumulates every byte pair into one accumulator and returns only after the loop, with the sole early returns on algorithm inequality and length inequality, both of which are public properties. No timing experiment was run and the repository test could not have detected a data-dependent early exit."
+    },
+    {
+      "name": "Rollback coexistence",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test release rollback_coexistence",
+      "result": "pass",
+      "output": "A release with database schema range 4..=6 and a rollback target declaring 1..=2 is refused by build() itself with RollbackIncompatible{release_min: 4, release_max: 6, rollback_min: 1, rollback_max: 2}, so the refusal happens in the manifest layer before any handoff decision exists. An overlapping target (3..=5 against 4..=6) builds and the target version is retained. A manifest with no rollback target builds and reports rollback() == None."
+    },
+    {
+      "name": "Capability requirements",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test release capability_requirements",
+      "result": "pass",
+      "output": "Against two required capabilities (cgroup_v2, landlock_abi_3) and one optional (systemd_adapter): a host offering all three yields CapabilityOutcome::Satisfied; a host missing only the optional yields Degraded{missing_optional: [\"systemd_adapter\"]}; a host missing a required one yields Refused{missing_required: [\"landlock_abi_3\"], missing_optional: []}; and a host missing one of each yields Refused carrying both lists separately, with an explicit assertion that the outcome does not match Degraded. Refusal and degradation are distinct enum variants rather than a boolean plus a list, so a reader cannot collapse them."
+    },
+    {
+      "name": "SDK compatibility",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test release sdk_compatibility",
+      "result": "pass",
+      "output": "SdkCompatibility carries the SDK protocol range and the schema digest the SDK was generated against, and admits() answers from those two fields alone with no SDK loaded. Measured: protocol 1 and 2 with the declared schema digest are admitted; protocol 3 with the correct digest is refused (range 1..=2); protocol 1 with a different digest is refused. So both a protocol-range mismatch and a schema-digest mismatch are detectable from the manifest alone."
+    },
+    {
+      "name": "Secret hygiene",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test release secret_hygiene && cargo test -p automonique-protocol --test audit_scratch (scratch copy of the crate, probing every bounded field with an absolute path)",
+      "result": "fail",
+      "output": "The credential half passes: CredentialDescriptor::new takes (name, version) only, and compiling `CredentialDescriptor::new(\"database\", 3, \"s3cret\")` against the built rlib produces error[E0061] 'this function takes 2 arguments but 3 arguments were supplied', so the compile_fail doctest pins the absence of a value parameter for its intended reason. No error rendering contains the synthetic secret or either digest body. The absolute-host-path half FAILS. The repository test measures only build_target. A probe run in a scratch copy of the crate, feeding '/etc/automonique/secret.pem' into each bounded manifest string field in turn, found that 6 of the 7 fields accept it and build a valid manifest: version, source_revision, unknown_field_value, unknown_field_key, credential_name and rollback_version. Only build_target is refused, with AbsolutePath{field: \"build_target\"}. The row's expectation that no parsed manifest field can hold an absolute host path is therefore not met, and the repository test could not have detected this because it probes one field."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path rust/Cargo.toml --all -- --check && cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --offline -- -D warnings && cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "fail",
+      "output": "Formatting exits 0. Strict all-target Clippy exits 0 with zero warnings, re-run from a cold CARGO_TARGET_DIR so the result is not a cache artifact. The workspace test run does NOT pass: 58 test binaries, 806 passed, 3 failed, exit 101, all three in the harness crate automonique-lab (harness_claim 'harness claim denied'; program_cli x2 'program selection denied'), outside this item's lease and traceable to the live plan graph freezing R0-19 under GATE-HARNESS. The item's own suite is green: tests/release.rs 23/23 and the release doctest (CredentialDescriptor compile_fail) passes among 42 automonique-protocol doctests. release.rs contains no #[allow], no dependency was added, and rust/Cargo.toml and rust/Cargo.lock are unmodified in the working tree."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "No independent review. This file is an automated read-only audit written by a subagent that ran the commands above; it is not a reviewer's verdict and no human examined this item for this record. Failing rows are recorded as failing checks, not as review findings."
+  },
+  "extra_checks": [
+    {
+      "name": "No I/O and no real artifact hashed",
+      "command": "strace -f -qq -e trace=%network -o net.trace rust/target/debug/deps/release-318ab2742878ac23 ; grep -rnE 'std::fs|std::net|std::process|SystemTime|sha2|Digest::' rust/crates/automonique-protocol/src/release.rs",
+      "result": "pass",
+      "output": "The release test binary issues zero network syscalls (empty trace file). release.rs references no std::fs, std::net, std::process, SystemTime, and no hashing crate: ArtifactDigest stores a validated hex string and never computes one, so no real artifact is hashed in this slice. Every digest used in the tests is a synthetic 64- or 128-character literal."
+    },
+    {
+      "name": "Refusal category table",
+      "command": "grep -n 'pub const fn category' -A 14 rust/crates/automonique-protocol/src/release.rs",
+      "result": "pass",
+      "output": "ManifestError declares 10 categories: unsupported_schema_revision, missing_field, field_invalid, range_invalid, unacceptable_digest_algorithm, malformed_digest, digest_mismatch, rollback_incompatible, absolute_path, too_many_unknown_fields. Eight of the ten are reached by the repository suite; too_many_unknown_fields (more than MAX_UNKNOWN_FIELDS = 64 retained fields) and the ValueError::ZeroBound path are not exercised by any test."
+    }
+  ],
+  "notes": "Base e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7 was taken from the task instruction and not verified against the repository: this session was instructed never to run git, so no commit lookup was performed. Toolchain: cargo 1.93.1, rustc 1.93.1. Six of the nine contract rows are measured and passing. The three that are not: Field completeness is unmeasured for its 'at parse' clause because the crate has no manifest decoder from bytes or text - a manifest can only be assembled programmatically through ReleaseManifestBuilder, so nothing in this slice can reject a manifest *document*; Secret hygiene fails on measurement, since 6 of 7 bounded string fields accept an absolute host path and only build_target is guarded; Quality fails on three pre-existing automonique-lab failures outside this item's lease. Two smaller observations recorded so they are not lost: an empty version range is unrepresentable rather than refused at construction, and constant-time digest comparison is established by reading the compare loop, not by any timing measurement. The scratch probe used to measure the absolute-path behaviour was run against a copy of the crate under the session scratch directory; no test, source or plan file in the repository was modified by this audit."
+}

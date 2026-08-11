@@ -1,0 +1,62 @@
+{
+  "item": "R1-07",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Invocation",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique --offline --test doctor_cli; RT=$(mktemp -d); chmod 700 $RT; mkdir -m 700 $RT/automonique; XDG_RUNTIME_DIR=$RT rust/target/debug/automonique doctor > /tmp/human1.txt; XDG_RUNTIME_DIR=$RT rust/target/debug/automonique doctor > /tmp/human2.txt; cmp /tmp/human1.txt /tmp/human2.txt; XDG_RUNTIME_DIR=$RT rust/target/debug/automonique doctor --json > /tmp/json1.txt; XDG_RUNTIME_DIR=$RT rust/target/debug/automonique doctor --json > /tmp/json2.txt; cmp /tmp/json1.txt /tmp/json2.txt; rust/target/debug/automonique; rust/target/debug/automonique status; rust/target/debug/automonique doctor --fix; rust/target/debug/automonique doctor --json extra",
+      "result": "pass",
+      "output": "Repeated invocations against the same fixture produced byte-identical output in both modes: cmp reported no difference for the two human renderings and none for the two JSON renderings. Nine checks are emitted in both modes, ordered by check code regardless of construction order. Exit codes observed: 1 for a degraded report in both modes with empty stderr, and 2 for four rejected argv forms (no argument, 'status', 'doctor --fix', 'doctor --json extra') each writing exactly 'usage: automonique doctor [--json]\\n' to stderr and nothing to stdout. The 3 doctor_cli integration tests and the 2 argv tests in doctor_read_only pass. Exit code 0 was never observed and is not asserted anywhere: supervisor.adapter is unconditionally Unavailable at this base, so the aggregate report cannot reach Healthy and the exit-0 branch of run() is unreachable in this release."
+    },
+    {
+      "name": "Read-only",
+      "command": "snap() { find $RT -printf '%p|%m|%s|%T@|%A@|%C@|%y|%U\\n' | sort; }; snap > pre; XDG_RUNTIME_DIR=$RT rust/target/debug/automonique doctor; XDG_RUNTIME_DIR=$RT rust/target/debug/automonique doctor --json; snap > post; diff pre post; cargo test --manifest-path rust/Cargo.toml -p automonique-cli --offline",
+      "result": "pass",
+      "output": "A recursive snapshot of the fixture runtime tree (path, mode, size, mtime, ctime, type, owner) taken before and after four invocations (two human, two JSON) is identical; diff reported no lines. With a live private Unix admin socket bound in the fixture, an atime-inclusive snapshot differed only in the two directory atimes, and a control run of the same two snapshots with no doctor invocation in between reproduced exactly that difference, so it is find's own readdir, not the doctor. The doctor never connects to the socket (only symlink_metadata) and opens kernel files with openat2 O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NOATIME and RESOLVE_NO_SYMLINKS. grep over rust/crates/automonique-cli/src and rust/crates/automonique/src finds no set_permissions, create_dir, remove_file, remove_dir, File::create, OpenOptions, set_times, chown or rename call at all. 24 automonique-cli tests pass (3 diagnostics_read_only, 6 doctor_read_only, 6 kernel_host_settings, 7 release_read_only, 2 supervisor_read_only), including kernel_host_settings, which asserts bytes, length, mode, inode, atime, atime_nsec, mtime, mtime_nsec, ctime and ctime_nsec are unchanged across every inspection. The process mutates no environment variable; it only reads XDG_RUNTIME_DIR."
+    },
+    {
+      "name": "Safety",
+      "command": "chmod 755 $RT/automonique; XDG_RUNTIME_DIR=$RT rust/target/debug/automonique doctor --json; stat -c '%a' $RT/automonique; ln -s $TGT $RT2/automonique; XDG_RUNTIME_DIR=$RT2 rust/target/debug/automonique doctor --json; ls -ld $RT2/automonique; cargo test --manifest-path rust/Cargo.toml -p automonique-cli --offline",
+      "result": "pass",
+      "output": "A 0o755 product directory produced runtime.directory=finding with reason runtime.directory-mode ('Automonique runtime directory is not private'); stat afterwards still reports 755. A symlinked $XDG_RUNTIME_DIR/automonique produced runtime.directory=finding with reason runtime.symlink-forbidden; ls -ld afterwards still shows the symlink pointing at the original target, which is untouched. The same never-repair behaviour is asserted by tests, which check the status and the surviving on-disk state: the admin socket at 0o666 yields Finding with the mode still 0o666 and a symlinked socket yields Finding with the path still a symlink (the tests assert status and disk state; the reason codes admin.socket-mode and admin.socket-symlink come from the source mapping, not from an assertion); the runtime base as a symlink and as a regular file each yield Finding; the release manifest at 0o644 yields ReleaseIssue::PermissiveMode with the mode still 0o644, and a symlinked parent or a symlinked manifest each yield ReleaseIssue::SymlinkForbidden, both asserted by exact variant. No repair code path exists: the two product crates contain no filesystem-mutating call."
+    },
+    {
+      "name": "Truthfulness",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test doctor_report; XDG_RUNTIME_DIR=$RT rust/target/debug/automonique doctor --json | python3 -c \"import json,sys; d=json.load(sys.stdin); [print(c['id'],c['status'],(c['reason'] or {}).get('code')) for c in d['checks']]\"",
+      "result": "pass",
+      "output": "6 doctor_report tests pass. Construction enforces the rule in both directions: DoctorCheck::new(Healthy, Some(reason)) returns HealthyReasonForbidden and DoctorCheck::new(Unavailable, None) returns ReasonRequired, so an unavailable check without a typed reason is unrepresentable. A report containing one Unavailable check aggregates to Degraded, never Healthy. In the live report all 7 non-healthy checks carried a typed reason code and single-line message (admin.socket-missing, database.control-plane-unavailable, kernel.cgroup-v2.controllers-unavailable, kernel.max-user-namespaces-setting-unavailable, release.missing, foreground.admin-endpoint-unavailable, supervisor.configuration-unavailable) and the 2 healthy checks (host.process-control, runtime.directory) carried none. Recorded but not a breach of this row: on this host both kernel checks report unavailable even though the underlying data is readable and healthy, because openat2 with O_NOATIME returns EPERM on the root-owned /sys and /proc files for a non-root euid; that is the fail-closed consequence of never touching an inspected file's atime, and it is reported as unavailable rather than healthy."
+    },
+    {
+      "name": "Compatibility",
+      "command": "XDG_RUNTIME_DIR=$RT rust/target/debug/automonique doctor --json; cargo test --manifest-path rust/Cargo.toml -p automonique --offline --test doctor_cli doctor_json_mode_uses_the_versioned_schema",
+      "result": "pass",
+      "output": "The rendered document contains the literal \\\"schema\\\":\\\"automonique.doctor/v1\\\" and the constant DOCTOR_REPORT_SCHEMA_V1 in the protocol crate is exactly \"automonique.doctor/v1\". The document has three top-level keys (checks, schema, status) emitted in a stable order, each check carrying id, status and a reason object or null; statuses observed were the stable spellings healthy, unavailable and degraded. The integration test asserting the versioned schema string passes, and doctor_report asserts DoctorReportV1::schema() equals the same constant."
+    },
+    {
+      "name": "Tests",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique -p automonique-cli --offline && cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test doctor_report",
+      "result": "pass",
+      "output": "36 tests pass offline with no network use: doctor_cli 3, legacyctl_forwarding 3, diagnostics_read_only 3, doctor_read_only 6, kernel_host_settings 6, release_read_only 7, supervisor_read_only 2, doctor_report 6. All six named categories are covered. Healthy: private 0700 runtime directory, private 0600 admin socket, complete cgroup controller list, non-zero max_user_namespaces, structurally valid manifest. Finding: permissive runtime mode, permissive socket mode, wrong-type socket and runtime entries, incomplete controller list, zero namespace setting, permissive 0644 manifest, non-regular manifest path. Malformed: truncated JSON, non-object JSON, missing required field, inverted protocol range, non-lowercase and duplicated controller tokens, non-numeric and negative namespace values. Missing: absent product directory, absent socket, absent controller file, absent namespace file, absent manifest. Symlink: symlinked runtime base, symlinked product directory, symlinked socket, symlinked controller file, symlinked namespace file, symlinked manifest parent and symlinked manifest. Permission: 0755 directory, 0666 socket, 0644 manifest, each left unrepaired."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "no independent review of this item took place. This evidence was written by an automated audit agent that re-ran every row at the recorded base; an automated agent is not an independent human reviewer, so the reviewer count is zero and the two findings below are recorded in notes rather than as review findings."
+  },
+  "extra_checks": [
+    {
+      "name": "Kernel read probe",
+      "command": "python3 - <<'PY' (os.open on /sys/fs/cgroup/cgroup.controllers and /proc/sys/user/max_user_namespaces with O_RDONLY and with O_RDONLY|O_NOATIME)",
+      "result": "pass",
+      "output": "Both files are readable with O_RDONLY as euid 1025 and return 'cpuset cpu io memory hugetlb pids rdma misc' and '256384'; both return EPERM with O_RDONLY|O_NOATIME because they are owned by uid 0. This pins the cause of the two unavailable kernel checks in the live report to the doctor's own O_NOATIME flag rather than to an absent or malformed kernel file."
+    },
+    {
+      "name": "Measurement control",
+      "command": "snap > a; sleep 1; snap > b; diff a b   (two snapshots with no doctor invocation between them)",
+      "result": "pass",
+      "output": "Two consecutive find-based snapshots with no doctor invocation in between differ in exactly the two directory atimes, which is the same difference seen around a doctor invocation. The read-only conclusion therefore rests on mode, size, mtime, ctime, inode, type and owner, which are unchanged in every run."
+    }
+  ],
+  "notes": "Two defects were observed that no contract row forbids, recorded here rather than hidden. First, both kernel checks (kernel.cgroup-v2.controllers and kernel.max-user-namespaces-setting) are permanently unavailable for any non-root invocation, because openat2 with O_NOATIME is refused with EPERM on the root-owned /sys and /proc files; the doctor therefore yields no kernel evidence in ordinary use, and no test covers a file the invoking user does not own, so the suite cannot detect it. Second, the aggregate report cannot reach Healthy at this base because inspect_supervisor_adapter returns Unavailable unconditionally, so exit code 0 is unreachable and is asserted by no test; only exit 1 (degraded or failed) and exit 2 (usage) were observed. Not measured: behaviour on a non-Linux host (the platform-unsupported branch of inspect_process_control is compiled out here), and the release.manifest-structure healthy branch end to end through the binary, which needs a manifest.json two directories above the executable and was exercised only at the library level. No TypeScript or cross-language surface exists for this item. The legacyctl forwarding tests named in the work-graph summary pass (3 tests) but are not a row of this contract."
+}

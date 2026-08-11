@@ -57,8 +57,16 @@
 //! A [`Projection`] owns nothing. Both of its fields are shared borrows of
 //! canonical state, and its dialect is read back out of the binding rather than
 //! stored, so there is no field a projection could cache and later disagree
-//! with. The borrow checker states that property: a projection cannot outlive
-//! the canonical value it projects, which an alternate store would have to.
+//! with.
+//!
+//! That claim needs two checks, because the compiler states only half of it.
+//! The `compile_fail` below states the lifetime tie: a projection cannot
+//! outlive the canonical value it projects, which an alternate store would have
+//! to. It says nothing about a cached copy — a projection that stored its
+//! dialect beside the binding would still compile and still satisfy the borrow
+//! checker. What rules that out is the width of the type, which is exactly its
+//! two shared borrows and nothing else, and `tests/protocols.rs` asserts that
+//! width rather than leaving it to the prose here.
 //!
 //! ```
 //! # use automonique_protocol::identity::Actor;
@@ -1553,14 +1561,23 @@ impl CanonicalActionPlan {
     /// though its own request had already been applied. Scoping also keeps two
     /// different canonical actions on one target from collapsing into one
     /// receipt, which would drop the second effect while reporting success.
+    ///
+    /// The tenant, the actor and the caller's key are bounded text, and bounded
+    /// text may contain the separator. Each is therefore escaped, so the
+    /// components can be read back one way only. Joined raw, the tenant `a`
+    /// with actor `b/c` and the tenant `a/b` with actor `c` — two actors in two
+    /// different tenants — spell one ledger key, which is the collision this
+    /// scoping exists to prevent. The dialect and action spellings come from
+    /// closed sets that contain no separator, so they are already unambiguous.
+    /// A component carrying no separator is emitted unchanged.
     #[must_use]
     pub fn scoped_idempotency_key(&self) -> String {
         format!(
             "{}/{}/{}/{}",
-            self.actor.tenant(),
-            self.actor.id(),
+            escaped(self.actor.tenant()),
+            escaped(self.actor.id()),
             self.action_id(),
-            self.idempotency_key
+            escaped(&self.idempotency_key)
         )
     }
 }
@@ -2200,6 +2217,23 @@ impl MappedApproval {
     pub const fn decided_by(&self) -> &Actor {
         &self.decided_by
     }
+}
+
+/// Escape the component separator so a joined key parses one way only.
+///
+/// `\` becomes `\\` and `/` becomes `\/`, which is injective: distinct
+/// components produce distinct escapings, and a component containing neither
+/// character is returned as it was.
+fn escaped(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '/' => escaped.push_str("\\/"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 fn bounded(value: &str, field: &'static str) -> Result<(), ProtocolError> {
