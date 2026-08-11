@@ -1,0 +1,80 @@
+{
+  "item": "R0-01",
+  "base": "606ff48c9b585e2ac5d801156c8a48a921d1b2b4",
+  "checks": [
+    {
+      "name": "Surface coverage",
+      "command": "python3 tools/contract_inventory/check.py --summary",
+      "result": "pass",
+      "output": "195 entries, and all seven classes are represented: input 62, state transition 42, timer 8, side effect 34, command 21, backend event 12, operational script 16. Counted per family: dashboard-route 39, command 19, conversation-route 13, durable-table 16, status-literal 16, timer 8, chat-platform-method 13, outbound-host 8, companion 7, operational-script 9, provider-dialect 4, spool-event-kind 5, parity-row 38. Three observations fit no class and are listed rather than absorbed: companion:a knowledge-base directory, parity-row:site-platform-knowledge-base-files and configuration-surface (deferred to the identifier inventory). The checker fails when any class reaches zero and when the recorded per-class counts are not the entries present, proven by test_counts_that_disagree_with_the_entries_are_refused."
+    },
+    {
+      "name": "Owner assignment",
+      "command": "python3 -m unittest tools.contract_inventory.test_contract_inventory",
+      "result": "pass",
+      "output": "179 of 195 entries resolve an owner through a named porting-map row, 4 through the parity ledger's own target-owner cell, and 12 record a null owner with a reason. Every resolved owner is verified twice: it must be one of the 11 destinations the permitted sources name (automonique-agents, -bootstrap, -core, -fleet, -lab, -policy, -runner, -shell, -store, -transports, -web) and it must appear in the destination cell of the cited row; where that row names several destinations the entry must record why one was chosen. An invented destination fails (test_an_invented_target_owner_is_refused: 'automonique-invented is not a destination any permitted source names'); a real crate outside its row's destinations fails (test_an_owner_outside_its_porting_map_row_is_refused: 'does not send its area to automonique-lab'); a null owner with a blank reason fails (test_a_null_owner_without_a_reason_is_refused). The 12 unowned entries are named in plan/inventory/contracts/coverage.md and include three safety rows: announce-target-before-action, the dedicated deployment notifications channel, and the guard-hook/sandbox-launcher row."
+    },
+    {
+      "name": "Fixture plan",
+      "command": "python3 tools/contract_inventory/check.py",
+      "result": "pass",
+      "output": "All 195 entries carry a fixture class from the closed set, observable inputs, observable outputs and a corpus status. Per class: enumeration-presence 95, effect-recording 36, legacy-test-conversion 20, none-replaced 18, schema-snapshot 16, replay-capture 5, provider-transcript 5. 82 plans are blocked and each names its blockers from the closed set (GATE-ORACLE, private-archive, live-network, production-read, production-write, secret) plus a reason. Corpus status is 'absent' for all 195: no sanitized capture exists in this repository, which is recorded as the gap no-sanitized-fixture-corpus. A blocked class claiming to be unblocked fails (test_a_blocked_class_cannot_claim_to_be_unblocked); a claimed capture whose path does not exist fails, while the same claim naming a file that does exist passes (test_a_claimed_capture_that_does_not_exist_is_refused carries both controls)."
+    },
+    {
+      "name": "Source citation",
+      "command": "python3 tools/contract_inventory/check.py",
+      "result": "pass",
+      "output": "207 citations across 195 entries, 3 unclassified findings and 9 gaps, naming 18 sections across the four permitted sources (legacy-inventory.md, feature-parity.md, migration-plan.md, corpus-index.md). Each citation is re-verified by re-finding its quotation inside the cited heading's body, so an entry the source does not evidence is refused: test_an_entry_the_source_does_not_evidence_is_refused observes \"does not say '`/api/invented`'\", and test_an_uncited_entry_is_refused observes 'an entry without a citation is invalid'. A heading that occurs more than once is refused rather than answered ambiguously (test_an_ambiguous_heading_is_refused_rather_than_answered)."
+    },
+    {
+      "name": "Clean-room provenance",
+      "command": "python3 -c \"import sys;sys.path.insert(0,'.');from tools.contract_inventory import build;o=set();sys.addaudithook(lambda e,a: o.add(a[0]) if e=='open' and isinstance(a[0],str) else None);build.Builder().build();print(sorted(p for p in o if not p.startswith('/usr')))\"",
+      "result": "pass",
+      "output": "A complete build opens exactly 5 files: the four permitted sources under docs/product-plan/reference/ and tools/contract_inventory/rules.toml. Nothing outside the worktree was opened; the private archive was never read, mounted, cloned or searched. A source key outside the permitted four raises (test_only_the_four_permitted_sources_are_readable). No prior source text, control flow or algorithm appears: every quotation is a substring of a checked-in planning document, verified by the citation check. The generator refuses to emit a legacy identifier into a generated file, using the fingerprint in plan/check.py rather than a second copy of the value (test_a_legacy_identifier_cannot_reach_a_generated_file, with test_neutral_text_is_not_refused as its positive control); plan/check.py --verify passes its legacy-identifier location rule with both generated files present, and python3 tools/scrub/scan.py reports 0 findings over 699 blobs and 84 commit messages."
+    },
+    {
+      "name": "Drift check",
+      "command": "python3 -m unittest tools.contract_inventory.test_contract_inventory",
+      "result": "pass",
+      "output": "Divergence fails in both directions, each break observed and then restored. Source gains a row: 'is not what its sources generate'. Source loses a row: same failure. Source edited at all: 'has changed since the inventory recorded its digest'. Artifact deleted: 'is missing; a fresh build produces it'. A file nothing generates in the output directory: 'carries file(s) nothing generates'. Hand-edited artifact: measured live on the checked-in copy, where an invented owner produced 2 failures (stale sha256 524e5e6ff327 against fresh bd9203a750e2, plus the invented destination) and a deleted entry produced 3 (stale copy, 'the recorded entry count 195 is not the 194 entries present', per-class counts); restoring the file returned 'ok - 195 entries verified against 4 permitted source(s)' both times. A parity row with no classification refuses the build outright ('has no classification in rules.toml'). Two documents counting the same 39 rows are compared, and removing one row from the coverage map produces 'the two documents disagree'. Regeneration is byte-identical (sha256 bd9203a750e2... and adda7fd4b989... unchanged across two rebuilds) and writes are staged then renamed. 33 tests, 0 failures."
+    },
+    {
+      "name": "Quality",
+      "command": "python3 tools/contract_inventory/check.py && python3 plan/check.py --verify && python3 -m unittest tools.contract_inventory.test_contract_inventory",
+      "result": "pass",
+      "output": "The checker verifies 195 entries and exits 0; plan/check.py --verify exits 0 with only the expected warnings (5 frozen harness contracts and 21 R1 items done without a gate record); 33 inventory tests pass in 13.1 s. Offline: run with socket.socket, socket.create_connection and socket.getaddrinfo poisoned, the checker completes with 0 network calls attempted. No secret: it passes under `env -i` with an empty environment. No new runtime dependency: the tooling imports only the standard library plus plan/check.py, and the four non-stdlib modules present (apport_python_hook, sitecustomize, zope, _distutils_hack) are loaded by the interpreter's own site configuration before any inventory code runs. Runnable both as a script and as `python3 -m tools.contract_inventory.check`."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "no reviewer examined this slice; the counts above are self-measured and the gate preflight was run read-only"
+  },
+  "extra_checks": [
+    {
+      "name": "Rust workspace regression",
+      "command": "cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "pass",
+      "output": "58 suites, 1139 passed, 0 failed - identical to the stated pre-work baseline. No Rust file was touched."
+    },
+    {
+      "name": "Plan tooling regression",
+      "command": "python3 tools/program.py --verify && python3 tools/guides.py --verify && python3 tools/scrub/scan.py",
+      "result": "pass",
+      "output": "375 nodes / 491 edges / 11 runnable; 6 guides / 48 objectives / 46 score-eligible; scrub clean over 699 blobs and 84 commit messages."
+    },
+    {
+      "name": "Specification debt",
+      "command": "python3 plan/baseline.py --json",
+      "result": "pass",
+      "output": "Unchanged at 94 (contracts_missing 91, gates_open 3, everything else 0), digest 1a18155d6b0914aa25e20ffd5a1a6ec88cca20f952d52bc9b0dd3f0b74badf4c. No counter moved in either direction: this item implements an existing contract and writes no new one. The gate preflight was run uncommitted and refused with exactly one refusal - 'no specification-debt counter decreased' - and passed when rerun with --allow-no-metric-change carrying that reason; no other refusal was raised, the 9 declared files were all found changed and inside the lease, and plan integrity passed inside the gate. links_broken and refs_undefined stay 0 with the generated coverage.md present."
+    },
+    {
+      "name": "Pre-existing selftest failure",
+      "command": "python3 plan/selftest.py",
+      "result": "fail",
+      "output": "Exits 1 with 'FAIL baseline: an unmodified copy does not pass'. Measured with this item's files moved out of the tree and the failure is identical, so it is pre-existing and not caused by this work: selftest's scratch tree copies plan/ and work-breakdown.md only, so plan/check.py's two vacuity guards (the legacy-identifier fingerprint must match inside legacy-inventory.md, and generated.rs must generate a LEGACY_ spelling) have nothing to match. Fixing it would mean editing plan/selftest.py or plan/check.py, both outside this item's lease and explicitly forbidden for this run."
+    }
+  ],
+  "notes": "What is measured and what is not. The inventory is derived from the four permitted checked-in sources; every entry carries a citation whose quotation the checker re-finds in the cited section, so nothing here is recalled. Much of what the contract asks about the legacy system is not reachable from this repository, and that part is enumerated as 9 gaps rather than filled in: 2 of 21 command ids and 38 of 47 modules are counted by the source but not named; 17 of 220 tests and 1 of 32 test files are not attributed to an area; the durable tables' column names are not in any permitted source; the two build scripts are not individually named; the four provider dialects' wire event vocabularies are not enumerated; no sanitized fixture corpus exists; and the configuration surface is deferred to the identifier inventory, which owns it. Two of the gaps are discrepancies inside the source itself, found by reconciling its stated counts against its own enumerations: it states 21 commands and lists 19, and it states 38 dashboard routes and lists 39. Both are reported, neither is silently reconciled. 12 entries have no owner because the porting map does not determine one; three of those are safety rows, and they are findings for the parity-ledger item, not defects hidden here. Granularity is recorded per entry: 38 parity-ledger rows are capability-level and 157 enumerated surfaces are surface-level, and they overlap by design, so per-family counts are published beside the per-class ones rather than presenting 195 as 195 distinct behaviours. What the checker cannot see, stated plainly: it refuses an invented owner, an uncited entry, a class outside the seven, an incomplete or self-contradicting fixture plan, a stale or hand-edited artifact and a count the source no longer supports, but it cannot tell a defensible class assignment from a wrong one. The classification judgements live in tools/contract_inventory/rules.toml, one row per family or parity row, so a reviewer can read all of them in one file rather than hunting them through 195 generated entries. The drift check is a self-contained module with its own main(); wiring it into plan/check.py is the follow-up for the integrator, deliberately not done here because several items share that file. This inventory is evidence for the sanitized fixture corpus and machine-readable parity ledger items and satisfies neither; it captures no fixture and closes no gate. No subagent was launched: the work is one generator, one checker and their tests, on a single lease."
+}

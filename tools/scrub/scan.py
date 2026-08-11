@@ -32,6 +32,17 @@ REQUIRED_FAMILIES = frozenset(
         "environment-name",
     }
 )
+# A scan carries exactly the coverage its installed rules give it. With no
+# protected rules the only values it can recognise are the four public synthetic
+# ones, so a pass says the scanner works — not that the tree is scrubbed. That
+# distinction is the whole difference between this gate and a green tick, and it
+# is easy to lose when reading CI output, so the run states it itself.
+COVERAGE_NOTE = (
+    "note: no protected rules were installed, so this run could only have found "
+    "the public synthetic values. It is evidence that the scanner works, not "
+    "that private identifiers are absent; only a run with the protected rule "
+    "bundle can support that claim. See plan/gates.md#gate-scrub."
+)
 RULE_ID = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\Z")
 PROTECTED_RULE_ID = re.compile(r"p[12]-[0-9]{3}\Z")
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -427,6 +438,8 @@ def main() -> int:
         f"messages with {len(public_rules)} synthetic and {len(protected)} "
         f"protected rules; {len(allowlist)} retained decisions"
     )
+    if not protected:
+        print(COVERAGE_NOTE)
     return 0
 
 

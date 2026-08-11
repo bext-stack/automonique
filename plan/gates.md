@@ -42,8 +42,9 @@ Closing evidence:
 
 ### GATE-IDENTITY
 
-**State: advisory/open.** Current commits are unsigned and dedicated workload
-identities have not been configured.
+**State: advisory/open.** Current commits are unsigned, dedicated workload
+identities have not been configured, and `main` has no protected write
+boundary.
 
 `GOVERNANCE.md` defines logical implementer, reviewer, fixer, builder and
 integration roles, but permits them to coincide when the owner chooses. This
@@ -55,11 +56,62 @@ owner-configured protected integration.
 
 Closing evidence:
 
-- every identity claimed as distinct has separate credentials;
-- signatures, when enabled, verify against a published trust root;
-- a test proves non-integration credentials cannot write the protected branch;
-- `PROVENANCE.md` § Repository identity is updated to describe the achieved
-  state rather than the gap.
+| Condition | State |
+|---|---|
+| every identity claimed as distinct has separate credentials | **met, vacuously** — `.github/identity/register.toml` claims no separation, and `check_identity.py` refuses a claim it cannot back |
+| signatures, when enabled, verify against a published trust root | **not met** — signing is not enabled, so nothing verifies |
+| a test proves non-integration credentials cannot write the protected branch | **not met** — there is no protected branch to be refused by |
+| `PROVENANCE.md` § Repository identity describes the achieved state | **met** — and a check refuses it when it drifts from the register |
+
+The first and last conditions are closable from inside the repository and are
+closed. The middle two are external administrative facts, and no amount of
+repository-side work can produce them.
+
+#### What the repository now enforces
+
+`.github/identity/register.toml` is the register of record: which identity
+holds which `GOVERNANCE.md` § Roles role, whether it is `shared` or
+`dedicated`, what it signs with, and which pre-rule commits are excused by
+exact SHA. `.github/identity/check_identity.py` — run by
+`.github/workflows/identity.yml` — refuses:
+
+- a `separation_claimed = true` that no dedicated credential backs, and two
+  `dedicated` identities sharing one fingerprint or one address;
+- a commit whose author or committer is not a registered identity, unless a
+  pinned exception names it, that exception still applies, and the commit
+  predates `rule_effective_commit`;
+- a commit-message attribution trailer;
+- a declared signing method whose commits `git verify-commit` will not accept,
+  and — in the other direction — a signed commit under a `signing = "none"`
+  declaration;
+- a `PROVENANCE.md` § Repository identity that no longer states what the
+  register states;
+- `plan/evidence/*.json` that claims independent review with zero reviewers.
+
+Wiring it into `plan/check.py` is the integrator's follow-up; it is standalone
+and importable so that wiring it needs no rewrite.
+
+#### Owner checklist — the external half
+
+Repository administration is an external action under `GOVERNANCE.md`. None of
+the following can be performed or verified from inside a worktree, and none of
+it is claimed here. Measured read-only against the configured remote on
+2026-08-11: `GET /branches/main/protection` answered `404 Branch not
+protected`, `GET /rulesets` answered `[]`, the repository is public, and 79 of
+79 commits reported `verified: false` with reason `unsigned`. The ambient
+developer credential in this environment holds `admin` and `push` on the
+repository, so today any credential that can reach the remote can write `main`.
+
+| # | Step | What it would prove | How to verify afterwards |
+|---|---|---|---|
+| 1 | Create a dedicated integration credential (machine account or app) with no key material shared with the implementer identity | two labels are two credentials, not one | add it to the register as `dedicated` with its fingerprint; `check_identity.py` refuses the entry if the fingerprint is empty or duplicated |
+| 2 | Publish the trust root (allowed-signers file or key set) and enable signing for the identities that sign | a signature can be traced to a published root rather than asserted | set `signing` and `signing_effective_commit` in the register; `git verify-commit` must accept every commit after it, which `check_identity.py` requires |
+| 3 | Restrict writes to `main` to the integration credential via branch protection or a ruleset, and require the `plan`, `rust`, `scrub` and `identity` checks | only the integration credential can advance the protected branch | `GET /branches/main/protection` returns 200 instead of today's 404, and lists those four required checks |
+| 4 | Attempt one push to `main` with a non-integration credential and keep the transcript | the boundary is real rather than configured | the push is rejected; the transcript is the closing evidence, because configuration that has never refused anything is a forbidden shortcut for this gate |
+| 5 | Update the register and `PROVENANCE.md` to the achieved state | the claim and the configuration agree | `python3 .github/identity/check_identity.py` exits 0 with `separation_claimed = true` |
+
+Steps 3 and 4 are the gate. Until a rejected push exists, this gate stays open
+however good the configuration looks.
 
 ---
 
@@ -78,6 +130,34 @@ Closing evidence:
   without committing or logging private values and fail on reintroduction;
 - the scan covers commit messages and file contents, not file contents alone;
 - a deliberately reintroduced identifier is rejected in a test commit.
+
+Measured at `606ff48` by `BOOT-003`, running `python3 tools/scrub/scan.py` and
+`python3 -m unittest discover -s tools/scrub -p 'test_*.py'` (36 tests, 0
+failures):
+
+| Closing condition | State |
+|---|---|
+| automated scan in CI over every tracked file | met — `.github/workflows/scrub.yml` runs `tools/scrub/scan.py` over every stage-zero blob, every blob reachable from any ref, and tracked path bytes; the clean run over the staged candidate covered 704 blobs and found 0 |
+| protected rules from both sanitization passes, configured without committing or logging a private value | **not met — zero protected rules are installed** |
+| commit messages as well as file contents | met — the same run covered 84 reachable commit messages, and a reintroduction in a non-tip message is a checked failure |
+| a deliberately reintroduced identifier is rejected in a test commit | met **for values some installed rule fingerprints**; with zero protected rules that set is the four public synthetic values, and no private identifier is in it |
+
+The second row is the gate, and it makes the fourth narrower than it reads. A
+scan's coverage is exactly its installed rules: a fixture that reintroduced an
+identifier into both a tracked file and a commit message still exited zero in
+development mode, and exited one naming rule, file and line as soon as a
+protected rule covered that value. So today's green scan means the scanner
+works, not that the tree is clean, and the scanner now says so on every run
+that has no protected rules.
+
+Closing needs two things no one inside the repository can supply: the family
+values from the two sanitization passes, which appear in no permitted input, and
+an observed pass of the `publication-scrub` job on protected `main` once they
+are installed. `tools/scrub/provision.py` turns an owner-held private file of
+those values into the two `scrub-publication` secrets without printing,
+committing or putting one on a command line. Until then
+`python3 tools/scrub/scan.py --require-protected` exits 2, which is this gate
+holding rather than a defect.
 
 Retained by decision, and therefore not scan failures:
 
@@ -109,15 +189,15 @@ identifiers are migration data, other people's names are not ours to publish.
 
 ### GATE-ORACLE
 
-**State: open.** The boundary is specified in `PROVENANCE.md`; nothing
-implements it.
+**State: open.** Three of four closing conditions are implemented and measured
+by `BOOT-004` (`tools/oracle/`); the fourth is not met.
 
 `PROVENANCE.md` permits a parity oracle to execute privately against synthetic
 inputs while exposing "only bounded behavior results." The AI harness
 (`docs/product-plan/requirements/ai-implementation-harness.md` § Differential
-parity and shadow oracle) depends on that comparison. No process today
-separates the oracle's output from the legacy source it runs against, so
-running one would contaminate the clean room it is meant to protect.
+parity and shadow oracle) depends on that comparison. Until `BOOT-004` nothing
+separated the oracle's output from the legacy source it runs against, so
+running one would have contaminated the clean room it is meant to protect.
 
 Blocks: `R0-02` and `R0-07` fixture capture, and all differential parity work.
 
@@ -130,6 +210,31 @@ Closing evidence:
 - oracle output is content-scanned before it reaches any agent context;
 - the configured review record or explicit owner acceptance is bound to the
   exact boundary candidate.
+
+Measured against those four, at the `BOOT-004` candidate:
+
+| Condition | State | Evidence |
+|---|---|---|
+| documented boundary with owners | met | `tools/oracle/README.md` names the custody side (repository owner, as archive custodian), the clean side (primary session and its implementers), and the trust transition (`release.parse`) |
+| deliberate leak attempt | met | 74 adversarial tests in `tools/oracle/test_boundary.py`, covering source text, credentials, private identifiers and tracebacks across three attack surfaces; 15 deliberate mutations of the boundary itself, 14 caught by a named test |
+| content scan before agent context | met | `tools/oracle/scan.py` refuses any string in a verdict that is not identity-equal to a clean-side constant, and `release.parse` refuses the verdict if the scan does |
+| review record or owner acceptance | **not met** | the candidate records 0 reviewers, there is no owner acceptance under `plan/owner-decisions/`, and an uncommitted candidate has no exact revision for one to be bound to |
+
+The gate therefore stays open. It closes when an owner accepts an exact
+revision of this boundary, or a configured review runs against it, and
+`BOOT-004` completes — `plan/baseline.py` derives a gate's closure from the
+status of the item that closes it, so no edit to this file can close it alone.
+
+Closing it will not by itself make the work it blocks selectable. Measured from
+`plan/work-graph.toml`: `R0-02` also waits on `R0-01` and has no contract;
+`R0-07` has no contract. This gate is one of three conditions for `R0-02` and
+one of two for `R0-07`.
+
+Two channels around the release channel are measured and remain open, and the
+boundary does not claim them: the custody process can still write files a
+reader might later find, and its wall-clock time is observable unless the
+channel holds each release to its deadline. `tools/oracle/README.md` § What this
+does not contain records both, with the deployment control for each.
 
 ---
 

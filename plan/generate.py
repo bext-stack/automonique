@@ -267,6 +267,19 @@ ITEM_STATUS = {
     "R0-06": "done",
     "R0-17": "done",
     "R0-18": "done",
+    # Discovery batch of 2026-08-11. Each passed the full `plan/gate.py --dry-run`
+    # completion preflight — readiness, lease, evidence, plan integrity — with
+    # --allow-no-metric-change, because an item that implements an existing
+    # contract cannot move a specification-debt counter by construction. That is
+    # the strongest authorization the gate can currently give: --commit is
+    # disabled outright. R0-10, R0-11 and BOOT-002 were in the same batch and are
+    # NOT here; the gate refused them on substance and they stay open.
+    "R0-01": "done",
+    "R0-08": "done",
+    "R0-09": "done",
+    "R0-13": "done",
+    "BOOT-003": "done",
+    "BOOT-004": "done",
     "R1-01": "done",
     "R1-02": "done",
     "R0-16": "done",

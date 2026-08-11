@@ -1,0 +1,78 @@
+{
+  "item": "R0-09",
+  "base": "606ff48c9b585e2ac5d801156c8a48a921d1b2b4",
+  "checks": [
+    {
+      "name": "Section coverage",
+      "command": "python3 tools/surface_inventory/verify.py",
+      "result": "pass",
+      "output": "all ten required sections present with 130 entries and 24 recorded gaps (entries/gaps): tenants 4/2, actor_mappings 9/2, roles 7/2, credentials 10/3, artifact_classes 12/3, workspaces_and_dirty_trees 7/2, retention 14/3, budgets 13/2, backup_dependencies 22/2, runbooks 32/3. No section is empty, so the empty-section rule was proved by negative control instead: deleting sections.runbooks was refused with 'sections.runbooks is missing — all ten sections are required'; emptying tenants without a reason was refused with 'the section is empty and states no reason'; adding the reason was then accepted (tests SectionCoverage, 5 cases)."
+    },
+    {
+      "name": "Credential safety",
+      "command": "python3 tools/surface_inventory/verify.py --inventory <copy with a value added>",
+      "result": "pass",
+      "output": "10 credential entries record class, owner, rotation, storage class and audience only; the parser's credential key set has no field a value could go in and no example field. Break observed: adding \"value\": \"xoxb-not-a-real-token\" to sections.credentials[transport] exited 1 with 'unknown field(s): value — the section's key set is closed'. Adding an example was refused the same way. Removing the secret-material withheld record was refused with 'must record that its secret material is withheld'. Adding a free-text field inside a withheld record was refused with 'it has no field that could hold the value it withholds'. 40 withheld facts across the inventory, 14 of them secret-material, all recorded as two enums with no free text. Restored copy verifies clean."
+    },
+    {
+      "name": "Scrub hygiene",
+      "command": "python3 tools/scrub/scan.py",
+      "result": "pass",
+      "output": "ok — scrubbed 711 current-or-reachable Git blobs and 84 commit messages with 4 synthetic and 0 protected rules; 4 retained decisions (run with all 12 new files staged, since the scanner reads stage-zero index blobs). The item's own shape-based scan (tools/surface_inventory/hygiene.py) reports 0 findings over every string in the inventory and both generated views. Breaks observed at the command line: a host name in a summary exited 1 with 'a host-shaped name ending .com'; an absolute home path exited 1 with 'an absolute home path — record the shape (absolute-filesystem-path) and its absence, not the path'. Unit negative controls also cover a personal email address, an IPv4 literal and five secret shapes, each with a positive control beside it (reserved .invalid address, .invalid host, repository path, schema identifier, credential prose). 3 synthetic placeholders exist and all are marked; changing one to 'northwind-trading' was refused with 'must be marked in the value itself', and changing the reserved candidate identity to a routable domain was refused with 'reserved, non-routable namespace'."
+    },
+    {
+      "name": "Policy provenance",
+      "command": "python3 tools/surface_inventory/verify.py",
+      "result": "pass",
+      "output": "59 citations, each verified verbatim against the checked-in file it names; every one of the 130 entries, 24 gaps and 10 owners cites one. 14 retention rows and 13 budget rows each cite a governing policy: 25 of 27 carry a null value with a closed-vocabulary reason (13 unassigned-in-corpus, 12 policy-configurable-no-default), and the only two numbers in the inventory are RPO 5 minutes and RTO 30 minutes, both quoted from operations-and-governance.md. Breaks observed: altering a quote so it is no longer in its source file exited 1 with 'quoted words are not in'; pointing a citation at a missing file exited 1 with 'cited file does not exist'; attaching 90 days to an unrelated policy citation exited 1 with '90 day does not appear in the words it cites, so the number is recalled rather than quoted' — that rule was added after the first version, which required only that some citation exist and would have let a recalled figure through."
+    },
+    {
+      "name": "Restore dependencies",
+      "command": "python3 tools/surface_inventory/verify.py",
+      "result": "pass",
+      "output": "22 backup-dependency entries: 12 recovery-set inputs, 8 verification steps, 1 enablement gate and 1 explicitly excluded credential class. plan/inventory/surface/restore-dependencies.json is generated from them and carries a 21-position topological order, the SHA-256 of the inventory it was rendered from, and the two cited recovery objectives R0-10 measures against. Order is deterministic (same result from reversed input) and every dependency precedes what needs it (asserted over the real entries, not a fixture). Breaks observed: a dependency on an undefined ID exited 1 with 'which is not a restorable entry in this section'; a two-node cycle exited 1 with 'restore dependencies do not form an order'; emptying a verification step's requires exited 1 with 'puts nothing in order'; removing every cited objective raised RenderError 'R0-10 would have nothing to measure its drill against'."
+    },
+    {
+      "name": "Runbook safety",
+      "command": "python3 -m unittest discover -s tools/surface_inventory -p 'test_*.py'",
+      "result": "pass",
+      "output": "32 runbook rows, each naming trigger, owner and reversibility, all with documentation_only true and steps empty. Measured honestly: 0 of 32 procedures are written (the corpus names the runbooks and contains none of their steps), owner is null with reason unassigned-in-corpus on 32 of 32 because no checked-in document assigns one, and reversibility is stated by policy for 2 rows (read-only-no-mutation for diagnostic capture, reversible-by-inverse-transition for a safety-mode transition) and unassigned-in-corpus for 30. 19 rows are production-touching and none can carry a step. Because no row has a step, the executable-step rule was proved by negative control: a step containing `sudo systemctl restart` was refused with 'a runbook step in this inventory is documentation and is never executable from it', as were a `$` shell prompt, a DELETE FROM statement and the same command placed in the trigger field instead; a mutating step on a production-touching runbook was refused with 'it is documentation only'; documentation_only false was refused; a step on a not-written runbook was refused. A prose step on a written runbook is accepted, which is the positive control."
+    },
+    {
+      "name": "Quality",
+      "command": "python3 -m unittest discover -s tools/surface_inventory -p 'test_*.py'; python3 plan/check.py --verify; cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "pass",
+      "output": "76 tests, 0 failures. Offline proved by execution, not assertion: socket.socket, socket.create_connection and socket.getaddrinfo were replaced with raising stubs and the full verification still exited 0. No new runtime dependency: every import in all six modules was parsed with ast and checked against sys.stdlib_module_names (only json, pathlib, re, typing, argparse, os, sys, tempfile, hashlib plus the package itself). No secret: no module references os.environ or getenv, asserted by regex over the sources. plan/check.py --verify: 'ok — 375 items, 11 ready, 47 unblocked-but-unspecified' with the expected 16 gate warnings plus the frozen-harness-contracts warning and no failures. plan/baseline.py counters unchanged at 94 total (links_broken 0, refs_undefined 0). cargo test: 58 suites, 1139 passed, 0 failed — the stated baseline, and no Rust file was touched. Generated views are byte-reproducible and written atomically through a staging file plus rename; a forced os.replace failure leaves the target unchanged and no staging file behind."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0
+  },
+  "measured": {
+    "sections": 10,
+    "entries": 130,
+    "gaps_recorded": 24,
+    "citations_verified_verbatim": 59,
+    "owner_null_with_reason": 70,
+    "owner_recorded": 60,
+    "withheld_facts": 40,
+    "withheld_secret_material": 14,
+    "synthetic_examples": 3,
+    "reserved_non_routable_examples": 1,
+    "numbers_with_a_quoted_citation": 2,
+    "restore_order_positions": 21,
+    "runbooks_named": 32,
+    "runbook_procedures_written": 0,
+    "unit_tests": 76,
+    "scrub_blobs_scanned": 711
+  },
+  "gate_preflight": {
+    "command": "python3 plan/gate.py --item R0-09 --summary '...' --files <the 12 changed paths> --dry-run",
+    "result": "refused",
+    "refusal": "no specification-debt counter decreased. Pass --allow-no-metric-change '<reason>' if that is honest for this item, and the reason is recorded in history.",
+    "observed": "gate: FAIL (1 refusal(s)); item R0-09 Identity/data/operations inventory; licence Elastic-2.0; files 12; debt 94 (digest 1a18155d6b0914aa25e20ffd5a1a6ec88cca20f952d52bc9b0dd3f0b74badf4c)",
+    "note": "The lease, evidence, readiness and plan-integrity checks all passed; the single refusal is the metric rule. This item implements an existing contract and flips no status, so no counter in plan/baseline.json can move — contracts_missing 91, gates_open 3, links_broken 0, refs_undefined 0, evidence_missing 0 are identical before and after. Rerunning the same preflight with --allow-no-metric-change 'R0-09 implements an existing contract; no specification-debt counter moves' passes and prints the completion attestation. The refusal is reported rather than worked around, per the instruction that ran it."
+  },
+  "notes": "Honest state of the inventory. (1) Owner assignment is the dominant gap, not an oversight: 70 of 130 entries record owner null with reason unassigned-in-corpus, including 13 of 14 retention classes, 7 of 10 credential classes and 32 of 32 runbooks. Policy in operations-and-governance.md requires an owner for each of those and the checked-in corpus assigns none, so the measurement is that the assignment work does not exist yet; inventing owners would have been the failure mode. (2) No deployed instance is recorded anywhere — no tenant, actor, credential, workspace or budget value — because this is a clean-room repository and the running system is not reachable from it; those are the 24 enumerated gaps, 9 of them not-reachable-from-repository. (3) The judgement the contract flags is implemented as: record class, owner and shape; withhold the value as two enums (shape plus reason) with no free-text field, so 'record the shape' cannot become a place to write the value. (4) The checker is deliberately NOT wired into plan/check.py: several items were in flight and that file is a collision point. tools/surface_inventory/verify.py is standalone with its own main() returning an exit status; wiring it into plan/check.py or the plan workflow is the follow-up for the integrator, and until then the inventory is checked only when that command is run. (5) The number-versus-citation rule was strengthened mid-item after a command-line break showed the first version accepted a recalled 90-day TTL parked beside an unrelated citation; it now requires the quoted words to contain the number beside its unit. (6) Self-review found and removed four classes of over-claim before finishing, where a field asserted a per-class value the corpus never assigns: credential storage class (9 of 10 now unspecified-in-corpus, since policy names three preferred mechanisms and selects none per class; only the escrowed-ciphertext class is stated), artifact visibility (12 of 12 now unassigned-in-corpus, with a gap recording that policy requires distinct visibility classes and assigns none), budget enforcement point (all nine scheduler budgets are now 'both', which is what the policy actually says, instead of a per-bullet split that was invented), and workspace release promotability (only the dirty-source capture is stated not-promotable). The repository-owner role's authority was narrowed to select-work after re-reading GOVERNANCE.md: the owner configures integration policy, the bounded integrator integrates. (7) Reported as input to R1-13 and R0-10; neither is claimed satisfied. R0-10 consumes plan/inventory/surface/restore-dependencies.json, which carries the ordered dependency list and the two declared objectives but no measured restore timing — that measurement is R0-10's to make."
+}

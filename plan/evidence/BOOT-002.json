@@ -1,0 +1,97 @@
+{
+  "item": "BOOT-002",
+  "status": "partial_blocked",
+  "base": "606ff48c9b585e2ac5d801156c8a48a921d1b2b4",
+  "gate": {
+    "id": "GATE-IDENTITY",
+    "closed": false,
+    "why": "Two of the four closing conditions in plan/gates.md#gate-identity are external administrative facts that do not exist. main has no protected write boundary and no commit is signed, so no rejected-push transcript and no verify-commit output can exist to close them. The two repository-side conditions are closed and are now enforced by a check that has been observed to fail."
+  },
+  "checks": [
+    {
+      "name": "Protected write boundary",
+      "command": "gh api repos/bext-stack/automonique/branches/main/protection; gh api repos/bext-stack/automonique/rulesets; gh api repos/bext-stack/automonique --jq .permissions",
+      "result": "fail",
+      "output": "Measured read-only against the configured remote on 2026-08-11. Branch protection: HTTP 404 'Branch not protected'. Rulesets: []. Repository visibility: public. The ambient developer credential present in this environment reports permissions {admin:true, maintain:true, push:true, triage:true, pull:true}. A non-integration credential therefore CAN write to main, which is the opposite of what this row requires. No push was attempted: plan/authority.toml denies push and administer_repository, and the absence of protection is conclusive without one. Proving the affirmative later still requires the rejected-push transcript named in the contract's Completion evidence; configuration alone is a forbidden shortcut for this row."
+    },
+    {
+      "name": "Signature verifies",
+      "command": "git verify-commit HEAD; git log --format=%G? HEAD | sort | uniq -c; gh api 'repos/bext-stack/automonique/commits?per_page=100' --jq '[.[] | .commit.verification.verified] | group_by(.) | map({v:.[0], n:length})'",
+      "result": null,
+      "reason": "Signing is not enabled, so the row's antecedent does not hold and there is no signature to verify. Enabling it requires generating key material and publishing a trust root, which is external administration under GOVERNANCE.md and outside worker authority.",
+      "output": "What was observed instead: `git verify-commit HEAD` exits 1 with empty stdout and empty stderr; all 78 commits reachable from HEAD report signature status N (unsigned); the remote reports [{v:false, n:79}] with reason 'unsigned' for its main tip. The enforcement half WAS measured: setting signing = \"ssh\" in the checked-in register produced 'REGISTER declares a signing identity but no signing_effective_commit', and with an effective commit set the fixture produced '`git verify-commit` does not accept it' per commit (.github/identity/test_check_identity.py::test_declared_signing_over_unsigned_commits). The reverse direction — a signed commit under signing = \"none\" — is exercised at the function boundary with a synthesised commit record, because producing a genuinely signed commit needs a key this environment does not have; that limitation is stated in the test's docstring."
+    },
+    {
+      "name": "Declared separation",
+      "command": "python3 .github/identity/check_identity.py",
+      "result": "pass",
+      "output": "Exit 0: 'ok — evidence_files 37, identities 1, exceptions 3, commits 78, excused 3, wrong_identity 0, wrong_trailer 0, signature_required 0, signature_verified 0'. This passes vacuously and says so: .github/identity/register.toml declares separation_claimed = false and one shared identity holding all five GOVERNANCE.md roles, so NO identity is claimed as separate and no separation exists. What is measured is that the claim cannot be made falsely. Breaking it on the real tree: separation_claimed = true produced 'separation_claimed is true, but these identities are not dedicated: candidate — identity separation is not achieved' (exit 1); restoring produced exit 0 with a byte-identical file. Two dedicated identities sharing one fingerprint produce 'share one fingerprint; they are one credential', and a dedicated identity with signing = \"none\" produces 'declared dedicated but signs nothing' (fixture tests). Deleting one historical_exception from the checked-in register produced 'commit 69db4ca8 is authored by an identity .github/identity/register.toml does not list' plus the committer line (exit 1); repointing an exception at HEAD produced 'historical_exception 606ff48c is not an ancestor of rule_effective_commit 868a97d3, so the rule was already in force when it was made' (exit 1). Each break was restored and re-run to exit 0."
+    },
+    {
+      "name": "Truthful evidence",
+      "command": "python3 .github/identity/check_identity.py && python3 -m unittest discover -s .github/identity -p 'test_*.py'",
+      "result": "pass",
+      "output": "The checker read 37 files under plan/evidence/ and refused none. It refuses a truthy independence key (independent, independent_review, independently_reviewed, independent_reviewers) in any evidence document whose review.reviewers is 0, and refuses independent_reviewers greater than reviewers. Broken on the real tree against this very file: adding \"independent\": true beside \"reviewers\": 0 produced 'plan/evidence/BOOT-002.json records zero reviewers but sets independent to True; doctrine allows self-review and forbids labelling it independent' (exit 1); removing it restored exit 0 and a byte-identical file. The positive control is the shape the honest evidence already in this tree uses — R1-12 and R1-21 carry adversarial_review.independent = false with reviewers 0 and are accepted. On the register side the shared identity is recorded as separation = \"shared\", not as five separate roles. This record itself claims zero reviewers and zero independent review."
+    }
+  ],
+  "extra_checks": [
+    {
+      "name": "Identity checker unit suite",
+      "command": "python3 -m unittest discover -s .github/identity -p 'test_*.py'",
+      "result": "pass",
+      "output": "38 tests, 0 failures, 0 errors. Every rule has a negative control and a positive control beside it; the fixtures build real Git repositories with real author and committer identities rather than restating the checker's constants, and test_repository_passes runs the checker against the real repository so the checked-in register and PROVENANCE.md cannot go stale without the suite going red."
+    },
+    {
+      "name": "PROVENANCE drift",
+      "command": "python3 .github/identity/check_identity.py",
+      "result": "pass",
+      "output": "PROVENANCE.md § Repository identity carries the one sentence derived from the register. Editing 'Identity separation: not claimed' to 'claimed' produced 'PROVENANCE.md § Repository identity does not match .github/identity/register.toml' with both the stale and the expected sentence printed (exit 1); restoring produced exit 0 and a byte-identical file. Comparison is on whitespace-collapsed text so the paragraph may wrap; test_provenance_may_be_wrapped covers that."
+    },
+    {
+      "name": "Plan integrity",
+      "command": "python3 plan/check.py --verify",
+      "result": "pass",
+      "output": "Exit 0: 'ok — 375 items, 11 ready, 47 unblocked-but-unspecified', with the expected warnings (5 frozen harness contracts, 21 'done but never passed through the gate'). The three new .github/identity files and the new workflow carry SPDX-License-Identifier: Elastic-2.0 and satisfy the source licence rule."
+    },
+    {
+      "name": "Scrub scan",
+      "command": "python3 tools/scrub/scan.py",
+      "result": "pass",
+      "output": "Exit 0. The scanner reads Git blobs, so the count moved once the new files were staged: 699 blobs before `git add -A` (the nine new files were still untracked and therefore unscanned) and 708 blobs after, both with 84 commit messages, 4 synthetic and 0 protected rules, 4 retained decisions, and zero findings. 708 is the state this patch represents. Nothing added here reproduces the personal name or address carried by commit 69db4ca8: the exception entry pins the SHA and states the reason without restating the identity, because AGENTS.md forbids committing a personal name or email address. A grep of the staged diff for that address and for credential prefixes returns zero hits."
+    },
+    {
+      "name": "Rust workspace",
+      "command": "cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "pass",
+      "output": "58 suites, 1139 passed, 0 failed — unchanged from the recorded starting state. No Rust file was touched; the run is a control against having disturbed something."
+    },
+    {
+      "name": "Specification debt",
+      "command": "python3 plan/baseline.py --json",
+      "result": "pass",
+      "output": "No counter moved: contracts_missing 91, gates_open 3, links_broken 0, refs_undefined 0, evidence_missing 0, total 94, identical to plan/baseline.json. GATE-IDENTITY is advisory, so gates_open does not count it and closing it would not have moved a counter either. plan/gate.py refuses a completion on a flat metric unless --allow-no-metric-change is passed; that refusal is reported verbatim rather than worked around."
+    }
+  ],
+  "external_completion_checks": [
+    {
+      "name": "Rejected non-integration write to main",
+      "result": null,
+      "reason": "Requires branch protection or a ruleset on main and a second credential, then one deliberately rejected push. Branch protection does not exist (HTTP 404) and no ruleset exists ([]). Configuring either is repository administration, which plan/authority.toml denies and GOVERNANCE.md places outside worker authority; performing the push is denied by the same file. plan/gates.md#gate-identity records this as owner checklist steps 3 and 4 with the verification command for each."
+    },
+    {
+      "name": "git verify-commit against a published trust root",
+      "result": null,
+      "reason": "No trust root is published and no identity signs. Generating key material and publishing an allowed-signers set is external administration. Recorded as owner checklist step 2."
+    },
+    {
+      "name": "Fingerprint listing for identities claimed as distinct",
+      "result": null,
+      "reason": "Zero identities are claimed as distinct, so the listing is empty and would prove nothing. The register carries the field and the checker refuses a dedicated identity with an empty or duplicated fingerprint, so the listing becomes measurable the moment step 1 of the owner checklist is performed."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0
+  },
+  "notes": "GATE-IDENTITY IS NOT CLOSED and BOOT-002 is not complete. Two of its four closing conditions are external administrative facts that do not exist, and the contract forbids closing this gate on configuration that has never refused a push. What landed is the repository-side half: a register of record with a closed vocabulary (.github/identity/register.toml), a standalone checker (.github/identity/check_identity.py) with its own main() returning an exit code, 38 unit tests, and a CI workflow. Wiring the checker into plan/check.py is deliberately left to the integrator, per the instruction not to edit plan/check.py from a parallel worker. Three findings that are facts about this repository rather than achievements of this item: (1) main on the configured remote has no branch protection and no ruleset, the repository is public, and the ambient developer credential holds admin and push, so any credential that can reach the remote can write main today; (2) commit 69db4ca8 was authored and committed under a personal name and email address, which AGENTS.md forbids — the 2026-08-10 rewrite covered three other commits and did not reach this one, and rewriting history is out of scope for this contract, so it is pinned as a historical exception rather than silently allowed; (3) tools/scrub/scan.py scans commit messages and blob contents but not commit author or committer fields, so the personal address in (2) is invisible to it — that is an observation for the owner, not a change made here, since tools/scrub/ is outside this item's lease. On evidence vocabulary: the orchestration brief asked for a result of \"unmeasured\", but plan/doctrine.md § Evidence and plan/gate.py define an unmeasured check as \"result\": null with a \"reason\", and gate.py refuses any other string. The two unmeasurable rows use null with a reason and record what WAS observed under \"output\" as well. No independent review of any kind occurred: one agent wrote the register, the checker, the tests and this file, and read its own diff. That is a self-review and is not independent."
+}

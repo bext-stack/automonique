@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+name: identity
+
+# The repository-side half of GATE-IDENTITY. It cannot see branch protection,
+# credentials or a trust root — those are external administrative facts listed
+# as an owner checklist in plan/gates.md#gate-identity. What it can see is
+# whether the repository's own identity claims match what Git records, and it
+# refuses the ones that do not. See plan/contracts/BOOT-002.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  declared-identity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A shallow log cannot show that every commit conforms, and the
+          # checker refuses to guess: it exits 2 rather than reporting a pass.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'   # tomllib is stdlib from 3.11
+
+      - name: Declared identities match what Git records
+        run: python3 .github/identity/check_identity.py
+
+      - name: The identity checker can still fail
+        run: python3 -m unittest discover -s .github/identity -p 'test_*.py'

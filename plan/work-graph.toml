@@ -103,7 +103,7 @@ summary = "map every input, state transition, timer, side effect, command, backe
 depends_on = ["BOOT-001"]
 licence = "Elastic-2.0"
 allowed_paths = ["plan/", "spikes/", ".automonique/dev/", "tools/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R0-02"
@@ -182,7 +182,7 @@ summary = "classify every current feature/script/companion as preserve, replace,
 depends_on = ["BOOT-001"]
 licence = "Elastic-2.0"
 allowed_paths = ["plan/", "spikes/", ".automonique/dev/", "tools/", "docs/product-plan/reference/feature-parity.md"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R0-09"
@@ -193,7 +193,7 @@ summary = "document tenants, actor mappings, roles, credentials, artifact classe
 depends_on = ["BOOT-001"]
 licence = "Elastic-2.0"
 allowed_paths = ["plan/", "spikes/", ".automonique/dev/", "tools/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R0-10"
@@ -237,7 +237,7 @@ summary = "classify every service, path, environment, protocol, package, command
 depends_on = ["BOOT-001"]
 licence = "Elastic-2.0"
 allowed_paths = ["plan/", "spikes/", ".automonique/dev/", "tools/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R0-14"

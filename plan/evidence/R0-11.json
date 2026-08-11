@@ -1,0 +1,89 @@
+{
+  "item": "R0-11",
+  "base": "606ff48c9b585e2ac5d801156c8a48a921d1b2b4",
+  "checks": [
+    {
+      "name": "Usage measurement",
+      "command": "python3 spikes/shell/check_shell_decision.py",
+      "result": null,
+      "reason": "no interactive-shell or file-transfer usage can be measured from this repository: nothing here reaches a running instance of the predecessor system, and AGENTS.md puts the private archive out of context, so no capture method exists that would produce a count. Inventing one, or substituting the synthetic worked example, is the exact failure the contract's stop conditions name.",
+      "output": "Observed: spikes/shell/observations/2026-08-11-no-live-system.json records all 6 usage classes with count null, capture_method 'none' and a written reason each — checker prints 'kind=unmeasured classes=6 counted=0 null_with_reason=6'. The only counted corpus is 2026-08-11-synthetic-example (kind=synthetic, 6 counted), and replay refuses to let it resolve anything: generated/decision-inputs.json reports totals.resolvable_classes=0 and, per class, 'no measured count for this class; the only count is synthetic and cannot resolve anything'. Frequency is derived where a count exists (synthetic file_upload 27 over a 90-day window = 0.3/day), so the frequency path is exercised, but zero real frequencies were measured. Deliberate break: a count of 31 planted into the unmeasured corpus was refused with 'ProvenanceError: 2026-08-11-no-live-system.json.observations[3] carries the number 31 in a corpus declared unmeasured; a recalled or estimated number presented as data is the failure this format exists to prevent' (exit 1); restoring the file returned exit 0. The format and the null-with-reason discipline are measured; the usage counts are not."
+    },
+    {
+      "name": "Capture sanitization",
+      "command": "python3 spikes/shell/test_shell_fixture.py && python3 tools/scrub/scan.py",
+      "result": "pass",
+      "output": "Two mechanisms, both observed. Structural: the observation format has no field that can hold a captured command string — a sample is {shape from a 10-value enum, placeholders from a 7-value enum, synthetic:true}. Adding a 'command' key is refused ('VocabularyError: ... key(s) outside the closed set: command'), a placeholder outside the enum is refused, and a sample with synthetic:false is refused ('synthetic must be exactly true'). Regex belt: all 10 sanitizer rules (credential_assignment, bearer_token, private_key_block, ssh_public_key, cloud_access_key_id, absolute_home_path, tilde_home_path, user_at_host, private_ipv4, private_hostname) were each fired with a purpose-built vector, in a corpus and again in the decision record, and each raised SanitizationError naming its own rule id — 20 refusals plus a clean-text positive control. Independent confirmation: python3 tools/scrub/scan.py over the staged tree exits 0, 'ok — scrubbed 709 current-or-reachable Git blobs and 84 commit messages with 4 synthetic and 0 protected rules; 4 retained decisions' (403 tracked files, 8 of them under spikes/shell). Test suite: 53 tests, 0 failures."
+    },
+    {
+      "name": "Decision completeness",
+      "command": "python3 spikes/shell/check_shell_decision.py",
+      "result": "pass",
+      "output": "Observed 'outcomes boundary=0, retirement=0, unresolved=6' and 'ok — 6 usage class(es), 0 resolvable, 6 explicitly unresolved'. Every one of the six classes carries exactly one outcome object; the parser refuses a missing class ('records no outcome for: file_download'), an unknown class ('names unknown class(es): shell_over_ssh'), an unresolved entry that does not state both open options ('must state both open options'), and owner_decision_required != true ('must be exactly true'). A class cannot default silently: an outcome other than 'unresolved' is refused unless the decision inputs record a measured count for that same class ('does not take an outcome on absent or synthetic usage data'), and today no class has one. The record also cites the decision inputs by SHA-256; a stale digest is refused with 're-derive the decision'. The standing plan-level disposition from docs/product-plan/reference/feature-parity.md is carried with binds_this_record:false, and setting it true is refused ('R0-11 asks for a per-class decision')."
+    },
+    {
+      "name": "Boundary specificity",
+      "command": "python3 -m unittest discover -s spikes/shell -p 'test_*.py'",
+      "result": "pass",
+      "output": "No boundary is accepted today, so this was measured against the validator with a positive control beside every negative one. Refused: isolates:['sandboxed'] -> BoundarySpecificityError 'says only ... name what is isolated, permitted or refused in words a reader could test, not reassuring ones'; isolates:['isolated and hardened'] -> same refusal (stopwords are stripped before judging, so a string of adjectives cannot hide behind 'and'). Accepted: a triple naming the artifact-service path, the shell_operator capability and the refused host paths parsed as outcome 'boundary'. Also refused: a boundary with a missing isolates/permits/refuses list, and a draft_boundary claiming accepted:true ('not an acceptance'). Five of the six classes carry a draft triple in plan/decisions/R0-11-shell-boundary.json, each validated by these same rules and each marked accepted:false."
+    },
+    {
+      "name": "Retirement path",
+      "command": "python3 -m unittest discover -s spikes/shell -p 'test_*.py'",
+      "result": "pass",
+      "output": "No retirement is recorded today, so this was measured against the validator. A retirement missing 'replacement' raises ReplacementlessRetirement ('retires inline_path_bridge without a usable replacement ... a replacementless retirement is a finding requiring an owner decision'); missing 'user_path' raises the same exception; a replacement of 'something more secure' raises it too ('does not name a replacement a user can reach'), because hollow nouns and reassuring adjectives are both refused. Positive control: replacement 'the artifact service upload and download operations' with a concrete user_path, an owner and a matching measured count parsed as outcome 'retirement'. An outcome citing a count the inputs do not record is refused ('the decision inputs record ...'). The memo also records the operational caution that a zero or low count alone does not justify retirement, because a break-glass path is rare and still load-bearing."
+    },
+    {
+      "name": "Offline replay",
+      "command": "python3 spikes/shell/replay.py --check",
+      "result": "pass",
+      "output": "Observed 'ok — spikes/shell/generated/decision-inputs.json matches a replay of 2 corpus file(s)' (exit 0). Replay reads only files under spikes/shell/observations/; an AST audit of fixture.py, replay.py and check_shell_decision.py finds no import of socket, ssl, http, urllib, ftplib, asyncio or subprocess, and a replay run with socket.socket, socket.create_connection, socket.getaddrinfo, subprocess.run and subprocess.Popen patched to raise produced bytes identical to the checked-in artifact. Reproducibility: two consecutive builds render identical bytes, and the artifact's SHA-256 is 051b6a12bc5fee226ad09e54cad9708cbf86928e271338c6caae6906829fc033 before and after a --write. Staleness is caught, not assumed: flipping one 'resolvable' flag in the checked-in artifact produced 'STALE: ... does not match a replay of 2 corpus file(s); run --write and commit the result' (exit 1) from replay --check and 'REFUSE: ... is stale' (exit 1) from the checker; --write restored a byte-identical file and both returned exit 0. Writes go to a .staging sibling and os.replace; with os.replace forced to fail, the destination still held its original bytes."
+    },
+    {
+      "name": "Quality",
+      "command": "python3 plan/check.py --verify && python3 spikes/shell/test_shell_fixture.py && python3 -m compileall -q spikes/shell",
+      "result": "pass",
+      "output": "plan/check.py --verify exits 0: 'ok — 375 items, 11 ready, 47 unblocked-but-unspecified', with the expected 22 warnings (5 frozen harness contracts, 17 R1 items done without passing the gate) and no failure. The spike suite runs 53 tests, 0 failures, in 0.10s, both standalone and under unittest discovery. No network access, no secret and no new runtime dependency: an AST import audit asserts every import in all four modules is either standard library or a sibling module in this directory, and the suite runs with no environment variable and no file outside the repository. compileall exits 0. No Rust, Cargo manifest, workflow, plan/check.py, plan/generate.py, work-graph or other item's evidence was touched."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "none — offered to the gate uncommitted, self-review only"
+  },
+  "extra_checks": [
+    {
+      "name": "Repository scrub scan",
+      "command": "python3 tools/scrub/scan.py",
+      "result": "pass",
+      "output": "exit 0 over the staged tree, which includes all 10 new files (the scan reads git ls-files --stage)."
+    },
+    {
+      "name": "Gate preflight",
+      "command": "python3 plan/gate.py --item R0-11 --summary \"shell decision fixture: format, offline replay harness and an unresolved per-class decision memo\" --files plan/decisions/R0-11-shell-boundary.json plan/decisions/R0-11-shell-boundary.md plan/evidence/R0-11.json spikes/shell/README.md spikes/shell/check_shell_decision.py spikes/shell/fixture.py spikes/shell/generated/decision-inputs.json spikes/shell/observations/2026-08-11-no-live-system.json spikes/shell/observations/2026-08-11-synthetic-example.json spikes/shell/replay.py spikes/shell/test_shell_fixture.py --dry-run",
+      "result": "fail",
+      "output": "gate: FAIL (2 refusal(s)), exit 1. Verbatim: \"REFUSE:  check 'Usage measurement' is unmeasured and cannot authorize completion: <this file's reason for that row>\" and \"REFUSE:  no specification-debt counter decreased. Pass --allow-no-metric-change '<reason>' if that is honest for this item, and the reason is recorded in history.\" Both refusals are true of this item and neither was worked around: the first is the gate correctly declining to let an unmeasured contract row authorize completion, which is the honest state of R0-11; the second is because R0-11 already had a contract, so no specification-debt counter moves, and the prescribed command carries no --allow-no-metric-change. Everything else was accepted: 'item R0-11 Shell decision fixture', 'licence Elastic-2.0', 'files 11' listing exactly the declared paths, 'debt 94 (digest 1a18155d6b0914aa25e20ffd5a1a6ec88cca20f952d52bc9b0dd3f0b74badf4c)'. No lease refusal, no undeclared-dirty note, no already-done refusal, and plan integrity passed inside the gate."
+    },
+    {
+      "name": "Plan selftest (pre-existing failure, not caused by this item)",
+      "command": "python3 plan/selftest.py",
+      "result": "fail",
+      "output": "Exits 1 with 'FAIL baseline: an unmodified copy does not pass' plus two whole-tree rules that cannot hold inside its scratch copy: the legacy-identifier fingerprint rule and the generated LEGACY_* registry rule. Reproduced identically from a pristine `git archive HEAD` extraction with none of this item's files present, so it is a property of the base (606ff48), not of this change. Reported rather than worked around; plan/selftest.py is outside this item's ownership."
+    },
+    {
+      "name": "Rust workspace suite",
+      "command": "cargo test --manifest-path rust/Cargo.toml --workspace --offline --no-fail-fast",
+      "result": "pass",
+      "output": "58 suites, 1139 passed, 0 failed, exit 0 — unchanged from the stated pre-work baseline. Run only to show the workspace is unaffected; this item touches no Rust file, no Cargo manifest and no lockfile."
+    }
+  ],
+  "unresolved": [
+    "every one of the six usage classes: interactive_shell_create, interactive_shell_attach, interactive_shell_command, file_upload, file_download, inline_path_bridge — recorded 'unresolved' with owner_decision_required true, blocked on usage-measurement and owner-choice",
+    "the boundary-or-retirement choice itself, which the contract's own hill-climbability note says needs an explicit owner choice"
+  ],
+  "follow_ups": [
+    "wire spikes/shell/check_shell_decision.py into plan/check.py and a CI workflow — both are shared files outside this item's ownership; the checker is self-contained, importable and returns an exit code from main()",
+    "when a measured corpus exists, drop it under spikes/shell/observations/, run replay.py --write, and record a per-class outcome; the parser refuses an outcome that does not match the measured count it cites"
+  ],
+  "notes": "No usage was measured and none is claimed. The deliverable is the fixture format, its offline replay harness, a clearly labelled synthetic worked example, and a decision memo that records all six classes as explicitly unresolved with the options and the evidence each would need. No shell, session, socket, process, credential or execution authority was created; nothing here satisfies the sandbox or shell contracts, and the memo says so. plan/check.py, plan/generate.py, plan/work-graph.toml, plan/baseline.json, plan/ready.md, .automonique/dev/, .github/, any Cargo manifest and every other item's evidence were left untouched. Reviewers: 0 — this is self-review, and no independence is claimed."
+}

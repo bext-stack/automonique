@@ -3,7 +3,7 @@
   "schema": "automonique.dev-program/v1",
   "source": {
     "graph": "plan/work-graph.toml",
-    "graph_sha256": "e68c4e6b8da3322d6a2a5794dd27433a39965ed7e1df300bd5b7915a5b94a617",
+    "graph_sha256": "78ef1c0d5333d9af383b4a07e602a1efd51d5c15c3420f23982a28fa07b50bfd",
     "item_count": 375
   },
   "items": [
@@ -131,9 +131,9 @@
         "tools/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R0-01.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R0-02",
@@ -292,9 +292,9 @@
         "docs/product-plan/reference/feature-parity.md"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R0-08.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R0-09",
@@ -314,9 +314,9 @@
         "tools/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R0-09.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R0-10",
@@ -402,9 +402,9 @@
         "tools/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R0-13.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R0-14",

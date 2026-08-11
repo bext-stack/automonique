@@ -88,6 +88,45 @@ item.**
    siblings.
 4. Open an item for the `src/event.rs` cursor duplication and its skipping hole.
 
+## Other cross-item defects found this session, each needing its own item
+
+None of these is fixable from inside the lease that found it, and none is
+claimed as done anywhere.
+
+1. **`src/event.rs` carries the cursor hole A2 closes.** `resolve_subscription`
+   applies the superseded "below only" rule to the parallel cursor type, so a
+   cursor left ahead of a truncated topic is still served live delivery from a
+   position the topic never reached. `JournalCursor`/`RetainedRange` against
+   `ConsumerCursor`/`resolve_subscription` is one concept implemented twice, and
+   only one copy now has the fix. The duplication is the underlying defect.
+
+2. **R0-09 and R0-10 never met.** R0-09 publishes
+   `plan/inventory/surface/restore-dependencies.json`, schema
+   `automonique.restore-dependencies/v1`, carrying `"consumer": "R0-10"` — it
+   was written for R0-10 by name. R0-10's consumer declares the path
+   `spikes/inventory/restore-dependencies.json` and the schema
+   `automonique.recovery.restore-dependencies.v1`, and pointed at R0-09's real
+   file it refuses with `unknown_key`, `consumed_entries=0`. Both
+   implementations are correct — the consumer declining a document it does not
+   understand is the right behaviour. The defect is that **neither contract
+   fixed the path or the schema**, so a producer and its named consumer can both
+   be complete and still not connect. Whoever resolves it picks one interface
+   and writes it into both contracts.
+
+3. **`plan/gate.py --commit` is disabled outright**, and this decision file's
+   sibling is wrong about why. `2026-08-11-retroactive-completion-recording.md`
+   says completion could not be gated because the files were already committed
+   and the lease needs them dirty. That is true but not the binding constraint:
+   `--commit` refuses unconditionally with *"disabled until baseline, history,
+   done status and regenerated plan artifacts can be included and verified in
+   one exact completion tree."* So the gate cannot authorize a completion today
+   in **any** state, and that decision's item 5 — "future items go through
+   `plan/gate.py --commit` before landing" — is not currently possible. What
+   *is* possible, and was done for this batch, is `--dry-run`: a full completion
+   preflight that checks readiness, lease, evidence, plan integrity and metric,
+   and authorizes nothing. Six of nine items passed it. Enabling `--commit` is
+   its own piece of work.
+
 ## What stays open regardless
 
 `plan/evidence/R1-12.json` carries adversarial findings D5a and D5b — a mutable

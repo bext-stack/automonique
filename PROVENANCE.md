@@ -50,8 +50,23 @@ enforcement mechanism for that boundary is unbuilt; it is tracked as
 
 ## Repository identity
 
-**Current state.** Every commit, including the root commit, is authored and
-committed by the owner's personal Git identity, and no commit is signed.
+**Declared state.** Identity separation: not claimed. Commit signing: not
+enabled. Identities of record: `.github/identity/register.toml`.
+
+That line is not prose. `.github/identity/check_identity.py` derives it from
+the register and refuses this document when the two disagree, so the claim
+here cannot drift away from the claim the register makes or from what Git
+records.
+
+**Current state.** One identity, `Automonique Candidate`, authors and commits
+every candidate. It performs every role in `GOVERNANCE.md` § Roles, so no role
+is separated from any other, and no commit is signed. Three commits predate the
+rule and are recorded as pinned exceptions in the register rather than
+rewritten: the root commit and the commit after it carry an owner bootstrap
+identity, and one later commit inherited an ambient personal Git configuration.
+`plan/owner-decisions/2026-08-10-candidate-identity-rewrite.md` records the
+rewrite that brought the rest of the history to the candidate identity, and
+`AGENTS.md` § Git authority states the rule that came out of it.
 
 **Bootstrap state.** Owner-supervised development permits truthful human or
 local-automation commit identities while every push, protected integration and

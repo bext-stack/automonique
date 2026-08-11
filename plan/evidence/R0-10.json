@@ -1,0 +1,96 @@
+{
+  "item": "R0-10",
+  "base": "606ff48c9b585e2ac5d801156c8a48a921d1b2b4",
+  "scope": "partial — a real local backup/restore/verify drill over a real artifact; no clean host was provisioned, so three of the seven contract rows are unmeasured with reasons",
+  "checks": [
+    {
+      "name": "Safety refusal",
+      "command": "python3 spikes/recovery/test_recovery_drill.py SafetyRefusalTests",
+      "result": "pass",
+      "disposition": "pass",
+      "output": "8 tests passed. All six closed Refusal codes were observed firing: workspace_inside_repository (target spikes/recovery/w), workspace_not_under_temporary_root (/var/lib/...), workspace_is_home_or_root (home directory and /), workspace_not_empty (a directory holding one foreign file), marker_missing and marker_token_mismatch (destroying a directory this run did not create). Positive controls: a fresh empty directory under the temporary root is accepted, and a correctly marked directory passes assert_marked. The end-to-end control `python3 spikes/recovery/drill.py --fault unsafe-workspace` printed refusal=workspace_inside_repository and exited 3, and the test compared spikes/recovery/ before and after to confirm nothing was created there."
+    },
+    {
+      "name": "Backup consistency",
+      "command": "python3 spikes/recovery/test_recovery_drill.py DrillOutcomeTests InvariantControlTests",
+      "result": "pass",
+      "disposition": "pass",
+      "output": "18 tests passed. An unbroken run backs up while transactions commit on a second SQLite connection from inside the online backup's own progress callback — not from a second thread — so the copy genuinely restarts under a changing source and the watermark lands deterministically at 40 (32 seed events plus the 8 committed mid-copy). The restored state satisfies all 8 coherence invariants: target_matches_manifest, database_integrity, event_counter_agreement, watermark_agreement, artifact_row_has_blob, blob_hash_matches_row, no_orphan_blob, config_revision_present. Every invariant has been observed failing: --fault naive-backup (components copied blobs-first) reported 'artifact_row_has_blob :: 40 artifact row(s); 8 without their bytes' with database_integrity still true, which is the point — the database was valid and the recovery set was still torn; an injected orphan blob, a deleted configuration file, a rewound configuration history, a bumped committed counter, a shifted manifest watermark, a tampered blob and an unreadable database each failed exactly their own invariant. A backup whose configuration file lags the database is refused at backup time, and a backup file that does not match its manifest hash is refused at restore time. Scale: 40 events, 40 artifacts, 42 backup files, kilobytes — the mechanism is real, the volume is fixture-sized."
+    },
+    {
+      "name": "Clean-host restore",
+      "result": null,
+      "disposition": "unmeasured",
+      "command": "python3 spikes/recovery/drill.py",
+      "reason": "no faithful disposable host is available to this agent, so no host was provisioned, no release runtime was installed, no service unit was started and no disconnected-recovery-mode startup occurred. What was measured is a clean *target*, which is strictly weaker and is reported as such rather than as the contract row.",
+      "output": "Measured instead, on the running host: the source recovery set is destroyed before the restore begins (reproducible.source_destroyed=true), the restore reads only the paths the backup manifest lists, the target directory did not exist beforehand, and after the restore the target's complete file set and hashes are compared to the manifest — 42 files, 0 unbacked, 0 missing, 0 mismatched. The negative control `--fault leak-source` copied one file straight from the source into the target and was caught: 'target_matches_manifest :: 43 file(s) present; 1 not in the backup manifest [leaked-from-source.json]', outcome inconsistent, exit 4. The five dependencies a real clean-host drill adds (host, runtime, release-manifest, recoverable-secret-material, service-definition) are enumerated as dependency_not_exercised findings on every run and printed by `drill.py --procedure`."
+    },
+    {
+      "name": "Objective measurement",
+      "result": null,
+      "disposition": "unmeasured",
+      "command": "python3 spikes/recovery/drill.py && python3 spikes/recovery/test_recovery_drill.py ObjectiveTests",
+      "reason": "RPO and RTO were measured with units, but neither can be validly compared to the declared objectives. The declared RPO (5 minutes or less) is a property of the production backup cadence, which this drill schedules itself; the declared RTO (30 minutes or less) is about a clean-host restore including provisioning, runtime installation, credential-descriptor resolution and recovery-mode startup, none of which happened. Reporting the fixture numbers as meeting the objectives would be the failure this contract exists to prevent, so the comparison is refused rather than guessed.",
+      "output": "Measured: rpo = 0.142058 seconds (wall-clock between the newest event the backup carries and the induced loss of the source; 6 events lost, exactly the 6 committed after the watermark), rto = 0.026534 seconds (monotonic, restore start to end of coherence verification). Declared objectives read from docs/product-plan/requirements/goals-and-invariants.md § initial acceptance targets: rpo 300 seconds, rto 1800 seconds. Both are reported with scope=local_fixture, comparison=out_of_scope, objective_met=null, and each emits an objective_comparison_out_of_scope finding. drill.compare_to_objective returns MET or MISSED only for a Scope.CLEAN_HOST measurement; it was exercised in both directions (2400 s against 1800 s -> MISSED with the measured value named in the detail; 120 s -> MET), so the comparator that a real host drill needs exists and is tested, and a test asserts a local-fixture run can never emit MET."
+    },
+    {
+      "name": "Dependency agreement",
+      "result": null,
+      "disposition": "unmeasured",
+      "command": "python3 spikes/recovery/dependencies.py --report",
+      "reason": "R0-09 has produced no restore dependency inventory — its status in plan/work-graph.toml is 'blocked' and plan/evidence/R0-09.json does not exist — so there is nothing to consume. Inventing one here would be the reinvention the contract forbids, and the declared publication path is deliberately outside this item's lease so the same agent cannot both report the gap and close it.",
+      "output": "Observed exit 2 with inventory_present=false at the declared path spikes/inventory/restore-dependencies.json, consumed_entries=0, and 10 findings: 1 inventory_absent against R0-09 plus 9 dependency_missing_from_inventory, one for each dependency the drill restores or names. The consuming logic itself is measured against fixtures: spikes/recovery/fixtures/inventory-present.json is consumed (9 entries) and yields exactly the four expected disagreement codes — dependency_missing_from_inventory (runtime), dependency_unverified_in_inventory (release-manifest), dependency_order_conflict (artifact-blobs and config-revision) and dependency_not_exercised (transport-offset-cursors, a dependency the inventory has and the drill does not restore). spikes/recovery/fixtures/inventory-invalid.json is refused at parse with unknown_enum_value and produces zero partial findings; not_an_object, unknown_schema, unknown_key, missing_key, duplicate_id and bad_order were each refused by their own code, with the unmodified document accepted as the positive control.\n\nCORRECTED AT INTEGRATION (base 40b7ce2, after R0-09 landed in the same batch). The reason recorded above is no longer the true one and must not be read as current. R0-09 ran concurrently in a separate worktree and HAS now published a restore dependency inventory: plan/inventory/surface/restore-dependencies.json, schema automonique.restore-dependencies/v1, carrying \"consumer\": \"R0-10\" — it was written for this item by name. The row is still not passing, but for a different and more interesting reason: the two items independently designed incompatible interfaces and never met. R0-10's consumer declares the path spikes/inventory/restore-dependencies.json and the schema automonique.recovery.restore-dependencies.v1; pointed at R0-09's actual file it refuses with {\"code\": \"unknown_key\", \"detail\": \"document keys ['consumer', 'excluded', 'objectives', 'order', 'source', 'work_item'] are not in the schema\"}, consumed_entries=0. Measured at integration by running `python3 spikes/recovery/dependencies.py --report --inventory plan/inventory/surface/restore-dependencies.json`. The refusal is correct behaviour — the consumer declines a document it does not understand rather than half-reading it — so nothing here is a defect in either implementation. The defect is that neither item's contract fixed the path or the schema, so a producer and its named consumer could both be complete and still not connect. Resolving it is a decision between the two items and is not taken here: see plan/owner-decisions/2026-08-11-r1-12-contract-amendments.md, which now lists it alongside the other cross-item defects found this session."
+    },
+    {
+      "name": "Rerun hygiene",
+      "command": "python3 spikes/recovery/test_recovery_drill.py DrillOutcomeTests",
+      "result": "pass",
+      "disposition": "pass",
+      "output": "22 independent runs (20 scripted plus 2 in-test) produced exactly one distinct reproducible view: outcome verified, watermark_event_id 40, event_count 40, artifact_count 40, config_revision 6, backup_file_count 42, lost_events 6, all 8 invariants true, the same 4 finding codes and the same 8 phases. Wall-clock durations, the workspace name and the run token are excluded from that block because a rerun cannot reproduce them. Residue: empty after success, after the injected mid-restore failure (outcome failed, exit 1) and after an inconsistent verdict, with cleanup running in a finally in every path. The residue detector was proven non-vacuous by `--fault skip-cleanup`, which reported residue_left with the surviving workspace named and exited 5; the workspace was then removed. A git status --porcelain --untracked-files=all comparison before and after a run showed the repository byte-identical."
+    },
+    {
+      "name": "Quality",
+      "command": "python3 spikes/recovery/test_recovery_drill.py QualityTests && python3 plan/check.py --verify",
+      "result": "pass",
+      "disposition": "pass",
+      "output": "5 quality tests passed. Offline: a full drill ran to outcome verified with socket.socket and socket.create_connection patched to raise, and the same test asserts the blocker itself raises, so the control is not vacuous. No new runtime dependency: an AST scan of recovery_set.py, drill.py and dependencies.py found every imported top-level name in sys.stdlib_module_names or a sibling module. No credential and no process: the same scan found no environ/getenv/putenv attribute access and no import of subprocess, socket, urllib, http, getpass, netrc, ssl, ftplib or smtplib in the three modules. The drill holds no credential of any kind — the fixture is generated from a fixed seed. plan/check.py --verify exited 0: 'ok — 375 items, 11 ready, 47 unblocked-but-unspecified', with the 21 expected 'done but never passed through the gate' warnings and the frozen-harness-contract warning. Generated-file reproducibility: two consecutive regenerations of spikes/recovery/restore-dependencies.json were byte-identical (sha256 c4c23473a80fe243… all three times), written atomically through a staging name; the staleness check was broken deliberately (one order value edited) and printed 'FAIL: restore-dependencies.json is stale: 3853 byte(s) checked in, 3852 byte(s) generated from the dependency table' at exit 1, then passed again once restored."
+    }
+  ],
+  "extra_checks": [
+    {
+      "name": "Full spike suite",
+      "command": "python3 spikes/recovery/test_recovery_drill.py",
+      "result": "pass",
+      "output": "46 tests, 0 failures, in 3.7 s. Every rule the drill enforces has both a negative control that was observed failing and a positive control that passes."
+    },
+    {
+      "name": "Determinism over repeated runs",
+      "command": "python3 spikes/recovery/drill.py (20 runs, reproducible blocks compared)",
+      "result": "pass",
+      "output": "20 runs, 1 distinct reproducible view, all outcome=verified with watermark 40."
+    },
+    {
+      "name": "Rust workspace suite",
+      "result": null,
+      "reason": "not run: this item touched no Rust, no Cargo manifest and no lockfile. The change set is four Python modules, one generated JSON file, two JSON fixtures and one README under spikes/recovery/, plus this evidence file. Running the 58-suite workspace would have measured nothing about this change while another agent was compiling on the same host."
+    }
+  ],
+  "review": {
+    "reviewers": 0,
+    "blocking_findings": 0,
+    "acceptance": "none — self-review only; no independent reviewer saw this diff"
+  },
+  "findings_for_other_items": [
+    {
+      "item": "R0-09",
+      "code": "inventory_absent",
+      "detail": "No restore dependency inventory exists at any path. R0-10's drill needs nine dependencies in restore order — host, runtime, release-manifest, control-database, audit-journal, artifact-blobs, config-revision, recoverable-secret-material, service-definition — and none of them can be confirmed against an operations inventory. spikes/recovery/restore-dependencies.json records what the drill needs, in the same closed schema the consumer parses, so R0-09 can compare rather than start from nothing. It is not a substitute for the inventory: it says what the drill needs, not what the operations surface has."
+    },
+    {
+      "item": "R0-10 follow-up",
+      "code": "integration_follow_up",
+      "detail": "Wiring `python3 spikes/recovery/dependencies.py --check` into plan/check.py is left for the integrator, per the parallel-work rule against editing plan/check.py. The module is self-contained, has its own main() returning an exit code, and is runnable standalone today."
+    }
+  ],
+  "notes": "This is an honest partial. Four of seven contract rows are measured and pass; three are null with reasons. The central limit is that no faithful disposable host is available, so the drill proves a real backup/restore/verify boundary over a real artifact on the running host and refuses to call that a clean-host restore or an objective comparison. The item is not claimed done, no status was flipped, and no gate is closed by this work. The drill is a spike, not product code: it operates only on synthetic fixture state it creates itself under the platform temporary root, never on the live repository or any production system, and it holds no credential."
+}

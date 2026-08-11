@@ -1,0 +1,228 @@
+{
+  "schema": "automonique.shell-boundary-decision/v1",
+  "work_item": "R0-11",
+  "recorded_on": "2026-08-11",
+  "decision_inputs": {
+    "path": "spikes/shell/generated/decision-inputs.json",
+    "sha256": "051b6a12bc5fee226ad09e54cad9708cbf86928e271338c6caae6906829fc033"
+  },
+  "standing_plan_disposition": {
+    "source": "docs/product-plan/reference/feature-parity.md",
+    "text": "isolate and preserve during migration; retire only by explicit later decision",
+    "binds_this_record": false
+  },
+  "classes": {
+    "interactive_shell_create": {
+      "outcome": "unresolved",
+      "owner_decision_required": true,
+      "blocked_on": ["usage-measurement", "owner-choice"],
+      "options": [
+        {
+          "option": "boundary",
+          "evidence_required": [
+            "one corpus of kind 'measured' covering at least a 90-day window with a log-derived count for this class",
+            "the isolates/permits/refuses triple accepted as written, with each refusal expressed as something a test can attempt and observe denied",
+            "a named owner acceptance recorded under plan/owner-decisions/"
+          ]
+        },
+        {
+          "option": "retirement",
+          "evidence_required": [
+            "a measured count for this class over a window long enough to cover quarterly and incident work",
+            "the replacement outcome named as a surface that exists, not as a plan item",
+            "the steps a current operator takes to reach that outcome instead",
+            "an answer to what breaks when the class is gone: a low or zero count is not sufficient on its own, because a break-glass path is rare and still load-bearing",
+            "a named owner acceptance recorded under plan/owner-decisions/"
+          ]
+        }
+      ],
+      "draft_boundary": {
+        "accepted": false,
+        "isolates": [
+          "the shell subsystem runs on its own execution backend and its own typed protocol, separate from the agent session protocol",
+          "a session is bound to one named workspace and holds no control-plane credential"
+        ],
+        "permits": [
+          "an operator holding the shell_operator capability creates a session against a named workspace with an explicit TTL and resource policy"
+        ],
+        "refuses": [
+          "creation without the shell_operator capability, without a named workspace, or without a TTL",
+          "a session that inherits any control-plane credential or reaches outside its workspace"
+        ]
+      }
+    },
+    "interactive_shell_attach": {
+      "outcome": "unresolved",
+      "owner_decision_required": true,
+      "blocked_on": ["usage-measurement", "owner-choice"],
+      "options": [
+        {
+          "option": "boundary",
+          "evidence_required": [
+            "a measured attach count separated into observer and controller attaches, since they carry different authority",
+            "an audit record shape that survives multi-attach and terminal restoration",
+            "a named owner acceptance recorded under plan/owner-decisions/"
+          ]
+        },
+        {
+          "option": "retirement",
+          "evidence_required": [
+            "a measured attach count showing who attaches and for what class of work",
+            "the replacement outcome named as a surface that exists",
+            "the steps a current operator takes to reach that outcome instead",
+            "an answer to what breaks when the class is gone, including incident response",
+            "a named owner acceptance recorded under plan/owner-decisions/"
+          ]
+        }
+      ],
+      "draft_boundary": {
+        "accepted": false,
+        "isolates": [
+          "attach authority is audited independently from provider sessions and never derived from an agent controller lease"
+        ],
+        "permits": [
+          "observer and controller attach to an existing session by an authorized operator, with every attach recorded"
+        ],
+        "refuses": [
+          "the operator cockpit proxying shell bytes, or widening an agent lease into shell authority"
+        ]
+      }
+    },
+    "interactive_shell_command": {
+      "outcome": "unresolved",
+      "owner_decision_required": true,
+      "blocked_on": ["usage-measurement", "owner-choice"],
+      "options": [
+        {
+          "option": "boundary",
+          "evidence_required": [
+            "a measured command count with a shape distribution, captured as shapes rather than command text",
+            "the shape classes that must remain reachable inside the boundary, and the ones that must not",
+            "a named owner acceptance recorded under plan/owner-decisions/"
+          ]
+        },
+        {
+          "option": "retirement",
+          "evidence_required": [
+            "a measured shape distribution showing which shapes carry the real workload",
+            "a replacement for each shape that carries load: a typed operation, not a general terminal",
+            "the steps a current operator takes to reach each replacement",
+            "an answer to what breaks for the shapes with no typed replacement",
+            "a named owner acceptance recorded under plan/owner-decisions/"
+          ]
+        }
+      ],
+      "draft_boundary": {
+        "accepted": false,
+        "isolates": [
+          "commands execute inside the workspace sandbox with resource limits and idle reaping, and cannot reach the control plane"
+        ],
+        "permits": [
+          "an authorized operator runs commands inside an attached session for the shapes the measurement shows are load-bearing"
+        ],
+        "refuses": [
+          "command execution that outlives the session TTL or escapes the workspace filesystem view"
+        ]
+      }
+    },
+    "file_upload": {
+      "outcome": "unresolved",
+      "owner_decision_required": true,
+      "blocked_on": ["usage-measurement", "owner-choice"],
+      "options": [
+        {
+          "option": "boundary",
+          "evidence_required": [
+            "a measured upload count and size distribution from the transfer or artifact log",
+            "the artifact-service mediation described as what it isolates, permits and refuses",
+            "a named owner acceptance recorded under plan/owner-decisions/"
+          ]
+        },
+        {
+          "option": "retirement",
+          "evidence_required": [
+            "a measured upload count over a window covering routine and incident work",
+            "the replacement upload surface named as something that exists and accepts the same sizes",
+            "the steps a current user takes to upload without the shell surface",
+            "an answer to what breaks when the class is gone",
+            "a named owner acceptance recorded under plan/owner-decisions/"
+          ]
+        }
+      ],
+      "draft_boundary": {
+        "accepted": false,
+        "isolates": [
+          "uploaded bytes enter through the artifact service and land in a named workspace, never on an arbitrary host path"
+        ],
+        "permits": [
+          "an authorized operator uploads into the workspace of a session they hold, within a quota"
+        ],
+        "refuses": [
+          "any upload that names a host path outside the workspace, or that bypasses the artifact service"
+        ]
+      }
+    },
+    "file_download": {
+      "outcome": "unresolved",
+      "owner_decision_required": true,
+      "blocked_on": ["usage-measurement", "owner-choice"],
+      "options": [
+        {
+          "option": "boundary",
+          "evidence_required": [
+            "a measured download count and size distribution from the transfer or artifact log",
+            "the artifact-service mediation described as what it isolates, permits and refuses, including egress of workspace data",
+            "a named owner acceptance recorded under plan/owner-decisions/"
+          ]
+        },
+        {
+          "option": "retirement",
+          "evidence_required": [
+            "a measured download count over a window covering routine and incident work",
+            "the replacement download surface named as something that exists",
+            "the steps a current user takes to retrieve workspace output without the shell surface",
+            "an answer to what breaks when the class is gone, including evidence collection during an incident",
+            "a named owner acceptance recorded under plan/owner-decisions/"
+          ]
+        }
+      ],
+      "draft_boundary": {
+        "accepted": false,
+        "isolates": [
+          "downloaded bytes leave through the artifact service with a recorded grant and provenance, never as a raw stream from a host path"
+        ],
+        "permits": [
+          "an authorized operator downloads artifacts produced inside the workspace of a session they hold"
+        ],
+        "refuses": [
+          "reading a path outside the workspace, and any download without an audit receipt"
+        ]
+      }
+    },
+    "inline_path_bridge": {
+      "outcome": "unresolved",
+      "owner_decision_required": true,
+      "blocked_on": ["usage-measurement", "owner-choice"],
+      "options": [
+        {
+          "option": "boundary",
+          "evidence_required": [
+            "a measured count showing the bridge is still used, and by which callers",
+            "a boundary that names the exact host paths it still permits, which is the part the current bridge does not have",
+            "a named owner acceptance recorded under plan/owner-decisions/"
+          ]
+        },
+        {
+          "option": "retirement",
+          "evidence_required": [
+            "a measured count for the bridge, including automated callers that will not notice a deprecation notice",
+            "the artifact-service replacement named as a surface that exists and accepts the same operations",
+            "the steps a current caller takes to move to it, including any client change",
+            "an answer to what breaks when the bridge is gone, since the migration plan already intends to remove it and the count is the only thing that says whether removal is safe",
+            "a named owner acceptance recorded under plan/owner-decisions/"
+          ]
+        }
+      ]
+    }
+  }
+}

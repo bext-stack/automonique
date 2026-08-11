@@ -1,0 +1,4218 @@
+{
+  "compatibility_forwards": {
+    ".legacy-current": {
+      "also": [],
+      "forwards_to": ".automonique-current",
+      "kind": "path"
+    },
+    ".legacy-releases": {
+      "also": [],
+      "forwards_to": ".automonique-releases",
+      "kind": "path"
+    },
+    "@legacy": {
+      "also": [],
+      "forwards_to": "@automonique",
+      "kind": "package"
+    },
+    "@legacy/*": {
+      "also": [],
+      "forwards_to": "@automonique",
+      "kind": "package"
+    },
+    "@legacy/sdk*": {
+      "also": [],
+      "forwards_to": "@automonique/sdk*",
+      "kind": "package"
+    },
+    "@legacy/sdk/connector": {
+      "also": [],
+      "forwards_to": "@automonique/sdk/connector",
+      "kind": "package"
+    },
+    "@legacy/sdk/provider": {
+      "also": [],
+      "forwards_to": "@automonique/sdk/provider",
+      "kind": "package"
+    },
+    "LEGACY_*": {
+      "also": [],
+      "forwards_to": "AUTOMONIQUE_*",
+      "kind": "environment-variable"
+    },
+    "LEGACY_RUNNER": {
+      "also": [],
+      "forwards_to": "AUTOMONIQUE_RUNNER",
+      "kind": "environment-variable"
+    },
+    "legacy-say": {
+      "also": [],
+      "forwards_to": "automonique-say",
+      "kind": "command"
+    },
+    "legacy-shell": {
+      "also": [],
+      "forwards_to": "automonique-shell",
+      "kind": "command"
+    },
+    "legacy-shot": {
+      "also": [],
+      "forwards_to": "automonique-shot",
+      "kind": "command"
+    },
+    "legacy-tui": {
+      "also": [],
+      "forwards_to": "automonique tui",
+      "kind": "command"
+    },
+    "legacy:audit": {
+      "also": [],
+      "forwards_to": "automonique audit",
+      "kind": "command"
+    },
+    "legacyctl": {
+      "also": [
+        "automonique audit",
+        "automonique doctor",
+        "automonique reload",
+        "automonique rollback",
+        "automonique status",
+        "automonique tui"
+      ],
+      "forwards_to": "automonique",
+      "kind": "command"
+    },
+    "legacyctl tui": {
+      "also": [],
+      "forwards_to": "automonique tui",
+      "kind": "command"
+    },
+    "legacyd": {
+      "also": [],
+      "forwards_to": "automonique daemon",
+      "kind": "command"
+    }
+  },
+  "consumers": {
+    "R1-17": "Read plan/inventory/identifiers.json. `durable_names` is the sorted set of every name classified durable; `compatibility_forwards` maps each compatibility-only name to {\"forwards_to\": <durable name>, \"also\": [<durable name>, ...]}. For the check 'no durable identifier is rewritten by this slice': every CanonicalName::spelling() in rust/crates/automonique-protocol/src/compat/generated.rs must appear in `durable_names`, and for every LegacyName the alias spelling must appear in `compatibility_forwards` with its canonical().spelling() equal to `forwards_to` or present in `also`. The inventory derives its names from docs/product-plan/ and never reads the registry, so the comparison is between two independently sourced lists rather than a restatement.",
+    "R1-19": "`legacy_exceptions` is the sorted exception set for the namespace gate: one row per compatibility-only entry whose first segment is the compatibility namespace root, carrying name, kind, forwards_to and the authorizing permitted source. An identifier outside the namespace and outside this set is a finding; an entry here naming an identifier the corpus no longer spells fails this inventory's own forward drift check first."
+  },
+  "counts": {
+    "by_class": {
+      "compatibility-only": 17,
+      "durable": 140,
+      "presentation-only": 2
+    },
+    "by_kind_including_unclassified": {
+      "command": 49,
+      "environment-variable": 57,
+      "external-platform-name": 13,
+      "package": 48,
+      "path": 6,
+      "protocol": 27,
+      "service": 6
+    },
+    "compatibility_forwards": 17,
+    "durable_names": 135,
+    "entries": 159,
+    "families": 1,
+    "gaps": 5,
+    "legacy_exceptions": 17,
+    "out_of_scope": 76,
+    "regions": 10,
+    "unclassified": 47,
+    "unclassified_by_kind": {
+      "command": 0,
+      "environment-variable": 43,
+      "external-platform-name": 0,
+      "package": 0,
+      "path": 2,
+      "protocol": 2,
+      "service": 0
+    },
+    "withheld": 1
+  },
+  "durable_names": [
+    ".automonique-current",
+    ".automonique-releases",
+    "@automonique",
+    "@automonique/sdk",
+    "@automonique/sdk*",
+    "@automonique/sdk/browser",
+    "@automonique/sdk/connector",
+    "@automonique/sdk/extension",
+    "@automonique/sdk/mcp",
+    "@automonique/sdk/node",
+    "@automonique/sdk/openai",
+    "@automonique/sdk/provider",
+    "@automonique/sdk/testing",
+    "@automonique/sdk/ui",
+    "AUTOMONIQUE_*",
+    "AUTOMONIQUE_RUNNER",
+    "ApprovalRequested",
+    "ApprovalResolved",
+    "AssistantMessageCompleted",
+    "CLAUDE_*",
+    "CODEX_*",
+    "OPENCODE_*",
+    "ProviderConnected",
+    "ProviderDisconnected",
+    "ProviderFault",
+    "ProviderWarning",
+    "RunTerminal",
+    "SLACK_BOT_TOKEN",
+    "SLACK_CHANNELS",
+    "SLACK_DELETE_TOKEN",
+    "SLACK_DEPLOY_CHANNEL",
+    "SessionCreated",
+    "SessionLoaded",
+    "SessionUpdated",
+    "SubagentCompleted",
+    "SubagentEvent",
+    "SubagentStarted",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_POLL_TIMEOUT_SEC",
+    "TMUX_BIN",
+    "ToolCallCompleted",
+    "ToolCallStarted",
+    "ToolCallUpdated",
+    "TurnCompleted",
+    "TurnInterrupted",
+    "TurnQueued",
+    "TurnStarted",
+    "TurnSteered",
+    "UsageUpdated",
+    "approvals",
+    "attention",
+    "auth.test",
+    "automonique",
+    "automonique agent",
+    "automonique attach",
+    "automonique audit",
+    "automonique bootstrap",
+    "automonique cancel",
+    "automonique daemon",
+    "automonique doctor",
+    "automonique generations",
+    "automonique lab",
+    "automonique reload",
+    "automonique reload-status",
+    "automonique rollback",
+    "automonique run",
+    "automonique runner",
+    "automonique runs",
+    "automonique self-host",
+    "automonique shell",
+    "automonique status",
+    "automonique tui",
+    "automonique-agents",
+    "automonique-artifacts",
+    "automonique-automation",
+    "automonique-bootstrap",
+    "automonique-cli",
+    "automonique-compat-api",
+    "automonique-context",
+    "automonique-core",
+    "automonique-daemon",
+    "automonique-deploy-broker",
+    "automonique-dev-protocol",
+    "automonique-executors",
+    "automonique-extensions",
+    "automonique-fleet",
+    "automonique-lab",
+    "automonique-media",
+    "automonique-memory",
+    "automonique-models",
+    "automonique-policy",
+    "automonique-protocol",
+    "automonique-runner",
+    "automonique-sandbox",
+    "automonique-sandbox-launcher",
+    "automonique-say",
+    "automonique-shell",
+    "automonique-shot",
+    "automonique-skills",
+    "automonique-store",
+    "automonique-tools",
+    "automonique-transports",
+    "automonique-tui",
+    "automonique-web",
+    "automonique-workspaces",
+    "automonique.dev-metrics/v1",
+    "cancel",
+    "chat.delete",
+    "chat.getPermalink",
+    "chat.postEphemeral",
+    "chat.postMessage",
+    "chat.update",
+    "conversations.history",
+    "conversations.info",
+    "conversations.members",
+    "conversations.replies",
+    "failures",
+    "help",
+    "id",
+    "ignored",
+    "new",
+    "queue",
+    "reactions.add",
+    "requests",
+    "retry",
+    "runs",
+    "sites",
+    "status",
+    "steer",
+    "support",
+    "ticket",
+    "tickets",
+    "usage",
+    "users.info",
+    "users.list"
+  ],
+  "entries": [
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "approvals",
+      "source": {
+        "evidence": "approvals",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "attention",
+      "source": {
+        "evidence": "attention",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique",
+      "source": {
+        "evidence": "unprivileged executable**, `automonique`",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "cited"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique agent",
+      "source": {
+        "evidence": "automonique agent",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique attach",
+      "source": {
+        "evidence": "automonique attach",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique audit",
+      "source": {
+        "evidence": "automonique audit",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique bootstrap",
+      "source": {
+        "evidence": "automonique bootstrap",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique cancel",
+      "source": {
+        "evidence": "automonique cancel",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique daemon",
+      "source": {
+        "evidence": "automonique daemon",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique doctor",
+      "source": {
+        "evidence": "automonique doctor",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique generations",
+      "source": {
+        "evidence": "automonique generations",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique lab",
+      "source": {
+        "evidence": "automonique lab",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique reload",
+      "source": {
+        "evidence": "automonique reload",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique reload-status",
+      "source": {
+        "evidence": "automonique reload-status",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique rollback",
+      "source": {
+        "evidence": "automonique rollback",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique run",
+      "source": {
+        "evidence": "automonique run",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique runner",
+      "source": {
+        "evidence": "automonique runner",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique runs",
+      "source": {
+        "evidence": "automonique runs",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique self-host",
+      "source": {
+        "evidence": "automonique self-host",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique shell",
+      "source": {
+        "evidence": "automonique shell",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique status",
+      "source": {
+        "evidence": "automonique status",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique tui",
+      "source": {
+        "evidence": "automonique tui",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "binary-subcommands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique-say",
+      "source": {
+        "evidence": "canonical `automonique-say` worker capability",
+        "files": [
+          "docs/product-plan/reference/feature-parity.md"
+        ],
+        "region": "cited"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "automonique-shot",
+      "source": {
+        "evidence": "under canonical `automonique-shot`",
+        "files": [
+          "docs/product-plan/reference/feature-parity.md"
+        ],
+        "region": "cited"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "cancel",
+      "source": {
+        "evidence": "cancel",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "failures",
+      "source": {
+        "evidence": "failures",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "help",
+      "source": {
+        "evidence": "help",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "id",
+      "source": {
+        "evidence": "id",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "ignored",
+      "source": {
+        "evidence": "ignored",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "authorized_by": "docs/product-plan/reference/feature-parity.md",
+      "class": "compatibility-only",
+      "forwards_to": "automonique-say",
+      "forwards_to_also": [],
+      "kind": "command",
+      "name": "legacy-say",
+      "reason": "the parity ledger replaces the progress-announcement helper with a canonical worker capability plus outbox and keeps a forwarding alias during migration.",
+      "source": {
+        "evidence": "legacy-say",
+        "files": [
+          "docs/product-plan/reference/feature-parity.md",
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "authorized_by": "docs/product-plan/reference/migration-plan.md",
+      "class": "compatibility-only",
+      "forwards_to": "automonique-shell",
+      "forwards_to_also": [],
+      "kind": "command",
+      "name": "legacy-shell",
+      "reason": "the optional isolated shell subsystem keeps only a declared forwarding alias; the agent TUI is never a general shell.",
+      "source": {
+        "evidence": "legacy-shell",
+        "files": [
+          "docs/product-plan/reference/feature-parity.md",
+          "docs/product-plan/reference/migration-plan.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "authorized_by": "docs/product-plan/reference/feature-parity.md",
+      "class": "compatibility-only",
+      "forwards_to": "automonique-shot",
+      "forwards_to_also": [],
+      "kind": "command",
+      "name": "legacy-shot",
+      "reason": "the parity ledger rebuilds the screenshot outcome under the canonical name while the implementation may remain unchanged initially.",
+      "source": {
+        "evidence": "legacy-shot",
+        "files": [
+          "docs/product-plan/reference/feature-parity.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/operator-tui.md",
+      "class": "compatibility-only",
+      "forwards_to": "automonique tui",
+      "forwards_to_also": [],
+      "kind": "command",
+      "name": "legacy-tui",
+      "reason": "the previous terminal entry point forwards to the same client during the declared compatibility window.",
+      "source": {
+        "evidence": "legacy-tui",
+        "files": [
+          "docs/product-plan/reference/corpus-index.md",
+          "docs/product-plan/reference/migration-plan.md",
+          "docs/product-plan/reference/work-breakdown.md",
+          "docs/product-plan/requirements/operator-tui.md",
+          "docs/product-plan/requirements/reload-protocol.md",
+          "docs/product-plan/requirements/state-and-protocols.md",
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "authorized_by": "docs/product-plan/reference/migration-plan.md",
+      "class": "compatibility-only",
+      "forwards_to": "automonique audit",
+      "forwards_to_also": [],
+      "kind": "command",
+      "name": "legacy:audit",
+      "reason": "reconciliation scripts become typed reconcilers reached through the canonical subcommand; the legacy command forwards during migration.",
+      "source": {
+        "evidence": "legacy:audit",
+        "files": [
+          "docs/product-plan/reference/migration-plan.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/target-architecture.md",
+      "class": "compatibility-only",
+      "forwards_to": "automonique",
+      "forwards_to_also": [
+        "automonique audit",
+        "automonique doctor",
+        "automonique reload",
+        "automonique rollback",
+        "automonique status",
+        "automonique tui"
+      ],
+      "kind": "command",
+      "name": "legacyctl",
+      "reason": "docs/product-plan/requirements/target-architecture.md installs the compatibility entry points as thin forwarding shims that exec `automonique <subcommand>` and contain no logic. The permitted sources additionally bind it to individual subcommands, which are recorded in forwards_to_also rather than collapsed into one.",
+      "source": {
+        "evidence": "legacyctl",
+        "files": [
+          "docs/product-plan/reference/feature-parity.md",
+          "docs/product-plan/reference/migration-plan.md",
+          "docs/product-plan/reference/work-breakdown.md",
+          "docs/product-plan/requirements/goals-and-invariants.md",
+          "docs/product-plan/requirements/reload-protocol.md",
+          "docs/product-plan/requirements/state-and-protocols.md",
+          "docs/product-plan/requirements/target-architecture.md",
+          "docs/product-plan/requirements/verification-and-rollout.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/operator-tui.md",
+      "class": "compatibility-only",
+      "forwards_to": "automonique tui",
+      "forwards_to_also": [],
+      "kind": "command",
+      "name": "legacyctl tui",
+      "reason": "the previous control command's terminal subcommand forwards to the same client during the declared compatibility window.",
+      "source": {
+        "evidence": "legacyctl tui",
+        "files": [
+          "docs/product-plan/requirements/operator-tui.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/target-architecture.md",
+      "class": "compatibility-only",
+      "forwards_to": "automonique daemon",
+      "forwards_to_also": [],
+      "kind": "command",
+      "name": "legacyd",
+      "reason": "docs/product-plan/requirements/target-architecture.md installs the compatibility entry points as thin forwarding shims that exec `automonique <subcommand>` and contain no logic. The daemon subcommand names the long-running control-plane role that this shim reaches.",
+      "source": {
+        "evidence": "legacyd",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "new",
+      "source": {
+        "evidence": "new",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "queue",
+      "source": {
+        "evidence": "queue",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "requests",
+      "source": {
+        "evidence": "requests",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "retry",
+      "source": {
+        "evidence": "retry",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "runs",
+      "source": {
+        "evidence": "runs",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "sites",
+      "source": {
+        "evidence": "sites",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "status",
+      "source": {
+        "evidence": "status",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "steer",
+      "source": {
+        "evidence": "steer",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "support",
+      "source": {
+        "evidence": "support",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "ticket",
+      "source": {
+        "evidence": "ticket",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "tickets",
+      "source": {
+        "evidence": "tickets",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "command",
+      "name": "usage",
+      "source": {
+        "evidence": "usage",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-commands"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "environment-variable",
+      "name": "AUTOMONIQUE_*",
+      "source": {
+        "evidence": "Canonical `AUTOMONIQUE_*` configuration is resolved before legacy",
+        "files": [
+          "docs/product-plan/requirements/operations-and-governance.md"
+        ],
+        "region": "cited"
+      },
+      "spelling_form": "name-family"
+    },
+    {
+      "class": "durable",
+      "kind": "environment-variable",
+      "name": "AUTOMONIQUE_RUNNER",
+      "source": {
+        "evidence": "canonical `AUTOMONIQUE_RUNNER=rust`",
+        "files": [
+          "docs/product-plan/reference/migration-plan.md"
+        ],
+        "region": "cited"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "environment-variable",
+      "name": "CLAUDE_*",
+      "source": {
+        "evidence": "CLAUDE_*",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "unprefixed-environment-variables"
+      },
+      "spelling_form": "name-family"
+    },
+    {
+      "class": "durable",
+      "kind": "environment-variable",
+      "name": "CODEX_*",
+      "source": {
+        "evidence": "CODEX_*",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "unprefixed-environment-variables"
+      },
+      "spelling_form": "name-family"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/operations-and-governance.md",
+      "class": "compatibility-only",
+      "forwards_to": "AUTOMONIQUE_*",
+      "forwards_to_also": [],
+      "kind": "environment-variable",
+      "name": "LEGACY_*",
+      "reason": "canonical configuration is resolved before the legacy fallback, and conflicting simultaneous values fail closed rather than applying a precedence rule.",
+      "source": {
+        "evidence": "LEGACY_*",
+        "files": [
+          "docs/product-plan/requirements/operations-and-governance.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "name-family"
+    },
+    {
+      "authorized_by": "docs/product-plan/reference/migration-plan.md",
+      "class": "compatibility-only",
+      "forwards_to": "AUTOMONIQUE_RUNNER",
+      "forwards_to_also": [],
+      "kind": "environment-variable",
+      "name": "LEGACY_RUNNER",
+      "reason": "the existing daemon selects the Rust runner through the canonical variable; the legacy spelling is accepted only as a recorded migration alias.",
+      "source": {
+        "evidence": "LEGACY_RUNNER",
+        "files": [
+          "docs/product-plan/reference/migration-plan.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "environment-variable",
+      "name": "OPENCODE_*",
+      "source": {
+        "evidence": "OPENCODE_*",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "unprefixed-environment-variables"
+      },
+      "spelling_form": "name-family"
+    },
+    {
+      "class": "durable",
+      "kind": "environment-variable",
+      "name": "SLACK_BOT_TOKEN",
+      "source": {
+        "evidence": "SLACK_BOT_TOKEN",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "unprefixed-environment-variables"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "environment-variable",
+      "name": "SLACK_CHANNELS",
+      "source": {
+        "evidence": "SLACK_CHANNELS",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "unprefixed-environment-variables"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "environment-variable",
+      "name": "SLACK_DELETE_TOKEN",
+      "source": {
+        "evidence": "SLACK_DELETE_TOKEN",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "unprefixed-environment-variables"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "environment-variable",
+      "name": "SLACK_DEPLOY_CHANNEL",
+      "source": {
+        "evidence": "SLACK_DEPLOY_CHANNEL",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "unprefixed-environment-variables"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "environment-variable",
+      "name": "TELEGRAM_BOT_TOKEN",
+      "source": {
+        "evidence": "TELEGRAM_BOT_TOKEN",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "unprefixed-environment-variables"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "environment-variable",
+      "name": "TELEGRAM_POLL_TIMEOUT_SEC",
+      "source": {
+        "evidence": "TELEGRAM_POLL_TIMEOUT_SEC",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "unprefixed-environment-variables"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "environment-variable",
+      "name": "TMUX_BIN",
+      "source": {
+        "evidence": "TMUX_BIN",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "unprefixed-environment-variables"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "external-platform-name",
+      "name": "auth.test",
+      "source": {
+        "evidence": "auth.test",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "chat-platform-methods"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "external-platform-name",
+      "name": "chat.delete",
+      "source": {
+        "evidence": "chat.delete",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "chat-platform-methods"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "external-platform-name",
+      "name": "chat.getPermalink",
+      "source": {
+        "evidence": "chat.getPermalink",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "chat-platform-methods"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "external-platform-name",
+      "name": "chat.postEphemeral",
+      "source": {
+        "evidence": "chat.postEphemeral",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "chat-platform-methods"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "external-platform-name",
+      "name": "chat.postMessage",
+      "source": {
+        "evidence": "chat.postMessage",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "chat-platform-methods"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "external-platform-name",
+      "name": "chat.update",
+      "source": {
+        "evidence": "chat.update",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "chat-platform-methods"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "external-platform-name",
+      "name": "conversations.history",
+      "source": {
+        "evidence": "conversations.history",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "chat-platform-methods"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "external-platform-name",
+      "name": "conversations.info",
+      "source": {
+        "evidence": "conversations.info",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "chat-platform-methods"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "external-platform-name",
+      "name": "conversations.members",
+      "source": {
+        "evidence": "conversations.members",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "chat-platform-methods"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "external-platform-name",
+      "name": "conversations.replies",
+      "source": {
+        "evidence": "conversations.replies",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "chat-platform-methods"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "external-platform-name",
+      "name": "reactions.add",
+      "source": {
+        "evidence": "reactions.add",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "chat-platform-methods"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "external-platform-name",
+      "name": "users.info",
+      "source": {
+        "evidence": "users.info",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "chat-platform-methods"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "external-platform-name",
+      "name": "users.list",
+      "source": {
+        "evidence": "users.list",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "chat-platform-methods"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "@automonique",
+      "source": {
+        "evidence": "@automonique",
+        "files": [
+          "docs/product-plan/requirements/typescript-sdk.md"
+        ],
+        "region": "automonique-packages"
+      },
+      "spelling_form": "name-family"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "@automonique/sdk",
+      "source": {
+        "evidence": "@automonique/sdk",
+        "files": [
+          "docs/product-plan/reference/migration-plan.md",
+          "docs/product-plan/reference/work-breakdown.md",
+          "docs/product-plan/requirements/typescript-sdk.md"
+        ],
+        "region": "automonique-packages"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "@automonique/sdk*",
+      "source": {
+        "evidence": "@automonique/sdk*",
+        "files": [
+          "docs/product-plan/reference/corpus-index.md",
+          "docs/product-plan/reference/migration-plan.md",
+          "docs/product-plan/reference/plan-review.md",
+          "docs/product-plan/requirements/target-architecture.md",
+          "docs/product-plan/requirements/verification-and-rollout.md"
+        ],
+        "region": "automonique-packages"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "@automonique/sdk/browser",
+      "source": {
+        "evidence": "@automonique/sdk/browser",
+        "files": [
+          "docs/product-plan/requirements/typescript-sdk.md"
+        ],
+        "region": "automonique-packages"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "@automonique/sdk/connector",
+      "source": {
+        "evidence": "@automonique/sdk/connector",
+        "files": [
+          "docs/product-plan/reference/migration-plan.md",
+          "docs/product-plan/reference/work-breakdown.md",
+          "docs/product-plan/requirements/channel-integrations.md",
+          "docs/product-plan/requirements/connector-catalog.md",
+          "docs/product-plan/requirements/target-architecture.md",
+          "docs/product-plan/requirements/typescript-sdk.md"
+        ],
+        "region": "automonique-packages"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "@automonique/sdk/extension",
+      "source": {
+        "evidence": "@automonique/sdk/extension",
+        "files": [
+          "docs/product-plan/reference/work-breakdown.md",
+          "docs/product-plan/requirements/tools-extensions-and-hooks.md",
+          "docs/product-plan/requirements/typescript-sdk.md"
+        ],
+        "region": "automonique-packages"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "@automonique/sdk/mcp",
+      "source": {
+        "evidence": "@automonique/sdk/mcp",
+        "files": [
+          "docs/product-plan/requirements/typescript-sdk.md"
+        ],
+        "region": "automonique-packages"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "@automonique/sdk/node",
+      "source": {
+        "evidence": "@automonique/sdk/node",
+        "files": [
+          "docs/product-plan/requirements/typescript-sdk.md"
+        ],
+        "region": "automonique-packages"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "@automonique/sdk/openai",
+      "source": {
+        "evidence": "@automonique/sdk/openai",
+        "files": [
+          "docs/product-plan/requirements/typescript-sdk.md"
+        ],
+        "region": "automonique-packages"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "@automonique/sdk/provider",
+      "source": {
+        "evidence": "@automonique/sdk/provider",
+        "files": [
+          "docs/product-plan/reference/migration-plan.md",
+          "docs/product-plan/reference/work-breakdown.md",
+          "docs/product-plan/requirements/typescript-sdk.md"
+        ],
+        "region": "automonique-packages"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "@automonique/sdk/testing",
+      "source": {
+        "evidence": "@automonique/sdk/testing",
+        "files": [
+          "docs/product-plan/reference/migration-plan.md",
+          "docs/product-plan/reference/work-breakdown.md",
+          "docs/product-plan/requirements/typescript-sdk.md"
+        ],
+        "region": "automonique-packages"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "@automonique/sdk/ui",
+      "source": {
+        "evidence": "@automonique/sdk/ui",
+        "files": [
+          "docs/product-plan/reference/work-breakdown.md",
+          "docs/product-plan/requirements/typescript-sdk.md"
+        ],
+        "region": "automonique-packages"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/typescript-sdk.md",
+      "class": "compatibility-only",
+      "forwards_to": "@automonique",
+      "forwards_to_also": [],
+      "kind": "package",
+      "name": "@legacy",
+      "reason": "the current/previous SDK-release compatibility matrix covers canonical and supported forwarding package scopes together.",
+      "source": {
+        "evidence": "@legacy",
+        "files": [
+          "docs/product-plan/reference/plan-review.md",
+          "docs/product-plan/reference/work-breakdown.md",
+          "docs/product-plan/requirements/target-architecture.md",
+          "docs/product-plan/requirements/typescript-sdk.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "name-family"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/channel-integrations.md",
+      "class": "compatibility-only",
+      "forwards_to": "@automonique",
+      "forwards_to_also": [],
+      "kind": "package",
+      "name": "@legacy/*",
+      "reason": "existing package identifiers remain compatibility names while connectors negotiate protocol and capabilities rather than display names.",
+      "source": {
+        "evidence": "@legacy/*",
+        "files": [
+          "docs/product-plan/requirements/channel-integrations.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "name-family"
+    },
+    {
+      "authorized_by": "docs/product-plan/reference/plan-review.md",
+      "class": "compatibility-only",
+      "forwards_to": "@automonique/sdk*",
+      "forwards_to_also": [],
+      "kind": "package",
+      "name": "@legacy/sdk*",
+      "reason": "every public package is canonicalized under the Automonique scope and the previous scope is forwarding-only for the deprecation window.",
+      "source": {
+        "evidence": "@legacy/sdk*",
+        "files": [
+          "docs/product-plan/reference/corpus-index.md",
+          "docs/product-plan/reference/migration-plan.md",
+          "docs/product-plan/requirements/typescript-sdk.md",
+          "docs/product-plan/requirements/verification-and-rollout.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "name-family"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/channel-integrations.md",
+      "class": "compatibility-only",
+      "forwards_to": "@automonique/sdk/connector",
+      "forwards_to_also": [],
+      "kind": "package",
+      "name": "@legacy/sdk/connector",
+      "reason": "connectors use the canonical connector package with a temporary forwarding export if needed.",
+      "source": {
+        "evidence": "@legacy/sdk/connector",
+        "files": [
+          "docs/product-plan/requirements/channel-integrations.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/typescript-sdk.md",
+      "class": "compatibility-only",
+      "forwards_to": "@automonique/sdk/provider",
+      "forwards_to_also": [],
+      "kind": "package",
+      "name": "@legacy/sdk/provider",
+      "reason": "the out-of-process provider adapter SPI ships under the canonical scope with a forwarding export during migration.",
+      "source": {
+        "evidence": "@legacy/sdk/provider",
+        "files": [
+          "docs/product-plan/requirements/typescript-sdk.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "presentation-only",
+      "kind": "package",
+      "name": "Monique",
+      "source": {
+        "evidence": "presentation-only signed assets/animations with no tools, secrets or authority. Monique is the first-party mascot",
+        "files": [
+          "docs/product-plan/requirements/client-experience-and-surfaces.md"
+        ],
+        "region": "cited"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique",
+      "source": {
+        "evidence": "automonique",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-agents",
+      "source": {
+        "evidence": "automonique-agents",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-artifacts",
+      "source": {
+        "evidence": "automonique-artifacts",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-automation",
+      "source": {
+        "evidence": "automonique-automation",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-bootstrap",
+      "source": {
+        "evidence": "automonique-bootstrap",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-cli",
+      "source": {
+        "evidence": "automonique-cli",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-compat-api",
+      "source": {
+        "evidence": "automonique-compat-api",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-context",
+      "source": {
+        "evidence": "automonique-context",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-core",
+      "source": {
+        "evidence": "automonique-core",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-daemon",
+      "source": {
+        "evidence": "automonique-daemon",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-dev-protocol",
+      "source": {
+        "evidence": "automonique-dev-protocol",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-executors",
+      "source": {
+        "evidence": "automonique-executors",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-extensions",
+      "source": {
+        "evidence": "automonique-extensions",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-fleet",
+      "source": {
+        "evidence": "automonique-fleet",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-lab",
+      "source": {
+        "evidence": "automonique-lab",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-media",
+      "source": {
+        "evidence": "automonique-media",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-memory",
+      "source": {
+        "evidence": "automonique-memory",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-models",
+      "source": {
+        "evidence": "automonique-models",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-policy",
+      "source": {
+        "evidence": "automonique-policy",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-protocol",
+      "source": {
+        "evidence": "automonique-protocol",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-runner",
+      "source": {
+        "evidence": "automonique-runner",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-sandbox",
+      "source": {
+        "evidence": "automonique-sandbox",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-shell",
+      "source": {
+        "evidence": "automonique-shell",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-skills",
+      "source": {
+        "evidence": "automonique-skills",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-store",
+      "source": {
+        "evidence": "automonique-store",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-tools",
+      "source": {
+        "evidence": "automonique-tools",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-transports",
+      "source": {
+        "evidence": "automonique-transports",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-tui",
+      "source": {
+        "evidence": "automonique-tui",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-web",
+      "source": {
+        "evidence": "automonique-web",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "package",
+      "name": "automonique-workspaces",
+      "source": {
+        "evidence": "automonique-workspaces",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "workspace-crates"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "path",
+      "name": ".automonique-current",
+      "source": {
+        "evidence": ".automonique-current -> .automonique-releases/<selected>",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "cited"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "path",
+      "name": ".automonique-releases",
+      "source": {
+        "evidence": ".automonique-releases/<timestamp>-<revision>/",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "cited"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/target-architecture.md",
+      "class": "compatibility-only",
+      "forwards_to": ".automonique-current",
+      "forwards_to_also": [],
+      "kind": "path",
+      "name": ".legacy-current",
+      "reason": "existing installations continue to recognize the previous release selector during the compatibility window, and migration must not create two independently active release selectors.",
+      "source": {
+        "evidence": ".legacy-current",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/target-architecture.md",
+      "class": "compatibility-only",
+      "forwards_to": ".automonique-releases",
+      "forwards_to_also": [],
+      "kind": "path",
+      "name": ".legacy-releases",
+      "reason": "existing installations continue to recognize the previous release tree during the compatibility window; migration adopts or links one verified release tree.",
+      "source": {
+        "evidence": ".legacy-releases",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "ApprovalRequested",
+      "source": {
+        "evidence": "ApprovalRequested",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "ApprovalResolved",
+      "source": {
+        "evidence": "ApprovalResolved",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "AssistantMessageCompleted",
+      "source": {
+        "evidence": "AssistantMessageCompleted",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "presentation-only",
+      "kind": "protocol",
+      "name": "AssistantPreviewDelta",
+      "source": {
+        "evidence": "AssistantPreviewDelta",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "ProviderConnected",
+      "source": {
+        "evidence": "ProviderConnected",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "ProviderDisconnected",
+      "source": {
+        "evidence": "ProviderDisconnected",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "ProviderFault",
+      "source": {
+        "evidence": "ProviderFault",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "ProviderWarning",
+      "source": {
+        "evidence": "ProviderWarning",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "RunTerminal",
+      "source": {
+        "evidence": "RunTerminal",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "SessionCreated",
+      "source": {
+        "evidence": "SessionCreated",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "SessionLoaded",
+      "source": {
+        "evidence": "SessionLoaded",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "SessionUpdated",
+      "source": {
+        "evidence": "SessionUpdated",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "SubagentCompleted",
+      "source": {
+        "evidence": "SubagentCompleted",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "SubagentEvent",
+      "source": {
+        "evidence": "SubagentEvent",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "SubagentStarted",
+      "source": {
+        "evidence": "SubagentStarted",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "ToolCallCompleted",
+      "source": {
+        "evidence": "ToolCallCompleted",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "ToolCallStarted",
+      "source": {
+        "evidence": "ToolCallStarted",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "ToolCallUpdated",
+      "source": {
+        "evidence": "ToolCallUpdated",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "TurnCompleted",
+      "source": {
+        "evidence": "TurnCompleted",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "TurnInterrupted",
+      "source": {
+        "evidence": "TurnInterrupted",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "TurnQueued",
+      "source": {
+        "evidence": "TurnQueued",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "TurnStarted",
+      "source": {
+        "evidence": "TurnStarted",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "TurnSteered",
+      "source": {
+        "evidence": "TurnSteered",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "UsageUpdated",
+      "source": {
+        "evidence": "UsageUpdated",
+        "files": [
+          "docs/product-plan/requirements/agent-integrations.md"
+        ],
+        "region": "normalized-events"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "protocol",
+      "name": "automonique.dev-metrics/v1",
+      "source": {
+        "evidence": "versioned `automonique.dev-metrics/v1` manifest",
+        "files": [
+          "docs/product-plan/requirements/ai-implementation-harness.md"
+        ],
+        "region": "cited"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "service",
+      "name": "automonique daemon",
+      "source": {
+        "evidence": "`daemon` names the long-running control-plane role",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "cited"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "service",
+      "name": "automonique runner",
+      "source": {
+        "evidence": "### `automonique runner` execution host",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "cited"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "service",
+      "name": "automonique-deploy-broker",
+      "source": {
+        "evidence": "`automonique-deploy-broker` \u2014 root-owned deployment broker",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "cited"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "service",
+      "name": "automonique-lab",
+      "source": {
+        "evidence": "`automonique-lab` is deliberately outside the production process graph",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "cited"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "service",
+      "name": "automonique-sandbox-launcher",
+      "source": {
+        "evidence": "`automonique-sandbox-launcher` \u2014 optional root-owned namespace/routing setup",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "cited"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "class": "durable",
+      "kind": "service",
+      "name": "automonique-shell",
+      "source": {
+        "evidence": "optional isolated interactive shell/file-transfer service",
+        "files": [
+          "docs/product-plan/requirements/target-architecture.md"
+        ],
+        "region": "cited"
+      },
+      "spelling_form": "literal"
+    }
+  ],
+  "families": [
+    {
+      "absorbed": [
+        "legacy_action_receipts",
+        "legacy_agent_profiles",
+        "legacy_approvals",
+        "legacy_artifact_links",
+        "legacy_artifacts",
+        "legacy_audit_events",
+        "legacy_automation_firings",
+        "legacy_automation_revisions",
+        "legacy_automations",
+        "legacy_connector_cursors",
+        "legacy_connector_installations",
+        "legacy_context_manifests",
+        "legacy_context_references",
+        "legacy_controller_leases",
+        "legacy_domain_events",
+        "legacy_executor_allocations",
+        "legacy_executor_capability_snapshots",
+        "legacy_executor_registrations",
+        "legacy_extension_installations",
+        "legacy_extension_packages",
+        "legacy_goal_iterations",
+        "legacy_goal_judgements",
+        "legacy_goals",
+        "legacy_hook_bindings",
+        "legacy_input_queue_items",
+        "legacy_mcp_capability_snapshots",
+        "legacy_mcp_servers",
+        "legacy_media_assets",
+        "legacy_media_derivations",
+        "legacy_memories",
+        "legacy_memory_proposals",
+        "legacy_memory_provider_bindings",
+        "legacy_notifications",
+        "legacy_proactive_targets",
+        "legacy_profile_revisions",
+        "legacy_protocol_clients",
+        "legacy_protocol_runs",
+        "legacy_provider_records",
+        "legacy_raw_provider_records",
+        "legacy_reload_epochs",
+        "legacy_settings_revisions",
+        "legacy_skill_catalogs",
+        "legacy_skill_installations",
+        "legacy_skill_revisions",
+        "legacy_speech_generations",
+        "legacy_tool_revisions",
+        "legacy_toolsets",
+        "legacy_transcriptions",
+        "legacy_transport_conversations",
+        "legacy_transport_interactions",
+        "legacy_transport_messages",
+        "legacy_transport_offsets",
+        "legacy_transport_rate_limits",
+        "legacy_trigger_deliveries",
+        "legacy_trigger_endpoints",
+        "legacy_work_edges",
+        "legacy_workspaces"
+      ],
+      "absorbed_count": 57,
+      "disposition": "out-of-scope",
+      "pattern": "legacy-table-names",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "region": "legacy-tokens"
+    }
+  ],
+  "gaps": [
+    {
+      "id": "legacy-service-names",
+      "reason": "docs/product-plan/reference/legacy-inventory.md describes the predecessor's two live units neutrally as 'the ticket bot and a durable tmux server' and spells neither unit name, so there is no permitted source to cite. Inventing one would be invention, not derivation.",
+      "statement": "no legacy name is inventoried under the service kind."
+    },
+    {
+      "id": "dashboard-route-paths",
+      "reason": "docs/product-plan/reference/legacy-inventory.md enumerates them and the plan reproduces the surface through the generated SDK, but no permitted source states whether each route path survives, forwards or is replaced, so every entry would be an unclassified finding carrying no information the source does not already carry.",
+      "statement": "the 38 dashboard API routes are not inventoried."
+    },
+    {
+      "id": "canonical-wire-protocol-names",
+      "reason": "the corpus spells `automonique.dev-metrics/v1` and no other dotted canonical protocol name, which is why the version-1 compatibility protocol family is recorded as unclassified rather than forwarded.",
+      "statement": "no canonical Automonique wire-protocol name is inventoried beyond the development-metrics manifest schema."
+    },
+    {
+      "id": "legacy-command-count",
+      "reason": "the region extracts what the document spells. The discrepancy is reported rather than reconciled, because reconciling it would mean inventing two commands or editing a source outside this item's lease.",
+      "statement": "legacy-inventory.md heads its direct command list 'Commands (21)' and then lists 19 backticked commands."
+    },
+    {
+      "id": "backward-scan-coverage",
+      "reason": "the compatibility half is covered corpus-wide by the `legacy-tokens` region, which reads every markdown file under docs/product-plan/. The canonical half is covered where the corpus enumerates it deterministically (workspace crates, binary subcommands, npm packages, normalized events) and by forwarding closure elsewhere: every compatibility-only entry's counterpart must exist as a durable entry. Prose that names a canonical identifier in neither an enumerated region nor a forwarding relation is not scanned.",
+      "statement": "the backward direction of the drift check covers the ten regions listed under `regions`, not the whole corpus."
+    }
+  ],
+  "generator": "tools/identifiers/inventory.py",
+  "item": "R0-13",
+  "legacy_exceptions": [
+    {
+      "authorized_by": "docs/product-plan/requirements/target-architecture.md",
+      "forwards_to": ".automonique-current",
+      "kind": "path",
+      "name": ".legacy-current"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/target-architecture.md",
+      "forwards_to": ".automonique-releases",
+      "kind": "path",
+      "name": ".legacy-releases"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/typescript-sdk.md",
+      "forwards_to": "@automonique",
+      "kind": "package",
+      "name": "@legacy"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/channel-integrations.md",
+      "forwards_to": "@automonique",
+      "kind": "package",
+      "name": "@legacy/*"
+    },
+    {
+      "authorized_by": "docs/product-plan/reference/plan-review.md",
+      "forwards_to": "@automonique/sdk*",
+      "kind": "package",
+      "name": "@legacy/sdk*"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/channel-integrations.md",
+      "forwards_to": "@automonique/sdk/connector",
+      "kind": "package",
+      "name": "@legacy/sdk/connector"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/typescript-sdk.md",
+      "forwards_to": "@automonique/sdk/provider",
+      "kind": "package",
+      "name": "@legacy/sdk/provider"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/operations-and-governance.md",
+      "forwards_to": "AUTOMONIQUE_*",
+      "kind": "environment-variable",
+      "name": "LEGACY_*"
+    },
+    {
+      "authorized_by": "docs/product-plan/reference/migration-plan.md",
+      "forwards_to": "AUTOMONIQUE_RUNNER",
+      "kind": "environment-variable",
+      "name": "LEGACY_RUNNER"
+    },
+    {
+      "authorized_by": "docs/product-plan/reference/feature-parity.md",
+      "forwards_to": "automonique-say",
+      "kind": "command",
+      "name": "legacy-say"
+    },
+    {
+      "authorized_by": "docs/product-plan/reference/migration-plan.md",
+      "forwards_to": "automonique-shell",
+      "kind": "command",
+      "name": "legacy-shell"
+    },
+    {
+      "authorized_by": "docs/product-plan/reference/feature-parity.md",
+      "forwards_to": "automonique-shot",
+      "kind": "command",
+      "name": "legacy-shot"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/operator-tui.md",
+      "forwards_to": "automonique tui",
+      "kind": "command",
+      "name": "legacy-tui"
+    },
+    {
+      "authorized_by": "docs/product-plan/reference/migration-plan.md",
+      "forwards_to": "automonique audit",
+      "kind": "command",
+      "name": "legacy:audit"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/target-architecture.md",
+      "forwards_to": "automonique",
+      "kind": "command",
+      "name": "legacyctl"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/operator-tui.md",
+      "forwards_to": "automonique tui",
+      "kind": "command",
+      "name": "legacyctl tui"
+    },
+    {
+      "authorized_by": "docs/product-plan/requirements/target-architecture.md",
+      "forwards_to": "automonique daemon",
+      "kind": "command",
+      "name": "legacyd"
+    }
+  ],
+  "licence": "Elastic-2.0",
+  "out_of_scope": [
+    {
+      "name": "LegacyClient",
+      "reason": "a TypeScript client type alias is not one of the seven inventoried kinds; docs/product-plan/requirements/typescript-sdk.md owns the SDK type surface.",
+      "source": {
+        "evidence": "LegacyClient",
+        "files": [
+          "docs/product-plan/requirements/typescript-sdk.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "LegacyTransport",
+      "reason": "a TypeScript in-memory transport type alias is not one of the seven inventoried kinds; docs/product-plan/requirements/typescript-sdk.md owns the SDK type surface.",
+      "source": {
+        "evidence": "LegacyTransport",
+        "files": [
+          "docs/product-plan/requirements/typescript-sdk.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "access",
+      "reason": "a conversation route label is a stored routing vocabulary, not a service, path, environment variable, protocol, package, command or external-platform name, so the closed kind set cannot represent it.",
+      "source": {
+        "evidence": "access",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-conversation-routes"
+      }
+    },
+    {
+      "name": "chat",
+      "reason": "a conversation route label is a stored routing vocabulary, not a service, path, environment variable, protocol, package, command or external-platform name, so the closed kind set cannot represent it.",
+      "source": {
+        "evidence": "chat",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-conversation-routes"
+      }
+    },
+    {
+      "name": "chatter",
+      "reason": "a conversation route label is a stored routing vocabulary, not a service, path, environment variable, protocol, package, command or external-platform name, so the closed kind set cannot represent it.",
+      "source": {
+        "evidence": "chatter",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-conversation-routes"
+      }
+    },
+    {
+      "name": "clarify",
+      "reason": "a conversation route label is a stored routing vocabulary, not a service, path, environment variable, protocol, package, command or external-platform name, so the closed kind set cannot represent it.",
+      "source": {
+        "evidence": "clarify",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-conversation-routes"
+      }
+    },
+    {
+      "name": "legacy",
+      "reason": "a bare compatibility namespace root written as a glob, not an identifier of any of the seven kinds; the identifiers it stands for are inventoried individually.",
+      "source": {
+        "evidence": "legacy",
+        "files": [
+          "docs/product-plan/requirements/channel-integrations.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy*",
+      "reason": "a bare compatibility namespace root written as a glob, not an identifier of any of the seven kinds; the identifiers it stands for are inventoried individually.",
+      "source": {
+        "evidence": "legacy*",
+        "files": [
+          "docs/product-plan/README.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy-inventory.md",
+      "reason": "a document path inside this repository's own plan corpus, not a predecessor runtime identifier.",
+      "source": {
+        "evidence": "legacy-inventory.md",
+        "files": [
+          "docs/product-plan/reference/feature-parity.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_*",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_*",
+        "files": [
+          "docs/product-plan/README.md",
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_action_receipts",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_action_receipts",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_agent_profiles",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_agent_profiles",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_approvals",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_approvals",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_artifact_links",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_artifact_links",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_artifacts",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_artifacts",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_audit_events",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_audit_events",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_automation_firings",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_automation_firings",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_automation_revisions",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_automation_revisions",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_automations",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_automations",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_connector_cursors",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_connector_cursors",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_connector_installations",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_connector_installations",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_context_manifests",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_context_manifests",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_context_references",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_context_references",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_controller_leases",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_controller_leases",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_domain_events",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_domain_events",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_executor_allocations",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_executor_allocations",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_executor_capability_snapshots",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_executor_capability_snapshots",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_executor_registrations",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_executor_registrations",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_extension_installations",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_extension_installations",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_extension_packages",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_extension_packages",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_goal_iterations",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_goal_iterations",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_goal_judgements",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_goal_judgements",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_goals",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_goals",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_hook_bindings",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_hook_bindings",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_input_queue_items",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_input_queue_items",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_mcp_capability_snapshots",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_mcp_capability_snapshots",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_mcp_servers",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_mcp_servers",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_media_assets",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_media_assets",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_media_derivations",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_media_derivations",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_memories",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_memories",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_memory_proposals",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_memory_proposals",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_memory_provider_bindings",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_memory_provider_bindings",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_notifications",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_notifications",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_proactive_targets",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_proactive_targets",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_profile_revisions",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_profile_revisions",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_protocol_clients",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_protocol_clients",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_protocol_runs",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_protocol_runs",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_provider_records",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_provider_records",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_raw_provider_records",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_raw_provider_records",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_reload_epochs",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_reload_epochs",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_settings_revisions",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_settings_revisions",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_skill_catalogs",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_skill_catalogs",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_skill_installations",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_skill_installations",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_skill_revisions",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_skill_revisions",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_speech_generations",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_speech_generations",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_tool_revisions",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_tool_revisions",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_toolsets",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_toolsets",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_transcriptions",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_transcriptions",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_transport_conversations",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_transport_conversations",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_transport_interactions",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_transport_interactions",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_transport_messages",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_transport_messages",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_transport_offsets",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_transport_offsets",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_transport_rate_limits",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_transport_rate_limits",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_trigger_deliveries",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_trigger_deliveries",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_trigger_endpoints",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_trigger_endpoints",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_work_edges",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_work_edges",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "legacy_workspaces",
+      "reason": "a durable database table name is not a service, path, environment variable, protocol, package, command or external-platform name; docs/product-plan/requirements/state-and-protocols.md owns the version-1 table vocabulary.",
+      "source": {
+        "evidence": "legacy_workspaces",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      }
+    },
+    {
+      "name": "memory",
+      "reason": "a conversation route label is a stored routing vocabulary, not a service, path, environment variable, protocol, package, command or external-platform name, so the closed kind set cannot represent it.",
+      "source": {
+        "evidence": "memory",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-conversation-routes"
+      }
+    },
+    {
+      "name": "query",
+      "reason": "a conversation route label is a stored routing vocabulary, not a service, path, environment variable, protocol, package, command or external-platform name, so the closed kind set cannot represent it.",
+      "source": {
+        "evidence": "query",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-conversation-routes"
+      }
+    },
+    {
+      "name": "site",
+      "reason": "a conversation route label is a stored routing vocabulary, not a service, path, environment variable, protocol, package, command or external-platform name, so the closed kind set cannot represent it.",
+      "source": {
+        "evidence": "site",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-conversation-routes"
+      }
+    },
+    {
+      "name": "sites",
+      "reason": "a conversation route label is a stored routing vocabulary, not a service, path, environment variable, protocol, package, command or external-platform name, so the closed kind set cannot represent it.",
+      "source": {
+        "evidence": "sites",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-conversation-routes"
+      }
+    },
+    {
+      "name": "support",
+      "reason": "a conversation route label is a stored routing vocabulary, not a service, path, environment variable, protocol, package, command or external-platform name, so the closed kind set cannot represent it.",
+      "source": {
+        "evidence": "support",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-conversation-routes"
+      }
+    },
+    {
+      "name": "support_email",
+      "reason": "a conversation route label is a stored routing vocabulary, not a service, path, environment variable, protocol, package, command or external-platform name, so the closed kind set cannot represent it.",
+      "source": {
+        "evidence": "support_email",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-conversation-routes"
+      }
+    },
+    {
+      "name": "support_email_compose",
+      "reason": "a conversation route label is a stored routing vocabulary, not a service, path, environment variable, protocol, package, command or external-platform name, so the closed kind set cannot represent it.",
+      "source": {
+        "evidence": "support_email_compose",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-conversation-routes"
+      }
+    },
+    {
+      "name": "ticket",
+      "reason": "a conversation route label is a stored routing vocabulary, not a service, path, environment variable, protocol, package, command or external-platform name, so the closed kind set cannot represent it.",
+      "source": {
+        "evidence": "ticket",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-conversation-routes"
+      }
+    },
+    {
+      "name": "tickets",
+      "reason": "a conversation route label is a stored routing vocabulary, not a service, path, environment variable, protocol, package, command or external-platform name, so the closed kind set cannot represent it.",
+      "source": {
+        "evidence": "tickets",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-conversation-routes"
+      }
+    }
+  ],
+  "permitted_corpus": "docs/product-plan",
+  "regions": [
+    {
+      "description": "every backticked npm package token in the permitted corpus under the canonical Automonique scope",
+      "extracted_count": 12,
+      "id": "automonique-packages",
+      "minimum": 8
+    },
+    {
+      "description": "every subcommand of the single unprivileged executable, from the One binary rule dispatch block in target-architecture.md",
+      "extracted_count": 19,
+      "id": "binary-subcommands",
+      "minimum": 15
+    },
+    {
+      "description": "every chat-platform Web API method in the External effect surface of legacy-inventory.md, recorded by its public protocol spelling only",
+      "extracted_count": 13,
+      "id": "chat-platform-methods",
+      "minimum": 10
+    },
+    {
+      "description": "every direct command in the Command and route vocabulary of legacy-inventory.md; the migration plan ports the exact command registry before model-assisted routing",
+      "extracted_count": 19,
+      "id": "legacy-commands",
+      "minimum": 15
+    },
+    {
+      "description": "every deterministic conversation route in the Command and route vocabulary of legacy-inventory.md",
+      "extracted_count": 13,
+      "id": "legacy-conversation-routes",
+      "minimum": 10
+    },
+    {
+      "description": "every product environment variable suffix in the Configuration surface table of legacy-inventory.md; the uniform prefix is noted once there and is never written here",
+      "extracted_count": 43,
+      "id": "legacy-environment-suffixes",
+      "minimum": 40
+    },
+    {
+      "description": "every backticked token in the permitted corpus whose first segment is the compatibility namespace root, ignoring a leading '@' or '.'",
+      "extracted_count": 84,
+      "id": "legacy-tokens",
+      "minimum": 25
+    },
+    {
+      "description": "every normalized event name in the Normalized event model of agent-integrations.md",
+      "extracted_count": 24,
+      "id": "normalized-events",
+      "minimum": 20
+    },
+    {
+      "description": "every unprefixed environment variable in legacy-inventory.md, which that document classifies as a credential or third-party contract",
+      "extracted_count": 11,
+      "id": "unprefixed-environment-variables",
+      "minimum": 10
+    },
+    {
+      "description": "every Cargo package named by the target workspace layout tree in target-architecture.md",
+      "extracted_count": 30,
+      "id": "workspace-crates",
+      "minimum": 25
+    }
+  ],
+  "schema": "automonique.identifier-inventory/v1",
+  "unclassified": [
+    {
+      "kind": "environment-variable",
+      "name": "AGENT",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "AGENT",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "CLASSIFY",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "CLASSIFY",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "CLASSIFY_MODEL",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "CLASSIFY_MODEL",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "CODEX_DANGER_FULL_ACCESS",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "CODEX_DANGER_FULL_ACCESS",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "CONVERSATION_ROUTER_SHADOW",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "CONVERSATION_ROUTER_SHADOW",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "CONVERSATION_ROUTER_V2",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "CONVERSATION_ROUTER_V2",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "DASH_HOST",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "DASH_HOST",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "DASH_PASS",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "DASH_PASS",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "DASH_PORT",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "DASH_PORT",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "DASH_TOKEN",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "DASH_TOKEN",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "DASH_USER",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "DASH_USER",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "DB",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "DB",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "FLEET_CONCURRENCY",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "FLEET_CONCURRENCY",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "FLEET_ENABLED",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "FLEET_ENABLED",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "FLEET_HEARTBEAT_MS",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "FLEET_HEARTBEAT_MS",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "FLEET_INSTANCE_ID",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "FLEET_INSTANCE_ID",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "FLEET_LOCK_HARNESS",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "FLEET_LOCK_HARNESS",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "FLEET_POLL_MS",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "FLEET_POLL_MS",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "FLEET_TOKEN",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "FLEET_TOKEN",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "FLEET_URL",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "FLEET_URL",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "GLOBAL_MAX_CONCURRENCY",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "GLOBAL_MAX_CONCURRENCY",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "GUARD",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "GUARD",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "GUARD_SETTINGS",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "GUARD_SETTINGS",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "JCODE_*",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "JCODE_*",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "name-family"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "MANAGE_SLACK_SYNC",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "MANAGE_SLACK_SYNC",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "MAX_CONCURRENCY",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "MAX_CONCURRENCY",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "MODEL",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "MODEL",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "MODELS",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "MODELS",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "REPO_DIR",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "REPO_DIR",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "SLACK_EVENT_DEDUP_TTL_MS",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "SLACK_EVENT_DEDUP_TTL_MS",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "SPLIT",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "SPLIT",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "SPOOL_ROOT",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "SPOOL_ROOT",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "SUPPORT_MAILER_ENV",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "SUPPORT_MAILER_ENV",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "SUPPORT_MAILER_NODE",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "SUPPORT_MAILER_NODE",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "SUPPORT_MAILER_PATH",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "SUPPORT_MAILER_PATH",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "TERM_COLS",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "TERM_COLS",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "TERM_IDLE_TTL_MS",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "TERM_IDLE_TTL_MS",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "TERM_ROWS",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "TERM_ROWS",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "TMUX_EXEC",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "TMUX_EXEC",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "TMUX_SOCKET",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "TMUX_SOCKET",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "WORKER_SANDBOX",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "WORKER_SANDBOX",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "WORKER_SANDBOX_BIN",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "WORKER_SANDBOX_BIN",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "environment-variable",
+      "name": "WORKER_TMP_ROOT",
+      "reason": "docs/product-plan/reference/legacy-inventory.md records this as a suffix of the predecessor's uniform product prefix, and no permitted source spells the canonical Automonique variable it would forward to. docs/product-plan/requirements/operations-and-governance.md states the rule that would generate the pair (canonical AUTOMONIQUE_* resolved before legacy LEGACY_* fallback) but enumerates no suffix, so classifying this compatibility-only would create the dangling forward the contract refuses, and classifying it durable would assert a rename no document has made.",
+      "source": {
+        "evidence": "WORKER_TMP_ROOT",
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "legacy-environment-suffixes"
+      },
+      "spelling_form": "legacy-suffix"
+    },
+    {
+      "kind": "path",
+      "name": "legacy-run.sh",
+      "reason": "the porting map names its Rust destination (automonique-runner execution hosts) but no permitted source declares a forwarding alias or a canonical path for it, so recording it compatibility-only would create a dangling forward and recording it durable would assert a survival the plan does not state.",
+      "source": {
+        "evidence": "legacy-run.sh",
+        "files": [
+          "docs/product-plan/reference/migration-plan.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "kind": "path",
+      "name": "legacy.db",
+      "reason": "docs/product-plan/requirements/operator-tui.md names this only as a file the TUI never opens directly, and no permitted source spells a canonical Automonique database path it would forward to.",
+      "source": {
+        "evidence": "legacy.db",
+        "files": [
+          "docs/product-plan/requirements/operator-tui.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "literal"
+    },
+    {
+      "kind": "protocol",
+      "name": "legacy.*",
+      "reason": "docs/product-plan/requirements/state-and-protocols.md calls this a version-1 compatibility surface that a compatibility release may decode but never emit, and docs/product-plan/requirements/target-architecture.md retains its codec, but no permitted source spells the canonical Automonique protocol name it would forward to; recording it compatibility-only would create the dangling forward the contract refuses.",
+      "source": {
+        "evidence": "legacy.*",
+        "files": [
+          "docs/product-plan/README.md",
+          "docs/product-plan/requirements/channel-integrations.md",
+          "docs/product-plan/requirements/state-and-protocols.md",
+          "docs/product-plan/requirements/target-architecture.md",
+          "docs/product-plan/requirements/typescript-sdk.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "name-family"
+    },
+    {
+      "kind": "protocol",
+      "name": "legacy.runner.event",
+      "reason": "docs/product-plan/requirements/state-and-protocols.md calls this a version-1 compatibility surface that a compatibility release may decode but never emit, and docs/product-plan/requirements/target-architecture.md retains its codec, but no permitted source spells the canonical Automonique protocol name it would forward to; recording it compatibility-only would create the dangling forward the contract refuses.",
+      "source": {
+        "evidence": "legacy.runner.event",
+        "files": [
+          "docs/product-plan/requirements/state-and-protocols.md"
+        ],
+        "region": "legacy-tokens"
+      },
+      "spelling_form": "literal"
+    }
+  ],
+  "vocabulary": {
+    "classes": [
+      "compatibility-only",
+      "durable",
+      "presentation-only"
+    ],
+    "dispositions": [
+      "compatibility-only",
+      "durable",
+      "presentation-only",
+      "unclassified",
+      "out-of-scope",
+      "withheld"
+    ],
+    "kinds": [
+      "command",
+      "environment-variable",
+      "external-platform-name",
+      "package",
+      "path",
+      "protocol",
+      "service"
+    ],
+    "spelling_forms": [
+      "literal",
+      "legacy-suffix",
+      "name-family"
+    ]
+  },
+  "withheld": [
+    {
+      "reason": "the unprefixed variable at this fingerprint names a third-party product. plan/gates.md#gate-scrub permits third-party product names nowhere, so the inventory accounts for the variable without copying its spelling out of the sanctioned inventory.",
+      "sha256": "33995859639c81ae2f708a8ac6853b22301affe6260485471a5bdaebe227d35f",
+      "source": {
+        "files": [
+          "docs/product-plan/reference/legacy-inventory.md"
+        ],
+        "region": "unprefixed-environment-variables"
+      }
+    }
+  ]
+}

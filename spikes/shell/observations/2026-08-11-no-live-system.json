@@ -1,0 +1,57 @@
+{
+  "schema": "automonique.shell-usage-observations/v1",
+  "corpus_id": "2026-08-11-no-live-system",
+  "kind": "unmeasured",
+  "captured_on": "2026-08-11",
+  "capture_host_access": "none",
+  "observations": [
+    {
+      "class": "interactive_shell_create",
+      "count": null,
+      "reason": "no running instance of the predecessor system is reachable from this repository, and no session-table or audit-log export has been supplied; a number here would be recall, not measurement",
+      "capture_method": "none",
+      "capture_citation": {"kind": "none", "ref": null},
+      "samples": []
+    },
+    {
+      "class": "interactive_shell_attach",
+      "count": null,
+      "reason": "attach events are audited on the running system only; nothing in this repository records them and no export has been supplied",
+      "capture_method": "none",
+      "capture_citation": {"kind": "none", "ref": null},
+      "samples": []
+    },
+    {
+      "class": "interactive_shell_command",
+      "count": null,
+      "reason": "per-command counts would need session or process accounting on a live host; this fixture has no host access and the archive holding the prior implementation is out of context by AGENTS.md",
+      "capture_method": "none",
+      "capture_citation": {"kind": "none", "ref": null},
+      "samples": []
+    },
+    {
+      "class": "file_upload",
+      "count": null,
+      "reason": "upload counts live in the running artifact and transfer logs; no export has been supplied to this repository",
+      "capture_method": "none",
+      "capture_citation": {"kind": "none", "ref": null},
+      "samples": []
+    },
+    {
+      "class": "file_download",
+      "count": null,
+      "reason": "download counts live in the running artifact and transfer logs; no export has been supplied to this repository",
+      "capture_method": "none",
+      "capture_citation": {"kind": "none", "ref": null},
+      "samples": []
+    },
+    {
+      "class": "inline_path_bridge",
+      "count": null,
+      "reason": "use of the arbitrary host-path transfer bridge can only be counted where it runs; this repository cannot observe it and must not guess whether it is dead or load-bearing",
+      "capture_method": "none",
+      "capture_citation": {"kind": "none", "ref": null},
+      "samples": []
+    }
+  ]
+}

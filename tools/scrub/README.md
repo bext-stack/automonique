@@ -34,6 +34,12 @@ python3 -m unittest discover -s tools/scrub -p 'test_*.py'
 python3 tools/scrub/scan.py
 ```
 
+A development run prints a note saying it found nothing *it could have found*.
+A scan's coverage is exactly its installed rules, so with no protected rules a
+pass shows the scanner works and says nothing about whether a private identifier
+is in the tree. `test_cli.py` measures that rather than asserting it: the same
+reintroduction that a protected rule catches passes development mode unseen.
+
 Publication mode additionally requires externally configured values:
 
 ```sh

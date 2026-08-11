@@ -1,0 +1,76 @@
+{
+  "schema": "automonique.shell-usage-observations/v1",
+  "corpus_id": "2026-08-11-synthetic-example",
+  "kind": "synthetic",
+  "captured_on": "2026-08-11",
+  "capture_host_access": "none",
+  "observations": [
+    {
+      "class": "interactive_shell_create",
+      "count": 42,
+      "capture_method": "synthetic_authored",
+      "capture_citation": {"kind": "repository_document", "ref": "spikes/shell/README.md"},
+      "window": {"start": "2026-05-13", "end": "2026-08-10"},
+      "samples": [
+        {"shape": "service_control", "placeholders": ["SYNTHETIC_SERVICE"], "synthetic": true}
+      ]
+    },
+    {
+      "class": "interactive_shell_attach",
+      "count": 118,
+      "capture_method": "synthetic_authored",
+      "capture_citation": {"kind": "repository_document", "ref": "spikes/shell/README.md"},
+      "window": {"start": "2026-05-13", "end": "2026-08-10"},
+      "samples": [
+        {"shape": "log_inspection", "placeholders": ["SYNTHETIC_SERVICE", "SYNTHETIC_PATH"], "synthetic": true}
+      ]
+    },
+    {
+      "class": "interactive_shell_command",
+      "count": 1763,
+      "capture_method": "synthetic_authored",
+      "capture_citation": {"kind": "repository_document", "ref": "spikes/shell/README.md"},
+      "window": {"start": "2026-05-13", "end": "2026-08-10"},
+      "samples": [
+        {"shape": "log_inspection", "placeholders": ["SYNTHETIC_SERVICE"], "synthetic": true},
+        {"shape": "filesystem_inspection", "placeholders": ["SYNTHETIC_WORKSPACE", "SYNTHETIC_PATH"], "synthetic": true},
+        {"shape": "database_client", "placeholders": ["SYNTHETIC_DATABASE"], "synthetic": true},
+        {"shape": "package_management", "placeholders": ["SYNTHETIC_SERVICE"], "synthetic": true},
+        {"shape": "text_editor", "placeholders": ["SYNTHETIC_FILE"], "synthetic": true},
+        {"shape": "network_diagnostic", "placeholders": ["SYNTHETIC_HOST"], "synthetic": true},
+        {"shape": "build_or_test", "placeholders": ["SYNTHETIC_WORKSPACE"], "synthetic": true},
+        {"shape": "other_uncategorized", "placeholders": ["SYNTHETIC_USER"], "synthetic": true}
+      ]
+    },
+    {
+      "class": "file_upload",
+      "count": 27,
+      "capture_method": "synthetic_authored",
+      "capture_citation": {"kind": "repository_document", "ref": "spikes/shell/README.md"},
+      "window": {"start": "2026-05-13", "end": "2026-08-10"},
+      "samples": [
+        {"shape": "file_transfer", "placeholders": ["SYNTHETIC_FILE", "SYNTHETIC_WORKSPACE"], "synthetic": true}
+      ]
+    },
+    {
+      "class": "file_download",
+      "count": 64,
+      "capture_method": "synthetic_authored",
+      "capture_citation": {"kind": "repository_document", "ref": "spikes/shell/README.md"},
+      "window": {"start": "2026-05-13", "end": "2026-08-10"},
+      "samples": [
+        {"shape": "file_transfer", "placeholders": ["SYNTHETIC_FILE"], "synthetic": true}
+      ]
+    },
+    {
+      "class": "inline_path_bridge",
+      "count": 3,
+      "capture_method": "synthetic_authored",
+      "capture_citation": {"kind": "repository_document", "ref": "spikes/shell/README.md"},
+      "window": {"start": "2026-05-13", "end": "2026-08-10"},
+      "samples": [
+        {"shape": "file_transfer", "placeholders": ["SYNTHETIC_PATH"], "synthetic": true}
+      ]
+    }
+  ]
+}

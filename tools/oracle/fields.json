@@ -1,0 +1,53 @@
+{
+  "schema": "automonique.oracle-fields/v1",
+  "fields": [
+    {
+      "id": "state_transition",
+      "area": "state",
+      "masked": false,
+      "description": "semantic state transition taken for the fixture"
+    },
+    {
+      "id": "action_effect",
+      "area": "action",
+      "masked": false,
+      "description": "external effect the run requested"
+    },
+    {
+      "id": "receipt",
+      "area": "receipt",
+      "masked": false,
+      "description": "receipt body compared field by field"
+    },
+    {
+      "id": "receipt_timestamp",
+      "area": "receipt",
+      "masked": true,
+      "description": "receipt clock value, approved as nondeterministic"
+    },
+    {
+      "id": "rendered_message",
+      "area": "rendering",
+      "masked": false,
+      "description": "rendered message structure, not its text"
+    },
+    {
+      "id": "provider_event",
+      "area": "provider_event",
+      "masked": false,
+      "description": "normalized provider event kind and ordering"
+    },
+    {
+      "id": "provider_event_id",
+      "area": "provider_event",
+      "masked": true,
+      "description": "provider-assigned event identifier, approved as nondeterministic"
+    },
+    {
+      "id": "resource_class",
+      "area": "resource",
+      "masked": false,
+      "description": "coarse resource class, never a measured quantity"
+    }
+  ]
+}

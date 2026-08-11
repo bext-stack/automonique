@@ -1,0 +1,268 @@
+{
+  "classes": {
+    "file_download": {
+      "measured": {
+        "capture_citation": null,
+        "capture_method": null,
+        "corpus_id": null,
+        "count": null,
+        "per_day": null,
+        "window": null
+      },
+      "resolvable": false,
+      "resolvable_reason": "no measured count for this class; the only count is synthetic and cannot resolve anything",
+      "sample_shapes": [
+        "file_transfer"
+      ],
+      "source": "docs/product-plan/reference/feature-parity.md",
+      "summary": "bytes downloaded out of a workspace through the shell surface",
+      "synthetic": {
+        "capture_citation": {
+          "kind": "repository_document",
+          "ref": "spikes/shell/README.md"
+        },
+        "capture_method": "synthetic_authored",
+        "corpus_id": "2026-08-11-synthetic-example",
+        "count": 64,
+        "per_day": 0.711,
+        "window": {
+          "end": "2026-08-10",
+          "start": "2026-05-13"
+        }
+      },
+      "unmeasured": [
+        {
+          "corpus_id": "2026-08-11-no-live-system",
+          "kind": "unmeasured",
+          "reason": "download counts live in the running artifact and transfer logs; no export has been supplied to this repository"
+        }
+      ]
+    },
+    "file_upload": {
+      "measured": {
+        "capture_citation": null,
+        "capture_method": null,
+        "corpus_id": null,
+        "count": null,
+        "per_day": null,
+        "window": null
+      },
+      "resolvable": false,
+      "resolvable_reason": "no measured count for this class; the only count is synthetic and cannot resolve anything",
+      "sample_shapes": [
+        "file_transfer"
+      ],
+      "source": "docs/product-plan/reference/feature-parity.md",
+      "summary": "bytes uploaded into a workspace through the shell surface",
+      "synthetic": {
+        "capture_citation": {
+          "kind": "repository_document",
+          "ref": "spikes/shell/README.md"
+        },
+        "capture_method": "synthetic_authored",
+        "corpus_id": "2026-08-11-synthetic-example",
+        "count": 27,
+        "per_day": 0.3,
+        "window": {
+          "end": "2026-08-10",
+          "start": "2026-05-13"
+        }
+      },
+      "unmeasured": [
+        {
+          "corpus_id": "2026-08-11-no-live-system",
+          "kind": "unmeasured",
+          "reason": "upload counts live in the running artifact and transfer logs; no export has been supplied to this repository"
+        }
+      ]
+    },
+    "inline_path_bridge": {
+      "measured": {
+        "capture_citation": null,
+        "capture_method": null,
+        "corpus_id": null,
+        "count": null,
+        "per_day": null,
+        "window": null
+      },
+      "resolvable": false,
+      "resolvable_reason": "no measured count for this class; the only count is synthetic and cannot resolve anything",
+      "sample_shapes": [
+        "file_transfer"
+      ],
+      "source": "docs/product-plan/reference/migration-plan.md",
+      "summary": "the arbitrary host-path transfer bridge the migration removes",
+      "synthetic": {
+        "capture_citation": {
+          "kind": "repository_document",
+          "ref": "spikes/shell/README.md"
+        },
+        "capture_method": "synthetic_authored",
+        "corpus_id": "2026-08-11-synthetic-example",
+        "count": 3,
+        "per_day": 0.033,
+        "window": {
+          "end": "2026-08-10",
+          "start": "2026-05-13"
+        }
+      },
+      "unmeasured": [
+        {
+          "corpus_id": "2026-08-11-no-live-system",
+          "kind": "unmeasured",
+          "reason": "use of the arbitrary host-path transfer bridge can only be counted where it runs; this repository cannot observe it and must not guess whether it is dead or load-bearing"
+        }
+      ]
+    },
+    "interactive_shell_attach": {
+      "measured": {
+        "capture_citation": null,
+        "capture_method": null,
+        "corpus_id": null,
+        "count": null,
+        "per_day": null,
+        "window": null
+      },
+      "resolvable": false,
+      "resolvable_reason": "no measured count for this class; the only count is synthetic and cannot resolve anything",
+      "sample_shapes": [
+        "log_inspection"
+      ],
+      "source": "docs/product-plan/reference/migration-plan.md",
+      "summary": "attaching to an existing session as observer or controller",
+      "synthetic": {
+        "capture_citation": {
+          "kind": "repository_document",
+          "ref": "spikes/shell/README.md"
+        },
+        "capture_method": "synthetic_authored",
+        "corpus_id": "2026-08-11-synthetic-example",
+        "count": 118,
+        "per_day": 1.311,
+        "window": {
+          "end": "2026-08-10",
+          "start": "2026-05-13"
+        }
+      },
+      "unmeasured": [
+        {
+          "corpus_id": "2026-08-11-no-live-system",
+          "kind": "unmeasured",
+          "reason": "attach events are audited on the running system only; nothing in this repository records them and no export has been supplied"
+        }
+      ]
+    },
+    "interactive_shell_command": {
+      "measured": {
+        "capture_citation": null,
+        "capture_method": null,
+        "corpus_id": null,
+        "count": null,
+        "per_day": null,
+        "window": null
+      },
+      "resolvable": false,
+      "resolvable_reason": "no measured count for this class; the only count is synthetic and cannot resolve anything",
+      "sample_shapes": [
+        "build_or_test",
+        "database_client",
+        "filesystem_inspection",
+        "log_inspection",
+        "network_diagnostic",
+        "other_uncategorized",
+        "package_management",
+        "text_editor"
+      ],
+      "source": "docs/product-plan/reference/feature-parity.md",
+      "summary": "commands run inside an attached session, recorded by shape only",
+      "synthetic": {
+        "capture_citation": {
+          "kind": "repository_document",
+          "ref": "spikes/shell/README.md"
+        },
+        "capture_method": "synthetic_authored",
+        "corpus_id": "2026-08-11-synthetic-example",
+        "count": 1763,
+        "per_day": 19.589,
+        "window": {
+          "end": "2026-08-10",
+          "start": "2026-05-13"
+        }
+      },
+      "unmeasured": [
+        {
+          "corpus_id": "2026-08-11-no-live-system",
+          "kind": "unmeasured",
+          "reason": "per-command counts would need session or process accounting on a live host; this fixture has no host access and the archive holding the prior implementation is out of context by AGENTS.md"
+        }
+      ]
+    },
+    "interactive_shell_create": {
+      "measured": {
+        "capture_citation": null,
+        "capture_method": null,
+        "corpus_id": null,
+        "count": null,
+        "per_day": null,
+        "window": null
+      },
+      "resolvable": false,
+      "resolvable_reason": "no measured count for this class; the only count is synthetic and cannot resolve anything",
+      "sample_shapes": [
+        "service_control"
+      ],
+      "source": "docs/product-plan/reference/feature-parity.md",
+      "summary": "creating an interactive shell session on the current dashboard",
+      "synthetic": {
+        "capture_citation": {
+          "kind": "repository_document",
+          "ref": "spikes/shell/README.md"
+        },
+        "capture_method": "synthetic_authored",
+        "corpus_id": "2026-08-11-synthetic-example",
+        "count": 42,
+        "per_day": 0.467,
+        "window": {
+          "end": "2026-08-10",
+          "start": "2026-05-13"
+        }
+      },
+      "unmeasured": [
+        {
+          "corpus_id": "2026-08-11-no-live-system",
+          "kind": "unmeasured",
+          "reason": "no running instance of the predecessor system is reachable from this repository, and no session-table or audit-log export has been supplied; a number here would be recall, not measurement"
+        }
+      ]
+    }
+  },
+  "generator": "spikes/shell/replay.py",
+  "replayed_from": [
+    {
+      "capture_host_access": "none",
+      "captured_on": "2026-08-11",
+      "corpus_id": "2026-08-11-no-live-system",
+      "counted_classes": 0,
+      "kind": "unmeasured",
+      "null_with_reason_classes": 6,
+      "path": "spikes/shell/observations/2026-08-11-no-live-system.json",
+      "sha256": "93858a8c384ee037dc4f6e9e246197ea4d7c7e874c8cd121236f0da948a533e2"
+    },
+    {
+      "capture_host_access": "none",
+      "captured_on": "2026-08-11",
+      "corpus_id": "2026-08-11-synthetic-example",
+      "counted_classes": 6,
+      "kind": "synthetic",
+      "null_with_reason_classes": 0,
+      "path": "spikes/shell/observations/2026-08-11-synthetic-example.json",
+      "sha256": "1d7eaaeb7f198f2fac951b55155b89f90483169c2deab39cdcbc1eec52e8789c"
+    }
+  ],
+  "schema": "automonique.shell-decision-inputs/v1",
+  "totals": {
+    "corpora": 2,
+    "resolvable_classes": 0,
+    "usage_classes": 6
+  }
+}

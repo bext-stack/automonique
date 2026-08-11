@@ -88,9 +88,19 @@ gate to be worked around.
 2. `plan/check.py --verify` must pass, warning included.
 3. `plan/baseline.py` is regenerated so the counters reflect reality.
 4. The seven partial items stay selectable with their gaps in `ready.md`.
-5. Future items go through `plan/gate.py --commit` *before* landing, so this
-   decision is not needed twice. That is the real fix and it costs nothing going
-   forward.
+5. ~~Future items go through `plan/gate.py --commit` *before* landing, so this
+   decision is not needed twice.~~ **Corrected 2026-08-11.** This was written
+   without checking, and it is wrong. `--commit` refuses unconditionally:
+   *"disabled until baseline, history, done status and regenerated plan
+   artifacts can be included and verified in one exact completion tree."* The
+   dirty-lease problem described above is real but is not the binding
+   constraint — the gate cannot authorize a completion today in any state.
+   What is available is `--dry-run`, a full completion preflight that checks
+   readiness, lease, evidence, plan integrity and metric and authorizes
+   nothing. Running it while the work is still uncommitted is now the standard,
+   and the batch that followed this decision did so. Enabling `--commit` is its
+   own piece of work; see
+   `plan/owner-decisions/2026-08-11-r1-12-contract-amendments.md`.
 
 ## What this decision does not do
 

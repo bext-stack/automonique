@@ -48,6 +48,13 @@ inability of workers to mint protected integration authority remain required.
 - **Merger:** performs one compare-and-swap integration after all policy gates
   pass; it cannot create or modify the candidate.
 
+Which identity performs each of these roles is recorded in
+`.github/identity/register.toml`, and `.github/identity/check_identity.py`
+reads the role vocabulary from this section rather than restating it: a role
+added here and assigned to nobody there fails the check. Roles coinciding on
+one identity is permitted and is what the register describes today. Describing
+them as separate when one credential does all of them is not.
+
 Review is owner-configurable and risk-based. Zero independent reviewers is a
 valid recorded outcome; it must never be represented as independent review.
 An owner may require one or more fresh-context reviews for a particular

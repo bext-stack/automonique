@@ -1,0 +1,236 @@
+{
+  "schema": "automonique.restore-dependencies/v1",
+  "work_item": "R0-09",
+  "consumer": "R0-10",
+  "source": {
+    "path": "plan/inventory/surface/inventory.json",
+    "sha256": "363e35fbccffaa39beba44e46010013f1ccf7dc4a665cefc4777109aeaed8e6d"
+  },
+  "objectives": [
+    {
+      "id": "recovery-point-objective-control-state",
+      "summary": "Initial acceptance recovery point objective for durable control state.",
+      "value": 5,
+      "unit": "minute",
+      "source": {
+        "path": "docs/product-plan/requirements/operations-and-governance.md",
+        "quote": "Initial acceptance objectives are RPO <= 5 minutes for durable control state and RTO <= 30 minutes on the same class of host."
+      }
+    },
+    {
+      "id": "recovery-time-objective-same-host-class",
+      "summary": "Initial acceptance recovery time objective, on the same class of host.",
+      "value": 30,
+      "unit": "minute",
+      "source": {
+        "path": "docs/product-plan/requirements/operations-and-governance.md",
+        "quote": "Initial acceptance objectives are RPO <= 5 minutes for durable control state and RTO <= 30 minutes on the same class of host."
+      }
+    }
+  ],
+  "order": [
+    {
+      "position": 1,
+      "id": "artifact-metadata-and-tombstones",
+      "class": "recovery-set-input",
+      "requires": [],
+      "verification": "none-recorded",
+      "summary": "Artifact metadata, blobs and deletion tombstones."
+    },
+    {
+      "position": 2,
+      "id": "audit-journal-through-watermark",
+      "class": "recovery-set-input",
+      "requires": [],
+      "verification": "none-recorded",
+      "summary": "The audit and event journal through the snapshot watermark; events after it belong to the next backup."
+    },
+    {
+      "position": 3,
+      "id": "configuration-and-workspace-registry",
+      "class": "recovery-set-input",
+      "requires": [],
+      "verification": "none-recorded",
+      "summary": "Non-secret configuration and workspace registry revisions."
+    },
+    {
+      "position": 4,
+      "id": "context-memory-and-automation-state",
+      "class": "recovery-set-input",
+      "requires": [],
+      "verification": "none-recorded",
+      "summary": "Context and compression manifests, memory and search state, skills, learning and curator state, profiles, goals, automations, boards and trigger definitions."
+    },
+    {
+      "position": 5,
+      "id": "corresponding-source-and-locks",
+      "class": "recovery-set-input",
+      "requires": [],
+      "verification": "none-recorded",
+      "summary": "The exact corresponding source and dependency locks for the last known-good seed."
+    },
+    {
+      "position": 6,
+      "id": "database-and-snapshot-metadata",
+      "class": "recovery-set-input",
+      "requires": [],
+      "verification": "none-recorded",
+      "summary": "The database plus snapshot metadata consistent with its write-ahead log, taken through the supported online backup mechanism."
+    },
+    {
+      "position": 7,
+      "id": "disconnected-start-bundle",
+      "class": "recovery-set-input",
+      "requires": [],
+      "verification": "none-recorded",
+      "summary": "An independently checksummed disconnected-start bundle."
+    },
+    {
+      "position": 8,
+      "id": "last-known-good-seed-and-verifier",
+      "class": "recovery-set-input",
+      "requires": [],
+      "verification": "none-recorded",
+      "summary": "The last known-good seed and bootstrap verifier for development-plane recovery, backed up separately from production."
+    },
+    {
+      "position": 9,
+      "id": "policy-and-bundle-hashes",
+      "class": "recovery-set-input",
+      "requires": [],
+      "verification": "none-recorded",
+      "summary": "Policy, persona, command and companion bundle hashes."
+    },
+    {
+      "position": 10,
+      "id": "recoverable-secret-material",
+      "class": "recovery-set-input",
+      "requires": [],
+      "verification": "none-recorded",
+      "summary": "Encrypted credential ciphertext with a separately escrowed rotatable key, or external secret-provider references with independently recoverable version metadata. Never a plaintext export."
+    },
+    {
+      "position": 11,
+      "id": "release-manifests-and-schemas",
+      "class": "recovery-set-input",
+      "requires": [],
+      "verification": "none-recorded",
+      "summary": "Current and previous release manifests, schemas and SDK compatibility metadata."
+    },
+    {
+      "position": 12,
+      "id": "tool-and-extension-manifests",
+      "class": "recovery-set-input",
+      "requires": [],
+      "verification": "none-recorded",
+      "summary": "Tool, MCP, extension and hook manifests with their enabled and quarantine revisions."
+    },
+    {
+      "position": 13,
+      "id": "verify-artifact-hashes",
+      "class": "verification-step",
+      "requires": [
+        "artifact-metadata-and-tombstones"
+      ],
+      "verification": "hash-comparison",
+      "summary": "The drill verifies artifact hashes against the restored artifact metadata."
+    },
+    {
+      "position": 14,
+      "id": "verify-database-integrity",
+      "class": "verification-step",
+      "requires": [
+        "database-and-snapshot-metadata"
+      ],
+      "verification": "integrity-check",
+      "summary": "The drill verifies database integrity before anything downstream is trusted."
+    },
+    {
+      "position": 15,
+      "id": "verify-disconnected-start-bundle",
+      "class": "verification-step",
+      "requires": [
+        "corresponding-source-and-locks",
+        "disconnected-start-bundle",
+        "last-known-good-seed-and-verifier"
+      ],
+      "verification": "integrity-check",
+      "summary": "Development-plane recovery checks the disconnected-start bundle against its independent checksum and its corresponding source."
+    },
+    {
+      "position": 16,
+      "id": "verify-manifests",
+      "class": "verification-step",
+      "requires": [
+        "configuration-and-workspace-registry",
+        "release-manifests-and-schemas"
+      ],
+      "verification": "version-comparison",
+      "summary": "The drill verifies release and configuration manifests against the restored revisions."
+    },
+    {
+      "position": 17,
+      "id": "verify-policy-versions",
+      "class": "verification-step",
+      "requires": [
+        "policy-and-bundle-hashes"
+      ],
+      "verification": "version-comparison",
+      "summary": "The drill verifies policy versions against the restored bundle hashes."
+    },
+    {
+      "position": 18,
+      "id": "start-in-disconnected-recovery",
+      "class": "verification-step",
+      "requires": [
+        "audit-journal-through-watermark",
+        "context-memory-and-automation-state",
+        "tool-and-extension-manifests",
+        "verify-artifact-hashes",
+        "verify-database-integrity",
+        "verify-manifests",
+        "verify-policy-versions"
+      ],
+      "verification": "startup-in-disconnected-recovery",
+      "summary": "Startup in disconnected recovery mode, with no external transport and no provider start, before any transport lease can be acquired."
+    },
+    {
+      "position": 19,
+      "id": "resolve-credential-descriptors",
+      "class": "verification-step",
+      "requires": [
+        "recoverable-secret-material",
+        "start-in-disconnected-recovery"
+      ],
+      "verification": "credential-resolution",
+      "summary": "Each required credential descriptor resolves to its expected secret version through the selected recovery path, without exposing a value. Metadata alone is not a recoverable backup."
+    },
+    {
+      "position": 20,
+      "id": "revalidate-audiences-and-tenants",
+      "class": "verification-step",
+      "requires": [
+        "resolve-credential-descriptors"
+      ],
+      "verification": "audience-revalidation",
+      "summary": "The audiences and tenants of the resolved credentials are revalidated before anything external is enabled."
+    },
+    {
+      "position": 21,
+      "id": "enable-transports-and-provider-starts",
+      "class": "enablement-gate",
+      "requires": [
+        "revalidate-audiences-and-tenants"
+      ],
+      "verification": "none-recorded",
+      "summary": "Transport intake, outbox delivery, provider starts and connector sends stay disabled until the credentials resolve and their audiences and tenants are revalidated."
+    }
+  ],
+  "excluded": [
+    {
+      "id": "release-and-deployment-credentials",
+      "summary": "Private release-signing, protected-branch and deployment credentials are never part of candidate or ordinary lab recovery, so a drill that needs them is testing the wrong boundary.",
+      "source": "docs/product-plan/requirements/operations-and-governance.md"
+    }
+  ]
+}

@@ -1,0 +1,919 @@
+# SPDX-License-Identifier: Elastic-2.0
+#
+# Classification rules for the behavioural contract inventory (R0-01).
+#
+# This file carries the judgements, and only the judgements: which of the seven
+# surface classes a family of observations belongs to, which Rust destination
+# the porting map resolves it to, and what a parity fixture for it would look
+# like. Every fact — the members of a family, the counts, the ledger's own
+# target owners — is read out of the permitted sources at generation time and
+# is never written down here.
+#
+# Two rules keep this file from becoming a place where claims accumulate:
+#
+#   * every `porting_map_row` must exist in the porting map, and the owner it
+#     resolves to must appear in that row's destination cell, so an invented
+#     destination is refused rather than discouraged;
+#   * every `quote` must be found in the section it cites, so a declared entry
+#     that the source does not evidence is refused.
+#
+# `tools/contract_inventory/check.py` enforces both.
+
+schema = "automonique.contract-inventory.rules/v1"
+
+# ---------------------------------------------------------------------------
+# Families extracted mechanically from a permitted source.
+# ---------------------------------------------------------------------------
+
+[family.dashboard-route]
+title = "dashboard API route"
+granularity = "surface"
+extraction = "table-cell-backticks"
+source = "legacy-inventory"
+section = "## Dashboard API"
+group_column = 0
+token_column = 1
+claim_pattern = "^(\\d+) routes\\."
+surface_class = "input"
+owner = "automonique-web"
+owner_via = "porting-map"
+porting_map_row = "`dashboard.ts`, `term.ts`, `runs.ts`"
+owner_note = "the row lists the web crate alongside SDK, TUI and CLI surfaces; automonique-web is its only crate destination"
+fixture_class = "enumeration-presence"
+fixture_inputs = "an authorized operator request to {name}"
+fixture_outputs = "the response contract for {name} and any durable or outbox effect it commits"
+
+[family.command]
+title = "operator command"
+granularity = "surface"
+extraction = "paragraph-backticks"
+source = "legacy-inventory"
+section = "## Command and route vocabulary"
+paragraph_prefix = "**Commands"
+claim_pattern = "\\*\\*Commands \\((\\d+)\\)"
+surface_class = "command"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "the command registry is a command module and this row names one crate destination"
+fixture_class = "enumeration-presence"
+fixture_inputs = "the command id {name} submitted through any transport that carries the canonical registry"
+fixture_outputs = "the registry resolves {name} to one deterministic command id with its aliases and help text"
+
+[family.conversation-route]
+title = "conversation route kind"
+granularity = "surface"
+extraction = "paragraph-backticks"
+source = "legacy-inventory"
+section = "## Command and route vocabulary"
+paragraph_prefix = "**Conversation routes"
+claim_pattern = "\\*\\*Conversation routes \\((\\d+)\\)"
+surface_class = "input"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "conversation routing is a conversation module and this row names one crate destination"
+fixture_class = "enumeration-presence"
+fixture_inputs = "an inbound conversational message plus its durable context"
+fixture_outputs = "the route kind {name} is selectable and is chosen deterministically for the inputs that select it"
+
+[family.durable-table]
+title = "durable state table"
+granularity = "surface"
+extraction = "table-rows"
+source = "legacy-inventory"
+section = "## Durable state"
+key_column = 0
+detail_column = 3
+claim_pattern = "^(\\d+) tables"
+surface_class = "state transition"
+owner = "automonique-store"
+owner_via = "porting-map"
+porting_map_row = "`registry.ts`, `db.ts`, sessions/settings"
+owner_note = "of the three destinations this row lists, a durable table and its transitions are the store's"
+fixture_class = "schema-snapshot"
+fixture_inputs = "the legacy rows of {name} at a captured revision"
+fixture_outputs = "every row and id survives the expand migration with its transitions representable in the target schema"
+
+[family.status-literal]
+title = "status literal"
+granularity = "surface"
+extraction = "paragraph-backticks"
+source = "legacy-inventory"
+section = "## State vocabulary"
+paragraph_prefix = "`queued`"
+surface_class = "state transition"
+owner = "automonique-store"
+owner_via = "porting-map"
+porting_map_row = "`registry.ts`, `db.ts`, sessions/settings"
+owner_note = "the literals are column values of the durable tables, which of this row's three destinations is the store's"
+fixture_class = "enumeration-presence"
+fixture_inputs = "a legacy row whose status column holds {name}"
+fixture_outputs = "{name} maps onto exactly one member of the canonical enum, and synonym pairs collapse rather than being carried forward"
+
+[family.timer]
+title = "scheduled job"
+granularity = "surface"
+extraction = "table-split-cell"
+source = "legacy-inventory"
+section = "## Scheduled work"
+key_column = 1
+detail_column = 0
+claim_pattern = "(\\w+) recurring jobs plus (\\w+) configurable"
+surface_class = "timer"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "`queue.ts`, `fleet.ts`, `manage-sync.ts`"
+owner_note = "draining and reconciling on an interval is the work-pipeline row's core destination; fleet owns the external claim protocol"
+fixture_class = "enumeration-presence"
+fixture_inputs = "a generation holding the fence for {name} at its stated interval"
+fixture_outputs = "{name} runs on its interval in exactly one generation and never in two at once"
+
+[family.chat-platform-method]
+title = "chat platform API method"
+granularity = "surface"
+extraction = "paragraph-backticks"
+source = "legacy-inventory"
+section = "## External effect surface"
+paragraph_prefix = "**Chat platform:**"
+claim_pattern = "(Thirteen) methods"
+surface_class = "side effect"
+owner = "automonique-transports"
+owner_via = "porting-map"
+porting_map_row = "Slack lifecycle in `index.ts`"
+owner_note = "of this row's two destinations the outward platform call is the transport's; core owns the decision to make it"
+fixture_class = "effect-recording"
+fixture_inputs = "a recorded request to {name} with its idempotency key"
+fixture_outputs = "the call is issued at most once per durable effect and is replayable from the outbox without duplication"
+
+[family.companion]
+title = "companion"
+granularity = "surface"
+extraction = "paragraph-comma-list"
+source = "legacy-inventory"
+section = "## Companions and operational scripts"
+paragraph_prefix = "**Companions"
+claim_pattern = "\\*\\*Companions \\((\\d+)\\)"
+surface_class = "operational script"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "this row's single crate destination owns the companion modules and packages the asset beside it"
+fixture_class = "effect-recording"
+fixture_inputs = "the argv and environment a worker invokes {name} with"
+fixture_outputs = "the recorded effect and exit status of {name} under a checksummed release asset"
+
+# ---------------------------------------------------------------------------
+# Families declared row by row, because the source states them in prose rather
+# than in a table. Each declared member carries a quotation the checker
+# re-finds in the cited section, so prose cannot become invention.
+# ---------------------------------------------------------------------------
+
+[family.outbound-host]
+title = "outbound host"
+granularity = "surface"
+extraction = "declared"
+source = "legacy-inventory"
+section = "## External effect surface"
+surface_class = "side effect"
+owner_via = "unresolved"
+fixture_class = "effect-recording"
+fixture_inputs = "the destination and credential class of an outbound call to {name}"
+fixture_outputs = "the egress is representable as a destination-aware grant, and no worker holds a credential for {name} it is not granted"
+
+[family.operational-script]
+title = "operational script"
+granularity = "surface"
+extraction = "declared"
+source = "legacy-inventory"
+section = "## Companions and operational scripts"
+claim_pattern = "\\*\\*Operational scripts \\((\\d+)\\)"
+surface_class = "operational script"
+owner_via = "unresolved"
+fixture_class = "effect-recording"
+fixture_inputs = "the invocation of {name} against a captured state"
+fixture_outputs = "a bounded mutation plan for {name} that is previewable before it is applied"
+
+[family.provider-dialect]
+title = "agent backend event dialect"
+granularity = "surface"
+extraction = "declared"
+source = "migration-plan"
+section = "## Phase 2 — independent Rust execution hosts"
+surface_class = "backend event"
+owner = "automonique-agents"
+owner_via = "porting-map"
+porting_map_row = "agent portions of `claude.ts` and backend-specific launch/parsing"
+owner_note = "of this row's two destinations the adapter dialect is the agents crate's; the runner owns the host process"
+fixture_class = "provider-transcript"
+fixture_inputs = "a sanitized transcript of {name} at a pinned binary and schema digest"
+fixture_outputs = "the transcript normalises to the authoritative event vocabulary without inventing completion"
+
+[family.spool-event-kind]
+title = "runner spool event kind"
+granularity = "surface"
+extraction = "declared"
+source = "feature-parity"
+section = "## Execution, companions and operator surfaces"
+surface_class = "backend event"
+owner = "automonique-runner"
+owner_via = "porting-map"
+porting_map_row = "`tmux-exec.ts`, `legacy-run.sh`, spool modules"
+owner_note = "spool modules are named in this row and it lists one destination"
+fixture_class = "replay-capture"
+fixture_inputs = "a captured spool stream containing {name} frames, including a split UTF-8 boundary"
+fixture_outputs = "{name} frames are read monotonically from a durable offset with retention applied and no gap or duplicate"
+
+# ---------------------------------------------------------------------------
+# The parity ledger's rows, classified one by one. Their target owner is taken
+# from the ledger when the ledger names a crate and from the porting map when
+# it does not; where neither determines one, `owner_via = "unresolved"` and the
+# entry is reported unowned rather than guessed.
+# ---------------------------------------------------------------------------
+
+[family.parity-row]
+title = "parity ledger row"
+granularity = "capability"
+extraction = "parity-rows"
+source = "feature-parity"
+section = "## Owner decision, 2026-08-09 — unpinned rows become `replace`"
+claim_pattern = "Of (\\d+) rows"
+surface_class = "input"
+owner_via = "unresolved"
+fixture_class = "legacy-test-conversion"
+fixture_inputs = "the inputs the ledger's named legacy test exercises for {name}"
+fixture_outputs = "the language-neutral outputs that test pins, converted without reading legacy source"
+
+# ---------------------------------------------------------------------------
+# Per-member overrides. A declared member inherits its family's rule except
+# where a row below states otherwise.
+# ---------------------------------------------------------------------------
+
+[[override]]
+family = "dashboard-route"
+when_group = "Terminal"
+owner = "automonique-shell"
+owner_via = "porting-map"
+porting_map_row = "interactive shells/file transfer"
+owner_note = "the parity ledger isolates the tmux-backed shells and their base64 transfer path; the porting map sends them to the optional isolated shell subsystem"
+
+[[override]]
+family = "timer"
+when_key = "flush fleet log"
+owner = "automonique-fleet"
+owner_note = "the row names fleet among its areas, and the fleet log is the fleet integration's"
+
+[[override]]
+family = "timer"
+when_key = "fleet poll"
+owner = "automonique-fleet"
+owner_note = "the row names fleet among its areas, and the poll is the fleet claim protocol's"
+
+[[override]]
+family = "timer"
+when_key = "fleet heartbeat"
+owner = "automonique-fleet"
+owner_note = "the row names fleet among its areas, and the heartbeat is the fleet claim protocol's"
+
+[[override]]
+family = "timer"
+when_key = "reconcile orphan approval gates"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "reconciliation scripts and `legacy:audit`"
+owner_note = "reconcilers become typed core reconcilers, and this row names one crate destination"
+
+[[override]]
+family = "timer"
+when_key = "dashboard prune"
+owner = "automonique-web"
+owner_via = "porting-map"
+porting_map_row = "`dashboard.ts`, `term.ts`, `runs.ts`"
+owner_note = "pruning the dashboard's own state belongs to its only crate destination"
+
+[[override]]
+family = "timer"
+when_key = "spool reaper"
+owner = "automonique-runner"
+owner_via = "porting-map"
+porting_map_row = "`tmux-exec.ts`, `legacy-run.sh`, spool modules"
+owner_note = "the reaper retires spools, and spool modules are named in this row"
+
+[[override]]
+family = "companion"
+when_key = "a sandbox (with C source)"
+owner_via = "unresolved"
+owner_reason = "the porting map row for the sandbox C source and the privileged broker names runner/broker crates in prose and no automonique- destination, so the sandbox's owner is not determined"
+fixture_class = "effect-recording"
+
+[[override]]
+family = "companion"
+when_key = "a guard binary"
+owner_via = "unresolved"
+owner_reason = "the same porting map row names runner/broker crates in prose and no automonique- destination, so the guard binary's owner is not determined"
+
+[[override]]
+family = "companion"
+when_key = "a Codex guard"
+fixture_class = "provider-transcript"
+
+[[override]]
+family = "companion"
+when_key = "a knowledge-base directory"
+surface_class = "unclassified"
+why_no_class = "a directory of site-platform knowledge-base files is versioned content, not behaviour; it is not an input, state transition, timer, side effect, command, backend event or operational script"
+disposition = "packaged as a checksummed release asset with a release hash and workspace applicability metadata; the parity ledger's row for it carries the same finding"
+
+# ---------------------------------------------------------------------------
+# Declared members.
+# ---------------------------------------------------------------------------
+
+[[declared]]
+family = "outbound-host"
+key = "messaging platform APIs"
+quote = "the messaging platform APIs"
+owner = "automonique-transports"
+owner_via = "porting-map"
+porting_map_row = "Slack lifecycle in `index.ts`"
+owner_note = "of this row's two destinations the outward platform call is the transport's"
+
+[[declared]]
+family = "outbound-host"
+key = "transactional email provider inbound endpoint"
+quote = "a transactional email provider's inbound endpoint"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "the support mail workflow is a support module and this row names one crate destination"
+
+[[declared]]
+family = "outbound-host"
+key = "source host"
+quote = "the source host"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "`queue.ts`, `fleet.ts`, `manage-sync.ts`"
+owner_note = "the source host is reached by the ticket-truth projection, which is this row's core destination"
+
+[[declared]]
+family = "outbound-host"
+key = "loopback address"
+quote = "a loopback address"
+owner_via = "unresolved"
+owner_reason = "a loopback destination is a deployment detail; the porting map names no destination that owns it, and which process listens on it is not stated in a permitted source"
+
+[[declared]]
+family = "outbound-host"
+key = "client portal"
+quote = "client portal"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "the client request portal is a support module and this row names one crate destination"
+
+[[declared]]
+family = "outbound-host"
+key = "fleet console"
+quote = "fleet console"
+owner = "automonique-fleet"
+owner_via = "porting-map"
+porting_map_row = "`queue.ts`, `fleet.ts`, `manage-sync.ts`"
+owner_note = "the row names fleet among its areas, and the console is the fleet integration's"
+
+[[declared]]
+family = "outbound-host"
+key = "support portal"
+quote = "support portal"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "the support portal is a support module and this row names one crate destination"
+
+[[declared]]
+family = "outbound-host"
+key = "font and CDN origins in dashboard markup"
+quote = "Font and CDN origins appear in dashboard markup"
+owner = "automonique-web"
+owner_via = "porting-map"
+porting_map_row = "`dashboard.ts`, `term.ts`, `runs.ts`"
+owner_note = "the markup that reaches these origins is the dashboard's, whose only crate destination is automonique-web"
+
+[[declared]]
+family = "operational-script"
+key = "audit"
+quote = "an audit"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "reconciliation scripts and `legacy:audit`"
+owner_note = "this row names the audit explicitly and lists one crate destination"
+
+[[declared]]
+family = "operational-script"
+key = "benchmark"
+quote = "a benchmark"
+owner_via = "unresolved"
+owner_reason = "no porting map row names a benchmark destination, and the permitted sources do not say what it measures"
+
+[[declared]]
+family = "operational-script"
+key = "build scripts"
+quote = "two build scripts"
+covers = 2
+owner_via = "unresolved"
+owner_reason = "no porting map row names a destination for the legacy build scripts; the Rust workspace's build jobs are new work rather than a port"
+
+[[declared]]
+family = "operational-script"
+key = "deploy-broker installer"
+quote = "a deploy-broker installer"
+owner_via = "unresolved"
+owner_reason = "the porting map row for the privileged broker names runner/broker crates in prose and no automonique- destination, so the installer's owner is not determined"
+
+[[declared]]
+family = "operational-script"
+key = "bootstrap bundler"
+quote = "a bootstrap bundler"
+owner = "automonique-bootstrap"
+owner_via = "porting-map"
+porting_map_row = "implementation harness, bootstrap and self-hosting"
+owner_note = "of this row's two destinations the bundler is the bootstrap's; the lab is the development harness"
+
+[[declared]]
+family = "operational-script"
+key = "reconciler: feedback-thread statuses"
+quote = "feedback-thread statuses"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "reconciliation scripts and `legacy:audit`"
+owner_note = "reconcilers become typed core reconcilers, and this row names one crate destination"
+
+[[declared]]
+family = "operational-script"
+key = "reconciler: orphan gates"
+quote = "orphan gates"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "reconciliation scripts and `legacy:audit`"
+owner_note = "reconcilers become typed core reconcilers, and this row names one crate destination"
+
+[[declared]]
+family = "operational-script"
+key = "reconciler: stale gates"
+quote = "stale gates"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "reconciliation scripts and `legacy:audit`"
+owner_note = "reconcilers become typed core reconcilers, and this row names one crate destination"
+
+[[declared]]
+family = "operational-script"
+key = "reconciler: request reactions"
+quote = "request reactions"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "reconciliation scripts and `legacy:audit`"
+owner_note = "reconcilers become typed core reconcilers, and this row names one crate destination"
+
+[[declared]]
+family = "provider-dialect"
+key = "Jcode ACP over an explicit daemon socket"
+quote = "Jcode ACP through an explicit daemon socket"
+
+[[declared]]
+family = "provider-dialect"
+key = "Claude bidirectional stream-JSON"
+quote = "Claude bidirectional stream-JSON"
+
+[[declared]]
+family = "provider-dialect"
+key = "Codex App Server over session-host stdio"
+quote = "Codex App Server over session-host stdio"
+
+[[declared]]
+family = "provider-dialect"
+key = "opencode authenticated HTTP server and SSE stream"
+quote = "opencode through an authenticated session-host HTTP server and SSE stream"
+
+[[declared]]
+family = "spool-event-kind"
+key = "live action"
+quote = "Live action"
+
+[[declared]]
+family = "spool-event-kind"
+key = "heartbeat"
+quote = "heartbeat"
+
+[[declared]]
+family = "spool-event-kind"
+key = "transcript"
+quote = "transcript"
+
+[[declared]]
+family = "spool-event-kind"
+key = "stderr"
+quote = "stderr"
+
+[[declared]]
+family = "spool-event-kind"
+key = "telemetry"
+quote = "telemetry"
+
+# ---------------------------------------------------------------------------
+# Observations that fit none of the seven classes. They are listed, never
+# forced into the nearest class, and they carry no owner or fixture plan
+# because an unclassified observation has no behaviour to plan a fixture for.
+# ---------------------------------------------------------------------------
+
+[[unclassified]]
+id = "configuration-surface"
+name = "the configuration surface: environment variables and the runtime-mutable settings file"
+source = "legacy-inventory"
+section = "## Configuration surface"
+quote = "classifies each as durable, compatibility-only or presentation-only"
+why_no_class = "a configuration name is neither behaviour nor an operational script; it parameterises behaviour that is inventoried elsewhere, and forcing it into a behavioural class would double-count the behaviour it configures"
+disposition = "deferred: the identifier inventory classifies every configuration name over its own closed vocabulary"
+
+# ---------------------------------------------------------------------------
+# Gaps: what a permitted source does not contain, and what would close it.
+# Count reconciliations are generated rather than declared, so a source whose
+# stated count stops matching its own enumeration produces a gap by itself.
+# ---------------------------------------------------------------------------
+
+[[gap]]
+id = "build-scripts-not-individually-named"
+kind = "unnamed-member"
+source = "legacy-inventory"
+section = "## Companions and operational scripts"
+quote = "two build scripts"
+detail = "the two build scripts are counted but not individually named, so the inventory carries one entry covering two scripts"
+needed_to_close = "a file listing of the legacy tree's script directory, which is a structural reference and permitted, but is not present in this repository"
+
+[[gap]]
+id = "durable-table-columns-unavailable"
+kind = "unreachable-source"
+source = "legacy-inventory"
+section = "## Durable state"
+quote = "16 tables, read read-only from the live database"
+detail = "the source records each table's row and column counts and its role, but not its column names or types, so no schema fixture can be written from this repository"
+needed_to_close = "a read-only schema capture of the live database, which the fixture-capture gate blocks until the oracle boundary exists"
+
+[[gap]]
+id = "no-sanitized-fixture-corpus"
+kind = "unreachable-source"
+source = "corpus-index"
+section = "# Automonique core rewrite (legacy compatibility runtime)"
+quote = "Reference material, not the authoritative index"
+detail = "the corpus index indexes planning documents, not captures; no sanitized fixture exists in this repository, so every entry's corpus status is absent and no fixture plan can claim a capture"
+needed_to_close = "the sanitized fixture corpus item, which is itself blocked by the oracle gate"
+
+[[gap]]
+id = "environment-variable-names-deferred"
+kind = "deferred-to-item"
+source = "legacy-inventory"
+section = "## Configuration surface"
+quote = "the suffixes are listed here and the prefix noted once"
+detail = "the configuration surface is enumerated by group and suffix rather than as individual classified names; this inventory does not duplicate that work"
+needed_to_close = "the identifier inventory, which classifies every configuration name as durable, compatibility-only or presentation-only"
+
+[[gap]]
+id = "provider-event-vocabularies-not-enumerated"
+kind = "unreachable-source"
+source = "migration-plan"
+section = "## Phase 0 — freeze contracts and prove reload primitives"
+quote = "Maintain a checked-in provider compatibility matrix and sanitized transcripts"
+detail = "the four backend dialects are named but their wire event vocabularies are not enumerated in any permitted source, so each dialect is one entry rather than one entry per event kind"
+needed_to_close = "a checked-in provider compatibility matrix and sanitized transcripts per native and fallback mode"
+[parity."slack-socket-mode-messages-mentions-threads-commands-and-actions"]
+row = "Slack Socket Mode messages, mentions, threads, commands and actions"
+section = "## Intake, conversation and approvals"
+surface_class = "input"
+owner = "automonique-transports"
+owner_via = "parity-ledger-target-owner"
+owner_note = "the ledger's own target-owner cell names the crate"
+
+[parity."telegram-polling-groups-private-chats-commands-reply"]
+row = "Telegram polling, groups/private chats, commands, reply correlation and inline approval/cancel"
+section = "## Intake, conversation and approvals"
+surface_class = "input"
+owner = "automonique-transports"
+owner_via = "parity-ledger-target-owner"
+owner_note = "the ledger's own target-owner cell names the crate"
+
+[parity."canonical-direct-command-registry-aliases-help-slack-presets"]
+row = "Canonical direct command registry, aliases, help, Slack presets and Telegram `setMyCommands`"
+section = "## Intake, conversation and approvals"
+surface_class = "command"
+owner = "automonique-core"
+owner_via = "parity-ledger-target-owner"
+owner_note = "the ledger's own target-owner cell names the crate"
+
+[parity."deterministic-query-chat-ticket-memory-chatter-clarify-routing"]
+row = "Deterministic query/chat/ticket/memory/chatter/clarify routing"
+section = "## Intake, conversation and approvals"
+surface_class = "input"
+owner = "automonique-core"
+owner_via = "parity-ledger-target-owner"
+owner_note = "the ledger's own target-owner cell names the crate"
+
+[parity."short-contextual-follow-ups-and-pending-support-composition"]
+row = "Short contextual follow-ups and pending Support composition intent"
+section = "## Intake, conversation and approvals"
+surface_class = "state transition"
+owner = "automonique-store"
+owner_via = "porting-map"
+porting_map_row = "`registry.ts`, `db.ts`, sessions/settings"
+owner_note = "the ledger names conversation/session repositories; of the three destinations this row lists, the durable slot record is the store's"
+
+[parity."multi-ticket-split"]
+row = "Multi-ticket split"
+section = "## Intake, conversation and approvals"
+surface_class = "state transition"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "`queue.ts`, `fleet.ts`, `manage-sync.ts`"
+owner_note = "the row lists core and fleet; the work graph and scheduler are core, while fleet owns the external claim protocol"
+
+[parity."human-work-approval"]
+row = "Human work approval"
+section = "## Intake, conversation and approvals"
+surface_class = "state transition"
+owner_via = "unresolved"
+owner_reason = "the ledger names an approval repository and a policy; the porting map row that covers durable records lists automonique-store, automonique-core and automonique-policy without choosing between them, and no other row covers approvals"
+
+[parity."provider-execution-approval"]
+row = "Provider execution approval"
+section = "## Intake, conversation and approvals"
+surface_class = "state transition"
+owner = "automonique-agents"
+owner_via = "porting-map"
+porting_map_row = "agent portions of `claude.ts` and backend-specific launch/parsing"
+owner_note = "the row lists agents and runner; a provider approval is a provider-protocol record, which the agent adapter owns"
+
+[parity."client-request-portal"]
+row = "Client request portal"
+section = "## Support, GitHub and client delivery"
+surface_class = "input"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "the client request portal is a support module and this row names one destination"
+
+[parity."internal-raw-agent-output-versus-staff-published-client-reply"]
+row = "Internal raw agent output versus staff-published client reply"
+section = "## Support, GitHub and client delivery"
+surface_class = "side effect"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "publication of support output is a support module and this row names one destination"
+
+[parity."support-inbox-query-and-formatting"]
+row = "Support inbox query and formatting"
+section = "## Support, GitHub and client delivery"
+surface_class = "input"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "support query modules; this row names one destination"
+
+[parity."support-email-compose-exact-sender-recipient-content-review-and"]
+row = "Support email compose, exact sender/recipient/content review and send"
+section = "## Support, GitHub and client delivery"
+surface_class = "side effect"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "support mail modules; this row names one destination"
+
+[parity."github-issue-as-durable-ticket-truth"]
+row = "GitHub issue as durable ticket truth"
+section = "## Support, GitHub and client delivery"
+surface_class = "side effect"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "`queue.ts`, `fleet.ts`, `manage-sync.ts`"
+owner_note = "the row names manage-sync among its areas; of its two destinations the GitHub projection is core, while fleet owns the fleet claim protocol"
+
+[parity."delivery-team-completion-heuristics-and-newest-occurrence"]
+row = "Delivery-team completion heuristics and newest-occurrence reopen semantics"
+section = "## Support, GitHub and client delivery"
+surface_class = "state transition"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "reconciliation scripts and `legacy:audit`"
+owner_note = "reconciliation policy, and this row names one destination"
+
+[parity."detailed-github-report-plus-brief-slack-completion-link-mentions"]
+row = "Detailed GitHub report plus brief Slack completion/link/mentions"
+section = "## Support, GitHub and client delivery"
+surface_class = "side effect"
+owner_via = "unresolved"
+owner_reason = "no porting-map row names report publication; the ledger's report artifact plus outboxes spans the typed artifact service, which legacy-inventory.md lists in the genuinely-new column, and the transport outbox"
+
+[parity."dedicated-deployment-notifications-channel"]
+row = "Dedicated deployment notifications channel"
+section = "## Support, GitHub and client delivery"
+surface_class = "side effect"
+owner_via = "unresolved"
+owner_reason = "safety row: the ledger names a typed deploy webhook and outbox; the dashboard row assigns the webhook route to automonique-web while the fail-closed channel policy is a transport concern, and no row determines which owns it"
+
+[parity."notes-notify-rules-and-github-to-slack-mapping"]
+row = "Notes, notify rules and GitHub-to-Slack mapping"
+section = "## Memory, sites and operational context"
+surface_class = "state transition"
+owner = "automonique-store"
+owner_via = "porting-map"
+porting_map_row = "`registry.ts`, `db.ts`, sessions/settings"
+owner_note = "memory and notification repositories are durable records; of the three destinations this row lists, the record is the store's"
+
+[parity."bounded-per-user-conversation-history"]
+row = "Bounded per-user conversation history"
+section = "## Memory, sites and operational context"
+surface_class = "state transition"
+owner = "automonique-store"
+owner_via = "porting-map"
+porting_map_row = "`registry.ts`, `db.ts`, sessions/settings"
+owner_note = "bounded history is a durable record; of the three destinations this row lists, the record is the store's"
+
+[parity."known-managed-sites-and-functional-site-summaries"]
+row = "Known managed sites and functional site summaries"
+section = "## Memory, sites and operational context"
+surface_class = "input"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "site modules; this row names one destination"
+
+[parity."account-access-explanations"]
+row = "Account/access explanations"
+section = "## Memory, sites and operational context"
+surface_class = "input"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "site and access modules; this row names one destination"
+
+[parity."learned-domain-to-server-targets"]
+row = "Learned domain-to-server targets"
+section = "## Memory, sites and operational context"
+surface_class = "state transition"
+owner_via = "unresolved"
+owner_reason = "the ledger assigns learned targets to the workspace registry, which legacy-inventory.md lists in the genuinely-new column; the porting map names no destination for it"
+
+[parity."announce-target-before-action-and-show-site-server-ip"]
+row = "Announce target before action and show site/server/IP"
+section = "## Memory, sites and operational context"
+surface_class = "side effect"
+owner_via = "unresolved"
+owner_reason = "safety row: announce-before-mutate spans work events, which legacy-inventory.md lists in the genuinely-new column, and the Slack outbox; no porting-map row determines the owner"
+
+[parity."persona-job-envelope-and-untrusted-context-labels"]
+row = "Persona, job envelope and untrusted-context labels"
+section = "## Memory, sites and operational context"
+surface_class = "input"
+owner = "automonique-policy"
+owner_via = "porting-map"
+porting_map_row = "`registry.ts`, `db.ts`, sessions/settings"
+owner_note = "the ledger names a versioned policy bundle; automonique-policy is one of this row's three destinations and the only one that is a policy bundle"
+
+[parity."site-platform-knowledge-base-files"]
+row = "Site-platform knowledge-base files"
+section = "## Memory, sites and operational context"
+surface_class = "unclassified"
+owner_via = "unclassified"
+why_no_class = "a versioned content bundle carrying a release hash and workspace applicability metadata is a packaging contract; it is not an input, state transition, timer, side effect, command, backend event or operational script"
+
+[parity."four-selectable-agent-backends-and-session-prefixed-resume"]
+row = "Four selectable agent backends and session-prefixed resume"
+section = "## Execution, companions and operator surfaces"
+surface_class = "backend event"
+owner = "automonique-agents"
+owner_via = "porting-map"
+porting_map_row = "agent portions of `claude.ts` and backend-specific launch/parsing"
+owner_note = "the row lists agents and runner; the adapter dialect is the agents crate's while the host process is the runner's"
+
+[parity."bounded-parallelism-per-thread-serialization-pause-and-cancel"]
+row = "Bounded parallelism, per-thread serialization, pause and cancel"
+section = "## Execution, companions and operator surfaces"
+surface_class = "state transition"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "`queue.ts`, `fleet.ts`, `manage-sync.ts`"
+owner_note = "the row lists core and fleet; the scheduler is core, while fleet owns the external claim protocol"
+
+[parity."live-action-heartbeat-transcript-stderr-and-telemetry"]
+row = "Live action, heartbeat, transcript, stderr and telemetry"
+section = "## Execution, companions and operator surfaces"
+surface_class = "backend event"
+owner = "automonique-runner"
+owner_via = "porting-map"
+porting_map_row = "`tmux-exec.ts`, `legacy-run.sh`, spool modules"
+owner_note = "spool modules are named in this row, and it lists one destination"
+
+[parity."legacy-say-progress-announcements"]
+row = "`legacy-say` progress announcements"
+section = "## Execution, companions and operator surfaces"
+surface_class = "side effect"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "companion modules; this row names one crate destination and packages the companion asset beside it"
+
+[parity."screenshot-proof"]
+row = "Screenshot proof"
+section = "## Execution, companions and operator surfaces"
+surface_class = "side effect"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "companion modules; this row names one crate destination and packages the companion asset beside it"
+
+[parity."scoped-application-kv-operations"]
+row = "Scoped application KV operations"
+section = "## Execution, companions and operator surfaces"
+surface_class = "side effect"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "companion modules; this row names one crate destination and packages the companion asset beside it"
+
+[parity."fleet-provisioning-helper"]
+row = "Fleet/provisioning helper"
+section = "## Execution, companions and operator surfaces"
+surface_class = "side effect"
+owner = "automonique-fleet"
+owner_via = "porting-map"
+porting_map_row = "`queue.ts`, `fleet.ts`, `manage-sync.ts`"
+owner_note = "the row names fleet among its areas; the provisioning helper is the fleet integration rather than the work pipeline"
+
+[parity."codex-worker-guard-hooks-and-sandbox-launcher"]
+row = "Codex/worker guard hooks and sandbox launcher"
+section = "## Execution, companions and operator surfaces"
+surface_class = "backend event"
+owner_via = "unresolved"
+owner_reason = "the porting map row for the sandbox and privileged broker names runner/broker crates in prose and no automonique- destination, so the sandbox launcher's owner is not determined"
+
+[parity."dashboard-live-tickets-approvals-history-ignored-messages"]
+row = "Dashboard live tickets, approvals, history, ignored messages, settings, memory and targets"
+section = "## Execution, companions and operator surfaces"
+surface_class = "input"
+owner = "automonique-web"
+owner_via = "porting-map"
+porting_map_row = "`dashboard.ts`, `term.ts`, `runs.ts`"
+owner_note = "the row lists the web crate plus SDK, TUI and CLI surfaces; automonique-web is its only crate destination"
+
+[parity."live-slack-channel-feed-and-legacy-post-as-the-assistant"]
+row = "Live Slack channel feed and legacy “post as the assistant” behavior"
+section = "## Execution, companions and operator surfaces"
+surface_class = "side effect"
+owner = "automonique-transports"
+owner_via = "porting-map"
+porting_map_row = "Slack lifecycle in `index.ts`"
+owner_note = "the row lists transports and core; posting into a channel is the transport's effect"
+
+[parity."browser-desktop-notifications"]
+row = "Browser desktop notifications"
+section = "## Execution, companions and operator surfaces"
+surface_class = "side effect"
+owner = "automonique-web"
+owner_via = "porting-map"
+porting_map_row = "`dashboard.ts`, `term.ts`, `runs.ts`"
+owner_note = "server-side notification state is served by the dashboard's crate; it is this row's only crate destination"
+
+[parity."force-ignored-message-into-a-ticket"]
+row = "Force ignored message into a ticket"
+section = "## Execution, companions and operator surfaces"
+surface_class = "state transition"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "Slack lifecycle in `index.ts`"
+owner_note = "the row lists transports and core; the intake surface is already owned by the Slack row, and this row's behaviour is the durable work creation and fresh approval gate, which is core"
+
+[parity."delete-ignored-user-authored-slack-message"]
+row = "Delete ignored/user-authored Slack message"
+section = "## Execution, companions and operator surfaces"
+surface_class = "side effect"
+owner = "automonique-transports"
+owner_via = "porting-map"
+porting_map_row = "Slack lifecycle in `index.ts`"
+owner_note = "safety row: deleting a platform message is a chat-platform mutation owned by the transport; the separate delete credential is the authorization, not the owner"
+
+[parity."site-digest-and-bounded-one-shot-assistance"]
+row = "Site digest and bounded one-shot assistance"
+section = "## Execution, companions and operator surfaces"
+surface_class = "input"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "site and restricted-provider modules; this row names one crate destination"
+
+[parity."ops-command-proposal-classification"]
+row = "Ops-command proposal classification"
+section = "## Execution, companions and operator surfaces"
+surface_class = "command"
+owner = "automonique-core"
+owner_via = "porting-map"
+porting_map_row = "commands/conversation/support/site/companion modules"
+owner_note = "command modules; this row names one crate destination"
+
