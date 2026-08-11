@@ -284,6 +284,10 @@ ITEM_STATUS = {
     "R1-07": "done",
     "R1-08": "done",
     "R1-09": "done",
+    # Were partial; their open rows were closed by implementation, not by
+    # rewording, and re-measured at the base they landed on.
+    "R1-10": "done",
+    "R1-11": "done",
     "R1-13": "done",
     "R1-14": "done",
     "R1-15": "done",

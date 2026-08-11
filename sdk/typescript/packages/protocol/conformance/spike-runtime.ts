@@ -57,6 +57,53 @@ throwsValidation("multibyte over the byte limit", () =>
   TurnId("é".repeat(TurnId_MAX_BYTES)),
 );
 
+// Brand distinctness, the half the type checker cannot show. `brand-crossing.ts`
+// proves the compiler refuses a cross-domain assignment; nothing of the brand
+// survives into the value, because every generated constructor ends in
+// `return value as TurnId`. The contract calls a brand that holds at compile
+// time and erases at runtime a *partial* pass, so the erasure is measured here
+// rather than assumed, and `generated/VERDICT.md` records it as a partial. If
+// the emitter is ever changed to carry the brand into the value, these checks
+// fail and the verdict has to be revisited instead of quietly going stale.
+const brandedTurn = TurnId("abc");
+const brandedSession = SessionId("abc");
+const brandProperty = (brandedTurn as unknown as {readonly __brand?: unknown}).__brand;
+const crossDomainEqual = (brandedTurn as string) === (brandedSession as string);
+check(
+  "a branded identifier is a plain string at runtime",
+  typeof brandedTurn === "string",
+  `typeof is ${typeof brandedTurn}; the brand now survives, so VERDICT.md must be revisited`,
+);
+check(
+  "the brand is not carried as a runtime property",
+  brandProperty === undefined,
+  `__brand is ${String(brandProperty)}; the brand now survives, so VERDICT.md must be revisited`,
+);
+check(
+  "the same text in two domains is indistinguishable at runtime",
+  crossDomainEqual,
+  'TurnId("abc") and SessionId("abc") no longer compare equal; VERDICT.md must be revisited',
+);
+check(
+  "a branded identifier serializes as a bare string",
+  JSON.stringify(brandedTurn) === '"abc"',
+  `serialized as ${JSON.stringify(brandedTurn)}; the brand now reaches the wire`,
+);
+
+// The compile-time pair for `conformance/negative/brand-crossing.ts`: the same
+// import, the same shape of assignment, differing only in the domain. That file
+// must not compile and this line must, or its failure would prove nothing about
+// branding. `tests/codegen.rs` typechecks this script for exactly that reason.
+const sameDomain: TurnId = brandedTurn;
+check("a same-domain assignment is accepted", sameDomain === brandedTurn);
+
+// Reported as a measurement so the Rust suite can compare what actually runs
+// against what the emitter's text implies and what the verdict records.
+const brandRuntimeExistence =
+  typeof brandedTurn === "string" && brandProperty === undefined && crossDomainEqual
+    ? "erased"
+    : "carried";
+
 // Bounded integers survive the signed 64-bit ceiling exactly.
 check("sequence at i64::MAX", Sequence(Sequence_MAX) === Sequence_MAX);
 throwsValidation("sequence past i64::MAX", () => Sequence(Sequence_MAX + 1n));
@@ -94,6 +141,10 @@ check(
 throwsValidation("unknown event payload over the ceiling", () =>
   decodeEvent("turn_hibernated", "x".repeat(MAX_UNKNOWN_EVENT_BYTES + 1)),
 );
+
+// Printed before any exit: it is a measurement, and it is most useful in the
+// run where something disagrees with it.
+console.log(`brand-runtime-existence: ${brandRuntimeExistence}`);
 
 if (failures.length > 0) {
   for (const failure of failures) console.error(`FAIL ${failure}`);

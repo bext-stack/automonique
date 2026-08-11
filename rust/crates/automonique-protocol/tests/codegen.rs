@@ -36,9 +36,10 @@ fn javascript_runtime() -> Option<&'static str> {
     })
 }
 
-/// Run `tsc` over one file, returning whether it typechecked.
-fn typechecks(file: &PathBuf) -> Option<(bool, String)> {
-    let output = Command::new("npx")
+/// Run `tsc` over one or more files, returning whether they typechecked.
+fn typechecks(files: &[PathBuf]) -> Option<(bool, String)> {
+    let mut command = Command::new("npx");
+    command
         .arg("--offline")
         .arg("tsc")
         .arg("--noEmit")
@@ -57,16 +58,46 @@ fn typechecks(file: &PathBuf) -> Option<(bool, String)> {
         .arg("--moduleResolution")
         .arg("Bundler")
         .arg("--allowImportingTsExtensions")
-        .arg(file)
-        .current_dir(package_root())
-        .output()
-        .ok()?;
+        .args(files);
+    let output = command.current_dir(package_root()).output().ok()?;
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     Some((output.status.success(), combined))
+}
+
+/// One run of the runtime half of the spike.
+struct RuntimeRun {
+    /// The interpreter that ran it.
+    runtime: &'static str,
+    /// Whether it exited zero.
+    success: bool,
+    /// What it printed on standard output.
+    stdout: String,
+    /// What it printed on standard error.
+    stderr: String,
+}
+
+/// Run `conformance/spike-runtime.ts`, or `None` when no runtime is installed.
+///
+/// The output is returned rather than asserted on so that two checks can share
+/// one execution: one asserts the script passed, the other reads the
+/// measurements it printed.
+fn run_runtime_conformance() -> Option<RuntimeRun> {
+    let runtime = javascript_runtime()?;
+    let output = Command::new(runtime)
+        .arg(package_root().join("conformance/spike-runtime.ts"))
+        .current_dir(package_root())
+        .output()
+        .ok()?;
+    Some(RuntimeRun {
+        runtime,
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 mod source_direction {
@@ -222,11 +253,40 @@ mod typescript_properties {
 
     #[test]
     fn the_generated_file_typechecks() {
-        let Some((ok, output)) = typechecks(&generated_path()) else {
+        let Some((ok, output)) = typechecks(&[generated_path()]) else {
             eprintln!("GAP: tsc is unavailable; the codegen spike is unmeasured");
             return;
         };
         assert!(ok, "generated TypeScript does not typecheck:\n{output}");
+    }
+
+    /// The positive half of the negative cases.
+    ///
+    /// A file that fails to compile is evidence only when the same code
+    /// compiles with the guarded property restored; otherwise a typo in an
+    /// import path would look exactly like a preserved brand.
+    /// `conformance/spike-runtime.ts` imports the same constructors from the
+    /// same generated file and performs the same shape of assignment *within*
+    /// one domain, so it must typecheck while `brand-crossing.ts` must not.
+    /// Typechecking it also keeps the runtime measurements themselves under the
+    /// compiler, which is where a stale cast would otherwise hide.
+    #[test]
+    fn the_runtime_conformance_script_typechecks() {
+        let files = [
+            package_root().join("conformance/spike-runtime.ts"),
+            // The ambient `process` declaration the script relies on. The
+            // package tsconfig picks it up by directory; a file list has to
+            // name it.
+            package_root().join("conformance/node-runtime.d.ts"),
+        ];
+        let Some((ok, output)) = typechecks(&files) else {
+            eprintln!("GAP: tsc is unavailable; the runtime conformance script is unmeasured");
+            return;
+        };
+        assert!(
+            ok,
+            "conformance/spike-runtime.ts does not typecheck:\n{output}"
+        );
     }
 
     /// Each negative case must fail to compile, and fail for the property it
@@ -266,7 +326,7 @@ mod typescript_properties {
 
         for (file, diagnostic) in expected {
             let path = directory.join(file);
-            let Some((ok, output)) = typechecks(&path) else {
+            let Some((ok, output)) = typechecks(&[path]) else {
                 eprintln!("GAP: tsc is unavailable; negative cases are unmeasured");
                 return;
             };
@@ -280,25 +340,19 @@ mod typescript_properties {
 
     #[test]
     fn the_runtime_behaviour_matches_the_rust_bounds() {
-        let Some(runtime) = javascript_runtime() else {
+        let Some(run) = run_runtime_conformance() else {
             eprintln!("GAP: no JavaScript runtime; runtime behaviour is unmeasured");
             return;
         };
-        let script = package_root().join("conformance/spike-runtime.ts");
-        let output = Command::new(runtime)
-            .arg(&script)
-            .current_dir(package_root())
-            .output()
-            .expect("runtime check starts");
         assert!(
-            output.status.success(),
-            "runtime property check failed under {runtime}:\n{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            run.success,
+            "runtime property check failed under {}:\n{}{}",
+            run.runtime, run.stdout, run.stderr
         );
         println!(
-            "codegen runtime checks under {runtime}: {}",
-            String::from_utf8_lossy(&output.stdout).trim()
+            "codegen runtime checks under {}: {}",
+            run.runtime,
+            run.stdout.trim()
         );
     }
 }
@@ -306,10 +360,107 @@ mod typescript_properties {
 mod verdict_quality {
     use super::*;
 
+    /// The properties the contract's check table names, spelled as the verdict
+    /// tabulates them.
+    const PROPERTIES: [&str; 5] = [
+        "Bound preservation",
+        "Brand distinctness",
+        "Union exhaustiveness",
+        "Unknown-event tolerance",
+        "Reproducibility",
+    ];
+
+    /// The results a property row may record. `null` is the contract's spelling
+    /// for unmeasured; anything else is a word whose meaning nobody has fixed,
+    /// and a reader would have to guess whether it counts as a pass.
+    const RECOGNIZED_RESULTS: [&str; 4] = ["pass", "partial", "fail", "null"];
+
+    fn verdict() -> String {
+        std::fs::read_to_string(package_root().join("generated/VERDICT.md"))
+            .expect("the spike verdict is checked in")
+    }
+
+    /// The whole table row the verdict records for one property.
+    fn row<'a>(verdict: &'a str, property: &str) -> &'a str {
+        let prefix = format!("| {property} |");
+        verdict
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("the verdict has no table row for {property}"))
+    }
+
+    /// The Result column of that row.
+    fn result_cell(verdict: &str, property: &str) -> String {
+        row(verdict, property)
+            .split('|')
+            .nth(2)
+            .unwrap_or_else(|| panic!("the {property} row has no result column"))
+            .trim()
+            .to_owned()
+    }
+
+    /// The section listing what `R8B` is told it must plan for.
+    fn constraints(verdict: &str) -> &str {
+        let start = verdict
+            .find("## Constraints")
+            .expect("the verdict lists the constraints R8B must plan for");
+        let rest = &verdict[start..];
+        &rest[..rest.find("\n## ").unwrap_or(rest.len())]
+    }
+
+    /// Where a generated brand exists.
+    #[derive(Debug, Eq, PartialEq)]
+    enum BrandExistence {
+        /// The type checker knows which domain a value came from; the value
+        /// itself does not.
+        CompileTimeOnly,
+        /// The value carries its domain into the running program.
+        Runtime,
+    }
+
+    /// Read the emitted constructor for `name` and decide where its brand
+    /// exists.
+    ///
+    /// What the verdict must record is derived from the emitter here rather
+    /// than hard-coded, so that changing the emitter changes the obligation
+    /// instead of leaving a stale caveat behind. A constructor that returns its
+    /// argument unchanged cannot carry a brand: the value that comes out is the
+    /// value that went in.
+    fn brand_existence(generated: &str, name: &str) -> BrandExistence {
+        let signature = format!("export function {name}(value: string): {name} {{");
+        let start = generated
+            .find(&signature)
+            .unwrap_or_else(|| panic!("{name} has no emitted constructor"));
+        let body = &generated[start + signature.len()..];
+        let end = body
+            .find("\n}")
+            .unwrap_or_else(|| panic!("{name}'s emitted constructor is unterminated"));
+        if body[..end].contains(&format!("return value as {name};")) {
+            BrandExistence::CompileTimeOnly
+        } else {
+            BrandExistence::Runtime
+        }
+    }
+
+    /// The branded domains whose brand exists only in the type checker.
+    fn erasing_brands(generated: &str, slice: &SpikeSchema) -> Vec<String> {
+        // Without this, a slice that lost its branded domains would make every
+        // question below vacuously true rather than loudly wrong.
+        assert!(
+            !slice.branded_ids.is_empty(),
+            "the slice has no branded domain to judge"
+        );
+        slice
+            .branded_ids
+            .iter()
+            .filter(|id| brand_existence(generated, &id.name) == BrandExistence::CompileTimeOnly)
+            .map(|id| id.name.clone())
+            .collect()
+    }
+
     #[test]
     fn the_verdict_is_recorded_and_names_its_outcome() {
-        let verdict = std::fs::read_to_string(package_root().join("generated/VERDICT.md"))
-            .expect("the spike verdict is checked in");
+        let verdict = verdict();
         let recognized = ["recommended with named constraints", "not recommended"]
             .iter()
             .any(|outcome| verdict.contains(outcome))
@@ -318,22 +469,102 @@ mod verdict_quality {
             recognized,
             "the verdict does not state a recognized outcome"
         );
-        // Every property in the contract's table must be accounted for.
-        for property in [
-            "bound preservation",
-            "brand distinctness",
-            "union exhaustiveness",
-            "unknown-event tolerance",
-            "reproducibility",
-        ] {
+        // Every property in the contract's table must be accounted for, and
+        // accounted for as a result rather than as prose.
+        for property in PROPERTIES {
+            let cell = result_cell(&verdict, property);
             assert!(
-                verdict.to_lowercase().contains(property),
-                "the verdict does not account for {property}"
+                RECOGNIZED_RESULTS.contains(&cell.as_str()),
+                "{property} records {cell:?}, which is not one of {RECOGNIZED_RESULTS:?}"
             );
+            // A qualification recorded only in the table is a footnote a
+            // planner reads past. Anything short of a clean pass must also
+            // reach the list of what R8B has to plan for.
+            if cell != "pass" {
+                let key = property
+                    .split_whitespace()
+                    .next()
+                    .expect("a property name is not empty")
+                    .to_lowercase();
+                assert!(
+                    constraints(&verdict).to_lowercase().contains(&key),
+                    "{property} is recorded as {cell:?}, but no constraint mentions {key:?}"
+                );
+            }
         }
         assert!(
             verdict.contains("R8B"),
             "the verdict does not state what a failure would cost R8B"
+        );
+    }
+
+    /// The contract calls a brand that holds at compile time and erases at
+    /// runtime a partial pass. This is what stops the verdict from recording it
+    /// as a clean one.
+    #[test]
+    fn a_brand_that_erases_at_runtime_is_recorded_as_a_partial() {
+        let slice = hostile_slice();
+        let generated = emit_typescript(&slice);
+        let erasing = erasing_brands(&generated, &slice);
+        if erasing.is_empty() {
+            // The emitter now carries brands into the value, so there is no
+            // partial left to record. The obligation follows the emitter.
+            return;
+        }
+
+        let verdict = verdict();
+        let cell = result_cell(&verdict, "Brand distinctness");
+        assert_eq!(
+            cell, "partial",
+            "the brands of {erasing:?} exist only in the type checker, which the contract records \
+             as a partial pass, but the verdict records {cell:?}"
+        );
+        let recorded = row(&verdict, "Brand distinctness").to_lowercase();
+        assert!(
+            recorded.contains("runtime") && recorded.contains("eras"),
+            "the brand distinctness row is marked partial without naming the runtime erasure that \
+             makes it one: {recorded}"
+        );
+        let planned = constraints(&verdict).to_lowercase();
+        assert!(
+            planned.contains("brand") && planned.contains("runtime"),
+            "no constraint tells R8B what the runtime erasure costs it"
+        );
+    }
+
+    /// What the verdict records, what the emitter writes and what the generated
+    /// code actually does must be the same claim. The first two are text; this
+    /// compares them against the third by running it.
+    #[test]
+    fn what_the_runtime_measures_agrees_with_the_emitted_brand() {
+        let slice = hostile_slice();
+        let generated = emit_typescript(&slice);
+        let emitted = if erasing_brands(&generated, &slice).len() == slice.branded_ids.len() {
+            "erased"
+        } else {
+            "carried"
+        };
+        let Some(run) = run_runtime_conformance() else {
+            eprintln!("GAP: no JavaScript runtime; the brand's runtime existence is unmeasured");
+            return;
+        };
+        let observed = run
+            .stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("brand-runtime-existence: "))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the runtime conformance script no longer reports whether the brand survives \
+                     into the value:\n{}{}",
+                    run.stdout, run.stderr
+                )
+            });
+        assert_eq!(
+            observed.trim(),
+            emitted,
+            "the emitted constructors say the brand is {emitted}, but running the generated code \
+             under {} reports {observed}",
+            run.runtime
         );
     }
 }

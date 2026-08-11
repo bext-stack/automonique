@@ -8,15 +8,22 @@
 //! a reason to stop, not a reason to proceed.
 //!
 //! Everything here is a pure function over supplied documents. Nothing fetches
-//! a URL, executes a provider binary or consults a registry. Digests are
-//! *compared*, never computed: this crate has no dependencies and therefore no
-//! hash implementation, so a caller supplies the computed digest and the
-//! bundle refuses to load unless it matches the declared one.
+//! a URL, executes a provider binary or consults a registry.
+//!
+//! Digests are *computed*, never taken on trust. A [`SchemaDocument`] encodes
+//! itself canonically ([`SchemaDocument::canonical_bytes`]) and hashes those
+//! bytes with the crate's own dependency-free SHA-256 ([`crate::digest`]), so
+//! [`PinnedBundle::load`] can check a checked-in declared digest against the
+//! document it claims to describe. A loaded bundle then has no digest field to
+//! drift from its document: [`PinnedBundle::digest`] derives the digest on
+//! demand, which makes a bundle whose digest disagrees with its content
+//! unrepresentable rather than merely refused once.
 
 use core::fmt;
 use std::error::Error;
 
 use crate::codec::{MajorVersion, VersionRange};
+use crate::digest::{DigestError, Sha256, Sha256Digest};
 
 /// Maximum UTF-8 byte length of a schema path or identifier.
 pub const MAX_SCHEMA_FIELD_BYTES: usize = 512;
@@ -189,13 +196,80 @@ impl SchemaDocument {
             unmodelled: extras,
         })
     }
+
+    /// The exact bytes this document is digested over.
+    ///
+    /// The encoding is canonical and injective: every section is preceded by
+    /// its element count and every string by its byte length, both as
+    /// big-endian `u64`, so no two different documents share an encoding and no
+    /// concatenation of parts can be mistaken for a different split of the same
+    /// text. Construction already sorts and deduplicates every section, so the
+    /// encoding depends on the document's content and never on the order its
+    /// parts were supplied in.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_text(&mut bytes, CANONICAL_ENCODING);
+        push_count(&mut bytes, self.fields.len());
+        for field in &self.fields {
+            push_text(&mut bytes, &field.path);
+            push_text(&mut bytes, &field.type_name);
+            bytes.push(u8::from(field.required));
+        }
+        push_count(&mut bytes, self.enums.len());
+        for entry in &self.enums {
+            push_text(&mut bytes, &entry.path);
+            bytes.push(match entry.sensitivity {
+                EnumSensitivity::SecuritySensitive => 1,
+                EnumSensitivity::ReadOnly => 0,
+            });
+            push_count(&mut bytes, entry.values.len());
+            for value in &entry.values {
+                push_text(&mut bytes, value);
+            }
+        }
+        push_count(&mut bytes, self.message_kinds.len());
+        for kind in &self.message_kinds {
+            push_text(&mut bytes, kind);
+        }
+        push_count(&mut bytes, self.endpoints.len());
+        for endpoint in &self.endpoints {
+            push_text(&mut bytes, endpoint);
+        }
+        push_count(&mut bytes, self.unmodelled.len());
+        for (key, value) in &self.unmodelled {
+            push_text(&mut bytes, key);
+            push_text(&mut bytes, value);
+        }
+        bytes
+    }
+
+    /// The SHA-256 digest of [`Self::canonical_bytes`].
+    ///
+    /// This is the digest a pinned bundle must declare.
+    #[must_use]
+    pub fn digest(&self) -> Sha256Digest {
+        Sha256::digest(&self.canonical_bytes())
+    }
 }
 
 /// Why a bundle, registry or descriptor was refused.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SchemaError {
-    /// A supplied digest did not match the bundle's declared digest.
-    DigestMismatch,
+    /// The digest computed from the document did not match the declared one.
+    ///
+    /// Both are named so an operator can repin without recomputing by hand.
+    DigestMismatch {
+        /// The digest the bundle declared.
+        declared: Sha256Digest,
+        /// The digest computed from the document the bundle carries.
+        computed: Sha256Digest,
+    },
+    /// A declared digest was not a canonical `sha256:` spelling.
+    DigestMalformed {
+        /// Which part of the spelling was wrong.
+        error: DigestError,
+    },
     /// Two bundles claim overlapping binary version ranges for one provider.
     OverlappingRanges {
         /// The provider whose ranges collide.
@@ -213,7 +287,8 @@ impl SchemaError {
     #[must_use]
     pub const fn category(&self) -> &'static str {
         match self {
-            Self::DigestMismatch => "digest_mismatch",
+            Self::DigestMismatch { .. } => "digest_mismatch",
+            Self::DigestMalformed { .. } => "digest_malformed",
             Self::OverlappingRanges { .. } => "overlapping_ranges",
             Self::FieldInvalid { .. } => "field_invalid",
         }
@@ -223,9 +298,11 @@ impl SchemaError {
 impl fmt::Display for SchemaError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DigestMismatch => {
-                formatter.write_str("supplied digest does not match the declared digest")
-            }
+            Self::DigestMismatch { declared, computed } => write!(
+                formatter,
+                "document digest is {computed}, but the bundle declared {declared}"
+            ),
+            Self::DigestMalformed { error } => write!(formatter, "declared digest: {error}"),
             Self::OverlappingRanges { provider } => write!(
                 formatter,
                 "provider {provider} has two bundles with overlapping version ranges"
@@ -238,40 +315,86 @@ impl fmt::Display for SchemaError {
 impl Error for SchemaError {}
 
 /// A checked-in schema bundle pinned to a binary version range.
+///
+/// The bundle stores no digest. [`Self::digest`] recomputes it from the
+/// document, so the two can never disagree after loading; the declared digest
+/// exists only as the checked-in claim [`Self::load`] verifies.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PinnedBundle {
     provider: String,
     binary_versions: VersionRange,
-    declared_digest: String,
     document: SchemaDocument,
 }
 
 impl PinnedBundle {
     /// Load a bundle, verifying the document against its declared digest.
     ///
-    /// `computed_digest` is supplied by a caller that hashed the document. The
-    /// two are never trusted independently: a bundle whose declared and
-    /// computed digests differ does not load.
+    /// `declared_digest` is the checked-in pin, in canonical
+    /// `sha256:<64 lowercase hex digits>` form. It is compared against the
+    /// digest computed from `document` here and now: a bundle whose document
+    /// has changed since it was pinned does not load. There is no parameter
+    /// through which a caller can supply the computed digest, so the two are
+    /// never trusted independently.
+    ///
+    /// ```
+    /// use automonique_protocol::codec::{MajorVersion, VersionRange};
+    /// use automonique_protocol::schema::{PinnedBundle, SchemaDocument};
+    ///
+    /// let document = SchemaDocument::new(vec![], vec![], &["turn_started"], &[], &[])?;
+    /// let declared = document.digest().to_string();
+    /// let bundle = PinnedBundle::load(
+    ///     "codex",
+    ///     VersionRange::exact(MajorVersion::FIRST),
+    ///     &declared,
+    ///     document,
+    /// )?;
+    /// assert_eq!(bundle.digest().to_string(), declared);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// Handing `load` a digest the caller computed itself does not compile:
+    /// there is no fifth parameter to put it in. The only difference from the
+    /// case above is that extra argument.
+    ///
+    /// ```compile_fail,E0061
+    /// use automonique_protocol::codec::{MajorVersion, VersionRange};
+    /// use automonique_protocol::schema::{PinnedBundle, SchemaDocument};
+    ///
+    /// let document = SchemaDocument::new(vec![], vec![], &["turn_started"], &[], &[])?;
+    /// let declared = document.digest().to_string();
+    /// let bundle = PinnedBundle::load(
+    ///     "codex",
+    ///     VersionRange::exact(MajorVersion::FIRST),
+    ///     &declared,
+    ///     &declared,
+    ///     document,
+    /// )?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns [`SchemaError::DigestMismatch`] or [`SchemaError::FieldInvalid`].
+    /// Returns [`SchemaError::DigestMalformed`] when `declared_digest` is not a
+    /// canonical `sha256:` spelling, [`SchemaError::DigestMismatch`] when it
+    /// does not describe `document`, and [`SchemaError::FieldInvalid`] for an
+    /// empty or oversized provider.
     pub fn load(
         provider: &str,
         binary_versions: VersionRange,
         declared_digest: &str,
-        computed_digest: &str,
         document: SchemaDocument,
     ) -> Result<Self, SchemaError> {
         bounded(provider, "provider")?;
-        bounded(declared_digest, "declared_digest")?;
-        if declared_digest != computed_digest {
-            return Err(SchemaError::DigestMismatch);
+        let declared: Sha256Digest = declared_digest
+            .parse()
+            .map_err(|error| SchemaError::DigestMalformed { error })?;
+        let computed = document.digest();
+        if declared != computed {
+            return Err(SchemaError::DigestMismatch { declared, computed });
         }
         Ok(Self {
             provider: provider.to_owned(),
             binary_versions,
-            declared_digest: declared_digest.to_owned(),
             document,
         })
     }
@@ -288,10 +411,13 @@ impl PinnedBundle {
         self.binary_versions
     }
 
-    /// The verified document digest.
+    /// The document's digest, recomputed from the document.
+    ///
+    /// Deriving rather than storing is what makes a bundle whose digest
+    /// disagrees with its content unrepresentable.
     #[must_use]
-    pub fn digest(&self) -> &str {
-        &self.declared_digest
+    pub fn digest(&self) -> Sha256Digest {
+        self.document.digest()
     }
 
     /// The modelled schema.
@@ -587,6 +713,20 @@ fn change(path: &str, reason: &'static str) -> Change {
         path: path.to_owned(),
         reason,
     }
+}
+
+/// Names the encoding a digest is taken over, so a digest of these bytes cannot
+/// be confused with a digest of some other structure that happens to serialize
+/// the same way.
+const CANONICAL_ENCODING: &str = "automonique.schema.document/v1";
+
+fn push_count(bytes: &mut Vec<u8>, count: usize) {
+    bytes.extend_from_slice(&(count as u64).to_be_bytes());
+}
+
+fn push_text(bytes: &mut Vec<u8>, value: &str) {
+    push_count(bytes, value.len());
+    bytes.extend_from_slice(value.as_bytes());
 }
 
 fn bounded(value: &str, field: &'static str) -> Result<(), SchemaError> {

@@ -665,7 +665,7 @@ summary = "generate/capture schemas, hash fixtures, map them to binary ranges an
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-11"
@@ -676,7 +676,7 @@ summary = "prove Rust-derived domain/API/event schemas can generate reproducible
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-12"

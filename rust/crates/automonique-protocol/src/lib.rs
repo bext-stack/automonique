@@ -11,6 +11,7 @@ pub mod codegen;
 pub mod compat;
 pub mod connector;
 pub mod context;
+pub mod digest;
 pub mod event;
 pub mod host;
 pub mod identity;
