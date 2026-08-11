@@ -6,6 +6,16 @@
 //! only exceptions are legacy compatibility identifiers listed in an inventory,
 //! and each of those must name the migration contract that authorized it.
 //!
+//! A prefix rule alone is vacuous on a qualified surface. A module path or a
+//! fixture inside a crate is recorded crate-qualified, so
+//! `automonique_protocol::legacy_shim` carries the prefix through its crate and
+//! no spelling of the leaf could ever be refused. The gate therefore applies the
+//! contract's second sentence as well — "an undocumented legacy identifier fails
+//! the build rather than becoming permanent by accident" — and refuses any
+//! identifier one of whose own segments names a legacy surface, on every class,
+//! whatever its crate. Inventorying it with a contract is still the way out; see
+//! [`ScannedIdentifier::names_legacy_surface`].
+//!
 //! There is deliberately no suppression comment, no separate allowlist file and
 //! no environment variable. Adding an exception means adding an inventory entry
 //! with its contract, which is reviewable; an escape hatch is exactly the
@@ -78,6 +88,23 @@ pub const CANONICAL_BARE: &str = "automonique";
 /// canonical spelling is dotted — see [`SurfaceClass::permits_dotted_namespace`]
 /// — so a package or binary called `automonique.thing` is still a finding.
 pub const CANONICAL_DOT_PREFIX: &str = "automonique.";
+
+/// The segment root that marks a legacy compatibility identifier.
+///
+/// This is the spelling the migration plan uses for every compatibility surface
+/// it names — `legacyctl`, `legacy-shell`, `legacy-tui`, `legacy-run.sh`,
+/// `legacy:audit`, `@legacy/sdk*` — and the one the gate's own seeded trees use
+/// for "outside the namespace". An identifier carrying it is a legacy
+/// identifier, permitted only through an inventory entry with its contract.
+pub const LEGACY_ROOT: &str = "legacy";
+
+/// Characters that separate one segment of an identifier from the next.
+///
+/// One identifier is spelled several ways across the surfaces: `::` in a module
+/// path, `-` in a package, `_` in a crate or metric, `.` in a schema or protocol
+/// name, `/` in a scoped package. Segmenting on all of them is what lets one
+/// rule read every class.
+const SEGMENT_SEPARATORS: [char; 5] = [':', '-', '_', '.', '/'];
 
 /// Maximum UTF-8 byte length of a scanned identifier or location.
 pub const MAX_NAMESPACE_FIELD_BYTES: usize = 512;
@@ -238,6 +265,28 @@ impl ScannedIdentifier {
             || self.name.starts_with(CANONICAL_UNDERSCORE_PREFIX)
             || (self.surface.permits_dotted_namespace()
                 && self.name.starts_with(CANONICAL_DOT_PREFIX))
+    }
+
+    /// Whether any segment of the identifier names a legacy compatibility surface.
+    ///
+    /// [`Self::is_canonical`] cannot answer this. A qualified identifier — a
+    /// module path, or a fixture inside a crate — is recorded with its crate in
+    /// front, so the prefix test is satisfied by the crate alone and
+    /// `automonique_protocol::legacy_shim` passes it. Every package in this
+    /// workspace is `automonique-*`, which would make the module and fixture
+    /// classes unable to produce a finding at all. Reading the segments is what
+    /// makes them able to: the crate qualifier cannot launder a legacy leaf, and
+    /// the rule is the same on all ten classes rather than special-cased to the
+    /// two qualified ones.
+    ///
+    /// This refuses a name; it does not forbid one. A legacy identifier that a
+    /// migration contract authorizes still passes through the inventory, which
+    /// is the reviewable decision the gate exists to require.
+    #[must_use]
+    pub fn names_legacy_surface(&self) -> bool {
+        self.name
+            .split(SEGMENT_SEPARATORS)
+            .any(|segment| segment.starts_with(LEGACY_ROOT))
     }
 
     /// The identifier.
@@ -612,6 +661,12 @@ impl NamespaceGate {
 
     /// Run the gate over a set of observed identifiers.
     ///
+    /// An identifier is a finding when it is outside the canonical namespace, or
+    /// when it names a legacy surface from inside it — see
+    /// [`ScannedIdentifier::names_legacy_surface`] — and in either case is not
+    /// inventoried. The second condition is what stops a canonical crate
+    /// qualifier from accepting any leaf spelling at all.
+    ///
     /// Deterministic: findings and orphans are sorted, so the same tree yields
     /// the same ordered report regardless of the order identifiers arrived in.
     ///
@@ -623,7 +678,7 @@ impl NamespaceGate {
     pub fn run(&self, scanned: &[ScannedIdentifier]) -> GateReport {
         let mut findings: Vec<Finding> = scanned
             .iter()
-            .filter(|identifier| !identifier.is_canonical())
+            .filter(|identifier| !identifier.is_canonical() || identifier.names_legacy_surface())
             .filter(|identifier| {
                 !self.inventory.iter().any(|entry| {
                     entry.name == identifier.name && entry.surface == identifier.surface

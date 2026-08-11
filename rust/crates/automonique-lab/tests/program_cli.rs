@@ -314,11 +314,14 @@ fn admitted_cli_allocates_and_replays_the_packet_bound_worktree() {
         thread::sleep(Duration::from_millis(2));
     }
     assert!(socket.exists());
+    // The admitted attempt is keyed by the selected item's objective, so this
+    // must follow the fixture's selection rather than name a frozen item.
+    let objective = format!("objective:{}", fixture.selected_id);
     let request = LabRequest::Observe(
         ObserveRequest::new(
             OpaqueId::new("admitted-observe").expect("request ID"),
-            OpaqueId::new("objective:R0-19").expect("objective ID"),
-            OpaqueId::new("objective:R0-19").expect("unit ID"),
+            OpaqueId::new(&objective).expect("objective ID"),
+            OpaqueId::new(&objective).expect("unit ID"),
             0,
             64,
         )

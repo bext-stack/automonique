@@ -192,6 +192,69 @@ mod schema_independence {
 mod outcome_vocabulary {
     use super::*;
 
+    /// Every variant of `ActionOutcome`, named one at a time.
+    ///
+    /// Written out here rather than read back out of `ActionOutcome::ALL`,
+    /// because `ALL` is exactly what these tests have to check.
+    const EVERY_OUTCOME: [ActionOutcome; 6] = [
+        ActionOutcome::Accepted,
+        ActionOutcome::Completed,
+        ActionOutcome::Rejected,
+        ActionOutcome::Conflict,
+        ActionOutcome::Unknown,
+        ActionOutcome::ResyncRequired,
+    ];
+
+    /// The wire spelling each variant is required to keep.
+    ///
+    /// The match is exhaustive over `ActionOutcome`, which is what ties this
+    /// file to the enum: `ALL` is a hand-written array and nothing inside the
+    /// type stops a seventh variant being added without extending it, but a
+    /// seventh variant makes this match non-exhaustive, so the suite stops
+    /// compiling until the variant is named here — and the assertions below
+    /// then require it to be present in `ALL` as well.
+    fn wire_spelling(outcome: ActionOutcome) -> &'static str {
+        match outcome {
+            ActionOutcome::Accepted => "accepted",
+            ActionOutcome::Completed => "completed",
+            ActionOutcome::Rejected => "rejected",
+            ActionOutcome::Conflict => "conflict",
+            ActionOutcome::Unknown => "unknown",
+            ActionOutcome::ResyncRequired => "resync_required",
+        }
+    }
+
+    #[test]
+    fn every_variant_of_the_outcome_enum_is_present_in_all() {
+        for outcome in EVERY_OUTCOME {
+            assert!(
+                ActionOutcome::ALL.contains(&outcome),
+                "{outcome:?} is a variant of ActionOutcome but is absent from \
+                 ActionOutcome::ALL, so anything exhaustive over ALL silently \
+                 misses it"
+            );
+        }
+        assert_eq!(
+            ActionOutcome::ALL.len(),
+            EVERY_OUTCOME.len(),
+            "ALL and the named variants disagree about how many outcomes exist"
+        );
+    }
+
+    #[test]
+    fn every_outcome_keeps_its_wire_spelling() {
+        // Distinctness alone would let all six be renamed at once. These are
+        // the literals a peer decodes, so they are pinned literally.
+        for outcome in EVERY_OUTCOME {
+            assert_eq!(
+                outcome.as_str(),
+                wire_spelling(outcome),
+                "the wire spelling of {outcome:?} changed, so a peer that \
+                 decodes the recorded spelling stops understanding it"
+            );
+        }
+    }
+
     #[test]
     fn the_outcome_set_is_closed_and_every_spelling_is_distinct() {
         assert_eq!(ActionOutcome::ALL.len(), 6);
@@ -414,13 +477,43 @@ mod receipt_durability {
         assert_eq!(found.outcome(), ActionOutcome::Completed);
     }
 
+    #[test]
+    fn a_lookup_answers_for_the_key_it_was_given() {
+        let mut ledger = ActionLedger::new();
+        ledger
+            .record("a-1", "work/w-1", "key-1", None, ActionOutcome::Accepted)
+            .expect("first");
+        ledger
+            .record("a-2", "work/w-2", "key-2", None, ActionOutcome::Completed)
+            .expect("second");
+
+        // Everything else in this file that reads a receipt back reads it
+        // through `find`, and every one of those reads would be satisfied by a
+        // lookup that returned an arbitrary recorded receipt. The key has to
+        // decide which one comes back, and an unrecorded key has to come back
+        // empty rather than borrowing somebody else's answer.
+        let second = ledger.find("key-2").expect("key-2 was recorded");
+        assert_eq!(second.action_id(), "a-2");
+        assert_eq!(second.target(), "work/w-2");
+        assert_eq!(second.outcome(), ActionOutcome::Completed);
+
+        let first = ledger.find("key-1").expect("key-1 was recorded");
+        assert_eq!(first.action_id(), "a-1");
+        assert_eq!(first.target(), "work/w-1");
+
+        assert!(
+            ledger.find("key-3").is_none(),
+            "an unrecorded key resolved to some other receipt"
+        );
+    }
+
     /// A receipt owns its data.
     ///
-    /// `ActionReceipt` has no lifetime parameter, so it cannot borrow from a
-    /// connection. The compile-fail case, and the passing case it is paired
-    /// with, are the doc tests on `ActionReceipt` itself, where a borrowing
-    /// receipt fails to outlive the connection that produced it. This pins the
-    /// runtime half.
+    /// `ActionReceipt` takes no lifetime argument, so a receipt that borrows
+    /// from a connection cannot be named at all. That is the compile-fail case
+    /// on `ActionReceipt` itself — a `Session<'connection>` holding an
+    /// `ActionReceipt<'connection>` — paired with the passing case that differs
+    /// from it only in that lifetime. This test pins the runtime half.
     #[test]
     fn a_receipt_is_clonable_and_owns_every_field() {
         let mut ledger = ActionLedger::new();
@@ -519,12 +612,23 @@ mod cursor_monotonicity {
         ));
     }
 
+    /// A cursor above the retained window resumes live.
+    ///
+    /// This is the implemented reading of the contract sentence "a cursor
+    /// outside the retained range yields `resync_required`": `resume_within`
+    /// reads "outside" as "below". Under the literal reading, position 401 is
+    /// outside `100..=400` and would resync, so this test encodes the opposite
+    /// of the contract's wording and does so deliberately — `position` is the
+    /// *next* position the consumer will receive, so `last + 1` is the ordinary
+    /// caught-up state and resyncing it would demand a snapshot of history the
+    /// consumer already has. `event::resolve_subscription` applies the same
+    /// rule. The evidence file records the Cursor monotonicity row as not
+    /// closed on account of the difference rather than treating this test as
+    /// settling it.
     #[test]
     fn a_caught_up_cursor_is_live_rather_than_a_resync() {
         let retained = RetainedRange::new(100, 400).expect("ordered window");
         let cursor = JournalCursor::new("projector", "work", 401).expect("valid");
-        // Nothing this consumer is waiting for has been discarded; it is ahead
-        // of the last retained position, which is being caught up, not stale.
         assert_eq!(
             cursor.resume_within(retained),
             CursorResume::Live { from: 401 }

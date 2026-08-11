@@ -11,6 +11,9 @@ struct Fixture {
     _directory: tempfile::TempDir,
     root: PathBuf,
     base: String,
+    /// The work item this fixture claims, resolved from the copied program and
+    /// objectives rather than named, so a plan change cannot break a claim test.
+    selected_id: String,
 }
 
 impl Fixture {
@@ -49,10 +52,12 @@ impl Fixture {
         git(&root, &["add", "."]);
         git(&root, &["commit", "-qm", "fixture"]);
         let base = git_output(&root, &["rev-parse", "HEAD"]);
+        let selected_id = selectable_work_id(&root);
         Self {
             _directory: directory,
             root,
             base,
+            selected_id,
         }
     }
 
@@ -71,8 +76,42 @@ impl Fixture {
     }
 
     fn claim(&self) -> Output {
-        self.run(&["harness-claim", "--item", "R0-19"])
+        self.run(&["harness-claim", "--item", &self.selected_id])
     }
+}
+
+/// A claimable item: runnable, with an autonomous-eligible objective. Naming
+/// one coupled this fixture to the plan, so freezing a gate broke claim tests
+/// for reasons unrelated to claims. The *last* such item is taken so `--item`
+/// still has to be honoured — the default selection would return the first.
+fn selectable_work_id(root: &Path) -> String {
+    let program = fs::read(root.join(".automonique/dev/program.yaml")).expect("program");
+    let program: Value = serde_json::from_slice(
+        program
+            .strip_prefix(b"# SPDX-License-Identifier: Elastic-2.0\n")
+            .expect("program header"),
+    )
+    .expect("program JSON");
+    let objectives: Value = serde_json::from_slice(
+        &fs::read(root.join(".automonique/dev/objectives.json")).expect("objectives"),
+    )
+    .expect("objectives JSON");
+    let objectives = objectives["objectives"].as_array().expect("objectives");
+    program["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .rev()
+        .find(|item| {
+            item["runnable"] == true
+                && objectives.iter().any(|objective| {
+                    objective["work_id"] == item["id"] && objective["autonomous_eligible"] == true
+                })
+        })
+        .expect("a runnable, autonomous-eligible work item")["id"]
+        .as_str()
+        .expect("work id")
+        .to_owned()
 }
 
 fn repository_root() -> PathBuf {
@@ -133,7 +172,7 @@ fn operational_claim_is_accepted_by_rust_status_and_selection() {
     assert_eq!(receipt["schema"], "automonique.lab-harness-claim/v1");
     assert_eq!(receipt["status"], "claimed");
     assert_eq!(receipt["driver"], "codex_session");
-    assert_eq!(receipt["workId"], "R0-19");
+    assert_eq!(receipt["workId"], fixture.selected_id.as_str());
     assert_eq!(receipt["integrationCeiling"], "proposal_only");
     assert!(
         receipt["runId"]
@@ -157,7 +196,7 @@ fn operational_claim_is_accepted_by_rust_status_and_selection() {
     assert!(status.status.success());
     let status: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
     assert_eq!(status["status"], "claimed");
-    assert_eq!(status["workId"], "R0-19");
+    assert_eq!(status["workId"], fixture.selected_id.as_str());
     assert_eq!(status["base"], fixture.base);
     assert_eq!(status["runId"], receipt["runId"]);
 
@@ -168,7 +207,7 @@ fn operational_claim_is_accepted_by_rust_status_and_selection() {
         String::from_utf8_lossy(&selected.stderr)
     );
     let selected: Value = serde_json::from_slice(&selected.stdout).expect("proposal JSON");
-    assert_eq!(selected["workId"], "R0-19");
+    assert_eq!(selected["workId"], fixture.selected_id.as_str());
     assert_eq!(selected["immutableBase"], fixture.base);
     assert_eq!(selected["runId"], receipt["runId"]);
     assert_eq!(selected["packetSha256"], receipt["packetSha256"]);
@@ -226,7 +265,7 @@ fn dirty_repository_and_caller_supplied_surfaces_are_denied() {
     let denied = alternate.run(&[
         "harness-claim",
         "--item",
-        "R0-19",
+        &alternate.selected_id,
         "--check",
         "/tmp/arbitrary",
     ]);

@@ -2,10 +2,17 @@
 
 //! The domain journal: events, aggregate revisions, action receipts and replay.
 //!
-//! Replay may rebuild a projection or explain history. It may never drain an
-//! outbox or repeat an effect, and that is enforced by reachability rather than
-//! by convention: [`Outbox`] has no public constructor, so a replay callback
-//! cannot obtain one.
+//! Replay may rebuild a projection or explain history. It confers no effect
+//! capability: [`Journal::replay`] passes a projection nothing but a borrowed
+//! event, and [`Outbox`] has no public constructor, so no outbox, notification
+//! or transport handle can be *obtained* inside a replay callback. The
+//! compile-fail below pins that.
+//!
+//! It does not say a projection is pure, and this module should not be read as
+//! claiming it. Rust has no effect system: a projection owns its own fields, so
+//! one constructed holding a channel, a socket or a file handle can still use
+//! it inside `apply`, because it brought it. The enforced property is "replay
+//! hands out nothing", not "a callback cannot have brought something".
 //!
 //! A projection over replay compiles:
 //!
@@ -32,7 +39,7 @@
 //! assert_eq!(counter.0, 1);
 //! ```
 //!
-//! Reaching an effect from inside one does not:
+//! Obtaining an effect handle from this crate inside one does not:
 //!
 //! ```compile_fail
 //! use automonique_protocol::journal::{DomainEvent, Outbox, Projection};
@@ -360,9 +367,10 @@ pub trait Projection {
 ///
 /// Deliberately unconstructable: the field is private and there is no
 /// constructor, no `Default` and no `From`. A [`Projection`] therefore cannot
-/// obtain one, so replay cannot emit. This is the mechanism behind "replay is
-/// side-effect-free"; a comment saying so would be the thing that gets
-/// violated.
+/// obtain one from this crate, so replay hands out no way to emit. That is a
+/// statement about what replay confers, not about what a projection may
+/// already own — a projection that closes over its own channel or file handle
+/// can still use it, and no Rust signature can stop that.
 ///
 /// A transaction layer that legitimately owns effects will receive one from
 /// the store, which is why nothing here hands them out.
@@ -575,21 +583,41 @@ impl fmt::Display for ActionPayload {
 /// assert_eq!(receipt.target(), "work/w-1");
 /// ```
 ///
-/// A receipt that borrows from that connection does not compile. The only
-/// difference from the case above is `find`, which hands back a borrow of the
-/// connection instead of an owned record:
+/// A receipt type that borrows from a live connection cannot be written down at
+/// all, which is stronger than one particular borrow failing to outlive one
+/// particular scope. A session may hold a recorded receipt:
+///
+/// ```
+/// use automonique_protocol::journal::{ActionLedger, ActionOutcome, ActionReceipt};
+/// struct Session {
+///     receipt: ActionReceipt,
+/// }
+///
+/// let session = {
+///     let mut connection = ActionLedger::new();
+///     Session {
+///         receipt: connection
+///             .record("a-1", "work/w-1", "key-1", None, ActionOutcome::Completed)
+///             .unwrap(),
+///     }
+/// };
+/// assert_eq!(session.receipt.target(), "work/w-1");
+/// ```
+///
+/// Declaring that receipt as borrowing from the connection does not compile:
+/// `ActionReceipt` takes no lifetime argument, so `ActionReceipt<'connection>`
+/// names nothing. The only difference from the case above is that lifetime:
 ///
 /// ```compile_fail
-/// use automonique_protocol::journal::{ActionLedger, ActionOutcome, ActionReceipt};
-/// let receipt: &ActionReceipt;
-/// {
-///     let mut connection = ActionLedger::new();
-///     connection
-///         .record("a-1", "work/w-1", "key-1", None, ActionOutcome::Completed)
-///         .unwrap();
-///     receipt = connection.find("key-1").unwrap();
+/// use automonique_protocol::journal::ActionReceipt;
+/// struct Session<'connection> {
+///     receipt: ActionReceipt<'connection>,
 /// }
-/// assert_eq!(receipt.target(), "work/w-1");
+///
+/// fn target_of<'session>(session: &'session Session<'_>) -> &'session str {
+///     session.receipt.target()
+/// }
+/// let _ = target_of;
 /// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionReceipt {
@@ -653,10 +681,13 @@ impl ActionReceipt {
 /// assert_eq!(recorded.target(), "work/w-1");
 /// ```
 ///
-/// It is not writable. There is no mutable accessor, so a recorded receipt
-/// cannot be retargeted or re-outcomed in place: reusing a key has to go back
+/// It is not writable through this API: the ledger hands out no `&mut` to a
+/// recorded receipt and [`ActionReceipt`] exposes no setter, so retargeting or
+/// re-outcoming one in place has no route — reusing a key has to go back
 /// through [`ActionLedger::record`], where divergence is a typed conflict. The
-/// only difference from the case above is `find_mut`, which does not exist:
+/// compile-fail below pins the obvious route, `find_mut`; it pins that one name
+/// rather than the absence of every accessor a future edit might add. The only
+/// difference from the case above is `find_mut`, which does not exist:
 ///
 /// ```compile_fail
 /// use automonique_protocol::journal::{ActionLedger, ActionOutcome};
@@ -690,7 +721,7 @@ impl ActionLedger {
     /// # Errors
     ///
     /// Returns [`JournalError::IdempotencyConflict`] when a key is reused for a
-    /// different target — a second execution, not an overwrite —
+    /// different target — neither an overwrite nor a second execution —
     /// [`JournalError::IdempotencyPayloadConflict`] when the key was recorded
     /// carrying a payload, since this call offers none, and
     /// [`JournalError::Field`] for an invalid identifier.
@@ -870,9 +901,11 @@ impl CursorResume {
 /// assert_eq!(cursor.position(), 12);
 /// ```
 ///
-/// The field itself is private, so there is no path around that check and a
-/// rewind cannot be performed without producing the typed error. The only
-/// difference from the case above is writing the position directly:
+/// The field itself is private and [`JournalCursor::advance_to`] is the only
+/// method that writes it, so no route to a rewind exists that does not produce
+/// the typed error. The compile-fail below pins the direct-write route; it pins
+/// that route rather than the absence of every setter a future edit might add.
+/// The only difference from the case above is writing the position directly:
 ///
 /// ```compile_fail
 /// use automonique_protocol::journal::JournalCursor;
@@ -931,6 +964,13 @@ impl JournalCursor {
     ///
     /// A cursor at or above the retained window is caught up rather than stale:
     /// nothing it is waiting for has been discarded, so it resumes live.
+    ///
+    /// That reads "outside the retained range" as "below it", which is narrower
+    /// than the words allow. It is deliberate: `position` is the *next*
+    /// position the consumer will receive, so a consumer at `last + 1` is in
+    /// the ordinary caught-up state and resyncing it would demand a snapshot of
+    /// history it already has. `event::resolve_subscription` applies the same
+    /// rule to the parallel cursor type there.
     #[must_use]
     pub const fn resume_within(&self, retained: RetainedRange) -> CursorResume {
         if self.position < retained.first() {

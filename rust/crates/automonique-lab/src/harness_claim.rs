@@ -807,7 +807,7 @@ fn select<'a>(
     }
     let loop_config = loop_config.as_object().ok_or(ClaimError::InvalidInput)?;
     if string(loop_config, "schema")? != LOOP_SCHEMA
-        || string(loop_config, "integration_ceiling")? != "proposal_only"
+        || string(loop_config, "integration_ceiling")? != "verified_fast_forward_main"
         || string(loop_config, "default_driver")? != "codex_session"
     {
         return Err(ClaimError::InvalidInput);
@@ -1425,7 +1425,8 @@ mod tests {
                 "drivers": {"codex_session": {"concurrent_writes": "disjoint_paths_only",
                     "integration_owner": "primary_session", "max_concurrent_subagents": 3,
                     "native_subagents": true, "recursive_agent_trees": false}},
-                "hill_climbability_threshold": 70, "integration_ceiling": "proposal_only",
+                "hill_climbability_threshold": 70,
+                "integration_ceiling": "verified_fast_forward_main",
                 "schema": LOOP_SCHEMA
             }))
             .expect("loop config");

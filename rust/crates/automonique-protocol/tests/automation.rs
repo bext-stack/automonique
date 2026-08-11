@@ -428,12 +428,45 @@ mod revision_immutability {
             .edited(revision(3), CanonicalSchedule::once(at(1)))
             .expect("matching expectation");
         assert_eq!(edited.revision().get(), 4);
+        // The edit applies: the successor carries the schedule the caller
+        // asked for, so `edited` cannot pass by returning the receiver at a
+        // higher revision.
+        assert_eq!(edited.schedule(), &CanonicalSchedule::once(at(1)));
+        // Everything the edit did not name is carried over rather than reset.
+        assert_eq!(edited.id(), "auto-1");
+        assert_eq!(edited.approved_effects(), ["notify:slack"]);
         // The original is untouched.
         assert_eq!(current.revision().get(), 3);
         assert_eq!(
             current.schedule(),
             &CanonicalSchedule::every(60_000).expect("positive interval")
         );
+    }
+
+    #[test]
+    fn each_edit_applies_its_own_schedule() {
+        // One schedule per canonical shape, so an `edited` that applied a
+        // constant, or applied only some shapes, fails here.
+        let cron = CanonicalSchedule::parse("daily").expect("recognized expression");
+        for schedule in [
+            CanonicalSchedule::once(at(1)),
+            CanonicalSchedule::once(at(-1_000)),
+            CanonicalSchedule::every(1).expect("positive interval"),
+            CanonicalSchedule::every(86_400_000).expect("positive interval"),
+            cron,
+        ] {
+            let current = automation();
+            let edited = current
+                .edited(revision(3), schedule.clone())
+                .expect("matching expectation");
+            assert_eq!(
+                edited.schedule(),
+                &schedule,
+                "the edit did not apply {}",
+                schedule.render()
+            );
+            assert_eq!(edited.revision().get(), 4);
+        }
     }
 
     #[test]
@@ -570,6 +603,55 @@ mod scope_authority {
                 offered: 9,
             }
         );
+    }
+
+    /// Effects that are near misses of the declared `notify:slack`.
+    ///
+    /// Each rules out a comparison that is not equality: the declared effect
+    /// carrying a suffix or a prefix rules out `contains`, `starts_with` and
+    /// `ends_with`; a truncated or partial spelling rules out the same three
+    /// applied the other way round; surrounding whitespace rules out a trimming
+    /// comparison; and a different case rules out an ASCII-insensitive one.
+    const NEAR_MISSES: [&str; 10] = [
+        "notify:slack && rm -rf /",
+        "notify:slack:production",
+        "sudo notify:slack",
+        "notify:slack ",
+        " notify:slack",
+        "notify:slack\n",
+        "notify:slac",
+        "notify:",
+        "slack",
+        "NOTIFY:SLACK",
+    ];
+
+    #[test]
+    fn scope_membership_is_exact_rather_than_prefix_or_substring() {
+        let automation = automation();
+        assert_eq!(automation.approved_effects(), ["notify:slack"]);
+        for effect in NEAR_MISSES {
+            assert!(
+                matches!(
+                    automation.decide_unattended(effect),
+                    UnattendedDecision::RequiresApproval(_)
+                ),
+                "{effect:?} was pre-approved by an automation that declared only notify:slack"
+            );
+            assert_eq!(
+                automation
+                    .permit_unattended(effect)
+                    .expect_err("a near miss is not the declared effect"),
+                AutomationError::OutsideApprovedScope {
+                    effect: effect.to_owned(),
+                },
+                "{effect:?} was permitted by an automation that declared only notify:slack"
+            );
+        }
+        // The exact spelling is still inside scope, so the assertions above
+        // cannot be satisfied by refusing everything.
+        automation
+            .permit_unattended("notify:slack")
+            .expect("the declared effect is exactly in scope");
     }
 
     #[test]
@@ -884,6 +966,69 @@ mod evidence_bound_completion {
             goal.complete_with(ReceiptEvidence::new("receipt-9", "posted").expect("receipt"));
         assert_eq!(verdict.outcome(), GoalOutcome::Complete);
         assert_eq!(verdict.evidence().as_str(), "posted");
+        let GoalVerdict::Complete { record } = verdict else {
+            panic!("a completed goal");
+        };
+        assert_eq!(record.goal_id(), "g-3");
+        assert_eq!(record.kind(), CompletionEvidenceKind::Receipt);
+        assert_eq!(record.reference(), Some("receipt-9"));
+    }
+
+    #[test]
+    fn a_completion_record_names_the_goal_it_closed_by_either_route() {
+        let statically: Goal<ArtifactEvidence> = Goal::declare("g-static").expect("valid goal");
+        let GoalVerdict::Complete { record } = statically.complete_with(
+            ArtifactEvidence::new("sha256:bundle", "built the bundle").expect("artifact"),
+        ) else {
+            panic!("a completed goal");
+        };
+        assert_eq!(record.goal_id(), "g-static");
+
+        let dynamically: Goal<ArtifactEvidence> = Goal::declare("g-dynamic").expect("valid goal");
+        let GoalVerdict::Complete { record } = dynamically
+            .complete_from(AnyCompletionEvidence::Artifact(
+                ArtifactEvidence::new("sha256:bundle", "built the bundle").expect("artifact"),
+            ))
+            .expect("the required evidence closes it")
+        else {
+            panic!("a completed goal");
+        };
+        assert_eq!(record.goal_id(), "g-dynamic");
+    }
+
+    /// The boundary of the type-level binding, asserted as it actually is.
+    ///
+    /// The binding between a goal's identity and its completion contract is
+    /// carried by the `Goal` value's type parameter; nothing in this slice
+    /// registers it. So a second goal declared with the same identity and a
+    /// prose contract *is* constructible and *does* close on prose — this test
+    /// says so rather than letting the module claim otherwise. What the record
+    /// gives a consumer is the means to detect it: the verdict names the goal
+    /// it closed and the kind that closed it, so a consumer holding the real
+    /// contract for `g-2` can reject the prose completion.
+    #[test]
+    fn a_prose_twin_of_a_demanding_goal_is_detectable_from_the_verdict_alone() {
+        let demanding: Goal<ArtifactEvidence> = Goal::declare("g-2").expect("valid goal");
+        assert_eq!(
+            demanding.required_evidence(),
+            CompletionEvidenceKind::Artifact
+        );
+
+        let twin: Goal<NarrativeEvidence> = Goal::declare("g-2").expect("valid goal");
+        let GoalVerdict::Complete { record } =
+            twin.complete_with(NarrativeEvidence::new("it looks done").expect("prose"))
+        else {
+            panic!("a completed goal");
+        };
+
+        // The verdict is about the same identity as the demanding goal, so the
+        // pairing a consumer holds cannot tell them apart.
+        assert_eq!(record.goal_id(), demanding.id());
+        // The record does say which contract closed it, and it is not the one
+        // `g-2` demanded, so the consumer has the means to refuse it.
+        assert_eq!(record.kind(), CompletionEvidenceKind::Narrative);
+        assert_ne!(record.kind(), demanding.required_evidence());
+        assert_eq!(record.reference(), None);
     }
 
     #[test]

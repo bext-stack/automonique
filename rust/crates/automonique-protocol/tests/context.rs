@@ -26,11 +26,15 @@ fn caps() -> ComponentCaps {
 }
 
 fn supplied(source: &str, trust: TrustClass) -> SuppliedComponent {
+    // One digest per source, not one digest for every supplied component: a
+    // repeated spelling makes the manifest's component order invisible to
+    // `ordered_digests()`.
+    let digest = format!("sha256:{source}");
     SuppliedComponent::new(
         source,
         SuppliedClass::Attachments,
         trust,
-        "sha256:c",
+        &digest,
         caps(),
         RedactionOutcome::Redacted,
     )
@@ -192,8 +196,34 @@ mod manifest_completeness {
         let manifest = manifest();
         assert_eq!(
             manifest.ordered_digests(),
-            vec!["sha256:p", "sha256:c", "sha256:c"],
+            vec!["sha256:p", "sha256:AGENTS.md", "sha256:retrieved"],
             "policy digests precede supplied digests in assembly order"
+        );
+    }
+
+    #[test]
+    fn supplied_components_keep_the_order_they_were_assembled_in() {
+        // Not just policy-before-supplied: the supplied components hold their
+        // own positions, so `ordered_digests()` reports assembly order rather
+        // than any order that happens to start with policy.
+        let swapped = ContextManifest::new(
+            revision(7),
+            TokenBudget::new(8_192),
+            vec![policy("tenant-policy")],
+            vec![
+                supplied("retrieved", TrustClass::Untrusted),
+                supplied("AGENTS.md", TrustClass::ActorSupplied),
+            ],
+        );
+        assert_eq!(
+            swapped.ordered_digests(),
+            vec!["sha256:p", "sha256:retrieved", "sha256:AGENTS.md"],
+            "the two supplied components were assembled in this order"
+        );
+        assert_ne!(
+            swapped.ordered_digests(),
+            manifest().ordered_digests(),
+            "two manifests differing only in supplied order have different orders"
         );
     }
 
@@ -247,6 +277,57 @@ mod precedence_enforcement {
         assert!(
             manifest.highest_supplied_trust().expect("some supplied") < TrustClass::Policy,
             "no supplied component reached policy trust"
+        );
+    }
+
+    #[test]
+    fn the_highest_supplied_trust_is_the_highest_not_merely_below_policy() {
+        // `< Policy` is true of every supplied trust, so it cannot tell the
+        // highest from the lowest. Pin the value itself.
+        let manifest = manifest();
+        assert_eq!(
+            manifest.highest_supplied_trust(),
+            Some(TrustClass::ActorSupplied),
+            "the manifest holds an actor_supplied and an untrusted component, so the highest is actor_supplied"
+        );
+
+        let reordered = ContextManifest::new(
+            revision(7),
+            TokenBudget::new(8_192),
+            vec![policy("tenant-policy")],
+            vec![
+                supplied("retrieved", TrustClass::Untrusted),
+                supplied("AGENTS.md", TrustClass::ActorSupplied),
+            ],
+        );
+        assert_eq!(
+            reordered.highest_supplied_trust(),
+            Some(TrustClass::ActorSupplied),
+            "the answer does not depend on which component came first"
+        );
+
+        let only_untrusted = ContextManifest::new(
+            revision(7),
+            TokenBudget::new(8_192),
+            vec![policy("tenant-policy")],
+            vec![supplied("retrieved", TrustClass::Untrusted)],
+        );
+        assert_eq!(
+            only_untrusted.highest_supplied_trust(),
+            Some(TrustClass::Untrusted),
+            "with one supplied component the highest is that component's trust"
+        );
+
+        let no_supplied = ContextManifest::new(
+            revision(7),
+            TokenBudget::new(8_192),
+            vec![policy("tenant-policy")],
+            Vec::new(),
+        );
+        assert_eq!(
+            no_supplied.highest_supplied_trust(),
+            None,
+            "a manifest with no supplied components has no highest supplied trust"
         );
     }
 
@@ -318,6 +399,29 @@ mod rule_discovery_bounds {
                 format.as_str()
             );
         }
+    }
+
+    #[test]
+    fn every_rule_file_format_has_its_own_stable_spelling() {
+        // `as_str()` is documented as a stable spelling and is otherwise read
+        // only inside assertion messages, where a collision is invisible.
+        assert_eq!(RuleFileFormat::Shared.as_str(), "shared");
+        assert_eq!(
+            RuleFileFormat::ProviderCompatibility.as_str(),
+            "provider_compatibility"
+        );
+        let mut spellings: Vec<&str> = RuleFileFormat::ALL
+            .iter()
+            .map(|format| format.as_str())
+            .collect();
+        let total = spellings.len();
+        spellings.sort_unstable();
+        spellings.dedup();
+        assert_eq!(
+            spellings.len(),
+            total,
+            "a provider-specific rule file must not report itself as the shared format"
+        );
     }
 
     #[test]
@@ -547,6 +651,20 @@ mod reference_typing {
 mod compression_lineage {
     use super::*;
 
+    fn compression_over(source_from: u64, source_to: u64) -> CompressionRecord {
+        CompressionRecord::record(CompressionParts {
+            source_from,
+            source_to,
+            compressor_provider: "compressor-provider",
+            compressor_model: "compressor-model",
+            template_digest: "sha256:template",
+            output_digest: "sha256:output",
+            protected_facts: &[],
+            verification: automonique_protocol::context::VerificationStatus::Verified,
+        })
+        .expect("valid record")
+    }
+
     #[test]
     fn a_compression_records_its_full_lineage() {
         let record = compression();
@@ -626,6 +744,40 @@ mod compression_lineage {
         let earlier = ContextFork::before_compression(&record, "session-12", "session-14", 3)
             .expect("an earlier fork is also before it");
         assert!(earlier.precedes(&record));
+    }
+
+    #[test]
+    fn a_fork_precedes_only_the_compressions_it_is_actually_before() {
+        // The constructor refuses a fork inside its own record's range, so a
+        // fork only ever meets the false case against a *different* record.
+        // Without this test `precedes()` could answer true unconditionally.
+        let record = compression(); // compresses messages 10..=42
+        let fork = ContextFork::before_compression(&record, "session-12", "session-13", 10)
+            .expect("a fork at the first compressed message is before it");
+
+        assert!(
+            fork.precedes(&compression_over(10, 20)),
+            "a fork at message 10 precedes a compression that starts at message 10"
+        );
+        assert!(
+            !fork.precedes(&compression_over(9, 20)),
+            "a fork at message 10 does not precede a compression that already started at message 9"
+        );
+        assert!(
+            !fork.precedes(&compression_over(0, 4)),
+            "a fork taken long after a compression does not precede it"
+        );
+
+        let earlier = ContextFork::before_compression(&record, "session-12", "session-14", 3)
+            .expect("an earlier fork is also before it");
+        assert!(
+            earlier.precedes(&compression_over(9, 20)),
+            "a fork at message 3 precedes a compression starting at message 9"
+        );
+        assert!(
+            !earlier.precedes(&compression_over(0, 4)),
+            "a fork at message 3 does not precede a compression starting at message 0"
+        );
     }
 
     #[test]
@@ -925,32 +1077,68 @@ mod supersession_and_deletion {
 mod proposal_isolation {
     use super::*;
 
-    fn payloads() -> Vec<ProposalPayload> {
+    /// Each payload beside the kind it must report and whether a proposal
+    /// carrying it may activate without review.
+    ///
+    /// Both expectations are written out here. Reading them back off
+    /// `payload.kind()` would make the mapping under test its own oracle, and
+    /// any permutation of that mapping would move the expectation with it.
+    fn payloads() -> Vec<(ProposalPayload, ProposalKind, bool)> {
         vec![
-            ProposalPayload::Memory(
-                CandidateMemory::propose(memory_parts(
-                    MemoryStore::UserProfile,
-                    "acme",
-                    "session-12",
-                    Retention::ReviewBy(EpochMillis::from_millis(9_000)),
-                ))
-                .expect("valid candidate"),
+            (
+                ProposalPayload::Memory(
+                    CandidateMemory::propose(memory_parts(
+                        MemoryStore::UserProfile,
+                        "acme",
+                        "session-12",
+                        Retention::ReviewBy(EpochMillis::from_millis(9_000)),
+                    ))
+                    .expect("valid candidate"),
+                ),
+                ProposalKind::Memory,
+                true,
             ),
-            ProposalPayload::SkillPatch {
-                skill: ContextLabel::new("deploy").expect("valid"),
-                patch_digest: ContextLabel::new("sha256:patch").expect("valid"),
-            },
-            ProposalPayload::NewSkill {
-                skill: ContextLabel::new("release").expect("valid"),
-                bundle_digest: ContextLabel::new("sha256:bundle").expect("valid"),
-            },
+            (
+                ProposalPayload::SkillPatch {
+                    skill: ContextLabel::new("deploy").expect("valid"),
+                    patch_digest: ContextLabel::new("sha256:patch").expect("valid"),
+                },
+                ProposalKind::SkillPatch,
+                false,
+            ),
+            (
+                ProposalPayload::NewSkill {
+                    skill: ContextLabel::new("release").expect("valid"),
+                    bundle_digest: ContextLabel::new("sha256:bundle").expect("valid"),
+                },
+                ProposalKind::NewSkill,
+                false,
+            ),
         ]
     }
 
     #[test]
+    fn every_payload_reports_the_kind_it_actually_carries() {
+        let mut reported = Vec::new();
+        for (payload, expected_kind, _) in payloads() {
+            assert_eq!(
+                payload.kind(),
+                expected_kind,
+                "a {} payload reported another kind",
+                expected_kind.as_str()
+            );
+            reported.push(payload.kind());
+        }
+        assert_eq!(
+            reported,
+            ProposalKind::ALL.to_vec(),
+            "every proposal kind is built here exactly once, so no kind is left unmapped"
+        );
+    }
+
+    #[test]
     fn a_proposal_always_carries_the_lowest_trust() {
-        for payload in payloads() {
-            let kind = payload.kind();
+        for (payload, expected_kind, _) in payloads() {
             let proposal = LearningProposal::new(payload, "three passing runs", revision(2))
                 .expect("valid proposal");
             assert_eq!(
@@ -958,22 +1146,32 @@ mod proposal_isolation {
                 TrustClass::Untrusted,
                 "a model-originated proposal cannot raise its own trust"
             );
-            assert_eq!(proposal.kind(), kind);
+            assert_eq!(
+                proposal.kind(),
+                expected_kind,
+                "the proposal reported a kind its payload does not carry"
+            );
             assert_eq!(proposal.revision(), revision(2));
         }
     }
 
     #[test]
     fn an_executable_skill_can_never_auto_activate() {
-        for payload in payloads() {
-            let kind = payload.kind();
+        for (payload, expected_kind, may_auto_activate) in payloads() {
             let proposal =
                 LearningProposal::new(payload, "evidence", revision(1)).expect("valid proposal");
             assert_eq!(
                 proposal.may_auto_activate(),
-                !kind.is_executable(),
-                "{} was auto-activatable",
-                kind.as_str()
+                may_auto_activate,
+                "a {} proposal answered the wrong way on auto-activation",
+                expected_kind.as_str()
+            );
+            assert_eq!(
+                proposal.kind(),
+                expected_kind,
+                "a {} proposal reported another kind, which is how an executable \
+                 skill would be read as a memory",
+                expected_kind.as_str()
             );
         }
         assert!(ProposalKind::SkillPatch.is_executable());

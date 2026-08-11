@@ -35,13 +35,55 @@
 //! let verdict = goal.complete_with(NarrativeEvidence::new("it looks done").unwrap());
 //! ```
 //!
-//! The verdict itself is not a way around that, because a `Complete` verdict
-//! carries a [`CompletionRecord`], which has no public constructor:
+//! The verdict is not a way around that either. A `Complete` verdict carries no
+//! free-text field — its paired passing case is the example above, which builds
+//! the same variant through the goal:
 //!
 //! ```compile_fail
 //! use automonique_protocol::automation::GoalVerdict;
 //! let verdict = GoalVerdict::Complete { evidence: String::from("it looks done") };
 //! ```
+//!
+//! That one is refused by the field name. What `Complete` does carry is a
+//! [`CompletionRecord`], and every field of it is private, so the record has to
+//! come out of the goal rather than be assembled beside it. Read back through
+//! its accessors,
+//!
+//! ```
+//! use automonique_protocol::automation::{
+//!     ArtifactEvidence, CompletionEvidenceKind, Goal, GoalVerdict,
+//! };
+//! let goal: Goal<ArtifactEvidence> = Goal::declare("g-1").unwrap();
+//! let verdict = goal.complete_with(ArtifactEvidence::new("sha256:bundle", "built it").unwrap());
+//! let GoalVerdict::Complete { record } = verdict else { panic!("a completed goal") };
+//! assert_eq!(record.goal_id(), "g-1");
+//! assert_eq!(record.kind(), CompletionEvidenceKind::Artifact);
+//! assert_eq!(record.reference(), Some("sha256:bundle"));
+//! assert_eq!(record.statement().as_str(), "built it");
+//! ```
+//!
+//! and the same four values written directly into the record they came from:
+//!
+//! ```compile_fail
+//! use automonique_protocol::automation::{
+//!     CompletionEvidenceKind, CompletionRecord, GoalVerdict, VerdictEvidence,
+//! };
+//! let record = CompletionRecord {
+//!     goal_id: String::from("g-1"),
+//!     kind: CompletionEvidenceKind::Artifact,
+//!     reference: Some(String::from("sha256:never-built")),
+//!     statement: VerdictEvidence::new("it looks done").unwrap(),
+//! };
+//! let verdict = GoalVerdict::Complete { record };
+//! ```
+//!
+//! What that does not say, because it would not be true: the binding between a
+//! goal identity and its completion contract lives in the [`Goal`] value's type
+//! parameter, and nothing here registers it. A second `Goal<NarrativeEvidence>`
+//! declared with the same identity is constructible and closes on prose. The
+//! record names the goal it closed and the kind that closed it, so a consumer
+//! holding the real contract for that identity can detect such a completion —
+//! this slice makes it *detectable*, not impossible. See [`CompletionRecord`].
 //!
 //! # An out-of-scope effect cannot become a completed effect
 //!
@@ -840,9 +882,12 @@ impl AutomationRevision {
 
     /// Produce the next revision with an approval request's effect declared.
     ///
-    /// This is the only way an approval becomes authority: a new immutable
-    /// revision that names the effect, not a mutation of the one that refused
-    /// it and not a value derived from the request itself.
+    /// This is the only way an [`ApprovalRequest`] becomes authority: a new
+    /// immutable revision that names the effect, not a mutation of the one that
+    /// refused it and not a value derived from the request itself. It is not a
+    /// claim about authority in general — whoever can call [`Self::new`] can
+    /// declare any effect on a fresh revision, which is what declaring an
+    /// automation *is*.
     ///
     /// # Errors
     ///
@@ -885,6 +930,12 @@ impl AutomationRevision {
     /// token a completion needs, or it is an approval request. There is no
     /// third outcome, so creating a schedule is never blanket authority for
     /// future arbitrary effects.
+    ///
+    /// Membership in the declared scope is exact equality, never a prefix or a
+    /// substring: an automation that declared `notify:slack` does not
+    /// pre-approve `notify:slack && rm -rf /`, ` notify:slack`, `notify:` or
+    /// `NOTIFY:SLACK`. Each of those is an approval request like any other
+    /// undeclared effect.
     #[must_use]
     pub fn decide_unattended(&self, effect: &str) -> UnattendedDecision {
         if self
@@ -1472,36 +1523,58 @@ impl AnyCompletionEvidence {
         }
     }
 
-    fn into_record(self) -> CompletionRecord {
+    fn into_record(self, goal_id: &str) -> CompletionRecord {
         match self {
-            Self::Narrative(evidence) => CompletionRecord::of(&evidence),
-            Self::Tests(evidence) => CompletionRecord::of(&evidence),
-            Self::Artifact(evidence) => CompletionRecord::of(&evidence),
-            Self::Receipt(evidence) => CompletionRecord::of(&evidence),
+            Self::Narrative(evidence) => CompletionRecord::of(goal_id, &evidence),
+            Self::Tests(evidence) => CompletionRecord::of(goal_id, &evidence),
+            Self::Artifact(evidence) => CompletionRecord::of(goal_id, &evidence),
+            Self::Receipt(evidence) => CompletionRecord::of(goal_id, &evidence),
         }
     }
 }
 
 /// What a `complete` verdict carries.
 ///
-/// Private fields and no public constructor: the only way to obtain one is
-/// [`Goal::complete_with`] or [`Goal::complete_from`], both of which require
-/// the evidence kind the goal's contract names. A persuasive summary cannot
-/// close a goal that demanded artifacts, because it cannot build this value.
+/// Every field is private, so the record cannot be assembled from a literal
+/// outside this module; it is produced by [`Goal::complete_with`] or
+/// [`Goal::complete_from`], both of which require the evidence kind the goal's
+/// contract names, and it carries the identity of the goal it closed.
+///
+/// Two limits, stated because the tests measure exactly this much and no more:
+///
+/// * The type-level binding holds at the call site. `Goal<ArtifactEvidence>`
+///   cannot be handed prose — but this slice has no registry from a goal
+///   identity to its contract, so a second `Goal<NarrativeEvidence>` declared
+///   with the same identity is constructible and closes on prose. Because the
+///   record names both [`Self::goal_id`] and [`Self::kind`], a consumer holding
+///   the contract for that identity can detect that completion. It is not
+///   prevented here.
+/// * That no *other* constructor for this type is public is a property of this
+///   `impl` block, established by reading it rather than by a test. A
+///   compile-fail proof can show a literal is refused; it cannot show the
+///   absence of a function that was never written.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompletionRecord {
+    goal_id: String,
     kind: CompletionEvidenceKind,
     reference: Option<String>,
     statement: VerdictEvidence,
 }
 
 impl CompletionRecord {
-    fn of<E: CompletionEvidence>(evidence: &E) -> Self {
+    fn of<E: CompletionEvidence>(goal_id: &str, evidence: &E) -> Self {
         Self {
+            goal_id: goal_id.to_owned(),
             kind: E::KIND,
             reference: evidence.reference().map(ToOwned::to_owned),
             statement: evidence.statement().clone(),
         }
+    }
+
+    /// The goal this record closed.
+    #[must_use]
+    pub fn goal_id(&self) -> &str {
+        &self.goal_id
     }
 
     /// The evidence kind that closed the goal.
@@ -1559,11 +1632,13 @@ impl<E: CompletionEvidence> Goal<E> {
     /// Complete the goal.
     ///
     /// Infallible, because the argument type *is* the contract: evidence of
-    /// another kind does not typecheck.
+    /// another kind does not typecheck. The record names this goal, so the
+    /// verdict says which goal it closed rather than relying on the caller to
+    /// keep the pairing.
     #[must_use]
     pub fn complete_with(&self, evidence: E) -> GoalVerdict {
         GoalVerdict::Complete {
-            record: CompletionRecord::of(&evidence),
+            record: CompletionRecord::of(&self.id, &evidence),
         }
     }
 
@@ -1583,7 +1658,7 @@ impl<E: CompletionEvidence> Goal<E> {
             });
         }
         Ok(GoalVerdict::Complete {
-            record: supplied.into_record(),
+            record: supplied.into_record(&self.id),
         })
     }
 }

@@ -2944,13 +2944,18 @@ pub enum HookPower {
 /// What a power or a prohibited action would have to reach to take effect.
 ///
 /// One enumeration for both, so "can this class do that" is an equality
-/// between two computed surfaces rather than a hand-written `false`.
+/// between two computed surfaces rather than a hand-written `false`. The
+/// mapping from [`HookPower`] is injective, so that equality is exactly
+/// "these are the same power" and never an accident of two powers sharing a
+/// surface.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Surface {
     /// Nothing at all.
     Nothing,
-    /// The action currently under review.
+    /// Whether the action currently under review proceeds.
     ActionUnderReview,
+    /// The output the action under review produced.
+    ActionOutput,
     /// The context assembled for the next model turn.
     ContextWindow,
     /// A newly created durable input or action.
@@ -2972,6 +2977,7 @@ impl Surface {
         match self {
             Self::Nothing => "nothing",
             Self::ActionUnderReview => "action_under_review",
+            Self::ActionOutput => "action_output",
             Self::ContextWindow => "context_window",
             Self::NewDurableInput => "new_durable_input",
             Self::ApprovalLedger => "approval_ledger",
@@ -3006,15 +3012,15 @@ impl HookPower {
 
     /// What this power reaches.
     ///
-    /// No power reaches the approval ledger, the sandbox specification,
-    /// recorded history or unbounded time.
+    /// One surface per power and no two alike, and no power reaches the
+    /// approval ledger, the sandbox specification, recorded history or
+    /// unbounded time.
     #[must_use]
     pub const fn surface(self) -> Surface {
         match self {
             Self::ObserveOnly => Surface::Nothing,
-            Self::RejectWithTypedReason | Self::ReplaceWithValidatedOutput => {
-                Surface::ActionUnderReview
-            }
+            Self::RejectWithTypedReason => Surface::ActionUnderReview,
+            Self::ReplaceWithValidatedOutput => Surface::ActionOutput,
             Self::AddLabelledContext => Surface::ContextWindow,
             Self::EnqueueDurableAction => Surface::NewDurableInput,
         }
@@ -3064,6 +3070,9 @@ impl ProhibitedHookAction {
     }
 
     /// What this action would have to reach.
+    ///
+    /// One privileged surface per action and no two alike, so no prohibition
+    /// rests on another's answer.
     #[must_use]
     pub const fn surface(self) -> Surface {
         match self {
@@ -3071,6 +3080,53 @@ impl ProhibitedHookAction {
             Self::WidenSandbox => Surface::SandboxSpecification,
             Self::RewriteHistory => Surface::RecordedHistory,
             Self::BlockIndefinitely => Surface::UnboundedTime,
+        }
+    }
+}
+
+/// Anything a hook might attempt: a power, or something no class may do.
+///
+/// The two live in one enumeration so [`HookClass::can_perform`] answers both
+/// by the same comparison. That matters for what the answer *is*: a class can
+/// perform its own power, so `true` is reachable, and a prohibited action is
+/// refused because the surfaces differ rather than because a constant says so.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum HookAction {
+    /// Exercising one of the five hook powers.
+    Exercise(HookPower),
+    /// One of the four things no hook class may do.
+    Prohibited(ProhibitedHookAction),
+}
+
+impl HookAction {
+    /// Every action, permitted and prohibited, for coverage checks.
+    pub const ALL: [Self; 9] = [
+        Self::Exercise(HookPower::ObserveOnly),
+        Self::Exercise(HookPower::RejectWithTypedReason),
+        Self::Exercise(HookPower::ReplaceWithValidatedOutput),
+        Self::Exercise(HookPower::AddLabelledContext),
+        Self::Exercise(HookPower::EnqueueDurableAction),
+        Self::Prohibited(ProhibitedHookAction::Approve),
+        Self::Prohibited(ProhibitedHookAction::WidenSandbox),
+        Self::Prohibited(ProhibitedHookAction::RewriteHistory),
+        Self::Prohibited(ProhibitedHookAction::BlockIndefinitely),
+    ];
+
+    /// What the action would have to reach.
+    #[must_use]
+    pub const fn surface(self) -> Surface {
+        match self {
+            Self::Exercise(power) => power.surface(),
+            Self::Prohibited(action) => action.surface(),
+        }
+    }
+
+    /// Stable lowercase spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exercise(power) => power.as_str(),
+            Self::Prohibited(action) => action.as_str(),
         }
     }
 }
@@ -3115,13 +3171,16 @@ impl HookClass {
         self.power().changes_outcome()
     }
 
-    /// Whether this class could perform a prohibited action.
+    /// Whether this class could perform an action.
     ///
-    /// Answered by comparing what the class's power reaches against what the
-    /// action would have to reach, so a power that acquired a privileged
-    /// surface would turn this answer to `true` rather than pass silently.
+    /// Answered by comparing what the class's one power reaches against what
+    /// the action would have to reach, so a power that acquired a privileged
+    /// surface would turn a prohibited answer to `true` rather than pass
+    /// silently. Both surfaces are injective in their source, so the answer is
+    /// `true` exactly for the class's own power and `false` for every other
+    /// power and every [`ProhibitedHookAction`].
     #[must_use]
-    pub fn can_perform(self, action: ProhibitedHookAction) -> bool {
+    pub fn can_perform(self, action: HookAction) -> bool {
         self.power().surface() == action.surface()
     }
 
@@ -3180,7 +3239,13 @@ impl HookOutcome {
         })
     }
 
-    /// Replace the output with a schema-validated bounded value.
+    /// Replace the output with a bounded value, naming the schema it claims
+    /// to satisfy.
+    ///
+    /// The replacement is screened for length and control characters and the
+    /// schema is carried alongside it. Nothing here validates the one against
+    /// the other: a [`SchemaContract`] is an identifier and a digest, and this
+    /// module has no schema engine. It pins which schema a host must check.
     ///
     /// # Errors
     ///
@@ -3532,9 +3597,18 @@ impl EmptyEnvironment {
 
 /// A pinned command helper with a closed argument schema.
 ///
-/// Every token, fixed or bound, is a single shell-inert word, so an arbitrary
-/// shell command is not representable in the executable position *or* in the
-/// argument vector.
+/// Every token, fixed or bound, is a single shell-inert word, and the schema
+/// has no free-text position, so an arbitrary shell *string* — anything
+/// carrying whitespace, a backslash or one of the twenty metacharacters — is
+/// not representable in the executable position or in the argument vector, and
+/// no argument the schema did not declare can be appended.
+///
+/// What this type does not do is judge what a pinned executable makes of its
+/// arguments. `/bin/sh` with a fixed `-c` and a single bound word passes every
+/// screen here, because one inert word is indistinguishable in shape from a
+/// vault item name; the shape of a token is all this module can see. Which
+/// executables a deployment allows a source to pin is a policy decision, made
+/// where the source is admitted, not here.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretCommand {
     executable: PinnedExecutable,

@@ -9,22 +9,24 @@
 //! programs that compile; those pairs run under `cargo test --doc`.
 
 use automonique_protocol::identity::Actor;
+use automonique_protocol::primitives::ValueError;
 use automonique_protocol::sandbox::{FilesystemAccess, SandboxProfile, ToolWorkloadEgress};
 use automonique_protocol::tools::{
     ApprovalRequirement, ArgumentSchema, ArgumentSlot, ArtifactRetention, BackendContribution,
     BackendExtensionKind, CallBudget, CapabilityId, CausationId, CpuBudget, CredentialAudiences,
     DiscoveryTimeout, ExportItem, ExtensionContribution, ExtensionManifest, ExtensionManifestParts,
-    ExtensionSignature, GrantScope, HookBinding, HookChain, HookClass, HookFailurePolicy,
-    HookOutcome, HookPower, HookTimeout, McpClientDescriptor, McpClientParts, McpCredentialMapping,
-    McpServerExport, McpToolFilter, McpTransport, McpTrustBoundary, MemoryBudget,
-    MigrationBehavior, NestedCallCost, NestedCause, OutputBudget, OutputContract, PinnedExecutable,
-    Platform, PlatformSupport, ProhibitedHookAction, PromptExport, ProvenanceDigest,
-    RESERVED_CAPABILITIES, ResourceBudget, ResourceExport, RunId, SamplingGrant, SchemaContract,
-    ScopedGrant, SecretCommand, SecretRetrieval, SecretSource, SessionToolset, SideEffectClass,
-    SupportedRange, Surface, SurfaceContribution, ToolDescriptor, ToolDescriptorParts, ToolError,
-    ToolsetChange, ToolsetGrant, TrustClass, UiSurface, UpdateChannel, VaultProvider,
-    WallClockBudget, WorkflowBudget, WorkflowCapability, WorkflowInvocable, WorkflowSpec,
-    describe_tool, effective_grant, search_tools,
+    ExtensionSignature, GrantScope, HookAction, HookBinding, HookChain, HookClass,
+    HookFailurePolicy, HookOutcome, HookPower, HookTimeout, MAX_TOOL_FIELD_BYTES,
+    McpClientDescriptor, McpClientParts, McpCredentialMapping, McpServerExport, McpToolFilter,
+    McpTransport, McpTrustBoundary, MemoryBudget, MigrationBehavior, NestedCallCost, NestedCause,
+    OutputBudget, OutputContract, PinnedExecutable, Platform, PlatformSupport,
+    ProhibitedHookAction, PromptExport, ProvenanceDigest, RESERVED_CAPABILITIES, ResourceBudget,
+    ResourceExport, RunId, SamplingGrant, SchemaContract, ScopedGrant, SecretCommand,
+    SecretRetrieval, SecretSource, SessionToolset, SideEffectClass, SupportedRange, Surface,
+    SurfaceContribution, ToolDescriptor, ToolDescriptorParts, ToolError, ToolsetChange,
+    ToolsetGrant, TrustClass, UiSurface, UpdateChannel, VaultProvider, WallClockBudget,
+    WorkflowBudget, WorkflowCapability, WorkflowInvocable, WorkflowSpec, describe_tool,
+    effective_grant, search_tools,
 };
 
 fn schema(id: &str) -> SchemaContract {
@@ -56,6 +58,15 @@ fn descriptor(
     side_effect: SideEffectClass,
     approval: ApprovalRequirement,
 ) -> ToolDescriptor {
+    declared(id, capability, side_effect, approval).expect("valid descriptor")
+}
+
+fn declared(
+    id: &str,
+    capability: &str,
+    side_effect: SideEffectClass,
+    approval: ApprovalRequirement,
+) -> Result<ToolDescriptor, ToolError> {
     ToolDescriptor::declare(ToolDescriptorParts {
         id,
         capability: CapabilityId::new(capability).expect("valid capability"),
@@ -74,7 +85,6 @@ fn descriptor(
             schema: schema("automonique.tool.output/v1"),
         },
     })
-    .expect("valid descriptor")
 }
 
 fn tool(id: &str, side_effect: SideEffectClass) -> ToolDescriptor {
@@ -258,6 +268,114 @@ mod descriptor_completeness {
                 .expect_err("above the ceiling")
                 .category(),
             "budget_out_of_range"
+        );
+    }
+
+    #[test]
+    fn every_bounded_field_is_length_capped_and_free_of_control_characters() {
+        // One screen serves every textual field in the module -- descriptor,
+        // MCP, extension, hook and secret alike -- so it is measured here at
+        // four of its call sites rather than left to code reading.
+        let over_long = "x".repeat(MAX_TOOL_FIELD_BYTES + 1);
+        let too_long = ValueError::TooLong {
+            max_bytes: MAX_TOOL_FIELD_BYTES,
+            actual_bytes: MAX_TOOL_FIELD_BYTES + 1,
+        };
+
+        assert_eq!(
+            declared(
+                &over_long,
+                "automonique.fs.read",
+                SideEffectClass::ReadOnly,
+                ApprovalRequirement::PerInvocation,
+            )
+            .expect_err("a tool identifier longer than the field ceiling"),
+            ToolError::Field {
+                field: "tool_id",
+                error: too_long,
+            }
+        );
+        assert_eq!(
+            CapabilityId::new(&over_long).expect_err("an over-long capability"),
+            ToolError::Field {
+                field: "capability_id",
+                error: too_long,
+            }
+        );
+        assert_eq!(
+            HookOutcome::rejected(&over_long).expect_err("an over-long rejection reason"),
+            ToolError::Field {
+                field: "rejection_reason",
+                error: too_long,
+            }
+        );
+        assert_eq!(
+            SecretSource::new(
+                &over_long,
+                "postgres",
+                SecretRetrieval::SystemdCredential {
+                    name: "db".to_owned()
+                },
+            )
+            .expect_err("an over-long secret source identifier"),
+            ToolError::Field {
+                field: "secret_source_id",
+                error: too_long,
+            }
+        );
+
+        // The ceiling itself is admissible, so the refusals above are the
+        // length screen and not an off-by-one that refuses everything.
+        assert!(
+            declared(
+                &"x".repeat(MAX_TOOL_FIELD_BYTES),
+                "automonique.fs.read",
+                SideEffectClass::ReadOnly,
+                ApprovalRequirement::PerInvocation,
+            )
+            .is_ok()
+        );
+
+        for (field, control) in [
+            ("tool_id", "fs\u{0}read"),
+            ("tool_id", "fs\nread"),
+            ("tool_id", "fs\u{7f}read"),
+        ] {
+            assert_eq!(
+                declared(
+                    control,
+                    "automonique.fs.read",
+                    SideEffectClass::ReadOnly,
+                    ApprovalRequirement::PerInvocation,
+                )
+                .expect_err("a control character in a field"),
+                ToolError::Field {
+                    field,
+                    error: ValueError::ControlCharacter,
+                },
+                "{control:?} was accepted"
+            );
+        }
+        assert_eq!(
+            HookOutcome::rejected("policy\u{1}").expect_err("a control character in a reason"),
+            ToolError::Field {
+                field: "rejection_reason",
+                error: ValueError::ControlCharacter,
+            }
+        );
+        assert_eq!(
+            SecretSource::new(
+                "db-password",
+                "postgres\u{0}",
+                SecretRetrieval::SystemdCredential {
+                    name: "db".to_owned()
+                },
+            )
+            .expect_err("a control character in an audience"),
+            ToolError::Field {
+                field: "credential_audience",
+                error: ValueError::ControlCharacter,
+            }
         );
     }
 }
@@ -520,7 +638,121 @@ mod workflow_bounds {
                 0,
                 "a refused call was charged against {budget}"
             );
+            assert_eq!(
+                capability.spent(),
+                NestedCallCost::new(0, 0, 0, 0),
+                "a refused {budget} call charged something against the capability"
+            );
         }
+    }
+
+    #[test]
+    fn a_refusal_charges_nothing_even_when_earlier_calls_did() {
+        // The refusal path must leave the ledger where the last admitted call
+        // left it, not where the refused call would have moved it.
+        let mut capability = capability(16);
+        let first = NestedCallCost::new(100, 200, 1_000, 2_000);
+        capability
+            .invoke("fs.read", CausationId::new("c-1").expect("id"), first)
+            .expect("the first call fits every budget");
+        assert_eq!(capability.spent(), first);
+
+        let refused = NestedCallCost::new(0, 400, 0, 0);
+        assert_eq!(
+            capability
+                .invoke("fs.read", CausationId::new("c-2").expect("id"), refused)
+                .expect_err("600ms of cpu against a 500ms budget"),
+            ToolError::WorkflowBudgetExceeded { budget: "cpu" }
+        );
+        assert_eq!(
+            capability.spent(),
+            first,
+            "the refused call was charged anyway"
+        );
+        assert_eq!(capability.calls_made(), 1);
+    }
+
+    #[test]
+    fn cpu_accumulates_across_calls_rather_than_being_a_per_call_ceiling() {
+        let mut capability = capability(16);
+        let half = NestedCallCost::new(0, 300, 0, 0);
+        capability
+            .invoke("fs.read", CausationId::new("c-1").expect("id"), half)
+            .expect("the first call fits");
+        assert_eq!(
+            capability.spent().cpu_millis(),
+            300,
+            "an admitted call was not charged for cpu"
+        );
+        assert_eq!(
+            capability
+                .invoke("fs.read", CausationId::new("c-2").expect("id"), half)
+                .expect_err("the second call crosses the cpu ceiling"),
+            ToolError::WorkflowBudgetExceeded { budget: "cpu" }
+        );
+        assert_eq!(capability.spent().cpu_millis(), 300);
+        assert_eq!(capability.calls_made(), 1);
+    }
+
+    #[test]
+    fn output_accumulates_across_calls_rather_than_being_a_per_call_ceiling() {
+        let mut capability = capability(16);
+        let half = NestedCallCost::new(0, 0, 0, 5_000);
+        capability
+            .invoke("fs.read", CausationId::new("c-1").expect("id"), half)
+            .expect("the first call fits");
+        assert_eq!(
+            capability.spent().output_bytes(),
+            5_000,
+            "an admitted call was not charged for output"
+        );
+        assert_eq!(
+            capability
+                .invoke("fs.read", CausationId::new("c-2").expect("id"), half)
+                .expect_err("the second call crosses the output ceiling"),
+            ToolError::WorkflowBudgetExceeded { budget: "output" }
+        );
+        assert_eq!(capability.spent().output_bytes(), 5_000);
+        assert_eq!(capability.calls_made(), 1);
+    }
+
+    #[test]
+    fn memory_is_charged_as_a_peak_and_is_kept() {
+        let mut capability = capability(16);
+        capability
+            .invoke(
+                "fs.read",
+                CausationId::new("c-1").expect("id"),
+                NestedCallCost::new(0, 0, 3_000, 0),
+            )
+            .expect("the first call fits");
+        assert_eq!(
+            capability.spent().memory_bytes(),
+            3_000,
+            "the observed peak was not kept"
+        );
+        // A smaller second call still fits -- memory is a high-water mark, not
+        // a running total -- and it must not lower the peak.
+        capability
+            .invoke(
+                "fs.read",
+                CausationId::new("c-2").expect("id"),
+                NestedCallCost::new(0, 0, 2_000, 0),
+            )
+            .expect("a smaller call fits under a peak, not under a sum");
+        assert_eq!(
+            capability.spent().memory_bytes(),
+            3_000,
+            "a smaller call lowered the peak"
+        );
+        capability
+            .invoke(
+                "fs.read",
+                CausationId::new("c-3").expect("id"),
+                NestedCallCost::new(0, 0, 4_096, 0),
+            )
+            .expect("the ceiling itself fits");
+        assert_eq!(capability.spent().memory_bytes(), 4_096);
     }
 
     #[test]
@@ -793,6 +1025,13 @@ mod mcp_boundaries {
 
     #[test]
     fn a_discovery_timeout_is_bounded_and_non_zero() {
+        // Named as a literal so raising the constant is a test failure rather
+        // than a silent widening: `MAX_MILLIS + 1` alone measures nothing.
+        assert_eq!(
+            DiscoveryTimeout::MAX_MILLIS,
+            120_000,
+            "the declared discovery ceiling is 120s"
+        );
         assert_eq!(
             DiscoveryTimeout::millis(0).expect_err("zero").category(),
             "budget_is_zero"
@@ -1043,6 +1282,16 @@ mod hook_class_powers {
                 power.as_str()
             );
         }
+        // The powers reach five distinct surfaces, which is what makes the
+        // surface comparison in can_perform an identity on powers rather than
+        // an accident of two powers sharing one surface.
+        let mut surfaces: Vec<&str> = HookPower::ALL
+            .iter()
+            .map(|power| power.surface().as_str())
+            .collect();
+        surfaces.sort_unstable();
+        surfaces.dedup();
+        assert_eq!(surfaces.len(), 5, "two powers reach the same surface");
     }
 
     #[test]
@@ -1051,13 +1300,66 @@ mod hook_class_powers {
         for class in HookClass::ALL {
             for action in ProhibitedHookAction::ALL {
                 assert!(
-                    !class.can_perform(action),
+                    !class.can_perform(HookAction::Prohibited(action)),
                     "{} could {}",
                     class.as_str(),
                     action.as_str()
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_prohibition_is_computed_and_not_a_constant() {
+        // A `false` in can_perform's place would satisfy the test above while
+        // measuring nothing. The same comparison answers `true` when the
+        // surfaces do meet, so both directions are pinned: a class can perform
+        // its own power and nothing else.
+        assert_eq!(HookAction::ALL.len(), 9);
+        let mut answered_true = 0;
+        for class in HookClass::ALL {
+            assert!(
+                class.can_perform(HookAction::Exercise(class.power())),
+                "{} cannot exercise its own power",
+                class.as_str()
+            );
+            for action in HookAction::ALL {
+                let expected = action == HookAction::Exercise(class.power());
+                assert_eq!(
+                    class.can_perform(action),
+                    expected,
+                    "{} answered wrongly for {}",
+                    class.as_str(),
+                    action.as_str()
+                );
+                answered_true += usize::from(class.can_perform(action));
+            }
+        }
+        assert_eq!(
+            answered_true, 5,
+            "exactly one action per class may be answered yes"
+        );
+    }
+
+    #[test]
+    fn each_prohibited_action_needs_a_distinct_privileged_surface() {
+        // If two prohibitions shared a surface, one of them would be resting
+        // on the other's answer rather than on its own.
+        let mut spellings: Vec<&str> = ProhibitedHookAction::ALL
+            .iter()
+            .map(|action| action.surface().as_str())
+            .collect();
+        spellings.sort_unstable();
+        assert_eq!(
+            spellings,
+            [
+                "approval_ledger",
+                "recorded_history",
+                "sandbox_specification",
+                "unbounded_time"
+            ],
+            "the four prohibited actions no longer need four distinct privileged surfaces"
+        );
     }
 
     #[test]
@@ -1135,6 +1437,14 @@ mod hook_class_powers {
 
     #[test]
     fn a_hook_cannot_block_indefinitely() {
+        // The ceiling is named as a literal, not as itself: a test written
+        // only as `millis(MAX_MILLIS + 1)` holds however high MAX_MILLIS is
+        // raised, so the declared 30 seconds would not be measured at all.
+        assert_eq!(
+            HookTimeout::MAX_MILLIS,
+            30_000,
+            "the declared hook ceiling is 30s"
+        );
         assert_eq!(
             HookTimeout::millis(0)
                 .expect_err("a zero timeout is not a timeout")
@@ -1318,6 +1628,26 @@ mod secret_sealing {
                 "{payload} was accepted as an argument"
             );
         }
+    }
+
+    #[test]
+    fn a_pinned_interpreter_with_one_inert_word_is_still_representable() {
+        // The limit of the screen, pinned so the type documentation cannot
+        // drift back into claiming more than this. Every token must be a
+        // single shell-inert word; one such word is indistinguishable in shape
+        // from a vault item name, so a pinned interpreter given one is
+        // accepted here. Which executables a source may pin is decided where
+        // the source is admitted, not by this type.
+        let command = SecretCommand::bind(
+            PinnedExecutable::new("/bin/sh").expect("an absolute path with no shell syntax"),
+            ArgumentSchema::new(vec![
+                ArgumentSlot::fixed("-c").expect("valid token"),
+                ArgumentSlot::named("script").expect("valid name"),
+            ]),
+            &["reboot"],
+        )
+        .expect("one inert word is what this type screens for");
+        assert_eq!(command.argv(), ["-c", "reboot"]);
     }
 
     #[test]

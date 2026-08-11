@@ -287,6 +287,12 @@ fn module_path(package: &Package, file: &Path) -> Option<String> {
 /// The shape this tree uses is a dotted lowercase name with a `/vN` revision,
 /// written as a whole string literal: `automonique.doctor/v1`. Anchoring on the
 /// opening quote is what keeps URL paths and file paths out.
+///
+/// This is *versioned* names only. The product also carries unversioned dotted
+/// protocol, capability and operation identities, and this rule does not reach
+/// them. That is a partial coverage inside a scanned class, and it is recorded
+/// by `surface_coverage::unversioned_protocol_names_are_a_recorded_gap_not_a_silent_one`
+/// rather than left implied.
 fn schema_names(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut found = Vec::new();
@@ -318,6 +324,101 @@ fn schema_names(text: &str) -> Vec<String> {
 
 const fn is_name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+}
+
+/// Whether `value` has the shape of a protocol, capability or operation identity.
+///
+/// `src/codec.rs` defines `ProtocolName` as a "Dotted lowercase protocol name,
+/// such as `automonique.runner`": ASCII lowercase and digits and dots, no
+/// leading digit, no trailing dot, no doubled dot. A dot is required here on top
+/// of that, because the single-word case is indistinguishable from every other
+/// lowercase string literal in the tree.
+fn is_protocol_name(value: &str) -> bool {
+    value.contains('.')
+        && !value.ends_with('.')
+        && !value.contains("..")
+        && value.starts_with(|first: char| first.is_ascii_lowercase())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.')
+}
+
+/// Whether `line` opens a `const` item.
+///
+/// A screaming-case name followed by its type annotation, which is what
+/// separates `const RESERVED_CAPABILITIES: [&str; 5] = [` from `const fn code(`
+/// — a `const fn` is a function, and treating one as a declaration would drag
+/// its whole body's literals in.
+fn opens_a_const_item(line: &str) -> bool {
+    let rest = line.strip_prefix("pub").map_or(line, |after| {
+        after
+            .strip_prefix("(crate)")
+            .or_else(|| after.strip_prefix("(super)"))
+            .unwrap_or(after)
+            .trim_start()
+    });
+    let Some(declaration) = rest.strip_prefix("const ") else {
+        return false;
+    };
+    let Some((name, _)) = declaration.split_once(':') else {
+        return false;
+    };
+    let name = name.trim();
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|letter| letter.is_ascii_uppercase() || letter.is_ascii_digit() || letter == '_')
+}
+
+/// Every string literal that is part of a `const` item.
+///
+/// This is where the tree spells a protocol, capability or operation identity:
+/// `RESERVED_CAPABILITIES` in `src/tools.rs`, `OPERATION` in
+/// `src/interaction.rs`, `CHECK_CODE` in `automonique-cli`. Reading the
+/// declaration rather than every literal is what keeps file names, git config
+/// keys and JSON field paths out — `state.sqlite3`, `user.email` and
+/// `unit.state` all share the unversioned dotted shape and none is a protocol.
+fn const_string_literals(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut inside = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with("//") {
+            continue;
+        }
+        if !inside && opens_a_const_item(line) {
+            inside = true;
+        }
+        if inside {
+            found.extend(quoted_items(line));
+            if line.ends_with(';') {
+                inside = false;
+            }
+        }
+    }
+    found
+}
+
+/// Every protocol-style identity declared as a constant in the shipped tree.
+///
+/// Not part of [`scan`]: see
+/// `surface_coverage::unversioned_protocol_names_are_a_recorded_gap_not_a_silent_one`
+/// for what the class contains and why the gate records it rather than scanning it.
+fn protocol_name_declarations(root: &Path) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for file in files_under(root) {
+        let here = location(root, &file);
+        if file.extension().and_then(OsStr::to_str) != Some("rs") || !is_shipped(&here) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).expect("readable source");
+        for literal in const_string_literals(&text) {
+            if is_protocol_name(&literal) {
+                found.push((literal, here.clone()));
+            }
+        }
+    }
+    distinct(found)
 }
 
 /// The first string-literal argument of any call to one of `macros`.
@@ -601,6 +702,30 @@ fn seeded_violating_tree(name: &str) -> PathBuf {
     root
 }
 
+/// A *namespaced* package that nonetheless carries legacy-named surfaces.
+///
+/// `seeded_violating_tree` cannot show the module and fixture rules working,
+/// because its package is `legacy-runner`: the crate-qualified identifiers it
+/// produces are refused by their crate prefix, not by their own spelling. Every
+/// package in the real workspace is `automonique-*`, so that is the case that
+/// matters. Here the package, the crate and two control surfaces are canonical
+/// and only the legacy-named module and fixture may be findings.
+fn legacy_surfaces_in_a_namespaced_crate(name: &str) -> PathBuf {
+    let root = scratch(name);
+    let package = root.join("crates/automonique-seed");
+    write(
+        &package.join("Cargo.toml"),
+        "[package]\nname = \"automonique-seed\"\n",
+    );
+    write(&package.join("src/lib.rs"), "pub mod codec;\n");
+    write(&package.join("src/codec.rs"), "");
+    write(&package.join("src/legacy_shim.rs"), "");
+    write(&package.join("src/legacy_area/mod.rs"), "");
+    write(&package.join("fixtures/wire-v1.json"), "{}\n");
+    write(&package.join("fixtures/legacy-corpus.json"), "{}\n");
+    root
+}
+
 // ---------------------------------------------------------------------------
 
 mod surface_coverage {
@@ -830,6 +955,84 @@ mod surface_coverage {
     }
 
     #[test]
+    fn unversioned_protocol_names_are_a_recorded_gap_not_a_silent_one() {
+        // The contract's Schema row says "schema and protocol names". The rule
+        // in this file reads *versioned* names, a dotted name carrying a `/vN`
+        // revision, because that is the only shape a bare literal can be
+        // recognised by without reporting the rest of the tree as protocol:
+        // `state.sqlite3`, `user.email`, `filter.sh` and `unit.state` all share
+        // the unversioned dotted shape and none of them is a protocol name.
+        // This product's protocol names are unversioned — `src/codec.rs`
+        // defines `ProtocolName` as a "Dotted lowercase protocol name, such as
+        // `automonique.runner`" and its validator rejects `/` — so they are
+        // outside what the schema rule reaches. The class is therefore
+        // partially covered, and the contract's rule for that is to report it.
+        // What follows is the report: the population enumerated, measured
+        // against the real tree.
+        let declared = protocol_name_declarations(&workspace_root());
+        let names: Vec<&str> = declared.iter().map(|(name, _)| name.as_str()).collect();
+
+        // The enumeration is not vacuous: the shipped reserved capabilities,
+        // five protocol identities in `src/tools.rs`, are all in it.
+        for capability in [
+            "automonique.workflow.execute",
+            "automonique.delegation.spawn",
+            "automonique.mcp.raw",
+            "automonique.approval.decide",
+            "automonique.privilege.broker",
+        ] {
+            assert!(
+                names.contains(&capability),
+                "{capability} was not found: {names:?}"
+            );
+        }
+
+        // And it really is a gap: not one of them is among the identifiers the
+        // schema rule records, so none of this class is covered twice.
+        let inventory = scan(&workspace_root());
+        let scanned_schemas: Vec<&str> = inventory
+            .identifiers()
+            .iter()
+            .filter(|identifier| identifier.surface() == SurfaceClass::Schema)
+            .map(ScannedIdentifier::name)
+            .collect();
+        for name in &names {
+            assert!(
+                !scanned_schemas.contains(name),
+                "{name} is covered by the schema rule after all; this record is stale"
+            );
+        }
+
+        // What scanning the class would produce, measured rather than asserted
+        // away: four shipped identities outside the namespace. Renaming a
+        // durable identifier needs a migration contract this item does not
+        // have, and none of the four is inventoried, so the gate records the
+        // class instead of scanning it — and this is the record. An
+        // un-namespaced protocol name added to shipped source fails here until
+        // it is entered, which makes the gap a decision rather than a drift.
+        let mut population = SurfaceInventory::new();
+        population
+            .record(SurfaceClass::Schema, &declared)
+            .expect("valid identifiers");
+        let outside: Vec<String> = NamespaceGate::new()
+            .run_scan(&population)
+            .findings
+            .into_iter()
+            .map(|finding| finding.identifier)
+            .collect();
+        assert_eq!(
+            outside,
+            [
+                "checkpoint.create",
+                "checkpoint.list",
+                "checkpoint.restore",
+                "supervisor.adapter",
+            ],
+            "the recorded gap changed: {declared:?}"
+        );
+    }
+
+    #[test]
     fn every_surface_rule_can_find_a_violation() {
         // "Scanned, none found" is only worth anything if the rule could have
         // found something. Each class is seeded with exactly one offender.
@@ -943,6 +1146,100 @@ mod namespace_enforcement {
         let foreign = NamespaceGate::new().run(&[scanned(SurfaceClass::Schema, &outside)]);
         assert_eq!(foreign.findings.len(), 1);
         assert_eq!(foreign.findings[0].identifier, outside);
+    }
+
+    #[test]
+    fn a_canonical_crate_qualifier_does_not_launder_a_legacy_leaf() {
+        // The module and fixture rules record crate-qualified identifiers, so
+        // the prefix test is satisfied by the crate. Judged on the prefix alone
+        // both classes would be unable to produce a finding anywhere in this
+        // workspace, because every package here is `automonique-*`.
+        for name in [
+            "automonique_protocol::legacy_shim",
+            "automonique_protocol::legacy_area",
+            "automonique_protocol::legacy-corpus",
+            "automonique_protocol::legacyctl",
+            "automonique-legacy-runner",
+        ] {
+            let report = NamespaceGate::new().run(&[scanned(SurfaceClass::Module, name)]);
+            assert_eq!(report.findings.len(), 1, "{name} was wrongly accepted");
+            assert_eq!(report.findings[0].identifier, name);
+        }
+
+        // The rule reads the head of a segment, not any substring: an ordinary
+        // leaf under a canonical crate is in the namespace and stays accepted,
+        // and so does a word that merely ends in the legacy root.
+        for name in [
+            "automonique_protocol::codec",
+            "automonique_protocol::wire-v1",
+            "automonique_protocol::sublegacy",
+        ] {
+            let report = NamespaceGate::new().run(&[scanned(SurfaceClass::Module, name)]);
+            assert!(report.findings.is_empty(), "{name} was wrongly refused");
+        }
+
+        // It refuses a name; it does not forbid one. The inventory is still the
+        // way out, so this is a reviewable decision rather than a wall.
+        let mut gate = NamespaceGate::new();
+        gate.inventory(
+            InventoryEntry::new(
+                SurfaceClass::Module,
+                "automonique_protocol::legacy_shim",
+                contract(),
+            )
+            .expect("valid"),
+        );
+        assert!(
+            gate.run(&[scanned(
+                SurfaceClass::Module,
+                "automonique_protocol::legacy_shim"
+            )])
+            .passed()
+        );
+    }
+
+    #[test]
+    fn a_legacy_module_or_fixture_inside_a_namespaced_crate_is_found_by_the_scan() {
+        // The same property through the real scan rather than a constructed
+        // identifier: legacy-named files dropped into a canonical crate.
+        let root = legacy_surfaces_in_a_namespaced_crate("legacy-inside-namespaced-crate");
+        let report = shipped_gate().run_scan(&scan(&root));
+
+        let named: Vec<(&str, SurfaceClass)> = report
+            .findings
+            .iter()
+            .map(|finding| (finding.identifier.as_str(), finding.surface))
+            .collect();
+        for expected in [
+            ("automonique_seed::legacy_shim", SurfaceClass::Module),
+            ("automonique_seed::legacy_area", SurfaceClass::Module),
+            ("automonique_seed::legacy-corpus", SurfaceClass::Fixture),
+        ] {
+            assert!(
+                named.contains(&expected),
+                "{expected:?} was not reported: {named:?}"
+            );
+        }
+
+        // Nothing here fires off the package name: the package, the crate and
+        // the two ordinary surfaces are all accepted, so the module and fixture
+        // findings are the module and fixture rules working.
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.surface == SurfaceClass::Package
+                    || finding.surface == SurfaceClass::Crate),
+            "the seeded package is canonical: {:?}",
+            report.findings
+        );
+        for control in ["automonique_seed::codec", "automonique_seed::wire-v1"] {
+            assert!(
+                !named.iter().any(|(name, _)| *name == control),
+                "{control} was wrongly refused: {named:?}"
+            );
+        }
+        assert!(!report.passed());
     }
 
     #[test]
