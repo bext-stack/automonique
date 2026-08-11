@@ -147,12 +147,23 @@ pub enum JournalError {
         /// Version the event declared.
         offered: u32,
     },
-    /// One idempotency key was reused for a different target or payload.
+    /// One idempotency key was reused for a different target.
     IdempotencyConflict {
         /// The target already recorded under this key.
         recorded_target: String,
         /// The target offered.
         offered_target: String,
+    },
+    /// One idempotency key was reused for a different payload.
+    ///
+    /// Separate from [`JournalError::IdempotencyConflict`] because the two say
+    /// different things to a caller: the same target with a changed payload is a
+    /// changed request, not a misaddressed one.
+    IdempotencyPayloadConflict {
+        /// The payload already recorded under this key.
+        recorded_payload: ActionPayload,
+        /// The payload offered.
+        offered_payload: ActionPayload,
     },
     /// A cursor was moved backwards.
     CursorWentBackwards {
@@ -160,6 +171,13 @@ pub enum JournalError {
         current: u64,
         /// Offered position.
         offered: u64,
+    },
+    /// A retained range was declared with its end below its start.
+    InvertedRetainedRange {
+        /// Lowest offered position.
+        from: u64,
+        /// Highest offered position.
+        to: u64,
     },
     /// A bounded identifier was rejected.
     Field {
@@ -179,7 +197,9 @@ impl JournalError {
             Self::RevisionConflict { .. } => "revision_conflict",
             Self::EventSchemaOutOfRange { .. } => "event_schema_out_of_range",
             Self::IdempotencyConflict { .. } => "idempotency_conflict",
+            Self::IdempotencyPayloadConflict { .. } => "idempotency_payload_conflict",
             Self::CursorWentBackwards { .. } => "cursor_went_backwards",
+            Self::InvertedRetainedRange { .. } => "inverted_retained_range",
             Self::Field { .. } => "field_invalid",
         }
     }
@@ -213,9 +233,21 @@ impl fmt::Display for JournalError {
                 "idempotency key already targets {recorded_target}; cannot retarget \
                  to {offered_target}"
             ),
+            Self::IdempotencyPayloadConflict {
+                recorded_payload,
+                offered_payload,
+            } => write!(
+                formatter,
+                "idempotency key already recorded {recorded_payload}; cannot replace \
+                 it with {offered_payload}"
+            ),
             Self::CursorWentBackwards { current, offered } => write!(
                 formatter,
                 "cursor cannot move from {current} back to {offered}"
+            ),
+            Self::InvertedRetainedRange { from, to } => write!(
+                formatter,
+                "retained range {from}..={to} ends below where it starts"
             ),
             Self::Field { field, error } => write!(formatter, "field {field}: {error}"),
         }
@@ -477,17 +509,95 @@ impl ActionOutcome {
     }
 }
 
+/// What an action carried, reduced to a digest.
+///
+/// Absence is its own value rather than an empty digest. "This action carried
+/// nothing" and "this action carried something whose digest is empty" are
+/// different requests, and one spelling standing for both is how a changed
+/// request slips back through under an old key. [`ActionPayload::digest`]
+/// refuses an empty string, so the ambiguous value is unrepresentable rather
+/// than merely discouraged.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ActionPayload(Option<String>);
+
+impl ActionPayload {
+    /// The payload of an action that carried none.
+    #[must_use]
+    pub const fn absent() -> Self {
+        Self(None)
+    }
+
+    /// The payload of an action that carried one, named by its digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Field`] for an empty, over-long or control
+    /// character bearing digest.
+    pub fn digest(digest: &str) -> Result<Self, JournalError> {
+        bounded(digest, "payload_digest")?;
+        Ok(Self(Some(digest.to_owned())))
+    }
+
+    /// The digest, when there is one.
+    #[must_use]
+    pub fn as_digest(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+impl fmt::Display for ActionPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(digest) => write!(formatter, "payload {digest}"),
+            None => formatter.write_str("no payload"),
+        }
+    }
+}
+
 /// The durable record of one accepted mutation.
 ///
 /// Owns every field. There is no lifetime parameter, so a receipt cannot borrow
 /// from a connection and therefore stays queryable after the client that
 /// requested it has gone.
+///
+/// A recorded receipt outlives the connection that produced it:
+///
+/// ```
+/// use automonique_protocol::journal::{ActionLedger, ActionOutcome, ActionReceipt};
+/// let receipt: ActionReceipt;
+/// {
+///     // This scope stands in for a live client connection.
+///     let mut connection = ActionLedger::new();
+///     receipt = connection
+///         .record("a-1", "work/w-1", "key-1", None, ActionOutcome::Completed)
+///         .unwrap();
+/// }
+/// assert_eq!(receipt.target(), "work/w-1");
+/// ```
+///
+/// A receipt that borrows from that connection does not compile. The only
+/// difference from the case above is `find`, which hands back a borrow of the
+/// connection instead of an owned record:
+///
+/// ```compile_fail
+/// use automonique_protocol::journal::{ActionLedger, ActionOutcome, ActionReceipt};
+/// let receipt: &ActionReceipt;
+/// {
+///     let mut connection = ActionLedger::new();
+///     connection
+///         .record("a-1", "work/w-1", "key-1", None, ActionOutcome::Completed)
+///         .unwrap();
+///     receipt = connection.find("key-1").unwrap();
+/// }
+/// assert_eq!(receipt.target(), "work/w-1");
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionReceipt {
     action_id: String,
     target: String,
     idempotency_key: String,
     expected_revision: Option<Revision>,
+    payload: ActionPayload,
     outcome: ActionOutcome,
 }
 
@@ -516,6 +626,12 @@ impl ActionReceipt {
         self.expected_revision
     }
 
+    /// What the action carried.
+    #[must_use]
+    pub const fn payload(&self) -> &ActionPayload {
+        &self.payload
+    }
+
     /// The terminal outcome.
     #[must_use]
     pub const fn outcome(&self) -> ActionOutcome {
@@ -524,6 +640,33 @@ impl ActionReceipt {
 }
 
 /// Receipts recorded against idempotency keys.
+///
+/// A recorded receipt is readable:
+///
+/// ```
+/// use automonique_protocol::journal::{ActionLedger, ActionOutcome};
+/// let mut ledger = ActionLedger::new();
+/// ledger
+///     .record("a-1", "work/w-1", "key-1", None, ActionOutcome::Accepted)
+///     .unwrap();
+/// let recorded = ledger.find("key-1").unwrap();
+/// assert_eq!(recorded.target(), "work/w-1");
+/// ```
+///
+/// It is not writable. There is no mutable accessor, so a recorded receipt
+/// cannot be retargeted or re-outcomed in place: reusing a key has to go back
+/// through [`ActionLedger::record`], where divergence is a typed conflict. The
+/// only difference from the case above is `find_mut`, which does not exist:
+///
+/// ```compile_fail
+/// use automonique_protocol::journal::{ActionLedger, ActionOutcome};
+/// let mut ledger = ActionLedger::new();
+/// ledger
+///     .record("a-1", "work/w-1", "key-1", None, ActionOutcome::Accepted)
+///     .unwrap();
+/// let recorded = ledger.find_mut("key-1").unwrap();
+/// assert_eq!(recorded.target(), "work/w-1");
+/// ```
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ActionLedger {
     receipts: Vec<ActionReceipt>,
@@ -538,14 +681,18 @@ impl ActionLedger {
         }
     }
 
-    /// Record a mutation, idempotently by key.
+    /// Record a mutation that carries no payload, idempotently by key.
     ///
     /// Replaying a key against the same target returns the identical receipt.
+    /// Equivalent to [`ActionLedger::record_with_payload`] with
+    /// [`ActionPayload::absent`].
     ///
     /// # Errors
     ///
     /// Returns [`JournalError::IdempotencyConflict`] when a key is reused for a
-    /// different target — a second execution, not an overwrite — and
+    /// different target — a second execution, not an overwrite —
+    /// [`JournalError::IdempotencyPayloadConflict`] when the key was recorded
+    /// carrying a payload, since this call offers none, and
     /// [`JournalError::Field`] for an invalid identifier.
     pub fn record(
         &mut self,
@@ -553,6 +700,38 @@ impl ActionLedger {
         target: &str,
         idempotency_key: &str,
         expected_revision: Option<Revision>,
+        outcome: ActionOutcome,
+    ) -> Result<ActionReceipt, JournalError> {
+        self.record_with_payload(
+            action_id,
+            target,
+            idempotency_key,
+            expected_revision,
+            ActionPayload::absent(),
+            outcome,
+        )
+    }
+
+    /// Record a mutation and what it carried, idempotently by key.
+    ///
+    /// Idempotency is exact in both directions. Replaying a key against the
+    /// same target *and* the same payload returns the identical receipt;
+    /// changing either is a typed conflict rather than an overwrite or a second
+    /// execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::IdempotencyConflict`] when a key is reused for a
+    /// different target, [`JournalError::IdempotencyPayloadConflict`] when it is
+    /// reused for a different payload, and [`JournalError::Field`] for an
+    /// invalid identifier.
+    pub fn record_with_payload(
+        &mut self,
+        action_id: &str,
+        target: &str,
+        idempotency_key: &str,
+        expected_revision: Option<Revision>,
+        payload: ActionPayload,
         outcome: ActionOutcome,
     ) -> Result<ActionReceipt, JournalError> {
         bounded(action_id, "action_id")?;
@@ -570,6 +749,12 @@ impl ActionLedger {
                     offered_target: target.to_owned(),
                 });
             }
+            if existing.payload != payload {
+                return Err(JournalError::IdempotencyPayloadConflict {
+                    recorded_payload: existing.payload.clone(),
+                    offered_payload: payload,
+                });
+            }
             return Ok(existing.clone());
         }
 
@@ -578,6 +763,7 @@ impl ActionLedger {
             target: target.to_owned(),
             idempotency_key: idempotency_key.to_owned(),
             expected_revision,
+            payload,
             outcome,
         };
         self.receipts.push(receipt.clone());
@@ -596,7 +782,104 @@ impl ActionLedger {
     }
 }
 
+/// The window of positions a topic still retains, inclusive at both ends.
+///
+/// A window that ends below where it starts retains nothing, and judging a
+/// cursor against one would answer a question about a range that does not
+/// exist. [`RetainedRange::new`] refuses it, so no such window can be built and
+/// handed to a cursor.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RetainedRange {
+    first: u64,
+    last: u64,
+}
+
+impl RetainedRange {
+    /// Declare what a topic still retains.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::InvertedRetainedRange`] when `last` is below
+    /// `first`.
+    pub const fn new(first: u64, last: u64) -> Result<Self, JournalError> {
+        if last < first {
+            return Err(JournalError::InvertedRetainedRange {
+                from: first,
+                to: last,
+            });
+        }
+        Ok(Self { first, last })
+    }
+
+    /// Lowest position still retained.
+    #[must_use]
+    pub const fn first(self) -> u64 {
+        self.first
+    }
+
+    /// Highest position still retained.
+    #[must_use]
+    pub const fn last(self) -> u64 {
+        self.last
+    }
+}
+
+/// Where a consumer may resume on a topic.
+///
+/// Closed: there is no third answer, so a consumer that has fallen out of
+/// retention cannot be served a silent partial stream or an empty success.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CursorResume {
+    /// Live delivery may begin at this position.
+    Live {
+        /// First position the consumer will receive.
+        from: u64,
+    },
+    /// The cursor is outside retention; a bounded snapshot is required first.
+    ResyncRequired {
+        /// Lowest position still retained.
+        snapshot_from: u64,
+        /// Highest position still retained.
+        snapshot_to: u64,
+    },
+}
+
+impl CursorResume {
+    /// The terminal outcome this decision reports to the caller.
+    ///
+    /// A resync reports [`ActionOutcome::ResyncRequired`]. Live delivery is not
+    /// a terminal outcome and reports none.
+    #[must_use]
+    pub const fn outcome(self) -> Option<ActionOutcome> {
+        match self {
+            Self::Live { .. } => None,
+            Self::ResyncRequired { .. } => Some(ActionOutcome::ResyncRequired),
+        }
+    }
+}
+
 /// A durable consumer position, keyed by consumer identity and topic.
+///
+/// [`JournalCursor::position`] is the next position the consumer will receive.
+/// It moves only through [`JournalCursor::advance_to`]:
+///
+/// ```
+/// use automonique_protocol::journal::JournalCursor;
+/// let mut cursor = JournalCursor::new("projector", "work", 10).unwrap();
+/// cursor.advance_to(12).unwrap();
+/// assert_eq!(cursor.position(), 12);
+/// ```
+///
+/// The field itself is private, so there is no path around that check and a
+/// rewind cannot be performed without producing the typed error. The only
+/// difference from the case above is writing the position directly:
+///
+/// ```compile_fail
+/// use automonique_protocol::journal::JournalCursor;
+/// let mut cursor = JournalCursor::new("projector", "work", 10).unwrap();
+/// cursor.position = 12;
+/// assert_eq!(cursor.position(), 12);
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JournalCursor {
     consumer: String,
@@ -620,10 +903,46 @@ impl JournalCursor {
         })
     }
 
-    /// Current position.
+    /// The consumer this position belongs to.
+    #[must_use]
+    pub fn consumer(&self) -> &str {
+        &self.consumer
+    }
+
+    /// The topic this position is kept on.
+    #[must_use]
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    /// Current position: the next position the consumer will receive.
     #[must_use]
     pub const fn position(&self) -> u64 {
         self.position
+    }
+
+    /// Where this consumer may resume, given what the topic still retains.
+    ///
+    /// A cursor below the retained window has fallen off the back of retention:
+    /// the positions it is waiting for are gone, so it yields
+    /// [`CursorResume::ResyncRequired`] carrying the bounded snapshot
+    /// coordinates it must catch up from — never a silent partial stream and
+    /// never an empty success.
+    ///
+    /// A cursor at or above the retained window is caught up rather than stale:
+    /// nothing it is waiting for has been discarded, so it resumes live.
+    #[must_use]
+    pub const fn resume_within(&self, retained: RetainedRange) -> CursorResume {
+        if self.position < retained.first() {
+            CursorResume::ResyncRequired {
+                snapshot_from: retained.first(),
+                snapshot_to: retained.last(),
+            }
+        } else {
+            CursorResume::Live {
+                from: self.position,
+            }
+        }
     }
 
     /// Move forward.

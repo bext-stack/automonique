@@ -8,9 +8,10 @@
 use std::path::PathBuf;
 
 use automonique_protocol::connector::{
-    Acknowledgement, ActionToken, ArtifactGrant, BusinessAcceptance, ConnectorError,
-    ConversationCoordinates, GrantDirection, IdentityResolution, InstallationKey,
-    InstallationRegistry, RenderIntent, SourceKey, SourceMessageEvent, TenantResolution,
+    Acknowledgement, ActionToken, ArtifactGrant, BusinessAcceptance, ConformanceObligation,
+    ConnectorError, ConversationCoordinates, DurableEvent, EventOutcome, GrantDirection,
+    IdentityResolution, InstallationKey, InstallationRegistry, IntentPhrase, RenderIntent,
+    SourceKey, SourceMessageEvent, SourceMessageLog, TenantResolution,
 };
 use automonique_protocol::identity::Actor;
 use automonique_protocol::primitives::{EpochMillis, Revision};
@@ -36,6 +37,22 @@ fn revision(value: u64) -> Revision {
 
 fn digest() -> ArtifactDigest {
     ArtifactDigest::new("sha-256", HEX).expect("valid digest")
+}
+
+fn phrase(wording: &str) -> IntentPhrase {
+    IntentPhrase::parse(wording).expect("plain wording")
+}
+
+fn coordinates() -> ConversationCoordinates {
+    ConversationCoordinates::new(
+        installation(),
+        "conv-1",
+        Some("thread-1"),
+        "msg-1",
+        Some("en-GB"),
+        true,
+    )
+    .expect("valid coordinates")
 }
 
 mod installation_resolution {
@@ -189,31 +206,102 @@ mod acknowledgement_split {
 mod render_intents {
     use super::*;
 
-    #[test]
-    fn every_intent_kind_is_structured_and_bounded() {
-        let progress = RenderIntent::progress("building", 2, Some(5)).expect("valid");
-        assert_eq!(progress.kind(), "progress");
-
-        let terminal = RenderIntent::terminal("done", true).expect("valid");
-        assert_eq!(terminal.kind(), "terminal");
-
-        let clarification = RenderIntent::Clarification {
-            question: "which branch?".to_owned(),
-        };
-        assert_eq!(clarification.kind(), "clarification");
-
-        let approval = RenderIntent::Approval {
-            summary: "deploy".to_owned(),
-            target_revision: revision(3),
-        };
-        assert_eq!(approval.kind(), "approval");
+    fn event(outcome: EventOutcome) -> DurableEvent {
+        DurableEvent::record("evt-1", revision(7), outcome).expect("durable event")
     }
 
     #[test]
-    fn intent_text_is_bounded() {
-        assert!(RenderIntent::progress("", 0, None).is_err());
-        assert!(RenderIntent::terminal(&"x".repeat(5_000), true).is_err());
-        assert!(RenderIntent::terminal("ok", true).is_ok());
+    fn every_intent_kind_is_derived_from_a_durable_event() {
+        let outcomes = [
+            (
+                EventOutcome::Progressed {
+                    summary: phrase("building"),
+                    completed: 2,
+                    total: Some(5),
+                },
+                "progress",
+            ),
+            (
+                EventOutcome::ClarificationRequested {
+                    question: phrase("which branch?"),
+                },
+                "clarification",
+            ),
+            (
+                EventOutcome::ApprovalRequired {
+                    summary: phrase("deploy"),
+                },
+                "approval",
+            ),
+            (
+                EventOutcome::Finished {
+                    summary: phrase("done"),
+                    succeeded: true,
+                },
+                "terminal",
+            ),
+        ];
+        for (outcome, kind) in outcomes {
+            let intent = RenderIntent::derived_from(&event(outcome.clone()));
+            assert_eq!(intent.kind(), kind);
+            // The intent names the event it came from, so it cannot describe a
+            // state that was never recorded.
+            assert_eq!(intent.source_event(), "evt-1");
+            assert_eq!(intent.target_revision(), revision(7));
+            assert_eq!(intent.outcome(), &outcome);
+        }
+    }
+
+    #[test]
+    fn pre_rendered_markup_is_not_a_representable_phrase() {
+        for markup in [
+            // The exact probe that measured this row as failing.
+            "<AdaptiveCard><TextBlock>done</TextBlock></AdaptiveCard>",
+            "{\"type\":\"AdaptiveCard\",\"version\":\"1.5\"}",
+            "{\"type\":2,\"data\":{\"custom_id\":\"approve\"}}",
+            "<b>done</b>",
+            "&lt;script&gt;",
+            "[approve](https://example.invalid/approve)",
+            "`rm -rf`",
+            "escaped\\u003c",
+        ] {
+            assert_eq!(
+                IntentPhrase::parse(markup)
+                    .expect_err("presentation is not wording")
+                    .category(),
+                "markup_rejected",
+                "{markup} reached an intent"
+            );
+        }
+        // Differing only in the markup, the same wording parses.
+        assert_eq!(phrase("done").as_str(), "done");
+    }
+
+    #[test]
+    fn intent_wording_is_bounded() {
+        assert_eq!(
+            IntentPhrase::parse("").expect_err("empty").category(),
+            "field_invalid"
+        );
+        assert!(IntentPhrase::parse(&"x".repeat(5_000)).is_err());
+        assert!(IntentPhrase::parse("ok").is_ok());
+    }
+
+    #[test]
+    fn an_invalid_event_identity_is_refused() {
+        assert_eq!(
+            DurableEvent::record(
+                "",
+                revision(1),
+                EventOutcome::Finished {
+                    summary: phrase("done"),
+                    succeeded: true,
+                },
+            )
+            .expect_err("an intent needs an event to point at")
+            .category(),
+            "field_invalid"
+        );
     }
 }
 
@@ -332,29 +420,34 @@ mod coordinate_preservation {
     use super::*;
 
     #[test]
-    fn coordinates_round_trip() {
-        let coordinates = ConversationCoordinates::new(
-            installation(),
-            "conv-1",
-            Some("thread-1"),
-            "msg-1",
-            Some("en-GB"),
-            true,
-        )
-        .expect("valid coordinates");
+    fn every_named_coordinate_round_trips() {
+        // Platform, installation, conversation, thread, message, locale and
+        // mention context: all seven go in and all seven come back out. A
+        // coordinate that cannot be read back was not preserved.
+        let coordinates = coordinates();
+        assert_eq!(coordinates.platform(), "teams");
+        assert_eq!(coordinates.installation(), &installation());
+        assert_eq!(coordinates.installation().application(), "app-1");
+        assert_eq!(
+            coordinates.installation().installation_owner(),
+            "ext-tenant-1"
+        );
         assert_eq!(coordinates.conversation(), "conv-1");
         assert_eq!(coordinates.thread(), Some("thread-1"));
         assert_eq!(coordinates.message(), "msg-1");
+        assert_eq!(coordinates.locale(), Some("en-GB"));
         assert!(coordinates.was_mentioned());
     }
 
     #[test]
-    fn a_platform_without_threads_is_representable() {
+    fn a_platform_without_threads_or_a_locale_is_representable() {
         let coordinates =
             ConversationCoordinates::new(installation(), "conv-1", None, "msg-1", None, false)
                 .expect("valid coordinates");
         assert_eq!(coordinates.thread(), None);
+        assert_eq!(coordinates.locale(), None);
         assert!(!coordinates.was_mentioned());
+        assert_eq!(coordinates.platform(), "teams");
     }
 
     #[test]
@@ -370,6 +463,36 @@ mod coordinate_preservation {
             SourceMessageEvent::Revised { revision } => assert_eq!(revision.get(), 2),
             SourceMessageEvent::Tombstoned { .. } => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn a_tombstone_is_recorded_beside_the_history_not_in_place_of_it() {
+        let mut log = SourceMessageLog::opened(coordinates());
+        log.record(SourceMessageEvent::Revised {
+            revision: revision(2),
+        });
+        log.record(SourceMessageEvent::Revised {
+            revision: revision(3),
+        });
+        log.record(SourceMessageEvent::Tombstoned { at: at(1_000) });
+
+        assert!(log.is_tombstoned());
+        assert_eq!(
+            log.events(),
+            [
+                SourceMessageEvent::Revised {
+                    revision: revision(2),
+                },
+                SourceMessageEvent::Revised {
+                    revision: revision(3),
+                },
+                SourceMessageEvent::Tombstoned { at: at(1_000) },
+            ],
+            "a deletion must not erase what was already recorded"
+        );
+        // The coordinates survive the deletion too.
+        assert_eq!(log.coordinates().message(), "msg-1");
+        assert_eq!(log.coordinates().locale(), Some("en-GB"));
     }
 }
 
@@ -397,13 +520,25 @@ mod platform_type_isolation {
             "BotFrameworkActivity",
         ];
 
+        // Walk the whole tree, not just its top level. A scan that reads only
+        // src/*.rs is defeated by adding src/teams/mod.rs, which is exactly
+        // the shape a platform package would arrive in.
+        fn rust_sources(directory: &std::path::Path, found: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(directory).expect("readable directory") {
+                let path = entry.expect("directory entry").path();
+                if path.is_dir() {
+                    rust_sources(&path, found);
+                } else if path.extension().and_then(|value| value.to_str()) == Some("rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let mut sources = Vec::new();
+        rust_sources(&source_dir, &mut sources);
+
         let mut scanned = 0_usize;
         let mut findings: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(&source_dir).expect("the crate has sources") {
-            let path = entry.expect("directory entry").path();
-            if path.extension().and_then(|value| value.to_str()) != Some("rs") {
-                continue;
-            }
+        for path in sources {
             let text = std::fs::read_to_string(&path).expect("readable source");
             scanned += 1;
             for name in forbidden {
@@ -426,14 +561,56 @@ mod platform_type_isolation {
 
     #[test]
     fn outbound_content_is_an_intent_rather_than_a_payload() {
-        // Every `RenderIntent` variant is structured. A caller cannot hand the
-        // protocol a pre-rendered body, because no variant accepts one.
-        let intents = [
-            RenderIntent::progress("building", 1, None).expect("valid"),
-            RenderIntent::terminal("done", true).expect("valid"),
-        ];
-        for intent in intents {
-            assert!(!intent.kind().is_empty());
+        // Every field of an intent is a count, a flag, a revision, a bounded
+        // event identity or parsed wording, and the only constructor takes a
+        // durable event, so there is nowhere on the type to put a body.
+        let event = DurableEvent::record(
+            "evt-1",
+            revision(1),
+            EventOutcome::Finished {
+                summary: phrase("done"),
+                succeeded: true,
+            },
+        )
+        .expect("durable event");
+        let intent = RenderIntent::derived_from(&event);
+        assert_eq!(intent.kind(), "terminal");
+        assert_eq!(intent.source_event(), "evt-1");
+        assert!(
+            IntentPhrase::parse("<AdaptiveCard><TextBlock>done</TextBlock></AdaptiveCard>")
+                .is_err(),
+            "an Adaptive Card body is not wording"
+        );
+    }
+}
+
+mod conformance_obligations {
+    use super::*;
+
+    /// Not a row of the check table; the objective's last bullet.
+    #[test]
+    fn the_obligations_are_a_checkable_list_including_restart_resumption() {
+        assert_eq!(ConformanceObligation::ALL.len(), 9);
+
+        let mut spellings: Vec<&str> = ConformanceObligation::ALL
+            .iter()
+            .map(|obligation| obligation.as_str())
+            .collect();
+        let total = spellings.len();
+        spellings.sort_unstable();
+        spellings.dedup();
+        assert_eq!(spellings.len(), total, "two obligations share a spelling");
+
+        for obligation in ConformanceObligation::ALL {
+            assert!(
+                !obligation.description().is_empty(),
+                "{} is unjudgeable without a description",
+                obligation.as_str()
+            );
         }
+
+        let resumption = ConformanceObligation::ResumeWithoutReplayingExternalEffects;
+        assert!(ConformanceObligation::ALL.contains(&resumption));
+        assert!(resumption.description().contains("restart"));
     }
 }

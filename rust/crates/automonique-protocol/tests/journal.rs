@@ -7,8 +7,8 @@
 
 use automonique_protocol::codec::{MajorVersion, VersionRange};
 use automonique_protocol::journal::{
-    ActionLedger, ActionOutcome, AggregateId, DomainEvent, EventSchemaVersion, Journal,
-    JournalCursor, JournalError, Projection,
+    ActionLedger, ActionOutcome, ActionPayload, AggregateId, CursorResume, DomainEvent,
+    EventSchemaVersion, Journal, JournalCursor, JournalError, Projection, RetainedRange,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 
@@ -229,6 +229,10 @@ mod outcome_vocabulary {
 mod idempotency_exactness {
     use super::*;
 
+    fn payload(digest: &str) -> ActionPayload {
+        ActionPayload::digest(digest).expect("valid digest")
+    }
+
     #[test]
     fn the_same_key_and_target_replay_to_the_identical_receipt() {
         let mut ledger = ActionLedger::new();
@@ -285,6 +289,111 @@ mod idempotency_exactness {
         assert_eq!(second.outcome(), ActionOutcome::Rejected);
         assert_eq!(ledger.find("key-1").expect("found").target(), "work/w-1");
     }
+
+    #[test]
+    fn the_same_key_target_and_payload_replay_to_the_identical_receipt() {
+        let mut ledger = ActionLedger::new();
+        let first = ledger
+            .record_with_payload(
+                "a-1",
+                "work/w-1",
+                "key-1",
+                Some(Revision::FIRST),
+                payload("sha256:aaa"),
+                ActionOutcome::Accepted,
+            )
+            .expect("first record");
+        let replay = ledger
+            .record_with_payload(
+                "a-2",
+                "work/w-1",
+                "key-1",
+                None,
+                payload("sha256:aaa"),
+                ActionOutcome::Completed,
+            )
+            .expect("replay");
+        assert_eq!(first, replay);
+        assert_eq!(replay.payload().as_digest(), Some("sha256:aaa"));
+    }
+
+    #[test]
+    fn the_same_key_with_a_different_payload_is_a_conflict() {
+        let mut ledger = ActionLedger::new();
+        ledger
+            .record_with_payload(
+                "a-1",
+                "work/w-1",
+                "key-1",
+                None,
+                payload("sha256:aaa"),
+                ActionOutcome::Accepted,
+            )
+            .expect("first");
+        // Same key, same target, changed payload: a changed request, so it is
+        // refused rather than overwriting or executing a second time.
+        assert_eq!(
+            ledger
+                .record_with_payload(
+                    "a-1",
+                    "work/w-1",
+                    "key-1",
+                    None,
+                    payload("sha256:bbb"),
+                    ActionOutcome::Accepted,
+                )
+                .expect_err("changed payload"),
+            JournalError::IdempotencyPayloadConflict {
+                recorded_payload: payload("sha256:aaa"),
+                offered_payload: payload("sha256:bbb"),
+            }
+        );
+        // The original stands.
+        assert_eq!(
+            ledger
+                .find("key-1")
+                .expect("still recorded")
+                .payload()
+                .as_digest(),
+            Some("sha256:aaa")
+        );
+    }
+
+    #[test]
+    fn a_payload_cannot_appear_under_a_key_recorded_without_one() {
+        let mut ledger = ActionLedger::new();
+        ledger
+            .record("a-1", "work/w-1", "key-1", None, ActionOutcome::Accepted)
+            .expect("first");
+        assert_eq!(
+            ledger
+                .record_with_payload(
+                    "a-1",
+                    "work/w-1",
+                    "key-1",
+                    None,
+                    payload("sha256:aaa"),
+                    ActionOutcome::Accepted,
+                )
+                .expect_err("payload appeared under a payload-free key"),
+            JournalError::IdempotencyPayloadConflict {
+                recorded_payload: ActionPayload::absent(),
+                offered_payload: payload("sha256:aaa"),
+            }
+        );
+    }
+
+    #[test]
+    fn absence_and_an_empty_digest_do_not_share_a_spelling() {
+        // If an empty digest were constructible it would be indistinguishable
+        // from "carried nothing", and a changed request would replay clean.
+        assert_eq!(
+            ActionPayload::digest("").expect_err("empty").category(),
+            "field_invalid"
+        );
+        assert_eq!(ActionPayload::absent().as_digest(), None);
+        assert_ne!(ActionPayload::absent(), payload("sha256:aaa"));
+    }
 }
 
 mod receipt_durability {
@@ -308,8 +417,10 @@ mod receipt_durability {
     /// A receipt owns its data.
     ///
     /// `ActionReceipt` has no lifetime parameter, so it cannot borrow from a
-    /// connection. The compile-fail case lives in the library doc tests where
-    /// it executes; this pins the positive half.
+    /// connection. The compile-fail case, and the passing case it is paired
+    /// with, are the doc tests on `ActionReceipt` itself, where a borrowing
+    /// receipt fails to outlive the connection that produced it. This pins the
+    /// runtime half.
     #[test]
     fn a_receipt_is_clonable_and_owns_every_field() {
         let mut ledger = ActionLedger::new();
@@ -345,6 +456,90 @@ mod cursor_monotonicity {
     fn a_cursor_requires_a_consumer_and_a_topic() {
         assert!(JournalCursor::new("", "work", 0).is_err());
         assert!(JournalCursor::new("projector", "", 0).is_err());
+    }
+
+    #[test]
+    fn cursors_are_keyed_by_consumer_identity_and_topic() {
+        let projector = JournalCursor::new("projector", "work", 10).expect("valid");
+        assert_eq!(projector.consumer(), "projector");
+        assert_eq!(projector.topic(), "work");
+        assert_ne!(
+            projector,
+            JournalCursor::new("auditor", "work", 10).expect("valid"),
+            "two consumers on one topic are not one cursor"
+        );
+        assert_ne!(
+            projector,
+            JournalCursor::new("projector", "runs", 10).expect("valid"),
+            "one consumer on two topics is not one cursor"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_cursor_yields_resync_with_snapshot_coordinates() {
+        let retained = RetainedRange::new(100, 400).expect("ordered window");
+        let stale = JournalCursor::new("projector", "work", 42).expect("valid");
+
+        let resume = stale.resume_within(retained);
+        assert_eq!(
+            resume,
+            CursorResume::ResyncRequired {
+                snapshot_from: 100,
+                snapshot_to: 400,
+            },
+            "a cursor below retention must be told where to catch up from"
+        );
+        assert_eq!(resume.outcome(), Some(ActionOutcome::ResyncRequired));
+        assert_eq!(
+            resume.outcome().expect("terminal outcome").as_str(),
+            "resync_required"
+        );
+    }
+
+    #[test]
+    fn a_retained_cursor_resumes_live_at_its_own_position() {
+        let retained = RetainedRange::new(100, 400).expect("ordered window");
+        for position in [100, 250, 400] {
+            let cursor = JournalCursor::new("projector", "work", position).expect("valid");
+            assert_eq!(
+                cursor.resume_within(retained),
+                CursorResume::Live { from: position }
+            );
+            assert_eq!(
+                cursor.resume_within(retained).outcome(),
+                None,
+                "live delivery is not a terminal outcome"
+            );
+        }
+        // One position below the window is already outside it.
+        let stale = JournalCursor::new("projector", "work", 99).expect("valid");
+        assert!(matches!(
+            stale.resume_within(retained),
+            CursorResume::ResyncRequired { .. }
+        ));
+    }
+
+    #[test]
+    fn a_caught_up_cursor_is_live_rather_than_a_resync() {
+        let retained = RetainedRange::new(100, 400).expect("ordered window");
+        let cursor = JournalCursor::new("projector", "work", 401).expect("valid");
+        // Nothing this consumer is waiting for has been discarded; it is ahead
+        // of the last retained position, which is being caught up, not stale.
+        assert_eq!(
+            cursor.resume_within(retained),
+            CursorResume::Live { from: 401 }
+        );
+    }
+
+    #[test]
+    fn a_retained_range_that_retains_nothing_cannot_be_built() {
+        assert_eq!(
+            RetainedRange::new(400, 100).expect_err("inverted"),
+            JournalError::InvertedRetainedRange { from: 400, to: 100 }
+        );
+        // A window holding a single position is legitimate and inclusive.
+        let single = RetainedRange::new(400, 400).expect("ordered");
+        assert_eq!((single.first(), single.last()), (400, 400));
     }
 }
 
