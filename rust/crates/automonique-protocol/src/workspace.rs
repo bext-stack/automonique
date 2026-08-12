@@ -211,6 +211,12 @@ impl WorkspaceRegistration {
         &self.tenant
     }
 
+    /// The canonical registered source coordinate.
+    #[must_use]
+    pub fn canonical_source(&self) -> &str {
+        &self.canonical_source
+    }
+
     /// The immutable base revision.
     #[must_use]
     pub const fn base_revision(&self) -> Revision {

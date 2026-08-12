@@ -38,6 +38,7 @@ use core::marker::PhantomData;
 use std::error::Error;
 
 use crate::primitives::{OpaqueId, ValueError};
+use crate::sandbox::{Digest, DigestAlgorithm, DigestError};
 
 /// Maximum UTF-8 byte length of a provider coordinate.
 pub const MAX_PROVIDER_ID_BYTES: usize = 128;
@@ -226,6 +227,18 @@ pub enum ProviderError {
         /// The differing component.
         component: &'static str,
     },
+    /// A provider binary or protocol digest was malformed.
+    Digest {
+        /// Field that was rejected.
+        field: &'static str,
+        /// Structural digest violation.
+        error: DigestError,
+    },
+    /// A well-formed digest used an algorithm other than SHA-256.
+    DigestAlgorithm {
+        /// Field that was rejected.
+        field: &'static str,
+    },
     /// A bounded provider value was rejected.
     Value {
         /// Field that was rejected.
@@ -248,6 +261,8 @@ impl ProviderError {
             Self::RequiredCapabilityIsDegraded { .. } => "required_capability_is_degraded",
             Self::RequiredCapabilitiesMissing { .. } => "required_capabilities_missing",
             Self::BindingMismatch { .. } => "binding_mismatch",
+            Self::Digest { .. } => "digest_invalid",
+            Self::DigestAlgorithm { .. } => "digest_algorithm_invalid",
             Self::Value { .. } => "value_invalid",
             Self::TooManyCapabilities { .. } => "too_many_capabilities",
         }
@@ -268,6 +283,10 @@ impl fmt::Display for ProviderError {
             ),
             Self::BindingMismatch { component } => {
                 write!(formatter, "session binding differs in {component}")
+            }
+            Self::Digest { field, error } => write!(formatter, "field {field}: {error}"),
+            Self::DigestAlgorithm { field } => {
+                write!(formatter, "field {field}: digest algorithm is not sha256")
             }
             Self::Value { field, error } => write!(formatter, "field {field}: {error}"),
             Self::TooManyCapabilities { max } => {
@@ -295,16 +314,19 @@ impl BinaryProvenance {
     ///
     /// # Errors
     ///
-    /// Returns [`ProviderError::Value`] for an invalid version or digest.
+    /// Returns [`ProviderError::Value`] for an invalid version,
+    /// [`ProviderError::Digest`] for malformed digest syntax, or
+    /// [`ProviderError::DigestAlgorithm`] for any algorithm other than
+    /// SHA-256.
     pub fn new(
         version: &str,
         digest: &str,
         schema_digest: Option<&str>,
     ) -> Result<Self, ProviderError> {
         bounded(version, "binary_version")?;
-        bounded(digest, "binary_digest")?;
+        canonical_sha256(digest, "binary_digest")?;
         if let Some(schema) = schema_digest {
-            bounded(schema, "schema_digest")?;
+            canonical_sha256(schema, "schema_digest")?;
         }
         Ok(Self {
             version: version.to_owned(),
@@ -376,6 +398,30 @@ impl SessionBinding {
             provider_namespace: provider_namespace.to_owned(),
             session,
         })
+    }
+
+    /// Owning tenant.
+    #[must_use]
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
+    /// Execution backend name.
+    #[must_use]
+    pub fn backend(&self) -> &str {
+        &self.backend
+    }
+
+    /// Provider-account coordinate.
+    #[must_use]
+    pub fn provider_account(&self) -> &str {
+        &self.provider_account
+    }
+
+    /// Provider namespace within the account.
+    #[must_use]
+    pub fn provider_namespace(&self) -> &str {
+        &self.provider_namespace
     }
 
     /// The durable session identity.
@@ -592,4 +638,12 @@ fn bounded(value: &str, field: &'static str) -> Result<(), ProviderError> {
         Some(error) => Err(ProviderError::Value { field, error }),
         None => Ok(()),
     }
+}
+
+fn canonical_sha256(value: &str, field: &'static str) -> Result<(), ProviderError> {
+    let digest = Digest::parse(value).map_err(|error| ProviderError::Digest { field, error })?;
+    if digest.algorithm() != DigestAlgorithm::Sha256 {
+        return Err(ProviderError::DigestAlgorithm { field });
+    }
+    Ok(())
 }

@@ -9,13 +9,19 @@ use automonique_protocol::provider::{
     BinaryProvenance, Capability, CapabilityGroup, CapabilityState, MAX_CAPABILITIES,
     ModeDeclaration, ProviderError, ProviderSessionId, SessionBinding, UnknownCapability,
 };
+use automonique_protocol::sandbox::DigestError;
+
+const SHA_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const SHA_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const SHA_C: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const SHA_D: &str = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 fn capability(group: CapabilityGroup, name: &str) -> Capability {
     Capability::new(group, name).expect("valid capability")
 }
 
 fn provenance() -> BinaryProvenance {
-    BinaryProvenance::new("1.2.3", "sha256:aaaa", Some("sha256:bbbb")).expect("valid provenance")
+    BinaryProvenance::new("1.2.3", SHA_A, Some(SHA_B)).expect("valid provenance")
 }
 
 fn session(value: &str) -> ProviderSessionId {
@@ -247,7 +253,13 @@ mod binding_safety {
 
     #[test]
     fn an_identical_binding_is_confirmed() {
-        binding().confirm_same(&binding()).expect("same binding");
+        let binding = binding();
+        assert_eq!(binding.tenant(), "tenant-a");
+        assert_eq!(binding.backend(), "codex");
+        assert_eq!(binding.provider_account(), "account-1");
+        assert_eq!(binding.provider_namespace(), "default");
+        assert_eq!(binding.session().as_str(), "s-1");
+        binding.confirm_same(&binding).expect("same binding");
     }
 
     #[test]
@@ -300,11 +312,8 @@ mod provenance_completeness {
     fn a_capability_record_carries_the_binary_it_was_observed_against() {
         let declaration = declaration();
         assert_eq!(declaration.provenance().version(), "1.2.3");
-        assert_eq!(declaration.provenance().digest(), "sha256:aaaa");
-        assert_eq!(
-            declaration.provenance().schema_digest(),
-            Some("sha256:bbbb")
-        );
+        assert_eq!(declaration.provenance().digest(), SHA_A);
+        assert_eq!(declaration.provenance().schema_digest(), Some(SHA_B));
     }
 
     #[test]
@@ -312,20 +321,81 @@ mod provenance_completeness {
         let recorded = provenance();
         assert!(recorded.matches(&provenance()));
 
-        let upgraded =
-            BinaryProvenance::new("1.2.4", "sha256:cccc", Some("sha256:bbbb")).expect("valid");
+        let upgraded = BinaryProvenance::new("1.2.4", SHA_C, Some(SHA_B)).expect("valid");
         assert!(!recorded.matches(&upgraded));
 
         // A schema change alone is also a difference.
-        let reschemad =
-            BinaryProvenance::new("1.2.3", "sha256:aaaa", Some("sha256:dddd")).expect("valid");
+        let reschemad = BinaryProvenance::new("1.2.3", SHA_A, Some(SHA_D)).expect("valid");
         assert!(!recorded.matches(&reschemad));
     }
 
     #[test]
     fn provenance_requires_a_version_and_a_digest() {
-        assert!(BinaryProvenance::new("", "sha256:aaaa", None).is_err());
+        assert!(BinaryProvenance::new("", SHA_A, None).is_err());
         assert!(BinaryProvenance::new("1.0.0", "", None).is_err());
-        assert!(BinaryProvenance::new("1.0.0", "sha256:aaaa", None).is_ok());
+        assert!(BinaryProvenance::new("1.0.0", SHA_A, None).is_ok());
+    }
+
+    #[test]
+    fn binary_and_schema_digests_are_canonical_lowercase_sha256() {
+        let malformed = [
+            (
+                "sha256:aaaa",
+                ProviderError::Digest {
+                    field: "binary_digest",
+                    error: DigestError::Length {
+                        expected: 64,
+                        actual: 4,
+                    },
+                },
+            ),
+            (
+                "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                ProviderError::Digest {
+                    field: "binary_digest",
+                    error: DigestError::NotLowercaseHex,
+                },
+            ),
+            (
+                "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+                ProviderError::Digest {
+                    field: "binary_digest",
+                    error: DigestError::NotLowercaseHex,
+                },
+            ),
+            (
+                "md5:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ProviderError::Digest {
+                    field: "binary_digest",
+                    error: DigestError::UnknownAlgorithm,
+                },
+            ),
+            (
+                "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ProviderError::DigestAlgorithm {
+                    field: "binary_digest",
+                },
+            ),
+        ];
+        for (candidate, expected) in malformed {
+            assert_eq!(
+                BinaryProvenance::new("1.0.0", candidate, None)
+                    .expect_err("noncanonical binary digest"),
+                expected,
+                "candidate {candidate}"
+            );
+        }
+
+        assert_eq!(
+            BinaryProvenance::new("1.0.0", SHA_A, Some("sha256:bbbb"))
+                .expect_err("noncanonical schema digest"),
+            ProviderError::Digest {
+                field: "schema_digest",
+                error: DigestError::Length {
+                    expected: 64,
+                    actual: 4,
+                },
+            }
+        );
     }
 }

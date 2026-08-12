@@ -112,6 +112,11 @@ mod base_immutability {
         assert_eq!(original.base_revision().get(), 7);
         assert_eq!(original.snapshot(), "snap-1");
         assert_eq!(moved.tenant(), original.tenant());
+        assert_eq!(moved.canonical_source(), original.canonical_source());
+        assert_eq!(
+            original.canonical_source(),
+            "git+ssh://example.invalid/repo"
+        );
         assert_eq!(moved.isolation(), IsolationKind::AttemptCopy);
     }
 }

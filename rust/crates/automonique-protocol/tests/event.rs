@@ -16,8 +16,10 @@ use automonique_protocol::provider::{
     BinaryProvenance, ProviderRequestId, ProviderSessionId, ProviderTurnId,
 };
 
+const SHA_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
 fn provenance() -> BinaryProvenance {
-    BinaryProvenance::new("1.0.0", "sha256:aaaa", None).expect("valid provenance")
+    BinaryProvenance::new("1.0.0", SHA_A, None).expect("valid provenance")
 }
 
 fn coordinates() -> EventCoordinates {
@@ -100,7 +102,7 @@ mod envelope_bounds {
     #[test]
     fn a_raw_record_carries_the_binary_it_came_from() {
         let record = RawProviderRecord::inline(provenance(), "t", "c", Vec::new()).expect("valid");
-        assert_eq!(record.provenance().digest(), "sha256:aaaa");
+        assert_eq!(record.provenance().digest(), SHA_A);
         assert_eq!(record.source_type(), "t");
         assert_eq!(record.source_cursor(), "c");
     }
