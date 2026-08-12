@@ -9,10 +9,12 @@ external effect typed, revision-checked, journaled, and reconcilable.
 
 ## Repository status
 
-Automonique is in early implementation. Product code currently lives mainly in
-`rust/crates/automonique-protocol/` and `rust/crates/automonique-policy/`.
-Large historical planning and development-harness surfaces remain in the tree,
-but they are no longer prerequisites for product development.
+Automonique is in early implementation. Its first runnable control-plane slice
+now includes a foreground daemon, peer-authenticated local administration,
+durable SQLite state, a bounded process runner, and fail-closed sandbox
+admission planning. Provider execution, scheduling, and external transports are
+not connected yet. Large historical planning and development-harness surfaces
+remain in the tree, but they are no longer prerequisites for product development.
 
 ```text
 docs/product-plan/       product goals, requirements, architecture, migration
@@ -57,6 +59,33 @@ cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --locked 
 Choose checks relevant to the changed area. Product CI remains authoritative
 for actual failures; the archived plan's self-consistency is not a product
 gate.
+
+## Run the local daemon
+
+The current executable requires explicit private XDG runtime and state roots;
+it does not fall back to a home directory. On a normal Linux user session these
+variables are often already set. To launch it:
+
+```sh
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:?set a private runtime directory}"
+export XDG_STATE_HOME="${XDG_STATE_HOME:?set a private state directory}"
+cargo run --manifest-path rust/Cargo.toml -p automonique -- daemon --foreground
+```
+
+From another terminal with the same environment:
+
+```sh
+cargo run --manifest-path rust/Cargo.toml -p automonique -- status
+cargo run --manifest-path rust/Cargo.toml -p automonique -- status --json
+cargo run --manifest-path rust/Cargo.toml -p automonique -- shutdown
+```
+
+The daemon creates only `automonique/` children under those roots, refuses
+permissive or foreign-owned paths, and exposes no network listener. This slice
+does not yet accept or schedule work, execute a provider, install OS sandbox
+enforcement, or send external effects. Accordingly `accepting_intake` remains
+`false`; the runner and sandbox crates are foundation APIs, not connected
+production authority.
 
 ## Clean-room and licensing
 

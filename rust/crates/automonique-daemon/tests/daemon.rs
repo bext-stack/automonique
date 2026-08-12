@@ -1,0 +1,318 @@
+// SPDX-License-Identifier: Elastic-2.0
+
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use automonique_daemon::{Daemon, DaemonConfig, DaemonError, run_foreground};
+use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse, DaemonState};
+use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
+use automonique_store::Store;
+use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
+
+fn fixture() -> (tempfile::TempDir, DaemonConfig) {
+    let root = tempfile::tempdir().expect("temporary root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private root");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    std::fs::create_dir(&runtime).expect("runtime root");
+    std::fs::create_dir(&state).expect("state root");
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
+        .expect("private runtime");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))
+        .expect("private state");
+    (
+        root,
+        DaemonConfig {
+            runtime_root: runtime,
+            state_root: state,
+        },
+    )
+}
+
+fn call(config: &DaemonConfig, command: AdminCommand) -> AdminResponse {
+    let mut stream = UnixStream::connect(config.admin_socket()).expect("connect to daemon");
+    let request = AdminRequest::new(
+        RequestId::new("integration-1").expect("request ID"),
+        command,
+    );
+    let payload = request
+        .to_message()
+        .expect("encode request")
+        .to_canonical_bytes();
+    let mut frame = Vec::new();
+    encode_frame(&payload, &mut frame).expect("frame request");
+    stream.write_all(&frame).expect("write request");
+    let mut prefix = [0_u8; 4];
+    stream.read_exact(&mut prefix).expect("response prefix");
+    let length = u32::from_be_bytes(prefix) as usize;
+    let mut response = vec![0_u8; length + 4];
+    response[..4].copy_from_slice(&prefix);
+    stream
+        .read_exact(&mut response[4..])
+        .expect("response body");
+    let FrameDecode::Frame { payload, .. } = decode_frame(&response).expect("response frame")
+    else {
+        panic!("complete response was incomplete")
+    };
+    AdminResponse::from_canonical_bytes(payload).expect("admitted response")
+}
+
+fn wait_for_socket(config: &DaemonConfig) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !config.admin_socket().exists() {
+        assert!(Instant::now() < deadline, "daemon did not bind");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn foreground_daemon_reports_durable_status_and_shuts_down_over_rpc() {
+    let (_root, config) = fixture();
+    let daemon = Daemon::open(&config).expect("daemon opens");
+    let stop = Arc::new(AtomicBool::new(false));
+    let serve_stop = Arc::clone(&stop);
+    let thread = std::thread::spawn(move || daemon.serve(&serve_stop));
+    wait_for_socket(&config);
+
+    let AdminResponse::Status { status, .. } = call(&config, AdminCommand::Status) else {
+        panic!("status response expected")
+    };
+    assert_eq!(status.state(), DaemonState::Ready);
+    assert!(!status.accepting_intake());
+    assert_eq!(status.inbox_pending(), 0);
+    assert_eq!(status.outbox_pending(), 0);
+    assert_eq!(status.running(), 0);
+    assert!(status.generation() >= 1);
+    assert!(status.event_cursor() >= 1);
+
+    assert!(matches!(
+        call(&config, AdminCommand::Shutdown),
+        AdminResponse::ShutdownAccepted { .. }
+    ));
+    thread.join().expect("daemon thread").expect("clean stop");
+    assert!(!config.admin_socket().exists());
+    assert!(config.database_path().is_file());
+}
+
+#[test]
+fn an_active_endpoint_refuses_a_second_daemon() {
+    let (_root, config) = fixture();
+    let first = Daemon::open(&config).expect("first daemon");
+    let before = Store::open(config.database_path())
+        .expect("inspect store")
+        .status_snapshot("foreground")
+        .expect("status before")
+        .event_cursor;
+    assert!(matches!(
+        Daemon::open(&config),
+        Err(DaemonError::AlreadyRunning)
+    ));
+    let after = Store::open(config.database_path())
+        .expect("inspect store")
+        .status_snapshot("foreground")
+        .expect("status after")
+        .event_cursor;
+    assert_eq!(
+        after, before,
+        "refused bind must not mutate generation state"
+    );
+    drop(first);
+}
+
+#[test]
+fn orderly_shutdown_releases_the_fence_for_immediate_restart() {
+    let (_root, config) = fixture();
+    for _ in 0..2 {
+        let daemon = Daemon::open(&config).expect("daemon opens");
+        let stop = Arc::new(AtomicBool::new(false));
+        let serve_stop = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || daemon.serve(&serve_stop));
+        wait_for_socket(&config);
+        assert!(matches!(
+            call(&config, AdminCommand::Shutdown),
+            AdminResponse::ShutdownAccepted { .. }
+        ));
+        thread.join().expect("daemon thread").expect("clean stop");
+    }
+}
+
+#[test]
+fn losing_the_durable_fence_ends_serving_without_false_ready() {
+    let (_root, config) = fixture();
+    let daemon = Daemon::open(&config).expect("daemon opens");
+    let stop = Arc::new(AtomicBool::new(false));
+    let serve_stop = Arc::clone(&stop);
+    let thread = std::thread::spawn(move || daemon.serve(&serve_stop));
+    wait_for_socket(&config);
+    let AdminResponse::Status { status, .. } = call(&config, AdminCommand::Status) else {
+        panic!("status response expected")
+    };
+    let now_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_millis(),
+    )
+    .expect("bounded time");
+    Store::open(config.database_path())
+        .expect("competing store")
+        .release_generation_lease(
+            "foreground",
+            status.instance_id().as_str(),
+            status.generation(),
+            now_ms,
+        )
+        .expect("release durable fence");
+
+    let mut stream = UnixStream::connect(config.admin_socket()).expect("connect after loss");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("timeout");
+    let request = AdminRequest::new(
+        RequestId::new("after-fence-loss").expect("request ID"),
+        AdminCommand::Status,
+    );
+    let mut frame = Vec::new();
+    encode_frame(
+        &request.to_message().expect("request").to_canonical_bytes(),
+        &mut frame,
+    )
+    .expect("frame");
+    stream.write_all(&frame).expect("write");
+    let mut byte = [0_u8; 1];
+    assert!(matches!(stream.read(&mut byte), Ok(0) | Err(_)));
+    let error = thread
+        .join()
+        .expect("daemon thread")
+        .expect_err("lost fence terminates serving");
+    assert_eq!(error.category(), "stale_epoch");
+}
+
+#[test]
+fn drop_never_unlinks_a_replacement_socket_inode() {
+    let (_root, config) = fixture();
+    let daemon = Daemon::open(&config).expect("daemon opens");
+    std::fs::remove_file(config.admin_socket()).expect("unlink original name");
+    let replacement = UnixListener::bind(config.admin_socket()).expect("replacement socket");
+    std::fs::set_permissions(
+        config.admin_socket(),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("replacement mode");
+    drop(daemon);
+    assert!(config.admin_socket().exists());
+    drop(replacement);
+}
+
+#[test]
+fn a_stale_owned_socket_is_replaced_and_serves_status() {
+    let (_root, config) = fixture();
+    std::fs::create_dir(config.runtime_dir()).expect("runtime directory");
+    std::fs::set_permissions(config.runtime_dir(), std::fs::Permissions::from_mode(0o700))
+        .expect("runtime mode");
+    let stale = UnixListener::bind(config.admin_socket()).expect("stale socket");
+    drop(stale);
+    assert!(config.admin_socket().exists());
+
+    let daemon = Daemon::open(&config).expect("replace stale socket");
+    let stop = Arc::new(AtomicBool::new(false));
+    let serve_stop = Arc::clone(&stop);
+    let thread = std::thread::spawn(move || daemon.serve(&serve_stop));
+    assert!(matches!(
+        call(&config, AdminCommand::Shutdown),
+        AdminResponse::ShutdownAccepted { .. }
+    ));
+    thread.join().expect("daemon thread").expect("clean stop");
+}
+
+#[test]
+fn a_symlinked_root_ancestor_is_refused() {
+    let (root, mut config) = fixture();
+    let linked = root.path().join("linked-runtime");
+    std::os::unix::fs::symlink(&config.runtime_root, &linked).expect("runtime symlink");
+    config.runtime_root = linked;
+    let error = Daemon::open(&config).err().expect("symlink refused");
+    assert_eq!(error.category(), "insecure_path");
+}
+
+#[test]
+fn rpc_shutdown_restores_the_calling_threads_signal_mask() {
+    let (_root, config) = fixture();
+    let worker_config = config.clone();
+    let worker = std::thread::spawn(move || {
+        let mut before = SigSet::empty();
+        pthread_sigmask(SigmaskHow::SIG_BLOCK, None, Some(&mut before)).expect("read mask");
+        run_foreground(&worker_config).expect("foreground run");
+        let mut after = SigSet::empty();
+        pthread_sigmask(SigmaskHow::SIG_BLOCK, None, Some(&mut after)).expect("read mask");
+        (
+            before.contains(Signal::SIGINT),
+            before.contains(Signal::SIGTERM),
+            after.contains(Signal::SIGINT),
+            after.contains(Signal::SIGTERM),
+        )
+    });
+    wait_for_socket(&config);
+    assert!(matches!(
+        call(&config, AdminCommand::Shutdown),
+        AdminResponse::ShutdownAccepted { .. }
+    ));
+    let (before_int, before_term, after_int, after_term) = worker.join().expect("worker");
+    assert_eq!((after_int, after_term), (before_int, before_term));
+}
+
+#[test]
+fn insecure_roots_are_refused_without_creating_product_paths() {
+    let (_root, config) = fixture();
+    std::fs::set_permissions(&config.runtime_root, std::fs::Permissions::from_mode(0o755))
+        .expect("make insecure");
+    let error = match Daemon::open(&config) {
+        Ok(_) => panic!("insecure runtime admitted"),
+        Err(error) => error,
+    };
+    assert_eq!(error.category(), "insecure_path");
+    assert!(!config.runtime_dir().exists());
+}
+
+#[test]
+fn store_open_failure_never_publishes_an_admin_socket() {
+    let (_root, config) = fixture();
+    std::fs::create_dir(config.state_dir()).expect("state directory");
+    std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
+        .expect("private state directory");
+    std::fs::create_dir(config.database_path()).expect("invalid database directory");
+    let error = Daemon::open(&config).err().expect("store failure");
+    assert!(matches!(error, DaemonError::Store(_)));
+    assert!(!config.admin_socket().exists());
+}
+
+#[test]
+fn oversized_admin_prefix_is_closed_without_stopping_the_daemon() {
+    let (_root, config) = fixture();
+    let daemon = Daemon::open(&config).expect("daemon opens");
+    let stop = Arc::new(AtomicBool::new(false));
+    let serve_stop = Arc::clone(&stop);
+    let thread = std::thread::spawn(move || daemon.serve(&serve_stop));
+    wait_for_socket(&config);
+
+    let mut hostile = UnixStream::connect(config.admin_socket()).expect("connect hostile peer");
+    hostile
+        .write_all(&(70_000_u32).to_be_bytes())
+        .expect("write prefix");
+    hostile
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("timeout");
+    let mut byte = [0_u8; 1];
+    assert_eq!(hostile.read(&mut byte).expect("connection closes"), 0);
+
+    assert!(matches!(
+        call(&config, AdminCommand::Shutdown),
+        AdminResponse::ShutdownAccepted { .. }
+    ));
+    thread.join().expect("daemon thread").expect("clean stop");
+}

@@ -94,7 +94,11 @@ fn doctor_json_mode_uses_the_versioned_schema() {
 #[test]
 fn unsupported_argv_is_usage_error_without_doctor_output() {
     let runtime = private_runtime();
-    for args in [&[][..], &["status"][..], &["doctor", "--fix"][..]] {
+    for args in [
+        &[][..],
+        &["doctor", "--fix"][..],
+        &["shutdown", "--force"][..],
+    ] {
         let output = run(runtime.path(), args);
         assert_eq!(output.status.code(), Some(2), "argv: {args:?}");
         assert!(output.stdout.is_empty(), "argv: {args:?}");

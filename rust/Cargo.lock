@@ -25,6 +25,8 @@ name = "automonique"
 version = "0.1.0"
 dependencies = [
  "automonique-cli",
+ "automonique-daemon",
+ "serde_json",
  "tempfile",
 ]
 
@@ -35,6 +37,16 @@ dependencies = [
  "automonique-protocol",
  "nix",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "automonique-daemon"
+version = "0.1.0"
+dependencies = [
+ "automonique-protocol",
+ "automonique-store",
+ "nix",
  "tempfile",
 ]
 
@@ -57,6 +69,31 @@ version = "0.1.0"
 [[package]]
 name = "automonique-protocol"
 version = "0.1.0"
+
+[[package]]
+name = "automonique-runner"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "sha2",
+]
+
+[[package]]
+name = "automonique-sandbox"
+version = "0.1.0"
+dependencies = [
+ "automonique-protocol",
+ "sha2",
+]
+
+[[package]]
+name = "automonique-store"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "rusqlite",
+ "tempfile",
+]
 
 [[package]]
 name = "bitflags"

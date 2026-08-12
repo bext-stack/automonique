@@ -71,7 +71,11 @@ fn unavailable_doctor_human_and_json_match_byte_for_byte() {
 #[test]
 fn invalid_invocations_match_byte_for_byte() {
     let runtime = runtime(true);
-    for arguments in [&[][..], &["status"][..], &["doctor", "--fix"][..]] {
+    for arguments in [
+        &[][..],
+        &["doctor", "--fix"][..],
+        &["shutdown", "--force"][..],
+    ] {
         assert_exact_forwarding(runtime.path(), arguments, 2);
     }
 }
