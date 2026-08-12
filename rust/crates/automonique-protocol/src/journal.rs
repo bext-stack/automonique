@@ -43,7 +43,7 @@
 //!
 //! ```
 //! use automonique_protocol::journal::{Journal, Projection, DomainEvent};
-//! # use automonique_protocol::journal::{AggregateId, EventSchemaVersion};
+//! # use automonique_protocol::journal::{AggregateId, DomainEventPayload, EventSchemaVersion};
 //! # use automonique_protocol::primitives::{EpochMillis, Revision};
 //! #[derive(Default)]
 //! struct Counter(usize);
@@ -56,6 +56,7 @@
 //! let event = DomainEvent::new(
 //!     1, aggregate, Revision::FIRST, EventSchemaVersion::new(1).unwrap(),
 //!     EpochMillis::from_millis(0), "created",
+//!     DomainEventPayload::text("work/w-1").unwrap(),
 //! ).unwrap();
 //! journal.append(event).unwrap();
 //!
@@ -154,6 +155,9 @@ use crate::primitives::{EpochMillis, Revision, ValueError};
 /// Maximum UTF-8 byte length of a journal identifier.
 pub const MAX_JOURNAL_FIELD_BYTES: usize = 128;
 
+/// Maximum UTF-8 byte length of one domain-event payload.
+pub const MAX_EVENT_PAYLOAD_BYTES: usize = 4 * 1024;
+
 /// Which aggregate an event belongs to.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AggregateId {
@@ -186,6 +190,66 @@ impl AggregateId {
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
+    }
+}
+
+/// The typed target of an action.
+///
+/// A target is owned and bounded. The ledger never stores an unvalidated raw
+/// string, while the string-taking recording methods remain as ergonomic
+/// adapters for existing callers.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ActionTarget(String);
+
+impl ActionTarget {
+    /// Validate and own an action target.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Field`] for an empty, over-long or control
+    /// character bearing target.
+    pub fn new(value: &str) -> Result<Self, JournalError> {
+        bounded(value, "target")?;
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Stable target spelling.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ActionTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A bounded domain-event payload.
+///
+/// The newtype keeps event data distinct from event kinds and other journal
+/// strings. Payload text is owned, non-empty, single-line and bounded by
+/// [`MAX_EVENT_PAYLOAD_BYTES`].
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct DomainEventPayload(String);
+
+impl DomainEventPayload {
+    /// Validate and own textual event data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Field`] for an empty, over-long or control
+    /// character bearing payload.
+    pub fn text(value: &str) -> Result<Self, JournalError> {
+        bounded_to(value, "event_payload", MAX_EVENT_PAYLOAD_BYTES)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Payload text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -236,6 +300,13 @@ pub enum JournalError {
         /// Revision it offered.
         observed: u64,
     },
+    /// The current aggregate revision has no representable successor.
+    RevisionExhausted {
+        /// Current, last representable revision.
+        current: u64,
+        /// Revision the append offered.
+        observed: u64,
+    },
     /// An event's schema version lies outside the reader's decode range.
     EventSchemaOutOfRange {
         /// Lowest decodable version.
@@ -248,9 +319,9 @@ pub enum JournalError {
     /// One idempotency key was reused for a different target.
     IdempotencyConflict {
         /// The target already recorded under this key.
-        recorded_target: String,
+        recorded_target: ActionTarget,
         /// The target offered.
-        offered_target: String,
+        offered_target: ActionTarget,
     },
     /// One idempotency key was reused for a different payload.
     ///
@@ -293,6 +364,7 @@ impl JournalError {
         match self {
             Self::EventIdNotIncreasing { .. } => "event_id_not_increasing",
             Self::RevisionConflict { .. } => "revision_conflict",
+            Self::RevisionExhausted { .. } => "revision_exhausted",
             Self::EventSchemaOutOfRange { .. } => "event_schema_out_of_range",
             Self::IdempotencyConflict { .. } => "idempotency_conflict",
             Self::IdempotencyPayloadConflict { .. } => "idempotency_payload_conflict",
@@ -313,6 +385,10 @@ impl fmt::Display for JournalError {
             Self::RevisionConflict { expected, observed } => write!(
                 formatter,
                 "expected revision {expected}, observed {observed}"
+            ),
+            Self::RevisionExhausted { current, observed } => write!(
+                formatter,
+                "revision {current} has no successor; observed {observed}"
             ),
             Self::EventSchemaOutOfRange {
                 supported_min,
@@ -363,6 +439,7 @@ pub struct DomainEvent {
     schema_version: EventSchemaVersion,
     at: EpochMillis,
     kind: String,
+    payload: DomainEventPayload,
 }
 
 impl DomainEvent {
@@ -378,6 +455,7 @@ impl DomainEvent {
         schema_version: EventSchemaVersion,
         at: EpochMillis,
         kind: &str,
+        payload: DomainEventPayload,
     ) -> Result<Self, JournalError> {
         bounded(kind, "event_kind")?;
         Ok(Self {
@@ -387,6 +465,7 @@ impl DomainEvent {
             schema_version,
             at,
             kind: kind.to_owned(),
+            payload,
         })
     }
 
@@ -426,6 +505,12 @@ impl DomainEvent {
         &self.kind
     }
 
+    /// The bounded typed event data.
+    #[must_use]
+    pub const fn payload(&self) -> &DomainEventPayload {
+        &self.payload
+    }
+
     /// Whether a reader declaring `range` may decode this event.
     ///
     /// # Errors
@@ -443,6 +528,39 @@ impl DomainEvent {
         }
         Ok(())
     }
+}
+
+/// Validate the revision one append must produce.
+///
+/// `None` denotes an aggregate with no events, whose first append must produce
+/// [`Revision::FIRST`]. A known revision must advance by exactly one. Exhaustion
+/// is refused explicitly rather than panicking or wrapping.
+///
+/// # Errors
+///
+/// Returns [`JournalError::RevisionConflict`] for a representable
+/// non-successor and [`JournalError::RevisionExhausted`] when `current` is the
+/// last representable revision.
+pub fn validate_revision_successor(
+    current: Option<Revision>,
+    observed: Revision,
+) -> Result<(), JournalError> {
+    let expected = match current {
+        None => Revision::FIRST,
+        Some(current) => current
+            .checked_next()
+            .map_err(|_| JournalError::RevisionExhausted {
+                current: current.get(),
+                observed: observed.get(),
+            })?,
+    };
+    if observed != expected {
+        return Err(JournalError::RevisionConflict {
+            expected: expected.get(),
+            observed: observed.get(),
+        });
+    }
+    Ok(())
 }
 
 /// Something rebuilt by reading history.
@@ -525,17 +643,12 @@ impl Journal {
                 offered: event.event_id(),
             });
         }
-        let expected = self
+        let current = self
             .events
             .iter()
             .rfind(|existing| existing.aggregate() == event.aggregate())
-            .map_or(Revision::FIRST.get(), |latest| latest.revision().get() + 1);
-        if event.revision().get() != expected {
-            return Err(JournalError::RevisionConflict {
-                expected,
-                observed: event.revision().get(),
-            });
-        }
+            .map(DomainEvent::revision);
+        validate_revision_successor(current, event.revision())?;
         self.events.push(event);
         Ok(())
     }
@@ -732,7 +845,7 @@ impl fmt::Display for ActionPayload {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionReceipt {
     action_id: String,
-    target: String,
+    target: ActionTarget,
     idempotency_key: String,
     expected_revision: Option<Revision>,
     payload: ActionPayload,
@@ -746,9 +859,18 @@ impl ActionReceipt {
         &self.action_id
     }
 
-    /// The typed target.
+    /// The target's stable spelling.
+    ///
+    /// Retained as the ergonomic string view used by existing callers. Use
+    /// [`ActionReceipt::typed_target`] when the target must remain typed.
     #[must_use]
     pub fn target(&self) -> &str {
+        self.target.as_str()
+    }
+
+    /// The typed action target.
+    #[must_use]
+    pub const fn typed_target(&self) -> &ActionTarget {
         &self.target
     }
 
@@ -852,7 +974,30 @@ impl ActionLedger {
         expected_revision: Option<Revision>,
         outcome: ActionOutcome,
     ) -> Result<ActionReceipt, JournalError> {
-        self.record_with_payload(
+        self.record_target(
+            action_id,
+            ActionTarget::new(target)?,
+            idempotency_key,
+            expected_revision,
+            outcome,
+        )
+    }
+
+    /// Record a payload-free mutation against an already validated target.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed idempotency and field errors as
+    /// [`ActionLedger::record`].
+    pub fn record_target(
+        &mut self,
+        action_id: &str,
+        target: ActionTarget,
+        idempotency_key: &str,
+        expected_revision: Option<Revision>,
+        outcome: ActionOutcome,
+    ) -> Result<ActionReceipt, JournalError> {
+        self.record_target_with_payload(
             action_id,
             target,
             idempotency_key,
@@ -884,8 +1029,37 @@ impl ActionLedger {
         payload: ActionPayload,
         outcome: ActionOutcome,
     ) -> Result<ActionReceipt, JournalError> {
+        self.record_target_with_payload(
+            action_id,
+            ActionTarget::new(target)?,
+            idempotency_key,
+            expected_revision,
+            payload,
+            outcome,
+        )
+    }
+
+    /// Record a mutation against an already validated target.
+    ///
+    /// This is the typed core of the ledger. The string-taking methods are
+    /// validation adapters and store exactly the same [`ActionTarget`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::IdempotencyConflict`] when a key is reused for a
+    /// different target, [`JournalError::IdempotencyPayloadConflict`] when it is
+    /// reused for a different payload, and [`JournalError::Field`] for an
+    /// invalid action identity or idempotency key.
+    pub fn record_target_with_payload(
+        &mut self,
+        action_id: &str,
+        target: ActionTarget,
+        idempotency_key: &str,
+        expected_revision: Option<Revision>,
+        payload: ActionPayload,
+        outcome: ActionOutcome,
+    ) -> Result<ActionReceipt, JournalError> {
         bounded(action_id, "action_id")?;
-        bounded(target, "target")?;
         bounded(idempotency_key, "idempotency_key")?;
 
         if let Some(existing) = self
@@ -896,7 +1070,7 @@ impl ActionLedger {
             if existing.target != target {
                 return Err(JournalError::IdempotencyConflict {
                     recorded_target: existing.target.clone(),
-                    offered_target: target.to_owned(),
+                    offered_target: target,
                 });
             }
             if existing.payload != payload {
@@ -910,7 +1084,7 @@ impl ActionLedger {
 
         let receipt = ActionReceipt {
             action_id: action_id.to_owned(),
-            target: target.to_owned(),
+            target,
             idempotency_key: idempotency_key.to_owned(),
             expected_revision,
             payload,
@@ -1161,11 +1335,15 @@ impl JournalCursor {
 }
 
 fn bounded(value: &str, field: &'static str) -> Result<(), JournalError> {
+    bounded_to(value, field, MAX_JOURNAL_FIELD_BYTES)
+}
+
+fn bounded_to(value: &str, field: &'static str, max_bytes: usize) -> Result<(), JournalError> {
     let error = if value.is_empty() {
         Some(ValueError::Empty)
-    } else if value.len() > MAX_JOURNAL_FIELD_BYTES {
+    } else if value.len() > max_bytes {
         Some(ValueError::TooLong {
-            max_bytes: MAX_JOURNAL_FIELD_BYTES,
+            max_bytes,
             actual_bytes: value.len(),
         })
     } else if value.chars().any(char::is_control) {

@@ -3,7 +3,7 @@
   "schema": "automonique.dev-program/v1",
   "source": {
     "graph": "plan/work-graph.toml",
-    "graph_sha256": "78ef1c0d5333d9af383b4a07e602a1efd51d5c15c3420f23982a28fa07b50bfd",
+    "graph_sha256": "1f974e38ddd40e35e90a8ae8c235a0db76688257c3e6d508391f569a92688e99",
     "item_count": 375
   },
   "items": [
@@ -1333,9 +1333,9 @@
         "xtask/"
       ],
       "closes_gate": null,
-      "status": "blocked",
+      "status": "done",
       "contract": "plan/contracts/R1-12.md",
-      "runnable": true
+      "runnable": false
     },
     {
       "id": "R1-13",

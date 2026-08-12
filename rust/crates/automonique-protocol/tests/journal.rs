@@ -7,8 +7,9 @@
 
 use automonique_protocol::codec::{MajorVersion, VersionRange};
 use automonique_protocol::journal::{
-    ActionLedger, ActionOutcome, ActionPayload, AggregateId, CursorResume, DomainEvent,
-    EventSchemaVersion, Journal, JournalCursor, JournalError, Projection, RetainedRange,
+    ActionLedger, ActionOutcome, ActionPayload, ActionTarget, AggregateId, CursorResume,
+    DomainEvent, DomainEventPayload, EventSchemaVersion, Journal, JournalCursor, JournalError,
+    MAX_EVENT_PAYLOAD_BYTES, Projection, RetainedRange, validate_revision_successor,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 
@@ -26,8 +27,10 @@ fn event(event_id: u64, aggregate_id: &str, revision: u64, schema_version: u32) 
         aggregate(aggregate_id),
         Revision::new(revision).expect("non-zero revision"),
         schema(schema_version),
-        EpochMillis::from_millis(i64::try_from(event_id).expect("small id")),
+        EpochMillis::from_millis(i64::try_from(event_id).unwrap_or(i64::MAX)),
         "changed",
+        DomainEventPayload::text(&format!("aggregate={aggregate_id}"))
+            .expect("bounded event payload"),
     )
     .expect("valid event")
 }
@@ -42,6 +45,8 @@ fn range(min: u32, max: u32) -> VersionRange {
 
 mod global_ordering {
     use super::*;
+
+    const ORDERING_MATRIX_CASES: usize = 36;
 
     #[test]
     fn event_identifiers_strictly_increase_across_the_journal() {
@@ -69,6 +74,36 @@ mod global_ordering {
         journal.append(event(5, "w-1", 1, 1)).expect("first");
         assert!(journal.append(event(5, "w-2", 1, 1)).is_err());
         assert_eq!(journal.events().len(), 1);
+    }
+
+    #[test]
+    fn deterministic_ordering_matrix_covers_36_global_pairs() {
+        let identifiers = [0, 1, 2, 17, u64::MAX - 1, u64::MAX];
+        let mut measured = 0;
+
+        for last in identifiers {
+            for offered in identifiers {
+                measured += 1;
+                let mut journal = Journal::new();
+                journal
+                    .append(event(last, "recorded", 1, 1))
+                    .expect("first identifier establishes the order");
+                let result = journal.append(event(offered, "offered", 1, 1));
+
+                if offered > last {
+                    result.expect("strictly increasing pair");
+                    assert_eq!(journal.events().len(), 2);
+                } else {
+                    assert_eq!(
+                        result.expect_err("duplicate or out-of-order pair"),
+                        JournalError::EventIdNotIncreasing { last, offered }
+                    );
+                    assert_eq!(journal.events().len(), 1, "a refusal cannot append");
+                }
+            }
+        }
+
+        assert_eq!(measured, ORDERING_MATRIX_CASES);
     }
 }
 
@@ -143,6 +178,27 @@ mod revision_algebra {
         );
         assert!(journal.revision_of(&aggregate("absent")).is_none());
     }
+
+    #[test]
+    fn revision_exhaustion_is_typed_and_never_wraps() {
+        let exhausted = Revision::new(u64::MAX).expect("non-zero maximum");
+        assert_eq!(
+            validate_revision_successor(Some(exhausted), Revision::FIRST)
+                .expect_err("the maximum revision has no successor"),
+            JournalError::RevisionExhausted {
+                current: u64::MAX,
+                observed: Revision::FIRST.get(),
+            }
+        );
+        assert_eq!(
+            JournalError::RevisionExhausted {
+                current: u64::MAX,
+                observed: 1,
+            }
+            .category(),
+            "revision_exhausted"
+        );
+    }
 }
 
 mod schema_independence {
@@ -184,6 +240,37 @@ mod schema_independence {
     fn a_zero_event_schema_version_is_refused() {
         assert_eq!(
             EventSchemaVersion::new(0).expect_err("zero").category(),
+            "field_invalid"
+        );
+    }
+
+    #[test]
+    fn a_domain_event_carries_an_owned_bounded_typed_payload() {
+        let at_limit = "x".repeat(MAX_EVENT_PAYLOAD_BYTES);
+        let payload = DomainEventPayload::text(&at_limit).expect("inclusive payload bound");
+        let event = DomainEvent::new(
+            1,
+            aggregate("w-1"),
+            Revision::FIRST,
+            schema(1),
+            EpochMillis::from_millis(0),
+            "changed",
+            payload,
+        )
+        .expect("event with typed payload");
+        assert_eq!(event.payload().as_str(), at_limit);
+
+        assert_eq!(
+            DomainEventPayload::text("")
+                .expect_err("empty payload")
+                .category(),
+            "field_invalid"
+        );
+        let too_long = "x".repeat(MAX_EVENT_PAYLOAD_BYTES + 1);
+        assert_eq!(
+            DomainEventPayload::text(&too_long)
+                .expect_err("payload above bound")
+                .category(),
             "field_invalid"
         );
     }
@@ -292,8 +379,14 @@ mod outcome_vocabulary {
 mod idempotency_exactness {
     use super::*;
 
+    const IDEMPOTENCY_MATRIX_CASES: usize = 81;
+
     fn payload(digest: &str) -> ActionPayload {
         ActionPayload::digest(digest).expect("valid digest")
+    }
+
+    fn matrix_payload(digest: Option<&str>) -> ActionPayload {
+        digest.map_or_else(ActionPayload::absent, payload)
     }
 
     #[test]
@@ -329,14 +422,40 @@ mod idempotency_exactness {
                 .record("a-1", "work/w-2", "key-1", None, ActionOutcome::Accepted)
                 .expect_err("retargeted"),
             JournalError::IdempotencyConflict {
-                recorded_target: "work/w-1".to_owned(),
-                offered_target: "work/w-2".to_owned(),
+                recorded_target: ActionTarget::new("work/w-1").expect("valid target"),
+                offered_target: ActionTarget::new("work/w-2").expect("valid target"),
             }
         );
         // The original stands.
         assert_eq!(
             ledger.find("key-1").expect("still recorded").target(),
             "work/w-1"
+        );
+    }
+
+    #[test]
+    fn the_ledger_stores_a_typed_target_while_string_calls_remain_ergonomic() {
+        let mut ledger = ActionLedger::new();
+        let target = ActionTarget::new("work/w-1").expect("valid target");
+        let receipt = ledger
+            .record_target(
+                "a-1",
+                target.clone(),
+                "key-1",
+                None,
+                ActionOutcome::Accepted,
+            )
+            .expect("typed record");
+        assert_eq!(receipt.typed_target(), &target);
+        assert_eq!(receipt.target(), target.as_str());
+
+        let replay = ledger
+            .record("a-2", "work/w-1", "key-1", None, ActionOutcome::Completed)
+            .expect("string adapter reaches the same typed target");
+        assert_eq!(replay, receipt);
+        assert_eq!(
+            ActionTarget::new("").expect_err("empty target").category(),
+            "field_invalid"
         );
     }
 
@@ -456,6 +575,72 @@ mod idempotency_exactness {
         );
         assert_eq!(ActionPayload::absent().as_digest(), None);
         assert_ne!(ActionPayload::absent(), payload("sha256:aaa"));
+    }
+
+    #[test]
+    fn deterministic_idempotency_matrix_covers_81_target_payload_pairs() {
+        let targets = ["work/a", "run/a", "work/b"];
+        let payloads = [None, Some("sha256:aaa"), Some("sha256:bbb")];
+        let mut measured = 0;
+
+        for recorded_target in targets {
+            for offered_target in targets {
+                for recorded_payload in payloads {
+                    for offered_payload in payloads {
+                        measured += 1;
+                        let mut ledger = ActionLedger::new();
+                        let first = ledger
+                            .record_with_payload(
+                                "a-recorded",
+                                recorded_target,
+                                "matrix-key",
+                                Some(Revision::FIRST),
+                                matrix_payload(recorded_payload),
+                                ActionOutcome::Accepted,
+                            )
+                            .expect("matrix seed");
+                        let replay = ledger.record_with_payload(
+                            "a-offered",
+                            offered_target,
+                            "matrix-key",
+                            None,
+                            matrix_payload(offered_payload),
+                            ActionOutcome::Completed,
+                        );
+
+                        if offered_target != recorded_target {
+                            assert_eq!(
+                                replay.expect_err("changed target"),
+                                JournalError::IdempotencyConflict {
+                                    recorded_target: ActionTarget::new(recorded_target)
+                                        .expect("valid matrix target"),
+                                    offered_target: ActionTarget::new(offered_target)
+                                        .expect("valid matrix target"),
+                                }
+                            );
+                        } else if offered_payload != recorded_payload {
+                            assert_eq!(
+                                replay.expect_err("changed payload"),
+                                JournalError::IdempotencyPayloadConflict {
+                                    recorded_payload: matrix_payload(recorded_payload),
+                                    offered_payload: matrix_payload(offered_payload),
+                                }
+                            );
+                        } else {
+                            assert_eq!(replay.expect("identical request"), first);
+                        }
+
+                        assert_eq!(
+                            ledger.find("matrix-key").expect("seed remains"),
+                            &first,
+                            "no matrix replay may overwrite its seed"
+                        );
+                    }
+                }
+            }
+        }
+
+        assert_eq!(measured, IDEMPOTENCY_MATRIX_CASES);
     }
 }
 
