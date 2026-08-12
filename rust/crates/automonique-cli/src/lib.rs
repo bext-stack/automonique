@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Closed, read-only product command dispatch.
+//! Closed product command dispatch and bounded local synthetic intake.
 
 use automonique_protocol::{
     CheckStatus, DoctorCheck, DoctorReason, DoctorReportError, DoctorReportV1, FindingCode,
     FindingMessage,
 };
 use std::ffi::{OsStr, OsString};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 mod admin_client;
@@ -34,12 +34,20 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
-const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique shutdown\n";
+const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique shutdown\n";
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Command {
-    Doctor { json: bool },
-    Status { json: bool },
+    Doctor {
+        json: bool,
+    },
+    Status {
+        json: bool,
+    },
+    Submit {
+        scope: OsString,
+        idempotency_key: OsString,
+    },
     Shutdown,
 }
 
@@ -51,20 +59,43 @@ where
     W: Write,
     E: Write,
 {
+    run_with_input(arguments, std::io::stdin().lock(), &mut stdout, &mut stderr)
+}
+
+/// Execute one closed product command with an explicit input stream.
+///
+/// Only `submit` consumes input. Keeping the task out of argv prevents it from
+/// appearing in process listings and makes the protocol size limit enforceable
+/// before any request is sent.
+pub fn run_with_input<I, S, R, W, E>(arguments: I, mut input: R, mut stdout: W, mut stderr: E) -> u8
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+    R: Read,
+    W: Write,
+    E: Write,
+{
     let mut arguments = arguments.into_iter().map(Into::into);
     let command = arguments.next();
-    let flag = arguments.next();
+    let first = arguments.next();
+    let second = arguments.next();
     let extra = arguments.next();
-    let command = match (command.as_deref(), flag.as_deref(), extra) {
-        (Some(command), None, None) if command == "doctor" => Command::Doctor { json: false },
-        (Some(command), Some(flag), None) if command == "doctor" && flag == "--json" => {
+    let command = match (command.as_deref(), first, second, extra) {
+        (Some(command), None, None, None) if command == "doctor" => Command::Doctor { json: false },
+        (Some(command), Some(flag), None, None) if command == "doctor" && flag == "--json" => {
             Command::Doctor { json: true }
         }
-        (Some(command), None, None) if command == "status" => Command::Status { json: false },
-        (Some(command), Some(flag), None) if command == "status" && flag == "--json" => {
+        (Some(command), None, None, None) if command == "status" => Command::Status { json: false },
+        (Some(command), Some(flag), None, None) if command == "status" && flag == "--json" => {
             Command::Status { json: true }
         }
-        (Some(command), None, None) if command == "shutdown" => Command::Shutdown,
+        (Some(command), Some(scope), Some(idempotency_key), None) if command == "submit" => {
+            Command::Submit {
+                scope,
+                idempotency_key,
+            }
+        }
+        (Some(command), None, None, None) if command == "shutdown" => Command::Shutdown,
         _ => {
             let _ = stderr.write_all(USAGE.as_bytes());
             return 2;
@@ -72,14 +103,27 @@ where
     };
 
     let runtime = std::env::var_os("XDG_RUNTIME_DIR");
-    if let Command::Status { json } = command {
-        return admin_status(runtime.as_deref(), json, &mut stdout, &mut stderr);
-    }
-    if matches!(command, Command::Shutdown) {
-        return admin_shutdown(runtime.as_deref(), &mut stdout, &mut stderr);
-    }
-    let Command::Doctor { json } = command else {
-        unreachable!("status and shutdown returned above")
+    let json = match command {
+        Command::Status { json } => {
+            return admin_status(runtime.as_deref(), json, &mut stdout, &mut stderr);
+        }
+        Command::Submit {
+            scope,
+            idempotency_key,
+        } => {
+            return admin_submit(
+                runtime.as_deref(),
+                scope,
+                idempotency_key,
+                &mut input,
+                &mut stdout,
+                &mut stderr,
+            );
+        }
+        Command::Shutdown => {
+            return admin_shutdown(runtime.as_deref(), &mut stdout, &mut stderr);
+        }
+        Command::Doctor { json } => json,
     };
     let report = match inspect_doctor(runtime.as_deref()) {
         Ok(report) => report,
@@ -100,6 +144,74 @@ where
         0
     } else {
         1
+    }
+}
+
+fn admin_submit<R: Read, W: Write, E: Write>(
+    runtime: Option<&OsStr>,
+    scope: OsString,
+    idempotency_key: OsString,
+    input: &mut R,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> u8 {
+    let Ok(scope) = scope.into_string() else {
+        let _ = stderr.write_all(b"automonique submit refused: invalid_scope\n");
+        return 2;
+    };
+    let Ok(idempotency_key) = idempotency_key.into_string() else {
+        let _ = stderr.write_all(b"automonique submit refused: invalid_idempotency_key\n");
+        return 2;
+    };
+    let mut task = Vec::new();
+    let limit = u64::try_from(automonique_protocol::admin::MAX_SYNTHETIC_TASK_BYTES)
+        .expect("protocol task bound fits u64")
+        + 1;
+    if input.take(limit).read_to_end(&mut task).is_err() {
+        let _ = stderr.write_all(b"automonique submit refused: stdin_io\n");
+        return 1;
+    }
+    if task.len() > automonique_protocol::admin::MAX_SYNTHETIC_TASK_BYTES {
+        let _ = stderr.write_all(b"automonique submit refused: task_too_large\n");
+        return 2;
+    }
+    let Ok(task) = String::from_utf8(task) else {
+        let _ = stderr.write_all(b"automonique submit refused: task_not_utf8\n");
+        return 2;
+    };
+    let submission =
+        match automonique_protocol::admin::SyntheticSubmission::new(scope, idempotency_key, task) {
+            Ok(submission) => submission,
+            Err(error) => {
+                let _ = writeln!(stderr, "automonique submit refused: {}", error.category());
+                return 2;
+            }
+        };
+    match admin_client::request(runtime, admin_client::Operation::Submit(submission)) {
+        Ok(automonique_protocol::admin::AdminResponse::SyntheticAccepted {
+            inbox_id,
+            duplicate,
+            ..
+        }) => {
+            if writeln!(
+                stdout,
+                "Automonique synthetic task accepted: inbox_id={inbox_id} duplicate={duplicate}"
+            )
+            .is_ok()
+            {
+                0
+            } else {
+                1
+            }
+        }
+        Ok(_) => {
+            let _ = stderr.write_all(b"automonique submit refused: response_mismatch\n");
+            1
+        }
+        Err(error) => {
+            let _ = writeln!(stderr, "automonique submit refused: {}", error.category());
+            1
+        }
     }
 }
 

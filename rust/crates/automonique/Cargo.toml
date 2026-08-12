@@ -12,6 +12,7 @@ automonique-cli = { path = "../automonique-cli" }
 automonique-daemon = { path = "../automonique-daemon" }
 
 [dev-dependencies]
+automonique-store = { path = "../automonique-store" }
 serde_json.workspace = true
 tempfile.workspace = true
 

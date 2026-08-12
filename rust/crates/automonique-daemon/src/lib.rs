@@ -19,13 +19,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use automonique_protocol::admin::{
     AdminInstanceId, AdminRequest, AdminResponse, DaemonState, DaemonStatus,
+    MAX_ADMIN_CANONICAL_BYTES,
 };
 use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, decode_frame, encode_frame};
-use automonique_store::{LeaseRenewal, LeaseRequest, Store, StoreError};
+use automonique_store::{InboxSubmission, LeaseRenewal, LeaseRequest, Store, StoreError};
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::sys::socket::{getsockopt, sockopt};
 use nix::unistd::geteuid;
+
+mod synthetic;
 
 /// Socket filename inside the private product runtime directory.
 pub const ADMIN_SOCKET_NAME: &str = concat!("admin", ".sock");
@@ -34,7 +37,7 @@ pub const ADMIN_SOCKET_NAME: &str = concat!("admin", ".sock");
 pub const DATABASE_NAME: &str = concat!("automonique", ".sqlite3");
 
 /// Maximum administration payload accepted by the daemon.
-pub const MAX_ADMIN_PAYLOAD_BYTES: usize = 64 * 1024;
+pub const MAX_ADMIN_PAYLOAD_BYTES: usize = MAX_ADMIN_CANONICAL_BYTES;
 
 const GENERATION_ID: &str = "foreground";
 const LEASE_TTL_MS: i64 = 30_000;
@@ -113,6 +116,8 @@ pub enum DaemonError {
     Io(std::io::Error),
     /// Durable state operation failed.
     Store(StoreError),
+    /// A previously claimed synthetic run has no durable terminal outcome.
+    ReconciliationRequired,
     /// Host signal setup failed.
     Signal(nix::Error),
 }
@@ -129,6 +134,7 @@ impl DaemonError {
             Self::ProtocolRefused(_) => "protocol_refused",
             Self::Io(_) => "io",
             Self::Store(error) => error.category(),
+            Self::ReconciliationRequired => "reconciliation_required",
             Self::Signal(_) => "signal",
         }
     }
@@ -151,6 +157,9 @@ impl fmt::Display for DaemonError {
             }
             Self::Io(error) => write!(formatter, "daemon I/O failed: {error}"),
             Self::Store(error) => write!(formatter, "daemon store failed: {error}"),
+            Self::ReconciliationRequired => {
+                formatter.write_str("synthetic scheduler requires reconciliation")
+            }
             Self::Signal(error) => write!(formatter, "daemon signal setup failed: {error}"),
         }
     }
@@ -188,6 +197,7 @@ pub struct Daemon {
     lease_epoch: u64,
     lease_expires_ms: i64,
     socket_identity: (u64, u64),
+    controller: automonique_core::Controller,
 }
 
 struct SocketCleanup {
@@ -270,6 +280,7 @@ impl Daemon {
             lease_epoch: lease.epoch,
             lease_expires_ms: lease.expires_ms,
             socket_identity,
+            controller: automonique_core::Controller::new(),
         })
     }
 
@@ -298,17 +309,22 @@ impl Daemon {
                 }
                 next_renewal = std::time::Instant::now() + LEASE_RENEW_INTERVAL;
             }
+            if let Err(error) = self.tick_synthetic() {
+                break Err(error);
+            }
             match self.listener.accept() {
                 Ok((mut stream, _)) => {
-                    // A cached epoch never authorizes a response. If durable
-                    // ownership moved, serving ends instead of reporting ready.
-                    if let Err(error) = self.renew_lease() {
-                        break Err(error);
-                    }
-                    next_renewal = std::time::Instant::now() + LEASE_RENEW_INTERVAL;
+                    // The timed renewal and each store mutation validate the
+                    // durable epoch. Read-only status additionally compares a
+                    // consistent lease snapshot, so client polling must not
+                    // turn into an fsync/lease-write storm.
                     match self.handle_stream(&mut stream, stop) {
                         Ok(()) => {}
-                        Err(error @ DaemonError::Store(_)) => break Err(error),
+                        Err(DaemonError::Store(store_error)) => {
+                            if fatal_store_error(&store_error) {
+                                break Err(DaemonError::Store(store_error));
+                            }
+                        }
                         Err(_) => {
                             // A hostile or incomplete peer is isolated to this
                             // connection. Refusal details never contain bytes.
@@ -353,6 +369,32 @@ impl Daemon {
         Ok(())
     }
 
+    fn tick_synthetic(&mut self) -> Result<(), DaemonError> {
+        use automonique_core::{SchedulerFence, TickOutcome};
+
+        let now_ms = unix_millis()?;
+        let fence = SchedulerFence::new(GENERATION_ID, self.instance_id.as_str(), self.lease_epoch)
+            .map_err(|_| DaemonError::ProtocolRefused("scheduler_fence"))?;
+        let mut durable = synthetic::StoreScheduler::new(
+            &mut self.store,
+            now_ms,
+            LEASE_TTL_MS,
+            &mut self.lease_expires_ms,
+        );
+        match self
+            .controller
+            .tick(&mut durable, &fence)
+            .map_err(|_| DaemonError::ProtocolRefused("scheduler_invariant"))?
+        {
+            TickOutcome::FenceRejected { .. } => Err(DaemonError::Store(StoreError::StaleEpoch)),
+            TickOutcome::Idle
+            | TickOutcome::Completed(_)
+            | TickOutcome::Replayed(_)
+            | TickOutcome::RetryRequired { .. } => Ok(()),
+            TickOutcome::ReconciliationRequired(_) => Err(DaemonError::ReconciliationRequired),
+        }
+    }
+
     fn handle_stream(
         &mut self,
         stream: &mut UnixStream,
@@ -383,12 +425,30 @@ impl Daemon {
                     snapshot.inbox_pending,
                     snapshot.outbox_pending,
                     snapshot.runs_running,
-                    false,
+                    true,
                 )
                 .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
                 AdminResponse::Status {
                     request_id: request.request_id().clone(),
                     status,
+                }
+            }
+            automonique_protocol::admin::AdminCommand::SubmitSynthetic => {
+                let submission = request
+                    .submission()
+                    .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
+                let receipt = self.store.submit_inbox(InboxSubmission {
+                    transport: "local.synthetic",
+                    transport_key: submission.idempotency_key(),
+                    scope: submission.scope(),
+                    payload: submission.task().as_bytes(),
+                    received_ms: unix_millis()?,
+                })?;
+                AdminResponse::SyntheticAccepted {
+                    request_id: request.request_id().clone(),
+                    inbox_id: u64::try_from(receipt.inbox_id)
+                        .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
+                    duplicate: receipt.duplicate,
                 }
             }
             automonique_protocol::admin::AdminCommand::Shutdown => {
@@ -597,4 +657,16 @@ fn unix_millis() -> Result<i64, DaemonError> {
         .map_err(|_| DaemonError::ProtocolRefused("clock_before_epoch"))?;
     i64::try_from(duration.as_millis())
         .map_err(|_| DaemonError::ProtocolRefused("clock_out_of_range"))
+}
+
+fn fatal_store_error(error: &StoreError) -> bool {
+    !matches!(
+        error,
+        StoreError::InvalidField(_)
+            | StoreError::IdempotencyConflict(_)
+            | StoreError::ScopeLocked
+            | StoreError::AlreadyTerminal
+            | StoreError::OutboxConflict
+            | StoreError::NotFound(_)
+    )
 }

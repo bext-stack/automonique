@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use automonique_daemon::{Daemon, DaemonConfig, DaemonError, run_foreground};
 use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse, DaemonState};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
-use automonique_store::Store;
+use automonique_store::{InboxSubmission, LeaseRequest, SchedulerClaim, Store};
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
 
 fn fixture() -> (tempfile::TempDir, DaemonConfig) {
@@ -83,7 +83,7 @@ fn foreground_daemon_reports_durable_status_and_shuts_down_over_rpc() {
         panic!("status response expected")
     };
     assert_eq!(status.state(), DaemonState::Ready);
-    assert!(!status.accepting_intake());
+    assert!(status.accepting_intake());
     assert_eq!(status.inbox_pending(), 0);
     assert_eq!(status.outbox_pending(), 0);
     assert_eq!(status.running(), 0);
@@ -97,6 +97,41 @@ fn foreground_daemon_reports_durable_status_and_shuts_down_over_rpc() {
     thread.join().expect("daemon thread").expect("clean stop");
     assert!(!config.admin_socket().exists());
     assert!(config.database_path().is_file());
+}
+
+#[test]
+fn status_polling_does_not_rewrite_the_durable_lease() {
+    let (_root, config) = fixture();
+    let daemon = Daemon::open(&config).expect("daemon opens");
+    let stop = Arc::new(AtomicBool::new(false));
+    let serve_stop = Arc::clone(&stop);
+    let thread = std::thread::spawn(move || daemon.serve(&serve_stop));
+    wait_for_socket(&config);
+    let before = Store::open(config.database_path())
+        .expect("inspect before")
+        .status_snapshot("foreground")
+        .expect("snapshot before")
+        .generation
+        .expect("generation before");
+    for _ in 0..40 {
+        assert!(matches!(
+            call(&config, AdminCommand::Status),
+            AdminResponse::Status { .. }
+        ));
+    }
+    let after = Store::open(config.database_path())
+        .expect("inspect after")
+        .status_snapshot("foreground")
+        .expect("snapshot after")
+        .generation
+        .expect("generation after");
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.lease_expires_ms, before.lease_expires_ms);
+    assert!(matches!(
+        call(&config, AdminCommand::Shutdown),
+        AdminResponse::ShutdownAccepted { .. }
+    ));
+    thread.join().expect("daemon thread").expect("clean stop");
 }
 
 #[test]
@@ -191,6 +226,51 @@ fn losing_the_durable_fence_ends_serving_without_false_ready() {
         .expect("daemon thread")
         .expect_err("lost fence terminates serving");
     assert_eq!(error.category(), "stale_epoch");
+}
+
+#[test]
+fn an_ambiguous_claim_stops_the_daemon_before_it_can_report_ready() {
+    let (_root, config) = fixture();
+    std::fs::create_dir(config.state_dir()).expect("state directory");
+    std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
+        .expect("state mode");
+    let mut store = Store::open(config.database_path()).expect("seed store");
+    let lease = store
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "foreground",
+            holder_id: "crashed-daemon",
+            now_ms: 1,
+            ttl_ms: 1,
+        })
+        .expect("old lease");
+    store
+        .submit_inbox(InboxSubmission {
+            transport: "local.synthetic",
+            transport_key: "ambiguous:1",
+            scope: "workspace:ambiguous",
+            payload: b"synthetic task",
+            received_ms: 1,
+        })
+        .expect("durable input");
+    store
+        .claim_next(SchedulerClaim {
+            transport: "local.synthetic",
+            generation_id: "foreground",
+            holder_id: "crashed-daemon",
+            lease_epoch: lease.epoch,
+            now_ms: 1,
+        })
+        .expect("claim")
+        .expect("claimed run");
+    drop(store);
+
+    let daemon = Daemon::open(&config).expect("new generation opens");
+    let stop = AtomicBool::new(false);
+    let error = daemon
+        .serve(&stop)
+        .expect_err("ambiguous prior execution must stop serving");
+    assert_eq!(error.category(), "reconciliation_required");
+    assert!(!config.admin_socket().exists());
 }
 
 #[test]

@@ -26,6 +26,7 @@ version = "0.1.0"
 dependencies = [
  "automonique-cli",
  "automonique-daemon",
+ "automonique-store",
  "serde_json",
  "tempfile",
 ]
@@ -41,12 +42,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "automonique-core"
+version = "0.1.0"
+
+[[package]]
 name = "automonique-daemon"
 version = "0.1.0"
 dependencies = [
+ "automonique-core",
  "automonique-protocol",
  "automonique-store",
  "nix",
+ "rusqlite",
  "tempfile",
 ]
 

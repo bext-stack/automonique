@@ -6,7 +6,8 @@
 //! server authenticates the Unix peer before it decodes a frame; putting a
 //! bearer secret in the payload would make that boundary weaker and easier to
 //! leak. Version one exposes only a read-only status query and an orderly
-//! shutdown request.
+//! shutdown request, plus a local no-effect synthetic intake used to exercise
+//! the durable control plane without granting provider or transport authority.
 
 use std::error::Error;
 use std::fmt;
@@ -20,8 +21,23 @@ use crate::wire::{JsonValue, Message};
 /// Stable protocol name for local daemon administration.
 pub const ADMIN_PROTOCOL: &str = "automonique.admin";
 
+/// Maximum canonical message bytes accepted by the local admin transport.
+pub const MAX_ADMIN_CANONICAL_BYTES: usize = 64 * 1024;
+
 /// Maximum UTF-8 byte length of a daemon instance identifier.
 pub const MAX_INSTANCE_ID_BYTES: usize = 128;
+
+/// Maximum UTF-8 byte length of a local synthetic-work scope.
+pub const MAX_SYNTHETIC_SCOPE_BYTES: usize = 256;
+
+/// Maximum UTF-8 byte length of its caller-supplied idempotency key.
+///
+/// The scheduler derives bounded receipt keys from this coordinate, so this
+/// limit intentionally leaves room for their fixed namespace prefixes.
+pub const MAX_SYNTHETIC_KEY_BYTES: usize = 128;
+
+/// Maximum task bytes accepted by the local synthetic intake.
+pub const MAX_SYNTHETIC_TASK_BYTES: usize = 8 * 1024;
 
 /// A refusal while constructing or decoding an administration message.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -160,6 +176,8 @@ impl DaemonState {
 pub enum AdminCommand {
     /// Read a consistent daemon status snapshot.
     Status,
+    /// Durably enqueue a no-effect synthetic work item.
+    SubmitSynthetic,
     /// Stop intake and request an orderly shutdown.
     Shutdown,
 }
@@ -168,8 +186,87 @@ impl AdminCommand {
     const fn kind(self) -> &'static str {
         match self {
             Self::Status => "status",
+            Self::SubmitSynthetic => "submit_synthetic",
             Self::Shutdown => "shutdown",
         }
+    }
+}
+
+/// Bounded local work used to exercise the durable scheduler without a provider
+/// or transport.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyntheticSubmission {
+    scope: String,
+    idempotency_key: String,
+    task: String,
+}
+
+impl SyntheticSubmission {
+    /// Validate a synthetic intake request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::InvalidBody`] for empty, overlong, or
+    /// control-character-bearing coordinates, or for an empty/overlong task.
+    pub fn new(
+        scope: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        task: impl Into<String>,
+    ) -> Result<Self, AdminError> {
+        let scope = scope.into();
+        let idempotency_key = idempotency_key.into();
+        let task = task.into();
+        if !valid_coordinate(&scope, MAX_SYNTHETIC_SCOPE_BYTES)
+            || !valid_coordinate(&idempotency_key, MAX_SYNTHETIC_KEY_BYTES)
+            || task.is_empty()
+            || task.len() > MAX_SYNTHETIC_TASK_BYTES
+            || task.contains('\0')
+        {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self {
+            scope,
+            idempotency_key,
+            task,
+        })
+    }
+
+    /// Serialization scope used by the scheduler.
+    #[must_use]
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    /// Stable caller-controlled retry key.
+    #[must_use]
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    /// Synthetic task text. It grants no provider or external-effect authority.
+    #[must_use]
+    pub fn task(&self) -> &str {
+        &self.task
+    }
+
+    fn to_body(&self) -> JsonValue {
+        JsonValue::Object(vec![
+            (
+                "idempotency_key".to_owned(),
+                JsonValue::String(self.idempotency_key.clone()),
+            ),
+            ("scope".to_owned(), JsonValue::String(self.scope.clone())),
+            ("task".to_owned(), JsonValue::String(self.task.clone())),
+        ])
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        exact_fields(body, &["idempotency_key", "scope", "task"])?;
+        Self::new(
+            required_body_string(body, "scope")?,
+            required_body_string(body, "idempotency_key")?,
+            required_body_string(body, "task")?,
+        )
     }
 }
 
@@ -178,6 +275,7 @@ impl AdminCommand {
 pub struct AdminRequest {
     request_id: RequestId,
     command: AdminCommand,
+    submission: Option<SyntheticSubmission>,
 }
 
 impl AdminRequest {
@@ -187,6 +285,17 @@ impl AdminRequest {
         Self {
             request_id,
             command,
+            submission: None,
+        }
+    }
+
+    /// Construct a durable synthetic-intake request.
+    #[must_use]
+    pub const fn submit(request_id: RequestId, submission: SyntheticSubmission) -> Self {
+        Self {
+            request_id,
+            command: AdminCommand::SubmitSynthetic,
+            submission: Some(submission),
         }
     }
 
@@ -202,6 +311,12 @@ impl AdminRequest {
         self.command
     }
 
+    /// Synthetic work body, present only for [`AdminCommand::SubmitSynthetic`].
+    #[must_use]
+    pub const fn submission(&self) -> Option<&SyntheticSubmission> {
+        self.submission.as_ref()
+    }
+
     /// Encode this request as a canonical local-protocol message.
     ///
     /// # Errors
@@ -209,9 +324,14 @@ impl AdminRequest {
     /// Returns a shared codec error only if a compile-time protocol literal no
     /// longer satisfies the shared envelope grammar.
     pub fn to_message(&self) -> Result<Message, AdminError> {
+        let body = match (self.command, &self.submission) {
+            (AdminCommand::SubmitSynthetic, Some(submission)) => submission.to_body(),
+            (AdminCommand::Status | AdminCommand::Shutdown, None) => JsonValue::Object(Vec::new()),
+            _ => return Err(AdminError::InvalidBody),
+        };
         Ok(Message::new(
             envelope(self.request_id.clone(), self.command.kind())?,
-            JsonValue::Object(Vec::new()),
+            body,
         ))
     }
 
@@ -223,15 +343,24 @@ impl AdminRequest {
     /// non-object command body.
     pub fn from_canonical_bytes(payload: &[u8]) -> Result<Self, AdminError> {
         let message = Message::from_canonical_bytes_admitted(payload, &[supported_protocol()?])?;
-        if !matches!(message.body(), JsonValue::Object(entries) if entries.is_empty()) {
-            return Err(AdminError::InvalidBody);
+        match message.envelope().kind().as_str() {
+            "submit_synthetic" => Ok(Self::submit(
+                message.envelope().request_id().clone(),
+                SyntheticSubmission::from_body(message.body())?,
+            )),
+            "status" | "shutdown" => {
+                if !matches!(message.body(), JsonValue::Object(entries) if entries.is_empty()) {
+                    return Err(AdminError::InvalidBody);
+                }
+                let command = if message.envelope().kind().as_str() == "status" {
+                    AdminCommand::Status
+                } else {
+                    AdminCommand::Shutdown
+                };
+                Ok(Self::new(message.envelope().request_id().clone(), command))
+            }
+            _ => Err(AdminError::UnknownKind),
         }
-        let command = match message.envelope().kind().as_str() {
-            "status" => AdminCommand::Status,
-            "shutdown" => AdminCommand::Shutdown,
-            _ => return Err(AdminError::UnknownKind),
-        };
-        Ok(Self::new(message.envelope().request_id().clone(), command))
     }
 }
 
@@ -425,6 +554,15 @@ pub enum AdminResponse {
         /// Consistent status snapshot.
         status: DaemonStatus,
     },
+    /// A synthetic work item is durable, or the exact retry was replayed.
+    SyntheticAccepted {
+        /// Correlation identifier from the request.
+        request_id: RequestId,
+        /// Durable inbox identity.
+        inbox_id: u64,
+        /// Whether an identical stable-key submission already existed.
+        duplicate: bool,
+    },
     /// The daemon accepted an orderly-shutdown request and closed intake.
     ShutdownAccepted {
         /// Correlation identifier from the request.
@@ -437,7 +575,9 @@ impl AdminResponse {
     #[must_use]
     pub const fn request_id(&self) -> &RequestId {
         match self {
-            Self::Status { request_id, .. } | Self::ShutdownAccepted { request_id } => request_id,
+            Self::Status { request_id, .. }
+            | Self::SyntheticAccepted { request_id, .. }
+            | Self::ShutdownAccepted { request_id } => request_id,
         }
     }
 
@@ -452,6 +592,17 @@ impl AdminResponse {
             Self::Status { request_id, status } => Ok(Message::new(
                 envelope(request_id.clone(), "status_result")?,
                 status.to_body()?,
+            )),
+            Self::SyntheticAccepted {
+                request_id,
+                inbox_id,
+                duplicate,
+            } => Ok(Message::new(
+                envelope(request_id.clone(), "synthetic_accepted")?,
+                JsonValue::Object(vec![
+                    ("duplicate".to_owned(), JsonValue::Bool(*duplicate)),
+                    ("inbox_id".to_owned(), integer("inbox_id", *inbox_id)?),
+                ]),
             )),
             Self::ShutdownAccepted { request_id } => Ok(Message::new(
                 envelope(request_id.clone(), "shutdown_accepted")?,
@@ -473,6 +624,18 @@ impl AdminResponse {
                 request_id,
                 status: DaemonStatus::from_body(message.body())?,
             }),
+            "synthetic_accepted" => {
+                exact_fields(message.body(), &["duplicate", "inbox_id"])?;
+                let duplicate = match message.body().get("duplicate") {
+                    Some(JsonValue::Bool(value)) => *value,
+                    _ => return Err(AdminError::InvalidBody),
+                };
+                Ok(Self::SyntheticAccepted {
+                    request_id,
+                    inbox_id: unsigned(message.body(), "inbox_id")?,
+                    duplicate,
+                })
+            }
             "shutdown_accepted" => {
                 if !matches!(message.body(), JsonValue::Object(entries) if entries.is_empty()) {
                     return Err(AdminError::InvalidBody);
@@ -512,4 +675,29 @@ fn unsigned(body: &JsonValue, field: &'static str) -> Result<u64, AdminError> {
         .and_then(JsonValue::as_integer)
         .ok_or(AdminError::InvalidBody)?;
     u64::try_from(value).map_err(|_| AdminError::InvalidBody)
+}
+
+fn valid_coordinate(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+}
+
+fn exact_fields(body: &JsonValue, fields: &[&str]) -> Result<(), AdminError> {
+    let JsonValue::Object(entries) = body else {
+        return Err(AdminError::InvalidBody);
+    };
+    if entries.len() != fields.len()
+        || !fields
+            .iter()
+            .all(|field| entries.iter().any(|(name, _)| name == field))
+    {
+        return Err(AdminError::InvalidBody);
+    }
+    Ok(())
+}
+
+fn required_body_string(body: &JsonValue, field: &'static str) -> Result<String, AdminError> {
+    body.get(field)
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned)
+        .ok_or(AdminError::InvalidBody)
 }

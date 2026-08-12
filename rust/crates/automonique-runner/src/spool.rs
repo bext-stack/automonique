@@ -39,6 +39,7 @@ impl Authority {
 pub enum EventKind {
     Started,
     AdapterEvent,
+    SimulationEvent,
     CancelRequested,
     Terminal,
 }
@@ -48,6 +49,7 @@ impl EventKind {
         match self {
             Self::Started => "started",
             Self::AdapterEvent => "adapter_event",
+            Self::SimulationEvent => "simulation_event",
             Self::CancelRequested => "cancel_requested",
             Self::Terminal => "terminal",
         }
@@ -56,6 +58,7 @@ impl EventKind {
         match value {
             "started" => Some(Self::Started),
             "adapter_event" => Some(Self::AdapterEvent),
+            "simulation_event" => Some(Self::SimulationEvent),
             "cancel_requested" => Some(Self::CancelRequested),
             "terminal" => Some(Self::Terminal),
             _ => None,
@@ -246,6 +249,23 @@ impl Spool {
         authority: Authority,
         payload: &[u8],
     ) -> Result<Event, SpoolError> {
+        let at_millis = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| SpoolError::Corrupt)?
+                .as_millis(),
+        )
+        .map_err(|_| SpoolError::Corrupt)?;
+        self.append_at(kind, authority, payload, at_millis)
+    }
+
+    pub(crate) fn append_at(
+        &mut self,
+        kind: EventKind,
+        authority: Authority,
+        payload: &[u8],
+        at_millis: u64,
+    ) -> Result<Event, SpoolError> {
         if self.terminal {
             return Err(SpoolError::AlreadyTerminal);
         }
@@ -256,13 +276,6 @@ impl Spool {
             .map_err(|_| SpoolError::LimitExceeded)?
             .checked_add(1)
             .ok_or(SpoolError::LimitExceeded)?;
-        let at_millis = u64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|_| SpoolError::Corrupt)?
-                .as_millis(),
-        )
-        .map_err(|_| SpoolError::Corrupt)?;
         let mut event = Event {
             run_id: self.run_id.clone(),
             sequence,

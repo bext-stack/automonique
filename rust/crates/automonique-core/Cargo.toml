@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+[package]
+name = "automonique-core"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

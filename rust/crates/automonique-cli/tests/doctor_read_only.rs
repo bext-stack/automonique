@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 
-const USAGE: &[u8] = b"usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique shutdown\n";
+const USAGE: &[u8] = b"usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique shutdown\n";
 
 fn private_runtime() -> tempfile::TempDir {
     let runtime = tempfile::tempdir().expect("runtime");
@@ -102,7 +102,7 @@ fn non_utf8_argv_is_a_bounded_usage_error() {
 }
 
 #[test]
-fn argv_rejection_never_reads_past_the_third_item() {
+fn argv_rejection_never_reads_past_the_fourth_item() {
     let mut index = 0usize;
     let arguments = std::iter::from_fn(move || {
         index += 1;
@@ -110,6 +110,7 @@ fn argv_rejection_never_reads_past_the_third_item() {
             1 => Some(OsString::from("doctor")),
             2 => Some(OsString::from("--json")),
             3 => Some(OsString::from("extra")),
+            4 => Some(OsString::from("extra-again")),
             _ => panic!("argument parser read beyond its fixed bound"),
         }
     });

@@ -11,9 +11,10 @@ external effect typed, revision-checked, journaled, and reconcilable.
 
 Automonique is in early implementation. Its first runnable control-plane slice
 now includes a foreground daemon, peer-authenticated local administration,
-durable SQLite state, a bounded process runner, and fail-closed sandbox
-admission planning. Provider execution, scheduling, and external transports are
-not connected yet. Large historical planning and development-harness surfaces
+durable SQLite state, a fenced FIFO scheduler, a deterministic no-effect
+execution lane, a bounded process-runner foundation, and fail-closed sandbox
+admission planning. Provider execution and external transports are not
+connected yet. Large historical planning and development-harness surfaces
 remain in the tree, but they are no longer prerequisites for product development.
 
 ```text
@@ -77,15 +78,19 @@ From another terminal with the same environment:
 ```sh
 cargo run --manifest-path rust/Cargo.toml -p automonique -- status
 cargo run --manifest-path rust/Cargo.toml -p automonique -- status --json
+printf '%s' 'local fixture' | cargo run --manifest-path rust/Cargo.toml -p automonique -- \
+  submit workspace:test fixture:1
 cargo run --manifest-path rust/Cargo.toml -p automonique -- shutdown
 ```
 
 The daemon creates only `automonique/` children under those roots, refuses
-permissive or foreign-owned paths, and exposes no network listener. This slice
-does not yet accept or schedule work, execute a provider, install OS sandbox
-enforcement, or send external effects. Accordingly `accepting_intake` remains
-`false`; the runner and sandbox crates are foundation APIs, not connected
-production authority.
+permissive or foreign-owned paths, and exposes no network listener. The submit
+command accepts only bounded local synthetic work, reads its task from stdin,
+serializes it by scope, and atomically records one deterministic terminal plus
+one pending `fake.receipt`. It cannot execute a process, call a provider, drain
+the outbox, or send an external effect. `accepting_intake=true` refers only to
+this local synthetic lane. The general runner remains fail-closed and sandbox
+plans still grant no OS-enforcement or production-runner authority.
 
 ## Clean-room and licensing
 

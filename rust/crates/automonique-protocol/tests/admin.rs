@@ -2,7 +2,9 @@
 
 use automonique_protocol::admin::{
     ADMIN_PROTOCOL, AdminCommand, AdminError, AdminInstanceId, AdminRequest, AdminResponse,
-    DaemonState, DaemonStatus, MAX_INSTANCE_ID_BYTES,
+    DaemonState, DaemonStatus, MAX_ADMIN_CANONICAL_BYTES, MAX_INSTANCE_ID_BYTES,
+    MAX_SYNTHETIC_KEY_BYTES, MAX_SYNTHETIC_SCOPE_BYTES, MAX_SYNTHETIC_TASK_BYTES,
+    SyntheticSubmission,
 };
 use automonique_protocol::codec::{CodecError, FrameDecode, RequestId, decode_frame, encode_frame};
 
@@ -44,6 +46,71 @@ fn requests_round_trip_through_canonical_framing() {
         assert_eq!(
             AdminRequest::from_canonical_bytes(decoded_payload).expect("admitted request"),
             request
+        );
+    }
+}
+
+#[test]
+fn synthetic_intake_and_receipt_round_trip_exactly() {
+    let submission = SyntheticSubmission::new("workspace:one", "telegram:update:7", "say hello")
+        .expect("bounded synthetic work");
+    let request = AdminRequest::submit(request_id(), submission.clone());
+    let payload = request
+        .to_message()
+        .expect("encode submission")
+        .to_canonical_bytes();
+    let decoded = AdminRequest::from_canonical_bytes(&payload).expect("decode submission");
+    assert_eq!(decoded, request);
+    assert_eq!(decoded.command(), AdminCommand::SubmitSynthetic);
+    assert_eq!(decoded.submission(), Some(&submission));
+
+    let response = AdminResponse::SyntheticAccepted {
+        request_id: request_id(),
+        inbox_id: 42,
+        duplicate: false,
+    };
+    let payload = response
+        .to_message()
+        .expect("encode receipt")
+        .to_canonical_bytes();
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(&payload).expect("decode receipt"),
+        response
+    );
+}
+
+#[test]
+fn synthetic_intake_is_bounded_and_closed() {
+    let worst_case = AdminRequest::submit(
+        request_id(),
+        SyntheticSubmission::new(
+            "s".repeat(MAX_SYNTHETIC_SCOPE_BYTES),
+            "k".repeat(MAX_SYNTHETIC_KEY_BYTES),
+            "\u{1}".repeat(MAX_SYNTHETIC_TASK_BYTES),
+        )
+        .expect("exact maximum task"),
+    )
+    .to_message()
+    .expect("maximum task encodes")
+    .to_canonical_bytes();
+    assert!(worst_case.len() <= MAX_ADMIN_CANONICAL_BYTES);
+    assert_eq!(
+        SyntheticSubmission::new("scope", "key", "x".repeat(MAX_SYNTHETIC_TASK_BYTES + 1))
+            .expect_err("oversized task"),
+        AdminError::InvalidBody
+    );
+    assert_eq!(
+        SyntheticSubmission::new("bad\nscope", "key", "task").expect_err("control in scope"),
+        AdminError::InvalidBody
+    );
+    for payload in [
+        br#"{"body":{"idempotency_key":"key","scope":"scope"},"kind":"submit_synthetic","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+        br#"{"body":{"future":true,"idempotency_key":"key","scope":"scope","task":"work"},"kind":"submit_synthetic","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+        br#"{"body":{"idempotency_key":"key","scope":"scope","task":1},"kind":"submit_synthetic","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+    ] {
+        assert_eq!(
+            AdminRequest::from_canonical_bytes(payload).expect_err("invalid submission"),
+            AdminError::InvalidBody
         );
     }
 }
