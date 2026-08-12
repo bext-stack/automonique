@@ -68,6 +68,7 @@ class CompositionResolution:
 EXERCISED_IDS = frozenset({
     "audit-journal-through-watermark",
     "database-and-snapshot-metadata",
+    "verify-database-integrity",
 })
 
 CANONICAL_IDS = (
@@ -130,7 +131,6 @@ BLOCKER_REASONS = {
     "release-manifests-and-schemas": "synthetic release metadata is not current and previous release/schema recovery",
     "tool-and-extension-manifests": "empty fixed lists do not exercise enabled or quarantined tool revisions",
     "verify-artifact-hashes": "hash checks succeeded but prerequisite artifact tombstone recovery is unresolved",
-    "verify-database-integrity": "integrity was checked inside a package verifier, but no restored target was admitted for downstream trust",
     "verify-disconnected-start-bundle": "no restored bundle was checked against corresponding source and seed verifier",
     "verify-manifests": "configuration and release prerequisites remain synthetic placeholders",
     "verify-policy-versions": "no restored policy bundle bytes exist for version comparison",
@@ -192,6 +192,13 @@ def _run() -> CompositionResolution:
             if not active_error:
                 raise CompositionRefused(CompositionRefusal.PACKAGE_INVALID, f"package descriptor close refused: {exc}") from exc
     boundary_sha256 = hashlib.sha256(boundary_json).hexdigest()
+    boundary_evidence = json.loads(boundary_json)["evidence"]
+    integrity_proven = _database_integrity_proven(boundary_evidence)
+    if not integrity_proven:
+        raise CompositionRefused(
+            CompositionRefusal.EVIDENCE_INVALID,
+            "position 14 requires exact nested database integrity evidence",
+        )
     evidence_base = {
         "plan": {
             "source_path": current_plan.source_path,
@@ -220,8 +227,20 @@ def _run() -> CompositionResolution:
     receipt_hashes: dict[str, str] = {}
     receipts: list[plan_model.StepReceipt] = []
     blockers: list[plan_model.EvidenceBlocker] = []
+    dispositions: dict[str, plan_model.Disposition] = {}
     for entry in current_plan.entries:
         exercised = entry.id in EXERCISED_IDS
+        if entry.id == "verify-database-integrity":
+            exercised = (
+                integrity_proven
+                and dispositions.get("database-and-snapshot-metadata")
+                is plan_model.Disposition.EXERCISED
+            )
+            if not exercised:
+                raise CompositionRefused(
+                    CompositionRefusal.EVIDENCE_INVALID,
+                    "position 14 prerequisite or nested proof is unresolved",
+                )
         disposition = plan_model.Disposition.EXERCISED if exercised else plan_model.Disposition.REQUIRED_BUT_NOT_EXERCISED
         blocker = None if exercised else plan_model.EvidenceBlocker(entry.id, "missing-integrated-evidence", BLOCKER_REASONS[entry.id])
         if blocker is not None:
@@ -241,6 +260,7 @@ def _run() -> CompositionResolution:
         )
         receipts.append(receipt)
         receipt_hashes[entry.id] = receipt.receipt_sha256()
+        dispositions[entry.id] = disposition
         state = receipt.transition.after
     receipt_set = plan_model.ReceiptSet(tuple(receipts))
     try:
@@ -271,8 +291,8 @@ def _validate_closed_plan(plan: object) -> None:
     if observed != CANONICAL_ENTRIES or (plan.source_path, plan.source_sha256) != CANONICAL_SOURCE or citations != CANONICAL_CITATIONS:
         raise CompositionRefused(CompositionRefusal.PLAN_INVALID, "canonical plan entries, source, or objective citations differ")
     exercised_coordinates = tuple((entry.position, entry.id) for entry in plan.entries if entry.id in EXERCISED_IDS)
-    if exercised_coordinates != ((2, CANONICAL_IDS[1]), (6, CANONICAL_IDS[5])):
-        raise CompositionRefused(CompositionRefusal.PLAN_INVALID, "exercised evidence coordinates differ from positions 2 and 6")
+    if exercised_coordinates != ((2, CANONICAL_IDS[1]), (6, CANONICAL_IDS[5]), (14, CANONICAL_IDS[13])):
+        raise CompositionRefused(CompositionRefusal.PLAN_INVALID, "exercised evidence coordinates differ from positions 2, 6, and 14")
     if set(BLOCKER_REASONS) != set(CANONICAL_IDS) - EXERCISED_IDS:
         raise CompositionRefused(CompositionRefusal.PLAN_INVALID, "closed blocker map differs from canonical non-exercised positions")
 
@@ -322,6 +342,11 @@ def _validate_boundary_result_inner(
     duration_ns = evidence["mechanism_ended_monotonic_ns"] - evidence["mechanism_started_monotonic_ns"]
     checks = (
         anonymous_boundary._verification_valid(verification),
+        verification["checks"] == list(anonymous_boundary.CHECK_NAMES),
+        "control_database_integrity" in verification["checks"],
+        "control_database_schema_exact" in verification["checks"],
+        verification["event_count"] == 4,
+        verification["artifact_count"] == 4,
         evidence["package_receipt"] == anonymous_boundary._receipt_document(anonymous_boundary.EXPECTED_RECEIPT),
         evidence["package_memfd_identity"] == package_identity,
         evidence["package_seals"] == anonymous_boundary.REQUIRED_SEALS,
@@ -372,6 +397,19 @@ def _validate_boundary_result_inner(
     if not all(checks) or type(caps) is not dict or set(caps) != {"effective", "permitted", "inheritable"} or any(words != [0, 0] for words in caps.values()):
         raise CompositionRefused(CompositionRefusal.BOUNDARY_REFUSED, "boundary evidence invariants differ")
     return (json.dumps(boundary.as_document(), sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+
+
+def _database_integrity_proven(evidence: object) -> bool:
+    if type(evidence) is not dict or type(evidence.get("verification")) is not dict:
+        return False
+    verification = evidence["verification"]
+    return (
+        verification.get("checks") == list(anonymous_boundary.CHECK_NAMES)
+        and "control_database_integrity" in verification["checks"]
+        and "control_database_schema_exact" in verification["checks"]
+        and verification.get("event_count") == 4
+        and verification.get("artifact_count") == 4
+    )
 
 
 def _json_value(value: object) -> object:

@@ -35,7 +35,7 @@ class AnonymousCompositionTests(unittest.TestCase):
         self.assertEqual([item.entry_id for item in receipts], [item.id for item in self.first.plan.entries])
         exercised = {item.entry_id for item in receipts if item.disposition is recovery_plan.Disposition.EXERCISED}
         self.assertEqual(exercised, set(composition.EXERCISED_IDS))
-        self.assertEqual(len(self.first.blockers), 19)
+        self.assertEqual(len(self.first.blockers), 18)
 
     def test_receipt_hash_chain_and_assessment_validate(self) -> None:
         assessment = recovery_plan.validate_receipts(self.first.plan, self.first.receipt_set)
@@ -58,7 +58,26 @@ class AnonymousCompositionTests(unittest.TestCase):
         for entry_id in blocked:
             self.assertIs(by_id[entry_id].disposition, recovery_plan.Disposition.REQUIRED_BUT_NOT_EXERCISED)
         self.assertFalse(self.first.enablement_verified_disabled)
-        self.assertEqual(self.first.assessment.final_state.phase, recovery_plan.StartupPhase.ASSEMBLING_RECOVERY_SET)
+        self.assertEqual(self.first.assessment.final_state.phase, recovery_plan.StartupPhase.VERIFYING_RECOVERY_SET)
+
+    def test_database_integrity_advances_only_position_14_while_13_stays_blocked(self) -> None:
+        by_id = {item.entry_id: item for item in self.first.receipt_set.receipts}
+        self.assertIs(
+            by_id["database-and-snapshot-metadata"].disposition,
+            recovery_plan.Disposition.EXERCISED,
+        )
+        self.assertIs(
+            by_id["verify-database-integrity"].disposition,
+            recovery_plan.Disposition.EXERCISED,
+        )
+        self.assertIs(
+            by_id["verify-artifact-hashes"].disposition,
+            recovery_plan.Disposition.REQUIRED_BUT_NOT_EXERCISED,
+        )
+        self.assertIn(
+            ("database-and-snapshot-metadata", by_id["database-and-snapshot-metadata"].receipt_sha256()),
+            by_id["verify-database-integrity"].prerequisite_receipt_hashes,
+        )
 
     def test_measurements_are_numeric_but_objective_comparisons_are_out_of_scope(self) -> None:
         by_id = {item.id: item for item in self.first.measurements}
@@ -162,6 +181,35 @@ class AnonymousCompositionTests(unittest.TestCase):
                         forged, package_identity, worker_source_identity,
                         runtime_identity,
                     )
+
+    def test_integrity_check_removal_or_count_mutation_refuses_before_derivation(self) -> None:
+        document = json.loads(self.first.boundary_json)
+        original = document["evidence"]
+        package_identity = original["package_memfd_identity"]
+        worker_source_identity = original["worker_source"]["identity"]
+        runtime_identity = original["runtime_identity"]
+        mutations = []
+        for check in ("control_database_integrity", "control_database_schema_exact"):
+            verification = dict(original["verification"])
+            verification["checks"] = [item for item in verification["checks"] if item != check]
+            mutations.append(verification)
+        for field in ("event_count", "artifact_count"):
+            verification = dict(original["verification"])
+            verification[field] = 3
+            mutations.append(verification)
+        for verification in mutations:
+            evidence = dict(original)
+            evidence["verification"] = verification
+            forged = anonymous_boundary.Result(
+                anonymous_boundary.Outcome.MECHANISM_VERIFIED,
+                evidence, None, True, 0,
+            )
+            with self.assertRaises(composition.CompositionRefused) as caught:
+                composition._validate_boundary_result(
+                    forged, package_identity, worker_source_identity,
+                    runtime_identity,
+                )
+            self.assertIs(caught.exception.refusal, composition.CompositionRefusal.BOUNDARY_REFUSED)
 
     def test_removed_reordered_extra_and_repositioned_plans_refuse(self) -> None:
         plan = self.first.plan
