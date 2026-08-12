@@ -24,12 +24,13 @@ use automonique_runner::{
     AdmissionFields, AdmissionFieldsParts, ArtifactGrantBinding, ArtifactGrantBindings,
     ArtifactGrantDigest, ArtifactGrantId, Authority, BackendPromptSession, CancellationToken,
     ContainmentEvidence, CwdToken, EventKind, ExecutionPlanDigest, ExtensionSetDigest,
-    FallbackEligibility, IntegrationMode, IoReservation, ModelRoutingDigest, OriginCoordinate,
-    PersonaDigest, PortabilityPolicy, ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference,
-    RemoteAttestationPolicy, RequiredCapabilities, RunCoordinates, RunOrigin, RunOriginSource,
-    RunSpec, RunSpecError, RunSpecParts, Runner, RunnerError, RunnerEventDialect,
-    SchedulerDecisionDigest, SchedulerReservationBinding, SchedulerReservationId, SkillsetDigest,
-    Spool, SpoolError, ToolsetDigest, WorkspaceRegistryId, WorkspaceReservation,
+    FallbackEligibility, IntegrationMode, IoReservation, MAX_RUN_SPEC_BYTES, ModelRoutingDigest,
+    OriginCoordinate, PersonaDigest, PortabilityPolicy, ProfileDigest, PromptDeliveryPlan,
+    ProtectedPromptReference, RemoteAttestationPolicy, RequiredCapabilities, RunCoordinates,
+    RunOrigin, RunOriginSource, RunSpec, RunSpecError, RunSpecParts, Runner, RunnerError,
+    RunnerEventDialect, SchedulerDecisionDigest, SchedulerReservationBinding,
+    SchedulerReservationId, SkillsetDigest, Spool, SpoolError, ToolsetDigest, WorkspaceRegistryId,
+    WorkspaceReservation,
 };
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -272,6 +273,14 @@ fn sandbox(
         prohibited_capabilities: ProhibitedCapabilities::declare(&[]).unwrap(),
     })
     .unwrap()
+}
+
+#[test]
+fn future_run_spec_document_limit_equals_the_protocol_frame_ceiling() {
+    assert_eq!(
+        MAX_RUN_SPEC_BYTES,
+        automonique_protocol::codec::MAX_FRAME_BYTES
+    );
 }
 
 #[test]

@@ -85,6 +85,12 @@ pub const MAX_ARG_BYTES: usize = 4_096;
 pub const MAX_TOTAL_ARG_BYTES: usize = 32 * 1_024;
 pub const MAX_ENV_COUNT: usize = 64;
 pub const MAX_TOTAL_ENV_BYTES: usize = 64 * 1_024;
+/// Reserved maximum byte length for a future canonical RunSpec document.
+///
+/// This aliases the protocol frame ceiling. It does not imply that this crate
+/// currently provides a RunSpec encoder or decoder.
+pub const MAX_RUN_SPEC_BYTES: usize = automonique_protocol::codec::MAX_FRAME_BYTES;
+const _: [(); automonique_protocol::codec::MAX_FRAME_BYTES] = [(); MAX_RUN_SPEC_BYTES];
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MIN_SPOOL_BYTES: u64 = 4_096;
 const MAX_SPOOL_BYTES: u64 = 1024 * 1024 * 1024;

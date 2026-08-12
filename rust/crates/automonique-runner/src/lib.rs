@@ -28,9 +28,9 @@ pub use simulation::{
 };
 pub use spec::{
     BackendPromptSession, CwdToken, MAX_ARG_BYTES, MAX_ARG_COUNT, MAX_ENV_COUNT, MAX_FIELD_BYTES,
-    MAX_PATH_BYTES, MAX_TOTAL_ARG_BYTES, MAX_TOTAL_ENV_BYTES, PromptDeliveryPlan,
-    ProtectedPromptReference, RunCoordinates, RunSpec, RunSpecError, RunSpecParts,
-    WorkspaceRegistryId,
+    MAX_PATH_BYTES, MAX_RUN_SPEC_BYTES, MAX_TOTAL_ARG_BYTES, MAX_TOTAL_ENV_BYTES,
+    PromptDeliveryPlan, ProtectedPromptReference, RunCoordinates, RunSpec, RunSpecError,
+    RunSpecParts, WorkspaceRegistryId,
 };
 pub use spec_fields::{
     AdmissionFields, AdmissionFieldsParts, ArtifactGrantBinding, ArtifactGrantBindings,
