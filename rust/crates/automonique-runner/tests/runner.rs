@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Elastic-2.0
 
+use automonique_protocol::automation::DurableId;
+use automonique_protocol::context::{ContextManifest, TokenBudget};
 use automonique_protocol::host::{AttemptId, HostId, HostLifetime, WorkId};
 use automonique_protocol::identity::Actor;
-use automonique_protocol::models::ProviderAccountId;
+use automonique_protocol::models::{ExecutorClass, ProviderAccountId, RemoteCoordinate};
 use automonique_protocol::primitives::Revision;
-use automonique_protocol::provider::BinaryProvenance;
+use automonique_protocol::provider::{BinaryProvenance, ProviderSessionId, SessionBinding};
 use automonique_protocol::sandbox::{
     BudgetQuantities, Budgets, CredentialDescriptors, ExecutionAllowlists, ExecutionBackendId,
     FilesystemAccess, ImplementationDigest, IsolationRequirement, NestedIsolation, NetworkAccess,
@@ -12,12 +14,16 @@ use automonique_protocol::sandbox::{
     RequiredFeatures, SandboxProfile, SandboxSpec, SandboxSpecParts, ToolWorkloadEgress,
     WorkspaceContextHash,
 };
-use automonique_protocol::tools::RunId;
+use automonique_protocol::tools::{ApprovalRequirement, CausationId, NestedCause, RunId};
 use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
 use automonique_runner::{
-    Authority, BackendPromptSession, CancellationToken, ContainmentEvidence, EventKind,
-    PromptDeliveryPlan, ProtectedPromptReference, RunCoordinates, RunSpec, RunSpecError,
-    RunSpecParts, Runner, RunnerError, Spool, SpoolError, WorkspaceRegistryId,
+    AdmissionFields, AdmissionFieldsParts, Authority, BackendPromptSession, CancellationToken,
+    ContainmentEvidence, EventKind, ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility,
+    IntegrationMode, IoReservation, ModelRoutingDigest, PersonaDigest, PortabilityPolicy,
+    ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference, RemoteAttestationPolicy,
+    RequiredCapabilities, RunCoordinates, RunOrigin, RunSpec, RunSpecError, RunSpecParts, Runner,
+    RunnerError, RunnerEventDialect, SkillsetDigest, Spool, SpoolError, ToolsetDigest,
+    WorkspaceRegistryId, WorkspaceReservation,
 };
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -81,11 +87,68 @@ fn parts(root: &Path, prompt: PromptDeliveryPlan) -> RunSpecParts {
             5_000,
             1024 * 1024,
         ),
+        admission: admission(0),
         timeout: Duration::from_secs(5),
         term_grace: Duration::from_millis(25),
         spool_directory: root.join("spool"),
         max_spool_bytes: 1024 * 1024,
     }
+}
+
+fn admission(workspace_bytes: u64) -> AdmissionFields {
+    AdmissionFields::new(admission_parts(workspace_bytes))
+}
+
+fn admission_parts(workspace_bytes: u64) -> AdmissionFieldsParts {
+    let mode = IntegrationMode::new("native").unwrap();
+    AdmissionFieldsParts {
+        io_reservation: IoReservation::new(1024, 1024).unwrap(),
+        workspace_reservation: WorkspaceReservation::new(workspace_bytes).unwrap(),
+        session_binding: None,
+        fallback_eligibility: FallbackEligibility::declare(&mode, Vec::new()).unwrap(),
+        integration_mode: mode,
+        required_capabilities: RequiredCapabilities::declare(Vec::new()).unwrap(),
+        context_manifest: ContextManifest::new(
+            Revision::FIRST,
+            TokenBudget::new(0),
+            Vec::new(),
+            Vec::new(),
+        ),
+        profile_digest: ProfileDigest::parse(&digest_text('6')).unwrap(),
+        model_routing_digest: ModelRoutingDigest::parse(&digest_text('7')).unwrap(),
+        toolset_digest: ToolsetDigest::parse(&digest_text('8')).unwrap(),
+        skillset_digest: SkillsetDigest::parse(&digest_text('9')).unwrap(),
+        extension_set_digest: ExtensionSetDigest::parse(&digest_text('a')).unwrap(),
+        origin: RunOrigin::Interactive,
+        executor_class: ExecutorClass::Local,
+        portability_policy: PortabilityPolicy::Pinned,
+        remote_attestation_policy: RemoteAttestationPolicy::NotRequired,
+        persona_digest: PersonaDigest::parse(&digest_text('b')).unwrap(),
+        execution_plan_digest: ExecutionPlanDigest::parse(&digest_text('c')).unwrap(),
+        credential_bindings: Vec::new(),
+        event_dialect: RunnerEventDialect::AutomoniqueRunnerV1,
+        approval_requirement: ApprovalRequirement::None,
+    }
+}
+
+fn digest_text(digit: char) -> String {
+    format!("sha256:{}", digit.to_string().repeat(64))
+}
+
+fn session_binding(
+    tenant: &str,
+    backend: &str,
+    provider_account: &str,
+    session: &str,
+) -> SessionBinding {
+    SessionBinding::new(
+        tenant,
+        backend,
+        provider_account,
+        "namespace-1",
+        ProviderSessionId::new(session).unwrap(),
+    )
+    .unwrap()
 }
 
 fn provider_binary() -> BinaryProvenance {
@@ -249,7 +312,9 @@ fn debug_redacts_argv_environment_and_prompt_coordinates() {
     let root = TempDir::new("debug-redaction");
     let mut candidate = parts(
         root.path(),
-        PromptDeliveryPlan::BackendSession(BackendPromptSession::new("SESSION_SENTINEL").unwrap()),
+        PromptDeliveryPlan::ProtectedReference(
+            ProtectedPromptReference::new("SESSION_SENTINEL").unwrap(),
+        ),
     );
     candidate.arguments = vec!["ARG_SENTINEL".into()];
     candidate.environment = vec![("SAFE_KEY".into(), "ENV_SENTINEL".into())];
@@ -364,8 +429,191 @@ fn workspace_and_sandbox_cross_field_mismatches_refuse() {
         let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
         candidate.workspace = workspace("acme", 7, isolation);
         candidate.sandbox = sandbox("acme", 7, access, 5_000, 1024 * 1024);
+        candidate.admission = admission(1024);
         assert!(RunSpec::new(candidate).is_ok());
     }
+}
+
+#[test]
+fn admission_field_constructors_refuse_unbounded_or_ambiguous_values() {
+    assert_eq!(
+        IoReservation::new(u64::MAX, 0).unwrap_err(),
+        RunSpecError::FieldInvalid("io_reservation")
+    );
+    assert_eq!(
+        WorkspaceReservation::new(u64::MAX).unwrap_err(),
+        RunSpecError::FieldInvalid("workspace_reservation")
+    );
+    assert_eq!(
+        IntegrationMode::new("../native").unwrap_err(),
+        RunSpecError::FieldInvalid("integration_mode")
+    );
+    let selected = IntegrationMode::new("native").unwrap();
+    assert_eq!(
+        FallbackEligibility::declare(&selected, vec![selected.clone()]).unwrap_err(),
+        RunSpecError::FieldInvalid("fallback_eligibility")
+    );
+    let duplicate = IntegrationMode::new("remote").unwrap();
+    assert_eq!(
+        FallbackEligibility::declare(&selected, vec![duplicate.clone(), duplicate]).unwrap_err(),
+        RunSpecError::FieldInvalid("fallback_eligibility")
+    );
+    assert_eq!(
+        ProfileDigest::parse("sha256:00").unwrap_err(),
+        RunSpecError::FieldInvalid("profile_digest")
+    );
+}
+
+#[test]
+fn remote_executor_classes_require_an_attestation_policy() {
+    let root = TempDir::new("remote-attestation");
+    for executor_class in [
+        ExecutorClass::Ssh,
+        ExecutorClass::Batch,
+        ExecutorClass::Cluster,
+        ExecutorClass::MicroVm,
+        ExecutorClass::Remote(RemoteCoordinate::new("vendor", "resource").unwrap()),
+    ] {
+        let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+        let mut fields = admission_parts(0);
+        fields.executor_class = executor_class;
+        candidate.admission = AdmissionFields::new(fields);
+        assert_eq!(
+            RunSpec::new(candidate).unwrap_err(),
+            RunSpecError::FieldInvalid("remote_attestation_policy")
+        );
+    }
+
+    let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+    let mut fields = admission_parts(0);
+    fields.executor_class = ExecutorClass::Ssh;
+    fields.remote_attestation_policy = RemoteAttestationPolicy::Signed;
+    candidate.admission = AdmissionFields::new(fields);
+    assert!(RunSpec::new(candidate).is_ok());
+}
+
+#[test]
+fn admission_cross_field_mismatches_fail_closed() {
+    let root = TempDir::new("admission-cross-fields");
+
+    let selected = IntegrationMode::new("selected").unwrap();
+    let alternate = IntegrationMode::new("alternate").unwrap();
+    let mut fields = admission_parts(0);
+    fields.integration_mode = alternate.clone();
+    fields.fallback_eligibility = FallbackEligibility::declare(&selected, vec![alternate]).unwrap();
+    let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+    candidate.admission = AdmissionFields::new(fields);
+    assert_eq!(
+        RunSpec::new(candidate).unwrap_err(),
+        RunSpecError::FieldInvalid("fallback_eligibility")
+    );
+
+    let mut candidate = parts(
+        root.path(),
+        PromptDeliveryPlan::BackendSession(BackendPromptSession::new("session-1").unwrap()),
+    );
+    assert_eq!(
+        RunSpec::new(candidate).unwrap_err(),
+        RunSpecError::FieldInvalid("backend_prompt_session")
+    );
+
+    candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+    candidate.coordinates = RunCoordinates::new(
+        WorkId::new("work-1").unwrap(),
+        RunId::new("run-1").unwrap(),
+        AttemptId::new("attempt-1").unwrap(),
+        HostId::new("host-1").unwrap(),
+        HostLifetime::Session,
+        ExecutionBackendId::new("local-direct").unwrap(),
+    );
+    assert!(RunSpec::new(candidate).is_ok());
+
+    let mut candidate = parts(
+        root.path(),
+        PromptDeliveryPlan::BackendSession(BackendPromptSession::new("session-1").unwrap()),
+    );
+    let mut fields = admission_parts(0);
+    fields.session_binding = Some(session_binding(
+        "acme",
+        "local-direct",
+        "provider-account-1",
+        "session-1",
+    ));
+    candidate.admission = AdmissionFields::new(fields);
+    assert!(RunSpec::new(candidate).is_ok());
+
+    for binding in [
+        session_binding(
+            "other-tenant",
+            "local-direct",
+            "provider-account-1",
+            "session-1",
+        ),
+        session_binding("acme", "other-backend", "provider-account-1", "session-1"),
+        session_binding("acme", "local-direct", "other-account", "session-1"),
+    ] {
+        let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+        let mut fields = admission_parts(0);
+        fields.session_binding = Some(binding);
+        candidate.admission = AdmissionFields::new(fields);
+        assert_eq!(
+            RunSpec::new(candidate).unwrap_err(),
+            RunSpecError::FieldInvalid("session_binding")
+        );
+    }
+
+    let mut candidate = parts(
+        root.path(),
+        PromptDeliveryPlan::BackendSession(BackendPromptSession::new("wrong-session").unwrap()),
+    );
+    let mut fields = admission_parts(0);
+    fields.session_binding = Some(session_binding(
+        "acme",
+        "local-direct",
+        "provider-account-1",
+        "session-1",
+    ));
+    candidate.admission = AdmissionFields::new(fields);
+    assert_eq!(
+        RunSpec::new(candidate).unwrap_err(),
+        RunSpecError::FieldInvalid("backend_prompt_session")
+    );
+}
+
+#[test]
+fn noninteractive_origin_preserves_exact_read_only_coordinates() {
+    let automation = DurableId::new("automation-1").unwrap();
+    let goal = DurableId::new("goal-1").unwrap();
+    let trigger = DurableId::new("trigger-1").unwrap();
+    let event = DurableId::new("event-1").unwrap();
+    let cause = NestedCause::root(
+        Actor::new("acme", "actor-1").unwrap(),
+        RunId::new("run-1").unwrap(),
+        CausationId::new("cause-1").unwrap(),
+    );
+    let origin = RunOrigin::non_interactive(
+        Some(automation.clone()),
+        Some(goal.clone()),
+        Some(trigger.clone()),
+        vec![event.clone()],
+        cause.clone(),
+    )
+    .unwrap();
+    let RunOrigin::NonInteractive(origin_data) = &origin else {
+        panic!("expected noninteractive origin");
+    };
+    assert_eq!(origin_data.automation(), Some(&automation));
+    assert_eq!(origin_data.goal(), Some(&goal));
+    assert_eq!(origin_data.trigger(), Some(&trigger));
+    assert_eq!(origin_data.causal_events(), &[event]);
+    assert_eq!(origin_data.cause(), &cause);
+
+    let root = TempDir::new("noninteractive-origin");
+    let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+    let mut fields = admission_parts(0);
+    fields.origin = origin;
+    candidate.admission = AdmissionFields::new(fields);
+    assert!(RunSpec::new(candidate).is_ok());
 }
 
 #[test]

@@ -11,6 +11,7 @@ mod boundary;
 mod runner;
 mod simulation;
 mod spec;
+mod spec_fields;
 mod spool;
 
 pub use boundary::{
@@ -30,5 +31,12 @@ pub use spec::{
     MAX_PATH_BYTES, MAX_TOTAL_ARG_BYTES, MAX_TOTAL_ENV_BYTES, PromptDeliveryPlan,
     ProtectedPromptReference, RunCoordinates, RunSpec, RunSpecError, RunSpecParts,
     WorkspaceRegistryId,
+};
+pub use spec_fields::{
+    AdmissionFields, AdmissionFieldsParts, CredentialBinding, ExecutionPlanDigest,
+    ExtensionSetDigest, FallbackEligibility, IntegrationMode, IoReservation, MAX_FALLBACK_MODES,
+    MAX_ORIGIN_CAUSES, MAX_RESERVATION_BYTES, ModelRoutingDigest, NonInteractiveOrigin,
+    PersonaDigest, PortabilityPolicy, ProfileDigest, RemoteAttestationPolicy, RequiredCapabilities,
+    RunOrigin, RunnerEventDialect, SkillsetDigest, ToolsetDigest, WorkspaceReservation,
 };
 pub use spool::{Authority, Event, EventKind, RunState, Spool, SpoolError, Status};

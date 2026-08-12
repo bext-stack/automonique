@@ -41,6 +41,7 @@
 //! assert!(matches!(backend_plan, PromptDeliveryPlan::BackendSession(_)));
 //! ```
 
+use crate::AdmissionFields;
 use automonique_protocol::host::{AttemptId, HostId, HostLifetime, WorkId};
 use automonique_protocol::primitives::BoundedString;
 use automonique_protocol::provider::BinaryProvenance;
@@ -300,6 +301,7 @@ pub struct RunSpecParts {
     pub workspace: WorkspaceRegistration,
     pub provider_binary: BinaryProvenance,
     pub sandbox: SandboxSpec,
+    pub admission: AdmissionFields,
     pub timeout: Duration,
     pub term_grace: Duration,
     pub spool_directory: PathBuf,
@@ -327,6 +329,7 @@ impl fmt::Debug for RunSpecParts {
             .field("workspace", &"<registered workspace>")
             .field("provider_binary", &"<pinned provider binary>")
             .field("sandbox", &"<compiled sandbox spec>")
+            .field("admission", &self.admission)
             .field("timeout", &self.timeout)
             .field("term_grace", &self.term_grace)
             .field("spool_directory", &self.spool_directory)
@@ -348,6 +351,7 @@ pub struct RunSpec {
     workspace: WorkspaceRegistration,
     provider_binary: BinaryProvenance,
     sandbox: SandboxSpec,
+    admission: AdmissionFields,
     timeout: Duration,
     term_grace: Duration,
     spool_directory: PathBuf,
@@ -375,6 +379,7 @@ impl fmt::Debug for RunSpec {
             .field("workspace", &"<registered workspace>")
             .field("provider_binary", &"<pinned provider binary>")
             .field("sandbox", &"<compiled sandbox spec>")
+            .field("admission", &self.admission)
             .field("timeout", &self.timeout)
             .field("term_grace", &self.term_grace)
             .field("spool_directory", &self.spool_directory)
@@ -409,6 +414,9 @@ impl RunSpec {
         if parts.max_spool_bytes != parts.sandbox.budgets().spool().quantity() {
             return Err(RunSpecError::SandboxSpoolMismatch);
         }
+        parts
+            .admission
+            .validate_against(&parts.coordinates, &parts.prompt, &parts.sandbox)?;
         Ok(Self {
             protocol_version: parts.protocol_version,
             coordinates: parts.coordinates,
@@ -421,6 +429,7 @@ impl RunSpec {
             workspace: parts.workspace,
             provider_binary: parts.provider_binary,
             sandbox: parts.sandbox,
+            admission: parts.admission,
             timeout: parts.timeout,
             term_grace: parts.term_grace,
             spool_directory: parts.spool_directory,
@@ -478,6 +487,9 @@ impl RunSpec {
     }
     pub const fn sandbox(&self) -> &SandboxSpec {
         &self.sandbox
+    }
+    pub const fn admission(&self) -> &AdmissionFields {
+        &self.admission
     }
     pub const fn timeout(&self) -> Duration {
         self.timeout
