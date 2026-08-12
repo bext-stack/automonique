@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use automonique_protocol::admin::{
-    AdminCommand, AdminRequest, AdminResponse, MAX_ADMIN_CANONICAL_BYTES, ReconciliationFailure,
-    SyntheticSubmission,
+    AdminCommand, AdminRequest, AdminResponse, MAX_ADMIN_CANONICAL_BYTES, OutboxReconciliation,
+    ReconciliationFailure, SyntheticSubmission,
 };
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use nix::sys::socket::{getsockopt, sockopt};
@@ -28,6 +28,8 @@ pub(crate) enum Operation {
     Submit(SyntheticSubmission),
     InspectReconciliation(u64),
     FailReconciliation(ReconciliationFailure),
+    InspectOutbox(u64),
+    ReconcileOutbox(OutboxReconciliation),
     Shutdown,
 }
 
@@ -61,6 +63,8 @@ pub(crate) fn request(
         Operation::Submit(_) => "submit",
         Operation::InspectReconciliation(_) => "reconcile-inspect",
         Operation::FailReconciliation(_) => "reconcile-fail",
+        Operation::InspectOutbox(_) => "outbox-inspect",
+        Operation::ReconcileOutbox(_) => "outbox-reconcile",
         Operation::Shutdown => "shutdown",
     };
     let request_id = format!(
@@ -78,6 +82,11 @@ pub(crate) fn request(
         }
         Operation::FailReconciliation(failure) => {
             AdminRequest::fail_reconciliation(request_id, failure)
+        }
+        Operation::InspectOutbox(outbox_id) => AdminRequest::inspect_outbox(request_id, outbox_id)
+            .map_err(|error| ClientError::Protocol(error.category()))?,
+        Operation::ReconcileOutbox(reconciliation) => {
+            AdminRequest::reconcile_outbox(request_id, reconciliation)
         }
         Operation::Status => AdminRequest::new(request_id, AdminCommand::Status),
         Operation::Shutdown => AdminRequest::new(request_id, AdminCommand::Shutdown),

@@ -21,7 +21,7 @@ use rusqlite::{
 };
 
 /// The only database schema this build can read and write.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 /// SQLite lock contention is bounded rather than waiting indefinitely.
 pub const BUSY_TIMEOUT: Duration = Duration::from_millis(2_000);
 
@@ -324,6 +324,28 @@ CREATE INDEX outbox_ready_fifo
     ON outbox(transport, kind, created_ms, outbox_id);
 "#;
 
+const MIGRATE_V4_TO_V5: &str = r#"
+CREATE TABLE telegram_poller_leases (
+    bot_id INTEGER PRIMARY KEY CHECK (bot_id > 0),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    generation_id TEXT NOT NULL REFERENCES generations(generation_id),
+    holder_id TEXT NOT NULL,
+    authority_lease_epoch INTEGER NOT NULL CHECK (authority_lease_epoch >= 1),
+    poller_epoch INTEGER NOT NULL CHECK (poller_epoch >= 1),
+    expires_ms INTEGER NOT NULL CHECK (expires_ms >= 0)
+) STRICT;
+ALTER TABLE telegram_batches ADD COLUMN batch_digest BLOB CHECK (
+    batch_digest IS NULL OR (typeof(batch_digest) = 'blob' AND length(batch_digest) = 32)
+);
+ALTER TABLE telegram_batches ADD COLUMN poller_generation_id TEXT;
+ALTER TABLE telegram_batches ADD COLUMN poller_holder_id TEXT;
+ALTER TABLE telegram_batches ADD COLUMN poller_epoch INTEGER CHECK (
+    poller_epoch IS NULL OR poller_epoch >= 1
+);
+CREATE INDEX telegram_poller_owner
+    ON telegram_poller_leases(generation_id, holder_id, poller_epoch);
+"#;
+
 /// A durable store error with stable refusal categories.
 #[derive(Debug)]
 pub enum StoreError {
@@ -341,6 +363,8 @@ pub enum StoreError {
     LeaseHeld,
     /// The supplied lease holder/epoch is stale or expired.
     StaleEpoch,
+    /// The caller's current authority lease is no longer live.
+    AuthorityLost,
     /// Another live run holds the requested scope.
     ScopeLocked,
     /// A prior run's scope lease expired and its execution must be reconciled.
@@ -371,6 +395,7 @@ impl StoreError {
             Self::IdempotencyConflict(_) => "idempotency_conflict",
             Self::LeaseHeld => "lease_held",
             Self::StaleEpoch => "stale_epoch",
+            Self::AuthorityLost => "authority_lost",
             Self::ScopeLocked => "scope_locked",
             Self::ReconciliationRequired { .. } => "reconciliation_required",
             Self::OutboxReconciliationRequired { .. } => "outbox_reconciliation_required",
@@ -405,6 +430,7 @@ impl fmt::Display for StoreError {
             Self::IdempotencyConflict(key) => write!(formatter, "stable key was reused: {key}"),
             Self::LeaseHeld => formatter.write_str("generation lease is held"),
             Self::StaleEpoch => formatter.write_str("generation lease epoch is stale or expired"),
+            Self::AuthorityLost => formatter.write_str("current generation authority was lost"),
             Self::ScopeLocked => formatter.write_str("work scope is locked"),
             Self::ReconciliationRequired { run_id } => {
                 write!(
@@ -529,6 +555,75 @@ pub struct TelegramBatchIngestion<'a> {
 pub struct TelegramBatchReceipt {
     pub next_offset: u64,
     pub disposition_count: usize,
+    pub duplicate: bool,
+}
+
+/// Exact durable ownership of one bot's polling cursor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TelegramPollerLease {
+    pub bot_id: i64,
+    pub generation_id: String,
+    pub holder_id: String,
+    pub epoch: u64,
+    pub expires_ms: i64,
+}
+
+/// Acquire an absent or expired bot lease under a live generation lease.
+pub struct TelegramPollerLeaseRequest<'a> {
+    pub bot_id: i64,
+    pub generation_id: &'a str,
+    pub holder_id: &'a str,
+    pub authority_lease_epoch: u64,
+    pub now_ms: i64,
+    pub ttl_ms: i64,
+}
+
+/// Renew one exact bot lease under the same live generation authority.
+pub struct TelegramPollerLeaseRenewal<'a> {
+    pub bot_id: i64,
+    pub generation_id: &'a str,
+    pub holder_id: &'a str,
+    pub authority_lease_epoch: u64,
+    pub poller_epoch: u64,
+    pub expected_expires_ms: i64,
+    pub now_ms: i64,
+    pub ttl_ms: i64,
+}
+
+/// Exact live bot lease coordinates used for cursor reads and release.
+pub struct TelegramPollerLeaseIdentity<'a> {
+    pub bot_id: i64,
+    pub generation_id: &'a str,
+    pub holder_id: &'a str,
+    pub poller_epoch: u64,
+    pub expected_expires_ms: i64,
+    pub now_ms: i64,
+}
+
+/// Cursor observation fenced to the exact live bot lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TelegramOffsetReceipt {
+    pub bot_id: i64,
+    pub lease_epoch: u64,
+    pub next_offset: u64,
+}
+
+/// One atomic fenced disposition and cursor commit.
+pub struct TelegramPollerCommit<'a> {
+    pub lease: TelegramPollerLeaseIdentity<'a>,
+    pub commit_before_ms: i64,
+    pub batch_digest: [u8; 32],
+    pub batch: TelegramBatchIngestion<'a>,
+}
+
+/// Runtime-compatible exact acknowledgement of a fenced batch commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TelegramPollerCommitReceipt {
+    pub bot_id: i64,
+    pub lease_epoch: u64,
+    pub next_offset: u64,
+    pub disposition_count: usize,
+    pub batch_digest: [u8; 32],
     pub duplicate: bool,
 }
 
@@ -1187,6 +1282,271 @@ impl Store {
         })
     }
 
+    /// Acquire an absent or expired bot poller lease under live generation authority.
+    pub fn acquire_telegram_poller_lease(
+        &mut self,
+        request: TelegramPollerLeaseRequest<'_>,
+    ) -> Result<TelegramPollerLease, StoreError> {
+        validate_telegram_poller_request(
+            request.bot_id,
+            request.generation_id,
+            request.holder_id,
+            request.now_ms,
+        )?;
+        let expires_ms = checked_expiry(request.now_ms, request.ttl_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_generation_authority_through(
+            &transaction,
+            request.generation_id,
+            request.holder_id,
+            request.authority_lease_epoch,
+            request.now_ms,
+            expires_ms,
+        )?;
+        let current = transaction
+            .query_row(
+                "SELECT p.generation_id, p.holder_id, p.authority_lease_epoch,
+                        p.poller_epoch, p.expires_ms, p.revision,
+                        EXISTS(SELECT 1 FROM generations g
+                               WHERE g.generation_id = p.generation_id
+                                 AND g.lease_holder = p.holder_id
+                                 AND g.lease_epoch = p.authority_lease_epoch
+                                 AND g.lease_expires_ms > ?2)
+                 FROM telegram_poller_leases p WHERE p.bot_id = ?1",
+                params![request.bot_id, request.now_ms],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, bool>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let poller_epoch = match current {
+            None => {
+                transaction.execute(
+                    "INSERT INTO telegram_poller_leases
+                     (bot_id, revision, generation_id, holder_id, authority_lease_epoch,
+                      poller_epoch, expires_ms) VALUES (?1, 1, ?2, ?3, ?4, 1, ?5)",
+                    params![
+                        request.bot_id,
+                        request.generation_id,
+                        request.holder_id,
+                        to_db_u64(request.authority_lease_epoch, "authority_lease_epoch")?,
+                        expires_ms
+                    ],
+                )?;
+                1
+            }
+            Some((
+                generation_id,
+                holder_id,
+                raw_authority_epoch,
+                raw_epoch,
+                old_expiry,
+                raw_revision,
+                owner_authority_live,
+            )) => {
+                let epoch = from_db_u64(raw_epoch, "telegram_poller_epoch")?;
+                if old_expiry > request.now_ms && owner_authority_live {
+                    if generation_id == request.generation_id
+                        && holder_id == request.holder_id
+                        && from_db_u64(raw_authority_epoch, "authority_lease_epoch")?
+                            == request.authority_lease_epoch
+                    {
+                        transaction.commit()?;
+                        return Ok(TelegramPollerLease {
+                            bot_id: request.bot_id,
+                            generation_id,
+                            holder_id,
+                            epoch,
+                            expires_ms: old_expiry,
+                        });
+                    }
+                    return Err(StoreError::LeaseHeld);
+                }
+                let next_epoch = epoch.checked_add(1).ok_or(StoreError::StaleEpoch)?;
+                let next_revision = from_db_u64(raw_revision, "telegram_poller_revision")?
+                    .checked_add(1)
+                    .ok_or(StoreError::InvalidField("telegram_poller_revision"))?;
+                transaction.execute(
+                    "UPDATE telegram_poller_leases SET revision = ?2, generation_id = ?3,
+                     holder_id = ?4, authority_lease_epoch = ?5, poller_epoch = ?6,
+                     expires_ms = ?7 WHERE bot_id = ?1",
+                    params![
+                        request.bot_id,
+                        to_db_u64(next_revision, "telegram_poller_revision")?,
+                        request.generation_id,
+                        request.holder_id,
+                        to_db_u64(request.authority_lease_epoch, "authority_lease_epoch")?,
+                        to_db_u64(next_epoch, "telegram_poller_epoch")?,
+                        expires_ms
+                    ],
+                )?;
+                next_epoch
+            }
+        };
+        transaction.commit()?;
+        Ok(TelegramPollerLease {
+            bot_id: request.bot_id,
+            generation_id: request.generation_id.to_owned(),
+            holder_id: request.holder_id.to_owned(),
+            epoch: poller_epoch,
+            expires_ms,
+        })
+    }
+
+    /// Renew only the exact currently live bot poller lease.
+    pub fn renew_telegram_poller_lease(
+        &mut self,
+        renewal: TelegramPollerLeaseRenewal<'_>,
+    ) -> Result<TelegramPollerLease, StoreError> {
+        validate_telegram_poller_request(
+            renewal.bot_id,
+            renewal.generation_id,
+            renewal.holder_id,
+            renewal.now_ms,
+        )?;
+        let expires_ms = checked_expiry(renewal.now_ms, renewal.ttl_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_generation_authority_through(
+            &transaction,
+            renewal.generation_id,
+            renewal.holder_id,
+            renewal.authority_lease_epoch,
+            renewal.now_ms,
+            expires_ms,
+        )?;
+        let changed = transaction.execute(
+            "UPDATE telegram_poller_leases SET revision = revision + 1, expires_ms = ?7
+             WHERE bot_id = ?1 AND generation_id = ?2 AND holder_id = ?3
+               AND authority_lease_epoch = ?4 AND poller_epoch = ?5
+               AND expires_ms = ?6 AND expires_ms > ?8",
+            params![
+                renewal.bot_id,
+                renewal.generation_id,
+                renewal.holder_id,
+                to_db_u64(renewal.authority_lease_epoch, "authority_lease_epoch")?,
+                to_db_u64(renewal.poller_epoch, "telegram_poller_epoch")?,
+                renewal.expected_expires_ms,
+                expires_ms,
+                renewal.now_ms
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::StaleEpoch);
+        }
+        transaction.commit()?;
+        Ok(TelegramPollerLease {
+            bot_id: renewal.bot_id,
+            generation_id: renewal.generation_id.to_owned(),
+            holder_id: renewal.holder_id.to_owned(),
+            epoch: renewal.poller_epoch,
+            expires_ms,
+        })
+    }
+
+    /// Release one exact live bot poller lease without deleting its fencing epoch.
+    pub fn release_telegram_poller_lease(
+        &mut self,
+        identity: TelegramPollerLeaseIdentity<'_>,
+    ) -> Result<(), StoreError> {
+        validate_telegram_poller_identity(&identity)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_exact_telegram_poller(&transaction, &identity, identity.now_ms)?;
+        let changed = transaction.execute(
+            "UPDATE telegram_poller_leases SET revision = revision + 1, expires_ms = ?6
+             WHERE bot_id = ?1 AND generation_id = ?2 AND holder_id = ?3
+               AND poller_epoch = ?4 AND expires_ms = ?5",
+            params![
+                identity.bot_id,
+                identity.generation_id,
+                identity.holder_id,
+                to_db_u64(identity.poller_epoch, "telegram_poller_epoch")?,
+                identity.expected_expires_ms,
+                identity.now_ms
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::StaleEpoch);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Read the cursor only while the exact bot poller lease remains live.
+    pub fn read_telegram_offset(
+        &mut self,
+        identity: TelegramPollerLeaseIdentity<'_>,
+    ) -> Result<TelegramOffsetReceipt, StoreError> {
+        validate_telegram_poller_identity(&identity)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        require_exact_telegram_poller(&transaction, &identity, identity.now_ms)?;
+        let next_offset = transaction
+            .query_row(
+                "SELECT next_offset FROM telegram_offsets WHERE bot_id = ?1",
+                [identity.bot_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|value| telegram_offset_from_bytes(&value))
+            .transpose()?
+            .unwrap_or(0);
+        transaction.commit()?;
+        Ok(TelegramOffsetReceipt {
+            bot_id: identity.bot_id,
+            lease_epoch: identity.poller_epoch,
+            next_offset,
+        })
+    }
+
+    /// Atomically persist every disposition and cursor under an exact live bot lease.
+    pub fn commit_telegram_batch(
+        &mut self,
+        commit: TelegramPollerCommit<'_>,
+    ) -> Result<TelegramPollerCommitReceipt, StoreError> {
+        validate_telegram_poller_identity(&commit.lease)?;
+        validate_telegram_batch(&commit.batch)?;
+        if commit.batch.bot_id != commit.lease.bot_id {
+            return Err(StoreError::InvalidField("telegram_bot_id"));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(receipt) = exact_telegram_commit_receipt(&transaction, &commit)? {
+            transaction.commit()?;
+            return Ok(receipt);
+        }
+        if commit.lease.now_ms >= commit.lease.expected_expires_ms {
+            return Err(StoreError::StaleEpoch);
+        }
+        if commit.commit_before_ms <= commit.lease.now_ms
+            || commit.commit_before_ms > commit.lease.expected_expires_ms
+        {
+            return Err(StoreError::InvalidField("telegram_commit_deadline"));
+        }
+        require_exact_telegram_poller(&transaction, &commit.lease, commit.commit_before_ms - 1)?;
+        let receipt = commit_fenced_telegram_batch(&transaction, &commit)?;
+        transaction.commit()?;
+        Ok(receipt)
+    }
+
+    /// Legacy unfenced ingestion retained for migration fixtures. Runtime code
+    /// must use `commit_telegram_batch`.
+    #[doc(hidden)]
     /// Atomically persist every disposition in a parsed Telegram batch and
     /// advance that bot's offset only after all rows are durable.
     pub fn ingest_telegram_batch(
@@ -1772,7 +2132,7 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_live_lease(
+        require_reconciliation_authority(
             &transaction,
             request.authority_generation_id,
             request.authority_holder_id,
@@ -2624,7 +2984,7 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_live_lease(
+        require_reconciliation_authority(
             &transaction,
             request.authority_generation_id,
             request.authority_holder_id,
@@ -2883,14 +3243,20 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
             return Err(StoreError::MigrationInvariant("foreign_key_check"));
         }
         migrate_v2_to_v3(connection)?;
-        return migrate_v3_to_v4(connection);
+        migrate_v3_to_v4(connection)?;
+        return migrate_v4_to_v5(connection);
     }
     if version == 2 {
         migrate_v2_to_v3(connection)?;
-        return migrate_v3_to_v4(connection);
+        migrate_v3_to_v4(connection)?;
+        return migrate_v4_to_v5(connection);
     }
     if version == 3 {
-        return migrate_v3_to_v4(connection);
+        migrate_v3_to_v4(connection)?;
+        return migrate_v4_to_v5(connection);
+    }
+    if version == 4 {
+        return migrate_v4_to_v5(connection);
     }
     if version != 0 {
         return Err(StoreError::SchemaVersion {
@@ -2913,6 +3279,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
     transaction.execute_batch(SCHEMA_V2)?;
     transaction.execute_batch(MIGRATE_V2_TO_V3)?;
     transaction.execute_batch(MIGRATE_V3_TO_V4)?;
+    transaction.execute_batch(MIGRATE_V4_TO_V5)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -2929,9 +3296,280 @@ fn migrate_v2_to_v3(connection: &mut Connection) -> Result<(), StoreError> {
 fn migrate_v3_to_v4(connection: &mut Connection) -> Result<(), StoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(MIGRATE_V3_TO_V4)?;
+    transaction.pragma_update(None, "user_version", 4)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v4_to_v5(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(MIGRATE_V4_TO_V5)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
+}
+
+fn validate_telegram_poller_request(
+    bot_id: i64,
+    generation_id: &str,
+    holder_id: &str,
+    now_ms: i64,
+) -> Result<(), StoreError> {
+    if bot_id <= 0 {
+        return Err(StoreError::InvalidField("telegram_bot_id"));
+    }
+    validate_id(generation_id, "generation_id")?;
+    validate_id(holder_id, "holder_id")?;
+    validate_time(now_ms)
+}
+
+fn validate_telegram_poller_identity(
+    identity: &TelegramPollerLeaseIdentity<'_>,
+) -> Result<(), StoreError> {
+    validate_telegram_poller_request(
+        identity.bot_id,
+        identity.generation_id,
+        identity.holder_id,
+        identity.now_ms,
+    )?;
+    if identity.poller_epoch == 0 || identity.expected_expires_ms < 0 {
+        return Err(StoreError::InvalidField("telegram_poller_lease"));
+    }
+    Ok(())
+}
+
+fn require_generation_authority_through(
+    transaction: &Transaction<'_>,
+    generation_id: &str,
+    holder_id: &str,
+    authority_lease_epoch: u64,
+    now_ms: i64,
+    required_through_ms: i64,
+) -> Result<(), StoreError> {
+    let valid: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generations
+            WHERE generation_id = ?1 AND lease_holder = ?2 AND lease_epoch = ?3
+              AND lease_expires_ms > ?4 AND lease_expires_ms >= ?5
+         )",
+        params![
+            generation_id,
+            holder_id,
+            to_db_u64(authority_lease_epoch, "authority_lease_epoch")?,
+            now_ms,
+            required_through_ms
+        ],
+        |row| row.get(0),
+    )?;
+    if valid {
+        Ok(())
+    } else {
+        Err(StoreError::StaleEpoch)
+    }
+}
+
+fn require_exact_telegram_poller(
+    transaction: &Transaction<'_>,
+    identity: &TelegramPollerLeaseIdentity<'_>,
+    live_at_ms: i64,
+) -> Result<(), StoreError> {
+    let valid: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM telegram_poller_leases p
+            JOIN generations g ON g.generation_id = p.generation_id
+            WHERE p.bot_id = ?1 AND p.generation_id = ?2 AND p.holder_id = ?3
+              AND p.poller_epoch = ?4 AND p.expires_ms = ?5 AND p.expires_ms > ?6
+              AND g.lease_holder = p.holder_id
+              AND g.lease_epoch = p.authority_lease_epoch
+              AND g.lease_expires_ms > ?6
+         )",
+        params![
+            identity.bot_id,
+            identity.generation_id,
+            identity.holder_id,
+            to_db_u64(identity.poller_epoch, "telegram_poller_epoch")?,
+            identity.expected_expires_ms,
+            live_at_ms
+        ],
+        |row| row.get(0),
+    )?;
+    if valid {
+        Ok(())
+    } else {
+        Err(StoreError::StaleEpoch)
+    }
+}
+
+fn commit_fenced_telegram_batch(
+    transaction: &Transaction<'_>,
+    commit: &TelegramPollerCommit<'_>,
+) -> Result<TelegramPollerCommitReceipt, StoreError> {
+    let batch = &commit.batch;
+    if batch.updates.is_empty() {
+        return Ok(TelegramPollerCommitReceipt {
+            bot_id: batch.bot_id,
+            lease_epoch: commit.lease.poller_epoch,
+            next_offset: batch.next_offset,
+            disposition_count: 0,
+            batch_digest: commit.batch_digest,
+            duplicate: false,
+        });
+    }
+    let expected = telegram_offset_bytes(batch.expected_offset);
+    let next = telegram_offset_bytes(batch.next_offset);
+    let existing = transaction
+        .query_row(
+            "SELECT next_offset FROM telegram_offsets WHERE bot_id = ?1",
+            [batch.bot_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .map(|value| telegram_offset_from_bytes(&value))
+        .transpose()?;
+    match existing {
+        Some(current) if current == batch.next_offset => {
+            return Err(StoreError::IdempotencyConflict("telegram_batch_lease"));
+        }
+        Some(current) if current != batch.expected_offset => {
+            return Err(StoreError::IdempotencyConflict("telegram_offset"));
+        }
+        Some(_) => {}
+        None if batch.expected_offset != 0 => {
+            return Err(StoreError::IdempotencyConflict("telegram_offset"));
+        }
+        None => {
+            transaction.execute(
+                "INSERT INTO telegram_offsets
+                 (bot_id, next_offset, revision, updated_ms) VALUES (?1, ?2, 1, ?3)",
+                params![batch.bot_id, &expected[..], batch.received_ms],
+            )?;
+        }
+    }
+    for update in batch.updates {
+        if transaction
+            .query_row(
+                "SELECT 1 FROM telegram_ingress WHERE bot_id = ?1 AND update_id = ?2",
+                params![batch.bot_id, &telegram_offset_bytes(update.update_id)[..]],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(StoreError::IdempotencyConflict("telegram_update"));
+        }
+        if transaction
+            .query_row(
+                "SELECT 1 FROM telegram_ingress WHERE source_key = ?1",
+                [update.source_key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(StoreError::IdempotencyConflict("telegram_source_key"));
+        }
+        let (disposition, content) = telegram_disposition_parts(update.disposition);
+        transaction.execute(
+            "INSERT INTO telegram_ingress
+             (bot_id, update_id, source_key, scope, disposition, content, received_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                batch.bot_id,
+                &telegram_offset_bytes(update.update_id)[..],
+                update.source_key,
+                update.scope,
+                disposition,
+                content,
+                batch.received_ms
+            ],
+        )?;
+    }
+    if batch.next_offset != batch.expected_offset {
+        transaction.execute(
+            "INSERT INTO telegram_batches
+             (bot_id, expected_offset, next_offset, disposition_count, received_ms,
+              batch_digest, poller_generation_id, poller_holder_id, poller_epoch)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                batch.bot_id,
+                &expected[..],
+                &next[..],
+                to_db_u64(batch.updates.len() as u64, "telegram_disposition_count")?,
+                batch.received_ms,
+                &commit.batch_digest[..],
+                commit.lease.generation_id,
+                commit.lease.holder_id,
+                to_db_u64(commit.lease.poller_epoch, "telegram_poller_epoch")?
+            ],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE telegram_offsets SET next_offset = ?3, revision = revision + 1,
+             updated_ms = ?4 WHERE bot_id = ?1 AND next_offset = ?2",
+            params![batch.bot_id, &expected[..], &next[..], batch.received_ms],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::IdempotencyConflict("telegram_offset"));
+        }
+    }
+    Ok(TelegramPollerCommitReceipt {
+        bot_id: batch.bot_id,
+        lease_epoch: commit.lease.poller_epoch,
+        next_offset: batch.next_offset,
+        disposition_count: batch.updates.len(),
+        batch_digest: commit.batch_digest,
+        duplicate: false,
+    })
+}
+
+fn exact_telegram_commit_receipt(
+    transaction: &Transaction<'_>,
+    commit: &TelegramPollerCommit<'_>,
+) -> Result<Option<TelegramPollerCommitReceipt>, StoreError> {
+    if commit.batch.updates.is_empty() {
+        return Ok(None);
+    }
+    let current = transaction
+        .query_row(
+            "SELECT next_offset FROM telegram_offsets WHERE bot_id = ?1",
+            [commit.batch.bot_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .map(|value| telegram_offset_from_bytes(&value))
+        .transpose()?;
+    if current != Some(commit.batch.next_offset) {
+        return Ok(None);
+    }
+    verify_telegram_retry(transaction, &commit.batch)?;
+    let exact: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM telegram_batches
+            WHERE bot_id = ?1 AND expected_offset = ?2 AND next_offset = ?3
+              AND batch_digest = ?4 AND poller_generation_id = ?5
+              AND poller_holder_id = ?6 AND poller_epoch = ?7
+         )",
+        params![
+            commit.batch.bot_id,
+            &telegram_offset_bytes(commit.batch.expected_offset)[..],
+            &telegram_offset_bytes(commit.batch.next_offset)[..],
+            &commit.batch_digest[..],
+            commit.lease.generation_id,
+            commit.lease.holder_id,
+            to_db_u64(commit.lease.poller_epoch, "telegram_poller_epoch")?
+        ],
+        |row| row.get(0),
+    )?;
+    if !exact {
+        return Err(StoreError::IdempotencyConflict("telegram_batch_lease"));
+    }
+    Ok(Some(TelegramPollerCommitReceipt {
+        bot_id: commit.batch.bot_id,
+        lease_epoch: commit.lease.poller_epoch,
+        next_offset: commit.batch.next_offset,
+        disposition_count: commit.batch.updates.len(),
+        batch_digest: commit.batch_digest,
+        duplicate: true,
+    }))
 }
 
 fn validate_telegram_batch(batch: &TelegramBatchIngestion<'_>) -> Result<(), StoreError> {
@@ -3249,6 +3887,22 @@ fn require_live_lease(
     expiry.ok_or(StoreError::StaleEpoch)
 }
 
+fn require_reconciliation_authority(
+    transaction: &Transaction<'_>,
+    generation_id: &str,
+    holder_id: &str,
+    epoch: u64,
+    now_ms: i64,
+) -> Result<i64, StoreError> {
+    require_live_lease(transaction, generation_id, holder_id, epoch, now_ms).map_err(|error| {
+        if matches!(error, StoreError::StaleEpoch) {
+            StoreError::AuthorityLost
+        } else {
+            error
+        }
+    })
+}
+
 fn append_event(
     transaction: &Transaction<'_>,
     aggregate_kind: &str,
@@ -3434,6 +4088,131 @@ fn query_count(transaction: &Transaction<'_>, sql: &str) -> Result<u64, StoreErr
 #[cfg(test)]
 mod migration_tests {
     use super::*;
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct LegacyTelegramBatch {
+        disposition_count: i64,
+        batch_digest: Option<Vec<u8>>,
+        generation_id: Option<String>,
+        holder_id: Option<String>,
+        poller_epoch: Option<i64>,
+    }
+
+    #[test]
+    fn populated_canonical_v4_preserves_telegram_rows_and_adds_null_provenance() {
+        let mut connection = Connection::open_in_memory().expect("memory database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        connection.execute_batch(SCHEMA_V2).expect("v2 base");
+        connection
+            .execute_batch(MIGRATE_V2_TO_V3)
+            .expect("v3 schema");
+        connection
+            .execute_batch(MIGRATE_V3_TO_V4)
+            .expect("canonical v4 schema");
+        connection
+            .pragma_update(None, "user_version", 4)
+            .expect("v4 marker");
+        let update_id = u64::MAX - 1;
+        connection
+            .execute(
+                "INSERT INTO telegram_offsets
+                 (bot_id, next_offset, revision, updated_ms) VALUES (?1, ?2, 2, 9)",
+                params![7, &telegram_offset_bytes(u64::MAX)[..]],
+            )
+            .expect("populated offset");
+        connection
+            .execute(
+                "INSERT INTO telegram_ingress
+                 (bot_id, update_id, source_key, scope, disposition, content, received_ms)
+                 VALUES (?1, ?2, ?3, 'telegram:7:chat', 'denied', NULL, 9)",
+                params![
+                    7,
+                    &telegram_offset_bytes(update_id)[..],
+                    format!("telegram:7:update:{update_id}")
+                ],
+            )
+            .expect("populated disposition");
+        connection
+            .execute(
+                "INSERT INTO telegram_batches
+                 (bot_id, expected_offset, next_offset, disposition_count, received_ms)
+                 VALUES (?1, ?2, ?3, 1, 9)",
+                params![
+                    7,
+                    &telegram_offset_bytes(0)[..],
+                    &telegram_offset_bytes(u64::MAX)[..]
+                ],
+            )
+            .expect("populated batch");
+
+        initialize_or_validate_schema(&mut connection).expect("v5 migration");
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
+        let offset: Vec<u8> = connection
+            .query_row(
+                "SELECT next_offset FROM telegram_offsets WHERE bot_id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preserved offset");
+        assert_eq!(
+            telegram_offset_from_bytes(&offset).expect("offset"),
+            u64::MAX
+        );
+        let disposition: (String, String, Option<Vec<u8>>) = connection
+            .query_row(
+                "SELECT source_key, disposition, content FROM telegram_ingress
+                 WHERE bot_id = 7 AND update_id = ?1",
+                [&telegram_offset_bytes(update_id)[..]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("preserved disposition");
+        assert_eq!(
+            disposition,
+            (
+                format!("telegram:7:update:{update_id}"),
+                "denied".to_owned(),
+                None
+            )
+        );
+        let batch: LegacyTelegramBatch = connection
+            .query_row(
+                "SELECT disposition_count, batch_digest, poller_generation_id,
+                            poller_holder_id, poller_epoch
+                     FROM telegram_batches WHERE bot_id = 7 AND expected_offset = ?1",
+                [&telegram_offset_bytes(0)[..]],
+                |row| {
+                    Ok(LegacyTelegramBatch {
+                        disposition_count: row.get(0)?,
+                        batch_digest: row.get(1)?,
+                        generation_id: row.get(2)?,
+                        holder_id: row.get(3)?,
+                        poller_epoch: row.get(4)?,
+                    })
+                },
+            )
+            .expect("preserved batch");
+        assert_eq!(
+            batch,
+            LegacyTelegramBatch {
+                disposition_count: 1,
+                batch_digest: None,
+                generation_id: None,
+                holder_id: None,
+                poller_epoch: None,
+            }
+        );
+        let poller_rows: i64 = connection
+            .query_row("SELECT count(*) FROM telegram_poller_leases", [], |row| {
+                row.get(0)
+            })
+            .expect("empty ownership table");
+        assert_eq!(poller_rows, 0);
+    }
 
     #[test]
     fn canonical_v3_outbox_migrates_without_making_delivered_work_ready() {

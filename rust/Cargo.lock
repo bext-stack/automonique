@@ -121,8 +121,10 @@ dependencies = [
 name = "automonique-transport-runtime"
 version = "0.1.0"
 dependencies = [
+ "automonique-store",
  "automonique-transports",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]

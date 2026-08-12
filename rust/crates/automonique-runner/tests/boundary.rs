@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-use automonique_runner::{BoundaryRequirement, BoundarySubject, ExecutionBoundaryAssessment};
+use automonique_runner::{
+    BoundaryRequirement, BoundarySubject, ExecutionBoundaryAssessment, LaunchBlocker,
+};
 
 fn subject() -> BoundarySubject {
     BoundarySubject::new(
@@ -19,6 +21,14 @@ fn current_linux_host_observation_never_grants_launch_authority() {
     let refusal = assessment.launch_refusal();
     assert_eq!(refusal.evidence_sha256(), assessment.evidence_sha256());
     assert_eq!(refusal.unenforced_requirements(), BoundaryRequirement::ALL);
+    assert_eq!(
+        refusal.blockers(),
+        [LaunchBlocker::MissingDescriptorClosure]
+    );
+    assert_eq!(
+        refusal.blockers()[0].category(),
+        "missing_descriptor_closure"
+    );
     for requirement in BoundaryRequirement::ALL {
         assert!(
             !assessment.status(requirement).is_enforced(),

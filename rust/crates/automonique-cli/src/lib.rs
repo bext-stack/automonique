@@ -34,7 +34,7 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
-const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique shutdown\n";
+const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique shutdown\n";
 
 #[derive(Clone)]
 enum Command {
@@ -57,6 +57,17 @@ enum Command {
         epoch: OsString,
         revision: OsString,
         decision_key: OsString,
+    },
+    OutboxInspect {
+        outbox_id: OsString,
+    },
+    OutboxReconcile {
+        decision: OsString,
+        outbox_id: OsString,
+        generation_id: OsString,
+        epoch: OsString,
+        attempt: OsString,
+        revision: OsString,
     },
     Shutdown,
 }
@@ -131,6 +142,36 @@ where
                 }
             }
         }
+        (Some(command), Some(action), Some(outbox_id), None)
+            if command == "outbox" && action == "inspect" =>
+        {
+            Command::OutboxInspect { outbox_id }
+        }
+        (Some(command), Some(action), Some(decision), Some(outbox_id))
+            if command == "outbox" && action == "reconcile" =>
+        {
+            let generation_id = arguments.next();
+            let epoch = arguments.next();
+            let attempt = arguments.next();
+            let revision = arguments.next();
+            let extra = arguments.next();
+            match (generation_id, epoch, attempt, revision, extra) {
+                (Some(generation_id), Some(epoch), Some(attempt), Some(revision), None) => {
+                    Command::OutboxReconcile {
+                        decision,
+                        outbox_id,
+                        generation_id,
+                        epoch,
+                        attempt,
+                        revision,
+                    }
+                }
+                _ => {
+                    let _ = stderr.write_all(USAGE.as_bytes());
+                    return 2;
+                }
+            }
+        }
         (Some(command), None, None, None) if command == "shutdown" => Command::Shutdown,
         _ => {
             let _ = stderr.write_all(USAGE.as_bytes());
@@ -177,6 +218,32 @@ where
                 &mut stderr,
             );
         }
+        Command::OutboxInspect { outbox_id } => {
+            return admin_outbox_inspect(runtime.as_deref(), outbox_id, &mut stdout, &mut stderr);
+        }
+        Command::OutboxReconcile {
+            decision,
+            outbox_id,
+            generation_id,
+            epoch,
+            attempt,
+            revision,
+        } => {
+            return admin_outbox_reconcile(
+                runtime.as_deref(),
+                OutboxCliCoordinates {
+                    decision,
+                    outbox_id,
+                    generation_id,
+                    epoch,
+                    attempt,
+                    revision,
+                },
+                &mut input,
+                &mut stdout,
+                &mut stderr,
+            );
+        }
         Command::Shutdown => {
             return admin_shutdown(runtime.as_deref(), &mut stdout, &mut stderr);
         }
@@ -201,6 +268,155 @@ where
         0
     } else {
         1
+    }
+}
+
+fn admin_outbox_inspect<W: Write, E: Write>(
+    runtime: Option<&OsStr>,
+    outbox_id: OsString,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> u8 {
+    let outbox_id = match parse_u64_coordinate(outbox_id, "outbox_id") {
+        Ok(value) => value,
+        Err(category) => {
+            let _ = writeln!(stderr, "automonique outbox refused: {category}");
+            return 2;
+        }
+    };
+    match admin_client::request(runtime, admin_client::Operation::InspectOutbox(outbox_id)) {
+        Ok(automonique_protocol::admin::AdminResponse::OutboxInspected { evidence, .. }) => {
+            if writeln!(
+                stdout,
+                "Automonique outbox: outbox_id={} intent_key={} transport={} kind={} state={} revision={} attempt={} lease_generation={} lease_holder={} lease_epoch={} lease_expires_ms={} lease_token_present={} delivery_receipt_present={}",
+                evidence.outbox_id(), evidence.intent_key(), evidence.transport(), evidence.kind(), evidence.state(), evidence.revision(), evidence.attempt(),
+                evidence.lease_generation_id().unwrap_or("-"), evidence.lease_holder().unwrap_or("-"),
+                evidence.lease_epoch().map_or_else(|| "-".to_owned(), |value| value.to_string()),
+                evidence.lease_expires_ms().map_or_else(|| "-".to_owned(), |value| value.to_string()),
+                evidence.lease_token().is_some(), evidence.delivery_receipt_key().is_some(),
+            ).is_ok() { 0 } else { 1 }
+        }
+        Ok(_) => { let _ = stderr.write_all(b"automonique outbox refused: response_mismatch\n"); 1 }
+        Err(error) => { let _ = writeln!(stderr, "automonique outbox refused: {}", error.category()); 1 }
+    }
+}
+
+struct OutboxCliCoordinates {
+    decision: OsString,
+    outbox_id: OsString,
+    generation_id: OsString,
+    epoch: OsString,
+    attempt: OsString,
+    revision: OsString,
+}
+
+fn admin_outbox_reconcile<R: Read, W: Write, E: Write>(
+    runtime: Option<&OsStr>,
+    coordinates: OutboxCliCoordinates,
+    input: &mut R,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> u8 {
+    let mut secret_input = Vec::new();
+    if input
+        .take((automonique_protocol::admin::MAX_RECONCILIATION_FIELD_BYTES + 2) as u64)
+        .read_to_end(&mut secret_input)
+        .is_err()
+        || secret_input.len() > automonique_protocol::admin::MAX_RECONCILIATION_FIELD_BYTES + 1
+    {
+        let _ = stderr.write_all(b"automonique outbox refused: invalid_private_input\n");
+        return 2;
+    }
+    let Ok(secret_input) = std::str::from_utf8(&secret_input) else {
+        let _ = stderr.write_all(b"automonique outbox refused: invalid_private_input\n");
+        return 2;
+    };
+    let mut private_fields = secret_input.lines();
+    let (Some(value), None) = (private_fields.next(), private_fields.next()) else {
+        let _ = stderr.write_all(b"automonique outbox refused: invalid_private_input\n");
+        return 2;
+    };
+    let parsed = (
+        parse_u64_coordinate(coordinates.outbox_id, "outbox_id"),
+        parse_u64_coordinate(coordinates.epoch, "epoch"),
+        parse_u64_coordinate(coordinates.attempt, "attempt"),
+        parse_u64_coordinate(coordinates.revision, "revision"),
+        coordinates.decision.into_string(),
+        coordinates.generation_id.into_string(),
+    );
+    let (Ok(outbox_id), Ok(epoch), Ok(attempt), Ok(revision), Ok(decision), Ok(generation_id)) =
+        parsed
+    else {
+        let _ = stderr.write_all(b"automonique outbox refused: invalid_coordinates\n");
+        return 2;
+    };
+    let decision = match decision.as_str() {
+        "delivered" => automonique_protocol::admin::OutboxReconciliationDecision::Delivered {
+            receipt_key: value.to_owned(),
+        },
+        "dead-letter" => automonique_protocol::admin::OutboxReconciliationDecision::DeadLetter {
+            reason: value.to_owned(),
+        },
+        _ => {
+            let _ = stderr.write_all(b"automonique outbox refused: invalid_decision\n");
+            return 2;
+        }
+    };
+    let lease_token =
+        match admin_client::request(runtime, admin_client::Operation::InspectOutbox(outbox_id)) {
+            Ok(automonique_protocol::admin::AdminResponse::OutboxInspected {
+                evidence, ..
+            }) if evidence.lease_generation_id() == Some(generation_id.as_str())
+                && evidence.lease_epoch() == Some(epoch)
+                && evidence.attempt() == attempt
+                && (evidence.revision() == revision
+                    || (matches!(evidence.state(), "delivered" | "dead_lettered")
+                        && revision.checked_add(1) == Some(evidence.revision()))) =>
+            {
+                match evidence.lease_token() {
+                    Some(token) => token.to_owned(),
+                    None => {
+                        let _ = stderr.write_all(b"automonique outbox refused: stale_evidence\n");
+                        return 1;
+                    }
+                }
+            }
+            Ok(automonique_protocol::admin::AdminResponse::OutboxInspected { .. }) => {
+                let _ = stderr.write_all(b"automonique outbox refused: stale_evidence\n");
+                return 1;
+            }
+            Ok(_) => {
+                let _ = stderr.write_all(b"automonique outbox refused: response_mismatch\n");
+                return 1;
+            }
+            Err(error) => {
+                let _ = writeln!(stderr, "automonique outbox refused: {}", error.category());
+                return 1;
+            }
+        };
+    let reconciliation = match automonique_protocol::admin::OutboxReconciliation::new(
+        automonique_protocol::admin::OutboxReconciliationParts {
+            outbox_id,
+            expected_generation_id: generation_id,
+            expected_lease_epoch: epoch,
+            expected_lease_token: lease_token,
+            expected_attempt: attempt,
+            expected_revision: revision,
+            decision,
+        },
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = writeln!(stderr, "automonique outbox refused: {}", error.category());
+            return 2;
+        }
+    };
+    match admin_client::request(runtime, admin_client::Operation::ReconcileOutbox(reconciliation)) {
+        Ok(automonique_protocol::admin::AdminResponse::OutboxReconciled { outbox_id, state, revision, duplicate, .. }) => {
+            if writeln!(stdout, "Automonique outbox reconciled: outbox_id={outbox_id} state={state} revision={revision} duplicate={duplicate}").is_ok() { 0 } else { 1 }
+        }
+        Ok(_) => { let _ = stderr.write_all(b"automonique outbox refused: response_mismatch\n"); 1 }
+        Err(error) => { let _ = writeln!(stderr, "automonique outbox refused: {}", error.category()); 1 }
     }
 }
 

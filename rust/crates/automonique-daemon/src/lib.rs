@@ -18,13 +18,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use automonique_protocol::admin::{
-    AdminInstanceId, AdminReconciliationEvidence, AdminRefusalCategory, AdminRequest,
-    AdminResponse, DaemonState, DaemonStatus, MAX_ADMIN_CANONICAL_BYTES,
+    AdminInstanceId, AdminOutboxEvidence, AdminOutboxEvidenceParts, AdminReconciliationEvidence,
+    AdminRefusalCategory, AdminRequest, AdminResponse, DaemonState, DaemonStatus,
+    MAX_ADMIN_CANONICAL_BYTES, OutboxReconciliationDecision,
 };
 use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, decode_frame, encode_frame};
 use automonique_store::{
-    InboxSubmission, LeaseRenewal, LeaseRequest, ReconciliationDecision, ReconciliationRequest,
-    Store, StoreError,
+    InboxSubmission, LeaseRenewal, LeaseRequest,
+    OutboxReconciliationDecision as StoreOutboxDecision, OutboxReconciliationRequest,
+    ReconciliationDecision, ReconciliationRequest, Store, StoreError,
 };
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
@@ -537,6 +539,85 @@ impl Daemon {
                         .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
                     outbox_id: u64::try_from(receipt.outbox_id)
                         .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
+                    duplicate: receipt.duplicate,
+                }
+            }
+            automonique_protocol::admin::AdminCommand::InspectOutbox => {
+                let outbox_id = request
+                    .outbox_id()
+                    .and_then(|value| i64::try_from(value).ok())
+                    .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
+                let evidence = match self.store.inspect_outbox_reconciliation(outbox_id) {
+                    Ok(evidence) => evidence,
+                    Err(error) if reconciliation_command_refusal(&error) => {
+                        return self.write_refusal(stream, request.request_id(), error.category());
+                    }
+                    Err(error) => return Err(DaemonError::Store(error)),
+                };
+                AdminResponse::OutboxInspected {
+                    request_id: request.request_id().clone(),
+                    evidence: AdminOutboxEvidence::new(AdminOutboxEvidenceParts {
+                        outbox_id: u64::try_from(evidence.outbox_id)
+                            .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
+                        intent_key: evidence.intent_key,
+                        transport: evidence.transport,
+                        kind: evidence.kind,
+                        state: evidence.state,
+                        revision: evidence.revision,
+                        attempt: evidence.attempt,
+                        lease_token: evidence.lease_token,
+                        lease_generation_id: evidence.lease_generation_id,
+                        lease_holder: evidence.lease_holder,
+                        lease_epoch: evidence.lease_epoch,
+                        lease_expires_ms: evidence
+                            .lease_expires_ms
+                            .map(u64::try_from)
+                            .transpose()
+                            .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
+                        delivery_receipt_key: evidence.delivery_receipt_key,
+                    })
+                    .map_err(|error| DaemonError::ProtocolRefused(error.category()))?,
+                }
+            }
+            automonique_protocol::admin::AdminCommand::ReconcileOutbox => {
+                let reconciliation = request
+                    .outbox_reconciliation()
+                    .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
+                let outbox_id = i64::try_from(reconciliation.outbox_id())
+                    .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?;
+                let decision = match reconciliation.decision() {
+                    OutboxReconciliationDecision::Delivered { receipt_key } => {
+                        StoreOutboxDecision::Delivered { receipt_key }
+                    }
+                    OutboxReconciliationDecision::DeadLetter { reason } => {
+                        StoreOutboxDecision::DeadLetter { reason }
+                    }
+                };
+                let receipt = match self.store.reconcile_outbox(OutboxReconciliationRequest {
+                    outbox_id,
+                    authority_generation_id: GENERATION_ID,
+                    authority_holder_id: self.instance_id.as_str(),
+                    authority_lease_epoch: self.lease_epoch,
+                    expected_generation_id: reconciliation.expected_generation_id(),
+                    expected_lease_epoch: reconciliation.expected_lease_epoch(),
+                    expected_lease_token: reconciliation.expected_lease_token(),
+                    expected_attempt: reconciliation.expected_attempt(),
+                    expected_revision: reconciliation.expected_revision(),
+                    now_ms: unix_millis()?,
+                    decision,
+                }) {
+                    Ok(receipt) => receipt,
+                    Err(error) if reconciliation_command_refusal(&error) => {
+                        return self.write_refusal(stream, request.request_id(), error.category());
+                    }
+                    Err(error) => return Err(DaemonError::Store(error)),
+                };
+                AdminResponse::OutboxReconciled {
+                    request_id: request.request_id().clone(),
+                    outbox_id: u64::try_from(receipt.outbox_id)
+                        .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
+                    state: receipt.state,
+                    revision: receipt.revision,
                     duplicate: receipt.duplicate,
                 }
             }

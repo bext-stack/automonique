@@ -5,6 +5,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use automonique_store::{
+    InboxSubmission, LeaseRequest, OutboxClaimRequest, SchedulerClaim, Store, TerminalRun,
+    TerminalState,
+};
+
 fn roots() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     let root = tempfile::tempdir().expect("temporary root");
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
@@ -76,6 +81,161 @@ fn wait_ready(runtime: &std::path::Path, state: &std::path::Path) {
         assert!(Instant::now() < deadline, "daemon did not become ready");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn seed_expired_outbox(state: &std::path::Path) -> (u64, String, u64, u64, u64) {
+    let product = state.join("automonique");
+    std::fs::create_dir(&product).expect("state directory");
+    std::fs::set_permissions(&product, std::fs::Permissions::from_mode(0o700))
+        .expect("private state");
+    let mut store = Store::open(product.join("automonique.sqlite3")).expect("store");
+    let generation = store
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "foreground",
+            holder_id: "crashed-cli",
+            now_ms: 1,
+            ttl_ms: 100,
+        })
+        .expect("generation");
+    store
+        .submit_inbox(InboxSubmission {
+            transport: "local.synthetic",
+            transport_key: "cli:outbox",
+            scope: "workspace:cli-outbox",
+            payload: b"inbox-private",
+            received_ms: 2,
+        })
+        .expect("inbox");
+    let run = store
+        .claim_next(SchedulerClaim {
+            transport: "local.synthetic",
+            generation_id: "foreground",
+            holder_id: "crashed-cli",
+            lease_epoch: generation.epoch,
+            now_ms: 3,
+        })
+        .expect("claim")
+        .expect("run");
+    store
+        .finish_run(TerminalRun {
+            run_id: run.run_id,
+            generation_id: "foreground",
+            holder_id: "crashed-cli",
+            lease_epoch: generation.epoch,
+            expected_revision: 1,
+            now_ms: 4,
+            state: TerminalState::Succeeded,
+            event_kind: "run.succeeded",
+            event_payload: b"event",
+            outbox_intent_key: "fake:cli-outbox",
+            outbox_kind: "fake.receipt",
+            outbox_payload: b"must-never-appear-in-cli",
+        })
+        .expect("outbox");
+    let lease = store
+        .claim_outbox(OutboxClaimRequest {
+            transport: "fake",
+            kind: "fake.receipt",
+            generation_id: "foreground",
+            holder_id: "crashed-cli",
+            lease_epoch: generation.epoch,
+            now_ms: 5,
+            ttl_ms: 10,
+        })
+        .expect("claim outbox")
+        .expect("outbox lease");
+    (
+        u64::try_from(lease.outbox_id).expect("id"),
+        lease.lease_token,
+        generation.epoch,
+        lease.attempt,
+        lease.revision,
+    )
+}
+
+#[test]
+fn cli_inspects_and_dead_letters_exact_expired_outbox_without_exposing_payload() {
+    let (_root, runtime, state) = roots();
+    let (outbox_id, token, epoch, attempt, revision) = seed_expired_outbox(&state);
+    let mut daemon = launch(&runtime, &state);
+    wait_ready(&runtime, &state);
+    let id = outbox_id.to_string();
+    let inspect = run(&runtime, &state, &["outbox", "inspect", &id]);
+    assert!(
+        inspect.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let inspected = String::from_utf8(inspect.stdout).expect("inspection");
+    assert!(inspected.contains("state=in_flight"), "{inspected}");
+    assert!(
+        inspected.contains("lease_token_present=true"),
+        "{inspected}"
+    );
+    assert!(!inspected.contains(&token), "{inspected}");
+    assert!(
+        !inspected.contains("must-never-appear-in-cli"),
+        "{inspected}"
+    );
+
+    let epoch = epoch.to_string();
+    let attempt = attempt.to_string();
+    let revision = revision.to_string();
+    let private_input = "operator_refused\n";
+    let wrong = run_with_stdin(
+        &runtime,
+        &state,
+        &[
+            "outbox",
+            "reconcile",
+            "dead-letter",
+            &id,
+            "wrong-generation",
+            &epoch,
+            &attempt,
+            &revision,
+        ],
+        private_input.as_bytes(),
+    );
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("stale_evidence"));
+    let unchanged = run(&runtime, &state, &["outbox", "inspect", &id]);
+    assert!(String::from_utf8_lossy(&unchanged.stdout).contains("state=in_flight"));
+
+    let exact_args = [
+        "outbox",
+        "reconcile",
+        "dead-letter",
+        &id,
+        "foreground",
+        &epoch,
+        &attempt,
+        &revision,
+    ];
+    let resolved = run_with_stdin(&runtime, &state, &exact_args, private_input.as_bytes());
+    assert!(
+        resolved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resolved.stderr)
+    );
+    assert!(String::from_utf8_lossy(&resolved.stdout).contains("state=dead_lettered"));
+    assert!(String::from_utf8_lossy(&resolved.stdout).contains("duplicate=false"));
+    let retry = run_with_stdin(&runtime, &state, &exact_args, private_input.as_bytes());
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert!(String::from_utf8_lossy(&retry.stdout).contains("duplicate=true"));
+
+    assert!(run(&runtime, &state, &["shutdown"]).status.success());
+    assert!(daemon.wait().expect("shutdown").success());
+    daemon = launch(&runtime, &state);
+    wait_ready(&runtime, &state);
+    let reopened = run(&runtime, &state, &["outbox", "inspect", &id]);
+    assert!(String::from_utf8_lossy(&reopened.stdout).contains("state=dead_lettered"));
+    assert!(run(&runtime, &state, &["shutdown"]).status.success());
+    assert!(daemon.wait().expect("restart shutdown").success());
 }
 
 #[test]

@@ -6,7 +6,12 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 
-const USAGE: &[u8] = b"usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique shutdown\n";
+fn assert_bounded_usage(stderr: &[u8]) {
+    let usage = std::str::from_utf8(stderr).expect("usage is UTF-8");
+    assert!(usage.starts_with("usage: automonique doctor [--json]\n"));
+    assert!(usage.ends_with("       automonique shutdown\n"));
+    assert!(usage.len() <= 2 * 1024);
+}
 
 fn private_runtime() -> tempfile::TempDir {
     let runtime = tempfile::tempdir().expect("runtime");
@@ -98,7 +103,7 @@ fn non_utf8_argv_is_a_bounded_usage_error() {
     let exit = run([OsString::from_vec(vec![0xff])], &mut stdout, &mut stderr);
     assert_eq!(exit, 2);
     assert!(stdout.is_empty());
-    assert_eq!(stderr, USAGE);
+    assert_bounded_usage(&stderr);
 }
 
 #[test]
@@ -118,5 +123,5 @@ fn argv_rejection_never_reads_past_the_fourth_item() {
     let mut stderr = Vec::new();
     assert_eq!(run(arguments, &mut stdout, &mut stderr), 2);
     assert!(stdout.is_empty());
-    assert_eq!(stderr, USAGE);
+    assert_bounded_usage(&stderr);
 }

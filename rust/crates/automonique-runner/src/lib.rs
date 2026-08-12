@@ -15,7 +15,7 @@ mod spool;
 
 pub use boundary::{
     BoundaryProbeError, BoundaryRequirement, BoundaryStatus, BoundarySubject,
-    ExecutionBoundaryAssessment, LaunchRefusal, LinuxPrimitive,
+    ExecutionBoundaryAssessment, LaunchBlocker, LaunchRefusal, LinuxPrimitive,
 };
 pub use runner::{CancellationToken, ContainmentEvidence, Runner, RunnerError};
 pub use simulation::{

@@ -9,8 +9,9 @@ use automonique_store::{
     OutboxFailureDecision, OutboxPayloadRequest, OutboxReconciliationDecision,
     OutboxReconciliationRequest, ReconciliationDecision, ReconciliationInboxState,
     ReconciliationRequest, ReconciliationRunState, SCHEMA_VERSION, SchedulerClaim, Store,
-    TelegramBatchIngestion, TelegramStoreDisposition, TelegramStoreUpdate, TerminalRun,
-    TerminalState, WorkClaim,
+    TelegramBatchIngestion, TelegramPollerCommit, TelegramPollerLeaseIdentity,
+    TelegramPollerLeaseRenewal, TelegramPollerLeaseRequest, TelegramStoreDisposition,
+    TelegramStoreUpdate, TerminalRun, TerminalState, WorkClaim,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -162,6 +163,41 @@ fn telegram_update<'a>(
         source_key,
         scope,
         disposition,
+    }
+}
+
+fn acquire_poller(
+    store: &mut Store,
+    bot_id: i64,
+    generation_id: &str,
+    holder_id: &str,
+    authority_lease_epoch: u64,
+    now_ms: i64,
+    ttl_ms: i64,
+) -> automonique_store::TelegramPollerLease {
+    store
+        .acquire_telegram_poller_lease(TelegramPollerLeaseRequest {
+            bot_id,
+            generation_id,
+            holder_id,
+            authority_lease_epoch,
+            now_ms,
+            ttl_ms,
+        })
+        .expect("poller lease")
+}
+
+fn poller_identity<'a>(
+    lease: &'a automonique_store::TelegramPollerLease,
+    now_ms: i64,
+) -> TelegramPollerLeaseIdentity<'a> {
+    TelegramPollerLeaseIdentity {
+        bot_id: lease.bot_id,
+        generation_id: &lease.generation_id,
+        holder_id: &lease.holder_id,
+        poller_epoch: lease.epoch,
+        expected_expires_ms: lease.expires_ms,
+        now_ms,
     }
 }
 
@@ -930,7 +966,7 @@ fn reconciliation_discovers_old_epoch_and_accepts_live_successor_authority() {
             },
         })
         .expect_err("stale operator authority refused");
-    assert_eq!(stale_authority.category(), "stale_epoch");
+    assert_eq!(stale_authority.category(), "authority_lost");
     let wrong_authority = store
         .reconcile_run(ReconciliationRequest {
             run_id: claim.run_id,
@@ -947,7 +983,7 @@ fn reconciliation_discovers_old_epoch_and_accepts_live_successor_authority() {
             },
         })
         .expect_err("wrong current operator refused");
-    assert_eq!(wrong_authority.category(), "stale_epoch");
+    assert_eq!(wrong_authority.category(), "authority_lost");
     let other_authority = store
         .acquire_generation_lease(LeaseRequest {
             generation_id: "generation-b",
@@ -972,7 +1008,7 @@ fn reconciliation_discovers_old_epoch_and_accepts_live_successor_authority() {
             },
         })
         .expect_err("wrong successor holder cannot authorize decision");
-    assert_eq!(wrong_successor_authority.category(), "stale_epoch");
+    assert_eq!(wrong_successor_authority.category(), "authority_lost");
     let wrong_epoch = store
         .reconcile_run(ReconciliationRequest {
             run_id: claim.run_id,
@@ -1481,7 +1517,7 @@ fn expired_effect_is_ambiguous_until_explicit_reconciliation() {
             },
         })
         .expect_err("expired old authority cannot reconcile");
-    assert_eq!(stale_authority.category(), "stale_epoch");
+    assert_eq!(stale_authority.category(), "authority_lost");
     let successor = reopened
         .acquire_generation_lease(LeaseRequest {
             generation_id: "generation-b",
@@ -1507,7 +1543,7 @@ fn expired_effect_is_ambiguous_until_explicit_reconciliation() {
             },
         })
         .expect_err("wrong successor holder cannot reconcile");
-    assert_eq!(wrong_authority.category(), "stale_epoch");
+    assert_eq!(wrong_authority.category(), "authority_lost");
     let resolved = reopened
         .reconcile_outbox(OutboxReconciliationRequest {
             outbox_id,
@@ -2013,4 +2049,317 @@ fn telegram_offset_regression_gap_and_unaccounted_advance_refuse() {
         ));
         assert_eq!(store.telegram_offset(7).expect("unchanged"), Some(3));
     }
+}
+
+#[test]
+fn telegram_poller_lease_is_fenced_across_connections_restart_and_authority_epochs() {
+    let database = PrivateDatabase::new();
+    let mut owner = Store::open(database.path()).expect("owner open");
+    let authority = lease(&mut owner, "holder-a", 0);
+    let first = acquire_poller(&mut owner, 7, "generation-a", "holder-a", authority, 1, 50);
+    let stable = acquire_poller(&mut owner, 7, "generation-a", "holder-a", authority, 2, 50);
+    assert_eq!(stable, first);
+
+    let mut competitor = Store::open(database.path()).expect("competitor open");
+    let competitor_authority = competitor
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "generation-b",
+            holder_id: "holder-b",
+            now_ms: 2,
+            ttl_ms: 100,
+        })
+        .expect("independent live generation authority");
+    let held = competitor
+        .acquire_telegram_poller_lease(TelegramPollerLeaseRequest {
+            bot_id: 7,
+            generation_id: "generation-b",
+            holder_id: "holder-b",
+            authority_lease_epoch: competitor_authority.epoch,
+            now_ms: 3,
+            ttl_ms: 20,
+        })
+        .expect_err("two live connections cannot own one bot");
+    assert_eq!(held.category(), "lease_held");
+
+    let renewed = owner
+        .renew_telegram_poller_lease(TelegramPollerLeaseRenewal {
+            bot_id: 7,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            authority_lease_epoch: authority,
+            poller_epoch: first.epoch,
+            expected_expires_ms: first.expires_ms,
+            now_ms: 4,
+            ttl_ms: 70,
+        })
+        .expect("exact renew");
+    assert_eq!(renewed.epoch, first.epoch);
+    assert_eq!(renewed.expires_ms, 74);
+    drop(owner);
+
+    let mut reopened = Store::open(database.path()).expect("restart open");
+    assert_eq!(
+        reopened
+            .read_telegram_offset(poller_identity(&renewed, 5))
+            .expect("durable lease read")
+            .next_offset,
+        0
+    );
+    reopened
+        .release_telegram_poller_lease(poller_identity(&renewed, 6))
+        .expect("exact release");
+    assert_eq!(
+        reopened
+            .read_telegram_offset(poller_identity(&renewed, 7))
+            .expect_err("released lease refuses")
+            .category(),
+        "stale_epoch"
+    );
+
+    reopened
+        .release_generation_lease("generation-a", "holder-a", authority, 8)
+        .expect("release authority");
+    let next_authority = reopened
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            now_ms: 8,
+            ttl_ms: 100,
+        })
+        .expect("same identity new authority epoch");
+    assert!(next_authority.epoch > authority);
+    let successor = acquire_poller(
+        &mut reopened,
+        7,
+        "generation-a",
+        "holder-a",
+        next_authority.epoch,
+        9,
+        30,
+    );
+    assert!(successor.epoch > renewed.epoch);
+    assert_eq!(
+        reopened
+            .read_telegram_offset(poller_identity(&renewed, 10))
+            .expect_err("old poller epoch remains fenced")
+            .category(),
+        "stale_epoch"
+    );
+}
+
+#[test]
+fn telegram_poller_commit_is_atomic_exact_and_deadline_fenced() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let authority = lease(&mut store, "holder-a", 0);
+    let poller = acquire_poller(&mut store, 7, "generation-a", "holder-a", authority, 1, 50);
+    let updates = [telegram_update(
+        2,
+        "telegram:7:update:2",
+        "telegram:7:chat",
+        TelegramStoreDisposition::Admitted {
+            content: b"accepted",
+        },
+    )];
+    let commit = |digest| TelegramPollerCommit {
+        lease: poller_identity(&poller, 10),
+        commit_before_ms: poller.expires_ms,
+        batch_digest: digest,
+        batch: TelegramBatchIngestion {
+            bot_id: 7,
+            expected_offset: 0,
+            next_offset: 3,
+            received_ms: 9,
+            updates: &updates,
+        },
+    };
+    let first = store
+        .commit_telegram_batch(commit([1; 32]))
+        .expect("atomic fenced commit");
+    assert!(!first.duplicate);
+    assert_eq!(first.next_offset, 3);
+    assert_eq!(first.batch_digest, [1; 32]);
+    let replay = store
+        .commit_telegram_batch(commit([1; 32]))
+        .expect("exact retry");
+    assert!(replay.duplicate);
+    assert_eq!(
+        store
+            .commit_telegram_batch(commit([2; 32]))
+            .expect_err("changed digest refuses")
+            .category(),
+        "idempotency_conflict"
+    );
+    drop(store);
+    let mut reopened = Store::open(database.path()).expect("reopen");
+    assert_eq!(
+        reopened.telegram_offset(7).expect("durable offset"),
+        Some(3)
+    );
+    assert_eq!(
+        reopened
+            .telegram_disposition(7, 2)
+            .expect("durable disposition")
+            .content,
+        Some(b"accepted".to_vec())
+    );
+    let recovered = reopened
+        .commit_telegram_batch(TelegramPollerCommit {
+            lease: poller_identity(&poller, poller.expires_ms + 1),
+            commit_before_ms: poller.expires_ms,
+            batch_digest: [1; 32],
+            batch: TelegramBatchIngestion {
+                bot_id: 7,
+                expected_offset: 0,
+                next_offset: 3,
+                received_ms: 9,
+                updates: &updates,
+            },
+        })
+        .expect("crash-lost exact receipt remains recoverable after expiry");
+    assert!(recovered.duplicate);
+
+    let expired_updates = [telegram_update(
+        3,
+        "telegram:7:update:3",
+        "telegram:7:chat",
+        TelegramStoreDisposition::Denied,
+    )];
+    let expired = reopened
+        .commit_telegram_batch(TelegramPollerCommit {
+            lease: TelegramPollerLeaseIdentity {
+                now_ms: poller.expires_ms,
+                ..poller_identity(&poller, poller.expires_ms)
+            },
+            commit_before_ms: poller.expires_ms,
+            batch_digest: [3; 32],
+            batch: TelegramBatchIngestion {
+                bot_id: 7,
+                expected_offset: 3,
+                next_offset: 4,
+                received_ms: 49,
+                updates: &expired_updates,
+            },
+        })
+        .expect_err("expired lease cannot mutate");
+    assert_eq!(expired.category(), "stale_epoch");
+    assert_eq!(
+        reopened.telegram_offset(7).expect("offset unchanged"),
+        Some(3)
+    );
+    assert_eq!(
+        reopened
+            .telegram_disposition(7, 3)
+            .expect_err("disposition rolled back")
+            .category(),
+        "not_found"
+    );
+}
+
+#[test]
+fn telegram_poller_commit_rolls_back_on_mid_batch_failure() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let authority = lease(&mut store, "holder-a", 0);
+    let poller = acquire_poller(&mut store, 2, "generation-a", "holder-a", authority, 1, 50);
+    drop(store);
+    let raw = Connection::open(database.path()).expect("fault connection");
+    raw.execute_batch(
+        "CREATE TRIGGER fail_fenced_telegram_disposition
+         BEFORE INSERT ON telegram_ingress
+         WHEN NEW.bot_id = 2 AND NEW.update_id = X'0000000000000001'
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+    )
+    .expect("fault trigger");
+    drop(raw);
+    let updates = [
+        telegram_update(
+            0,
+            "telegram:2:update:0",
+            "telegram:2:chat",
+            TelegramStoreDisposition::Denied,
+        ),
+        telegram_update(
+            1,
+            "telegram:2:update:1",
+            "telegram:2:chat",
+            TelegramStoreDisposition::Denied,
+        ),
+    ];
+    let mut reopened = Store::open(database.path()).expect("reopen");
+    assert_eq!(
+        reopened
+            .commit_telegram_batch(TelegramPollerCommit {
+                lease: poller_identity(&poller, 5),
+                commit_before_ms: poller.expires_ms,
+                batch_digest: [4; 32],
+                batch: TelegramBatchIngestion {
+                    bot_id: 2,
+                    expected_offset: 0,
+                    next_offset: 2,
+                    received_ms: 4,
+                    updates: &updates,
+                },
+            })
+            .expect_err("fault rolls back")
+            .category(),
+        "sqlite"
+    );
+    assert_eq!(reopened.telegram_offset(2).expect("no cursor"), None);
+    assert_eq!(
+        reopened
+            .telegram_disposition(2, 0)
+            .expect_err("first row rolled back")
+            .category(),
+        "not_found"
+    );
+}
+
+#[test]
+fn telegram_fenced_commit_preserves_u64_max_cursor_across_reopen() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let authority = lease(&mut store, "holder-a", 0);
+    let poller = acquire_poller(&mut store, 7, "generation-a", "holder-a", authority, 1, 50);
+    let update_id = u64::MAX - 1;
+    let source_key = format!("telegram:7:update:{update_id}");
+    let updates = [telegram_update(
+        update_id,
+        &source_key,
+        "telegram:7:chat",
+        TelegramStoreDisposition::Denied,
+    )];
+    let receipt = store
+        .commit_telegram_batch(TelegramPollerCommit {
+            lease: poller_identity(&poller, 5),
+            commit_before_ms: poller.expires_ms,
+            batch_digest: [u8::MAX; 32],
+            batch: TelegramBatchIngestion {
+                bot_id: 7,
+                expected_offset: 0,
+                next_offset: u64::MAX,
+                received_ms: 4,
+                updates: &updates,
+            },
+        })
+        .expect("maximum cursor commit");
+    assert_eq!(receipt.next_offset, u64::MAX);
+    drop(store);
+
+    let mut reopened = Store::open(database.path()).expect("reopen maximum cursor");
+    assert_eq!(
+        reopened.telegram_offset(7).expect("raw cursor read"),
+        Some(u64::MAX)
+    );
+    let fenced = reopened
+        .read_telegram_offset(poller_identity(&poller, 6))
+        .expect("fenced cursor read");
+    assert_eq!(fenced.next_offset, u64::MAX);
+    assert_eq!(
+        reopened
+            .telegram_disposition(7, update_id)
+            .expect("maximum update preserved")
+            .source_key,
+        source_key
+    );
 }

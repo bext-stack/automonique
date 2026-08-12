@@ -1,16 +1,110 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 use automonique_protocol::admin::{
-    ADMIN_PROTOCOL, AdminCommand, AdminError, AdminInstanceId, AdminReconciliationEvidence,
-    AdminRefusalCategory, AdminRequest, AdminResponse, DaemonState, DaemonStatus,
-    MAX_ADMIN_CANONICAL_BYTES, MAX_INSTANCE_ID_BYTES, MAX_SYNTHETIC_KEY_BYTES,
-    MAX_SYNTHETIC_SCOPE_BYTES, MAX_SYNTHETIC_TASK_BYTES, ReconciliationFailure,
-    SyntheticSubmission,
+    ADMIN_PROTOCOL, AdminCommand, AdminError, AdminInstanceId, AdminOutboxEvidence,
+    AdminOutboxEvidenceParts, AdminReconciliationEvidence, AdminRefusalCategory, AdminRequest,
+    AdminResponse, DaemonState, DaemonStatus, MAX_ADMIN_CANONICAL_BYTES, MAX_INSTANCE_ID_BYTES,
+    MAX_SYNTHETIC_KEY_BYTES, MAX_SYNTHETIC_SCOPE_BYTES, MAX_SYNTHETIC_TASK_BYTES,
+    OutboxReconciliation, OutboxReconciliationDecision, OutboxReconciliationParts,
+    ReconciliationFailure, SyntheticSubmission,
 };
 use automonique_protocol::codec::{CodecError, FrameDecode, RequestId, decode_frame, encode_frame};
 
 fn request_id() -> RequestId {
     RequestId::new("req-admin-1").expect("valid request ID")
+}
+
+#[test]
+fn outbox_inspection_and_reconciliation_are_exact_correlated_and_redacted() {
+    let inspect = AdminRequest::inspect_outbox(request_id(), 9).expect("inspect");
+    let decoded = AdminRequest::from_canonical_bytes(
+        &inspect.to_message().expect("encode").to_canonical_bytes(),
+    )
+    .expect("decode");
+    assert_eq!(decoded.command(), AdminCommand::InspectOutbox);
+    assert_eq!(decoded.outbox_id(), Some(9));
+
+    for decision in [
+        OutboxReconciliationDecision::Delivered {
+            receipt_key: "provider:9".to_owned(),
+        },
+        OutboxReconciliationDecision::DeadLetter {
+            reason: "operator_refused".to_owned(),
+        },
+    ] {
+        let reconciliation = OutboxReconciliation::new(OutboxReconciliationParts {
+            outbox_id: 9,
+            expected_generation_id: "generation-old".to_owned(),
+            expected_lease_epoch: 4,
+            expected_lease_token: "lease:9".to_owned(),
+            expected_attempt: 2,
+            expected_revision: 7,
+            decision,
+        })
+        .expect("coordinates");
+        let request = AdminRequest::reconcile_outbox(request_id(), reconciliation.clone());
+        let decoded = AdminRequest::from_canonical_bytes(
+            &request.to_message().expect("encode").to_canonical_bytes(),
+        )
+        .expect("decode");
+        assert_eq!(decoded.command(), AdminCommand::ReconcileOutbox);
+        assert_eq!(decoded.outbox_reconciliation(), Some(&reconciliation));
+    }
+
+    let evidence = AdminOutboxEvidence::new(AdminOutboxEvidenceParts {
+        outbox_id: 9,
+        intent_key: "intent:9".to_owned(),
+        transport: "telegram".to_owned(),
+        kind: "telegram.reply".to_owned(),
+        state: "in_flight".to_owned(),
+        revision: 7,
+        attempt: 2,
+        lease_token: Some("lease:9".to_owned()),
+        lease_generation_id: Some("generation-old".to_owned()),
+        lease_holder: Some("holder-old".to_owned()),
+        lease_epoch: Some(4),
+        lease_expires_ms: Some(100),
+        delivery_receipt_key: None,
+    })
+    .expect("redacted evidence");
+    let response = AdminResponse::OutboxInspected {
+        request_id: request_id(),
+        evidence,
+    };
+    let bytes = response.to_message().expect("encode").to_canonical_bytes();
+    assert!(!String::from_utf8_lossy(&bytes).contains("payload"));
+    let debug = format!("{response:?}");
+    assert!(!debug.contains("lease:9"));
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(&bytes).expect("decode"),
+        response
+    );
+
+    let response = AdminResponse::OutboxReconciled {
+        request_id: request_id(),
+        outbox_id: 9,
+        state: "delivered".to_owned(),
+        revision: 8,
+        duplicate: true,
+    };
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(
+            &response.to_message().expect("encode").to_canonical_bytes()
+        )
+        .expect("decode"),
+        response,
+    );
+
+    let widened = br#"{"body":{"decision":"delivered","expected_attempt":2,"expected_generation_id":"generation-old","expected_lease_epoch":4,"expected_lease_token":"lease:9","expected_revision":7,"future":true,"outbox_id":9,"receipt_key":"provider:9"},"kind":"reconcile_outbox","protocol":"automonique.admin","request_id":"r","version":1}"#;
+    assert_eq!(
+        AdminRequest::from_canonical_bytes(widened).expect_err("extra field"),
+        AdminError::InvalidBody
+    );
+    let partial_lease = br#"{"body":{"attempt":1,"delivery_receipt_key":null,"intent_key":"i","kind":"fake.receipt","lease_epoch":null,"lease_expires_ms":null,"lease_generation_id":"foreground","lease_holder":null,"lease_token":null,"outbox_id":1,"revision":1,"state":"in_flight","transport":"fake"},"kind":"outbox_inspected","protocol":"automonique.admin","request_id":"r","version":1}"#;
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(partial_lease).expect_err("partial lease evidence"),
+        AdminError::InvalidBody
+    );
 }
 
 #[test]

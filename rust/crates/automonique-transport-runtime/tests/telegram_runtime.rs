@@ -375,9 +375,9 @@ fn ambiguous_commit_and_duplicate_response_do_not_duplicate_dispositions() {
     second_poller
         .poll_once(&lease(), 11, &CancellationToken::new())
         .expect_err("ambiguous acknowledgement");
-    let duplicate = second_poller
-        .reconcile_commit(&lease(), 12)
-        .expect("exact retained batch resolves through durable duplicate receipt");
+    let duplicate = second_poller.reconcile_commit(&lease(), 100_001).expect(
+        "exact retained batch resolves after lease expiry through durable duplicate receipt",
+    );
     assert_eq!(duplicate.previous_offset, 0);
     assert_eq!(duplicate.next_offset, 1);
     assert!(duplicate.duplicate);

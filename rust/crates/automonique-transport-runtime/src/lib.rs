@@ -17,6 +17,10 @@ use automonique_transports::{
 };
 use sha2::{Digest, Sha256};
 
+mod store_sink;
+
+pub use store_sink::{Clock, ClockFailure, StoreTelegramDurableSink, SystemClock};
+
 const MAX_LEASE_ID_BYTES: usize = 256;
 const MAX_LONG_POLL_SECONDS: u16 = 50;
 
@@ -260,6 +264,36 @@ pub struct DurableTelegramBatch {
     pub digest: [u8; 32],
 }
 
+impl DurableTelegramBatch {
+    /// Construct a canonical batch and bind its digest to every coordinate and disposition.
+    pub fn new(
+        bot_id: i64,
+        expected_offset: u64,
+        next_offset: u64,
+        received_ms: i64,
+        updates: Vec<DurableTelegramUpdate>,
+    ) -> Result<Self, RuntimeError> {
+        if bot_id <= 0
+            || received_ms < 0
+            || updates.len() > MAX_TELEGRAM_UPDATES
+            || next_offset < expected_offset
+            || (updates.is_empty() && next_offset != expected_offset)
+        {
+            return Err(RuntimeError::InvalidConfiguration("telegram_batch"));
+        }
+        let mut batch = Self {
+            bot_id,
+            expected_offset,
+            next_offset,
+            received_ms,
+            updates,
+            digest: [0; 32],
+        };
+        batch.digest = telegram_batch_digest(&batch);
+        Ok(batch)
+    }
+}
+
 /// Durable, full-fidelity state that a host must store before acknowledging a
 /// post-commit ambiguity. It contains admitted message content and must be
 /// protected like the ingress table; `Debug` deliberately reveals only the
@@ -332,6 +366,8 @@ pub trait TelegramDurableSink {
 
     /// Commit while independently observing that the exact lease remains live
     /// before `commit_before_ms` and fencing its epoch in the same transaction.
+    /// An implementation may return an exact digest-bound duplicate receipt
+    /// after expiry, but expiry must prevent every new mutation.
     fn commit_batch(
         &mut self,
         lease: &PollerLease,
@@ -537,15 +573,13 @@ where
             .iter()
             .map(normalize_update)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut batch = DurableTelegramBatch {
-            bot_id: lease.bot_id,
-            expected_offset: offset.next_offset,
-            next_offset: parsed.next_offset(),
-            received_ms: now_ms,
+        let batch = DurableTelegramBatch::new(
+            lease.bot_id,
+            offset.next_offset,
+            parsed.next_offset(),
+            now_ms,
             updates,
-            digest: [0; 32],
-        };
-        batch.digest = telegram_batch_digest(&batch);
+        )?;
         check_cancelled(cancellation)?;
         let receipt = match self.sink.commit_batch(lease, &batch, lease.expires_ms) {
             Ok(receipt) => receipt,
@@ -595,7 +629,7 @@ where
                 "pending_commit_reconciliation",
             ))?;
         let batch = pending.batch();
-        if now_ms < batch.received_ms || now_ms >= lease.expires_ms {
+        if now_ms < batch.received_ms {
             return Err(RuntimeError::LeaseExpired);
         }
         let receipt = self

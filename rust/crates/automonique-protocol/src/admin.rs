@@ -6,8 +6,8 @@
 //! server authenticates the Unix peer before it decodes a frame; putting a
 //! bearer secret in the payload would make that boundary weaker and easier to
 //! leak. Version one exposes only a read-only status query and an orderly
-//! shutdown request, a local no-effect synthetic intake, and an explicit
-//! fail-only reconciliation path for an ambiguously claimed synthetic run.
+//! shutdown request, a local no-effect synthetic intake, and explicit fenced
+//! reconciliation paths for ambiguous synthetic runs and expired outbox effects.
 
 use std::error::Error;
 use std::fmt;
@@ -188,6 +188,10 @@ pub enum AdminCommand {
     InspectReconciliation,
     /// Explicitly fail one exact old run observation under the daemon's fence.
     FailReconciliation,
+    /// Inspect redacted durable evidence for one outbox effect.
+    InspectOutbox,
+    /// Close one exact expired outbox observation as delivered or dead-lettered.
+    ReconcileOutbox,
     /// Stop intake and request an orderly shutdown.
     Shutdown,
 }
@@ -199,8 +203,215 @@ impl AdminCommand {
             Self::SubmitSynthetic => "submit_synthetic",
             Self::InspectReconciliation => "inspect_reconciliation",
             Self::FailReconciliation => "fail_reconciliation",
+            Self::InspectOutbox => "inspect_outbox",
+            Self::ReconcileOutbox => "reconcile_outbox",
             Self::Shutdown => "shutdown",
         }
+    }
+}
+
+/// Operator decision for one expired, outcome-ambiguous outbox effect.
+#[derive(Clone, Eq, PartialEq)]
+pub enum OutboxReconciliationDecision {
+    /// External delivery was independently confirmed.
+    Delivered { receipt_key: String },
+    /// The effect is permanently closed without delivery.
+    DeadLetter { reason: String },
+}
+
+impl fmt::Debug for OutboxReconciliationDecision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Delivered { .. } => formatter.write_str("Delivered(<redacted>)"),
+            Self::DeadLetter { .. } => formatter.write_str("DeadLetter(<redacted>)"),
+        }
+    }
+}
+
+/// Exact old outbox evidence carried into a fenced reconciliation decision.
+#[derive(Clone, Eq, PartialEq)]
+pub struct OutboxReconciliation {
+    outbox_id: u64,
+    expected_generation_id: String,
+    expected_lease_epoch: u64,
+    expected_lease_token: String,
+    expected_attempt: u64,
+    expected_revision: u64,
+    decision: OutboxReconciliationDecision,
+}
+
+impl fmt::Debug for OutboxReconciliation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OutboxReconciliation")
+            .field("outbox_id", &self.outbox_id)
+            .field("expected_generation_id", &self.expected_generation_id)
+            .field("expected_lease_epoch", &self.expected_lease_epoch)
+            .field("expected_attempt", &self.expected_attempt)
+            .field("expected_revision", &self.expected_revision)
+            .field("expected_lease_token", &"<redacted>")
+            .field("decision", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Fields used to construct one exact outbox reconciliation request.
+pub struct OutboxReconciliationParts {
+    pub outbox_id: u64,
+    pub expected_generation_id: String,
+    pub expected_lease_epoch: u64,
+    pub expected_lease_token: String,
+    pub expected_attempt: u64,
+    pub expected_revision: u64,
+    pub decision: OutboxReconciliationDecision,
+}
+
+impl OutboxReconciliation {
+    pub fn new(parts: OutboxReconciliationParts) -> Result<Self, AdminError> {
+        let decision_value = match &parts.decision {
+            OutboxReconciliationDecision::Delivered { receipt_key } => receipt_key,
+            OutboxReconciliationDecision::DeadLetter { reason } => reason,
+        };
+        if parts.outbox_id == 0
+            || parts.expected_lease_epoch == 0
+            || parts.expected_attempt == 0
+            || parts.expected_revision == 0
+            || !valid_coordinate(
+                &parts.expected_generation_id,
+                MAX_RECONCILIATION_FIELD_BYTES,
+            )
+            || !valid_coordinate(&parts.expected_lease_token, MAX_RECONCILIATION_FIELD_BYTES)
+            || !valid_coordinate(decision_value, MAX_RECONCILIATION_FIELD_BYTES)
+        {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self {
+            outbox_id: parts.outbox_id,
+            expected_generation_id: parts.expected_generation_id,
+            expected_lease_epoch: parts.expected_lease_epoch,
+            expected_lease_token: parts.expected_lease_token,
+            expected_attempt: parts.expected_attempt,
+            expected_revision: parts.expected_revision,
+            decision: parts.decision,
+        })
+    }
+
+    #[must_use]
+    pub const fn outbox_id(&self) -> u64 {
+        self.outbox_id
+    }
+    #[must_use]
+    pub fn expected_generation_id(&self) -> &str {
+        &self.expected_generation_id
+    }
+    #[must_use]
+    pub const fn expected_lease_epoch(&self) -> u64 {
+        self.expected_lease_epoch
+    }
+    #[must_use]
+    pub fn expected_lease_token(&self) -> &str {
+        &self.expected_lease_token
+    }
+    #[must_use]
+    pub const fn expected_attempt(&self) -> u64 {
+        self.expected_attempt
+    }
+    #[must_use]
+    pub const fn expected_revision(&self) -> u64 {
+        self.expected_revision
+    }
+    #[must_use]
+    pub const fn decision(&self) -> &OutboxReconciliationDecision {
+        &self.decision
+    }
+
+    fn to_body(&self) -> Result<JsonValue, AdminError> {
+        let (decision, value_name, value) = match &self.decision {
+            OutboxReconciliationDecision::Delivered { receipt_key } => {
+                ("delivered", "receipt_key", receipt_key)
+            }
+            OutboxReconciliationDecision::DeadLetter { reason } => {
+                ("dead_letter", "reason", reason)
+            }
+        };
+        Ok(JsonValue::Object(vec![
+            (
+                "decision".to_owned(),
+                JsonValue::String(decision.to_owned()),
+            ),
+            (
+                "expected_attempt".to_owned(),
+                integer("expected_attempt", self.expected_attempt)?,
+            ),
+            (
+                "expected_generation_id".to_owned(),
+                JsonValue::String(self.expected_generation_id.clone()),
+            ),
+            (
+                "expected_lease_epoch".to_owned(),
+                integer("expected_lease_epoch", self.expected_lease_epoch)?,
+            ),
+            (
+                "expected_lease_token".to_owned(),
+                JsonValue::String(self.expected_lease_token.clone()),
+            ),
+            (
+                "expected_revision".to_owned(),
+                integer("expected_revision", self.expected_revision)?,
+            ),
+            (
+                "outbox_id".to_owned(),
+                integer("outbox_id", self.outbox_id)?,
+            ),
+            (value_name.to_owned(), JsonValue::String(value.clone())),
+        ]))
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        let decision = required_body_string(body, "decision")?;
+        let (fields, decision) = match decision.as_str() {
+            "delivered" => (
+                [
+                    "decision",
+                    "expected_attempt",
+                    "expected_generation_id",
+                    "expected_lease_epoch",
+                    "expected_lease_token",
+                    "expected_revision",
+                    "outbox_id",
+                    "receipt_key",
+                ],
+                OutboxReconciliationDecision::Delivered {
+                    receipt_key: required_body_string(body, "receipt_key")?,
+                },
+            ),
+            "dead_letter" => (
+                [
+                    "decision",
+                    "expected_attempt",
+                    "expected_generation_id",
+                    "expected_lease_epoch",
+                    "expected_lease_token",
+                    "expected_revision",
+                    "outbox_id",
+                    "reason",
+                ],
+                OutboxReconciliationDecision::DeadLetter {
+                    reason: required_body_string(body, "reason")?,
+                },
+            ),
+            _ => return Err(AdminError::InvalidBody),
+        };
+        exact_fields(body, &fields)?;
+        Self::new(OutboxReconciliationParts {
+            outbox_id: unsigned(body, "outbox_id")?,
+            expected_generation_id: required_body_string(body, "expected_generation_id")?,
+            expected_lease_epoch: unsigned(body, "expected_lease_epoch")?,
+            expected_lease_token: required_body_string(body, "expected_lease_token")?,
+            expected_attempt: unsigned(body, "expected_attempt")?,
+            expected_revision: unsigned(body, "expected_revision")?,
+            decision,
+        })
     }
 }
 
@@ -404,6 +615,8 @@ pub struct AdminRequest {
     submission: Option<SyntheticSubmission>,
     reconciliation_run_id: Option<u64>,
     reconciliation_failure: Option<ReconciliationFailure>,
+    outbox_id: Option<u64>,
+    outbox_reconciliation: Option<OutboxReconciliation>,
 }
 
 impl AdminRequest {
@@ -416,6 +629,8 @@ impl AdminRequest {
             submission: None,
             reconciliation_run_id: None,
             reconciliation_failure: None,
+            outbox_id: None,
+            outbox_reconciliation: None,
         }
     }
 
@@ -428,6 +643,8 @@ impl AdminRequest {
             submission: Some(submission),
             reconciliation_run_id: None,
             reconciliation_failure: None,
+            outbox_id: None,
+            outbox_reconciliation: None,
         }
     }
 
@@ -442,6 +659,8 @@ impl AdminRequest {
             submission: None,
             reconciliation_run_id: Some(run_id),
             reconciliation_failure: None,
+            outbox_id: None,
+            outbox_reconciliation: None,
         })
     }
 
@@ -457,6 +676,39 @@ impl AdminRequest {
             submission: None,
             reconciliation_run_id: None,
             reconciliation_failure: Some(failure),
+            outbox_id: None,
+            outbox_reconciliation: None,
+        }
+    }
+
+    pub fn inspect_outbox(request_id: RequestId, outbox_id: u64) -> Result<Self, AdminError> {
+        if outbox_id == 0 {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self {
+            request_id,
+            command: AdminCommand::InspectOutbox,
+            submission: None,
+            reconciliation_run_id: None,
+            reconciliation_failure: None,
+            outbox_id: Some(outbox_id),
+            outbox_reconciliation: None,
+        })
+    }
+
+    #[must_use]
+    pub const fn reconcile_outbox(
+        request_id: RequestId,
+        reconciliation: OutboxReconciliation,
+    ) -> Self {
+        Self {
+            request_id,
+            command: AdminCommand::ReconcileOutbox,
+            submission: None,
+            reconciliation_run_id: None,
+            reconciliation_failure: None,
+            outbox_id: None,
+            outbox_reconciliation: Some(reconciliation),
         }
     }
 
@@ -488,6 +740,16 @@ impl AdminRequest {
         self.reconciliation_failure.as_ref()
     }
 
+    #[must_use]
+    pub const fn outbox_id(&self) -> Option<u64> {
+        self.outbox_id
+    }
+
+    #[must_use]
+    pub const fn outbox_reconciliation(&self) -> Option<&OutboxReconciliation> {
+        self.outbox_reconciliation.as_ref()
+    }
+
     /// Encode this request as a canonical local-protocol message.
     ///
     /// # Errors
@@ -500,13 +762,28 @@ impl AdminRequest {
             &self.submission,
             self.reconciliation_run_id,
             &self.reconciliation_failure,
+            self.outbox_id,
+            &self.outbox_reconciliation,
         ) {
-            (AdminCommand::SubmitSynthetic, Some(submission), None, None) => submission.to_body(),
-            (AdminCommand::InspectReconciliation, None, Some(run_id), None) => {
+            (AdminCommand::SubmitSynthetic, Some(submission), None, None, None, None) => {
+                submission.to_body()
+            }
+            (AdminCommand::InspectReconciliation, None, Some(run_id), None, None, None) => {
                 JsonValue::Object(vec![("run_id".to_owned(), integer("run_id", run_id)?)])
             }
-            (AdminCommand::FailReconciliation, None, None, Some(failure)) => failure.to_body()?,
-            (AdminCommand::Status | AdminCommand::Shutdown, None, None, None) => {
+            (AdminCommand::FailReconciliation, None, None, Some(failure), None, None) => {
+                failure.to_body()?
+            }
+            (AdminCommand::InspectOutbox, None, None, None, Some(outbox_id), None) => {
+                JsonValue::Object(vec![(
+                    "outbox_id".to_owned(),
+                    integer("outbox_id", outbox_id)?,
+                )])
+            }
+            (AdminCommand::ReconcileOutbox, None, None, None, None, Some(reconciliation)) => {
+                reconciliation.to_body()?
+            }
+            (AdminCommand::Status | AdminCommand::Shutdown, None, None, None, None, None) => {
                 JsonValue::Object(Vec::new())
             }
             _ => return Err(AdminError::InvalidBody),
@@ -540,6 +817,17 @@ impl AdminRequest {
             "fail_reconciliation" => Ok(Self::fail_reconciliation(
                 message.envelope().request_id().clone(),
                 ReconciliationFailure::from_body(message.body())?,
+            )),
+            "inspect_outbox" => {
+                exact_fields(message.body(), &["outbox_id"])?;
+                Self::inspect_outbox(
+                    message.envelope().request_id().clone(),
+                    unsigned(message.body(), "outbox_id")?,
+                )
+            }
+            "reconcile_outbox" => Ok(Self::reconcile_outbox(
+                message.envelope().request_id().clone(),
+                OutboxReconciliation::from_body(message.body())?,
             )),
             "status" | "shutdown" => {
                 if !matches!(message.body(), JsonValue::Object(entries) if entries.is_empty()) {
@@ -893,6 +1181,260 @@ impl AdminReconciliationEvidence {
     }
 }
 
+/// Redacted durable evidence for one outbox effect. Payload bytes are never present.
+#[derive(Clone, Eq, PartialEq)]
+pub struct AdminOutboxEvidence {
+    outbox_id: u64,
+    intent_key: String,
+    transport: String,
+    kind: String,
+    state: String,
+    revision: u64,
+    attempt: u64,
+    lease_token: Option<String>,
+    lease_generation_id: Option<String>,
+    lease_holder: Option<String>,
+    lease_epoch: Option<u64>,
+    lease_expires_ms: Option<u64>,
+    delivery_receipt_key: Option<String>,
+}
+
+impl fmt::Debug for AdminOutboxEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdminOutboxEvidence")
+            .field("outbox_id", &self.outbox_id)
+            .field("intent_key", &self.intent_key)
+            .field("transport", &self.transport)
+            .field("kind", &self.kind)
+            .field("state", &self.state)
+            .field("revision", &self.revision)
+            .field("attempt", &self.attempt)
+            .field(
+                "lease_token",
+                &self.lease_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("lease_generation_id", &self.lease_generation_id)
+            .field("lease_holder", &self.lease_holder)
+            .field("lease_epoch", &self.lease_epoch)
+            .field("lease_expires_ms", &self.lease_expires_ms)
+            .field(
+                "delivery_receipt_key",
+                &self.delivery_receipt_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Fields used to validate one redacted durable outbox observation.
+pub struct AdminOutboxEvidenceParts {
+    pub outbox_id: u64,
+    pub intent_key: String,
+    pub transport: String,
+    pub kind: String,
+    pub state: String,
+    pub revision: u64,
+    pub attempt: u64,
+    pub lease_token: Option<String>,
+    pub lease_generation_id: Option<String>,
+    pub lease_holder: Option<String>,
+    pub lease_epoch: Option<u64>,
+    pub lease_expires_ms: Option<u64>,
+    pub delivery_receipt_key: Option<String>,
+}
+
+impl AdminOutboxEvidence {
+    pub fn new(parts: AdminOutboxEvidenceParts) -> Result<Self, AdminError> {
+        let valid_optional = |value: &Option<String>| {
+            value
+                .as_deref()
+                .is_none_or(|value| valid_coordinate(value, MAX_RECONCILIATION_FIELD_BYTES))
+        };
+        let lease_fields_present = [
+            parts.lease_token.is_some(),
+            parts.lease_generation_id.is_some(),
+            parts.lease_holder.is_some(),
+            parts.lease_epoch.is_some(),
+            parts.lease_expires_ms.is_some(),
+        ];
+        let lease_is_complete = lease_fields_present.iter().all(|present| *present);
+        let lease_is_absent = lease_fields_present.iter().all(|present| !*present);
+        let state_is_coherent = match parts.state.as_str() {
+            "pending" => lease_is_absent && parts.delivery_receipt_key.is_none(),
+            "in_flight" => {
+                lease_is_complete && parts.attempt > 0 && parts.delivery_receipt_key.is_none()
+            }
+            "delivered" => {
+                (lease_is_complete || lease_is_absent) && parts.delivery_receipt_key.is_some()
+            }
+            "dead_lettered" => {
+                (lease_is_complete || lease_is_absent) && parts.delivery_receipt_key.is_none()
+            }
+            _ => false,
+        };
+        if parts.outbox_id == 0
+            || parts.revision == 0
+            || !valid_coordinate(&parts.intent_key, MAX_RECONCILIATION_FIELD_BYTES)
+            || !valid_coordinate(&parts.transport, MAX_RECONCILIATION_FIELD_BYTES)
+            || !valid_coordinate(&parts.kind, MAX_RECONCILIATION_FIELD_BYTES)
+            || !state_is_coherent
+            || !valid_optional(&parts.lease_token)
+            || !valid_optional(&parts.lease_generation_id)
+            || !valid_optional(&parts.lease_holder)
+            || !valid_optional(&parts.delivery_receipt_key)
+            || parts.lease_epoch == Some(0)
+        {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self {
+            outbox_id: parts.outbox_id,
+            intent_key: parts.intent_key,
+            transport: parts.transport,
+            kind: parts.kind,
+            state: parts.state,
+            revision: parts.revision,
+            attempt: parts.attempt,
+            lease_token: parts.lease_token,
+            lease_generation_id: parts.lease_generation_id,
+            lease_holder: parts.lease_holder,
+            lease_epoch: parts.lease_epoch,
+            lease_expires_ms: parts.lease_expires_ms,
+            delivery_receipt_key: parts.delivery_receipt_key,
+        })
+    }
+
+    #[must_use]
+    pub const fn outbox_id(&self) -> u64 {
+        self.outbox_id
+    }
+    #[must_use]
+    pub fn intent_key(&self) -> &str {
+        &self.intent_key
+    }
+    #[must_use]
+    pub fn transport(&self) -> &str {
+        &self.transport
+    }
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+    #[must_use]
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    #[must_use]
+    pub const fn attempt(&self) -> u64 {
+        self.attempt
+    }
+    #[must_use]
+    pub fn lease_token(&self) -> Option<&str> {
+        self.lease_token.as_deref()
+    }
+    #[must_use]
+    pub fn lease_generation_id(&self) -> Option<&str> {
+        self.lease_generation_id.as_deref()
+    }
+    #[must_use]
+    pub fn lease_holder(&self) -> Option<&str> {
+        self.lease_holder.as_deref()
+    }
+    #[must_use]
+    pub const fn lease_epoch(&self) -> Option<u64> {
+        self.lease_epoch
+    }
+    #[must_use]
+    pub const fn lease_expires_ms(&self) -> Option<u64> {
+        self.lease_expires_ms
+    }
+    #[must_use]
+    pub fn delivery_receipt_key(&self) -> Option<&str> {
+        self.delivery_receipt_key.as_deref()
+    }
+
+    fn to_body(&self) -> Result<JsonValue, AdminError> {
+        Ok(JsonValue::Object(vec![
+            ("attempt".to_owned(), integer("attempt", self.attempt)?),
+            (
+                "delivery_receipt_key".to_owned(),
+                optional_string(&self.delivery_receipt_key),
+            ),
+            (
+                "intent_key".to_owned(),
+                JsonValue::String(self.intent_key.clone()),
+            ),
+            ("kind".to_owned(), JsonValue::String(self.kind.clone())),
+            (
+                "lease_epoch".to_owned(),
+                optional_integer("lease_epoch", self.lease_epoch)?,
+            ),
+            (
+                "lease_expires_ms".to_owned(),
+                optional_integer("lease_expires_ms", self.lease_expires_ms)?,
+            ),
+            (
+                "lease_generation_id".to_owned(),
+                optional_string(&self.lease_generation_id),
+            ),
+            (
+                "lease_holder".to_owned(),
+                optional_string(&self.lease_holder),
+            ),
+            ("lease_token".to_owned(), optional_string(&self.lease_token)),
+            (
+                "outbox_id".to_owned(),
+                integer("outbox_id", self.outbox_id)?,
+            ),
+            ("revision".to_owned(), integer("revision", self.revision)?),
+            ("state".to_owned(), JsonValue::String(self.state.clone())),
+            (
+                "transport".to_owned(),
+                JsonValue::String(self.transport.clone()),
+            ),
+        ]))
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        exact_fields(
+            body,
+            &[
+                "attempt",
+                "delivery_receipt_key",
+                "intent_key",
+                "kind",
+                "lease_epoch",
+                "lease_expires_ms",
+                "lease_generation_id",
+                "lease_holder",
+                "lease_token",
+                "outbox_id",
+                "revision",
+                "state",
+                "transport",
+            ],
+        )?;
+        Self::new(AdminOutboxEvidenceParts {
+            outbox_id: unsigned(body, "outbox_id")?,
+            intent_key: required_body_string(body, "intent_key")?,
+            transport: required_body_string(body, "transport")?,
+            kind: required_body_string(body, "kind")?,
+            state: required_body_string(body, "state")?,
+            revision: unsigned(body, "revision")?,
+            attempt: unsigned(body, "attempt")?,
+            lease_token: optional_body_string(body, "lease_token")?,
+            lease_generation_id: optional_body_string(body, "lease_generation_id")?,
+            lease_holder: optional_body_string(body, "lease_holder")?,
+            lease_epoch: optional_unsigned(body, "lease_epoch")?,
+            lease_expires_ms: optional_unsigned(body, "lease_expires_ms")?,
+            delivery_receipt_key: optional_body_string(body, "delivery_receipt_key")?,
+        })
+    }
+}
+
 /// A correlated response from the local daemon.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdminResponse {
@@ -925,6 +1467,19 @@ pub enum AdminResponse {
         outbox_id: u64,
         duplicate: bool,
     },
+    /// Redacted evidence for one durable outbox effect.
+    OutboxInspected {
+        request_id: RequestId,
+        evidence: AdminOutboxEvidence,
+    },
+    /// An expired effect was explicitly closed, or the exact decision replayed.
+    OutboxReconciled {
+        request_id: RequestId,
+        outbox_id: u64,
+        state: String,
+        revision: u64,
+        duplicate: bool,
+    },
     /// The request was definitely refused before a successful mutation.
     Refused {
         request_id: RequestId,
@@ -946,6 +1501,8 @@ impl AdminResponse {
             | Self::SyntheticAccepted { request_id, .. }
             | Self::ReconciliationInspected { request_id, .. }
             | Self::ReconciliationFailed { request_id, .. }
+            | Self::OutboxInspected { request_id, .. }
+            | Self::OutboxReconciled { request_id, .. }
             | Self::Refused { request_id, .. }
             | Self::ShutdownAccepted { request_id } => request_id,
         }
@@ -1002,6 +1559,36 @@ impl AdminResponse {
                     ),
                 ]),
             )),
+            Self::OutboxInspected {
+                request_id,
+                evidence,
+            } => Ok(Message::new(
+                envelope(request_id.clone(), "outbox_inspected")?,
+                evidence.to_body()?,
+            )),
+            Self::OutboxReconciled {
+                request_id,
+                outbox_id,
+                state,
+                revision,
+                duplicate,
+            } => {
+                if *outbox_id == 0
+                    || *revision == 0
+                    || !matches!(state.as_str(), "delivered" | "dead_lettered")
+                {
+                    return Err(AdminError::InvalidBody);
+                }
+                Ok(Message::new(
+                    envelope(request_id.clone(), "outbox_reconciled")?,
+                    JsonValue::Object(vec![
+                        ("duplicate".to_owned(), JsonValue::Bool(*duplicate)),
+                        ("outbox_id".to_owned(), integer("outbox_id", *outbox_id)?),
+                        ("revision".to_owned(), integer("revision", *revision)?),
+                        ("state".to_owned(), JsonValue::String(state.clone())),
+                    ]),
+                ))
+            }
             Self::Refused {
                 request_id,
                 category,
@@ -1065,6 +1652,36 @@ impl AdminResponse {
                     duplicate,
                 })
             }
+            "outbox_inspected" => Ok(Self::OutboxInspected {
+                request_id,
+                evidence: AdminOutboxEvidence::from_body(message.body())?,
+            }),
+            "outbox_reconciled" => {
+                exact_fields(
+                    message.body(),
+                    &["duplicate", "outbox_id", "revision", "state"],
+                )?;
+                let duplicate = match message.body().get("duplicate") {
+                    Some(JsonValue::Bool(value)) => *value,
+                    _ => return Err(AdminError::InvalidBody),
+                };
+                let state = required_body_string(message.body(), "state")?;
+                let outbox_id = unsigned(message.body(), "outbox_id")?;
+                let revision = unsigned(message.body(), "revision")?;
+                if outbox_id == 0
+                    || revision == 0
+                    || !matches!(state.as_str(), "delivered" | "dead_lettered")
+                {
+                    return Err(AdminError::InvalidBody);
+                }
+                Ok(Self::OutboxReconciled {
+                    request_id,
+                    outbox_id,
+                    state,
+                    revision,
+                    duplicate,
+                })
+            }
             "refused" => {
                 exact_fields(message.body(), &["category"])?;
                 Ok(Self::Refused {
@@ -1114,6 +1731,37 @@ fn unsigned(body: &JsonValue, field: &'static str) -> Result<u64, AdminError> {
         .and_then(JsonValue::as_integer)
         .ok_or(AdminError::InvalidBody)?;
     u64::try_from(value).map_err(|_| AdminError::InvalidBody)
+}
+
+fn optional_integer(field: &'static str, value: Option<u64>) -> Result<JsonValue, AdminError> {
+    value.map_or(Ok(JsonValue::Null), |value| integer(field, value))
+}
+
+fn optional_unsigned(body: &JsonValue, field: &'static str) -> Result<Option<u64>, AdminError> {
+    match body.get(field) {
+        Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Integer(value)) => u64::try_from(*value)
+            .map(Some)
+            .map_err(|_| AdminError::InvalidBody),
+        _ => Err(AdminError::InvalidBody),
+    }
+}
+
+fn optional_string(value: &Option<String>) -> JsonValue {
+    value
+        .as_ref()
+        .map_or(JsonValue::Null, |value| JsonValue::String(value.clone()))
+}
+
+fn optional_body_string(
+    body: &JsonValue,
+    field: &'static str,
+) -> Result<Option<String>, AdminError> {
+    match body.get(field) {
+        Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(value)) => Ok(Some(value.clone())),
+        _ => Err(AdminError::InvalidBody),
+    }
 }
 
 fn valid_coordinate(value: &str, max_bytes: usize) -> bool {

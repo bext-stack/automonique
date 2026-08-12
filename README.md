@@ -18,9 +18,10 @@ durable dispositions/offsets, fail-only reconciliation over the authenticated
 local admin endpoint, and a read-only Codex invocation normalizer. Provider
 execution and transport networking are not connected yet. Delivery intents now
 have durable FIFO leases, exact provider receipts, retry/dead-letter outcomes,
-and explicit ambiguity reconciliation. A side-effect-free Telegram polling
-orchestrator binds parsed batches to an atomic sink with a fenced deadline and
-content digest, while a detached observability model provides closed,
+and explicit ambiguity reconciliation through redacted operator commands. A
+side-effect-free Telegram polling orchestrator binds parsed batches to the real
+SQLite store through a renewable per-bot lease, fenced deadline, and content
+digest, while a detached observability model provides closed,
 content-free metric and event vocabularies. Large historical
 planning and development-harness surfaces remain in the tree, but they are no
 longer prerequisites for product development.
@@ -105,6 +106,19 @@ The decision never requeues ambiguous work. It atomically records a failed run,
 failed inbox item, and fake reconciliation receipt; an exact retry replays the
 same receipt.
 
+Expired, outcome-ambiguous outbox effects can likewise be inspected without
+revealing their payload or lease token. The CLI fetches and validates the exact
+token over the authenticated local socket; only the receipt/reason is read as a
+bounded line on stdin, keeping both values out of argv and process listings:
+
+```sh
+cargo run --manifest-path rust/Cargo.toml -p automonique -- outbox inspect <outbox-id>
+printf '%s\n' '<receipt-or-reason>' | \
+  cargo run --manifest-path rust/Cargo.toml -p automonique -- \
+  outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> \
+  <epoch> <attempt> <revision>
+```
+
 The daemon creates only `automonique/` children under those roots, refuses
 permissive or foreign-owned paths, and exposes no network listener. The submit
 command accepts only bounded local synthetic work, reads its task from stdin,
@@ -115,8 +129,9 @@ this local synthetic lane. The general runner remains fail-closed and sandbox
 plans still grant no OS-enforcement or production-runner authority. The Codex
 adapter cannot spawn or probe a process, and the Telegram slice performs no
 HTTP call. Its token reaches only an injected, trusted HTTP boundary through a
-short-lived redacted view; no concrete network client or store adapter is wired
-into the daemon. The observability crate is likewise a validated projection
+short-lived redacted view; its concrete store adapter persists dispositions and
+the offset atomically, but neither it nor a network client is wired into the
+daemon. The observability crate is likewise a validated projection
 model, not a live exporter or health authority. Those paths remain unavailable
 until enforcement and production integration are implemented.
 

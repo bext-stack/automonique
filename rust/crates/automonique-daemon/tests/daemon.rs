@@ -9,10 +9,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use automonique_daemon::{Daemon, DaemonConfig, DaemonError, run_foreground};
 use automonique_protocol::admin::{
-    AdminCommand, AdminRequest, AdminResponse, DaemonState, ReconciliationFailure,
+    AdminCommand, AdminRequest, AdminResponse, DaemonState, OutboxReconciliation,
+    OutboxReconciliationDecision, OutboxReconciliationParts, ReconciliationFailure,
 };
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
-use automonique_store::{InboxSubmission, LeaseRequest, SchedulerClaim, Store, WorkClaim};
+use automonique_store::{
+    InboxSubmission, LeaseRequest, OutboxClaimRequest, SchedulerClaim, Store, TerminalRun,
+    TerminalState, WorkClaim,
+};
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
 
 fn fixture() -> (tempfile::TempDir, DaemonConfig) {
@@ -74,6 +78,168 @@ fn wait_for_socket(config: &DaemonConfig) {
         assert!(Instant::now() < deadline, "daemon did not bind");
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn seed_expired_outbox(config: &DaemonConfig) -> (u64, String, u64, u64, u64) {
+    std::fs::create_dir(config.state_dir()).expect("state directory");
+    std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
+        .expect("state mode");
+    let mut store = Store::open(config.database_path()).expect("seed store");
+    let generation = store
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "foreground",
+            holder_id: "crashed-outbox",
+            now_ms: 1,
+            ttl_ms: 100,
+        })
+        .expect("old generation");
+    store
+        .submit_inbox(InboxSubmission {
+            transport: "local.synthetic",
+            transport_key: "outbox:ambiguous",
+            scope: "workspace:outbox",
+            payload: b"never exposed",
+            received_ms: 2,
+        })
+        .expect("inbox");
+    let run = store
+        .claim_next(SchedulerClaim {
+            transport: "local.synthetic",
+            generation_id: "foreground",
+            holder_id: "crashed-outbox",
+            lease_epoch: generation.epoch,
+            now_ms: 3,
+        })
+        .expect("claim")
+        .expect("run");
+    store
+        .finish_run(TerminalRun {
+            run_id: run.run_id,
+            generation_id: "foreground",
+            holder_id: "crashed-outbox",
+            lease_epoch: generation.epoch,
+            expected_revision: 1,
+            now_ms: 4,
+            state: TerminalState::Succeeded,
+            event_kind: "run.succeeded",
+            event_payload: b"synthetic",
+            outbox_intent_key: "fake:ambiguous",
+            outbox_kind: "fake.receipt",
+            outbox_payload: b"secret-effect-payload",
+        })
+        .expect("terminal outbox");
+    let lease = store
+        .claim_outbox(OutboxClaimRequest {
+            transport: "fake",
+            kind: "fake.receipt",
+            generation_id: "foreground",
+            holder_id: "crashed-outbox",
+            lease_epoch: generation.epoch,
+            now_ms: 5,
+            ttl_ms: 10,
+        })
+        .expect("claim outbox")
+        .expect("effect");
+    (
+        u64::try_from(lease.outbox_id).expect("outbox id"),
+        lease.lease_token,
+        generation.epoch,
+        lease.attempt,
+        lease.revision,
+    )
+}
+
+#[test]
+fn expired_outbox_requires_exact_fenced_operator_reconciliation_and_replays_after_restart() {
+    let (_root, config) = fixture();
+    let (outbox_id, token, old_epoch, attempt, revision) = seed_expired_outbox(&config);
+    let daemon = Daemon::open(&config).expect("successor daemon");
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let thread = std::thread::spawn(move || daemon.serve(&thread_stop));
+    wait_for_socket(&config);
+
+    let inspected = call_request(
+        &config,
+        AdminRequest::inspect_outbox(
+            RequestId::new("inspect-outbox").expect("request"),
+            outbox_id,
+        )
+        .expect("inspect"),
+    );
+    let AdminResponse::OutboxInspected { evidence, .. } = inspected else {
+        panic!("inspection")
+    };
+    assert_eq!(evidence.state(), "in_flight");
+    assert_eq!(evidence.lease_token(), Some(token.as_str()));
+    assert_eq!(evidence.lease_generation_id(), Some("foreground"));
+    assert_eq!(evidence.attempt(), attempt);
+    assert_eq!(evidence.revision(), revision);
+
+    let wrong = OutboxReconciliation::new(OutboxReconciliationParts {
+        outbox_id,
+        expected_generation_id: "wrong-generation".to_owned(),
+        expected_lease_epoch: old_epoch,
+        expected_lease_token: token.clone(),
+        expected_attempt: attempt,
+        expected_revision: revision,
+        decision: OutboxReconciliationDecision::Delivered {
+            receipt_key: "operator:receipt:1".to_owned(),
+        },
+    })
+    .expect("wrong request");
+    assert!(matches!(
+        call_request(&config, AdminRequest::reconcile_outbox(RequestId::new("wrong-outbox").expect("request"), wrong)),
+        AdminResponse::Refused { ref category, .. } if category.as_str() == "stale_epoch"
+    ));
+    let unchanged = call_request(
+        &config,
+        AdminRequest::inspect_outbox(
+            RequestId::new("inspect-unchanged").expect("request"),
+            outbox_id,
+        )
+        .expect("inspect"),
+    );
+    assert!(
+        matches!(unchanged, AdminResponse::OutboxInspected { ref evidence, .. } if evidence.state() == "in_flight" && evidence.revision() == revision)
+    );
+
+    let exact = OutboxReconciliation::new(OutboxReconciliationParts {
+        outbox_id,
+        expected_generation_id: "foreground".to_owned(),
+        expected_lease_epoch: old_epoch,
+        expected_lease_token: token,
+        expected_attempt: attempt,
+        expected_revision: revision,
+        decision: OutboxReconciliationDecision::Delivered {
+            receipt_key: "operator:receipt:1".to_owned(),
+        },
+    })
+    .expect("exact request");
+    assert!(matches!(
+        call_request(&config, AdminRequest::reconcile_outbox(RequestId::new("resolve-outbox").expect("request"), exact.clone())),
+        AdminResponse::OutboxReconciled { state, duplicate: false, .. } if state == "delivered"
+    ));
+    assert!(matches!(
+        call(&config, AdminCommand::Shutdown),
+        AdminResponse::ShutdownAccepted { .. }
+    ));
+    thread.join().expect("join").expect("shutdown");
+
+    let daemon = Daemon::open(&config).expect("restart");
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let thread = std::thread::spawn(move || daemon.serve(&thread_stop));
+    wait_for_socket(&config);
+    assert!(matches!(
+        call_request(&config, AdminRequest::reconcile_outbox(RequestId::new("replay-outbox").expect("request"), exact)),
+        AdminResponse::OutboxReconciled { state, duplicate: true, .. } if state == "delivered"
+    ));
+    assert!(matches!(
+        call(&config, AdminCommand::Shutdown),
+        AdminResponse::ShutdownAccepted { .. }
+    ));
+    thread.join().expect("join").expect("shutdown");
 }
 
 #[test]

@@ -254,6 +254,30 @@ impl ExecutionBoundaryAssessment {
         LaunchRefusal {
             evidence_sha256: self.evidence_sha256.clone(),
             unenforced: BoundaryRequirement::ALL.to_vec(),
+            blockers: vec![LaunchBlocker::MissingDescriptorClosure],
+        }
+    }
+}
+
+/// A concrete blocker that prevents installing the complete launch boundary.
+///
+/// This is narrower than [`BoundaryRequirement`]: requirements describe the
+/// final invariant, while blockers explain a presently verified reason the
+/// runner cannot claim that invariant.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum LaunchBlocker {
+    /// The runner has no installed, digest-pinned path that closes every
+    /// descriptor outside an explicit allowlist before the boundary installer
+    /// runs. Merely observing `/proc/self/fd` is not descriptor closure.
+    MissingDescriptorClosure,
+}
+
+impl LaunchBlocker {
+    /// Stable non-payload category for logs and protocol adapters.
+    #[must_use]
+    pub const fn category(self) -> &'static str {
+        match self {
+            Self::MissingDescriptorClosure => "missing_descriptor_closure",
         }
     }
 }
@@ -263,6 +287,7 @@ impl ExecutionBoundaryAssessment {
 pub struct LaunchRefusal {
     evidence_sha256: String,
     unenforced: Vec<BoundaryRequirement>,
+    blockers: Vec<LaunchBlocker>,
 }
 
 impl LaunchRefusal {
@@ -276,6 +301,12 @@ impl LaunchRefusal {
     #[must_use]
     pub fn unenforced_requirements(&self) -> &[BoundaryRequirement] {
         &self.unenforced
+    }
+
+    /// Concrete, typed reasons the complete boundary cannot be installed.
+    #[must_use]
+    pub fn blockers(&self) -> &[LaunchBlocker] {
+        &self.blockers
     }
 }
 
@@ -576,6 +607,10 @@ mod tests {
             assessment.launch_refusal().unenforced_requirements(),
             BoundaryRequirement::ALL
         );
+        assert_eq!(
+            assessment.launch_refusal().blockers(),
+            [LaunchBlocker::MissingDescriptorClosure]
+        );
     }
 
     #[test]
@@ -590,6 +625,10 @@ mod tests {
             assert_eq!(assessment.status(requirement), &BoundaryStatus::Unavailable);
         }
         assert_eq!(assessment.launch_refusal().unenforced.len(), 5);
+        assert_eq!(
+            assessment.launch_refusal().blockers,
+            [LaunchBlocker::MissingDescriptorClosure]
+        );
     }
 
     #[test]
