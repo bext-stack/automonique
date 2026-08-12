@@ -176,9 +176,16 @@ pub fn emit_typescript(schema: &SpikeSchema) -> String {
     out.push_str("  return encoder.encode(value).length;\n");
     out.push_str("}\n\n");
     out.push_str("export class ValidationError extends Error {\n");
-    out.push_str("  constructor(readonly field: string, readonly violation: string) {\n");
+    // Keep the output executable by runtimes that implement TypeScript by
+    // erasing types only. Constructor parameter properties require a transform
+    // and are rejected by Node's strip-only loader.
+    out.push_str("  readonly field: string;\n");
+    out.push_str("  readonly violation: string;\n");
+    out.push_str("  constructor(field: string, violation: string) {\n");
     out.push_str("    super(`${field}: ${violation}`);\n");
     out.push_str("    this.name = \"ValidationError\";\n");
+    out.push_str("    this.field = field;\n");
+    out.push_str("    this.violation = violation;\n");
     out.push_str("  }\n");
     out.push_str("}\n");
 

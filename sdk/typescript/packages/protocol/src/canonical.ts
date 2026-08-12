@@ -269,8 +269,11 @@ export function decodeFrame(input: Uint8Array): FrameDecode {
 class Parser {
   private position = 0;
   private depth = 0;
+  private readonly text: string;
 
-  constructor(private readonly text: string) {}
+  constructor(text: string) {
+    this.text = text;
+  }
 
   private peek(): string | undefined {
     return this.text[this.position];

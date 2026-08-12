@@ -12,9 +12,13 @@ function byteLength(value: string): number {
 }
 
 export class ValidationError extends Error {
-  constructor(readonly field: string, readonly violation: string) {
+  readonly field: string;
+  readonly violation: string;
+  constructor(field: string, violation: string) {
     super(`${field}: ${violation}`);
     this.name = "ValidationError";
+    this.field = field;
+    this.violation = violation;
   }
 }
 
