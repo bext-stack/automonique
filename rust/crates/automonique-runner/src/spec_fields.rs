@@ -21,6 +21,7 @@ use automonique_protocol::primitives::Revision;
 use automonique_protocol::provider::{Capability, MAX_CAPABILITIES, SessionBinding};
 use automonique_protocol::sandbox::{Digest, DigestAlgorithm, SandboxSpec};
 use automonique_protocol::tools::{CredentialAudiences, NestedCause};
+use automonique_protocol::wire::MAX_JSON_ENTRIES;
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
@@ -870,7 +871,24 @@ impl AdmissionFields {
         sandbox: &SandboxSpec,
     ) -> Result<(), RunSpecError> {
         self.validate_session(coordinates, prompt, sandbox)?;
-        if !self.context_manifest().within_budget() {
+        let context = self.context_manifest();
+        if context.policy().len() > MAX_JSON_ENTRIES || context.supplied().len() > MAX_JSON_ENTRIES
+        {
+            return Err(RunSpecError::FieldInvalid("context_manifest"));
+        }
+        let declared_tokens = context
+            .policy()
+            .iter()
+            .map(|component| component.caps().token_cap())
+            .chain(
+                context
+                    .supplied()
+                    .iter()
+                    .map(|component| component.caps().token_cap()),
+            )
+            .try_fold(0_u64, u64::checked_add)
+            .ok_or(RunSpecError::FieldInvalid("context_manifest"))?;
+        if declared_tokens > context.token_budget().total_tokens() {
             return Err(RunSpecError::FieldInvalid("context_manifest"));
         }
         if self

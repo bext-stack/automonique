@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 use automonique_protocol::automation::DurableId;
-use automonique_protocol::context::{ContextManifest, TokenBudget};
+use automonique_protocol::context::{
+    ComponentCaps, ContextManifest, PolicyComponent, RedactionOutcome, SuppliedClass,
+    SuppliedComponent, TokenBudget, TrustClass,
+};
 use automonique_protocol::host::{AttemptId, HostId, HostLifetime, WorkId};
 use automonique_protocol::identity::Actor;
 use automonique_protocol::models::{ExecutorClass, ProviderAccountId, RemoteCoordinate};
@@ -15,6 +18,7 @@ use automonique_protocol::sandbox::{
     WorkspaceContextHash,
 };
 use automonique_protocol::tools::{CausationId, NestedCause, RunId};
+use automonique_protocol::wire::MAX_JSON_ENTRIES;
 use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
 use automonique_runner::{
     AdmissionFields, AdmissionFieldsParts, ArtifactGrantBinding, ArtifactGrantBindings,
@@ -135,6 +139,45 @@ fn admission_parts(workspace_bytes: u64) -> AdmissionFieldsParts {
 
 fn digest_text(digit: char) -> String {
     format!("sha256:{}", digit.to_string().repeat(64))
+}
+
+fn parts_with_context(root: &Path, context_manifest: ContextManifest) -> RunSpecParts {
+    let mut spec = parts(root, PromptDeliveryPlan::Stdin);
+    let mut admission = admission_parts(0);
+    admission.context_manifest = context_manifest;
+    spec.admission = AdmissionFields::new(admission);
+    spec
+}
+
+fn policy_component(source: &str) -> PolicyComponent {
+    policy_component_with_token_cap(source, 1)
+}
+
+fn policy_component_with_token_cap(source: &str, token_cap: u64) -> PolicyComponent {
+    PolicyComponent::new(
+        source,
+        Revision::FIRST,
+        "policy-component-digest",
+        ComponentCaps::new(1, token_cap).unwrap(),
+        RedactionOutcome::Clean,
+    )
+    .unwrap()
+}
+
+fn supplied_component(source: &str) -> SuppliedComponent {
+    supplied_component_with_token_cap(source, 1)
+}
+
+fn supplied_component_with_token_cap(source: &str, token_cap: u64) -> SuppliedComponent {
+    SuppliedComponent::new(
+        source,
+        SuppliedClass::Skills,
+        TrustClass::ActorSupplied,
+        "supplied-component-digest",
+        ComponentCaps::new(1, token_cap).unwrap(),
+        RedactionOutcome::Clean,
+    )
+    .unwrap()
 }
 
 fn session_binding(
@@ -1077,4 +1120,135 @@ fn stale_status_temporary_does_not_block_restart() {
     .unwrap();
     let reopened = Spool::open(&spool_root, "run-status", 1024 * 1024).unwrap();
     assert_eq!(reopened.status().last_sequence(), 1);
+}
+
+#[test]
+fn context_policy_array_accepts_exact_wire_limit_with_duplicates_and_order() {
+    let root = TempDir::new("context-policy-limit");
+    let repeated = policy_component("policy-repeated");
+    let mut policy = vec![repeated; MAX_JSON_ENTRIES];
+    policy[0] = policy_component("policy-first");
+    policy[MAX_JSON_ENTRIES - 1] = policy_component("policy-last");
+    let manifest = ContextManifest::new(
+        Revision::FIRST,
+        TokenBudget::new(MAX_JSON_ENTRIES as u64),
+        policy,
+        Vec::new(),
+    );
+
+    let spec = RunSpec::new(parts_with_context(root.path(), manifest)).expect("exact limit");
+    let preserved = spec.admission().context_manifest().policy();
+    assert_eq!(preserved.len(), MAX_JSON_ENTRIES);
+    assert_eq!(preserved[0].source(), "policy-first");
+    assert_eq!(preserved[1].source(), "policy-repeated");
+    assert_eq!(preserved[2].source(), "policy-repeated");
+    assert_eq!(preserved[MAX_JSON_ENTRIES - 1].source(), "policy-last");
+}
+
+#[test]
+fn context_policy_array_refuses_one_over_wire_limit() {
+    let root = TempDir::new("context-policy-over-limit");
+    let policy = vec![policy_component("policy-repeated"); MAX_JSON_ENTRIES + 1];
+    let manifest = ContextManifest::new(
+        Revision::FIRST,
+        TokenBudget::new((MAX_JSON_ENTRIES + 1) as u64),
+        policy,
+        Vec::new(),
+    );
+
+    assert_eq!(
+        RunSpec::new(parts_with_context(root.path(), manifest)).unwrap_err(),
+        RunSpecError::FieldInvalid("context_manifest")
+    );
+}
+
+#[test]
+fn context_supplied_array_accepts_exact_wire_limit_with_duplicates_and_order() {
+    let root = TempDir::new("context-supplied-limit");
+    let repeated = supplied_component("supplied-repeated");
+    let mut supplied = vec![repeated; MAX_JSON_ENTRIES];
+    supplied[0] = supplied_component("supplied-first");
+    supplied[MAX_JSON_ENTRIES - 1] = supplied_component("supplied-last");
+    let manifest = ContextManifest::new(
+        Revision::FIRST,
+        TokenBudget::new(MAX_JSON_ENTRIES as u64),
+        Vec::new(),
+        supplied,
+    );
+
+    let spec = RunSpec::new(parts_with_context(root.path(), manifest)).expect("exact limit");
+    let preserved = spec.admission().context_manifest().supplied();
+    assert_eq!(preserved.len(), MAX_JSON_ENTRIES);
+    assert_eq!(preserved[0].source(), "supplied-first");
+    assert_eq!(preserved[1].source(), "supplied-repeated");
+    assert_eq!(preserved[2].source(), "supplied-repeated");
+    assert_eq!(preserved[MAX_JSON_ENTRIES - 1].source(), "supplied-last");
+}
+
+#[test]
+fn context_supplied_array_refuses_one_over_wire_limit() {
+    let root = TempDir::new("context-supplied-over-limit");
+    let supplied = vec![supplied_component("supplied-repeated"); MAX_JSON_ENTRIES + 1];
+    let manifest = ContextManifest::new(
+        Revision::FIRST,
+        TokenBudget::new((MAX_JSON_ENTRIES + 1) as u64),
+        Vec::new(),
+        supplied,
+    );
+
+    assert_eq!(
+        RunSpec::new(parts_with_context(root.path(), manifest)).unwrap_err(),
+        RunSpecError::FieldInvalid("context_manifest")
+    );
+}
+
+#[test]
+fn context_combined_array_limits_use_the_exact_checked_budget() {
+    let root = TempDir::new("context-combined-limit");
+    let policy = vec![policy_component("policy-repeated"); MAX_JSON_ENTRIES];
+    let supplied = vec![supplied_component("supplied-repeated"); MAX_JSON_ENTRIES];
+    let exact_budget = (MAX_JSON_ENTRIES * 2) as u64;
+
+    let accepted = ContextManifest::new(
+        Revision::FIRST,
+        TokenBudget::new(exact_budget),
+        policy.clone(),
+        supplied.clone(),
+    );
+    let spec = RunSpec::new(parts_with_context(root.path(), accepted)).expect("exact budget");
+    assert_eq!(
+        spec.admission().context_manifest().policy().len(),
+        MAX_JSON_ENTRIES
+    );
+    assert_eq!(
+        spec.admission().context_manifest().supplied().len(),
+        MAX_JSON_ENTRIES
+    );
+
+    let under_budgeted = ContextManifest::new(
+        Revision::FIRST,
+        TokenBudget::new(exact_budget - 1),
+        policy,
+        supplied,
+    );
+    assert_eq!(
+        RunSpec::new(parts_with_context(root.path(), under_budgeted)).unwrap_err(),
+        RunSpecError::FieldInvalid("context_manifest")
+    );
+}
+
+#[test]
+fn context_token_cap_arithmetic_overflow_refuses() {
+    let root = TempDir::new("context-token-overflow");
+    let manifest = ContextManifest::new(
+        Revision::FIRST,
+        TokenBudget::new(u64::MAX),
+        vec![policy_component_with_token_cap("policy-max", u64::MAX)],
+        vec![supplied_component_with_token_cap("supplied-one", 1)],
+    );
+
+    assert_eq!(
+        RunSpec::new(parts_with_context(root.path(), manifest)).unwrap_err(),
+        RunSpecError::FieldInvalid("context_manifest")
+    );
 }
