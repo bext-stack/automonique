@@ -1,69 +1,70 @@
 {
   "item": "R0-10",
-  "base": "eb0935adb4d4b26335ccc6d18f0dd747369b7e38",
-  "scope": "partial \u2014 bind the drill to the canonical R0-09 producer and harden backup-manifest containment; clean-host execution and objective comparison remain unmeasured",
+  "base": "14793cb1388c9318ece6d344bc6894d6bee72e18",
+  "scope": "partial — add a live exec-clean same-kernel boundary probe and a permanently completion-ineligible canonical 21-position receipt model; neither is yet integrated with the restore",
   "checks": [
     {
       "name": "Safety refusal",
-      "command": "python3 spikes/recovery/test_recovery_drill.py",
+      "command": "python3 -m unittest discover -s spikes/recovery -p 'test_*.py'",
       "result": "pass",
       "disposition": "pass",
-      "output": "50/50 tests passed. Six workspace refusal codes retain positive and negative controls. Backup manifests reject unknown/missing/duplicate keys, non-integer counters, noncanonical relative paths, absolute paths, traversal, non-SHA-256 hashes, payload/root/target-parent symlinks, missing files and non-regular files before creating the restore target. Descriptor-relative O_NOFOLLOW reads/writes close source replacement races. Post-write device/inode revalidation closes target-parent replacement races and removes the fd-pinned target on refusal. Both deterministic race controls passed."
+      "output": "81/81 recovery tests passed. The boundary has typed refusals for capability, clone, UID map, parent control, Landlock, privilege, exec, worker, report, size and timeout failures. Missing-control and timeout children are killed and reaped; a launcher-death test proves parent-death protection kills the child. Existing workspace and restore-containment controls remain green."
     },
     {
       "name": "Backup consistency",
       "command": "python3 spikes/recovery/test_recovery_drill.py",
       "result": "pass",
       "disposition": "pass",
-      "output": "The existing SQLite online-backup drill still restores 40 events and 40 artifacts and passes all eight coherence invariants. The naive-order, torn-set, corrupt-database, missing/config-lag, orphan, hash-tamper and unreadable-database controls remain green. Restore now validates every source payload and containment rule before it creates or writes the target."
+      "output": "The existing SQLite online-backup drill still restores 40 events and 40 artifacts and passes all eight coherence invariants and all containment/race controls. This slice does not change that engine."
     },
     {
       "name": "Clean-host restore",
-      "command": "python3 spikes/recovery/drill.py",
+      "command": "python3 spikes/recovery/clean_boundary.py",
       "result": null,
       "disposition": "unmeasured",
-      "reason": "This bounded slice does not create the disposable same-kernel namespace, execute a disconnected recovery startup, or prove source and repository inaccessibility. The current drill remains a clean-target local fixture and is not presented as clean-host evidence."
+      "reason": "The standalone probe creates an exec-clean same-kernel boundary, but this slice does not run the backup restore, invariants or disconnected recovery startup inside it. It is boundary-mechanism evidence, not the completed Clean-host restore row.",
+      "output": "Live probe verified on Linux x86_64 with Landlock ABI 4: PID 1 and UID 0 under UID-only mapping; all seven parent/child namespace identities differ; no_new_privs=1; capability words are zero; repository read and TCP connect return EACCES; only report FD 3 survives; child exits 0 and is reaped. Evidence records no seccomp, a trusted inline worker and standalone-probe scope."
     },
     {
       "name": "Objective measurement",
       "command": "python3 spikes/recovery/drill.py",
       "result": null,
       "disposition": "unmeasured",
-      "reason": "The local fixture still reports both timing comparisons out_of_scope. This slice consumes the canonical R0-09 objective declarations without claiming that its existing pacing or restore-only timer meets them."
+      "reason": "The boundary and receipt model are not yet integrated with the scheduled backup and restore, so neither RPO nor full-boundary RTO is newly measured or compared in this slice."
     },
     {
       "name": "Dependency agreement",
-      "command": "python3 spikes/recovery/dependencies.py --report (expected exit 2 for recorded gaps); python3 -m unittest -v spikes.recovery.test_dependencies_contract; python3 tools/surface_inventory/verify.py",
+      "command": "python3 -m unittest -v spikes.recovery.test_recovery_plan; python3 spikes/recovery/dependencies.py --report (expected exit 2)",
       "result": null,
       "disposition": "unmeasured",
-      "reason": "Producer authenticity and consumption pass, but the existing drill does not yet emit one disposition receipt for each of the 21 positions. The report's expected exit 2 and 28 findings keep the full Dependency agreement row open.",
-      "output": "The canonical producer plan/inventory/surface/restore-dependencies.json is authenticated and consumed: schema automonique.restore-dependencies/v1, work_item R0-09, consumer R0-10, 21 ordered positions, two minute objectives and one excluded class. Authenticity is separate from agreement: the report truthfully names 8 existing local-drill IDs absent from R0-09 and 20 canonical positions not yet exercised. The consumer verifies exact recursive shapes/types/enums, duplicate keys, contiguous topological order and earlier references, exact lexical path and source digest, then re-renders the actual R0-09 source and requires byte equality. Nine test methods passed, including threshold/source/order/path and symlink-alias refusals. Surface inventory verification passed with all derived views current."
+      "reason": "The receipt model requires one canonical ordered receipt and preserves unresolved-prerequisite semantics, but deliberately has no execution resolver and can never mark itself completion-eligible. The actual drill still reports 28 agreement gaps.",
+      "output": "12/12 receipt-model tests passed. IDs, order and prerequisites come only through the strict R0-09 consumer. Receipts are hash-chained; all five external-effect flags remain false; every N/A refuses absent policy; required-unrun parents prevent exercised or verified-disabled children and advance only the receipt cursor, not semantic startup state."
     },
     {
       "name": "Rerun hygiene",
-      "command": "python3 spikes/recovery/test_recovery_drill.py",
+      "command": "python3 -m unittest -v spikes.recovery.test_clean_boundary",
       "result": "pass",
       "disposition": "pass",
-      "output": "Sequential reruns retain the same normalized outcome and leave no run-scoped workspace after success, inconsistency or injected failure. The skip-cleanup control still proves residue detection."
+      "output": "10/10 boundary tests passed, including bounded timeout, parent death, missing control, forged report, nonzero child exit and high inherited descriptor after lowered soft limit. Every child is reaped and no fallback runs. Existing drill residue controls remain green."
     },
     {
       "name": "Quality",
-      "command": "python3 spikes/recovery/test_recovery_drill.py && python3 -m unittest -v spikes.recovery.test_dependencies_contract && python3 -m py_compile spikes/recovery/dependencies.py spikes/recovery/recovery_set.py spikes/recovery/test_dependencies_contract.py spikes/recovery/test_recovery_drill.py && git diff --check",
+      "command": "python3 -m unittest discover -s spikes/recovery -p 'test_*.py' && python3 spikes/recovery/clean_boundary.py && python3 -m py_compile spikes/recovery/*.py && git diff --check",
       "result": "pass",
       "disposition": "pass",
-      "output": "50 recovery tests, 9 canonical-consumer tests and 59/59 discovery tests passed. Python compilation and diff whitespace checks passed. The implementation uses the standard library plus the exact checked-in R0-09 renderer module, pinned by full import-module/name/alias AST comparison; it performs no network fetch, production access or credential handling. The local drill now returns outcome=incomplete and exit 2 while the 28 agreement findings remain."
+      "output": "81/81 discovery tests passed: 50 original recovery, 9 canonical consumer, 10 live boundary and 12 receipt model. Direct boundary execution verified and was reaped at status 0. Python compilation and whitespace checks passed. New modules use only the standard library and checked-in sibling consumer; no external dependency, network fetch, production access or credential value was introduced."
     }
   ],
   "review": {
-    "reviewers": 1,
+    "reviewers": 2,
     "blocking_findings": 0,
-    "acceptance": "accepted for partial typed integration after independent adversarial review; not accepted as R0-10 completion"
+    "acceptance": "accepted only as two standalone partial mechanisms after adversarial review; not accepted as R0-10 completion"
   },
   "remaining": [
-    "Create and attest an exec-clean disposable same-kernel recovery boundary with source and repository content inaccessible.",
-    "Execute or source-backed-disposition all 21 R0-09 positions, including disconnected startup, synthetic descriptor resolution, audience revalidation and verified-disabled transport/provider enablement.",
+    "Package the trusted recovery worker and run the actual restore, invariants and canonical receipt resolver inside the proven boundary.",
+    "Execute all 21 R0-09 positions, including disconnected startup, synthetic descriptor resolution, audience revalidation and verified-disabled transport/provider enablement.",
     "Measure scheduled synthetic RPO and full-boundary RTO against the canonical objectives; a miss must block verified outcome.",
-    "Replace the local nine-row needs table as the drill's execution authority and update the procedure/report around the 21 canonical positions."
+    "Replace the local nine-row needs table as the drill authority and bind real evidence documents to the canonical receipt model."
   ],
-  "notes": "This candidate is intentionally partial. It resolves the producer/consumer mismatch and closes real restore traversal and replacement-race vulnerabilities, but it does not mark R0-10 done, close a gate, or claim production readiness. Three contract rows remain null with reasons and full completion is not requested."
+  "notes": "This candidate is intentionally partial. The live boundary and receipt model are independent mechanisms and are not presented as an integrated clean-host restore. Three contract rows remain null with reasons; R0-10 stays open and no production-readiness, deployment or transport claim is made."
 }

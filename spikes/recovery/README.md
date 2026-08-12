@@ -11,6 +11,16 @@ It is a **real drill over a real artifact**, and it is **not a clean-host
 restore**. Both halves of that sentence matter, and the difference is the first
 thing this file has to say.
 
+Two partial mechanisms now make the next integration step explicit:
+
+- `clean_boundary.py` proves a trusted inline worker can run as PID 1 in seven
+  fresh Linux namespaces with repository and TCP access denied, capabilities
+  zeroed, parent-death cleanup armed and only its report descriptor surviving.
+  It is a standalone boundary probe, not yet the restore.
+- `recovery_plan.py` validates one typed, hash-chained receipt per canonical
+  R0-09 position. It grants no N/A decisions and can never certify completion
+  by itself; real execution provenance belongs to the integration step.
+
 ## What is measured, and what is not
 
 | | measured here | needed for the contract's claim |
@@ -56,6 +66,8 @@ python3 spikes/recovery/dependencies.py --report       # consume the R0-09 inven
 python3 spikes/recovery/dependencies.py --check        # generated list is current
 python3 spikes/recovery/test_recovery_drill.py         # 50 controls
 python3 -m unittest -v spikes.recovery.test_dependencies_contract  # 9 controls
+python3 -m unittest -v spikes.recovery.test_clean_boundary          # 10 controls
+python3 -m unittest -v spikes.recovery.test_recovery_plan           # 12 controls
 ```
 
 Exit codes: `0` verified, `1` failed, `2` incomplete dependency agreement,
