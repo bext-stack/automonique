@@ -50,12 +50,26 @@ fn helper() -> &'static Path {
 }
 
 #[test]
-fn helper_closes_inherited_high_descriptor_before_fixed_fixture() {
+fn helper_closes_inherited_high_descriptor_or_refuses_missing_fixed_dependency() {
     let workspace = TempDir::new();
     let metadata = fs::metadata(&workspace.0).expect("metadata");
     let helper_digest = digest(helper());
-    let bwrap_digest = digest(Path::new("/usr/bin/bwrap"));
-    let fixture_digest = digest(Path::new("/usr/bin/busybox"));
+    let bwrap_path = Path::new("/usr/bin/bwrap");
+    let fixture_path = Path::new("/usr/bin/busybox");
+    let bwrap_available = fs::symlink_metadata(bwrap_path)
+        .is_ok_and(|metadata| metadata.file_type().is_file());
+    let fixture_available = fs::symlink_metadata(fixture_path)
+        .is_ok_and(|metadata| metadata.file_type().is_file());
+    let bwrap_digest = if bwrap_available {
+        digest(bwrap_path)
+    } else {
+        "b".repeat(64)
+    };
+    let fixture_digest = if fixture_available {
+        digest(fixture_path)
+    } else {
+        "c".repeat(64)
+    };
     let workspace_digest = "a".repeat(64);
 
     dup2(0, 314).expect("install inherited high descriptor");
@@ -79,6 +93,22 @@ fn helper_closes_inherited_high_descriptor_before_fixed_fixture() {
         .output()
         .expect("execute helper");
     close(314).expect("close test descriptor");
+
+    if !bwrap_available || !fixture_available {
+        assert_eq!(output.status.code(), Some(64));
+        assert!(output.stdout.is_empty());
+        let expected_category = if bwrap_available {
+            "fixture"
+        } else {
+            "bwrap"
+        };
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("utf8 refusal"),
+            format!("automonique fixture helper refused: {expected_category}\n")
+        );
+        return;
+    }
+
     assert!(
         output.status.success(),
         "helper refused: {}",
