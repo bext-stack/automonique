@@ -4389,6 +4389,16 @@ pub enum ExecutorClass {
 }
 
 impl ExecutorClass {
+    /// Every fieldless executor class, for closed-codec coverage.
+    pub const FIELDLESS: [Self; 6] = [
+        Self::Local,
+        Self::Container,
+        Self::Ssh,
+        Self::Batch,
+        Self::Cluster,
+        Self::MicroVm,
+    ];
+
     /// Stable spelling.
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
@@ -4411,6 +4421,25 @@ impl ExecutorClass {
             _ => None,
         }
     }
+
+    /// Parse an executor spelling together with its optional remote
+    /// coordinate.
+    ///
+    /// A remote executor without a coordinate and a local executor with one
+    /// are both refused, preserving the enum's existing type invariant.
+    #[must_use]
+    pub fn from_spelling(value: &str, remote: Option<RemoteCoordinate>) -> Option<Self> {
+        match (value, remote) {
+            ("local", None) => Some(Self::Local),
+            ("container", None) => Some(Self::Container),
+            ("ssh", None) => Some(Self::Ssh),
+            ("batch", None) => Some(Self::Batch),
+            ("cluster", None) => Some(Self::Cluster),
+            ("micro_vm", None) => Some(Self::MicroVm),
+            ("remote", Some(coordinate)) => Some(Self::Remote(coordinate)),
+            _ => None,
+        }
+    }
 }
 
 /// How a workspace reaches the executor.
@@ -4424,6 +4453,31 @@ pub enum WorkspaceTransfer {
     ContentAddressedBundle,
 }
 
+impl WorkspaceTransfer {
+    /// Every transfer mode, for closed-codec coverage.
+    pub const ALL: [Self; 3] = [
+        Self::SharedMount,
+        Self::SynchronizedOverAttestedChannel,
+        Self::ContentAddressedBundle,
+    ];
+
+    /// Stable lowercase spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SharedMount => "shared_mount",
+            Self::SynchronizedOverAttestedChannel => "synchronized_over_attested_channel",
+            Self::ContentAddressedBundle => "content_addressed_bundle",
+        }
+    }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == value)
+    }
+}
+
 /// How artifacts leave the executor.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ArtifactTransfer {
@@ -4431,6 +4485,26 @@ pub enum ArtifactTransfer {
     DigestVerifiedPull,
     /// The executor pushes, and the control plane verifies digests.
     DigestVerifiedPush,
+}
+
+impl ArtifactTransfer {
+    /// Every transfer mode, for closed-codec coverage.
+    pub const ALL: [Self; 2] = [Self::DigestVerifiedPull, Self::DigestVerifiedPush];
+
+    /// Stable lowercase spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DigestVerifiedPull => "digest_verified_pull",
+            Self::DigestVerifiedPush => "digest_verified_push",
+        }
+    }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == value)
+    }
 }
 
 /// The immutable specification an executor accepted.

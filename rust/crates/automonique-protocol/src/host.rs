@@ -58,6 +58,28 @@ pub enum HostLifetime {
     Session,
 }
 
+impl HostLifetime {
+    /// Every lifetime, for closed-codec coverage.
+    pub const ALL: [Self; 2] = [Self::Attempt, Self::Session];
+
+    /// Stable lowercase spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Attempt => "attempt",
+            Self::Session => "session",
+        }
+    }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|lifetime| lifetime.as_str() == value)
+    }
+}
+
 /// Why a host operation was refused.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostError {
@@ -136,10 +158,7 @@ impl fmt::Display for HostError {
 impl Error for HostError {}
 
 const fn lifetime_name(lifetime: HostLifetime) -> &'static str {
-    match lifetime {
-        HostLifetime::Attempt => "attempt",
-        HostLifetime::Session => "session",
-    }
+    lifetime.as_str()
 }
 
 /// The supervised state of a host.

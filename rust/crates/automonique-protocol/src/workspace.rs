@@ -167,6 +167,27 @@ pub enum IsolationKind {
     Overlay,
 }
 
+impl IsolationKind {
+    /// Every isolation kind, for closed-codec coverage.
+    pub const ALL: [Self; 3] = [Self::ReadOnlySnapshot, Self::AttemptCopy, Self::Overlay];
+
+    /// Stable lowercase spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnlySnapshot => "read_only_snapshot",
+            Self::AttemptCopy => "attempt_copy",
+            Self::Overlay => "overlay",
+        }
+    }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == value)
+    }
+}
+
 /// A registered workspace at one immutable base.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceRegistration {

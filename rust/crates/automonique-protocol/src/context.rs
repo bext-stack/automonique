@@ -115,6 +115,12 @@ impl TrustClass {
             Self::Policy => "policy",
         }
     }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|class| class.as_str() == value)
+    }
 }
 
 /// Why a context operation was refused.
@@ -427,6 +433,14 @@ impl RedactionOutcome {
             Self::Redacted => "redacted",
         }
     }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|outcome| outcome.as_str() == value)
+    }
 }
 
 /// The byte and token ceilings a component was admitted under.
@@ -532,6 +546,12 @@ impl SuppliedClass {
     pub const fn as_str(self) -> &'static str {
         self.as_component_class().as_str()
     }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|class| class.as_str() == value)
+    }
 }
 
 /// Which accounting class a token count belongs to.
@@ -581,6 +601,12 @@ impl ComponentClass {
             Self::Attachments => "attachments",
             Self::Conversation => "conversation",
         }
+    }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|class| class.as_str() == value)
     }
 }
 

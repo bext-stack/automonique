@@ -617,6 +617,9 @@ pub enum PathAccess {
 }
 
 impl PathAccess {
+    /// Every path access mode, for closed-codec coverage.
+    pub const ALL: [Self; 2] = [Self::ReadOnly, Self::ReadWrite];
+
     /// Stable spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -624,6 +627,14 @@ impl PathAccess {
             Self::ReadOnly => "read_only",
             Self::ReadWrite => "read_write",
         }
+    }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|access| access.as_str() == value)
     }
 }
 
@@ -807,6 +818,33 @@ pub enum FilesystemAccess {
 }
 
 impl FilesystemAccess {
+    /// Every filesystem access mode, for closed-codec coverage.
+    pub const ALL: [Self; 4] = [
+        Self::None,
+        Self::ReadOnlySnapshot,
+        Self::IsolatedWritable,
+        Self::WritableWithGrants,
+    ];
+
+    /// Stable lowercase spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ReadOnlySnapshot => "read_only_snapshot",
+            Self::IsolatedWritable => "isolated_writable",
+            Self::WritableWithGrants => "writable_with_grants",
+        }
+    }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|access| access.as_str() == value)
+    }
+
     /// Whether the profile grants any read at all.
     #[must_use]
     pub const fn permits_read(self) -> bool {
@@ -829,6 +867,29 @@ pub enum NetworkAccess {
     BrokeredNamed,
     /// Any destination the broker permits.
     BrokeredAny,
+}
+
+impl NetworkAccess {
+    /// Every network access mode, for closed-codec coverage.
+    pub const ALL: [Self; 3] = [Self::Denied, Self::BrokeredNamed, Self::BrokeredAny];
+
+    /// Stable lowercase spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Denied => "denied",
+            Self::BrokeredNamed => "brokered_named",
+            Self::BrokeredAny => "brokered_any",
+        }
+    }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|access| access.as_str() == value)
+    }
 }
 
 /// Egress policy for the trusted provider-control channel.
@@ -1061,6 +1122,12 @@ impl AllowlistClass {
             Self::Companion => "companion",
         }
     }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|class| class.as_str() == value)
+    }
 }
 
 /// One allowlisted subject and the class it is allowlisted for.
@@ -1194,6 +1261,12 @@ impl ProcessClass {
             Self::Companion => "companion",
             Self::ExtensionWorker => "extension_worker",
         }
+    }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|class| class.as_str() == value)
     }
 }
 
@@ -1333,6 +1406,12 @@ impl BudgetUnit {
             Self::SpoolBytes => "spool_bytes",
             Self::ArtifactBytes => "artifact_bytes",
         }
+    }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|unit| unit.as_str() == value)
     }
 
     /// The declared ceiling for this unit.
@@ -1737,6 +1816,14 @@ impl IsolationRequirement {
             Self::SeparateChildBoundary => "separate_child_boundary",
             Self::StrongerIsolation => "stronger_isolation",
         }
+    }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|requirement| requirement.as_str() == value)
     }
 }
 

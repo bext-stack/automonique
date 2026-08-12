@@ -105,6 +105,17 @@ pub enum CapabilityGroup {
 }
 
 impl CapabilityGroup {
+    /// Every group, for closed-codec coverage.
+    pub const ALL: [Self; 7] = [
+        Self::Sessions,
+        Self::Turns,
+        Self::Events,
+        Self::Approvals,
+        Self::Tools,
+        Self::Telemetry,
+        Self::Lifecycle,
+    ];
+
     /// Stable lowercase wire spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -117,6 +128,12 @@ impl CapabilityGroup {
             Self::Telemetry => "telemetry",
             Self::Lifecycle => "lifecycle",
         }
+    }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|group| group.as_str() == value)
     }
 }
 
