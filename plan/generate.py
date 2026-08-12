@@ -247,6 +247,11 @@ ITEM_PATHS = {
         "rust/crates/automonique-protocol/",
         "rust/Cargo.lock",
     ],
+    "R2-03": [
+        "rust/crates/automonique-runner/",
+        "rust/crates/automonique-protocol/",
+        "rust/Cargo.lock",
+    ],
     "R11-08": ["sdk/typescript/packages/extension/"],
     "R11-09": ["sdk/typescript/packages/ui/"],
 }
@@ -261,6 +266,13 @@ ITEM_DEPS = {
     "R0-20": ["R0-21"],
     "R0-22": ["R0-20", "R0-21"],
     "R1-07": ["R1-01"],
+}
+
+# These rows replace a coarse dependency transcribed from the breakdown with
+# the exact typed-input edge. Additive ITEM_DEPS would retain the stale edge.
+ITEM_DEP_REPLACEMENTS = {
+    "R2-02": ["R2-01"],
+    "R2-03": ["R1-09", "R2-01"],
 }
 
 # Completion is written here so regeneration cannot silently reopen landed
@@ -418,15 +430,21 @@ def build() -> str:
 
     for it in items:
         epic = it["epic"]
-        deps = list(it["item_deps"]) + ITEM_DEPS.get(it["id"], [])
-        # depend on the last item of each predecessor epic; item-level deps refine
-        for pred in EPIC_DEPS.get(epic, []):
-            if pred in by_epic and by_epic[pred]:
-                deps.append(by_epic[pred][-1])
-            elif pred in BOOT_IDS:
-                deps.append(pred)
-            elif pred in item_ids:
-                deps.append(pred)
+        deps = (
+            list(ITEM_DEP_REPLACEMENTS[it["id"]])
+            if it["id"] in ITEM_DEP_REPLACEMENTS
+            else list(it["item_deps"]) + ITEM_DEPS.get(it["id"], [])
+        )
+        # Exact replacements already include the typed input that carries any
+        # transitive epic-spine dependency; do not re-add the coarse predecessor.
+        if it["id"] not in ITEM_DEP_REPLACEMENTS:
+            for pred in EPIC_DEPS.get(epic, []):
+                if pred in by_epic and by_epic[pred]:
+                    deps.append(by_epic[pred][-1])
+                elif pred in BOOT_IDS:
+                    deps.append(pred)
+                elif pred in item_ids:
+                    deps.append(pred)
         deps = sorted(set(deps))
         licence = ("Apache-2.0" if epic in APACHE_EPICS or it["id"] in APACHE_ITEMS
                    else "Elastic-2.0")

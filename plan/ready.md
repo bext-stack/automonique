@@ -15,7 +15,7 @@ Product work is what ships. Discovery feeds the specification. Harness work buil
 
 | Class | Items | Done | Contracts | Ready |
 |---|---|---|---|---|
-| product | 330 | 25 | 27 | 1 |
+| product | 330 | 25 | 28 | 1 |
 | discovery | 23 | 13 | 18 | 5 |
 | harness | 22 | 0 | 5 | 0 |
 
@@ -49,7 +49,7 @@ The first blocked items behind the current ready set:
 
 Dependency- and gate-clear, but no contract exists, so they are not selectable. Writing one of these contracts is itself useful work and lowers `contracts_missing`. **Ordered product first** — specifying product work is what makes product work selectable, and nothing else in this repository does that.
 
-  `R2-03`, `R2-04`, `R2-05`, `R2-06`, `R2-07`, `R2-08`, `R2-09`, `R2-10`, `R2-11`, `R2-12`, `R2-13`, `R2-14`, `R2-15`, `R2-16`, `R2-17`, `R2-18`, `R2-19`, `R2-20`, `R2-21`, `R2-22`, `R2-23`, `R2-24`, `R2-25`, `R2-26` …and 21 more
+  `R2-04`, `R2-05`, `R2-06`, `R2-07`, `R2-08`, `R2-09`, `R2-10`, `R2-11`, `R2-12`, `R2-13`, `R2-14`, `R2-15`, `R2-16`, `R2-17`, `R2-18`, `R2-19`, `R2-20`, `R2-21`, `R2-22`, `R2-23`, `R2-24`, `R2-25`, `R2-26`, `R2-27` …and 20 more
 
 ## Gate-blocked work
 

@@ -2531,6 +2531,66 @@
         "plan/contracts/R2-02.md",
         "docs/product-plan/reference/work-breakdown.md"
       ]
+    },
+    {
+      "id": "objective:R2-03",
+      "work_id": "R2-03",
+      "objective": "Evolve the existing runner spool into the sole private durable writer for one exact RunSpec attempt. It appends ordered canonical runner events with embedded bounded raw-provider records, preserves stdout and stderr as separate raw streams, exposes exact cursor replay, publishes status through atomic replacement, recovers deterministically after interruption, and charges all bytes to the RunSpec spool budget.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 19,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Type reuse",
+        "Kind and authority",
+        "Sequence",
+        "Terminal",
+        "Exact formats",
+        "Raw channels",
+        "Inline bound",
+        "Aggregate quota",
+        "Hash chain",
+        "Cursor",
+        "Crash tail",
+        "Atomic status",
+        "Restart",
+        "Filesystem",
+        "Budget accounting",
+        "Leakage",
+        "Replay",
+        "Non-authority",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on a second public event vocabulary; copied protocol types instead of read-only projections; preview reaching terminal; magic terminal payloads; sequence gaps/regression or post-terminal append; magic terminal-outcome inference; any channel escaping the shared quota; unbounded allocation, `read_to_end`, unchecked arithmetic or raw payload; changing the fixed stderr rotation without a contract revision; newline framing of unescaped raw bytes; hash-as-authenticity claims; durable-terminal-as-business-completion claims; reopened history labeled running without evidence; truncating complete corruption; trusting stale status; arbitrary paths/symlink following/unsafe replacement/multiple writers/deletion authority; secret-free content claims; artifact/provider/network/process activity; execution enablement; a new registry package/version or lock drift beyond the reviewed direct rustix edge; unsafe/lint weakening; private-archive/network access; licence crossing; out-of-lease edits; or a required-check failure whose repair is outside scope."
+      ],
+      "hill_climbability": 94,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-runner/",
+        "rust/crates/automonique-protocol/",
+        "rust/Cargo.lock"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R2-03.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
     }
   ]
 }

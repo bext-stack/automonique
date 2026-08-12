@@ -3,7 +3,7 @@
   "schema": "automonique.dev-program/v1",
   "source": {
     "graph": "plan/work-graph.toml",
-    "graph_sha256": "661dd189140d58c44c7fc7274704425091b72256a43aae09ef540e64c084d8c3",
+    "graph_sha256": "aad06de58c47fa39dc417c7b05711eaa2fd74418b4f83f8628df034667599108",
     "item_count": 375
   },
   "items": [
@@ -1687,20 +1687,19 @@
       "title": "Spool writer",
       "summary": "monotonic events, raw channels and atomic terminal status.",
       "depends_on": [
-        "R1-25"
+        "R1-09",
+        "R2-01"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
       "allowed_paths": [
         "rust/crates/automonique-runner/",
-        "rust/crates/automonique-sandbox/",
-        "rust/crates/automonique-agents/",
-        "rust/crates/automonique-workspaces/",
-        "rust/crates/automonique-artifacts/"
+        "rust/crates/automonique-protocol/",
+        "rust/Cargo.lock"
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
+      "contract": "plan/contracts/R2-03.md",
       "runnable": false
     },
     {
