@@ -56,10 +56,10 @@ fn helper_closes_inherited_high_descriptor_or_refuses_missing_fixed_dependency()
     let helper_digest = digest(helper());
     let bwrap_path = Path::new("/usr/bin/bwrap");
     let fixture_path = Path::new("/usr/bin/busybox");
-    let bwrap_available = fs::symlink_metadata(bwrap_path)
-        .is_ok_and(|metadata| metadata.file_type().is_file());
-    let fixture_available = fs::symlink_metadata(fixture_path)
-        .is_ok_and(|metadata| metadata.file_type().is_file());
+    let bwrap_available =
+        fs::symlink_metadata(bwrap_path).is_ok_and(|metadata| metadata.file_type().is_file());
+    let fixture_available =
+        fs::symlink_metadata(fixture_path).is_ok_and(|metadata| metadata.file_type().is_file());
     let bwrap_digest = if bwrap_available {
         digest(bwrap_path)
     } else {
@@ -97,11 +97,7 @@ fn helper_closes_inherited_high_descriptor_or_refuses_missing_fixed_dependency()
     if !bwrap_available || !fixture_available {
         assert_eq!(output.status.code(), Some(64));
         assert!(output.stdout.is_empty());
-        let expected_category = if bwrap_available {
-            "fixture"
-        } else {
-            "bwrap"
-        };
+        let expected_category = if bwrap_available { "fixture" } else { "bwrap" };
         assert_eq!(
             String::from_utf8(output.stderr).expect("utf8 refusal"),
             format!("automonique fixture helper refused: {expected_category}\n")
