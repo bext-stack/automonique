@@ -2476,6 +2476,61 @@
         "plan/contracts/R2-01.md",
         "docs/product-plan/reference/work-breakdown.md"
       ]
+    },
+    {
+      "id": "objective:R2-02",
+      "work_id": "R2-02",
+      "objective": "Prepare one immutable, attempt-bound protected handoff containing the canonical R2-01 `RunSpec` and bounded prompt payload for `PromptDeliveryPlan::Stdin` or `PromptDeliveryPlan::ProtectedReference`. The mechanism uses distinct anonymous owned descriptors. Prompt bytes are never copied or derived by this handoff into argv, environment, canonical RunSpec bytes, durable state, a file name, `Debug`, display text or errors.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 12,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Spec bytes",
+        "Prompt modes",
+        "Prompt bound",
+        "Seals",
+        "Binding",
+        "Encapsulation",
+        "Leakage",
+        "Descriptor discipline",
+        "Cleanup",
+        "Concurrency",
+        "Non-authority",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop if the handoff copies or derives any prompt material into argv, environment, RunSpec, logs, errors, metadata, durable state or a file name; any credential-value input route; public raw-FD/path authority; clone/replay/reset; claiming that a caller-supplied payload proves authoritative resolution; interpreting a protected reference as a path; fallback to named file, pipe, environment or argv; clearing `CLOEXEC`; launch or child-inheritance claims; enabling runner or adapter execution; same-UID confidentiality, credential freshness, containment or attestation claims; a new dependency or lockfile change; unsafe-code/lint weakening; network/private-archive access; licence-boundary crossing; out-of-lease edits; or a failed required check whose repair is outside scope."
+      ],
+      "hill_climbability": 93,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-runner/",
+        "rust/crates/automonique-sandbox/",
+        "rust/crates/automonique-agents/",
+        "rust/crates/automonique-workspaces/",
+        "rust/crates/automonique-artifacts/"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R2-02.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
     }
   ]
 }

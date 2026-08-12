@@ -3,7 +3,7 @@
   "schema": "automonique.dev-program/v1",
   "source": {
     "graph": "plan/work-graph.toml",
-    "graph_sha256": "aed0e561d90e9c68da54db54062a7bdffa45de3ac78c9a59dbd92160bdc6b191",
+    "graph_sha256": "661dd189140d58c44c7fc7274704425091b72256a43aae09ef540e64c084d8c3",
     "item_count": 375
   },
   "items": [
@@ -1664,7 +1664,7 @@
       "title": "Exclusive protected spec delivery",
       "summary": "no prompt/secret argv.",
       "depends_on": [
-        "R1-25"
+        "R2-01"
       ],
       "blocked_by_gates": [],
       "licence": "Elastic-2.0",
@@ -1677,7 +1677,7 @@
       ],
       "closes_gate": null,
       "status": "blocked",
-      "contract": null,
+      "contract": "plan/contracts/R2-02.md",
       "runnable": false
     },
     {
