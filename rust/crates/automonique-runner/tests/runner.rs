@@ -18,12 +18,12 @@ use automonique_protocol::tools::{ApprovalRequirement, CausationId, NestedCause,
 use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
 use automonique_runner::{
     AdmissionFields, AdmissionFieldsParts, Authority, BackendPromptSession, CancellationToken,
-    ContainmentEvidence, EventKind, ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility,
-    IntegrationMode, IoReservation, ModelRoutingDigest, PersonaDigest, PortabilityPolicy,
-    ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference, RemoteAttestationPolicy,
-    RequiredCapabilities, RunCoordinates, RunOrigin, RunSpec, RunSpecError, RunSpecParts, Runner,
-    RunnerError, RunnerEventDialect, SkillsetDigest, Spool, SpoolError, ToolsetDigest,
-    WorkspaceRegistryId, WorkspaceReservation,
+    ContainmentEvidence, CwdToken, EventKind, ExecutionPlanDigest, ExtensionSetDigest,
+    FallbackEligibility, IntegrationMode, IoReservation, ModelRoutingDigest, PersonaDigest,
+    PortabilityPolicy, ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference,
+    RemoteAttestationPolicy, RequiredCapabilities, RunCoordinates, RunOrigin, RunSpec,
+    RunSpecError, RunSpecParts, Runner, RunnerError, RunnerEventDialect, SkillsetDigest, Spool,
+    SpoolError, ToolsetDigest, WorkspaceRegistryId, WorkspaceReservation,
 };
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -32,7 +32,6 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
@@ -61,7 +60,7 @@ impl Drop for TempDir {
     }
 }
 
-fn parts(root: &Path, prompt: PromptDeliveryPlan) -> RunSpecParts {
+fn parts(_root: &Path, prompt: PromptDeliveryPlan) -> RunSpecParts {
     RunSpecParts {
         protocol_version: 1,
         coordinates: RunCoordinates::new(
@@ -74,7 +73,7 @@ fn parts(root: &Path, prompt: PromptDeliveryPlan) -> RunSpecParts {
         ),
         executable: PathBuf::from("/bin/true"),
         arguments: Vec::new(),
-        cwd: root.to_path_buf(),
+        cwd_token: CwdToken::new("cwd-1").unwrap(),
         environment: Vec::new(),
         prompt,
         workspace_registry_id: WorkspaceRegistryId::new("workspace-registry-1").unwrap(),
@@ -88,10 +87,6 @@ fn parts(root: &Path, prompt: PromptDeliveryPlan) -> RunSpecParts {
             1024 * 1024,
         ),
         admission: admission(0),
-        timeout: Duration::from_secs(5),
-        term_grace: Duration::from_millis(25),
-        spool_directory: root.join("spool"),
-        max_spool_bytes: 1024 * 1024,
     }
 }
 
@@ -247,11 +242,9 @@ fn strict_run_spec_validation_rejects_unbounded_and_ambiguous_values() {
         RunSpecError::PathNotCanonical("executable")
     );
 
-    let mut candidate = parts(root.path(), prompt.clone());
-    candidate.cwd = PathBuf::from("relative");
     assert_eq!(
-        RunSpec::new(candidate).unwrap_err(),
-        RunSpecError::PathNotAbsolute("cwd")
+        CwdToken::new("../relative").unwrap_err(),
+        RunSpecError::FieldInvalid("cwd_token")
     );
 
     let mut candidate = parts(root.path(), prompt.clone());
@@ -292,6 +285,7 @@ fn run_spec_partial_has_typed_coordinates_and_payload_free_prompt_modes() {
     assert_eq!(spec.host_id().as_str(), "host-1");
     assert_eq!(spec.host_lifetime(), HostLifetime::Attempt);
     assert_eq!(spec.backend_id().as_str(), "local-direct");
+    assert_eq!(spec.cwd_token().as_str(), "cwd-1");
     assert!(matches!(
         spec.prompt_delivery(),
         PromptDeliveryPlan::ProtectedReference(_)
@@ -308,6 +302,22 @@ fn run_spec_partial_has_typed_coordinates_and_payload_free_prompt_modes() {
 }
 
 #[test]
+fn cwd_token_enforces_exact_bounds_and_rejects_path_shapes() {
+    let boundary = "x".repeat(256);
+    assert_eq!(CwdToken::new(&boundary).unwrap().as_str(), boundary);
+    assert_eq!(
+        CwdToken::new("x".repeat(257)).unwrap_err(),
+        RunSpecError::FieldInvalid("cwd_token")
+    );
+    for invalid in ["", "/root", "a/b", r"a\b", "..", "name:slot", "~home"] {
+        assert_eq!(
+            CwdToken::new(invalid).unwrap_err(),
+            RunSpecError::FieldInvalid("cwd_token")
+        );
+    }
+}
+
+#[test]
 fn debug_redacts_argv_environment_and_prompt_coordinates() {
     let root = TempDir::new("debug-redaction");
     let mut candidate = parts(
@@ -318,12 +328,14 @@ fn debug_redacts_argv_environment_and_prompt_coordinates() {
     );
     candidate.arguments = vec!["ARG_SENTINEL".into()];
     candidate.environment = vec![("SAFE_KEY".into(), "ENV_SENTINEL".into())];
+    candidate.cwd_token = CwdToken::new("CWD_SENTINEL").unwrap();
     let rendered_parts = format!("{candidate:?}");
     let rendered_spec = format!("{:?}", RunSpec::new(candidate).unwrap());
     for rendered in [&rendered_parts, &rendered_spec] {
         assert!(!rendered.contains("ARG_SENTINEL"));
         assert!(!rendered.contains("ENV_SENTINEL"));
         assert!(!rendered.contains("SESSION_SENTINEL"));
+        assert!(!rendered.contains("CWD_SENTINEL"));
     }
 }
 
@@ -404,20 +416,6 @@ fn workspace_and_sandbox_cross_field_mismatches_refuse() {
         RunSpecError::WorkspaceIsolationMismatch
     );
 
-    let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
-    candidate.timeout = Duration::from_secs(5) + Duration::from_nanos(999_999);
-    assert_eq!(
-        RunSpec::new(candidate).unwrap_err(),
-        RunSpecError::SandboxTimeoutMismatch
-    );
-
-    let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
-    candidate.max_spool_bytes += 1;
-    assert_eq!(
-        RunSpec::new(candidate).unwrap_err(),
-        RunSpecError::SandboxSpoolMismatch
-    );
-
     let writable_cases = [
         (
             IsolationKind::AttemptCopy,
@@ -431,6 +429,35 @@ fn workspace_and_sandbox_cross_field_mismatches_refuse() {
         candidate.sandbox = sandbox("acme", 7, access, 5_000, 1024 * 1024);
         candidate.admission = admission(1024);
         assert!(RunSpec::new(candidate).is_ok());
+    }
+
+    for spool_bytes in [4_096, 1024 * 1024 * 1024] {
+        let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+        candidate.sandbox = sandbox(
+            "acme",
+            7,
+            FilesystemAccess::ReadOnlySnapshot,
+            5_000,
+            spool_bytes,
+        );
+        assert_eq!(
+            RunSpec::new(candidate).unwrap().spool_budget_bytes(),
+            spool_bytes
+        );
+    }
+    for spool_bytes in [4_095, 1024 * 1024 * 1024 + 1] {
+        let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+        candidate.sandbox = sandbox(
+            "acme",
+            7,
+            FilesystemAccess::ReadOnlySnapshot,
+            5_000,
+            spool_bytes,
+        );
+        assert_eq!(
+            RunSpec::new(candidate).unwrap_err(),
+            RunSpecError::SpoolLimitInvalid
+        );
     }
 }
 

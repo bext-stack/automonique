@@ -40,6 +40,29 @@
 //! assert!(matches!(protected_plan, PromptDeliveryPlan::ProtectedReference(_)));
 //! assert!(matches!(backend_plan, PromptDeliveryPlan::BackendSession(_)));
 //! ```
+//!
+//! Workspace registration and working-directory tokens remain distinct:
+//!
+//! ```compile_fail
+//! use automonique_protocol::workspace::WorkspaceToken;
+//! use automonique_runner::CwdToken;
+//! let cwd = CwdToken::new("cwd-1").unwrap();
+//! let workspace: WorkspaceToken = cwd;
+//! ```
+//!
+//! ```compile_fail
+//! use automonique_runner::{CwdToken, WorkspaceRegistryId};
+//! let cwd = CwdToken::new("cwd-1").unwrap();
+//! let workspace: WorkspaceRegistryId = cwd;
+//! ```
+//!
+//! ```
+//! use automonique_runner::{CwdToken, WorkspaceRegistryId};
+//! let cwd = CwdToken::new("cwd-1").unwrap();
+//! let workspace = WorkspaceRegistryId::new("workspace-1").unwrap();
+//! assert_eq!(cwd.as_str(), "cwd-1");
+//! assert_eq!(workspace.as_str(), "workspace-1");
+//! ```
 
 use crate::AdmissionFields;
 use automonique_protocol::host::{AttemptId, HostId, HostLifetime, WorkId};
@@ -63,7 +86,6 @@ pub const MAX_TOTAL_ARG_BYTES: usize = 32 * 1_024;
 pub const MAX_ENV_COUNT: usize = 64;
 pub const MAX_TOTAL_ENV_BYTES: usize = 64 * 1_024;
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
-const MAX_TERM_GRACE: Duration = Duration::from_secs(5);
 const MIN_SPOOL_BYTES: u64 = 4_096;
 const MAX_SPOOL_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -84,10 +106,7 @@ pub enum RunSpecError {
     WorkspaceTenantMismatch,
     WorkspaceBaseMismatch,
     WorkspaceIsolationMismatch,
-    SandboxTimeoutMismatch,
-    SandboxSpoolMismatch,
     TimeoutInvalid,
-    TermGraceInvalid,
     SpoolLimitInvalid,
 }
 
@@ -127,18 +146,11 @@ impl fmt::Display for RunSpecError {
             Self::WorkspaceIsolationMismatch => {
                 formatter.write_str("workspace isolation differs from sandbox filesystem policy")
             }
-            Self::SandboxTimeoutMismatch => {
-                formatter.write_str("runner timeout differs from sandbox timeout budget")
-            }
-            Self::SandboxSpoolMismatch => {
-                formatter.write_str("runner spool limit differs from sandbox spool budget")
-            }
-            Self::TimeoutInvalid => formatter.write_str("timeout is outside the supported range"),
-            Self::TermGraceInvalid => {
-                formatter.write_str("termination grace is outside the supported range")
+            Self::TimeoutInvalid => {
+                formatter.write_str("sandbox timeout is outside the supported range")
             }
             Self::SpoolLimitInvalid => {
-                formatter.write_str("spool limit is outside the supported range")
+                formatter.write_str("sandbox spool limit is outside the supported range")
             }
         }
     }
@@ -231,6 +243,41 @@ impl fmt::Debug for WorkspaceRegistryId {
     }
 }
 
+/// Opaque workspace-relative working-directory coordinate.
+///
+/// A token is not a host filesystem path and carries no path-resolution
+/// authority. The workspace registry must resolve it in a later bounded step.
+#[derive(Clone, Eq, PartialEq)]
+pub struct CwdToken(BoundedString<MAX_FIELD_BYTES>);
+
+impl CwdToken {
+    /// Construct a path-free working-directory coordinate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunSpecError::FieldInvalid`] for empty, oversized, control,
+    /// or path-shaped input.
+    pub fn new(value: impl Into<String>) -> Result<Self, RunSpecError> {
+        let value = value.into();
+        reject_path_shaped_reference(&value, "cwd_token")?;
+        let value =
+            BoundedString::new(value).map_err(|_| RunSpecError::FieldInvalid("cwd_token"))?;
+        Ok(Self(value))
+    }
+
+    /// Stable opaque spelling.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for CwdToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CwdToken(<opaque>)")
+    }
+}
+
 /// Canonical, domain-distinct lifecycle coordinates from the protocol crate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunCoordinates {
@@ -294,7 +341,7 @@ pub struct RunSpecParts {
     pub coordinates: RunCoordinates,
     pub executable: PathBuf,
     pub arguments: Vec<OsString>,
-    pub cwd: PathBuf,
+    pub cwd_token: CwdToken,
     pub environment: Vec<(OsString, OsString)>,
     pub prompt: PromptDeliveryPlan,
     pub workspace_registry_id: WorkspaceRegistryId,
@@ -302,10 +349,6 @@ pub struct RunSpecParts {
     pub provider_binary: BinaryProvenance,
     pub sandbox: SandboxSpec,
     pub admission: AdmissionFields,
-    pub timeout: Duration,
-    pub term_grace: Duration,
-    pub spool_directory: PathBuf,
-    pub max_spool_bytes: u64,
 }
 
 impl fmt::Debug for RunSpecParts {
@@ -319,7 +362,7 @@ impl fmt::Debug for RunSpecParts {
                 "arguments",
                 &format_args!("<redacted:{} entries>", self.arguments.len()),
             )
-            .field("cwd", &self.cwd)
+            .field("cwd_token", &self.cwd_token)
             .field(
                 "environment",
                 &format_args!("<redacted:{} entries>", self.environment.len()),
@@ -330,10 +373,6 @@ impl fmt::Debug for RunSpecParts {
             .field("provider_binary", &"<pinned provider binary>")
             .field("sandbox", &"<compiled sandbox spec>")
             .field("admission", &self.admission)
-            .field("timeout", &self.timeout)
-            .field("term_grace", &self.term_grace)
-            .field("spool_directory", &self.spool_directory)
-            .field("max_spool_bytes", &self.max_spool_bytes)
             .finish()
     }
 }
@@ -344,7 +383,7 @@ pub struct RunSpec {
     coordinates: RunCoordinates,
     executable: PathBuf,
     arguments: Vec<OsString>,
-    cwd: PathBuf,
+    cwd_token: CwdToken,
     environment: Vec<(OsString, OsString)>,
     prompt: PromptDeliveryPlan,
     workspace_registry_id: WorkspaceRegistryId,
@@ -352,10 +391,6 @@ pub struct RunSpec {
     provider_binary: BinaryProvenance,
     sandbox: SandboxSpec,
     admission: AdmissionFields,
-    timeout: Duration,
-    term_grace: Duration,
-    spool_directory: PathBuf,
-    max_spool_bytes: u64,
 }
 
 impl fmt::Debug for RunSpec {
@@ -369,7 +404,7 @@ impl fmt::Debug for RunSpec {
                 "arguments",
                 &format_args!("<redacted:{} entries>", self.arguments.len()),
             )
-            .field("cwd", &self.cwd)
+            .field("cwd_token", &self.cwd_token)
             .field(
                 "environment",
                 &format_args!("<redacted:{} entries>", self.environment.len()),
@@ -380,10 +415,6 @@ impl fmt::Debug for RunSpec {
             .field("provider_binary", &"<pinned provider binary>")
             .field("sandbox", &"<compiled sandbox spec>")
             .field("admission", &self.admission)
-            .field("timeout", &self.timeout)
-            .field("term_grace", &self.term_grace)
-            .field("spool_directory", &self.spool_directory)
-            .field("max_spool_bytes", &self.max_spool_bytes)
             .finish()
     }
 }
@@ -394,26 +425,18 @@ impl RunSpec {
             return Err(RunSpecError::UnsupportedProtocol(parts.protocol_version));
         }
         validate_absolute_canonical(&parts.executable, "executable")?;
-        validate_absolute_canonical(&parts.cwd, "cwd")?;
-        validate_absolute_canonical(&parts.spool_directory, "spool_directory")?;
         validate_arguments(&parts.arguments)?;
         validate_environment(&parts.environment)?;
-        if parts.timeout.is_zero() || parts.timeout > MAX_TIMEOUT {
+        let timeout = Duration::from_millis(parts.sandbox.budgets().timeout().quantity());
+        if timeout.is_zero() || timeout > MAX_TIMEOUT {
             return Err(RunSpecError::TimeoutInvalid);
         }
-        if parts.term_grace > MAX_TERM_GRACE {
-            return Err(RunSpecError::TermGraceInvalid);
-        }
-        if !(MIN_SPOOL_BYTES..=MAX_SPOOL_BYTES).contains(&parts.max_spool_bytes) {
+        if !(MIN_SPOOL_BYTES..=MAX_SPOOL_BYTES)
+            .contains(&parts.sandbox.budgets().spool().quantity())
+        {
             return Err(RunSpecError::SpoolLimitInvalid);
         }
         validate_workspace_sandbox(&parts.workspace, &parts.sandbox)?;
-        if parts.timeout != Duration::from_millis(parts.sandbox.budgets().timeout().quantity()) {
-            return Err(RunSpecError::SandboxTimeoutMismatch);
-        }
-        if parts.max_spool_bytes != parts.sandbox.budgets().spool().quantity() {
-            return Err(RunSpecError::SandboxSpoolMismatch);
-        }
         parts
             .admission
             .validate_against(&parts.coordinates, &parts.prompt, &parts.sandbox)?;
@@ -422,7 +445,7 @@ impl RunSpec {
             coordinates: parts.coordinates,
             executable: parts.executable,
             arguments: parts.arguments,
-            cwd: parts.cwd,
+            cwd_token: parts.cwd_token,
             environment: parts.environment,
             prompt: parts.prompt,
             workspace_registry_id: parts.workspace_registry_id,
@@ -430,10 +453,6 @@ impl RunSpec {
             provider_binary: parts.provider_binary,
             sandbox: parts.sandbox,
             admission: parts.admission,
-            timeout: parts.timeout,
-            term_grace: parts.term_grace,
-            spool_directory: parts.spool_directory,
-            max_spool_bytes: parts.max_spool_bytes,
         })
     }
 
@@ -467,8 +486,8 @@ impl RunSpec {
     pub fn arguments(&self) -> &[OsString] {
         &self.arguments
     }
-    pub fn cwd(&self) -> &Path {
-        &self.cwd
+    pub const fn cwd_token(&self) -> &CwdToken {
+        &self.cwd_token
     }
     pub fn environment(&self) -> &[(OsString, OsString)] {
         &self.environment
@@ -491,17 +510,11 @@ impl RunSpec {
     pub const fn admission(&self) -> &AdmissionFields {
         &self.admission
     }
-    pub const fn timeout(&self) -> Duration {
-        self.timeout
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.sandbox.budgets().timeout().quantity())
     }
-    pub const fn term_grace(&self) -> Duration {
-        self.term_grace
-    }
-    pub fn spool_directory(&self) -> &Path {
-        &self.spool_directory
-    }
-    pub const fn max_spool_bytes(&self) -> u64 {
-        self.max_spool_bytes
+    pub fn spool_budget_bytes(&self) -> u64 {
+        self.sandbox.budgets().spool().quantity()
     }
 }
 
