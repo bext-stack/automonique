@@ -1689,7 +1689,7 @@
     {
       "id": "objective:R1-12",
       "work_id": "R1-12",
-      "objective": "Define the journal vocabulary that makes every authoritative state change resumable and explainable: schema-versioned domain events with globally ordered identifiers, per-aggregate revisions, action receipts keyed by idempotency key, durable consumer cursors by consumer identity and topic, and a replay operation that is provably free of side effects. Replay may rebuild a projection or explain history; it may never drain an outbox or repeat an effect.",
+      "objective": "Define the journal vocabulary that makes every authoritative state change resumable and explainable: schema-versioned domain events with globally ordered identifiers, per-aggregate revisions, action receipts keyed by idempotency key, durable consumer cursors by consumer identity and topic, and a replay operation whose API confers no effect capability. Replay may rebuild a projection or explain history; it hands the projection nothing the projection did not already own. Projection-owned handles remain limit L1 below.",
       "metric": {
         "name": "required_contract_checks_passed",
         "target": 9,
@@ -1721,7 +1721,7 @@
         "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
         "Stop if a required check fails and the next correction is outside the declared paths or authority.",
         "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
-        "Stop on any need for a new dependency or `Cargo.lock` change, non-monotonic event identifiers or revisions, a revision conflict resolved by overwrite, an open-ended outcome vocabulary, transport and operation failure collapsing into one outcome, an idempotency key accepting a changed target, a receipt that cannot outlive its client, a cursor that can move backwards, any reachable effect inside replay, a database or transport call, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
+        "Stop on any need for a new dependency or `Cargo.lock` change, non-monotonic event identifiers or revisions, a revision conflict resolved by overwrite, an open-ended outcome vocabulary, transport and operation failure collapsing into one outcome, an idempotency key accepting a changed target, a receipt that cannot outlive its client, a cursor that can move backwards, any effect handle obtainable from this crate's API inside replay, a database or transport call, a licence-boundary violation, a forbidden clean-room input, or any path outside the lease."
       ],
       "hill_climbability": 91,
       "autonomous_eligible": true,

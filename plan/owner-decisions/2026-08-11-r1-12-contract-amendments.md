@@ -2,21 +2,36 @@
 
 # Owner decision — two amendments to the R1-12 journal contract
 
-**Status: DRAFT. Awaiting owner. Both rows remain open and R1-12 is not done.**
+**Status: ACCEPTED by contemporaneous owner instruction on 2026-08-12.**
 
 | Field | Value |
 |---|---|
 | Proposed in | `plan/contracts/R1-12.md`, § Amendments |
 | Rows blocked | `Replay purity`, `Cursor monotonicity` |
-| Asks for | acceptance of A1 and A2, and of limits L1 and L2 |
-| Recommendation | accept both |
+| Decision | accept A1 and A2, including limits L1 and L2 |
+| Authority | owner accepted A1/A2 and instructed agents to proceed without further owner confirmations; repository safety and exact-tree controls remain in force |
+| Candidate base | `b43b148ae1e4a7fdc5702a6f1aab39877258e821` |
+| Effective | only after this decision is integrated, for descendant attempts |
 
-The candidate cannot close these itself. `AGENTS.md`: *a candidate is judged by
+The implementation candidate could not close these itself. `AGENTS.md`: *a candidate is judged by
 those rules as they stand at its own admitted base, never by the version it
-introduces.* So the superseded wording stays in the check table verbatim,
-`plan/evidence/R1-12.json` answers both rows against that superseded wording,
-and both are recorded as not passing — even though the work each amendment
-describes is implemented and measured. That is the rule working, not a stall.
+introduces.* The superseded wording remains quoted in the contract's Amendments
+section. `plan/evidence/R1-12.json` answers both rows against the wording at its
+own base and remains unchanged. This separately integrated decision makes the
+amended wording authoritative only for later attempts.
+
+## Candidate report
+
+| Field | Recorded value |
+|---|---|
+| Immutable base | `b43b148ae1e4a7fdc5702a6f1aab39877258e821` |
+| Allowed paths | `plan/contracts/R1-12.md`, `plan/owner-decisions/2026-08-11-r1-12-contract-amendments.md`, `.automonique/dev/objectives.json` |
+| Objective | apply the already-proposed A1/A2 wording after explicit owner acceptance, without implementing product behavior |
+| Budget | one bounded policy candidate; one deterministically regenerated objective manifest; no dependency, source, test, graph, metric or baseline changes |
+| Checks | `python3 plan/check.py --verify` pass; `python3 tools/program.py --verify` pass; `python3 tools/guides.py --verify` pass; `git diff --check` pass; `python3 -m unittest tools.test_git_broker tools.test_local_integration` pass (16 tests); typed exact-tree integration follows |
+| Licence | `Elastic-2.0` |
+| Stop conditions | stop on base drift, any changed path outside the three-file lease, any attempt to make the decision retroactive, any weakened unrelated check, or any required check that remains failed after deterministic regeneration |
+| Review | first review: 1 reviewer, 4 blocking findings; re-review: 1 reviewer, 0 blocking findings, accepted for typed integration |
 
 ## A1 — `Replay purity` asks for something Rust cannot express
 
@@ -33,8 +48,10 @@ and "the callee performs no effect" are different claims, and only the first is
 a type.
 
 The amendment states the boundary that does exist — replay hands a projection
-nothing it did not already own, proven by compile-fail coverage paired case for
-case with a passing twin — and names what is left over:
+nothing it did not already own. Paired cases cover arity and callback
+signatures, compile-fail cases cover the named `Outbox` construction routes,
+and API inspection confirms there is no other exported constructor. It also
+names what is left over:
 
 > **Limit L1.** A projection can smuggle in its own handle. A discipline, not a
 > guarantee, and irreducible in safe Rust for every callback interface this
@@ -52,15 +69,17 @@ routes it took.
 The row demands that *an out-of-range cursor yields `resync_required`*.
 
 A cursor names the boundary **before** the next position its consumer will
-receive, not an event. For a retained window `first ..= last` there are
-`last - first + 2` resumable positions — one more than the window retains — so
-the resumable set can never coincide with the retained set. Read literally, a
-caught-up consumer sits at `last + 1`, is told to resync, takes a snapshot
+receive, not an event. For a retained window `first ..= last` whose `last` is
+below `u64::MAX`, there are `last - first + 2` resumable positions — one more
+than the window retains. At `u64::MAX`, the caught-up boundary saturates to
+`last`. Read literally in the ordinary non-saturated case, a caught-up consumer
+sits at `last + 1`, is told to resync, takes a snapshot
 through `last`, returns to `last + 1`, and is told to resync again. **The
 literal reading livelocks the ordinary caught-up state.**
 
-The amendment restates the rule in the resumable window `first ..= last + 1`,
-below and above alike, conceding exactly one position as limit L2.
+The amendment restates the rule in the resumable window
+`first ..= last.saturating_add(1)`, below and above alike, conceding one
+additional representable position as limit L2 when `last < u64::MAX`.
 
 **This one is not only bookkeeping.** The previous "outside means below" reading
 left a hole in the other direction: every position *above* the window resumed
@@ -78,15 +97,15 @@ against `ConsumerCursor`/`resolve_subscription` is the underlying defect and
 neither half is fixable from inside R1-12's lease. **It should get its own
 item.**
 
-## If both are accepted
+## Effect of acceptance
 
-1. Apply the amended wording into the check table and § Journal contract,
-   keeping the superseded text quoted in § Amendments.
-2. Re-answer both rows in `plan/evidence/R1-12.json` against the amended
-   wording; the work they describe is already implemented and measured.
-3. `R1-12` becomes eligible for `done` under the same Option B recording as its
-   siblings.
-4. Open an item for the `src/event.rs` cursor duplication and its skipping hole.
+The amended wording is applied to the check table and § Journal contract while
+the superseded wording remains quoted in § Amendments. Earlier evidence and
+verdicts remain immutable and are not reinterpreted. A later R1-12 attempt is
+judged against the amended wording, must still close every other contract gap,
+and may become `done` only through its own exact-tree completion transaction.
+The `src/event.rs` cursor duplication and skipping hole remain a separate
+follow-up finding.
 
 ## Other cross-item defects found this session, each needing its own item
 
