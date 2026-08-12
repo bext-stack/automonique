@@ -569,6 +569,14 @@ impl RunSpec {
     pub fn canonical_digest(&self) -> Result<crate::RunSpecDigest, crate::RunSpecEncodeError> {
         crate::spec_encode::digest(self)
     }
+
+    /// Decode one complete strict canonical RunSpec v1 document.
+    ///
+    /// Success reconstructs immutable declarative admission data only. It does
+    /// not grant execution or use-time authority.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, crate::RunSpecDecodeError> {
+        crate::spec_decode::decode(bytes)
+    }
 }
 
 fn validate_absolute_canonical(path: &Path, field: &'static str) -> Result<(), RunSpecError> {
