@@ -82,6 +82,15 @@ mod canonical_encoding {
         let parsed = parse_canonical(&bytes).expect("canonical round trip");
         assert_eq!(parsed.to_canonical_bytes(), bytes);
     }
+
+    #[test]
+    fn long_ascii_and_multibyte_strings_take_the_same_lossless_path() {
+        let value = JsonValue::String(format!("{}é雪😀{}", "a".repeat(512), "z".repeat(512)));
+        let bytes = value.to_canonical_bytes();
+        let parsed = parse_canonical(&bytes).expect("mixed UTF-8 canonical round trip");
+        assert_eq!(parsed, value);
+        assert_eq!(parsed.to_canonical_bytes(), bytes);
+    }
 }
 
 mod strict_decoding {

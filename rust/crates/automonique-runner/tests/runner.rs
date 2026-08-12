@@ -32,8 +32,8 @@ use automonique_runner::{
     FallbackEligibility, IntegrationMode, IoReservation, MAX_RUN_SPEC_BYTES, ModelRoutingDigest,
     OriginCoordinate, PersonaDigest, PortabilityPolicy, ProfileDigest, PromptDeliveryPlan,
     ProtectedPromptReference, RemoteAttestationPolicy, RequiredCapabilities, RunCoordinates,
-    RunOrigin, RunOriginSource, RunSpec, RunSpecError, RunSpecParts, Runner, RunnerError,
-    RunnerEventDialect, SchedulerDecisionDigest, SchedulerReservationBinding,
+    RunOrigin, RunOriginSource, RunSpec, RunSpecEncodeError, RunSpecError, RunSpecParts, Runner,
+    RunnerError, RunnerEventDialect, SchedulerDecisionDigest, SchedulerReservationBinding,
     SchedulerReservationId, SkillsetDigest, Spool, SpoolError, ToolsetDigest, WorkspaceRegistryId,
     WorkspaceReservation,
 };
@@ -281,6 +281,51 @@ fn sandbox(
 }
 
 fn full_golden_spec() -> RunSpec {
+    full_golden_spec_with_context(ContextManifest::new(
+        Revision::new(2).unwrap(),
+        TokenBudget::new(100),
+        vec![
+            PolicyComponent::new(
+                "policy-source-a",
+                Revision::new(2).unwrap(),
+                "policy-digest-a",
+                ComponentCaps::new(100, 10).unwrap(),
+                RedactionOutcome::Clean,
+            )
+            .unwrap(),
+            PolicyComponent::new(
+                "policy-source-b",
+                Revision::new(3).unwrap(),
+                "policy-digest-b",
+                ComponentCaps::new(200, 20).unwrap(),
+                RedactionOutcome::Redacted,
+            )
+            .unwrap(),
+        ],
+        vec![
+            SuppliedComponent::new(
+                "skill-source",
+                SuppliedClass::Skills,
+                TrustClass::ActorSupplied,
+                "supplied-digest-a",
+                ComponentCaps::new(300, 30).unwrap(),
+                RedactionOutcome::Clean,
+            )
+            .unwrap(),
+            SuppliedComponent::new(
+                "attachment-source",
+                SuppliedClass::Attachments,
+                TrustClass::Untrusted,
+                "supplied-digest-b",
+                ComponentCaps::new(400, 40).unwrap(),
+                RedactionOutcome::Redacted,
+            )
+            .unwrap(),
+        ],
+    ))
+}
+
+fn full_golden_spec_with_context(context_manifest: ContextManifest) -> RunSpec {
     let sha256 = ImplementationDigest::parse(&digest_text('3')).unwrap();
     let sha512 = ImplementationDigest::parse(&format!("sha512:{}", "4".repeat(128))).unwrap();
     let blake3 = ImplementationDigest::parse(&format!("blake3:{}", "7".repeat(64))).unwrap();
@@ -373,48 +418,7 @@ fn full_golden_spec() -> RunSpec {
             Capability::new(CapabilityGroup::Tools, "structured_output").unwrap(),
         ])
         .unwrap(),
-        context_manifest: ContextManifest::new(
-            Revision::new(2).unwrap(),
-            TokenBudget::new(100),
-            vec![
-                PolicyComponent::new(
-                    "policy-source-a",
-                    Revision::new(2).unwrap(),
-                    "policy-digest-a",
-                    ComponentCaps::new(100, 10).unwrap(),
-                    RedactionOutcome::Clean,
-                )
-                .unwrap(),
-                PolicyComponent::new(
-                    "policy-source-b",
-                    Revision::new(3).unwrap(),
-                    "policy-digest-b",
-                    ComponentCaps::new(200, 20).unwrap(),
-                    RedactionOutcome::Redacted,
-                )
-                .unwrap(),
-            ],
-            vec![
-                SuppliedComponent::new(
-                    "skill-source",
-                    SuppliedClass::Skills,
-                    TrustClass::ActorSupplied,
-                    "supplied-digest-a",
-                    ComponentCaps::new(300, 30).unwrap(),
-                    RedactionOutcome::Clean,
-                )
-                .unwrap(),
-                SuppliedComponent::new(
-                    "attachment-source",
-                    SuppliedClass::Attachments,
-                    TrustClass::Untrusted,
-                    "supplied-digest-b",
-                    ComponentCaps::new(400, 40).unwrap(),
-                    RedactionOutcome::Redacted,
-                )
-                .unwrap(),
-            ],
-        ),
+        context_manifest,
         profile_digest: ProfileDigest::parse(&digest_text('6')).unwrap(),
         model_routing_digest: ModelRoutingDigest::parse(&digest_text('7')).unwrap(),
         toolset_digest: ToolsetDigest::parse(&digest_text('8')).unwrap(),
@@ -539,6 +543,76 @@ fn full_typed_spec_encodes_to_the_independent_golden_and_still_refuses_execution
         ))
     ));
     assert!(!root.path().join("spool").exists());
+}
+
+fn frame_limit_context(one_byte_over: bool) -> ContextManifest {
+    fn field(field_index: usize, one_byte_over: bool) -> String {
+        let length = match field_index {
+            0..127 => 512,
+            127 => 502,
+            128 if one_byte_over => 455,
+            _ => 454,
+        };
+        "x".repeat(length)
+    }
+
+    let mut field_index = 0_usize;
+    let mut next_field = || {
+        let value = field(field_index, one_byte_over);
+        field_index += 1;
+        value
+    };
+    let policy = (0..MAX_JSON_ENTRIES)
+        .map(|_| {
+            let source = next_field();
+            let digest = next_field();
+            PolicyComponent::new(
+                &source,
+                Revision::FIRST,
+                &digest,
+                ComponentCaps::new(1, 1).unwrap(),
+                RedactionOutcome::Clean,
+            )
+            .unwrap()
+        })
+        .collect();
+    let supplied = (0..MAX_JSON_ENTRIES)
+        .map(|_| {
+            let source = next_field();
+            let digest = next_field();
+            SuppliedComponent::new(
+                &source,
+                SuppliedClass::Skills,
+                TrustClass::ActorSupplied,
+                &digest,
+                ComponentCaps::new(1, 1).unwrap(),
+                RedactionOutcome::Clean,
+            )
+            .unwrap()
+        })
+        .collect();
+    assert_eq!(field_index, 4 * MAX_JSON_ENTRIES);
+    ContextManifest::new(
+        Revision::FIRST,
+        TokenBudget::new((2 * MAX_JSON_ENTRIES) as u64),
+        policy,
+        supplied,
+    )
+}
+
+#[test]
+fn canonical_run_spec_enforces_the_exact_whole_frame_ceiling() {
+    let exact = full_golden_spec_with_context(frame_limit_context(false));
+    let bytes = exact.to_canonical_bytes().unwrap();
+    assert_eq!(bytes.len(), MAX_RUN_SPEC_BYTES);
+    let decoded = RunSpec::from_canonical_bytes(&bytes).unwrap();
+    assert_eq!(decoded.to_canonical_bytes().unwrap(), bytes);
+
+    let one_over = full_golden_spec_with_context(frame_limit_context(true));
+    assert_eq!(
+        one_over.to_canonical_bytes().unwrap_err(),
+        RunSpecEncodeError::DocumentTooLarge
+    );
 }
 
 #[test]

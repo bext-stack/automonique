@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
+use automonique_protocol::sandbox::{BudgetQuantities, BudgetUnit, Budgets};
 use automonique_runner::{
     MAX_ARG_BYTES, MAX_ARG_COUNT, MAX_ENV_COUNT, MAX_FIELD_BYTES, MAX_RESERVATION_BYTES,
     MAX_TOTAL_ARG_BYTES, MAX_TOTAL_ENV_BYTES, PromptDeliveryPlan, RunSpec, RunSpecDecodeError,
@@ -311,5 +312,148 @@ fn protected_reference_timeout_and_reservations_enforce_exact_boundaries() {
     refused(
         &workspace(MAX_RESERVATION_BYTES + 1),
         RunSpecDecodeError::Domain("workspace_reservation"),
+    );
+}
+
+#[derive(Clone, Copy)]
+struct BudgetAxis {
+    key: &'static str,
+    fixture_value: u64,
+    unit: BudgetUnit,
+}
+
+const BUDGET_AXES: [BudgetAxis; 8] = [
+    BudgetAxis {
+        key: "artifact_bytes",
+        fixture_value: 4_194_304,
+        unit: BudgetUnit::ArtifactBytes,
+    },
+    BudgetAxis {
+        key: "cgroup_cpu_millicores",
+        fixture_value: 2_000,
+        unit: BudgetUnit::CpuMillicores,
+    },
+    BudgetAxis {
+        key: "cgroup_memory_bytes",
+        fixture_value: 268_435_456,
+        unit: BudgetUnit::MemoryBytes,
+    },
+    BudgetAxis {
+        key: "rlimit_descriptors",
+        fixture_value: 512,
+        unit: BudgetUnit::FileDescriptors,
+    },
+    BudgetAxis {
+        key: "rlimit_processes",
+        fixture_value: 128,
+        unit: BudgetUnit::Processes,
+    },
+    BudgetAxis {
+        key: "spool_bytes",
+        fixture_value: 2_097_152,
+        unit: BudgetUnit::SpoolBytes,
+    },
+    BudgetAxis {
+        key: "temporary_storage_bytes",
+        fixture_value: 2_097_152,
+        unit: BudgetUnit::TempBytes,
+    },
+    BudgetAxis {
+        key: "timeout_millis",
+        fixture_value: 10_000,
+        unit: BudgetUnit::Milliseconds,
+    },
+];
+
+fn quantities_with(axis: BudgetUnit, quantity: u64) -> BudgetQuantities {
+    let mut quantities = BudgetQuantities {
+        cgroup_memory_bytes: 1,
+        cgroup_cpu_millicores: 1,
+        rlimit_processes: 1,
+        rlimit_descriptors: 1,
+        timeout_millis: 1,
+        temporary_storage_bytes: 1,
+        spool_bytes: 1,
+        artifact_bytes: 1,
+    };
+    match axis {
+        BudgetUnit::Milliseconds => quantities.timeout_millis = quantity,
+        BudgetUnit::MemoryBytes => quantities.cgroup_memory_bytes = quantity,
+        BudgetUnit::CpuMillicores => quantities.cgroup_cpu_millicores = quantity,
+        BudgetUnit::Processes => quantities.rlimit_processes = quantity,
+        BudgetUnit::FileDescriptors => quantities.rlimit_descriptors = quantity,
+        BudgetUnit::TempBytes => quantities.temporary_storage_bytes = quantity,
+        BudgetUnit::SpoolBytes => quantities.spool_bytes = quantity,
+        BudgetUnit::ArtifactBytes => quantities.artifact_bytes = quantity,
+    }
+    quantities
+}
+
+fn budget_mutation(axis: BudgetAxis, quantity: u64) -> Vec<u8> {
+    replace_once(
+        &format!("\"{}\":\"{}\"", axis.key, axis.fixture_value),
+        &format!("\"{}\":\"{quantity}\"", axis.key),
+    )
+}
+
+#[test]
+fn every_nested_budget_axis_maps_to_its_typed_ceiling_and_refuses_one_over() {
+    assert_eq!(BudgetUnit::ALL.len(), BUDGET_AXES.len());
+    for unit in BudgetUnit::ALL {
+        assert_eq!(
+            BUDGET_AXES.iter().filter(|axis| axis.unit == unit).count(),
+            1,
+            "unit {} must map to exactly one wire key",
+            unit.as_str()
+        );
+    }
+
+    for axis in BUDGET_AXES {
+        let ceiling = axis.unit.ceiling();
+        let budgets = Budgets::declare(quantities_with(axis.unit, ceiling))
+            .expect("the exact protocol ceiling is representable");
+        let declared = budgets
+            .all()
+            .into_iter()
+            .find(|budget| budget.unit() == axis.unit)
+            .expect("every named axis is present");
+        assert_eq!(declared.quantity(), ceiling, "axis {}", axis.key);
+
+        let error = Budgets::declare(quantities_with(axis.unit, ceiling + 1))
+            .expect_err("one over a protocol ceiling must refuse");
+        assert_eq!(error.category(), "budget_out_of_range", "axis {}", axis.key);
+        assert!(
+            error.to_string().contains(axis.unit.as_str()),
+            "axis {}",
+            axis.key
+        );
+
+        let over = budget_mutation(axis, ceiling + 1);
+        refused(&over, RunSpecDecodeError::Domain("budgets"));
+
+        let exact = budget_mutation(axis, ceiling);
+        if axis.unit == BudgetUnit::SpoolBytes {
+            refused(&exact, RunSpecDecodeError::Domain("run_spec"));
+        } else {
+            let spec = accepted(&exact);
+            let decoded = spec
+                .sandbox()
+                .budgets()
+                .all()
+                .into_iter()
+                .find(|budget| budget.unit() == axis.unit)
+                .expect("decoded spec preserves every budget axis");
+            assert_eq!(decoded.quantity(), ceiling, "axis {}", axis.key);
+        }
+    }
+
+    let runner_spool_max = 1024 * 1024 * 1024;
+    assert_eq!(
+        accepted(&budget_mutation(BUDGET_AXES[5], runner_spool_max)).spool_budget_bytes(),
+        runner_spool_max
+    );
+    refused(
+        &budget_mutation(BUDGET_AXES[5], runner_spool_max + 1),
+        RunSpecDecodeError::Domain("run_spec"),
     );
 }

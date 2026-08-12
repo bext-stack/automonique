@@ -267,6 +267,7 @@ impl Parser<'_> {
                     value.push(decoded);
                 }
                 control if control < 0x20 => return Err(CodecError::MalformedJson),
+                ascii if ascii < 0x80 => value.push(char::from(ascii)),
                 _ => {
                     // Re-read the character as UTF-8 rather than a raw byte.
                     let start = self.position - 1;
