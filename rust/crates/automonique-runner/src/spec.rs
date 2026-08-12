@@ -43,8 +43,10 @@
 
 use automonique_protocol::host::{AttemptId, HostId, HostLifetime, WorkId};
 use automonique_protocol::primitives::BoundedString;
-use automonique_protocol::sandbox::ExecutionBackendId;
+use automonique_protocol::provider::BinaryProvenance;
+use automonique_protocol::sandbox::{ExecutionBackendId, FilesystemAccess, SandboxSpec};
 use automonique_protocol::tools::RunId;
+use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
@@ -78,6 +80,11 @@ pub enum RunSpecError {
     DuplicateEnvironmentKey,
     EnvironmentValueTooLarge,
     EnvironmentTooLarge,
+    WorkspaceTenantMismatch,
+    WorkspaceBaseMismatch,
+    WorkspaceIsolationMismatch,
+    SandboxTimeoutMismatch,
+    SandboxSpoolMismatch,
     TimeoutInvalid,
     TermGraceInvalid,
     SpoolLimitInvalid,
@@ -109,6 +116,21 @@ impl fmt::Display for RunSpecError {
             }
             Self::EnvironmentTooLarge => {
                 formatter.write_str("total environment bytes exceed the limit")
+            }
+            Self::WorkspaceTenantMismatch => {
+                formatter.write_str("workspace tenant differs from sandbox tenant")
+            }
+            Self::WorkspaceBaseMismatch => {
+                formatter.write_str("workspace base revision differs from sandbox base revision")
+            }
+            Self::WorkspaceIsolationMismatch => {
+                formatter.write_str("workspace isolation differs from sandbox filesystem policy")
+            }
+            Self::SandboxTimeoutMismatch => {
+                formatter.write_str("runner timeout differs from sandbox timeout budget")
+            }
+            Self::SandboxSpoolMismatch => {
+                formatter.write_str("runner spool limit differs from sandbox spool budget")
             }
             Self::TimeoutInvalid => formatter.write_str("timeout is outside the supported range"),
             Self::TermGraceInvalid => {
@@ -182,6 +204,32 @@ pub enum PromptDeliveryPlan {
     BackendSession(BackendPromptSession),
 }
 
+/// Opaque identity of one registered workspace record. It is deliberately
+/// distinct from the workspace's host-resolved token and cannot carry a path.
+#[derive(Clone, Eq, PartialEq)]
+pub struct WorkspaceRegistryId(BoundedString<MAX_FIELD_BYTES>);
+
+impl WorkspaceRegistryId {
+    pub fn new(value: impl Into<String>) -> Result<Self, RunSpecError> {
+        let value = value.into();
+        reject_path_shaped_reference(&value, "workspace_registry_id")?;
+        let value = BoundedString::new(value)
+            .map_err(|_| RunSpecError::FieldInvalid("workspace_registry_id"))?;
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for WorkspaceRegistryId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WorkspaceRegistryId(<opaque>)")
+    }
+}
+
 /// Canonical, domain-distinct lifecycle coordinates from the protocol crate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunCoordinates {
@@ -248,6 +296,10 @@ pub struct RunSpecParts {
     pub cwd: PathBuf,
     pub environment: Vec<(OsString, OsString)>,
     pub prompt: PromptDeliveryPlan,
+    pub workspace_registry_id: WorkspaceRegistryId,
+    pub workspace: WorkspaceRegistration,
+    pub provider_binary: BinaryProvenance,
+    pub sandbox: SandboxSpec,
     pub timeout: Duration,
     pub term_grace: Duration,
     pub spool_directory: PathBuf,
@@ -271,6 +323,10 @@ impl fmt::Debug for RunSpecParts {
                 &format_args!("<redacted:{} entries>", self.environment.len()),
             )
             .field("prompt", &self.prompt)
+            .field("workspace_registry_id", &self.workspace_registry_id)
+            .field("workspace", &"<registered workspace>")
+            .field("provider_binary", &"<pinned provider binary>")
+            .field("sandbox", &"<compiled sandbox spec>")
             .field("timeout", &self.timeout)
             .field("term_grace", &self.term_grace)
             .field("spool_directory", &self.spool_directory)
@@ -288,6 +344,10 @@ pub struct RunSpec {
     cwd: PathBuf,
     environment: Vec<(OsString, OsString)>,
     prompt: PromptDeliveryPlan,
+    workspace_registry_id: WorkspaceRegistryId,
+    workspace: WorkspaceRegistration,
+    provider_binary: BinaryProvenance,
+    sandbox: SandboxSpec,
     timeout: Duration,
     term_grace: Duration,
     spool_directory: PathBuf,
@@ -311,6 +371,10 @@ impl fmt::Debug for RunSpec {
                 &format_args!("<redacted:{} entries>", self.environment.len()),
             )
             .field("prompt", &self.prompt)
+            .field("workspace_registry_id", &self.workspace_registry_id)
+            .field("workspace", &"<registered workspace>")
+            .field("provider_binary", &"<pinned provider binary>")
+            .field("sandbox", &"<compiled sandbox spec>")
             .field("timeout", &self.timeout)
             .field("term_grace", &self.term_grace)
             .field("spool_directory", &self.spool_directory)
@@ -338,6 +402,13 @@ impl RunSpec {
         if !(MIN_SPOOL_BYTES..=MAX_SPOOL_BYTES).contains(&parts.max_spool_bytes) {
             return Err(RunSpecError::SpoolLimitInvalid);
         }
+        validate_workspace_sandbox(&parts.workspace, &parts.sandbox)?;
+        if parts.timeout != Duration::from_millis(parts.sandbox.budgets().timeout().quantity()) {
+            return Err(RunSpecError::SandboxTimeoutMismatch);
+        }
+        if parts.max_spool_bytes != parts.sandbox.budgets().spool().quantity() {
+            return Err(RunSpecError::SandboxSpoolMismatch);
+        }
         Ok(Self {
             protocol_version: parts.protocol_version,
             coordinates: parts.coordinates,
@@ -346,6 +417,10 @@ impl RunSpec {
             cwd: parts.cwd,
             environment: parts.environment,
             prompt: parts.prompt,
+            workspace_registry_id: parts.workspace_registry_id,
+            workspace: parts.workspace,
+            provider_binary: parts.provider_binary,
+            sandbox: parts.sandbox,
             timeout: parts.timeout,
             term_grace: parts.term_grace,
             spool_directory: parts.spool_directory,
@@ -391,6 +466,18 @@ impl RunSpec {
     }
     pub const fn prompt_delivery(&self) -> &PromptDeliveryPlan {
         &self.prompt
+    }
+    pub const fn workspace_registry_id(&self) -> &WorkspaceRegistryId {
+        &self.workspace_registry_id
+    }
+    pub const fn workspace(&self) -> &WorkspaceRegistration {
+        &self.workspace
+    }
+    pub const fn provider_binary(&self) -> &BinaryProvenance {
+        &self.provider_binary
+    }
+    pub const fn sandbox(&self) -> &SandboxSpec {
+        &self.sandbox
     }
     pub const fn timeout(&self) -> Duration {
         self.timeout
@@ -491,6 +578,32 @@ fn reject_path_shaped_reference(value: &str, field: &'static str) -> Result<(), 
         || value.starts_with('~')
     {
         return Err(RunSpecError::FieldInvalid(field));
+    }
+    Ok(())
+}
+
+fn validate_workspace_sandbox(
+    workspace: &WorkspaceRegistration,
+    sandbox: &SandboxSpec,
+) -> Result<(), RunSpecError> {
+    if workspace.tenant() != sandbox.tenant() {
+        return Err(RunSpecError::WorkspaceTenantMismatch);
+    }
+    if workspace.base_revision() != sandbox.base_revision() {
+        return Err(RunSpecError::WorkspaceBaseMismatch);
+    }
+    let access = sandbox.profile().filesystem();
+    let isolation_matches = match workspace.isolation() {
+        IsolationKind::ReadOnlySnapshot => access == FilesystemAccess::ReadOnlySnapshot,
+        IsolationKind::AttemptCopy | IsolationKind::Overlay => {
+            matches!(
+                access,
+                FilesystemAccess::IsolatedWritable | FilesystemAccess::WritableWithGrants
+            )
+        }
+    };
+    if !isolation_matches {
+        return Err(RunSpecError::WorkspaceIsolationMismatch);
     }
     Ok(())
 }

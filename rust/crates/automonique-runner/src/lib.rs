@@ -29,5 +29,6 @@ pub use spec::{
     BackendPromptSession, MAX_ARG_BYTES, MAX_ARG_COUNT, MAX_ENV_COUNT, MAX_FIELD_BYTES,
     MAX_PATH_BYTES, MAX_TOTAL_ARG_BYTES, MAX_TOTAL_ENV_BYTES, PromptDeliveryPlan,
     ProtectedPromptReference, RunCoordinates, RunSpec, RunSpecError, RunSpecParts,
+    WorkspaceRegistryId,
 };
 pub use spool::{Authority, Event, EventKind, RunState, Spool, SpoolError, Status};

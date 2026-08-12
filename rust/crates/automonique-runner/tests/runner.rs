@@ -1,12 +1,23 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 use automonique_protocol::host::{AttemptId, HostId, HostLifetime, WorkId};
-use automonique_protocol::sandbox::ExecutionBackendId;
+use automonique_protocol::identity::Actor;
+use automonique_protocol::models::ProviderAccountId;
+use automonique_protocol::primitives::Revision;
+use automonique_protocol::provider::BinaryProvenance;
+use automonique_protocol::sandbox::{
+    BudgetQuantities, Budgets, CredentialDescriptors, ExecutionAllowlists, ExecutionBackendId,
+    FilesystemAccess, ImplementationDigest, IsolationRequirement, NestedIsolation, NetworkAccess,
+    PathGrants, PolicyDigest, ProhibitedCapabilities, ProviderControlEgress, RequiredFeature,
+    RequiredFeatures, SandboxProfile, SandboxSpec, SandboxSpecParts, ToolWorkloadEgress,
+    WorkspaceContextHash,
+};
 use automonique_protocol::tools::RunId;
+use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
 use automonique_runner::{
     Authority, BackendPromptSession, CancellationToken, ContainmentEvidence, EventKind,
     PromptDeliveryPlan, ProtectedPromptReference, RunCoordinates, RunSpec, RunSpecError,
-    RunSpecParts, Runner, RunnerError, Spool, SpoolError,
+    RunSpecParts, Runner, RunnerError, Spool, SpoolError, WorkspaceRegistryId,
 };
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -60,11 +71,99 @@ fn parts(root: &Path, prompt: PromptDeliveryPlan) -> RunSpecParts {
         cwd: root.to_path_buf(),
         environment: Vec::new(),
         prompt,
+        workspace_registry_id: WorkspaceRegistryId::new("workspace-registry-1").unwrap(),
+        workspace: workspace("acme", 7, IsolationKind::ReadOnlySnapshot),
+        provider_binary: provider_binary(),
+        sandbox: sandbox(
+            "acme",
+            7,
+            FilesystemAccess::ReadOnlySnapshot,
+            5_000,
+            1024 * 1024,
+        ),
         timeout: Duration::from_secs(5),
         term_grace: Duration::from_millis(25),
         spool_directory: root.join("spool"),
         max_spool_bytes: 1024 * 1024,
     }
+}
+
+fn provider_binary() -> BinaryProvenance {
+    BinaryProvenance::new(
+        "1.2.3",
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        Some("sha256:2222222222222222222222222222222222222222222222222222222222222222"),
+    )
+    .unwrap()
+}
+
+fn workspace(tenant: &str, base: u64, isolation: IsolationKind) -> WorkspaceRegistration {
+    WorkspaceRegistration::new(
+        tenant,
+        "source-1",
+        Revision::new(base).unwrap(),
+        "snapshot-1",
+        isolation,
+        WorkspaceToken::new("workspace-token-1").unwrap(),
+    )
+    .unwrap()
+}
+
+fn sandbox(
+    tenant: &str,
+    base: u64,
+    filesystem: FilesystemAccess,
+    timeout_millis: u64,
+    spool_bytes: u64,
+) -> SandboxSpec {
+    let implementation = ImplementationDigest::parse(
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    )
+    .unwrap();
+    SandboxSpec::compile(SandboxSpecParts {
+        profile: SandboxProfile::new("test-profile", 1, filesystem, ToolWorkloadEgress::denied())
+            .unwrap(),
+        policy_digest: PolicyDigest::parse(
+            "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        )
+        .unwrap(),
+        actor: Actor::new(tenant, "actor-1").unwrap(),
+        provider_account: ProviderAccountId::new("provider-account-1").unwrap(),
+        workspace_context: WorkspaceContextHash::parse(
+            "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        )
+        .unwrap(),
+        base_revision: Revision::new(base).unwrap(),
+        path_grants: PathGrants::declare(&[]).unwrap(),
+        allowlists: ExecutionAllowlists::declare(&[]).unwrap(),
+        provider_control_egress: ProviderControlEgress::brokered(NetworkAccess::BrokeredNamed),
+        tool_workload_egress: ToolWorkloadEgress::denied(),
+        credentials: CredentialDescriptors::declare(&[]).unwrap(),
+        budgets: Budgets::declare(BudgetQuantities {
+            cgroup_memory_bytes: 128 * 1024 * 1024,
+            cgroup_cpu_millicores: 1_000,
+            rlimit_processes: 64,
+            rlimit_descriptors: 256,
+            timeout_millis,
+            temporary_storage_bytes: 1024 * 1024,
+            spool_bytes,
+            artifact_bytes: 1024 * 1024,
+        })
+        .unwrap(),
+        required_features: RequiredFeatures::declare(&[RequiredFeature::new(
+            "process_boundary",
+            &[implementation],
+        )
+        .unwrap()])
+        .unwrap(),
+        nested_isolation: NestedIsolation::new(
+            IsolationRequirement::SeparateChildBoundary,
+            IsolationRequirement::SeparateChildBoundary,
+        ),
+        approval_revision: Revision::FIRST,
+        prohibited_capabilities: ProhibitedCapabilities::declare(&[]).unwrap(),
+    })
+    .unwrap()
 }
 
 #[test]
@@ -190,6 +289,83 @@ fn path_and_environment_aggregate_bounds_fail_closed() {
         RunSpec::new(candidate).unwrap_err(),
         RunSpecError::EnvironmentTooLarge
     );
+}
+
+#[test]
+fn canonical_workspace_sandbox_and_provider_values_are_embedded_exactly() {
+    let root = TempDir::new("canonical-embeddings");
+    let spec = RunSpec::new(parts(root.path(), PromptDeliveryPlan::Stdin)).unwrap();
+    assert_eq!(
+        spec.workspace_registry_id().as_str(),
+        "workspace-registry-1"
+    );
+    assert_eq!(spec.workspace().tenant(), "acme");
+    assert_eq!(spec.workspace().base_revision(), Revision::new(7).unwrap());
+    assert_eq!(spec.sandbox().tenant(), "acme");
+    assert_eq!(spec.sandbox().base_revision(), Revision::new(7).unwrap());
+    assert_eq!(spec.provider_binary().version(), "1.2.3");
+    assert_eq!(
+        spec.provider_binary().digest(),
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    );
+    assert_eq!(
+        WorkspaceRegistryId::new("../workspace").unwrap_err(),
+        RunSpecError::FieldInvalid("workspace_registry_id")
+    );
+}
+
+#[test]
+fn workspace_and_sandbox_cross_field_mismatches_refuse() {
+    let root = TempDir::new("cross-field-refusal");
+
+    let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+    candidate.workspace = workspace("other-tenant", 7, IsolationKind::ReadOnlySnapshot);
+    assert_eq!(
+        RunSpec::new(candidate).unwrap_err(),
+        RunSpecError::WorkspaceTenantMismatch
+    );
+
+    let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+    candidate.workspace = workspace("acme", 8, IsolationKind::ReadOnlySnapshot);
+    assert_eq!(
+        RunSpec::new(candidate).unwrap_err(),
+        RunSpecError::WorkspaceBaseMismatch
+    );
+
+    let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+    candidate.workspace = workspace("acme", 7, IsolationKind::AttemptCopy);
+    assert_eq!(
+        RunSpec::new(candidate).unwrap_err(),
+        RunSpecError::WorkspaceIsolationMismatch
+    );
+
+    let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+    candidate.timeout = Duration::from_secs(5) + Duration::from_nanos(999_999);
+    assert_eq!(
+        RunSpec::new(candidate).unwrap_err(),
+        RunSpecError::SandboxTimeoutMismatch
+    );
+
+    let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+    candidate.max_spool_bytes += 1;
+    assert_eq!(
+        RunSpec::new(candidate).unwrap_err(),
+        RunSpecError::SandboxSpoolMismatch
+    );
+
+    let writable_cases = [
+        (
+            IsolationKind::AttemptCopy,
+            FilesystemAccess::IsolatedWritable,
+        ),
+        (IsolationKind::Overlay, FilesystemAccess::WritableWithGrants),
+    ];
+    for (isolation, access) in writable_cases {
+        let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+        candidate.workspace = workspace("acme", 7, isolation);
+        candidate.sandbox = sandbox("acme", 7, access, 5_000, 1024 * 1024);
+        assert!(RunSpec::new(candidate).is_ok());
+    }
 }
 
 #[test]
