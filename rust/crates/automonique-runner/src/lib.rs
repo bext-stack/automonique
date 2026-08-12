@@ -11,6 +11,7 @@ mod boundary;
 mod runner;
 mod simulation;
 mod spec;
+mod spec_encode;
 mod spec_fields;
 mod spool;
 
@@ -32,6 +33,7 @@ pub use spec::{
     PromptDeliveryPlan, ProtectedPromptReference, RunCoordinates, RunSpec, RunSpecError,
     RunSpecParts, WorkspaceRegistryId,
 };
+pub use spec_encode::{RunSpecDigest, RunSpecEncodeError};
 pub use spec_fields::{
     AdmissionFields, AdmissionFieldsParts, ArtifactGrantBinding, ArtifactGrantBindings,
     ArtifactGrantDigest, ArtifactGrantId, CredentialBinding, ExecutionPlanDigest,

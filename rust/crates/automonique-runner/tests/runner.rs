@@ -7,17 +7,22 @@ use automonique_protocol::context::{
 };
 use automonique_protocol::host::{AttemptId, HostId, HostLifetime, WorkId};
 use automonique_protocol::identity::Actor;
-use automonique_protocol::models::{ExecutorClass, ProviderAccountId, RemoteCoordinate};
-use automonique_protocol::primitives::Revision;
-use automonique_protocol::provider::{BinaryProvenance, ProviderSessionId, SessionBinding};
-use automonique_protocol::sandbox::{
-    BudgetQuantities, Budgets, CredentialDescriptors, ExecutionAllowlists, ExecutionBackendId,
-    FilesystemAccess, ImplementationDigest, IsolationRequirement, NestedIsolation, NetworkAccess,
-    PathGrants, PolicyDigest, ProhibitedCapabilities, ProviderControlEgress, RequiredFeature,
-    RequiredFeatures, SandboxProfile, SandboxSpec, SandboxSpecParts, ToolWorkloadEgress,
-    WorkspaceContextHash,
+use automonique_protocol::models::{
+    ArtifactTransfer, ExecutorClass, ProviderAccountId, RemoteCoordinate, WorkspaceTransfer,
 };
-use automonique_protocol::tools::{CausationId, NestedCause, RunId};
+use automonique_protocol::primitives::Revision;
+use automonique_protocol::provider::{
+    BinaryProvenance, Capability, CapabilityGroup, ProviderSessionId, SessionBinding,
+};
+use automonique_protocol::sandbox::{
+    AllowlistClass, AllowlistEntry, BudgetQuantities, Budgets, CredentialDescriptor,
+    CredentialDescriptors, ExecutionAllowlists, ExecutionBackendId, FilesystemAccess,
+    ImplementationDigest, IsolationRequirement, NestedIsolation, NetworkAccess, PathAccess,
+    PathGrant, PathGrants, PolicyDigest, ProcessClass, ProhibitedCapabilities,
+    ProviderControlEgress, RequiredFeature, RequiredFeatures, SandboxProfile, SandboxSpec,
+    SandboxSpecParts, ToolWorkloadEgress, WorkspaceContextHash,
+};
+use automonique_protocol::tools::{CausationId, CredentialAudiences, NestedCause, RunId};
 use automonique_protocol::wire::MAX_JSON_ENTRIES;
 use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
 use automonique_runner::{
@@ -275,12 +280,265 @@ fn sandbox(
     .unwrap()
 }
 
+fn full_golden_spec() -> RunSpec {
+    let sha256 = ImplementationDigest::parse(&digest_text('3')).unwrap();
+    let sha512 = ImplementationDigest::parse(&format!("sha512:{}", "4".repeat(128))).unwrap();
+    let blake3 = ImplementationDigest::parse(&format!("blake3:{}", "7".repeat(64))).unwrap();
+    let full_sandbox = SandboxSpec::compile(SandboxSpecParts {
+        profile: SandboxProfile::new(
+            "full-profile",
+            2,
+            FilesystemAccess::WritableWithGrants,
+            ToolWorkloadEgress::brokered(NetworkAccess::BrokeredAny),
+        )
+        .unwrap(),
+        policy_digest: PolicyDigest::parse(&format!("blake3:{}", "5".repeat(64))).unwrap(),
+        actor: Actor::new("acme", "actor-1").unwrap(),
+        provider_account: ProviderAccountId::new("provider-account-1").unwrap(),
+        workspace_context: WorkspaceContextHash::parse(&format!("sha512:{}", "6".repeat(128)))
+            .unwrap(),
+        base_revision: Revision::new(7).unwrap(),
+        path_grants: PathGrants::declare(&[
+            PathGrant::new("/workspace", PathAccess::ReadWrite).unwrap(),
+            PathGrant::new("/inputs", PathAccess::ReadOnly).unwrap(),
+        ])
+        .unwrap(),
+        allowlists: ExecutionAllowlists::declare(&[
+            AllowlistEntry::new(AllowlistClass::Executable, "fixture-runner").unwrap(),
+            AllowlistEntry::new(AllowlistClass::Tool, "fixture-runner").unwrap(),
+        ])
+        .unwrap(),
+        provider_control_egress: ProviderControlEgress::brokered(NetworkAccess::BrokeredNamed),
+        tool_workload_egress: ToolWorkloadEgress::brokered(NetworkAccess::BrokeredAny),
+        credentials: CredentialDescriptors::declare(&[CredentialDescriptor::new(
+            "fixture_credential",
+            ProcessClass::ProviderAdapter,
+        )
+        .unwrap()])
+        .unwrap(),
+        budgets: Budgets::declare(BudgetQuantities {
+            cgroup_memory_bytes: 256 * 1024 * 1024,
+            cgroup_cpu_millicores: 2_000,
+            rlimit_processes: 128,
+            rlimit_descriptors: 512,
+            timeout_millis: 10_000,
+            temporary_storage_bytes: 2 * 1024 * 1024,
+            spool_bytes: 2 * 1024 * 1024,
+            artifact_bytes: 4 * 1024 * 1024,
+        })
+        .unwrap(),
+        required_features: RequiredFeatures::declare(&[
+            RequiredFeature::new("process_boundary", &[sha256, sha512]).unwrap(),
+            RequiredFeature::new("network_boundary", &[blake3]).unwrap(),
+        ])
+        .unwrap(),
+        nested_isolation: NestedIsolation::new(
+            IsolationRequirement::HostBoundary,
+            IsolationRequirement::StrongerIsolation,
+        ),
+        approval_revision: Revision::new(2).unwrap(),
+        prohibited_capabilities: ProhibitedCapabilities::declare(&["ptrace", "raw_socket"])
+            .unwrap(),
+    })
+    .unwrap();
+
+    let mode = IntegrationMode::new("native").unwrap();
+    let cause = NestedCause::root(
+        Actor::new("acme", "actor-1").unwrap(),
+        RunId::new("run-1").unwrap(),
+        CausationId::new("cause-1").unwrap(),
+    )
+    .caused(CausationId::new("cause-2").unwrap());
+    let admission = AdmissionFields::new(AdmissionFieldsParts {
+        io_reservation: IoReservation::new(2_048, 4_096).unwrap(),
+        workspace_reservation: WorkspaceReservation::new(8_192).unwrap(),
+        session_binding: Some(
+            SessionBinding::new(
+                "acme",
+                "local-direct",
+                "provider-account-1",
+                "fixture-namespace",
+                ProviderSessionId::new("session-1").unwrap(),
+            )
+            .unwrap(),
+        ),
+        fallback_eligibility: FallbackEligibility::declare(
+            &mode,
+            vec![IntegrationMode::new("alternate").unwrap()],
+        )
+        .unwrap(),
+        integration_mode: mode,
+        required_capabilities: RequiredCapabilities::declare(vec![
+            Capability::new(CapabilityGroup::Sessions, "resume").unwrap(),
+            Capability::new(CapabilityGroup::Tools, "structured_output").unwrap(),
+        ])
+        .unwrap(),
+        context_manifest: ContextManifest::new(
+            Revision::new(2).unwrap(),
+            TokenBudget::new(100),
+            vec![
+                PolicyComponent::new(
+                    "policy-source-a",
+                    Revision::new(2).unwrap(),
+                    "policy-digest-a",
+                    ComponentCaps::new(100, 10).unwrap(),
+                    RedactionOutcome::Clean,
+                )
+                .unwrap(),
+                PolicyComponent::new(
+                    "policy-source-b",
+                    Revision::new(3).unwrap(),
+                    "policy-digest-b",
+                    ComponentCaps::new(200, 20).unwrap(),
+                    RedactionOutcome::Redacted,
+                )
+                .unwrap(),
+            ],
+            vec![
+                SuppliedComponent::new(
+                    "skill-source",
+                    SuppliedClass::Skills,
+                    TrustClass::ActorSupplied,
+                    "supplied-digest-a",
+                    ComponentCaps::new(300, 30).unwrap(),
+                    RedactionOutcome::Clean,
+                )
+                .unwrap(),
+                SuppliedComponent::new(
+                    "attachment-source",
+                    SuppliedClass::Attachments,
+                    TrustClass::Untrusted,
+                    "supplied-digest-b",
+                    ComponentCaps::new(400, 40).unwrap(),
+                    RedactionOutcome::Redacted,
+                )
+                .unwrap(),
+            ],
+        ),
+        profile_digest: ProfileDigest::parse(&digest_text('6')).unwrap(),
+        model_routing_digest: ModelRoutingDigest::parse(&digest_text('7')).unwrap(),
+        toolset_digest: ToolsetDigest::parse(&digest_text('8')).unwrap(),
+        skillset_digest: SkillsetDigest::parse(&digest_text('9')).unwrap(),
+        extension_set_digest: ExtensionSetDigest::parse(&digest_text('a')).unwrap(),
+        origin: RunOrigin::non_interactive(
+            RunOriginSource::Automation,
+            DurableId::new("event-1").unwrap(),
+            OriginCoordinate::Automation(DurableId::new("automation-1").unwrap()),
+            vec![
+                DurableId::new("event-parent-1").unwrap(),
+                DurableId::new("event-parent-2").unwrap(),
+            ],
+            cause,
+        )
+        .unwrap(),
+        executor_class: ExecutorClass::Remote(
+            RemoteCoordinate::new("vendor-1", "resource-1").unwrap(),
+        ),
+        portability_policy: PortabilityPolicy::Portable {
+            workspace_transfer: WorkspaceTransfer::ContentAddressedBundle,
+            artifact_transfer: ArtifactTransfer::DigestVerifiedPush,
+        },
+        remote_attestation_policy: RemoteAttestationPolicy::MutuallyAuthenticated,
+        persona_digest: PersonaDigest::parse(&digest_text('b')).unwrap(),
+        execution_plan_digest: ExecutionPlanDigest::parse(&digest_text('c')).unwrap(),
+        scheduler_reservation: SchedulerReservationBinding::new(
+            SchedulerReservationId::new("reservation-1").unwrap(),
+            Revision::new(2).unwrap(),
+            SchedulerDecisionDigest::parse(&digest_text('d')).unwrap(),
+        ),
+        artifact_grants: ArtifactGrantBindings::declare(vec![
+            ArtifactGrantBinding::new(
+                ArtifactGrantId::new("grant-1").unwrap(),
+                Revision::new(2).unwrap(),
+                ArtifactGrantDigest::parse(&digest_text('e')).unwrap(),
+            ),
+            ArtifactGrantBinding::new(
+                ArtifactGrantId::new("grant-2").unwrap(),
+                Revision::new(3).unwrap(),
+                ArtifactGrantDigest::parse(&digest_text('f')).unwrap(),
+            ),
+        ])
+        .unwrap(),
+        credential_bindings: vec![
+            automonique_runner::CredentialBinding::new(
+                "fixture_credential",
+                std::num::NonZeroU64::new(4).unwrap(),
+                CredentialAudiences::exactly(&["audience-a", "audience-b"]).unwrap(),
+            )
+            .unwrap(),
+        ],
+        event_dialect: RunnerEventDialect::AutomoniqueRunnerV1,
+    });
+
+    RunSpec::new(RunSpecParts {
+        protocol_version: 1,
+        coordinates: RunCoordinates::new(
+            WorkId::new("work-1").unwrap(),
+            RunId::new("run-1").unwrap(),
+            AttemptId::new("attempt-1").unwrap(),
+            HostId::new("host-1").unwrap(),
+            HostLifetime::Session,
+            ExecutionBackendId::new("local-direct").unwrap(),
+        ),
+        executable: PathBuf::from("/bin/true"),
+        arguments: vec![
+            OsString::from_vec(vec![b'a', 0xff]),
+            OsString::from("second"),
+        ],
+        cwd_token: CwdToken::new("cwd-1").unwrap(),
+        environment: vec![
+            (
+                OsString::from("ALPHA"),
+                OsString::from_vec(vec![0xff, b'x']),
+            ),
+            (OsString::from("BETA"), OsString::from("value")),
+        ],
+        prompt: PromptDeliveryPlan::BackendSession(BackendPromptSession::new("session-1").unwrap()),
+        workspace_registry_id: WorkspaceRegistryId::new("workspace-registry-1").unwrap(),
+        workspace: WorkspaceRegistration::new(
+            "acme",
+            "fixture-source",
+            Revision::new(7).unwrap(),
+            "snapshot-1",
+            IsolationKind::Overlay,
+            WorkspaceToken::new("workspace-token-1").unwrap(),
+        )
+        .unwrap(),
+        provider_binary: BinaryProvenance::new("2.0.0", &digest_text('1'), Some(&digest_text('2')))
+            .unwrap(),
+        sandbox: full_sandbox,
+        admission,
+    })
+    .unwrap()
+}
+
 #[test]
 fn future_run_spec_document_limit_equals_the_protocol_frame_ceiling() {
     assert_eq!(
         MAX_RUN_SPEC_BYTES,
         automonique_protocol::codec::MAX_FRAME_BYTES
     );
+}
+
+#[test]
+fn full_typed_spec_encodes_to_the_independent_golden_and_still_refuses_execution() {
+    const GOLDEN: &[u8] = include_bytes!("fixtures/run_spec_v1_full.cjson");
+    const DIGEST: &str = "sha256:12a7a94d02665732ee3a205d443056359ca992bfa2ae923e6b6123e82e0ccc04";
+    let root = TempDir::new("full-encode-only");
+    let spec = full_golden_spec();
+    let first = spec.to_canonical_bytes().unwrap();
+    assert_eq!(first, GOLDEN);
+    assert_eq!(spec.to_canonical_bytes().unwrap(), first);
+    let digest = spec.canonical_digest().unwrap();
+    assert_eq!(digest.as_str(), DIGEST);
+    assert_eq!(format!("{digest:?}"), "RunSpecDigest(<sha256>)");
+    assert!(matches!(
+        Runner.run(spec, &CancellationToken::new()),
+        Err(RunnerError::ContainmentUnenforced(
+            ContainmentEvidence::ProcessGroupOnly
+        ))
+    ));
+    assert!(!root.path().join("spool").exists());
 }
 
 #[test]

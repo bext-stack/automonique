@@ -85,10 +85,10 @@ pub const MAX_ARG_BYTES: usize = 4_096;
 pub const MAX_TOTAL_ARG_BYTES: usize = 32 * 1_024;
 pub const MAX_ENV_COUNT: usize = 64;
 pub const MAX_TOTAL_ENV_BYTES: usize = 64 * 1_024;
-/// Reserved maximum byte length for a future canonical RunSpec document.
+/// Maximum byte length emitted by the canonical RunSpec v1 encoder.
 ///
 /// This aliases the protocol frame ceiling. It does not imply that this crate
-/// currently provides a RunSpec encoder or decoder.
+/// provides a RunSpec decoder.
 pub const MAX_RUN_SPEC_BYTES: usize = automonique_protocol::codec::MAX_FRAME_BYTES;
 const _: [(); automonique_protocol::codec::MAX_FRAME_BYTES] = [(); MAX_RUN_SPEC_BYTES];
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
@@ -555,6 +555,19 @@ impl RunSpec {
     }
     pub fn spool_budget_bytes(&self) -> u64 {
         self.sandbox.budgets().spool().quantity()
+    }
+
+    /// Encode this immutable admission document as canonical RunSpec v1 JSON.
+    ///
+    /// This is an encode-only, declarative projection. It grants no execution
+    /// authority and does not imply that a RunSpec decoder exists.
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, crate::RunSpecEncodeError> {
+        crate::spec_encode::encode(self)
+    }
+
+    /// Compute the domain-separated SHA-256 of the canonical encoding.
+    pub fn canonical_digest(&self) -> Result<crate::RunSpecDigest, crate::RunSpecEncodeError> {
+        crate::spec_encode::digest(self)
     }
 }
 
