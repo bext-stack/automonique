@@ -177,6 +177,33 @@ impl DaemonState {
     }
 }
 
+/// Telegram capability state reported independently from local synthetic intake.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TelegramState {
+    /// No trusted HTTP client or configured bot exists; no bot lease is owned.
+    DisabledNoClient,
+    /// A configured bot lease is owned, but HTTP remains deliberately unavailable.
+    LeaseOwnedNoClient,
+}
+
+impl TelegramState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DisabledNoClient => "disabled_no_client",
+            Self::LeaseOwnedNoClient => "lease_owned_no_client",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, AdminError> {
+        match value {
+            "disabled_no_client" => Ok(Self::DisabledNoClient),
+            "lease_owned_no_client" => Ok(Self::LeaseOwnedNoClient),
+            _ => Err(AdminError::InvalidBody),
+        }
+    }
+}
+
 /// Commands admitted by the first local administration protocol.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AdminCommand {
@@ -856,6 +883,8 @@ pub struct DaemonStatus {
     outbox_pending: u64,
     running: u64,
     accepting_intake: bool,
+    telegram_state: TelegramState,
+    telegram_poller_epoch: Option<u64>,
 }
 
 impl DaemonStatus {
@@ -894,7 +923,27 @@ impl DaemonStatus {
             outbox_pending,
             running,
             accepting_intake,
+            telegram_state: TelegramState::DisabledNoClient,
+            telegram_poller_epoch: None,
         })
+    }
+
+    /// Replace the default disabled Telegram observation with an exact coherent state.
+    pub fn with_telegram(
+        mut self,
+        telegram_state: TelegramState,
+        telegram_poller_epoch: Option<u64>,
+    ) -> Result<Self, AdminError> {
+        if !matches!(
+            (telegram_state, telegram_poller_epoch),
+            (TelegramState::DisabledNoClient, None)
+                | (TelegramState::LeaseOwnedNoClient, Some(1..))
+        ) {
+            return Err(AdminError::InvalidBody);
+        }
+        self.telegram_state = telegram_state;
+        self.telegram_poller_epoch = telegram_poller_epoch;
+        Ok(self)
     }
 
     /// Daemon instance identifier.
@@ -945,6 +994,16 @@ impl DaemonStatus {
         self.accepting_intake
     }
 
+    #[must_use]
+    pub const fn telegram_state(&self) -> TelegramState {
+        self.telegram_state
+    }
+
+    #[must_use]
+    pub const fn telegram_poller_epoch(&self) -> Option<u64> {
+        self.telegram_poller_epoch
+    }
+
     fn to_body(&self) -> Result<JsonValue, AdminError> {
         Ok(JsonValue::Object(vec![
             (
@@ -976,11 +1035,19 @@ impl DaemonStatus {
                 "state".to_owned(),
                 JsonValue::String(self.state.as_str().to_owned()),
             ),
+            (
+                "telegram_poller_epoch".to_owned(),
+                optional_integer("telegram_poller_epoch", self.telegram_poller_epoch)?,
+            ),
+            (
+                "telegram_state".to_owned(),
+                JsonValue::String(self.telegram_state.as_str().to_owned()),
+            ),
         ]))
     }
 
     fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
-        const FIELDS: [&str; 8] = [
+        const FIELDS: [&str; 10] = [
             "accepting_intake",
             "event_cursor",
             "generation",
@@ -989,6 +1056,8 @@ impl DaemonStatus {
             "outbox_pending",
             "running",
             "state",
+            "telegram_poller_epoch",
+            "telegram_state",
         ];
         let JsonValue::Object(entries) = body else {
             return Err(AdminError::InvalidBody);
@@ -1022,6 +1091,12 @@ impl DaemonStatus {
             unsigned(body, "running")?,
             accepting_intake,
         )
+        .and_then(|status| {
+            status.with_telegram(
+                TelegramState::parse(required_body_string(body, "telegram_state")?.as_str())?,
+                optional_unsigned(body, "telegram_poller_epoch")?,
+            )
+        })
     }
 }
 

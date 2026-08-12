@@ -11,11 +11,12 @@ use automonique_daemon::{Daemon, DaemonConfig, DaemonError, run_foreground};
 use automonique_protocol::admin::{
     AdminCommand, AdminRequest, AdminResponse, DaemonState, OutboxReconciliation,
     OutboxReconciliationDecision, OutboxReconciliationParts, ReconciliationFailure,
+    SyntheticSubmission,
 };
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_store::{
-    InboxSubmission, LeaseRequest, OutboxClaimRequest, SchedulerClaim, Store, TerminalRun,
-    TerminalState, WorkClaim,
+    InboxSubmission, LeaseRequest, OutboxClaimRequest, SchedulerClaim, Store,
+    TelegramPollerLeaseIdentity, TelegramPollerLeaseRequest, TerminalRun, TerminalState, WorkClaim,
 };
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
 
@@ -159,6 +160,29 @@ fn expired_outbox_requires_exact_fenced_operator_reconciliation_and_replays_afte
     let thread = std::thread::spawn(move || daemon.serve(&thread_stop));
     wait_for_socket(&config);
 
+    let AdminResponse::Status { status, .. } = call(&config, AdminCommand::Status) else {
+        panic!("status response")
+    };
+    assert_eq!(status.state(), DaemonState::Failed);
+    assert!(!status.accepting_intake());
+    let blocked_submission = SyntheticSubmission::new(
+        "workspace:blocked",
+        "outbox-ambiguity-blocks-intake",
+        "must not be admitted",
+    )
+    .expect("synthetic submission");
+    assert!(matches!(
+        call_request(
+            &config,
+            AdminRequest::submit(
+                RequestId::new("blocked-outbox-intake").expect("request"),
+                blocked_submission,
+            ),
+        ),
+        AdminResponse::Refused { ref category, .. }
+            if category.as_str() == "reconciliation_required"
+    ));
+
     let inspected = call_request(
         &config,
         AdminRequest::inspect_outbox(
@@ -243,6 +267,79 @@ fn expired_outbox_requires_exact_fenced_operator_reconciliation_and_replays_afte
 }
 
 #[test]
+fn clean_telegram_release_does_not_invent_reconciliation_debt() {
+    let (_root, config) = fixture();
+    std::fs::create_dir(config.state_dir()).expect("state directory");
+    std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
+        .expect("state mode");
+    let mut store = Store::open(config.database_path()).expect("seed store");
+    let generation = store
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "foreground",
+            holder_id: "crashed-telegram",
+            now_ms: 1,
+            ttl_ms: 20,
+        })
+        .expect("old generation");
+    let poller = store
+        .acquire_telegram_poller_lease(TelegramPollerLeaseRequest {
+            bot_id: 7,
+            generation_id: "foreground",
+            holder_id: "crashed-telegram",
+            authority_lease_epoch: generation.epoch,
+            now_ms: 1,
+            ttl_ms: 10,
+        })
+        .expect("old telegram poller");
+    store
+        .release_telegram_poller_lease(TelegramPollerLeaseIdentity {
+            bot_id: poller.bot_id,
+            generation_id: &poller.generation_id,
+            holder_id: &poller.holder_id,
+            poller_epoch: poller.epoch,
+            expected_expires_ms: poller.expires_ms,
+            now_ms: 2,
+        })
+        .expect("clean poller release");
+    drop(store);
+
+    let daemon = Daemon::open(&config).expect("successor daemon");
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let thread = std::thread::spawn(move || daemon.serve(&thread_stop));
+    wait_for_socket(&config);
+
+    let AdminResponse::Status { status, .. } = call(&config, AdminCommand::Status) else {
+        panic!("status response")
+    };
+    assert_eq!(status.state(), DaemonState::Ready);
+    assert!(status.accepting_intake());
+    assert!(matches!(
+        call_request(
+            &config,
+            AdminRequest::submit(
+                RequestId::new("released-telegram-intake").expect("request"),
+                SyntheticSubmission::new(
+                    "workspace:released",
+                    "released-telegram-does-not-block",
+                    "admitted fixture",
+                )
+                .expect("synthetic submission"),
+            ),
+        ),
+        AdminResponse::SyntheticAccepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        call(&config, AdminCommand::Shutdown),
+        AdminResponse::ShutdownAccepted { .. }
+    ));
+    thread.join().expect("join").expect("shutdown");
+}
+
+#[test]
 fn foreground_daemon_reports_durable_status_and_shuts_down_over_rpc() {
     let (_root, config) = fixture();
     let daemon = Daemon::open(&config).expect("daemon opens");
@@ -259,6 +356,11 @@ fn foreground_daemon_reports_durable_status_and_shuts_down_over_rpc() {
     assert_eq!(status.inbox_pending(), 0);
     assert_eq!(status.outbox_pending(), 0);
     assert_eq!(status.running(), 0);
+    assert_eq!(
+        status.telegram_state(),
+        automonique_protocol::admin::TelegramState::DisabledNoClient
+    );
+    assert_eq!(status.telegram_poller_epoch(), None);
     assert!(status.generation() >= 1);
     assert!(status.event_cursor() >= 1);
 
@@ -279,26 +381,24 @@ fn status_polling_does_not_rewrite_the_durable_lease() {
     let serve_stop = Arc::clone(&stop);
     let thread = std::thread::spawn(move || daemon.serve(&serve_stop));
     wait_for_socket(&config);
-    let before = Store::open(config.database_path())
+    let before_snapshot = Store::open(config.database_path())
         .expect("inspect before")
         .status_snapshot("foreground")
-        .expect("snapshot before")
-        .generation
-        .expect("generation before");
+        .expect("snapshot before");
+    let before = before_snapshot.generation().expect("generation before");
     for _ in 0..40 {
         assert!(matches!(
             call(&config, AdminCommand::Status),
             AdminResponse::Status { .. }
         ));
     }
-    let after = Store::open(config.database_path())
+    let after_snapshot = Store::open(config.database_path())
         .expect("inspect after")
         .status_snapshot("foreground")
-        .expect("snapshot after")
-        .generation
-        .expect("generation after");
-    assert_eq!(after.revision, before.revision);
-    assert_eq!(after.lease_expires_ms, before.lease_expires_ms);
+        .expect("snapshot after");
+    let after = after_snapshot.generation().expect("generation after");
+    assert_eq!(after.revision(), before.revision());
+    assert_eq!(after.lease_expires_ms(), before.lease_expires_ms());
     assert!(matches!(
         call(&config, AdminCommand::Shutdown),
         AdminResponse::ShutdownAccepted { .. }
@@ -314,7 +414,7 @@ fn an_active_endpoint_refuses_a_second_daemon() {
         .expect("inspect store")
         .status_snapshot("foreground")
         .expect("status before")
-        .event_cursor;
+        .event_cursor();
     assert!(matches!(
         Daemon::open(&config),
         Err(DaemonError::AlreadyRunning)
@@ -323,7 +423,7 @@ fn an_active_endpoint_refuses_a_second_daemon() {
         .expect("inspect store")
         .status_snapshot("foreground")
         .expect("status after")
-        .event_cursor;
+        .event_cursor();
     assert_eq!(
         after, before,
         "refused bind must not mutate generation state"

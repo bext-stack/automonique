@@ -630,12 +630,14 @@ fn admin_status<W: Write, E: Write>(
             "outbox_pending": status.outbox_pending(),
             "running": status.running(),
             "state": status.state().as_str(),
+            "telegram_poller_epoch": status.telegram_poller_epoch(),
+            "telegram_state": status.telegram_state().as_str(),
         })
         .to_string()
             + "\n"
     } else {
         format!(
-            "Automonique daemon: {}\ninstance: {}\ngeneration: {}\nevent cursor: {}\ninbox pending: {}\noutbox pending: {}\nrunning: {}\naccepting intake: {}\n",
+            "Automonique daemon: {}\ninstance: {}\ngeneration: {}\nevent cursor: {}\ninbox pending: {}\noutbox pending: {}\nrunning: {}\naccepting intake: {}\ntelegram: {}\ntelegram poller epoch: {}\n",
             status.state().as_str(),
             status.instance_id().as_str(),
             status.generation(),
@@ -644,6 +646,10 @@ fn admin_status<W: Write, E: Write>(
             status.outbox_pending(),
             status.running(),
             status.accepting_intake(),
+            status.telegram_state().as_str(),
+            status
+                .telegram_poller_epoch()
+                .map_or_else(|| "-".to_owned(), |value| value.to_string()),
         )
     };
     if stdout.write_all(rendered.as_bytes()).is_err() {

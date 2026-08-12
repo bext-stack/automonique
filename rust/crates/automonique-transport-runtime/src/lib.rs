@@ -405,6 +405,159 @@ pub struct PollOutcome {
     pub duplicate: bool,
 }
 
+/// Disabled or lease-owning Telegram host state. Neither state can perform HTTP.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TelegramHostState {
+    DisabledNoClient,
+    LeaseOwnedNoClient(PollerLease),
+}
+
+/// Store-backed lease lifecycle for a future trusted Telegram HTTP host.
+pub struct TelegramLeaseCoordinator<C> {
+    sink: StoreTelegramDurableSink<C>,
+    authority_lease_epoch: u64,
+    ttl_ms: i64,
+    state: TelegramHostState,
+    pending_commit: Option<PendingCommit>,
+}
+
+impl<C> TelegramLeaseCoordinator<C>
+where
+    C: Clock,
+{
+    /// Construct the default state. It owns no bot lease and cannot poll.
+    pub fn disabled(
+        sink: StoreTelegramDurableSink<C>,
+        authority_lease_epoch: u64,
+        ttl_ms: i64,
+    ) -> Result<Self, RuntimeError> {
+        if authority_lease_epoch == 0 || ttl_ms <= 0 {
+            return Err(RuntimeError::InvalidConfiguration("telegram_lease"));
+        }
+        Ok(Self {
+            sink,
+            authority_lease_epoch,
+            ttl_ms,
+            state: TelegramHostState::DisabledNoClient,
+            pending_commit: None,
+        })
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> &TelegramHostState {
+        &self.state
+    }
+
+    /// Explicitly acquire a configured bot lease without enabling polling.
+    pub fn acquire_no_client(
+        &mut self,
+        bot_id: i64,
+        generation_id: &str,
+        holder_id: &str,
+    ) -> Result<&PollerLease, RuntimeError> {
+        if !matches!(self.state, TelegramHostState::DisabledNoClient) {
+            return Err(RuntimeError::InvalidConfiguration("telegram_lease_owned"));
+        }
+        let lease = self
+            .sink
+            .acquire_poller_lease(
+                bot_id,
+                generation_id,
+                holder_id,
+                self.authority_lease_epoch,
+                self.ttl_ms,
+            )
+            .map_err(RuntimeError::Sink)?;
+        self.state = TelegramHostState::LeaseOwnedNoClient(lease);
+        match &self.state {
+            TelegramHostState::LeaseOwnedNoClient(lease) => Ok(lease),
+            TelegramHostState::DisabledNoClient => unreachable!("assigned owned state"),
+        }
+    }
+
+    /// Renew the exact owned lease without changing its epoch or owner.
+    pub fn renew(&mut self) -> Result<&PollerLease, RuntimeError> {
+        let TelegramHostState::LeaseOwnedNoClient(lease) = &self.state else {
+            return Err(RuntimeError::InvalidConfiguration("telegram_lease_absent"));
+        };
+        let renewed = self
+            .sink
+            .renew_poller_lease(lease, self.authority_lease_epoch, self.ttl_ms)
+            .map_err(RuntimeError::Sink)?;
+        if renewed.bot_id != lease.bot_id
+            || renewed.generation_id != lease.generation_id
+            || renewed.holder_id != lease.holder_id
+            || renewed.epoch != lease.epoch
+        {
+            return Err(RuntimeError::SinkReceiptMismatch);
+        }
+        self.state = TelegramHostState::LeaseOwnedNoClient(renewed);
+        match &self.state {
+            TelegramHostState::LeaseOwnedNoClient(lease) => Ok(lease),
+            TelegramHostState::DisabledNoClient => unreachable!("assigned owned state"),
+        }
+    }
+
+    /// Restore a crash-preserved ambiguous commit before shutdown or polling.
+    pub fn restore_pending_commit(&mut self, pending: PendingCommit) -> Result<(), RuntimeError> {
+        let TelegramHostState::LeaseOwnedNoClient(lease) = &self.state else {
+            return Err(RuntimeError::InvalidConfiguration("telegram_lease_absent"));
+        };
+        if self.pending_commit.is_some() || pending.batch.bot_id != lease.bot_id {
+            return Err(RuntimeError::InvalidConfiguration("pending_commit"));
+        }
+        self.pending_commit = Some(pending);
+        Ok(())
+    }
+
+    /// Resolve the exact pending batch through the durable sink without HTTP.
+    pub fn resolve_pending_commit(&mut self) -> Result<DurableCommitReceipt, RuntimeError> {
+        let TelegramHostState::LeaseOwnedNoClient(lease) = &self.state else {
+            return Err(RuntimeError::InvalidConfiguration("telegram_lease_absent"));
+        };
+        let pending = self
+            .pending_commit
+            .as_ref()
+            .ok_or(RuntimeError::InvalidConfiguration("pending_commit"))?;
+        let receipt = self
+            .sink
+            .commit_batch(lease, pending.batch(), lease.expires_ms)
+            .map_err(RuntimeError::Sink)?;
+        validate_commit_receipt(lease, pending.batch(), &receipt)?;
+        self.pending_commit = None;
+        Ok(receipt)
+    }
+
+    /// Release only after any ambiguous pending commit has been exactly resolved.
+    pub fn release(&mut self) -> Result<(), RuntimeError> {
+        if let Some(pending) = &self.pending_commit {
+            return Err(RuntimeError::CommitReconciliationRequired {
+                bot_id: pending.batch.bot_id,
+                next_offset: pending.batch.next_offset,
+                batch_digest: pending.batch.digest,
+            });
+        }
+        let TelegramHostState::LeaseOwnedNoClient(lease) = &self.state else {
+            return Ok(());
+        };
+        self.sink
+            .release_poller_lease(lease)
+            .map_err(RuntimeError::Sink)?;
+        self.state = TelegramHostState::DisabledNoClient;
+        Ok(())
+    }
+
+    /// Recover the sink only after clean release and reconciliation.
+    pub fn into_sink(self) -> Result<StoreTelegramDurableSink<C>, RuntimeError> {
+        if self.pending_commit.is_some()
+            || !matches!(self.state, TelegramHostState::DisabledNoClient)
+        {
+            return Err(RuntimeError::InvalidConfiguration("telegram_shutdown"));
+        }
+        Ok(self.sink)
+    }
+}
+
 /// Stable, content-free runtime refusal.
 #[derive(Debug)]
 pub enum RuntimeError {

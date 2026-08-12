@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use automonique_store::{
     Store, StoreError, TelegramBatchIngestion, TelegramPollerCommit,
-    TelegramPollerLease as StorePollerLease, TelegramPollerLeaseIdentity, TelegramStoreDisposition,
+    TelegramPollerLease as StorePollerLease, TelegramPollerLeaseIdentity,
+    TelegramPollerLeaseRenewal, TelegramPollerLeaseRequest, TelegramStoreDisposition,
     TelegramStoreUpdate,
 };
 
@@ -85,6 +86,62 @@ where
                     Ok(now_ms)
                 }
             })
+    }
+
+    /// Acquire one exact bot lease beneath an already-live generation fence.
+    pub fn acquire_poller_lease(
+        &mut self,
+        bot_id: i64,
+        generation_id: &str,
+        holder_id: &str,
+        authority_lease_epoch: u64,
+        ttl_ms: i64,
+    ) -> Result<PollerLease, SinkFailure> {
+        let now_ms = self.observed_now()?;
+        let lease = self
+            .store
+            .acquire_telegram_poller_lease(TelegramPollerLeaseRequest {
+                bot_id,
+                generation_id,
+                holder_id,
+                authority_lease_epoch,
+                now_ms,
+                ttl_ms,
+            })
+            .map_err(map_lifecycle_error)?;
+        PollerLease::try_from(lease).map_err(|_| SinkFailure::Conflict)
+    }
+
+    /// Renew the exact bot lease without changing its epoch or owner.
+    pub fn renew_poller_lease(
+        &mut self,
+        lease: &PollerLease,
+        authority_lease_epoch: u64,
+        ttl_ms: i64,
+    ) -> Result<PollerLease, SinkFailure> {
+        let now_ms = self.observed_now()?;
+        let renewed = self
+            .store
+            .renew_telegram_poller_lease(TelegramPollerLeaseRenewal {
+                bot_id: lease.bot_id,
+                generation_id: &lease.generation_id,
+                holder_id: &lease.holder_id,
+                authority_lease_epoch,
+                poller_epoch: lease.epoch,
+                expected_expires_ms: lease.expires_ms,
+                now_ms,
+                ttl_ms,
+            })
+            .map_err(map_lifecycle_error)?;
+        PollerLease::try_from(renewed).map_err(|_| SinkFailure::Conflict)
+    }
+
+    /// Release the exact bot lease while preserving its fencing epoch.
+    pub fn release_poller_lease(&mut self, lease: &PollerLease) -> Result<(), SinkFailure> {
+        let now_ms = self.observed_now()?;
+        self.store
+            .release_telegram_poller_lease(store_lease(lease, now_ms))
+            .map_err(map_lifecycle_error)
     }
 }
 
@@ -189,6 +246,27 @@ fn store_update(
 }
 
 fn map_read_error(error: StoreError) -> SinkFailure {
+    match error {
+        StoreError::AuthorityLost | StoreError::StaleEpoch | StoreError::LeaseHeld => {
+            SinkFailure::StaleLease
+        }
+        StoreError::InvalidField(_)
+        | StoreError::IdempotencyConflict(_)
+        | StoreError::ScopeLocked
+        | StoreError::ReconciliationRequired { .. }
+        | StoreError::OutboxReconciliationRequired { .. }
+        | StoreError::NotFound(_)
+        | StoreError::AlreadyTerminal
+        | StoreError::OutboxConflict => SinkFailure::Conflict,
+        StoreError::InsecurePath(_)
+        | StoreError::SchemaVersion { .. }
+        | StoreError::MigrationInvariant(_)
+        | StoreError::Io(_)
+        | StoreError::Sqlite(_) => SinkFailure::Unavailable,
+    }
+}
+
+fn map_lifecycle_error(error: StoreError) -> SinkFailure {
     match error {
         StoreError::AuthorityLost | StoreError::StaleEpoch | StoreError::LeaseHeld => {
             SinkFailure::StaleLease

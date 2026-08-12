@@ -21,8 +21,11 @@ have durable FIFO leases, exact provider receipts, retry/dead-letter outcomes,
 and explicit ambiguity reconciliation through redacted operator commands. A
 side-effect-free Telegram polling orchestrator binds parsed batches to the real
 SQLite store through a renewable per-bot lease, fenced deadline, and content
-digest, while a detached observability model provides closed,
-content-free metric and event vocabularies. Large historical
+digest. A no-client lifecycle coordinator can acquire, renew, reconcile, and
+release that lease without enabling HTTP, while the foreground daemon reports
+Telegram as explicitly disabled. Store-derived operational snapshots classify
+ready, delayed, live, ambiguous, delivered, and dead-lettered work without
+inventing runtime health. Large historical
 planning and development-harness surfaces remain in the tree, but they are no
 longer prerequisites for product development.
 
@@ -126,13 +129,17 @@ serializes it by scope, and atomically records one deterministic terminal plus
 one pending `fake.receipt`. It cannot execute a process, call a provider, drain
 the outbox, or send an external effect. `accepting_intake=true` refers only to
 this local synthetic lane. The general runner remains fail-closed and sandbox
-plans still grant no OS-enforcement or production-runner authority. The Codex
+plans still grant no OS-enforcement or production-runner authority. A dedicated
+descriptor-closure helper exercises a fixed inert Bubblewrap/BusyBox boundary,
+but the product launch API still refuses with `missing_reviewed_helper_pin`;
+there is no provider execution success type. The Codex
 adapter cannot spawn or probe a process, and the Telegram slice performs no
 HTTP call. Its token reaches only an injected, trusted HTTP boundary through a
 short-lived redacted view; its concrete store adapter persists dispositions and
 the offset atomically, but neither it nor a network client is wired into the
-daemon. The observability crate is likewise a validated projection
-model, not a live exporter or health authority. Those paths remain unavailable
+daemon. The observability crate derives bounded metrics from one timestamped
+SQLite snapshot, but it remains a projection model rather than a live exporter
+or health authority. Those paths remain unavailable
 until enforcement and production integration are implemented.
 
 ## Clean-room and licensing

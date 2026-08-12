@@ -647,10 +647,13 @@ fn status_snapshot_counts_pending_terminal_and_outbox_state() {
     let running = store
         .status_snapshot("generation-a")
         .expect("running snapshot");
-    assert_eq!(running.inbox_pending, 1);
-    assert_eq!(running.outbox_pending, 0);
-    assert_eq!(running.runs_running, 1);
-    assert_eq!(running.generation.expect("generation").lease_epoch, epoch);
+    assert_eq!(running.inbox_pending(), 1);
+    assert_eq!(running.outbox_pending(), 0);
+    assert_eq!(running.runs_running(), 1);
+    assert_eq!(
+        running.generation().expect("generation").lease_epoch(),
+        epoch
+    );
 
     let terminal = store
         .finish_run(TerminalRun {
@@ -671,13 +674,206 @@ fn status_snapshot_counts_pending_terminal_and_outbox_state() {
     let finished = store
         .status_snapshot("generation-a")
         .expect("terminal snapshot");
-    assert_eq!(finished.inbox_pending, 1);
-    assert_eq!(finished.outbox_pending, 1);
-    assert_eq!(finished.runs_running, 0);
+    assert_eq!(finished.inbox_pending(), 1);
+    assert_eq!(finished.outbox_pending(), 1);
+    assert_eq!(finished.runs_running(), 0);
     assert_eq!(
-        finished.event_cursor,
+        finished.event_cursor(),
         u64::try_from(terminal.event_id).unwrap()
     );
+}
+
+#[test]
+fn status_snapshot_at_classifies_every_outbox_and_poller_state_at_time_boundary() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let epoch = lease(&mut store, "holder-a", 0);
+
+    let delayed_id = add_effect(&mut store, epoch, "status-delayed", 1);
+    let delayed = claim_effect(&mut store, "holder-a", epoch, 4);
+    assert_eq!(delayed.outbox_id, delayed_id);
+    store
+        .fail_outbox(OutboxFailure {
+            outbox_id: delayed_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            lease_token: &delayed.lease_token,
+            expected_attempt: delayed.attempt,
+            now_ms: 5,
+            decision: OutboxFailureDecision::Retry {
+                reason: "later",
+                retry_after_ms: 95,
+            },
+        })
+        .expect("delayed");
+
+    submit_at(&mut store, "effect:status-live", "scope:status-live", 6);
+    let live_run = claim_next(&mut store, "holder-a", epoch, 7).expect("live run");
+    let live_id = store
+        .finish_run(TerminalRun {
+            run_id: live_run.run_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            expected_revision: 1,
+            now_ms: 8,
+            state: TerminalState::Succeeded,
+            event_kind: "run.succeeded",
+            event_payload: b"status-live",
+            outbox_intent_key: "intent:status-live",
+            outbox_kind: "test.live",
+            outbox_payload: b"status-live",
+        })
+        .expect("live terminal")
+        .outbox_id;
+    let live = store
+        .claim_outbox(OutboxClaimRequest {
+            transport: "test",
+            kind: "test.live",
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            now_ms: 9,
+            ttl_ms: 60,
+        })
+        .expect("live claim")
+        .expect("live effect");
+    assert_eq!(live.outbox_id, live_id);
+    submit_at(
+        &mut store,
+        "effect:status-ambiguous",
+        "scope:status-ambiguous",
+        10,
+    );
+    let ambiguous_run = claim_next(&mut store, "holder-a", epoch, 11).expect("ambiguous run");
+    let ambiguous_terminal = store
+        .finish_run(TerminalRun {
+            run_id: ambiguous_run.run_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            expected_revision: 1,
+            now_ms: 12,
+            state: TerminalState::Succeeded,
+            event_kind: "run.succeeded",
+            event_payload: b"status-ambiguous",
+            outbox_intent_key: "intent:status-ambiguous",
+            outbox_kind: "test.ambiguous",
+            outbox_payload: b"status-ambiguous",
+        })
+        .expect("ambiguous terminal");
+    let ambiguous_id = ambiguous_terminal.outbox_id;
+    let ambiguous = store
+        .claim_outbox(OutboxClaimRequest {
+            transport: "test",
+            kind: "test.ambiguous",
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            now_ms: 13,
+            ttl_ms: 7,
+        })
+        .expect("ambiguous claim")
+        .expect("ambiguous effect");
+    assert_eq!(ambiguous.outbox_id, ambiguous_id);
+
+    let delivered_id = add_effect(&mut store, epoch, "status-delivered", 14);
+    let delivered = claim_effect(&mut store, "holder-a", epoch, 17);
+    assert_eq!(delivered.outbox_id, delivered_id);
+    store
+        .deliver_outbox(OutboxDelivery {
+            outbox_id: delivered_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            lease_token: &delivered.lease_token,
+            expected_attempt: delivered.attempt,
+            receipt_key: "status-delivered-receipt",
+            now_ms: 18,
+        })
+        .expect("delivered");
+
+    let dead_id = add_effect(&mut store, epoch, "status-dead", 19);
+    let dead = claim_effect(&mut store, "holder-a", epoch, 22);
+    assert_eq!(dead.outbox_id, dead_id);
+    store
+        .fail_outbox(OutboxFailure {
+            outbox_id: dead_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            lease_token: &dead.lease_token,
+            expected_attempt: dead.attempt,
+            now_ms: 23,
+            decision: OutboxFailureDecision::DeadLetter { reason: "closed" },
+        })
+        .expect("dead-lettered");
+    add_effect(&mut store, epoch, "status-ready", 24);
+
+    acquire_poller(&mut store, 7, "generation-a", "holder-a", epoch, 1, 60);
+    acquire_poller(&mut store, 8, "generation-a", "holder-a", epoch, 1, 19);
+    let other_authority = store
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "generation-b",
+            holder_id: "holder-b",
+            now_ms: 1,
+            ttl_ms: 100,
+        })
+        .expect("other generation");
+    acquire_poller(
+        &mut store,
+        9,
+        "generation-b",
+        "holder-b",
+        other_authority.epoch,
+        2,
+        80,
+    );
+    acquire_poller(
+        &mut store,
+        10,
+        "generation-b",
+        "holder-b",
+        other_authority.epoch,
+        2,
+        10,
+    );
+    let snapshot = store
+        .status_snapshot_at("generation-a", 50)
+        .expect("boundary snapshot");
+    assert_eq!(snapshot.observed_ms(), 50);
+    assert_eq!(snapshot.outbox_pending(), 2);
+    assert_eq!(snapshot.outbox_pending_ready(), 1);
+    assert_eq!(snapshot.outbox_pending_delayed(), 1);
+    assert_eq!(snapshot.outbox_in_flight_live(), 1);
+    assert_eq!(snapshot.outbox_in_flight_ambiguous(), 1);
+    assert_eq!(snapshot.outbox_delivered(), 1);
+    assert_eq!(snapshot.outbox_dead_lettered(), 1);
+    assert_eq!(snapshot.outbox_oldest_ready_age_ms(), 24);
+    assert_eq!(snapshot.telegram_pollers_live(), 1);
+    assert_eq!(snapshot.telegram_pollers_expired(), 1);
+    let other_snapshot = store
+        .status_snapshot_at("generation-b", 50)
+        .expect("other generation snapshot");
+    assert_eq!(other_snapshot.telegram_pollers_live(), 1);
+    assert_eq!(other_snapshot.telegram_pollers_expired(), 1);
+    drop(store);
+
+    let mut reopened = Store::open(database.path()).expect("reopen");
+    assert_eq!(
+        reopened
+            .status_snapshot_at("generation-a", 50)
+            .expect("same snapshot after restart"),
+        snapshot
+    );
+    let before_boundary = reopened
+        .status_snapshot_at("generation-a", 19)
+        .expect("before boundary");
+    assert_eq!(before_boundary.outbox_in_flight_live(), 2);
+    assert_eq!(before_boundary.outbox_in_flight_ambiguous(), 0);
+    assert_eq!(before_boundary.telegram_pollers_live(), 2);
+    assert_eq!(before_boundary.telegram_pollers_expired(), 0);
 }
 
 #[test]
@@ -757,7 +953,7 @@ fn scheduler_transport_filter_never_claims_an_older_foreign_input() {
         store
             .status_snapshot("generation-a")
             .expect("status")
-            .inbox_pending,
+            .inbox_pending(),
         1,
         "foreign input remains pending"
     );
@@ -822,7 +1018,7 @@ fn scheduler_serializes_fifo_and_preserves_reconciliation_owned_work() {
         store
             .status_snapshot("generation-a")
             .expect("status")
-            .inbox_pending,
+            .inbox_pending(),
         2
     );
     assert!(blocked > oldest);

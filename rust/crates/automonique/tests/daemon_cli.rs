@@ -249,12 +249,16 @@ fn the_product_binary_serves_status_and_shutdown_end_to_end() {
     let human = String::from_utf8(human.stdout).expect("UTF-8 status");
     assert!(human.contains("Automonique daemon: ready"), "{human}");
     assert!(human.contains("accepting intake: true"), "{human}");
+    assert!(human.contains("telegram: disabled_no_client"), "{human}");
+    assert!(human.contains("telegram poller epoch: -"), "{human}");
 
     let json = run(&runtime, &state, &["status", "--json"]);
     assert!(json.status.success());
     let value: serde_json::Value = serde_json::from_slice(&json.stdout).expect("JSON status");
     assert_eq!(value["state"], "ready");
     assert_eq!(value["accepting_intake"], true);
+    assert_eq!(value["telegram_state"], "disabled_no_client");
+    assert_eq!(value["telegram_poller_epoch"], serde_json::Value::Null);
     assert!(
         value["event_cursor"]
             .as_u64()

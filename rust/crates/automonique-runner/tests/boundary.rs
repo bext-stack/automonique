@@ -23,11 +23,11 @@ fn current_linux_host_observation_never_grants_launch_authority() {
     assert_eq!(refusal.unenforced_requirements(), BoundaryRequirement::ALL);
     assert_eq!(
         refusal.blockers(),
-        [LaunchBlocker::MissingDescriptorClosure]
+        [LaunchBlocker::MissingReviewedHelperPin]
     );
     assert_eq!(
         refusal.blockers()[0].category(),
-        "missing_descriptor_closure"
+        "missing_reviewed_helper_pin"
     );
     for requirement in BoundaryRequirement::ALL {
         assert!(

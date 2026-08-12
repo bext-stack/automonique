@@ -83,6 +83,10 @@ dependencies = [
 [[package]]
 name = "automonique-observability"
 version = "0.1.0"
+dependencies = [
+ "automonique-store",
+ "tempfile",
+]
 
 [[package]]
 name = "automonique-policy"

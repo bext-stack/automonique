@@ -8,8 +8,8 @@ use automonique_store::{LeaseRequest, Store, TelegramPollerLeaseRequest};
 use automonique_transport_runtime::{
     CancellationToken, Clock, ClockFailure, DurableDisposition, DurableTelegramBatch,
     DurableTelegramUpdate, HttpFailure, OpaqueBotToken, PendingCommit, PollerLease, SinkFailure,
-    StoreTelegramDurableSink, TelegramDurableSink, TelegramHttpClient, TelegramHttpPlan,
-    TelegramHttpResponse, TelegramPoller,
+    StoreTelegramDurableSink, TelegramDurableSink, TelegramHostState, TelegramHttpClient,
+    TelegramHttpPlan, TelegramHttpResponse, TelegramLeaseCoordinator, TelegramPoller,
 };
 use automonique_transports::{
     TelegramAccessPolicy, TelegramBotId, TelegramInputKind, TelegramPrincipal,
@@ -27,6 +27,176 @@ impl TelegramHttpClient for NoHttp {
         self.0.fetch_add(1, Ordering::AcqRel);
         Err(HttpFailure::Unavailable)
     }
+}
+
+#[test]
+fn coordinator_release_and_successor_handoff_fence_the_stale_owner() {
+    let (_directory, path, store, initial_lease) = open_fixture();
+    let clock = TestClock::new(2);
+    let mut coordinator = TelegramLeaseCoordinator::disabled(
+        StoreTelegramDurableSink::new(store, clock.clone()),
+        1,
+        600,
+    )
+    .expect("disabled coordinator");
+    assert_eq!(coordinator.state(), &TelegramHostState::DisabledNoClient);
+    let owned = coordinator
+        .acquire_no_client(7, "generation-a", "poller-a")
+        .expect("idempotent existing lease")
+        .clone();
+    assert_eq!(owned, initial_lease);
+    clock.set(10);
+    let renewed = coordinator.renew().expect("renew").clone();
+    assert_eq!(renewed.epoch, owned.epoch);
+    assert!(renewed.expires_ms > owned.expires_ms);
+
+    let unresolved = PendingCommit::restore(batch(b"pending")).expect("pending commit");
+    coordinator
+        .restore_pending_commit(unresolved)
+        .expect("restore pending");
+    assert!(matches!(
+        coordinator.release(),
+        Err(automonique_transport_runtime::RuntimeError::CommitReconciliationRequired { .. })
+    ));
+    assert!(matches!(
+        coordinator.state(),
+        TelegramHostState::LeaseOwnedNoClient(_)
+    ));
+    coordinator
+        .resolve_pending_commit()
+        .expect("resolve exact pending commit");
+    clock.set(20);
+    coordinator.release().expect("resolved shutdown release");
+    assert_eq!(coordinator.state(), &TelegramHostState::DisabledNoClient);
+    let (mut store, _) = coordinator
+        .into_sink()
+        .expect("clean sink handoff")
+        .into_parts();
+    store
+        .release_generation_lease("generation-a", "poller-a", 1, 20)
+        .expect("release old generation");
+    let successor_authority = store
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "generation-a",
+            holder_id: "poller-b",
+            now_ms: 21,
+            ttl_ms: 1_000,
+        })
+        .expect("successor generation");
+    clock.set(22);
+    let mut successor = TelegramLeaseCoordinator::disabled(
+        StoreTelegramDurableSink::new(store, clock.clone()),
+        successor_authority.epoch,
+        600,
+    )
+    .expect("successor coordinator");
+    let next = successor
+        .acquire_no_client(7, "generation-a", "poller-b")
+        .expect("successor lease")
+        .clone();
+    assert!(next.epoch > renewed.epoch);
+    assert_ne!(next.holder_id, renewed.holder_id);
+
+    successor.release().expect("successor clean release");
+    let (store, _) = successor.into_sink().expect("successor sink").into_parts();
+    let mut stale = StoreTelegramDurableSink::new(Store::open(&path).expect("stale store"), clock);
+    assert_eq!(
+        stale
+            .read_offset(&renewed, 0)
+            .expect_err("stale owner cannot read"),
+        SinkFailure::StaleLease
+    );
+    let stale_batch = DurableTelegramBatch::new(
+        7,
+        0,
+        1,
+        22,
+        vec![DurableTelegramUpdate {
+            update_id: 0,
+            source_key: "telegram:7:update:0".to_owned(),
+            scope: "telegram:7:chat:-100".to_owned(),
+            kind: TelegramInputKind::Message,
+            disposition: DurableDisposition::Denied,
+        }],
+    )
+    .expect("stale batch");
+    assert_eq!(
+        stale
+            .commit_batch(&renewed, &stale_batch, renewed.expires_ms)
+            .expect_err("stale owner cannot commit"),
+        SinkFailure::StaleLease
+    );
+    assert_eq!(store.telegram_offset(7).expect("no stale advance"), Some(6));
+}
+
+#[test]
+fn crashed_coordinator_keeps_fence_until_expiry_then_successor_takes_over() {
+    let (_directory, path, store, initial_lease) = open_fixture();
+    let clock = TestClock::new(2);
+    let mut crashed = TelegramLeaseCoordinator::disabled(
+        StoreTelegramDurableSink::new(store, clock.clone()),
+        1,
+        600,
+    )
+    .expect("disabled coordinator");
+    let crashed_lease = crashed
+        .acquire_no_client(7, "generation-a", "poller-a")
+        .expect("existing lease")
+        .clone();
+    drop(crashed);
+
+    let mut store = Store::open(&path).expect("restart before expiry");
+    assert_eq!(
+        store
+            .acquire_generation_lease(LeaseRequest {
+                generation_id: "generation-a",
+                holder_id: "poller-b",
+                now_ms: 500,
+                ttl_ms: 1_000,
+            })
+            .expect_err("live crashed authority remains fenced")
+            .category(),
+        "lease_held"
+    );
+
+    let successor_authority = store
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "generation-a",
+            holder_id: "poller-b",
+            now_ms: 1_001,
+            ttl_ms: 1_000,
+        })
+        .expect("successor generation after expiry");
+    clock.set(1_002);
+    let mut successor = TelegramLeaseCoordinator::disabled(
+        StoreTelegramDurableSink::new(store, clock.clone()),
+        successor_authority.epoch,
+        600,
+    )
+    .expect("successor coordinator");
+    let successor_lease = successor
+        .acquire_no_client(7, "generation-a", "poller-b")
+        .expect("successor poller lease")
+        .clone();
+    assert!(successor_lease.epoch > crashed_lease.epoch);
+
+    let mut stale = StoreTelegramDurableSink::new(Store::open(&path).expect("stale store"), clock);
+    assert_eq!(
+        stale
+            .read_offset(&initial_lease, 0)
+            .expect_err("crashed owner cannot read after takeover"),
+        SinkFailure::StaleLease
+    );
+    assert_eq!(
+        stale
+            .commit_batch(&initial_lease, &batch(b"stale"), initial_lease.expires_ms)
+            .expect_err("crashed owner cannot commit after takeover"),
+        SinkFailure::StaleLease
+    );
+
+    successor.release().expect("successor release");
+    let (store, _) = successor.into_sink().expect("clean successor").into_parts();
+    assert_eq!(store.telegram_offset(7).expect("no stale advance"), None);
 }
 
 fn policy() -> TelegramAccessPolicy {

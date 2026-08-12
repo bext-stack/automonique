@@ -953,23 +953,150 @@ pub struct OutboxReconciliationRequest<'a> {
 /// One generation row in a consistent operator-status snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerationSnapshot {
-    pub generation_id: String,
-    pub revision: u64,
-    pub state: String,
-    pub holder_id: String,
-    pub lease_epoch: u64,
-    pub lease_expires_ms: i64,
+    generation_id: String,
+    revision: u64,
+    state: String,
+    holder_id: String,
+    lease_epoch: u64,
+    lease_expires_ms: i64,
+}
+
+impl GenerationSnapshot {
+    #[must_use]
+    pub fn generation_id(&self) -> &str {
+        &self.generation_id
+    }
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    #[must_use]
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+    #[must_use]
+    pub fn holder_id(&self) -> &str {
+        &self.holder_id
+    }
+    #[must_use]
+    pub const fn lease_epoch(&self) -> u64 {
+        self.lease_epoch
+    }
+    #[must_use]
+    pub const fn lease_expires_ms(&self) -> i64 {
+        self.lease_expires_ms
+    }
 }
 
 /// Read-only database status observed from one SQLite snapshot transaction.
+///
+/// Time-classified fields are meaningful only when produced by
+/// [`Store::status_snapshot_at`]. The compatibility wrapper records
+/// `observed_ms = 0` and is aggregate-only.
+/// ```compile_fail
+/// use automonique_store::StatusSnapshot;
+/// // Store snapshots are issued only by Store; external code cannot invent
+/// // durable measurements with a struct literal.
+/// let _forged = StatusSnapshot {
+///     schema_version: 1, observed_ms: 1, generation: None, event_cursor: 0,
+///     inbox_pending: 0, outbox_pending: 0, runs_running: 0,
+///     runs_reconciliation_pending: 0, outbox_pending_ready: 0,
+///     outbox_pending_delayed: 0, outbox_in_flight_live: 0,
+///     outbox_in_flight_ambiguous: 0, outbox_delivered: 0,
+///     outbox_dead_lettered: 0, outbox_oldest_ready_age_ms: 0,
+///     telegram_pollers_live: 0, telegram_pollers_expired: 0,
+/// };
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatusSnapshot {
-    pub schema_version: u32,
-    pub generation: Option<GenerationSnapshot>,
-    pub event_cursor: u64,
-    pub inbox_pending: u64,
-    pub outbox_pending: u64,
-    pub runs_running: u64,
+    schema_version: u32,
+    observed_ms: i64,
+    generation: Option<GenerationSnapshot>,
+    event_cursor: u64,
+    inbox_pending: u64,
+    outbox_pending: u64,
+    runs_running: u64,
+    runs_reconciliation_pending: u64,
+    outbox_pending_ready: u64,
+    outbox_pending_delayed: u64,
+    outbox_in_flight_live: u64,
+    outbox_in_flight_ambiguous: u64,
+    outbox_delivered: u64,
+    outbox_dead_lettered: u64,
+    outbox_oldest_ready_age_ms: u64,
+    telegram_pollers_live: u64,
+    telegram_pollers_expired: u64,
+}
+
+impl StatusSnapshot {
+    #[must_use]
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+    #[must_use]
+    pub const fn observed_ms(&self) -> i64 {
+        self.observed_ms
+    }
+    #[must_use]
+    pub const fn generation(&self) -> Option<&GenerationSnapshot> {
+        self.generation.as_ref()
+    }
+    #[must_use]
+    pub const fn event_cursor(&self) -> u64 {
+        self.event_cursor
+    }
+    #[must_use]
+    pub const fn inbox_pending(&self) -> u64 {
+        self.inbox_pending
+    }
+    #[must_use]
+    pub const fn outbox_pending(&self) -> u64 {
+        self.outbox_pending
+    }
+    #[must_use]
+    pub const fn runs_running(&self) -> u64 {
+        self.runs_running
+    }
+    #[must_use]
+    pub const fn runs_reconciliation_pending(&self) -> u64 {
+        self.runs_reconciliation_pending
+    }
+    #[must_use]
+    pub const fn outbox_pending_ready(&self) -> u64 {
+        self.outbox_pending_ready
+    }
+    #[must_use]
+    pub const fn outbox_pending_delayed(&self) -> u64 {
+        self.outbox_pending_delayed
+    }
+    #[must_use]
+    pub const fn outbox_in_flight_live(&self) -> u64 {
+        self.outbox_in_flight_live
+    }
+    #[must_use]
+    pub const fn outbox_in_flight_ambiguous(&self) -> u64 {
+        self.outbox_in_flight_ambiguous
+    }
+    #[must_use]
+    pub const fn outbox_delivered(&self) -> u64 {
+        self.outbox_delivered
+    }
+    #[must_use]
+    pub const fn outbox_dead_lettered(&self) -> u64 {
+        self.outbox_dead_lettered
+    }
+    #[must_use]
+    pub const fn outbox_oldest_ready_age_ms(&self) -> u64 {
+        self.outbox_oldest_ready_age_ms
+    }
+    #[must_use]
+    pub const fn telegram_pollers_live(&self) -> u64 {
+        self.telegram_pollers_live
+    }
+    #[must_use]
+    pub const fn telegram_pollers_expired(&self) -> u64 {
+        self.telegram_pollers_expired
+    }
 }
 
 /// Product SQLite store. A daemon should own it from one dedicated actor.
@@ -3101,9 +3228,24 @@ impl Store {
         )?)
     }
 
-    /// Observe daemon-facing status from one explicit, consistent read transaction.
+    /// Compatibility aggregate snapshot at epoch zero.
+    ///
+    /// Existing callers may read generation/cursor/aggregate pending/running
+    /// fields. Operational projections must use [`Self::status_snapshot_at`].
     pub fn status_snapshot(&mut self, generation_id: &str) -> Result<StatusSnapshot, StoreError> {
+        self.status_snapshot_at(generation_id, 0)
+    }
+
+    /// Observe time-classified queue status from one consistent SQLite snapshot.
+    /// Ready-item age clamps to zero when a stored creation timestamp is later
+    /// than the explicit observation time.
+    pub fn status_snapshot_at(
+        &mut self,
+        generation_id: &str,
+        now_ms: i64,
+    ) -> Result<StatusSnapshot, StoreError> {
         validate_id(generation_id, "generation_id")?;
+        validate_time(now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
@@ -3152,14 +3294,77 @@ impl Store {
             &transaction,
             "SELECT count(*) FROM runs WHERE state = 'running'",
         )?;
+        let runs_reconciliation_pending: i64 = transaction.query_row(
+            "SELECT count(DISTINCT r.run_id) FROM runs r
+             JOIN work_locks w ON w.run_id = r.run_id
+             WHERE r.state = 'running' AND w.expires_ms <= ?1",
+            [now_ms],
+            |row| row.get(0),
+        )?;
+        let outbox_counts: (i64, i64, i64, i64, i64, i64, Option<i64>) =
+            transaction.query_row(
+                "SELECT
+                    COALESCE(sum(CASE WHEN state = 'pending' AND available_ms <= ?1 THEN 1 ELSE 0 END), 0),
+                    COALESCE(sum(CASE WHEN state = 'pending' AND available_ms > ?1 THEN 1 ELSE 0 END), 0),
+                    COALESCE(sum(CASE WHEN state = 'in_flight' AND lease_expires_ms > ?1 THEN 1 ELSE 0 END), 0),
+                    COALESCE(sum(CASE WHEN state = 'in_flight' AND lease_expires_ms <= ?1 THEN 1 ELSE 0 END), 0),
+                    COALESCE(sum(CASE WHEN state = 'delivered' THEN 1 ELSE 0 END), 0),
+                    COALESCE(sum(CASE WHEN state = 'dead_lettered' THEN 1 ELSE 0 END), 0),
+                    min(CASE WHEN state = 'pending' AND available_ms <= ?1 THEN created_ms END)
+                 FROM outbox",
+                [now_ms],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )?;
+        let poller_counts: (i64, i64) = transaction.query_row(
+            "SELECT
+                COALESCE(sum(CASE WHEN p.expires_ms > ?1 AND g.lease_holder = p.holder_id
+                              AND g.lease_epoch = p.authority_lease_epoch
+                              AND g.lease_expires_ms > ?1 THEN 1 ELSE 0 END), 0),
+                COALESCE(sum(CASE WHEN NOT (p.expires_ms > ?1 AND g.lease_holder = p.holder_id
+                                  AND g.lease_epoch = p.authority_lease_epoch
+                                  AND g.lease_expires_ms > ?1) THEN 1 ELSE 0 END), 0)
+             FROM telegram_poller_leases p
+             JOIN generations g ON g.generation_id = p.generation_id
+             WHERE p.generation_id = ?2",
+            params![now_ms, generation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         transaction.commit()?;
         Ok(StatusSnapshot {
             schema_version: SCHEMA_VERSION,
+            observed_ms: now_ms,
             generation,
             event_cursor,
             inbox_pending,
             outbox_pending,
             runs_running,
+            runs_reconciliation_pending: from_db_u64(
+                runs_reconciliation_pending,
+                "runs_reconciliation_pending",
+            )?,
+            outbox_pending_ready: from_db_u64(outbox_counts.0, "outbox_pending_ready")?,
+            outbox_pending_delayed: from_db_u64(outbox_counts.1, "outbox_pending_delayed")?,
+            outbox_in_flight_live: from_db_u64(outbox_counts.2, "outbox_in_flight_live")?,
+            outbox_in_flight_ambiguous: from_db_u64(outbox_counts.3, "outbox_in_flight_ambiguous")?,
+            outbox_delivered: from_db_u64(outbox_counts.4, "outbox_delivered")?,
+            outbox_dead_lettered: from_db_u64(outbox_counts.5, "outbox_dead_lettered")?,
+            outbox_oldest_ready_age_ms: outbox_counts
+                .6
+                .map_or(0, |created_ms| now_ms.saturating_sub(created_ms))
+                .try_into()
+                .map_err(|_| StoreError::MigrationInvariant("outbox_ready_age"))?,
+            telegram_pollers_live: from_db_u64(poller_counts.0, "telegram_pollers_live")?,
+            telegram_pollers_expired: from_db_u64(poller_counts.1, "telegram_pollers_expired")?,
         })
     }
 }

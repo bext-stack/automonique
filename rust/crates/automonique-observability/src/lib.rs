@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
+use automonique_store::StatusSnapshot;
+
 const MAX_GENERATION_ID_BYTES: usize = 128;
 
 /// Closed metric vocabulary exported by the first operational projection.
@@ -29,10 +31,18 @@ pub enum MetricName {
     TelegramOffsetLag,
     ProviderAvailable,
     SandboxLaunchRefusals,
+    OutboxPendingReady,
+    OutboxPendingDelayed,
+    OutboxInFlightLive,
+    OutboxInFlightAmbiguous,
+    OutboxDelivered,
+    OutboxDeadLettered,
+    TelegramPollersLive,
+    TelegramPollersExpired,
 }
 
 impl MetricName {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 19] = [
         Self::DaemonReady,
         Self::IntakeEnabled,
         Self::InboxPending,
@@ -44,6 +54,14 @@ impl MetricName {
         Self::TelegramOffsetLag,
         Self::ProviderAvailable,
         Self::SandboxLaunchRefusals,
+        Self::OutboxPendingReady,
+        Self::OutboxPendingDelayed,
+        Self::OutboxInFlightLive,
+        Self::OutboxInFlightAmbiguous,
+        Self::OutboxDelivered,
+        Self::OutboxDeadLettered,
+        Self::TelegramPollersLive,
+        Self::TelegramPollersExpired,
     ];
 
     #[must_use]
@@ -60,6 +78,14 @@ impl MetricName {
             Self::TelegramOffsetLag => "automonique_telegram_offset_lag",
             Self::ProviderAvailable => "automonique_provider_available",
             Self::SandboxLaunchRefusals => "automonique_sandbox_launch_refusals_total",
+            Self::OutboxPendingReady => "automonique_outbox_pending_ready",
+            Self::OutboxPendingDelayed => "automonique_outbox_pending_delayed",
+            Self::OutboxInFlightLive => "automonique_outbox_in_flight_live",
+            Self::OutboxInFlightAmbiguous => "automonique_outbox_in_flight_ambiguous",
+            Self::OutboxDelivered => "automonique_outbox_delivered_total",
+            Self::OutboxDeadLettered => "automonique_outbox_dead_lettered_total",
+            Self::TelegramPollersLive => "automonique_telegram_pollers_live",
+            Self::TelegramPollersExpired => "automonique_telegram_pollers_expired",
         }
     }
 
@@ -71,6 +97,107 @@ impl MetricName {
                 | Self::TelegramPollerOwned
                 | Self::ProviderAvailable
         )
+    }
+}
+
+/// Conservative assessment derived only from durable store evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreAssessment {
+    /// No durable ambiguity is visible, but runtime/provider readiness is not integrated.
+    Unknown,
+    /// Durable expired work requires reconciliation.
+    Degraded,
+}
+
+/// Metrics and assessment derived from one real SQLite status snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreProjection {
+    metrics: MetricsSnapshot,
+    assessment: StoreAssessment,
+}
+
+impl StoreProjection {
+    pub fn from_status(status: &StatusSnapshot) -> Result<Self, ObservabilityError> {
+        let generation = status
+            .generation()
+            .ok_or(ObservabilityError::MissingGeneration)?;
+        let observed_ms = u64::try_from(status.observed_ms())
+            .map_err(|_| ObservabilityError::InvalidCoordinate)?;
+        let reconciliation_pending = status
+            .runs_reconciliation_pending()
+            .checked_add(status.outbox_in_flight_ambiguous())
+            .and_then(|value| value.checked_add(status.telegram_pollers_expired()))
+            .ok_or(ObservabilityError::MetricOverflow)?;
+        let unavailable = |name| MetricSample::unavailable(name, UnavailableReason::NotIntegrated);
+        let measured = |name, value| MetricSample::new(name, value);
+        let samples = [
+            unavailable(MetricName::DaemonReady),
+            unavailable(MetricName::IntakeEnabled),
+            measured(MetricName::InboxPending, status.inbox_pending())?,
+            measured(MetricName::RunsRunning, status.runs_running())?,
+            measured(MetricName::ReconciliationPending, reconciliation_pending)?,
+            measured(MetricName::OutboxPending, status.outbox_pending())?,
+            measured(
+                MetricName::OutboxOldestAgeMs,
+                status.outbox_oldest_ready_age_ms(),
+            )?,
+            measured(
+                MetricName::TelegramPollerOwned,
+                u64::from(status.telegram_pollers_live() > 0),
+            )?,
+            unavailable(MetricName::TelegramOffsetLag),
+            unavailable(MetricName::ProviderAvailable),
+            unavailable(MetricName::SandboxLaunchRefusals),
+            measured(
+                MetricName::OutboxPendingReady,
+                status.outbox_pending_ready(),
+            )?,
+            measured(
+                MetricName::OutboxPendingDelayed,
+                status.outbox_pending_delayed(),
+            )?,
+            measured(
+                MetricName::OutboxInFlightLive,
+                status.outbox_in_flight_live(),
+            )?,
+            measured(
+                MetricName::OutboxInFlightAmbiguous,
+                status.outbox_in_flight_ambiguous(),
+            )?,
+            measured(MetricName::OutboxDelivered, status.outbox_delivered())?,
+            measured(
+                MetricName::OutboxDeadLettered,
+                status.outbox_dead_lettered(),
+            )?,
+            measured(
+                MetricName::TelegramPollersLive,
+                status.telegram_pollers_live(),
+            )?,
+            measured(
+                MetricName::TelegramPollersExpired,
+                status.telegram_pollers_expired(),
+            )?,
+        ];
+        let metrics = MetricsSnapshot::new(observed_ms, generation.generation_id(), samples)?;
+        let assessment = if reconciliation_pending > 0 {
+            StoreAssessment::Degraded
+        } else {
+            StoreAssessment::Unknown
+        };
+        Ok(Self {
+            metrics,
+            assessment,
+        })
+    }
+
+    #[must_use]
+    pub const fn metrics(&self) -> &MetricsSnapshot {
+        &self.metrics
+    }
+
+    #[must_use]
+    pub const fn assessment(&self) -> StoreAssessment {
+        self.assessment
     }
 }
 
@@ -335,6 +462,8 @@ pub enum ObservabilityError {
     InvalidBooleanMetric(MetricName),
     DuplicateMetric(MetricName),
     IncompleteSnapshot,
+    MissingGeneration,
+    MetricOverflow,
 }
 
 impl fmt::Display for ObservabilityError {

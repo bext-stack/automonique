@@ -26,7 +26,7 @@ use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, decode_frame, encode_fram
 use automonique_store::{
     InboxSubmission, LeaseRenewal, LeaseRequest,
     OutboxReconciliationDecision as StoreOutboxDecision, OutboxReconciliationRequest,
-    ReconciliationDecision, ReconciliationRequest, Store, StoreError,
+    ReconciliationDecision, ReconciliationRequest, StatusSnapshot, Store, StoreError,
 };
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
@@ -34,6 +34,7 @@ use nix::sys::socket::{getsockopt, sockopt};
 use nix::unistd::geteuid;
 
 mod synthetic;
+mod telegram;
 
 /// Socket filename inside the private product runtime directory.
 pub const ADMIN_SOCKET_NAME: &str = concat!("admin", ".sock");
@@ -204,6 +205,7 @@ pub struct Daemon {
     socket_identity: (u64, u64),
     controller: automonique_core::Controller,
     reconciliation_run_id: Option<i64>,
+    telegram: telegram::TelegramHost,
 }
 
 struct SocketCleanup {
@@ -288,6 +290,7 @@ impl Daemon {
             socket_identity,
             controller: automonique_core::Controller::new(),
             reconciliation_run_id: None,
+            telegram: telegram::TelegramHost::disabled(),
         })
     }
 
@@ -424,16 +427,19 @@ impl Daemon {
             .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
         let response = match request.command() {
             automonique_protocol::admin::AdminCommand::Status => {
-                let snapshot = self.store.status_snapshot(GENERATION_ID)?;
-                let generation = snapshot.generation.ok_or(StoreError::StaleEpoch)?;
-                if generation.holder_id != self.instance_id.as_str()
-                    || generation.lease_epoch != self.lease_epoch
-                    || generation.lease_expires_ms != self.lease_expires_ms
-                    || generation.lease_expires_ms <= unix_millis()?
+                let now_ms = unix_millis()?;
+                let snapshot = self.store.status_snapshot_at(GENERATION_ID, now_ms)?;
+                let generation = snapshot.generation().ok_or(StoreError::StaleEpoch)?;
+                if generation.holder_id() != self.instance_id.as_str()
+                    || generation.lease_epoch() != self.lease_epoch
+                    || generation.lease_expires_ms() != self.lease_expires_ms
+                    || generation.lease_expires_ms() <= now_ms
                 {
                     return Err(DaemonError::Store(StoreError::StaleEpoch));
                 }
-                let degraded = self.reconciliation_run_id.is_some();
+                let degraded = self.reconciliation_run_id.is_some()
+                    || snapshot_requires_reconciliation(&snapshot);
+                let (telegram_state, telegram_poller_epoch) = self.telegram.status();
                 let status = DaemonStatus::new(
                     self.instance_id.clone(),
                     if degraded {
@@ -442,12 +448,13 @@ impl Daemon {
                         DaemonState::Ready
                     },
                     self.lease_epoch,
-                    snapshot.event_cursor,
-                    snapshot.inbox_pending,
-                    snapshot.outbox_pending,
-                    snapshot.runs_running,
+                    snapshot.event_cursor(),
+                    snapshot.inbox_pending(),
+                    snapshot.outbox_pending(),
+                    snapshot.runs_running(),
                     !degraded,
                 )
+                .and_then(|status| status.with_telegram(telegram_state, telegram_poller_epoch))
                 .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
                 AdminResponse::Status {
                     request_id: request.request_id().clone(),
@@ -455,8 +462,17 @@ impl Daemon {
                 }
             }
             automonique_protocol::admin::AdminCommand::SubmitSynthetic => {
-                if self.reconciliation_run_id.is_some() {
-                    return Err(DaemonError::ReconciliationRequired);
+                let snapshot = self
+                    .store
+                    .status_snapshot_at(GENERATION_ID, unix_millis()?)?;
+                if self.reconciliation_run_id.is_some()
+                    || snapshot_requires_reconciliation(&snapshot)
+                {
+                    return self.write_refusal(
+                        stream,
+                        request.request_id(),
+                        DaemonError::ReconciliationRequired.category(),
+                    );
                 }
                 let submission = request
                     .submission()
@@ -666,6 +682,10 @@ impl Daemon {
         stream.flush()?;
         Ok(())
     }
+}
+
+fn snapshot_requires_reconciliation(snapshot: &StatusSnapshot) -> bool {
+    snapshot.runs_reconciliation_pending() > 0 || snapshot.outbox_in_flight_ambiguous() > 0
 }
 
 impl Drop for Daemon {

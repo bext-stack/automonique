@@ -286,6 +286,11 @@ fn status_response_is_exact_and_round_trips() {
     assert_eq!(status.outbox_pending(), 3);
     assert_eq!(status.running(), 1);
     assert!(status.accepting_intake());
+    assert_eq!(
+        status.telegram_state(),
+        automonique_protocol::admin::TelegramState::DisabledNoClient
+    );
+    assert_eq!(status.telegram_poller_epoch(), None);
 }
 
 #[test]
@@ -356,10 +361,63 @@ fn status_body_rejects_missing_extra_wrong_and_negative_fields() {
 
 #[test]
 fn unknown_state_is_a_security_sensitive_refusal() {
-    let payload = br#"{"body":{"accepting_intake":true,"event_cursor":1,"generation":1,"inbox_pending":0,"instance_id":"d","outbox_pending":0,"running":0,"state":"recovering"},"kind":"status_result","protocol":"automonique.admin","request_id":"r","version":1}"#;
+    let payload = br#"{"body":{"accepting_intake":true,"event_cursor":1,"generation":1,"inbox_pending":0,"instance_id":"d","outbox_pending":0,"running":0,"state":"recovering","telegram_poller_epoch":null,"telegram_state":"disabled_no_client"},"kind":"status_result","protocol":"automonique.admin","request_id":"r","version":1}"#;
     assert_eq!(
         AdminResponse::from_canonical_bytes(payload).expect_err("unknown state"),
         AdminError::UnknownState
+    );
+}
+
+#[test]
+fn telegram_status_is_closed_and_epoch_coherent() {
+    let owned = DaemonStatus::new(
+        AdminInstanceId::new("daemon-telegram").expect("instance"),
+        DaemonState::Ready,
+        1,
+        1,
+        0,
+        0,
+        0,
+        true,
+    )
+    .and_then(|status| {
+        status.with_telegram(
+            automonique_protocol::admin::TelegramState::LeaseOwnedNoClient,
+            Some(9),
+        )
+    })
+    .expect("owned no-client state");
+    assert_eq!(owned.telegram_poller_epoch(), Some(9));
+    for (state, epoch) in [
+        (
+            automonique_protocol::admin::TelegramState::DisabledNoClient,
+            Some(1),
+        ),
+        (
+            automonique_protocol::admin::TelegramState::LeaseOwnedNoClient,
+            None,
+        ),
+    ] {
+        assert_eq!(
+            DaemonStatus::new(
+                AdminInstanceId::new("d").expect("instance"),
+                DaemonState::Ready,
+                1,
+                1,
+                0,
+                0,
+                0,
+                true,
+            )
+            .and_then(|status| status.with_telegram(state, epoch))
+            .expect_err("incoherent state"),
+            AdminError::InvalidBody
+        );
+    }
+    let unknown = br#"{"body":{"accepting_intake":true,"event_cursor":1,"generation":1,"inbox_pending":0,"instance_id":"d","outbox_pending":0,"running":0,"state":"ready","telegram_poller_epoch":null,"telegram_state":"enabled"},"kind":"status_result","protocol":"automonique.admin","request_id":"r","version":1}"#;
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(unknown).expect_err("unknown telegram state"),
+        AdminError::InvalidBody
     );
 }
 
