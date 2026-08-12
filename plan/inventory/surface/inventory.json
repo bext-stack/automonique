@@ -232,11 +232,11 @@
     },
     "agents-candidate-identity": {
       "path": "AGENTS.md",
-      "quote": "`Automonique Candidate <candidate@automonique.invalid>`, the identity"
+      "quote": "`Automonique Candidate <candidate@automonique.invalid>`; human-authored commits"
     },
     "gov-owner": {
       "path": "GOVERNANCE.md",
-      "quote": "The owner selects work, chooses review depth from the change's risk, and alone"
+      "quote": "The owner may ask Codex or a human"
     }
   },
   "owners": {
