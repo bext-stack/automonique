@@ -17,6 +17,7 @@ import ast
 import contextlib
 import io
 import json
+import os
 import pathlib
 import socket
 import sqlite3
@@ -131,7 +132,7 @@ class DrillOutcomeTests(unittest.TestCase):
 
     def test_unbroken_run_restores_a_coherent_point_in_time(self) -> None:
         report = self.run_drill()
-        self.assertIs(report.outcome, drill.Outcome.VERIFIED)
+        self.assertIs(report.outcome, drill.Outcome.INCOMPLETE)
         self.assertEqual(len(report.invariants), len(rs.Invariant))
         self.assertTrue(all(r.ok for r in report.invariants), report.invariants)
         self.assertTrue(report.reproducible["source_destroyed"])
@@ -307,6 +308,109 @@ class InvariantControlTests(unittest.TestCase):
             rs.restore(self.backup, self.target.parent / "target-two")
         self.assertIn("manifest hash", str(caught.exception))
 
+    def test_manifest_paths_hashes_and_symlinks_fail_closed(self) -> None:
+        original = (self.backup / "manifest.json").read_bytes()
+        document = json.loads(original)
+        cases = {
+            "traversal": {"../outside": "0" * 64},
+            "absolute": {"/outside": "0" * 64},
+            "non_digest": {"control.db": "not-a-digest"},
+        }
+        try:
+            for label, files in cases.items():
+                with self.subTest(label=label):
+                    changed = {**document, "files": files}
+                    rs.write_atomic(
+                        self.backup / "manifest.json",
+                        (json.dumps(changed, indent=2, sort_keys=True) + "\n").encode())
+                    with self.assertRaises(ValueError):
+                        rs.restore(self.backup, self.target.parent / f"target-{label}")
+
+            rs.write_atomic(self.backup / "manifest.json", original)
+            source = self.backup / "control.db"
+            source.unlink()
+            source.symlink_to(self.layout.database)
+            with self.assertRaises(ValueError) as caught:
+                rs.restore(self.backup, self.target.parent / "target-symlink")
+            self.assertIn("symlink", str(caught.exception))
+        finally:
+            rs.write_atomic(self.backup / "manifest.json", original)
+
+    def test_duplicate_manifest_keys_and_symlinked_roots_fail_closed(self) -> None:
+        manifest = (self.backup / "manifest.json").read_text()
+        duplicate = manifest.replace(
+            '  "files": {',
+            '  "files": {"../outside": "' + ("0" * 64) + '"},\n  "files": {',
+            1,
+        )
+        rs.write_atomic(self.backup / "manifest.json", duplicate.encode())
+        with self.assertRaises(ValueError) as caught:
+            rs.restore(self.backup, self.target.parent / "target-duplicate")
+        self.assertIn("repeats JSON key", str(caught.exception))
+
+        rs.write_manifest(self.backup, self.manifest)
+        backup_alias = self.backup.parent / "backup-alias"
+        backup_alias.symlink_to(self.backup, target_is_directory=True)
+        with self.assertRaises(ValueError) as caught:
+            rs.restore(backup_alias, self.target.parent / "target-backup-alias")
+        self.assertIn("traverses a symlink", str(caught.exception))
+
+        target_parent = self.backup.parent / "target-parent-alias"
+        target_parent.symlink_to(self.backup.parent, target_is_directory=True)
+        with self.assertRaises(ValueError) as caught:
+            rs.restore(self.backup, target_parent / "escaped-target")
+        self.assertIn("traverses a symlink", str(caught.exception))
+
+    def test_a_payload_swap_to_a_symlink_cannot_race_the_open(self) -> None:
+        source = self.backup / "control.db"
+        outside = self.backup.parent / "outside-control.db"
+        outside.write_bytes(source.read_bytes())
+        real_open = os.open
+        swapped = False
+
+        def swap_before_open(path: object, flags: int, mode: int = 0o777,
+                             *, dir_fd: int | None = None) -> int:
+            nonlocal swapped
+            if path == "control.db" and dir_fd is not None and not swapped:
+                swapped = True
+                source.unlink()
+                source.symlink_to(outside)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(rs.os, "open", side_effect=swap_before_open):
+            with self.assertRaises(ValueError) as caught:
+                rs.restore(self.backup, self.target.parent / "target-race")
+        self.assertTrue(swapped)
+        self.assertIn("traverses a symlink", str(caught.exception))
+        self.assertFalse((self.target.parent / "target-race").exists())
+
+    def test_a_replaced_target_parent_cannot_yield_a_false_success(self) -> None:
+        visible_parent = self.backup.parent / "visible-parent"
+        visible_parent.mkdir()
+        pinned_parent = self.backup.parent / "pinned-parent"
+        outside = self.backup.parent / "outside-parent"
+        outside.mkdir()
+        requested = visible_parent / "target"
+        real_write = rs._write_regular_at
+        swapped = False
+
+        def replace_parent(root_fd: int, relative: str, payload: bytes) -> None:
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                visible_parent.rename(pinned_parent)
+                visible_parent.symlink_to(outside, target_is_directory=True)
+            real_write(root_fd, relative, payload)
+
+        with mock.patch.object(rs, "_write_regular_at", side_effect=replace_parent):
+            with self.assertRaises(ValueError) as caught:
+                rs.restore(self.backup, requested)
+        self.assertTrue(swapped)
+        self.assertIn("target identity changed", str(caught.exception))
+        self.assertFalse(requested.exists())
+        self.assertFalse((pinned_parent / "target").exists())
+        self.assertEqual(list(outside.iterdir()), [])
+
 
 class ObjectiveTests(unittest.TestCase):
     """RPO and RTO carry units, and a local fixture never claims a host."""
@@ -352,73 +456,68 @@ class ObjectiveTests(unittest.TestCase):
 
 
 class DependencyAgreementTests(unittest.TestCase):
-    """The R0-09 list is consumed, and its absence is reported, not filled in."""
+    """The real R0-09 list is consumed and cannot be replaced by a fixture."""
 
-    def test_the_absent_inventory_is_reported_and_not_invented(self) -> None:
+    def test_the_canonical_inventory_is_consumed_and_gaps_are_findings(self) -> None:
         report = dep.consume()
-        self.assertFalse(report["inventory_present"])
-        self.assertEqual(report["consumed_entries"], 0)
-        codes = [f["code"] for f in report["findings"]]
+        self.assertTrue(report["inventory_present"])
+        self.assertIsNone(report["refused"])
+        self.assertEqual(report["consumed_entries"], 21)
+        self.assertEqual(len(report["objectives"]), 2)
+        self.assertEqual(len(report["excluded"]), 1)
+        codes = [finding["code"] for finding in report["findings"]]
         self.assertEqual(
-            codes.count(dep.DependencyFinding.INVENTORY_ABSENT.value), 1)
+            codes.count(dep.DependencyFinding.DEPENDENCY_MISSING_FROM_INVENTORY.value),
+            8)
         self.assertEqual(
-            codes.count(
-                dep.DependencyFinding.DEPENDENCY_MISSING_FROM_INVENTORY.value),
-            len(rs.RESTORE_DEPENDENCIES))
+            codes.count(dep.DependencyFinding.DEPENDENCY_NOT_EXERCISED.value),
+            20)
         self.assertEqual(report["declared_inventory_path"],
                          dep.DECLARED_INVENTORY_PATH)
-        self.assertFalse(
-            (REPOSITORY_ROOT / dep.DECLARED_INVENTORY_PATH).exists(),
-            "the declared path is outside this item's lease; if it exists, the "
-            "inventory landed and this test should be measuring agreement")
+        self.assertEqual(
+            (REPOSITORY_ROOT / dep.DECLARED_INVENTORY_PATH).resolve(),
+            dep.CANONICAL_INVENTORY.resolve())
 
-    def test_a_present_inventory_is_consumed_and_disagreements_are_findings(self) -> None:
+    def test_a_schema_shaped_fixture_cannot_replace_the_real_producer(self) -> None:
         report = dep.consume(FIXTURES / "inventory-present.json")
         self.assertTrue(report["inventory_present"])
-        self.assertEqual(report["consumed_entries"], 9)
-        codes = sorted({f["code"] for f in report["findings"]})
-        self.assertEqual(codes, [
-            dep.DependencyFinding.DEPENDENCY_MISSING_FROM_INVENTORY.value,
-            dep.DependencyFinding.DEPENDENCY_NOT_EXERCISED.value,
-            dep.DependencyFinding.DEPENDENCY_ORDER_CONFLICT.value,
-            dep.DependencyFinding.DEPENDENCY_UNVERIFIED_IN_INVENTORY.value,
-        ])
-        subjects = {f["code"]: f["subject"] for f in report["findings"]}
-        self.assertEqual(
-            subjects[dep.DependencyFinding.DEPENDENCY_MISSING_FROM_INVENTORY.value],
-            "runtime")
-        self.assertEqual(
-            subjects[dep.DependencyFinding.DEPENDENCY_NOT_EXERCISED.value],
-            "transport-offset-cursors")
+        self.assertEqual(report["consumed_entries"], 0)
+        self.assertEqual(report["refused"]["code"],
+                         dep.Refusal.PATH_MISMATCH.value)
+        self.assertEqual(report["findings"], [])
 
-    def test_an_entry_outside_the_vocabulary_is_refused_at_parse(self) -> None:
+    def test_an_alternate_invalid_inventory_is_refused_before_parse(self) -> None:
         report = dep.consume(FIXTURES / "inventory-invalid.json")
         self.assertIsNotNone(report["refused"])
         self.assertEqual(report["refused"]["code"],
-                         dep.Refusal.UNKNOWN_ENUM_VALUE.value)
+                         dep.Refusal.PATH_MISMATCH.value)
         self.assertEqual(report["findings"], [],
                          "a refused inventory yields no partial agreement")
 
     def test_every_malformed_shape_is_refused_by_its_own_code(self) -> None:
-        good = json.loads((FIXTURES / "inventory-present.json").read_text())
+        encoded = dep.CANONICAL_INVENTORY.read_bytes()
+        good = json.loads(encoded)
+        duplicate = json.loads(encoded)
+        duplicate["order"][1]["id"] = duplicate["order"][0]["id"]
+        bad_order = json.loads(encoded)
+        bad_order["order"][0]["position"] = 0
         cases = {
-            dep.Refusal.NOT_AN_OBJECT: ["not", "a", "document"],
+            dep.Refusal.NOT_AN_OBJECT: ["not", "an", "object"],
             dep.Refusal.UNKNOWN_SCHEMA: {**good, "schema": "something.else.v1"},
             dep.Refusal.UNKNOWN_KEY: {**good, "extra": 1},
             dep.Refusal.MISSING_KEY: {k: v for k, v in good.items()
-                                      if k != "item"},
-            dep.Refusal.DUPLICATE_ID: {
-                **good, "dependencies": good["dependencies"]
-                + [good["dependencies"][0]]},
-            dep.Refusal.BAD_ORDER: {
-                **good, "dependencies": [{**good["dependencies"][0], "order": 0}]},
+                                      if k != "work_item"},
+            dep.Refusal.DUPLICATE_ID: duplicate,
+            dep.Refusal.BAD_ORDER: bad_order,
         }
         for expected, document in cases.items():
             with self.subTest(refusal=expected.value):
                 with self.assertRaises(dep.InventoryRefused) as caught:
-                    dep.parse_inventory(document)
+                    dep.validate_inventory(
+                        (json.dumps(document, indent=2, ensure_ascii=True)
+                         + "\n").encode())
                 self.assertIs(caught.exception.refusal, expected)
-        dep.parse_inventory(good)              # positive control
+        dep.validate_inventory(encoded)        # real-producer positive control
 
     def test_the_consumer_vocabulary_cannot_widen_the_drill_report(self) -> None:
         drill_codes = {code.value for code in drill.FindingCode}
@@ -428,10 +527,11 @@ class DependencyAgreementTests(unittest.TestCase):
 
     def test_the_drill_report_carries_the_dependency_agreement(self) -> None:
         report = drill.run(drill.Options())
-        self.assertEqual(report.dependency_report["drill_dependencies"],
-                         len(rs.RESTORE_DEPENDENCIES))
-        self.assertIn(drill.FindingCode.INVENTORY_ABSENT,
-                      [f.code for f in report.findings])
+        self.assertEqual(report.dependency_report["consumed_entries"], 21)
+        self.assertIsNone(report.dependency_report["refused"])
+        self.assertEqual(len(report.dependency_report["findings"]), 28)
+        self.assertNotIn(drill.FindingCode.INVENTORY_ABSENT,
+                         [f.code for f in report.findings])
 
 
 class GeneratedFileTests(unittest.TestCase):
@@ -463,14 +563,12 @@ class GeneratedFileTests(unittest.TestCase):
             rs.write_atomic(dep.GENERATED, original)
         self.assertIsNone(dep.check_generated())
 
-    def test_the_generated_copy_parses_under_the_inventory_schema(self) -> None:
+    def test_the_drill_generated_copy_cannot_pose_as_r0_09_authority(self) -> None:
         document = json.loads(dep.GENERATED.read_text())
-        entries = [{k: v for k, v in entry.items() if k != "exercised"}
-                   for entry in document["dependencies"]]
-        parsed = dep.parse_inventory({"schema": dep.INVENTORY_SCHEMA,
-                                      "item": "R0-10",
-                                      "dependencies": entries})
-        self.assertEqual(len(parsed), len(rs.RESTORE_DEPENDENCIES))
+        document["schema"] = dep.INVENTORY_SCHEMA
+        with self.assertRaises(dep.InventoryRefused) as caught:
+            dep.parse_inventory(document)
+        self.assertIs(caught.exception.refusal, dep.Refusal.UNKNOWN_KEY)
 
 
 class QualityTests(unittest.TestCase):
@@ -486,13 +584,31 @@ class QualityTests(unittest.TestCase):
                 names.add(node.module.split(".")[0])
         return names
 
+    def repository_imports(self, module: str) -> set[tuple[str, str, str | None]]:
+        tree = ast.parse((HERE / module).read_text())
+        return {
+            (node.module, alias.name, alias.asname)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and node.level == 0
+            and node.module is not None
+            and node.module.startswith("tools")
+            for alias in node.names
+        }
+
     def test_no_module_imports_anything_outside_the_standard_library(self) -> None:
         siblings = {path.stem for path in HERE.glob("*.py")}
         for module in MODULES:
             with self.subTest(module=module):
                 outside = sorted(self.imported_names(module)
                                  - set(sys.stdlib_module_names) - siblings)
-                self.assertEqual(outside, [])
+                expected = ["tools"] if module == "dependencies.py" else []
+                self.assertEqual(outside, expected)
+                repository = self.repository_imports(module)
+                expected_repository = ({
+                    ("tools.surface_inventory", "render", "surface_render")
+                } if module == "dependencies.py" else set())
+                self.assertEqual(repository, expected_repository)
 
     def test_no_module_reads_an_environment_variable_or_starts_a_process(self) -> None:
         forbidden_attributes = {"environ", "getenv", "environb", "putenv"}
@@ -514,7 +630,7 @@ class QualityTests(unittest.TestCase):
         with mock.patch.object(socket, "socket", refuse), \
                 mock.patch.object(socket, "create_connection", refuse):
             report = drill.run(drill.Options())
-            self.assertIs(report.outcome, drill.Outcome.VERIFIED)
+            self.assertIs(report.outcome, drill.Outcome.INCOMPLETE)
             with self.assertRaises(AssertionError):
                 socket.socket()                # the blocker really blocks
 

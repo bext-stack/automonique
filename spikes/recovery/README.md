@@ -54,11 +54,13 @@ python3 spikes/recovery/drill.py                       # the drill
 python3 spikes/recovery/drill.py --procedure           # procedure only, touches nothing
 python3 spikes/recovery/dependencies.py --report       # consume the R0-09 inventory
 python3 spikes/recovery/dependencies.py --check        # generated list is current
-python3 spikes/recovery/test_recovery_drill.py         # 46 controls
+python3 spikes/recovery/test_recovery_drill.py         # 50 controls
+python3 -m unittest -v spikes.recovery.test_dependencies_contract  # 9 controls
 ```
 
-Exit codes: `0` verified, `1` failed, `3` refused, `4` inconsistent, `5`
-residue left.
+Exit codes: `0` verified, `1` failed, `2` incomplete dependency agreement,
+`3` refused, `4` inconsistent, `5` residue left. The current local drill exits
+`2`; it cannot certify R0-10 while canonical positions remain unexercised.
 
 ## Preconditions, refused rather than assumed
 
@@ -119,23 +121,19 @@ carries no leftover installation, because no host is provisioned.
 
 ## Dependency agreement with `R0-09`
 
-`plan/contracts/R0-10.md` requires the `R0-09` restore dependency list to be
-consumed rather than reinvented. `R0-09` has not produced one: its status in
-`plan/work-graph.toml` is `blocked` and there is no `plan/evidence/R0-09.json`.
+`dependencies.py` consumes only R0-09's canonical publication at
+`plan/inventory/surface/restore-dependencies.json`, schema
+`automonique.restore-dependencies/v1`. It validates the complete closed shape,
+the named producer and consumer, the two declared objectives, the contiguous
+topological order and the source digest. It then invokes R0-09's real renderer
+over the actual source inventory and requires byte-for-byte equality. A copied,
+stale or threshold-loosened document is refused even if its shape looks valid.
 
-`dependencies.py` therefore looks in one declared publication path —
-`spikes/inventory/restore-dependencies.json`, deliberately outside this item's
-lease — finds nothing, and reports the absence plus every dependency the drill
-needs as findings against `R0-09`. It never substitutes the drill's own table
-for the inventory: the table is what the drill *needs*, and only `R0-09` can say
-what the operations surface *has*.
-
-When the inventory does land, the consumer parses it under a closed schema
-(unknown key, unknown enum value, duplicate id or non-positive order are refused
-at parse, not repaired) and reports order conflicts, undeclared verification and
-dependencies on either side that the other lacks. That path is exercised today
-against `fixtures/inventory-present.json`, so the logic is measured even though
-the real consumption is not.
+The consumer now records 21 ordered positions, two objectives and one excluded
+credential class. It separately reports 8 legacy local-drill IDs missing from
+R0-09 and 20 canonical positions the current local drill does not exercise.
+Authenticity is therefore a pass while agreement remains an explicit partial
+gap; the two claims cannot silently collapse into one another.
 
 ## Generated file
 
@@ -144,9 +142,8 @@ the real consumption is not.
 `python3 spikes/recovery/dependencies.py --write`, written atomically through a
 staging name, and `--check` fails when the checked-in copy is stale.
 
-**Follow-up for the integrator:** wiring `dependencies.py --check` into
-`plan/check.py` is left undone on purpose — several items are editing that file
-in parallel, so this module is self-contained and runnable on its own instead.
+This generated file is retained as a description of the old local drill's own
+needs. It is not accepted as R0-09 authority, and a test holds that boundary.
 
 ## Idempotence and residue
 
@@ -163,7 +160,8 @@ vacuous.
 ## Safety properties
 
 No network access, no subprocess, no environment variable read, no credential of
-any kind, and no new runtime dependency: the three modules import only the
-standard library, and a test asserts it from the parsed syntax tree rather than
-from a promise. The drill never touches the live repository, and a test compares
-`git status` before and after a run to prove it.
+any kind, and no new external runtime dependency. The drill modules use the
+standard library; the canonical consumer additionally imports the checked-in
+R0-09 renderer by its exact module path. A syntax-tree test asserts that precise
+boundary. The drill never touches the live repository, and a test compares Git
+status before and after a run to prove it.

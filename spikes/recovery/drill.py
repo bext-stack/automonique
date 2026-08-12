@@ -76,6 +76,7 @@ class Phase(enum.Enum):
 
 class Outcome(enum.Enum):
     VERIFIED = "verified"
+    INCOMPLETE = "incomplete"
     REFUSED = "refused"
     INCONSISTENT = "inconsistent"
     RESIDUE_LEFT = "residue_left"
@@ -84,6 +85,7 @@ class Outcome(enum.Enum):
 
 EXIT_CODE = {
     Outcome.VERIFIED: 0,
+    Outcome.INCOMPLETE: 2,
     Outcome.FAILED: 1,
     Outcome.REFUSED: 3,
     Outcome.INCONSISTENT: 4,
@@ -538,6 +540,9 @@ def decide(report: Report, restore_failed: str | None) -> Outcome:
         return Outcome.FAILED
     if any(not result.ok for result in report.invariants):
         return Outcome.INCONSISTENT
+    if (report.dependency_report.get("refused") is not None
+            or report.dependency_report.get("findings")):
+        return Outcome.INCOMPLETE
     return Outcome.VERIFIED
 
 

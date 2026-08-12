@@ -37,8 +37,10 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
+import stat
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
@@ -46,6 +48,127 @@ from typing import Callable, Iterable
 BLOB_BYTES = 128
 CONFIG_EVERY = 8
 MANIFEST_SCHEMA = "automonique.recovery.backup-manifest.v1"
+MANIFEST_KEYS = frozenset({
+    "schema", "watermark_event_id", "watermark_ns", "config_revision",
+    "event_count", "artifact_count", "files",
+})
+SHA256_PATTERN = re.compile(r"\A[0-9a-f]{64}\Z")
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    document: dict[str, object] = {}
+    for key, value in pairs:
+        if key in document:
+            raise ValueError(f"backup manifest repeats JSON key {key!r}")
+        document[key] = value
+    return document
+
+
+def _open_directory_no_symlinks(path: pathlib.Path, role: str) -> int:
+    """Open a directory through descriptors so no component can be swapped."""
+    absolute = path.absolute()
+    descriptor = os.open(absolute.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in absolute.parts[1:]:
+            following = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = following
+        return descriptor
+    except OSError as exc:
+        os.close(descriptor)
+        raise ValueError(f"{role} is absent, not a directory, or traverses a symlink") \
+            from exc
+
+
+def _read_regular_at(root_fd: int, relative: str) -> bytes:
+    parts = pathlib.PurePosixPath(relative).parts
+    descriptor = os.dup(root_fd)
+    try:
+        for part in parts[:-1]:
+            following = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = following
+        file_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
+        try:
+            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                raise ValueError(f"backup file {relative} is not a regular file")
+            chunks: list[bytes] = []
+            while chunk := os.read(file_fd, 65536):
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(file_fd)
+    except OSError as exc:
+        raise ValueError(
+            f"backup file {relative} is absent, non-regular, or traverses a symlink") \
+            from exc
+    finally:
+        os.close(descriptor)
+
+
+def _write_regular_at(root_fd: int, relative: str, payload: bytes) -> None:
+    parts = pathlib.PurePosixPath(relative).parts
+    descriptor = os.dup(root_fd)
+    try:
+        for part in parts[:-1]:
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            following = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = following
+        staging = f".{parts[-1]}.staging"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        file_fd = os.open(staging, flags, 0o600, dir_fd=descriptor)
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(file_fd, view)
+                view = view[written:]
+            os.fsync(file_fd)
+        finally:
+            os.close(file_fd)
+        os.rename(staging, parts[-1], src_dir_fd=descriptor, dst_dir_fd=descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _clear_directory_at(root_fd: int) -> None:
+    """Remove only children reachable from an already-open directory."""
+    for name in os.listdir(root_fd):
+        metadata = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        if stat.S_ISDIR(metadata.st_mode):
+            child_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=root_fd,
+            )
+            try:
+                _clear_directory_at(child_fd)
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=root_fd)
+        else:
+            os.unlink(name, dir_fd=root_fd)
+
+
+def _same_open_directory(first_fd: int, second_fd: int) -> bool:
+    first = os.fstat(first_fd)
+    second = os.fstat(second_fd)
+    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
 
 class DependencyKind(enum.Enum):
@@ -434,15 +557,47 @@ class BackupManifest:
 
     @classmethod
     def from_document(cls, document: dict[str, object]) -> "BackupManifest":
+        if type(document) is not dict:
+            raise ValueError("backup manifest is not an object")
+        unknown = sorted(set(document) - MANIFEST_KEYS)
+        missing = sorted(MANIFEST_KEYS - set(document))
+        if unknown or missing:
+            raise ValueError(
+                f"backup manifest keys differ: unknown={unknown}, missing={missing}")
         if document.get("schema") != MANIFEST_SCHEMA:
             raise ValueError(f"unknown manifest schema {document.get('schema')!r}")
+        numeric: dict[str, int] = {}
+        for name in ("watermark_event_id", "watermark_ns", "config_revision",
+                     "event_count", "artifact_count"):
+            value = document[name]
+            if type(value) is not int or value < 0:
+                raise ValueError(
+                    f"backup manifest {name} is not a non-negative integer")
+            numeric[name] = value
+        raw_files = document["files"]
+        if type(raw_files) is not dict or not raw_files:
+            raise ValueError("backup manifest files is not a non-empty object")
+        files: dict[str, str] = {}
+        for raw_relative, raw_digest in raw_files.items():
+            if type(raw_relative) is not str or type(raw_digest) is not str:
+                raise ValueError("backup manifest file names and hashes must be strings")
+            relative = pathlib.PurePosixPath(raw_relative)
+            if (not raw_relative or raw_relative == "." or relative.is_absolute()
+                    or relative.as_posix() != raw_relative
+                    or any(part in ("", ".", "..") for part in relative.parts)):
+                raise ValueError(
+                    f"backup manifest path {raw_relative!r} is not canonical relative")
+            if SHA256_PATTERN.fullmatch(raw_digest) is None:
+                raise ValueError(
+                    f"backup manifest hash for {raw_relative!r} is not a SHA-256")
+            files[raw_relative] = raw_digest
         return cls(
-            watermark_event_id=int(document["watermark_event_id"]),
-            watermark_ns=int(document["watermark_ns"]),
-            config_revision=int(document["config_revision"]),
-            event_count=int(document["event_count"]),
-            artifact_count=int(document["artifact_count"]),
-            files={str(k): str(v) for k, v in dict(document["files"]).items()},
+            watermark_event_id=numeric["watermark_event_id"],
+            watermark_ns=numeric["watermark_ns"],
+            config_revision=numeric["config_revision"],
+            event_count=numeric["event_count"],
+            artifact_count=numeric["artifact_count"],
+            files=files,
         )
 
 
@@ -599,7 +754,10 @@ def write_manifest(backup_root: pathlib.Path, manifest: BackupManifest) -> None:
 
 def read_manifest(backup_root: pathlib.Path) -> BackupManifest:
     return BackupManifest.from_document(
-        json.loads((backup_root / "manifest.json").read_text()))
+        json.loads(
+            (backup_root / "manifest.json").read_text(),
+            object_pairs_hook=_unique_json_object,
+        ))
 
 
 def restore(backup_root: pathlib.Path, target_root: pathlib.Path) -> BackupManifest:
@@ -608,16 +766,65 @@ def restore(backup_root: pathlib.Path, target_root: pathlib.Path) -> BackupManif
     The manifest is the only index consulted, so nothing outside the backup can
     reach the target through this function.
     """
-    if target_root.exists():
-        raise ValueError(f"restore target already exists: {target_root.name}")
-    manifest = read_manifest(backup_root)
-    target_root.mkdir(parents=True, mode=0o700)
-    for relative, digest in sorted(manifest.files.items()):
-        payload = (backup_root / relative).read_bytes()
-        if sha256_bytes(payload) != digest:
-            raise ValueError(f"backup file {relative} does not match its manifest hash")
-        write_atomic(target_root / relative, payload)
-    return manifest
+    if target_root.name in ("", ".", ".."):
+        raise ValueError("restore target must be one named child of its parent")
+    backup_fd = _open_directory_no_symlinks(backup_root, "backup root")
+    parent_fd = _open_directory_no_symlinks(target_root.parent, "restore target parent")
+    target_fd: int | None = None
+    try:
+        manifest_payload = _read_regular_at(backup_fd, "manifest.json")
+        manifest = BackupManifest.from_document(json.loads(
+            manifest_payload, object_pairs_hook=_unique_json_object))
+        payloads: dict[str, bytes] = {}
+        for relative, digest in sorted(manifest.files.items()):
+            payload = _read_regular_at(backup_fd, relative)
+            if sha256_bytes(payload) != digest:
+                raise ValueError(
+                    f"backup file {relative} does not match its manifest hash")
+            payloads[relative] = payload
+        try:
+            os.mkdir(target_root.name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            raise ValueError(
+                f"restore target already exists: {target_root.name}") from None
+        target_fd = os.open(
+            target_root.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        for relative, payload in sorted(payloads.items()):
+            _write_regular_at(target_fd, relative, payload)
+        visible_parent_fd: int | None = None
+        visible_target_fd: int | None = None
+        try:
+            visible_parent_fd = _open_directory_no_symlinks(
+                target_root.parent, "visible restore target parent")
+            visible_target_fd = os.open(
+                target_root.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=visible_parent_fd,
+            )
+            if (not _same_open_directory(parent_fd, visible_parent_fd)
+                    or not _same_open_directory(target_fd, visible_target_fd)):
+                raise ValueError(
+                    "restore target identity changed while the restore was running")
+        except (OSError, ValueError) as exc:
+            _clear_directory_at(target_fd)
+            os.rmdir(target_root.name, dir_fd=parent_fd)
+            raise ValueError(
+                "restore target identity changed while the restore was running") \
+                from exc
+        finally:
+            if visible_target_fd is not None:
+                os.close(visible_target_fd)
+            if visible_parent_fd is not None:
+                os.close(visible_parent_fd)
+        return manifest
+    finally:
+        if target_fd is not None:
+            os.close(target_fd)
+        os.close(parent_fd)
+        os.close(backup_fd)
 
 
 @dataclass(frozen=True)

@@ -1,36 +1,31 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Elastic-2.0
 
-"""Consume the `R0-09` restore dependency inventory; never invent one.
+"""Strictly consume the canonical `R0-09` restore dependency inventory.
 
-`plan/contracts/R0-10.md` requires that the restore dependency list from
-`R0-09` is *consumed rather than reinvented*, and that a dependency the drill
-discovers but the inventory lacks is reported back as a finding. `R0-09` has
-not produced its inventory yet, so this module's live behavior is the second
-half of that rule: it looks in the one declared publication path, finds
-nothing, and reports every dependency the drill needs as a finding against
-`R0-09` instead of quietly standing in for it.
+The only accepted producer is:
 
-The declared path is a proposal to `R0-09`, not a claim that it exists:
+    plan/inventory/surface/restore-dependencies.json
 
-    spikes/inventory/restore-dependencies.json
+Its schema is closed, its dependency order is checked as a contiguous
+topological order, and its source digest is checked against the actual
+`R0-09` source document.  Finally, this consumer calls the producer's public
+``render_restore`` function over those actual source bytes and requires exact
+byte equality.  A stale, hand-rewritten, or merely schema-shaped copy is
+therefore refused rather than partly trusted.
 
-It is deliberately outside this item's lease. This item cannot create it, so
-the absence cannot be resolved by the same agent that reports it.
-
-Two other jobs live here, because both are about the same list:
+Two legacy-local-description jobs remain here, but neither is accepted as
+R0-09 authority:
 
 - `--write` regenerates `spikes/recovery/restore-dependencies.json` from the
   typed dependency table in `recovery_set.py`, atomically;
 - `--check` fails when the checked-in copy is stale.
 
-Wiring `--check` into `plan/check.py` is the follow-up for the integrator; this
-module is self-contained and runnable on its own so that it can be wired
-without being rewritten.
+`--check` verifies only that local description. Contract-facing consumption is
+the canonical producer validation performed by `--report`.
 
     python3 spikes/recovery/dependencies.py --check
     python3 spikes/recovery/dependencies.py --report
-    python3 spikes/recovery/dependencies.py --report --inventory <path>
 
 Exit codes: 0 clean, 1 stale or refused at parse, 2 findings recorded.
 """
@@ -39,26 +34,58 @@ from __future__ import annotations
 
 import argparse
 import enum
+import hashlib
 import json
 import pathlib
+import re
 import sys
-from dataclasses import dataclass
+from typing import Any
 
 HERE = pathlib.Path(__file__).resolve().parent
+REPOSITORY_ROOT = HERE.parent.parent
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import recovery_set as rs  # noqa: E402
+from tools.surface_inventory import render as surface_render  # noqa: E402
 
-REPOSITORY_ROOT = HERE.parent.parent
 GENERATED = HERE / "restore-dependencies.json"
 GENERATED_SCHEMA = "automonique.recovery.restore-dependencies.v1"
-INVENTORY_SCHEMA = "automonique.recovery.restore-dependencies.v1"
-DECLARED_INVENTORY_PATH = "spikes/inventory/restore-dependencies.json"
+INVENTORY_SCHEMA = "automonique.restore-dependencies/v1"
+DECLARED_INVENTORY_PATH = "plan/inventory/surface/restore-dependencies.json"
+DECLARED_SOURCE_PATH = "plan/inventory/surface/inventory.json"
+CANONICAL_INVENTORY = REPOSITORY_ROOT / DECLARED_INVENTORY_PATH
+CANONICAL_SOURCE = REPOSITORY_ROOT / DECLARED_SOURCE_PATH
 
-ENTRY_KEYS = frozenset(
-    {"id", "order", "kind", "source", "verified_by", "owner_class", "note"})
-DOCUMENT_KEYS = frozenset({"schema", "item", "dependencies"})
+DOCUMENT_KEYS = frozenset({
+    "schema", "work_item", "consumer", "source", "objectives", "order",
+    "excluded",
+})
+SOURCE_KEYS = frozenset({"path", "sha256"})
+OBJECTIVE_KEYS = frozenset({"id", "summary", "value", "unit", "source"})
+OBJECTIVE_SOURCE_KEYS = frozenset({"path", "quote"})
+ORDER_KEYS = frozenset(
+    {"position", "id", "class", "requires", "verification", "summary"})
+EXCLUDED_KEYS = frozenset({"id", "summary", "source"})
+OBJECTIVE_IDS = frozenset({
+    "recovery-point-objective-control-state",
+    "recovery-time-objective-same-host-class",
+})
+OBJECTIVE_UNITS = frozenset({"minute"})
+ORDER_CLASSES = frozenset(
+    {"recovery-set-input", "verification-step", "enablement-gate"})
+VERIFICATIONS = frozenset({
+    "integrity-check",
+    "hash-comparison",
+    "version-comparison",
+    "startup-in-disconnected-recovery",
+    "credential-resolution",
+    "audience-revalidation",
+    "none-recorded",
+})
+SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
 class DependencyFinding(enum.Enum):
@@ -74,13 +101,25 @@ class DependencyFinding(enum.Enum):
 class Refusal(enum.Enum):
     """Why an inventory is refused at parse rather than partly believed."""
 
+    INVALID_JSON = "invalid_json"
     NOT_AN_OBJECT = "not_an_object"
     UNKNOWN_SCHEMA = "unknown_schema"
     UNKNOWN_KEY = "unknown_key"
     MISSING_KEY = "missing_key"
+    DUPLICATE_KEY = "duplicate_key"
+    TYPE_MISMATCH = "type_mismatch"
+    WRONG_WORK_ITEM = "wrong_work_item"
+    WRONG_CONSUMER = "wrong_consumer"
+    PATH_MISMATCH = "path_mismatch"
+    SOURCE_MISMATCH = "source_mismatch"
+    SOURCE_DIGEST_MISMATCH = "source_digest_mismatch"
     UNKNOWN_ENUM_VALUE = "unknown_enum_value"
     DUPLICATE_ID = "duplicate_id"
     BAD_ORDER = "bad_order"
+    BAD_REFERENCE = "bad_reference"
+    BAD_OBJECTIVE = "bad_objective"
+    BAD_EXCLUDED = "bad_excluded"
+    RENDER_MISMATCH = "render_mismatch"
 
 
 class InventoryRefused(Exception):
@@ -90,139 +129,274 @@ class InventoryRefused(Exception):
         self.detail = detail
 
 
-@dataclass(frozen=True)
-class InventoryEntry:
-    id: str
-    order: int
-    kind: rs.DependencyKind
-    source: rs.DependencySource
-    verified_by: rs.Verification
-    owner_class: str
-    note: str
+def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    document: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in document:
+            raise InventoryRefused(
+                Refusal.DUPLICATE_KEY, f"JSON object repeats key {key!r}")
+        document[key] = value
+    return document
 
 
-def _enum_value(cls, raw: object, field: str, entry_id: str):
-    try:
-        return cls(raw)
-    except ValueError:
-        permitted = ", ".join(sorted(member.value for member in cls))
+def _object(value: object, where: str) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise InventoryRefused(
+            Refusal.NOT_AN_OBJECT, f"{where} is not a JSON object")
+    return value
+
+
+def _keys(value: dict[str, Any], expected: frozenset[str], where: str) -> None:
+    unknown = sorted(set(value) - expected)
+    if unknown:
+        raise InventoryRefused(
+            Refusal.UNKNOWN_KEY, f"{where} has unknown keys {unknown}")
+    missing = sorted(expected - set(value))
+    if missing:
+        raise InventoryRefused(
+            Refusal.MISSING_KEY, f"{where} is missing keys {missing}")
+
+
+def _string(value: object, where: str) -> str:
+    if type(value) is not str or not value:
+        raise InventoryRefused(
+            Refusal.TYPE_MISMATCH, f"{where} is not a non-empty string")
+    return value
+
+
+def _list(value: object, where: str) -> list[Any]:
+    if type(value) is not list:
+        raise InventoryRefused(
+            Refusal.TYPE_MISMATCH, f"{where} is not a JSON array")
+    return value
+
+
+def _enum(value: object, permitted: frozenset[str], where: str) -> str:
+    text = _string(value, where)
+    if text not in permitted:
         raise InventoryRefused(
             Refusal.UNKNOWN_ENUM_VALUE,
-            f"entry {entry_id!r} field {field!r} is {raw!r}; permitted values "
-            f"are {permitted}") from None
+            f"{where} is {text!r}; permitted values are {sorted(permitted)}")
+    return text
 
 
-def parse_inventory(document: object) -> list[InventoryEntry]:
-    """Parse strictly. An entry that is not representable is refused, not fixed."""
-    if not isinstance(document, dict):
-        raise InventoryRefused(Refusal.NOT_AN_OBJECT,
-                               "the inventory is not a JSON object")
-    unknown = sorted(set(document) - DOCUMENT_KEYS)
-    if unknown:
-        raise InventoryRefused(Refusal.UNKNOWN_KEY,
-                               f"document keys {unknown} are not in the schema")
-    missing = sorted(DOCUMENT_KEYS - set(document))
-    if missing:
-        raise InventoryRefused(Refusal.MISSING_KEY,
-                               f"document is missing {missing}")
-    if document["schema"] != INVENTORY_SCHEMA:
+def _validate_objectives(raw: object) -> None:
+    objectives = _list(raw, "objectives")
+    if len(objectives) != len(OBJECTIVE_IDS):
         raise InventoryRefused(
-            Refusal.UNKNOWN_SCHEMA,
-            f"schema {document['schema']!r}; expected {INVENTORY_SCHEMA!r}")
-
-    entries: list[InventoryEntry] = []
+            Refusal.BAD_OBJECTIVE,
+            f"objectives has {len(objectives)} entries; expected "
+            f"{len(OBJECTIVE_IDS)}")
     seen: set[str] = set()
-    raw_entries = document["dependencies"]
-    if not isinstance(raw_entries, list):
-        raise InventoryRefused(Refusal.NOT_AN_OBJECT,
-                               "'dependencies' is not a list")
-    for raw in raw_entries:
-        if not isinstance(raw, dict):
-            raise InventoryRefused(Refusal.NOT_AN_OBJECT,
-                                   "a dependency entry is not an object")
-        entry_id = str(raw.get("id", "<unnamed>"))
-        unknown = sorted(set(raw) - ENTRY_KEYS)
-        if unknown:
+    for index, value in enumerate(objectives):
+        where = f"objectives[{index}]"
+        objective = _object(value, where)
+        _keys(objective, OBJECTIVE_KEYS, where)
+        objective_id = _string(objective["id"], f"{where}.id")
+        if objective_id in seen:
             raise InventoryRefused(
-                Refusal.UNKNOWN_KEY,
-                f"entry {entry_id!r} has keys {unknown} that are not in the schema")
-        missing = sorted(ENTRY_KEYS - set(raw))
-        if missing:
-            raise InventoryRefused(Refusal.MISSING_KEY,
-                                   f"entry {entry_id!r} is missing {missing}")
-        order = raw["order"]
-        if not isinstance(order, int) or isinstance(order, bool) or order < 1:
+                Refusal.DUPLICATE_ID, f"objective {objective_id!r} repeats")
+        seen.add(objective_id)
+        _string(objective["summary"], f"{where}.summary")
+        threshold = objective["value"]
+        if type(threshold) not in {int, float} or threshold <= 0:
+            raise InventoryRefused(
+                Refusal.BAD_OBJECTIVE,
+                f"{where}.value is not a positive JSON number")
+        _enum(objective["unit"], OBJECTIVE_UNITS, f"{where}.unit")
+        source = _object(objective["source"], f"{where}.source")
+        _keys(source, OBJECTIVE_SOURCE_KEYS, f"{where}.source")
+        _string(source["path"], f"{where}.source.path")
+        _string(source["quote"], f"{where}.source.quote")
+    if seen != OBJECTIVE_IDS:
+        raise InventoryRefused(
+            Refusal.BAD_OBJECTIVE,
+            f"objective IDs are {sorted(seen)}; expected {sorted(OBJECTIVE_IDS)}")
+
+
+def _validate_order(raw: object) -> None:
+    values = _list(raw, "order")
+    if not values:
+        raise InventoryRefused(Refusal.BAD_ORDER, "order is empty")
+    entries: list[dict[str, Any]] = []
+    by_id: dict[str, int] = {}
+    for index, value in enumerate(values):
+        where = f"order[{index}]"
+        entry = _object(value, where)
+        _keys(entry, ORDER_KEYS, where)
+        position = entry["position"]
+        if type(position) is not int or position != index + 1:
             raise InventoryRefused(
                 Refusal.BAD_ORDER,
-                f"entry {entry_id!r} order {order!r} is not a positive integer")
+                f"{where}.position is {position!r}; expected {index + 1}")
+        entry_id = _string(entry["id"], f"{where}.id")
+        if entry_id in by_id:
+            raise InventoryRefused(
+                Refusal.DUPLICATE_ID, f"order ID {entry_id!r} repeats")
+        by_id[entry_id] = position
+        kind = _enum(entry["class"], ORDER_CLASSES, f"{where}.class")
+        requires = _list(entry["requires"], f"{where}.requires")
+        if any(type(item) is not str or not item for item in requires):
+            raise InventoryRefused(
+                Refusal.TYPE_MISMATCH,
+                f"{where}.requires contains a non-string or empty ID")
+        if len(set(requires)) != len(requires):
+            raise InventoryRefused(
+                Refusal.BAD_REFERENCE, f"{where}.requires repeats an ID")
+        if kind == "recovery-set-input" and requires:
+            raise InventoryRefused(
+                Refusal.BAD_REFERENCE,
+                f"{where} is a recovery-set input but has prerequisites")
+        if kind != "recovery-set-input" and not requires:
+            raise InventoryRefused(
+                Refusal.BAD_REFERENCE,
+                f"{where} is {kind!r} but has no prerequisite")
+        _enum(entry["verification"], VERIFICATIONS, f"{where}.verification")
+        _string(entry["summary"], f"{where}.summary")
+        entries.append(entry)
+
+    for index, entry in enumerate(entries):
+        for dependency in entry["requires"]:
+            position = by_id.get(dependency)
+            if position is None:
+                raise InventoryRefused(
+                    Refusal.BAD_REFERENCE,
+                    f"order[{index}].requires names unknown ID {dependency!r}")
+            if position >= entry["position"]:
+                raise InventoryRefused(
+                    Refusal.BAD_ORDER,
+                    f"order[{index}] requires {dependency!r} at position "
+                    f"{position}, not an earlier position")
+
+
+def _validate_excluded(raw: object) -> None:
+    values = _list(raw, "excluded")
+    if not values:
+        raise InventoryRefused(
+            Refusal.BAD_EXCLUDED, "excluded has no boundary record")
+    seen: set[str] = set()
+    for index, value in enumerate(values):
+        where = f"excluded[{index}]"
+        entry = _object(value, where)
+        _keys(entry, EXCLUDED_KEYS, where)
+        entry_id = _string(entry["id"], f"{where}.id")
         if entry_id in seen:
-            raise InventoryRefused(Refusal.DUPLICATE_ID,
-                                   f"entry {entry_id!r} appears more than once")
+            raise InventoryRefused(
+                Refusal.DUPLICATE_ID, f"excluded ID {entry_id!r} repeats")
         seen.add(entry_id)
-        entries.append(InventoryEntry(
-            id=entry_id,
-            order=order,
-            kind=_enum_value(rs.DependencyKind, raw["kind"], "kind", entry_id),
-            source=_enum_value(rs.DependencySource, raw["source"], "source",
-                               entry_id),
-            verified_by=_enum_value(rs.Verification, raw["verified_by"],
-                                    "verified_by", entry_id),
-            owner_class=str(raw["owner_class"]),
-            note=str(raw["note"]),
-        ))
-    return entries
+        _string(entry["summary"], f"{where}.summary")
+        _string(entry["source"], f"{where}.source")
 
 
-def load_inventory(path: pathlib.Path) -> list[InventoryEntry]:
-    return parse_inventory(json.loads(path.read_text()))
+def validate_inventory(
+    encoded: bytes, *, source_bytes: bytes | None = None
+) -> dict[str, Any]:
+    """Validate canonical bytes and return their closed JSON document."""
+    try:
+        document = json.loads(encoded, object_pairs_hook=_pairs)
+    except InventoryRefused:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InventoryRefused(
+            Refusal.INVALID_JSON, f"inventory JSON cannot be decoded: {exc}") from None
+    document = _object(document, "document")
+    _keys(document, DOCUMENT_KEYS, "document")
+    schema = _string(document["schema"], "schema")
+    if schema != INVENTORY_SCHEMA:
+        raise InventoryRefused(
+            Refusal.UNKNOWN_SCHEMA,
+            f"schema {schema!r}; expected {INVENTORY_SCHEMA!r}")
+    work_item = _string(document["work_item"], "work_item")
+    if work_item != "R0-09":
+        raise InventoryRefused(
+            Refusal.WRONG_WORK_ITEM,
+            f"work_item {work_item!r}; expected 'R0-09'")
+    consumer = _string(document["consumer"], "consumer")
+    if consumer != "R0-10":
+        raise InventoryRefused(
+            Refusal.WRONG_CONSUMER,
+            f"consumer {consumer!r}; expected 'R0-10'")
+
+    source = _object(document["source"], "source")
+    _keys(source, SOURCE_KEYS, "source")
+    source_path = _string(source["path"], "source.path")
+    if source_path != DECLARED_SOURCE_PATH:
+        raise InventoryRefused(
+            Refusal.SOURCE_MISMATCH,
+            f"source.path {source_path!r}; expected {DECLARED_SOURCE_PATH!r}")
+    digest = source["sha256"]
+    if type(digest) is not str or SHA256.fullmatch(digest) is None:
+        raise InventoryRefused(
+            Refusal.TYPE_MISMATCH, "source.sha256 is not a lowercase SHA-256")
+
+    actual_source = CANONICAL_SOURCE.read_bytes() if source_bytes is None else source_bytes
+    actual_digest = hashlib.sha256(actual_source).hexdigest()
+    if digest != actual_digest:
+        raise InventoryRefused(
+            Refusal.SOURCE_DIGEST_MISMATCH,
+            f"source.sha256 is {digest}; actual source digest is {actual_digest}")
+
+    _validate_objectives(document["objectives"])
+    _validate_order(document["order"])
+    _validate_excluded(document["excluded"])
+
+    try:
+        source_document = _object(
+            json.loads(actual_source, object_pairs_hook=_pairs),
+            "canonical source",
+        )
+        expected = surface_render.render_restore(source_document, actual_source)
+    except InventoryRefused:
+        raise
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        surface_render.RenderError,
+    ) as exc:
+        raise InventoryRefused(
+            Refusal.SOURCE_MISMATCH,
+            f"canonical source cannot be independently rendered: {exc}") from None
+    if encoded != expected:
+        raise InventoryRefused(
+            Refusal.RENDER_MISMATCH,
+            "inventory bytes differ from render_restore(actual R0-09 source)")
+    return document
+
+
+def parse_inventory(document: object) -> dict[str, Any]:
+    """Compatibility entry point; still subjects the value to byte equality."""
+    encoded = (json.dumps(document, indent=2, ensure_ascii=True) + "\n").encode()
+    return validate_inventory(encoded)
+
+
+def _is_canonical_inventory_path(path: pathlib.Path) -> bool:
+    if path not in (CANONICAL_INVENTORY, pathlib.Path(DECLARED_INVENTORY_PATH)):
+        return False
+    cursor = REPOSITORY_ROOT
+    for part in pathlib.Path(DECLARED_INVENTORY_PATH).parts:
+        cursor /= part
+        if cursor.is_symlink():
+            return False
+    return True
+
+
+def load_inventory(path: pathlib.Path = CANONICAL_INVENTORY) -> dict[str, Any]:
+    if not _is_canonical_inventory_path(path):
+        raise InventoryRefused(
+            Refusal.PATH_MISMATCH,
+            f"inventory path {path}; expected {DECLARED_INVENTORY_PATH}")
+    return validate_inventory(CANONICAL_INVENTORY.read_bytes())
 
 
 def _finding(code: DependencyFinding, subject: str, detail: str) -> dict[str, str]:
     return {"code": code.value, "subject": subject, "detail": detail}
 
 
-def compare(entries: list[InventoryEntry]) -> list[dict[str, str]]:
-    """Findings from the drill's needs against what the inventory records."""
-    by_id = {entry.id: entry for entry in entries}
-    findings: list[dict[str, str]] = []
-    for needed in rs.RESTORE_DEPENDENCIES:
-        entry = by_id.get(needed.id)
-        if entry is None:
-            findings.append(_finding(
-                DependencyFinding.DEPENDENCY_MISSING_FROM_INVENTORY, needed.id,
-                f"the drill restores {needed.kind.value} at order "
-                f"{needed.order} and the inventory does not list it"))
-            continue
-        if entry.order != needed.order:
-            findings.append(_finding(
-                DependencyFinding.DEPENDENCY_ORDER_CONFLICT, needed.id,
-                f"the inventory restores it at order {entry.order}; the drill "
-                f"restores it at order {needed.order}"))
-        if (entry.verified_by is rs.Verification.NONE_DECLARED
-                and needed.verified_by is not rs.Verification.NONE_DECLARED):
-            findings.append(_finding(
-                DependencyFinding.DEPENDENCY_UNVERIFIED_IN_INVENTORY, needed.id,
-                f"the inventory declares no verification; the drill proves it "
-                f"with {needed.verified_by.value}"))
-    known = {needed.id for needed in rs.RESTORE_DEPENDENCIES}
-    for entry in entries:
-        if entry.id not in known:
-            findings.append(_finding(
-                DependencyFinding.DEPENDENCY_NOT_EXERCISED, entry.id,
-                f"the inventory requires {entry.kind.value} from "
-                f"{entry.source.value} at order {entry.order}; this drill does "
-                f"not restore it"))
-    return findings
-
-
 def consume(inventory: pathlib.Path | None = None) -> dict[str, object]:
-    """Read the inventory if it exists; otherwise report its absence.
-
-    Never substitutes the drill's own dependency table for the inventory. The
-    table is what the drill *needs*; the inventory is what the operations
-    surface *has*, and only `R0-09` can say what that is.
-    """
-    path = inventory or (REPOSITORY_ROOT / DECLARED_INVENTORY_PATH)
+    """Consume only the canonical producer and preserve the drill report API."""
+    path = inventory or CANONICAL_INVENTORY
     report: dict[str, object] = {
         "declared_inventory_path": DECLARED_INVENTORY_PATH,
         "inventory_path": path.relative_to(REPOSITORY_ROOT).as_posix()
@@ -231,8 +405,17 @@ def consume(inventory: pathlib.Path | None = None) -> dict[str, object]:
         "refused": None,
         "consumed_entries": 0,
         "drill_dependencies": len(rs.RESTORE_DEPENDENCIES),
+        "objectives": [],
+        "excluded": [],
         "findings": [],
     }
+    if not _is_canonical_inventory_path(path):
+        refusal = InventoryRefused(
+            Refusal.PATH_MISMATCH,
+            f"inventory path {path}; expected {DECLARED_INVENTORY_PATH}")
+        report["refused"] = {
+            "code": refusal.refusal.value, "detail": refusal.detail}
+        return report
     if not path.is_file():
         findings = [_finding(
             DependencyFinding.INVENTORY_ABSENT, "R0-09",
@@ -249,13 +432,35 @@ def consume(inventory: pathlib.Path | None = None) -> dict[str, object]:
         report["findings"] = findings
         return report
     try:
-        entries = load_inventory(path)
+        document = load_inventory(path)
     except InventoryRefused as refusal:
         report["refused"] = {"code": refusal.refusal.value,
                              "detail": refusal.detail}
         return report
-    report["consumed_entries"] = len(entries)
-    report["findings"] = compare(entries)
+    report["consumed_entries"] = len(document["order"])
+    report["objectives"] = document["objectives"]
+    report["excluded"] = document["excluded"]
+    inventory_ids = {entry["id"] for entry in document["order"]}
+    drill_ids = {entry.id for entry in rs.RESTORE_DEPENDENCIES}
+    report["findings"] = [
+        _finding(
+            DependencyFinding.DEPENDENCY_MISSING_FROM_INVENTORY,
+            entry.id,
+            "the existing local drill declares this need, but R0-09 does not "
+            "contain the same typed dependency ID",
+        )
+        for entry in rs.RESTORE_DEPENDENCIES
+        if entry.id not in inventory_ids
+    ] + [
+        _finding(
+            DependencyFinding.DEPENDENCY_NOT_EXERCISED,
+            entry["id"],
+            "R0-09 requires this ordered position and the existing local drill "
+            "does not yet emit a disposition receipt for it",
+        )
+        for entry in document["order"]
+        if entry["id"] not in drill_ids
+    ]
     return report
 
 
