@@ -431,6 +431,51 @@ pub enum RunOriginSource {
     Evaluation,
 }
 
+impl RunOriginSource {
+    /// Every origin source in canonical codec order.
+    pub const ALL: [Self; 12] = [
+        Self::Interactive,
+        Self::Automation,
+        Self::Goal,
+        Self::Trigger,
+        Self::Schedule,
+        Self::Recovery,
+        Self::GraphChild,
+        Self::BackgroundCuration,
+        Self::Media,
+        Self::RemoteWakeup,
+        Self::Batch,
+        Self::Evaluation,
+    ];
+
+    /// Stable lowercase spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Automation => "automation",
+            Self::Goal => "goal",
+            Self::Trigger => "trigger",
+            Self::Schedule => "schedule",
+            Self::Recovery => "recovery",
+            Self::GraphChild => "graph_child",
+            Self::BackgroundCuration => "background_curation",
+            Self::Media => "media",
+            Self::RemoteWakeup => "remote_wakeup",
+            Self::Batch => "batch",
+            Self::Evaluation => "evaluation",
+        }
+    }
+
+    /// Parse an exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|source| source.as_str() == value)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OriginCoordinate {
     None,
@@ -567,11 +612,89 @@ pub enum PortabilityPolicy {
     },
 }
 
+impl PortabilityPolicy {
+    /// Stable spelling of the portability policy kind.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pinned => "pinned",
+            Self::Portable { .. } => "portable",
+        }
+    }
+
+    /// The workspace transfer coordinate, only for a portable policy.
+    #[must_use]
+    pub const fn workspace_transfer(self) -> Option<WorkspaceTransfer> {
+        match self {
+            Self::Pinned => None,
+            Self::Portable {
+                workspace_transfer, ..
+            } => Some(workspace_transfer),
+        }
+    }
+
+    /// The artifact transfer coordinate, only for a portable policy.
+    #[must_use]
+    pub const fn artifact_transfer(self) -> Option<ArtifactTransfer> {
+        match self {
+            Self::Pinned => None,
+            Self::Portable {
+                artifact_transfer, ..
+            } => Some(artifact_transfer),
+        }
+    }
+
+    /// Reconstruct a policy from its exact spelling and optional transfers.
+    ///
+    /// `pinned` accepts no transfer payload and `portable` requires both
+    /// transfers. Unknown spellings and every missing or extra payload refuse.
+    #[must_use]
+    pub fn from_spelling(
+        value: &str,
+        workspace_transfer: Option<WorkspaceTransfer>,
+        artifact_transfer: Option<ArtifactTransfer>,
+    ) -> Option<Self> {
+        match (value, workspace_transfer, artifact_transfer) {
+            ("pinned", None, None) => Some(Self::Pinned),
+            ("portable", Some(workspace_transfer), Some(artifact_transfer)) => {
+                Some(Self::Portable {
+                    workspace_transfer,
+                    artifact_transfer,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoteAttestationPolicy {
     NotRequired,
     Signed,
     MutuallyAuthenticated,
+}
+
+impl RemoteAttestationPolicy {
+    /// Every remote-attestation requirement in canonical codec order.
+    pub const ALL: [Self; 3] = [Self::NotRequired, Self::Signed, Self::MutuallyAuthenticated];
+
+    /// Stable lowercase spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not_required",
+            Self::Signed => "signed",
+            Self::MutuallyAuthenticated => "mutually_authenticated",
+        }
+    }
+
+    /// Parse an exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|policy| policy.as_str() == value)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -611,6 +734,27 @@ impl CredentialBinding {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunnerEventDialect {
     AutomoniqueRunnerV1,
+}
+
+impl RunnerEventDialect {
+    /// Every runner event dialect in canonical codec order.
+    pub const ALL: [Self; 1] = [Self::AutomoniqueRunnerV1];
+
+    /// Stable lowercase spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AutomoniqueRunnerV1 => "automonique_runner_v1",
+        }
+    }
+
+    /// Parse an exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|dialect| dialect.as_str() == value)
+    }
 }
 
 #[derive(Clone, Debug)]

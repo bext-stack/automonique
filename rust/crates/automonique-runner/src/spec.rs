@@ -217,6 +217,40 @@ pub enum PromptDeliveryPlan {
     BackendSession(BackendPromptSession),
 }
 
+impl PromptDeliveryPlan {
+    /// Stable spelling of the prompt-delivery mode.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stdin => "stdin",
+            Self::ProtectedReference(_) => "protected_reference",
+            Self::BackendSession(_) => "backend_session",
+        }
+    }
+
+    /// Reconstruct a mode from its exact spelling and optional coordinates.
+    ///
+    /// The payload shape is closed: `stdin` accepts neither coordinate,
+    /// `protected_reference` accepts only a protected reference, and
+    /// `backend_session` accepts only a backend session. Unknown spellings or
+    /// any missing, extra, or transposed coordinate refuse.
+    #[must_use]
+    pub fn from_spelling(
+        value: &str,
+        protected_reference: Option<ProtectedPromptReference>,
+        backend_session: Option<BackendPromptSession>,
+    ) -> Option<Self> {
+        match (value, protected_reference, backend_session) {
+            ("stdin", None, None) => Some(Self::Stdin),
+            ("protected_reference", Some(reference), None) => {
+                Some(Self::ProtectedReference(reference))
+            }
+            ("backend_session", None, Some(session)) => Some(Self::BackendSession(session)),
+            _ => None,
+        }
+    }
+}
+
 /// Opaque identity of one registered workspace record. It is deliberately
 /// distinct from the workspace's host-resolved token and cannot carry a path.
 #[derive(Clone, Eq, PartialEq)]
