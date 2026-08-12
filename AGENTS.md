@@ -1,237 +1,87 @@
-# Automonique agent contract
+# Automonique development policy
 
-This is a clean-room implementation repository. Prior implementation *source* —
-code, tests, build scripts, configuration and Git history — is outside the
-allowed context and must not be copied, mounted, searched, or used to generate
-code.
+Codex may work directly in this repository: inspect files, edit code and
+documentation, run tests, use bounded parallel agents, and create ordinary
+commits and non-force pushes for owner-requested repository work.
 
-## Permitted and forbidden inputs
+The material under `plan/`, `.automonique/dev/`, and the harness-related tools
+is retained as planning history and optional tooling. Claims, packets, leases,
+readiness gates, per-item contracts, evidence records, mandatory reviews, and
+exact-tree completion transactions are not prerequisites for development.
 
-Permitted:
+## Clean-room boundary
 
-- everything checked in under `docs/product-plan/` and `plan/`;
-- **structural references** to the prior implementation: file and module names,
-  directory shape, table and column names, command and environment names, and
-  the porting map in `docs/product-plan/reference/migration-plan.md`. The owner
-  authorized these. They record *where behavior lived* and *where it is going*;
-- black-box input/output fixtures with recorded provenance;
-- public standards and dependencies approved by the licence policy.
+This is a clean-room implementation repository. Prior implementation source —
+including code, tests, build scripts, configuration, and Git history — must not
+be read, mounted, cloned, searched, copied, paraphrased, reconstructed from
+memory, or used to generate code.
 
-Forbidden:
+Permitted inputs are:
 
-- reading, mounting, cloning or searching the private archive;
-- reproducing prior source text, control flow, algorithms or comments — quoted,
-  paraphrased, or reconstructed from memory;
-- treating a structural reference as licence to reconstruct the code behind it.
+- files checked into this repository;
+- structural references authorized by the owner, such as prior file and module
+  names, directory shape, table and column names, command and environment names,
+  and the porting map in
+  `docs/product-plan/reference/migration-plan.md`;
+- black-box input/output fixtures with recorded provenance; and
+- public standards and dependencies permitted by the repository's licence
+  policy.
 
-The distinction is deliberate. That Slack lifecycle lived in `index.ts` and
-belongs in `automonique-transports` is orientation. How `index.ts` implemented
-it is contamination. When unsure which side of the line an input falls on, stop
-and ask rather than proceeding.
+A structural reference identifies where behavior lived, not how it was
+implemented. Stop and ask if an input may cross this boundary.
 
-## Before implementation
+## Working directly
 
-- Select a ready work ID from `plan/ready.md`; its contract is
-  `plan/contracts/<ID>.md` and its node is in `plan/work-graph.toml`.
-- Record dependency evidence, allowed paths, expected base, objective, budget,
-  tests, licence class, and stop conditions.
-- Refuse work blocked by an unresolved gate in `plan/gates.md`.
+- Start from the owner's requested outcome. Read the relevant product-plan
+  documents and current code, then implement the smallest coherent change.
+- Use parallel agents when useful. Give concurrent writers disjoint files and
+  reconcile their results before committing.
+- Preserve unrelated working-tree changes. Do not sweep another task's files
+  into a commit.
+- Run the tests, formatters, linters, generators, and security checks relevant
+  to the changed area. Report the commands and actual results.
+- Generated files must be regenerated from their documented source and
+  committed with it. Do not hand-edit a generated artifact.
+- Do not delete, skip, weaken, stub, or broadly suppress a test merely to make
+  a change pass.
 
-Contract and policy preparation is the exception to the first bullet: it may
-start without a pre-existing ready ID, because requiring a contract in order to
-write the contract is circular. It does not need a per-contract owner decision.
-Record the immutable base, allowed paths, objective, budget, checks, licence
-class and stop conditions in the candidate's own report; add a file under
-`plan/owner-decisions/` only when the change is a policy or authority change.
-This exception cannot implement product behavior or waive a gate.
+The roadmap, contracts, and gates under `plan/` remain useful design inputs,
+but they do not decide whether work may start or land. Product reality and
+relevant tests take precedence over plan bookkeeping.
 
-Writing a contract for an unblocked-but-unspecified item is ordinary,
-self-selectable work: it lowers `contracts_missing` and makes the item
-selectable on the next pass.
+## Data and operational safety
 
-## Codex session driver
+Never commit credentials, secret values, private or customer data, logs,
+sessions, real infrastructure identifiers, personal email addresses in source
+files, or absolute home-directory paths.
 
-The normal interactive entry point is an owner opening Codex in this
-repository and asking it to continue. The primary Codex session is the
-coordinator; do not start a nested Codex CLI process.
+Do not access or mutate production infrastructure, deploy to production,
+publish a release or package, rotate credentials, administer the repository,
+or enable live transports or providers without explicit contemporaneous owner
+authority for that operation.
 
-For a continuation request:
+Never generate a shell command string from model output. Use explicit argument
+vectors or typed APIs for commands influenced by untrusted/model-produced data.
 
-1. Run `python3 tools/harness_loop.py status`. Resume a valid
-   `codex_session` claim, or run `python3 tools/harness_loop.py claim` to admit
-   one ready, score-eligible work item and create its immutable packet.
-2. Read the packet, contract, dependency evidence and applicable gates before
-   editing. Stop if they disagree.
-3. Use native subagents for bounded independent work. Launch at least one when
-   the admitted objective has a useful independent exploration, implementation
-   or verification stream; use no more than three concurrently. Give each
-   subagent an exact objective, allowed paths, checks and requested return
-   evidence.
-4. Prefer parallel read-only exploration and verification. Concurrent writers
-   must have disjoint path ownership. The primary session owns coordination,
-   resolves conflicts and remains responsible for the integrated candidate.
-5. Run the checks required for the current bounded slice and
-   `python3 tools/harness_loop.py check` after integration. A partial slice may
-   be committed and published through the typed exact-tree path when its actual
-   checks pass, but its commit and report must say that it is partial. It may
-   not mark the work item done, close a gate, or claim the full contract.
-6. Declare full completion only through one exact-tree completion transaction
-   that includes the final implementation, measured metrics, completion
-   evidence and generated plan/status changes. Run every contract check against
-   that same tree. If any check or required record is missing, keep the work
-   partial and report the gap truthfully.
+## Git safety and provenance
 
-   Run it with `python3 tools/harness_loop.py complete --item <ID> --summary
-   "<line>"`, adding `--reason "<why>"` when no specification-debt counter
-   moves, which is normal for an item that implements an existing contract. The
-   command flips the status, regenerates every derived artifact, appends the
-   history record, runs `plan/gate.py --dry-run` against that exact tree, and
-   commits through the typed broker only if the gate passes.
+Ordinary commits and non-force pushes for requested repository work are
+permitted. Codex-authored commits use the configured automation identity
+`Automonique Candidate <candidate@automonique.invalid>`; human-authored commits
+use the human's truthful configured identity. Do not add assistant attribution
+or co-author trailers.
 
-   Do not commit the implementation as its own slice and complete it
-   afterwards. The completion may write the item's implementation lease plus
-   its own closing artifacts — `plan/evidence/<ID>.json`, `plan/generate.py`,
-   `plan/work-graph.toml`, `plan/ready.md`, `plan/baseline.json`,
-   `plan/history.jsonl`, `.automonique/dev/program.yaml` and
-   `.automonique/dev/objectives.json` — and nothing else. It cannot touch
-   `plan/authority.toml`, its own contract, this file or the gate, so a
-   candidate can never certify itself by widening the rule that judges it.
-7. After verification, the primary session may use the configured typed
-   integrator to compare-and-swap local `main` and publish that exact commit by
-   a non-force fast-forward to configured `origin/main`, whatever leased paths
-   the candidate touches. Stop on local or remote tip drift, ambiguity, or a
-   non-fast-forward.
-8. Use `python3 tools/harness_loop.py release --reason blocked` (or
-   `user_cancelled`) if the attempt cannot continue safely.
+Do not discard work, rewrite history, force-push, delete refs, change remotes,
+or use destructive commands such as `git reset --hard` unless the owner
+explicitly authorizes the exact operation and recovery path. Stop on conflicts,
+ambiguous remote state, or non-fast-forward rejection.
 
-Subagents inherit this contract. They may not expand the lease, approve or
-integrate their own work, launch recursive agent trees, or push. If native
-subagents are unavailable or the task is genuinely atomic, the primary session
-may proceed alone but must say why in its completion evidence.
+## Licence boundary
 
-## Authority modes
+Product code uses `Elastic-2.0`. Code under `sdk/`, `integrations/`, and
+`connectors/` uses `Apache-2.0`.
 
-`plan/authority.toml` selects the repository's current mode. The repository is
-in `autonomous-protected-integration`.
-
-In this mode, a bounded worker may run required checks and a gate preflight,
-create an isolated candidate branch or worktree from the expected base, and
-create a local candidate commit containing only leased paths. The primary
-session may automatically advance local `main` to an exact verified candidate by
-fast-forward compare-and-swap and may publish the same commit only as a
-non-force fast-forward to the configured `origin/main`. No class of leased
-change is reserved for owner sign-off: plan, contract, governance and authority
-candidates integrate by the same path as implementation candidates. Review is
-risk-based and owner-configurable.
-
-This narrow integration authority grants no generic push, merge, force,
-history rewrite, other-ref or other-remote mutation, repository administration,
-release signing, package publication or production deployment authority. The
-local and remote expected tips, candidate commit and verified tree must be
-exact. Separate identities and independent review are optional hardening, not
-universal readiness gates.
-
-## Hard rules
-
-- Never commit credentials, private/customer data, logs, sessions, real
-  infrastructure identifiers, personal email addresses, or absolute home paths.
-- Never generate a shell command string from model output. Use explicit argv or
-  typed APIs.
-- Never edit outside the work unit's lease or recorded owner-decision scope.
-  Never change the metric, baseline, licence, policy, or budget and then use the
-  changed rule to certify the same candidate.
-- Never delete, skip, ignore, or weaken a test; add a stub; bulk-refresh a
-  golden; or widen unsafe/lint allowances to pass a gate.
-- A candidate may change governance, authority, required checks, branch rules,
-  or the metric, baseline or budget — but it is judged by those rules as they
-  stand at its own admitted base, never by the version it introduces. A
-  candidate that edits a check must still pass that check as written before its
-  change. Exact-tree fast-forward integration is allowed for every leased
-  change, including this class; no external acceptance step is required.
-  Release, package publication and production deployment always remain separate
-  authorities. Self-review and deterministic gate preflight are allowed, but
-  evidence must record the actual reviewer count and may not claim independence
-  that did not occur.
-- Never claim an unmeasured metric. Missing evidence is `null` with a reason.
-- Never extend the development harness to make development easier. Items
-  `R0-19`…`R0-40` — the lab, its brokers and leases, self-hosting levels,
-  candidate lifecycle, promotion and recursive improvement — are frozen by
-  `GATE-HARNESS`. Building the tool that builds the product always feels like
-  progress and is always measurable by the tool's own instruments; that is why
-  this repository produced 35,000 lines of harness against 2,000 lines of
-  product before anyone noticed. Fixing the harness so it stops blocking a
-  product item is permitted and should be the smallest change that unblocks it.
-  Improving the harness for its own sake is not. If a product item is
-  unselectable because it has no contract, write that contract — that, not more
-  tooling, is what makes product work startable.
-- Product files use `Elastic-2.0`; `sdk/`, `integrations/`, and `connectors/`
-  use `Apache-2.0`. Moving product code across that boundary requires owner
-  review before distribution.
-- Changing `plan/work-graph.toml` means regenerating everything derived from it
-  in the same commit: `python3 plan/check.py` (writes `plan/ready.md`), then
-  `python3 tools/program.py`, then `python3 tools/guides.py`, then
-  `python3 plan/baseline.py`. `.automonique/dev/program.yaml` records the
-  graph's digest, so a graph that moves without it leaves the harness refusing
-  to select any work — correctly, but with a message (`program selection
-  denied`) that says nothing about why. Only the lab suite catches that one, so
-  run it after touching the graph. `plan/check.py --verify` now refuses a stale
-  `plan/ready.md` rather than passing over it, which is how a commit shipped a
-  ready set advertising finished work as selectable.
-- A test fixture must never restate the constant it is checking. Every fixture
-  in `automonique-lab` hard-coded `integration_ceiling` to the same literal as
-  the validator, so the two agreed for a year while the actual producer,
-  `tools/harness_loop.py`, wrote a value neither would accept. A fixture that
-  copies the implementation proves the implementation equals itself. Compare the
-  real producer against the real validator, and keep a positive control beside
-  every negative one.
-
-## Git authority
-
-Every commit is authored **and** committed as
-`Automonique Candidate <candidate@automonique.invalid>`, the identity
-`tools/git_broker.py` sets. No commit carries an assistant attribution trailer,
-a personal name or a personal email address. A commit made outside the broker
-sets `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME` and
-`GIT_COMMITTER_EMAIL` explicitly rather than inheriting the ambient Git
-configuration; a fresh clone sets the same values in its local repository
-configuration before its first commit. Attribution is provenance here, not
-etiquette: the repository's own record of who produced a candidate is wrong if a
-human or a tool signs one.
-
-Workers use typed stage/commit operations for leased paths at an expected base.
-They may create a candidate branch or worktree and a local candidate commit.
-Only the primary session's bounded integrator may then:
-
-- fast-forward local `refs/heads/main` from the recorded expected local tip to
-  the exact verified candidate using compare-and-swap; and
-- publish that same commit to configured `origin/main` with an ordinary
-  non-force fast-forward push whose advertised remote tip matches the recorded
-  expected remote tip.
-
-The integrator records an idempotent receipt and stops on drift, conflict,
-ambiguous outcome or non-fast-forward rejection. It has no authority to merge,
-force, rewrite history, change another ref or remote, edit remote configuration,
-administer the repository, release, publish a package or deploy. Subagents and
-workers cannot push.
-
-Partial verified slices may use this path when the commit and evidence state
-their partial scope and actual checks. Full completion requires the
-implementation, all contract checks, measured metrics, completion evidence and
-plan/status transition to be bound to one exact-tree completion transaction.
-The policy judging a tree is the policy already integrated at its admitted
-base; a candidate cannot make new authority retroactive to itself. This is the
-one control the autonomous mode keeps: a candidate may widen authority for the
-work that follows it, never for itself.
-
-A contemporaneous owner instruction may delegate one exact publication or
-history-rewrite operation outside the narrow configured fast-forward path
-without creating standing worker authority. Before acting, record the remote,
-branch, expected remote tip, intended snapshot, allowed operation and recovery
-reference under `plan/owner-decisions/`. A rewrite must use compare-and-swap
-protection such as `--force-with-lease` and must not alter any other branch,
-tag, remote or repository setting.
-
-## Verification
-
-Report actual checks, counts, failure paths, restart behavior, compatibility,
-licence classification, and provenance. Compilation alone is not completion.
+Do not move or duplicate code across that boundary without recording the
+licence consequence and obtaining owner review before distribution. Release
+and distribution work must also perform the dependency, notices, and SBOM
+checks required by `LICENSE-POLICY.md`.

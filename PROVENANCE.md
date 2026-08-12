@@ -50,28 +50,33 @@ enforcement mechanism for that boundary is unbuilt; it is tracked as
 
 ## Repository identity
 
+The identity register below records the repository's candidate automation
+identity and its historical exceptions. From the direct-development decision
+of 2026-08-12 onward it is an optional audit rather than a work-admission or CI
+gate. Codex-authored commits continue to use `Automonique Candidate`; human
+commits may use the human's truthful configured identity.
+
 **Declared state.** Identity separation: not claimed. Commit signing: not
 enabled. Identities of record: `.github/identity/register.toml`.
 
-That line is not prose. `.github/identity/check_identity.py` derives it from
-the register and refuses this document when the two disagree, so the claim
-here cannot drift away from the claim the register makes or from what Git
-records.
+The archived `.github/identity/check_identity.py` derives that line from the
+register and refuses this document when the two disagree. It can still audit
+the candidate-identity era; it no longer determines whether ordinary work may
+start or land.
 
-**Current state.** One identity, `Automonique Candidate`, authors and commits
-every candidate. It performs every role in `GOVERNANCE.md` § Roles, so no role
-is separated from any other, and no commit is signed. Three commits predate the
-rule and are recorded as pinned exceptions in the register rather than
-rewritten: the root commit and the commit after it carry an owner bootstrap
-identity, and one later commit inherited an ambient personal Git configuration.
+**Recorded candidate-bot state.** One identity, `Automonique Candidate`,
+performed every role in `GOVERNANCE.md` § Roles, so no role was separated and
+no commit was signed. Three commits predate that rule and are recorded as pinned
+exceptions in the register rather than rewritten: the root commit and the
+commit after it carry an owner bootstrap identity, and one later commit
+inherited an ambient personal Git configuration.
 `plan/owner-decisions/2026-08-10-candidate-identity-rewrite.md` records the
-rewrite that brought the rest of the history to the candidate identity, and
-`AGENTS.md` § Git authority states the rule that came out of it.
+rewrite that brought the rest of that history to the candidate identity.
 
-**Bootstrap state.** Owner-supervised development permits truthful human or
-local-automation commit identities while every push, protected integration and
-release action remains external. This lets the implementation and its harness
-be built before unattended integration credentials exist.
+**Direct-development state.** Codex uses the candidate identity; humans may use
+their truthful configured identity. Ordinary non-force pushes are permitted.
+Repository administration, release, publication, credential, and production
+operations remain separately authorized.
 
 **Optional hardened state.** Dedicated workload identities may separate
 candidate, review/build and integration activity when the operational value

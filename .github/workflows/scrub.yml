@@ -5,6 +5,7 @@ name: scrub
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -28,7 +29,10 @@ jobs:
         run: python3 tools/scrub/scan.py
 
   publication-scrub:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Protected fingerprints are publication credentials, not ordinary
+    # development prerequisites. Run this explicitly before a release, package
+    # publication, or transition of a non-public repository/artifact to public.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: scrub-publication
     steps:

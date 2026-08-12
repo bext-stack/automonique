@@ -1,14 +1,14 @@
-# Blocking gates
+# Historical gates and capability conditions
 
-A blocking gate is a condition the repository must satisfy before its named
-class of work may start. This file also records advisory hardening gates that
-block only the corresponding capability claim. `AGENTS.md` requires refusing
-work explicitly blocked by an unresolved gate, and `plan/check.py` refuses a
-graph that closes a gate not defined here.
+This file preserves the gates used by the former executable-plan workflow.
+They remain useful as requirements for the specific capability claim they
+describe, but they do not prevent ordinary product development from starting,
+being committed, or being pushed. `plan/check.py` may still interpret them as
+blocking when someone explicitly opts into the archived graph workflow.
 
-A gate closes when its **closing evidence** exists and receives the review or
-explicit owner acceptance configured for that gate. A gate is never closed by
-an unsupported assertion.
+A capability claim is supported only when its **closing evidence** exists. An
+unsupported assertion does not become true merely because the gate is no
+longer a development admission control.
 
 | Gate | Closed by | Blocks |
 |---|---|---|

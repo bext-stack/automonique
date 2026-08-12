@@ -64,8 +64,9 @@ decision. Build tools used without distribution are recorded independently.
 
 ## Development check
 
-`python3 plan/check.py --verify` performs the intentionally small automated
+`python3 tools/check_licenses.py` performs the intentionally small automated
 check: commentable source files must carry the SPDX identifier dictated by
-their path. Dependency inventories, notices, SBOMs, compatibility decisions,
-and cross-boundary code review belong to the first relevant distribution
-contract rather than every development commit.
+their path. It is independent of the archived executable-plan verifier.
+Dependency inventories, notices, SBOMs, compatibility decisions, and
+cross-boundary code review belong to the first relevant distribution effort
+rather than every development commit.
