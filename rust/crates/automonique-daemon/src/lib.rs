@@ -18,11 +18,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use automonique_protocol::admin::{
-    AdminInstanceId, AdminRequest, AdminResponse, DaemonState, DaemonStatus,
-    MAX_ADMIN_CANONICAL_BYTES,
+    AdminInstanceId, AdminReconciliationEvidence, AdminRefusalCategory, AdminRequest,
+    AdminResponse, DaemonState, DaemonStatus, MAX_ADMIN_CANONICAL_BYTES,
 };
 use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, decode_frame, encode_frame};
-use automonique_store::{InboxSubmission, LeaseRenewal, LeaseRequest, Store, StoreError};
+use automonique_store::{
+    InboxSubmission, LeaseRenewal, LeaseRequest, ReconciliationDecision, ReconciliationRequest,
+    Store, StoreError,
+};
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::sys::socket::{getsockopt, sockopt};
@@ -198,6 +201,7 @@ pub struct Daemon {
     lease_expires_ms: i64,
     socket_identity: (u64, u64),
     controller: automonique_core::Controller,
+    reconciliation_run_id: Option<i64>,
 }
 
 struct SocketCleanup {
@@ -281,6 +285,7 @@ impl Daemon {
             lease_expires_ms: lease.expires_ms,
             socket_identity,
             controller: automonique_core::Controller::new(),
+            reconciliation_run_id: None,
         })
     }
 
@@ -309,7 +314,9 @@ impl Daemon {
                 }
                 next_renewal = std::time::Instant::now() + LEASE_RENEW_INTERVAL;
             }
-            if let Err(error) = self.tick_synthetic() {
+            if self.reconciliation_run_id.is_none()
+                && let Err(error) = self.tick_synthetic()
+            {
                 break Err(error);
             }
             match self.listener.accept() {
@@ -391,7 +398,14 @@ impl Daemon {
             | TickOutcome::Completed(_)
             | TickOutcome::Replayed(_)
             | TickOutcome::RetryRequired { .. } => Ok(()),
-            TickOutcome::ReconciliationRequired(_) => Err(DaemonError::ReconciliationRequired),
+            TickOutcome::ReconciliationRequired(reconciliation) => {
+                let run_id = reconciliation
+                    .work_id()
+                    .parse::<i64>()
+                    .map_err(|_| DaemonError::ProtocolRefused("reconciliation_run_id"))?;
+                self.reconciliation_run_id = Some(run_id);
+                Ok(())
+            }
         }
     }
 
@@ -417,15 +431,20 @@ impl Daemon {
                 {
                     return Err(DaemonError::Store(StoreError::StaleEpoch));
                 }
+                let degraded = self.reconciliation_run_id.is_some();
                 let status = DaemonStatus::new(
                     self.instance_id.clone(),
-                    DaemonState::Ready,
+                    if degraded {
+                        DaemonState::Failed
+                    } else {
+                        DaemonState::Ready
+                    },
                     self.lease_epoch,
                     snapshot.event_cursor,
                     snapshot.inbox_pending,
                     snapshot.outbox_pending,
                     snapshot.runs_running,
-                    true,
+                    !degraded,
                 )
                 .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
                 AdminResponse::Status {
@@ -434,6 +453,9 @@ impl Daemon {
                 }
             }
             automonique_protocol::admin::AdminCommand::SubmitSynthetic => {
+                if self.reconciliation_run_id.is_some() {
+                    return Err(DaemonError::ReconciliationRequired);
+                }
                 let submission = request
                     .submission()
                     .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
@@ -447,6 +469,73 @@ impl Daemon {
                 AdminResponse::SyntheticAccepted {
                     request_id: request.request_id().clone(),
                     inbox_id: u64::try_from(receipt.inbox_id)
+                        .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
+                    duplicate: receipt.duplicate,
+                }
+            }
+            automonique_protocol::admin::AdminCommand::InspectReconciliation => {
+                let run_id = request
+                    .reconciliation_run_id()
+                    .and_then(|value| i64::try_from(value).ok())
+                    .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
+                let evidence = match self.store.inspect_reconciliation(run_id) {
+                    Ok(evidence) => evidence,
+                    Err(error) if reconciliation_command_refusal(&error) => {
+                        return self.write_refusal(stream, request.request_id(), error.category());
+                    }
+                    Err(error) => return Err(DaemonError::Store(error)),
+                };
+                AdminResponse::ReconciliationInspected {
+                    request_id: request.request_id().clone(),
+                    evidence: AdminReconciliationEvidence::new(
+                        u64::try_from(evidence.run_id)
+                            .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
+                        evidence.scope,
+                        evidence.generation_id,
+                        evidence.lease_epoch,
+                        evidence.run_revision,
+                        evidence.terminal_payload_present,
+                        evidence.outbox_count,
+                    )
+                    .map_err(|error| DaemonError::ProtocolRefused(error.category()))?,
+                }
+            }
+            automonique_protocol::admin::AdminCommand::FailReconciliation => {
+                let failure = request
+                    .reconciliation_failure()
+                    .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
+                let run_id = i64::try_from(failure.run_id())
+                    .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?;
+                let receipt = match self.store.reconcile_run(ReconciliationRequest {
+                    run_id,
+                    authority_generation_id: GENERATION_ID,
+                    authority_holder_id: self.instance_id.as_str(),
+                    authority_lease_epoch: self.lease_epoch,
+                    expected_generation_id: failure.expected_generation_id(),
+                    expected_lease_epoch: failure.expected_lease_epoch(),
+                    expected_revision: failure.expected_revision(),
+                    decision_key: failure.decision_key(),
+                    now_ms: unix_millis()?,
+                    decision: ReconciliationDecision::Fail {
+                        reason: failure.reason(),
+                    },
+                }) {
+                    Ok(receipt) => receipt,
+                    Err(error) if reconciliation_command_refusal(&error) => {
+                        return self.write_refusal(stream, request.request_id(), error.category());
+                    }
+                    Err(error) => return Err(DaemonError::Store(error)),
+                };
+                if self.reconciliation_run_id == Some(run_id) {
+                    self.reconciliation_run_id = None;
+                }
+                AdminResponse::ReconciliationFailed {
+                    request_id: request.request_id().clone(),
+                    run_event_id: u64::try_from(receipt.run_event_id)
+                        .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
+                    inbox_event_id: u64::try_from(receipt.inbox_event_id)
+                        .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
+                    outbox_id: u64::try_from(receipt.outbox_id)
                         .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
                     duplicate: receipt.duplicate,
                 }
@@ -472,6 +561,28 @@ impl Daemon {
         ) {
             stop.store(true, Ordering::Release);
         }
+        Ok(())
+    }
+
+    fn write_refusal(
+        &self,
+        stream: &mut UnixStream,
+        request_id: &automonique_protocol::codec::RequestId,
+        category: &str,
+    ) -> Result<(), DaemonError> {
+        let response = AdminResponse::Refused {
+            request_id: request_id.clone(),
+            category: AdminRefusalCategory::new(category)
+                .map_err(|error| DaemonError::ProtocolRefused(error.category()))?,
+        }
+        .to_message()
+        .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
+        .to_canonical_bytes();
+        let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + response.len());
+        encode_frame(&response, &mut frame)
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
+        stream.write_all(&frame)?;
+        stream.flush()?;
         Ok(())
     }
 }
@@ -664,6 +775,20 @@ fn fatal_store_error(error: &StoreError) -> bool {
         error,
         StoreError::InvalidField(_)
             | StoreError::IdempotencyConflict(_)
+            | StoreError::ScopeLocked
+            | StoreError::AlreadyTerminal
+            | StoreError::OutboxConflict
+            | StoreError::NotFound(_)
+    )
+}
+
+fn reconciliation_command_refusal(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::InvalidField(_)
+            | StoreError::IdempotencyConflict(_)
+            | StoreError::StaleEpoch
+            | StoreError::LeaseHeld
             | StoreError::ScopeLocked
             | StoreError::AlreadyTerminal
             | StoreError::OutboxConflict

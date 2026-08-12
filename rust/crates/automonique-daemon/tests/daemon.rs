@@ -8,9 +8,11 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use automonique_daemon::{Daemon, DaemonConfig, DaemonError, run_foreground};
-use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse, DaemonState};
+use automonique_protocol::admin::{
+    AdminCommand, AdminRequest, AdminResponse, DaemonState, ReconciliationFailure,
+};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
-use automonique_store::{InboxSubmission, LeaseRequest, SchedulerClaim, Store};
+use automonique_store::{InboxSubmission, LeaseRequest, SchedulerClaim, Store, WorkClaim};
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
 
 fn fixture() -> (tempfile::TempDir, DaemonConfig) {
@@ -35,11 +37,15 @@ fn fixture() -> (tempfile::TempDir, DaemonConfig) {
 }
 
 fn call(config: &DaemonConfig, command: AdminCommand) -> AdminResponse {
-    let mut stream = UnixStream::connect(config.admin_socket()).expect("connect to daemon");
     let request = AdminRequest::new(
         RequestId::new("integration-1").expect("request ID"),
         command,
     );
+    call_request(config, request)
+}
+
+fn call_request(config: &DaemonConfig, request: AdminRequest) -> AdminResponse {
+    let mut stream = UnixStream::connect(config.admin_socket()).expect("connect to daemon");
     let payload = request
         .to_message()
         .expect("encode request")
@@ -229,7 +235,7 @@ fn losing_the_durable_fence_ends_serving_without_false_ready() {
 }
 
 #[test]
-fn an_ambiguous_claim_stops_the_daemon_before_it_can_report_ready() {
+fn an_ambiguous_claim_degrades_until_an_exact_operator_failure() {
     let (_root, config) = fixture();
     std::fs::create_dir(config.state_dir()).expect("state directory");
     std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
@@ -252,7 +258,7 @@ fn an_ambiguous_claim_stops_the_daemon_before_it_can_report_ready() {
             received_ms: 1,
         })
         .expect("durable input");
-    store
+    let first_claim = store
         .claim_next(SchedulerClaim {
             transport: "local.synthetic",
             generation_id: "foreground",
@@ -262,15 +268,180 @@ fn an_ambiguous_claim_stops_the_daemon_before_it_can_report_ready() {
         })
         .expect("claim")
         .expect("claimed run");
+    let second_inbox = store
+        .submit_inbox(InboxSubmission {
+            transport: "local.synthetic",
+            transport_key: "ambiguous:2",
+            scope: "workspace:ambiguous:second",
+            payload: b"second synthetic task",
+            received_ms: 1,
+        })
+        .expect("second durable input");
+    let second_claim = store
+        .claim_work(WorkClaim {
+            claim_key: "manual:ambiguous:2",
+            inbox_id: second_inbox.inbox_id,
+            scope: "workspace:ambiguous:second",
+            generation_id: "foreground",
+            holder_id: "crashed-daemon",
+            lease_epoch: lease.epoch,
+            now_ms: 1,
+        })
+        .expect("second ambiguous claim");
     drop(store);
 
     let daemon = Daemon::open(&config).expect("new generation opens");
-    let stop = AtomicBool::new(false);
-    let error = daemon
-        .serve(&stop)
-        .expect_err("ambiguous prior execution must stop serving");
-    assert_eq!(error.category(), "reconciliation_required");
-    assert!(!config.admin_socket().exists());
+    let stop = Arc::new(AtomicBool::new(false));
+    let serve_stop = Arc::clone(&stop);
+    let thread = std::thread::spawn(move || daemon.serve(&serve_stop));
+    wait_for_socket(&config);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let AdminResponse::Status { status, .. } = call(&config, AdminCommand::Status) else {
+            panic!("status response")
+        };
+        if status.state() == DaemonState::Failed {
+            assert!(!status.accepting_intake());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not expose reconciliation state"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let inspected = call_request(
+        &config,
+        AdminRequest::inspect_reconciliation(
+            RequestId::new("inspect-ambiguous").expect("request"),
+            u64::try_from(first_claim.run_id).expect("run id"),
+        )
+        .expect("inspect request"),
+    );
+    let AdminResponse::ReconciliationInspected { evidence, .. } = inspected else {
+        panic!("inspection response")
+    };
+    assert_eq!(evidence.run_id(), 1);
+    assert!(!evidence.terminal_payload_present());
+    assert_eq!(evidence.outbox_count(), 0);
+
+    let failure = ReconciliationFailure::new(
+        evidence.run_id(),
+        evidence.generation_id(),
+        evidence.lease_epoch(),
+        evidence.run_revision(),
+        "operator:ambiguous:1",
+        "execution_outcome_unknown",
+    )
+    .expect("failure request");
+    let wrong = ReconciliationFailure::new(
+        evidence.run_id(),
+        "wrong-generation",
+        evidence.lease_epoch(),
+        evidence.run_revision(),
+        "operator:wrong:1",
+        "execution_outcome_unknown",
+    )
+    .expect("wrong failure request");
+    assert!(matches!(
+        call_request(
+            &config,
+            AdminRequest::fail_reconciliation(
+                RequestId::new("wrong-fail-ambiguous").expect("request"),
+                wrong,
+            ),
+        ),
+        AdminResponse::Refused { ref category, .. } if category.as_str() == "stale_epoch"
+    ));
+    let AdminResponse::Status { status, .. } = call(&config, AdminCommand::Status) else {
+        panic!("status after refusal")
+    };
+    assert_eq!(status.state(), DaemonState::Failed);
+    assert!(matches!(
+        call_request(
+            &config,
+            AdminRequest::fail_reconciliation(
+                RequestId::new("fail-ambiguous").expect("request"),
+                failure.clone(),
+            ),
+        ),
+        AdminResponse::ReconciliationFailed {
+            duplicate: false,
+            ..
+        }
+    ));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let AdminResponse::Status { status, .. } = call(&config, AdminCommand::Status) else {
+            panic!("status response")
+        };
+        if status.state() == DaemonState::Failed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "second ambiguity was not discovered"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(matches!(
+        call_request(
+            &config,
+            AdminRequest::fail_reconciliation(
+                RequestId::new("retry-fail-ambiguous").expect("request"),
+                failure,
+            ),
+        ),
+        AdminResponse::ReconciliationFailed {
+            duplicate: true,
+            ..
+        }
+    ));
+    let second = call_request(
+        &config,
+        AdminRequest::inspect_reconciliation(
+            RequestId::new("inspect-second-ambiguous").expect("request"),
+            u64::try_from(second_claim.run_id).expect("run id"),
+        )
+        .expect("inspect request"),
+    );
+    let AdminResponse::ReconciliationInspected { evidence, .. } = second else {
+        panic!("second inspection response")
+    };
+    let second_failure = ReconciliationFailure::new(
+        evidence.run_id(),
+        evidence.generation_id(),
+        evidence.lease_epoch(),
+        evidence.run_revision(),
+        "operator:ambiguous:2",
+        "execution_outcome_unknown",
+    )
+    .expect("second failure request");
+    assert!(matches!(
+        call_request(
+            &config,
+            AdminRequest::fail_reconciliation(
+                RequestId::new("fail-second-ambiguous").expect("request"),
+                second_failure,
+            ),
+        ),
+        AdminResponse::ReconciliationFailed {
+            duplicate: false,
+            ..
+        }
+    ));
+    let AdminResponse::Status { status, .. } = call(&config, AdminCommand::Status) else {
+        panic!("status response")
+    };
+    assert_eq!(status.state(), DaemonState::Ready);
+    assert!(status.accepting_intake());
+    assert!(matches!(
+        call(&config, AdminCommand::Shutdown),
+        AdminResponse::ShutdownAccepted { .. }
+    ));
+    thread.join().expect("join").expect("orderly serve");
 }
 
 #[test]

@@ -41,3 +41,30 @@ fn submission_task_must_be_nonempty_utf8_without_nul() {
         );
     }
 }
+
+#[test]
+fn reconciliation_coordinates_are_parsed_and_refused_before_connection() {
+    for arguments in [
+        vec!["reconcile", "inspect", "0"],
+        vec![
+            "reconcile",
+            "fail",
+            "1",
+            "generation-old",
+            "not-an-epoch",
+            "2",
+            "decision-1",
+        ],
+    ] {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit = run_with_input(arguments, b"".as_slice(), &mut stdout, &mut stderr);
+        assert_eq!(exit, 2);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8(stderr)
+                .expect("utf8 refusal")
+                .starts_with("automonique reconcile refused: invalid_")
+        );
+    }
+}

@@ -5,8 +5,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use automonique_store::{
-    InboxSubmission, LeaseRenewal, LeaseRequest, SCHEMA_VERSION, SchedulerClaim, Store,
-    TerminalRun, TerminalState, WorkClaim,
+    InboxSubmission, LeaseRenewal, LeaseRequest, ReconciliationDecision, ReconciliationInboxState,
+    ReconciliationRequest, ReconciliationRunState, SCHEMA_VERSION, SchedulerClaim, Store,
+    TelegramBatchIngestion, TelegramStoreDisposition, TelegramStoreUpdate, TerminalRun,
+    TerminalState, WorkClaim,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -112,6 +114,20 @@ fn finish_scheduled(store: &mut Store, run_id: i64, epoch: u64, now_ms: i64, suf
             outbox_payload: suffix.as_bytes(),
         })
         .expect("finish scheduled run");
+}
+
+fn telegram_update<'a>(
+    update_id: u64,
+    source_key: &'a str,
+    scope: &'a str,
+    disposition: TelegramStoreDisposition<'a>,
+) -> TelegramStoreUpdate<'a> {
+    TelegramStoreUpdate {
+        update_id,
+        source_key,
+        scope,
+        disposition,
+    }
 }
 
 #[test]
@@ -819,4 +835,618 @@ fn scheduler_terminal_retry_never_duplicates_run_event_or_outbox() {
             .inbox_id,
         next_inbox
     );
+}
+
+#[test]
+fn reconciliation_discovers_old_epoch_and_accepts_live_successor_authority() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let old_epoch = lease(&mut store, "holder-a", 0);
+    submit(&mut store, "reconcile-evidence", "scope:evidence");
+    let claim = claim_next(&mut store, "holder-a", old_epoch, 2).expect("claim");
+    let evidence = store
+        .inspect_reconciliation(claim.run_id)
+        .expect("reconciliation evidence");
+    assert_eq!(evidence.run_state, ReconciliationRunState::Running);
+    assert_eq!(evidence.inbox_state, ReconciliationInboxState::Claimed);
+    assert_eq!(evidence.inbox_revision, 2);
+    assert_eq!(evidence.claimed_run_id, Some(claim.run_id));
+    assert_eq!(evidence.generation_id, "generation-a");
+    assert_eq!(evidence.lease_epoch, old_epoch);
+    assert_eq!(evidence.lock_generation_id.as_deref(), Some("generation-a"));
+    assert_eq!(evidence.lock_epoch, Some(old_epoch));
+    assert_eq!(evidence.lock_expires_ms, Some(100));
+    assert!(!evidence.terminal_payload_present);
+    assert!(evidence.outbox_intent_key.is_none());
+    assert_eq!(evidence.outbox_count, 0);
+
+    let live = store
+        .reconcile_run(ReconciliationRequest {
+            run_id: claim.run_id,
+            authority_generation_id: "generation-a",
+            authority_holder_id: "holder-a",
+            authority_lease_epoch: old_epoch,
+            expected_generation_id: "generation-a",
+            expected_lease_epoch: old_epoch,
+            expected_revision: evidence.run_revision,
+            decision_key: "reconcile-live",
+            now_ms: 3,
+            decision: ReconciliationDecision::Fail {
+                reason: "execution_outcome_unknown",
+            },
+        })
+        .expect_err("live work cannot be reconciled");
+    assert_eq!(live.category(), "lease_held");
+
+    lease(&mut store, "holder-b", 101);
+    let stale_authority = store
+        .reconcile_run(ReconciliationRequest {
+            run_id: claim.run_id,
+            authority_generation_id: "generation-a",
+            authority_holder_id: "holder-a",
+            authority_lease_epoch: old_epoch,
+            expected_generation_id: "generation-a",
+            expected_lease_epoch: old_epoch,
+            expected_revision: evidence.run_revision,
+            decision_key: "reconcile-stale-authority",
+            now_ms: 102,
+            decision: ReconciliationDecision::Fail {
+                reason: "execution_outcome_unknown",
+            },
+        })
+        .expect_err("stale operator authority refused");
+    assert_eq!(stale_authority.category(), "stale_epoch");
+    let wrong_authority = store
+        .reconcile_run(ReconciliationRequest {
+            run_id: claim.run_id,
+            authority_generation_id: "generation-a",
+            authority_holder_id: "holder-c",
+            authority_lease_epoch: old_epoch + 1,
+            expected_generation_id: "generation-a",
+            expected_lease_epoch: old_epoch,
+            expected_revision: evidence.run_revision,
+            decision_key: "reconcile-wrong-authority",
+            now_ms: 102,
+            decision: ReconciliationDecision::Fail {
+                reason: "execution_outcome_unknown",
+            },
+        })
+        .expect_err("wrong current operator refused");
+    assert_eq!(wrong_authority.category(), "stale_epoch");
+    let other_authority = store
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "generation-b",
+            holder_id: "holder-b",
+            now_ms: 101,
+            ttl_ms: 100,
+        })
+        .expect("independently live other generation");
+    let wrong_successor_authority = store
+        .reconcile_run(ReconciliationRequest {
+            run_id: claim.run_id,
+            authority_generation_id: "generation-b",
+            authority_holder_id: "holder-c",
+            authority_lease_epoch: other_authority.epoch,
+            expected_generation_id: "generation-a",
+            expected_lease_epoch: old_epoch,
+            expected_revision: evidence.run_revision,
+            decision_key: "reconcile-wrong-successor-authority",
+            now_ms: 102,
+            decision: ReconciliationDecision::Fail {
+                reason: "execution_outcome_unknown",
+            },
+        })
+        .expect_err("wrong successor holder cannot authorize decision");
+    assert_eq!(wrong_successor_authority.category(), "stale_epoch");
+    let wrong_epoch = store
+        .reconcile_run(ReconciliationRequest {
+            run_id: claim.run_id,
+            authority_generation_id: "generation-a",
+            authority_holder_id: "holder-b",
+            authority_lease_epoch: old_epoch + 1,
+            expected_generation_id: "generation-a",
+            expected_lease_epoch: old_epoch + 1,
+            expected_revision: evidence.run_revision,
+            decision_key: "reconcile-wrong-epoch",
+            now_ms: 102,
+            decision: ReconciliationDecision::Fail {
+                reason: "execution_outcome_unknown",
+            },
+        })
+        .expect_err("wrong claimed epoch refused");
+    assert_eq!(wrong_epoch.category(), "stale_epoch");
+    let stale = store
+        .reconcile_run(ReconciliationRequest {
+            run_id: claim.run_id,
+            authority_generation_id: "generation-a",
+            authority_holder_id: "holder-b",
+            authority_lease_epoch: old_epoch + 1,
+            expected_generation_id: "generation-a",
+            expected_lease_epoch: old_epoch,
+            expected_revision: evidence.run_revision + 1,
+            decision_key: "reconcile-stale",
+            now_ms: 102,
+            decision: ReconciliationDecision::Fail {
+                reason: "execution_outcome_unknown",
+            },
+        })
+        .expect_err("stale revision refused");
+    assert_eq!(stale.category(), "idempotency_conflict");
+    assert_eq!(
+        store
+            .inspect_reconciliation(claim.run_id)
+            .expect("unchanged")
+            .run_state,
+        ReconciliationRunState::Running
+    );
+    let adopted = store
+        .reconcile_run(ReconciliationRequest {
+            run_id: claim.run_id,
+            authority_generation_id: "generation-b",
+            authority_holder_id: "holder-b",
+            authority_lease_epoch: other_authority.epoch,
+            expected_generation_id: "generation-a",
+            expected_lease_epoch: old_epoch,
+            expected_revision: evidence.run_revision,
+            decision_key: "reconcile-successor-generation",
+            now_ms: 102,
+            decision: ReconciliationDecision::Fail {
+                reason: "execution_outcome_unknown",
+            },
+        })
+        .expect("live successor generation reconciles expired predecessor work");
+    assert!(!adopted.duplicate);
+    assert_eq!(
+        store
+            .inspect_reconciliation(claim.run_id)
+            .expect("reconciled")
+            .run_state,
+        ReconciliationRunState::Failed
+    );
+}
+
+#[test]
+fn explicit_reconciliation_failure_is_atomic_retryable_and_unique() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let old_epoch = lease(&mut store, "holder-a", 0);
+    submit(&mut store, "reconcile-fail", "scope:reconcile-fail");
+    let claim = claim_next(&mut store, "holder-a", old_epoch, 2).expect("claim");
+    lease(&mut store, "holder-b", 101);
+    let request = || ReconciliationRequest {
+        run_id: claim.run_id,
+        authority_generation_id: "generation-a",
+        authority_holder_id: "holder-b",
+        authority_lease_epoch: old_epoch + 1,
+        expected_generation_id: "generation-a",
+        expected_lease_epoch: old_epoch,
+        expected_revision: 1,
+        decision_key: "fake-reconciliation:fail",
+        now_ms: 102,
+        decision: ReconciliationDecision::Fail {
+            reason: "execution_outcome_unknown",
+        },
+    };
+    let events_before = store.event_count().expect("events before");
+    let first = store.reconcile_run(request()).expect("explicit failure");
+    assert!(!first.duplicate);
+    let outbox = store
+        .outbox_snapshot(first.outbox_id)
+        .expect("outbox receipt");
+    assert_eq!(outbox.kind, "fake.reconciliation.receipt");
+    assert_eq!(outbox.state, "pending");
+    assert!(
+        !store
+            .scope_is_locked("scope:reconcile-fail")
+            .expect("unlock")
+    );
+    assert_eq!(
+        store
+            .inspect_reconciliation(claim.run_id)
+            .expect("resolved")
+            .run_state,
+        ReconciliationRunState::Failed
+    );
+    assert_eq!(store.outbox_count().expect("one receipt"), 1);
+    assert_eq!(
+        store.event_count().expect("two terminal events"),
+        events_before + 2
+    );
+
+    let retry = store.reconcile_run(request()).expect("exact retry");
+    assert!(retry.duplicate);
+    assert_eq!(
+        retry,
+        automonique_store::ReconciliationReceipt {
+            duplicate: true,
+            ..first
+        }
+    );
+    assert_eq!(store.outbox_count().expect("still one receipt"), 1);
+
+    let conflict = store
+        .reconcile_run(ReconciliationRequest {
+            decision: ReconciliationDecision::Fail {
+                reason: "different_reason",
+            },
+            ..request()
+        })
+        .expect_err("conflicting decision refused");
+    assert_eq!(conflict.category(), "already_terminal");
+    assert_eq!(store.outbox_count().expect("no duplicate outbox"), 1);
+}
+
+#[test]
+fn reconciliation_outbox_conflict_rolls_back_run_inbox_events_and_unlock() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let old_epoch = lease(&mut store, "holder-a", 0);
+
+    submit_at(&mut store, "receipt-owner", "scope:receipt-owner", 1);
+    let receipt_owner = claim_next(&mut store, "holder-a", old_epoch, 2).expect("first claim");
+    store
+        .finish_run(TerminalRun {
+            run_id: receipt_owner.run_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: old_epoch,
+            expected_revision: 1,
+            now_ms: 3,
+            state: TerminalState::Succeeded,
+            event_kind: "run.succeeded",
+            event_payload: b"done",
+            outbox_intent_key: "fake-reconciliation:collision",
+            outbox_kind: "provider.reply",
+            outbox_payload: b"reply",
+        })
+        .expect("occupy intent key");
+
+    submit_at(&mut store, "ambiguous", "scope:ambiguous", 4);
+    let ambiguous = claim_next(&mut store, "holder-a", old_epoch, 5).expect("ambiguous claim");
+    lease(&mut store, "holder-b", 101);
+    let events_before = store.event_count().expect("events before refusal");
+    let outbox_before = store.outbox_count().expect("outbox before refusal");
+    let error = store
+        .reconcile_run(ReconciliationRequest {
+            run_id: ambiguous.run_id,
+            authority_generation_id: "generation-a",
+            authority_holder_id: "holder-b",
+            authority_lease_epoch: old_epoch + 1,
+            expected_generation_id: "generation-a",
+            expected_lease_epoch: old_epoch,
+            expected_revision: 1,
+            decision_key: "fake-reconciliation:collision",
+            now_ms: 102,
+            decision: ReconciliationDecision::Fail {
+                reason: "execution_outcome_unknown",
+            },
+        })
+        .expect_err("duplicate receipt key refuses atomically");
+    assert_eq!(error.category(), "outbox_conflict");
+    assert_eq!(
+        store.event_count().expect("events rolled back"),
+        events_before
+    );
+    assert_eq!(store.outbox_count().expect("outbox stable"), outbox_before);
+    assert_eq!(
+        store
+            .run_snapshot(ambiguous.run_id)
+            .expect("run rolled back")
+            .state,
+        "running"
+    );
+    let evidence = store
+        .inspect_reconciliation(ambiguous.run_id)
+        .expect("inbox and lock rolled back");
+    assert_eq!(evidence.run_revision, 1);
+    assert_eq!(evidence.inbox_state, ReconciliationInboxState::Claimed);
+    assert_eq!(evidence.claimed_run_id, Some(ambiguous.run_id));
+    assert_eq!(evidence.lock_epoch, Some(old_epoch));
+    assert!(
+        store
+            .scope_is_locked("scope:ambiguous")
+            .expect("lock retained")
+    );
+}
+
+#[test]
+fn failed_reconciliation_survives_restart_and_scheduler_advances_fifo() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let old_epoch = lease(&mut store, "holder-a", 0);
+    let failed_inbox = submit_at(&mut store, "reconcile-first", "scope:first", 1);
+    let next_inbox = submit_at(&mut store, "reconcile-second", "scope:second", 2);
+    let claim = claim_next(&mut store, "holder-a", old_epoch, 2).expect("claim");
+    assert_eq!(claim.inbox_id, failed_inbox);
+    let new_epoch = lease(&mut store, "holder-b", 101);
+    let request = || ReconciliationRequest {
+        run_id: claim.run_id,
+        authority_generation_id: "generation-a",
+        authority_holder_id: "holder-b",
+        authority_lease_epoch: new_epoch,
+        expected_generation_id: "generation-a",
+        expected_lease_epoch: old_epoch,
+        expected_revision: 1,
+        decision_key: "fake-reconciliation:restart",
+        now_ms: 102,
+        decision: ReconciliationDecision::Fail {
+            reason: "execution_outcome_unknown",
+        },
+    };
+    let receipt = store.reconcile_run(request()).expect("explicit failure");
+    assert!(receipt.outbox_id > 0);
+    assert!(!receipt.duplicate);
+    assert_eq!(store.outbox_count().expect("one fake receipt"), 1);
+    drop(store);
+
+    let mut reopened = Store::open(database.path()).expect("restart");
+    let retry = reopened
+        .reconcile_run(request())
+        .expect("exact failure retry after restart");
+    assert!(retry.duplicate);
+    assert_eq!(retry.run_event_id, receipt.run_event_id);
+    assert_eq!(retry.inbox_event_id, receipt.inbox_event_id);
+    assert_eq!(retry.outbox_id, receipt.outbox_id);
+    assert_eq!(reopened.outbox_count().expect("still one receipt"), 1);
+
+    let next =
+        claim_next(&mut reopened, "holder-b", new_epoch, 103).expect("scheduler forward progress");
+    assert_eq!(next.inbox_id, next_inbox);
+    assert_ne!(next.run_id, claim.run_id);
+    assert!(!next.duplicate);
+    assert_eq!(
+        reopened
+            .claimed_inbox(next.run_id, "generation-a", "holder-b", new_epoch, 104,)
+            .expect("next input")
+            .inbox_id,
+        next_inbox
+    );
+    assert_eq!(reopened.outbox_count().expect("no duplicate outbox"), 1);
+}
+
+#[test]
+fn telegram_batch_is_atomic_replayable_and_content_minimizing() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let updates = [
+        telegram_update(
+            2,
+            "telegram:7:update:2",
+            "telegram:7:-100",
+            TelegramStoreDisposition::Admitted { content: b"hello" },
+        ),
+        telegram_update(
+            4,
+            "telegram:7:update:4",
+            "telegram:7:-100",
+            TelegramStoreDisposition::Denied,
+        ),
+        telegram_update(
+            5,
+            "telegram:7:update:5",
+            "telegram:7:unsupported",
+            TelegramStoreDisposition::IgnoredUnsupported,
+        ),
+    ];
+    let batch = || TelegramBatchIngestion {
+        bot_id: 7,
+        expected_offset: 0,
+        next_offset: 6,
+        received_ms: 10,
+        updates: &updates,
+    };
+    let first = store.ingest_telegram_batch(batch()).expect("first batch");
+    assert!(!first.duplicate);
+    assert_eq!(first.next_offset, 6);
+    assert_eq!(first.disposition_count, updates.len());
+    assert_eq!(store.telegram_offset(7).expect("offset"), Some(6));
+    assert_eq!(
+        store.telegram_disposition(7, 2).expect("admitted").content,
+        Some(b"hello".to_vec())
+    );
+    for update_id in [4, 5] {
+        assert_eq!(
+            store
+                .telegram_disposition(7, update_id)
+                .expect("content-free disposition")
+                .content,
+            None
+        );
+    }
+
+    let retry = store.ingest_telegram_batch(batch()).expect("exact retry");
+    assert!(retry.duplicate);
+    assert_eq!(retry.next_offset, first.next_offset);
+    assert_eq!(retry.disposition_count, first.disposition_count);
+    let changed = [
+        telegram_update(
+            2,
+            "telegram:7:update:2",
+            "telegram:7:-100",
+            TelegramStoreDisposition::Admitted {
+                content: b"changed",
+            },
+        ),
+        telegram_update(
+            4,
+            "telegram:7:update:4",
+            "telegram:7:-100",
+            TelegramStoreDisposition::Denied,
+        ),
+        telegram_update(
+            5,
+            "telegram:7:update:5",
+            "telegram:7:unsupported",
+            TelegramStoreDisposition::IgnoredUnsupported,
+        ),
+    ];
+    let conflict = store
+        .ingest_telegram_batch(TelegramBatchIngestion {
+            bot_id: 7,
+            expected_offset: 0,
+            next_offset: 6,
+            received_ms: 10,
+            updates: &changed,
+        })
+        .expect_err("changed retry is not exact");
+    assert_eq!(conflict.category(), "idempotency_conflict");
+    assert_eq!(store.telegram_offset(7).expect("stable offset"), Some(6));
+}
+
+#[test]
+fn telegram_batch_failure_rolls_back_every_disposition_and_offset() {
+    let database = PrivateDatabase::new();
+    drop(Store::open(database.path()).expect("initialize schema"));
+    let raw = Connection::open(database.path()).expect("fault-injection connection");
+    raw.execute_batch(
+        "CREATE TRIGGER fail_second_telegram_disposition
+         BEFORE INSERT ON telegram_ingress
+         WHEN NEW.bot_id = 2 AND NEW.update_id = X'0000000000000001'
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+    )
+    .expect("install deterministic transaction fault");
+    drop(raw);
+    let mut store = Store::open(database.path()).expect("open");
+
+    let partial_then_conflict = [
+        telegram_update(
+            0,
+            "telegram:2:update:0",
+            "telegram:2:chat",
+            TelegramStoreDisposition::Admitted { content: b"first" },
+        ),
+        telegram_update(
+            1,
+            "telegram:2:update:1",
+            "telegram:2:chat",
+            TelegramStoreDisposition::Admitted { content: b"second" },
+        ),
+    ];
+    let error = store
+        .ingest_telegram_batch(TelegramBatchIngestion {
+            bot_id: 2,
+            expected_offset: 0,
+            next_offset: 2,
+            received_ms: 2,
+            updates: &partial_then_conflict,
+        })
+        .expect_err("second disposition failure rolls back transaction");
+    assert_eq!(error.category(), "sqlite");
+    assert_eq!(store.telegram_offset(2).expect("no offset advance"), None);
+    assert_eq!(
+        store
+            .telegram_disposition(2, 0)
+            .expect_err("first disposition rolled back")
+            .category(),
+        "not_found"
+    );
+    drop(store);
+
+    let reopened = Store::open(database.path()).expect("reopen after failed transaction");
+    assert_eq!(reopened.telegram_offset(2).expect("still absent"), None);
+}
+
+#[test]
+fn telegram_commit_and_offset_survive_crash_boundary_and_bot_ids_isolate_updates() {
+    let database = PrivateDatabase::new();
+    {
+        let unopened = Store::open(database.path()).expect("open before simulated crash");
+        assert_eq!(unopened.telegram_offset(7).expect("no batch"), None);
+    }
+    let update_a = [telegram_update(
+        9,
+        "telegram:7:update:9",
+        "telegram:7:chat",
+        TelegramStoreDisposition::Admitted { content: b"a" },
+    )];
+    let update_b = [telegram_update(
+        9,
+        "telegram:8:update:9",
+        "telegram:8:chat",
+        TelegramStoreDisposition::Admitted { content: b"b" },
+    )];
+    let mut store = Store::open(database.path()).expect("reopen before commit");
+    for (bot_id, updates) in [(7, update_a.as_slice()), (8, update_b.as_slice())] {
+        store
+            .ingest_telegram_batch(TelegramBatchIngestion {
+                bot_id,
+                expected_offset: 0,
+                next_offset: 10,
+                received_ms: 3,
+                updates,
+            })
+            .expect("bot-scoped batch");
+    }
+    drop(store);
+
+    let reopened = Store::open(database.path()).expect("reopen after commit");
+    assert_eq!(reopened.telegram_offset(7).expect("bot 7"), Some(10));
+    assert_eq!(reopened.telegram_offset(8).expect("bot 8"), Some(10));
+    assert_eq!(
+        reopened
+            .telegram_disposition(7, 9)
+            .expect("bot 7 update")
+            .content,
+        Some(b"a".to_vec())
+    );
+    assert_eq!(
+        reopened
+            .telegram_disposition(8, 9)
+            .expect("bot 8 update")
+            .content,
+        Some(b"b".to_vec())
+    );
+}
+
+#[test]
+fn telegram_offset_regression_gap_and_unaccounted_advance_refuse() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let initial_gap = store
+        .ingest_telegram_batch(TelegramBatchIngestion {
+            bot_id: 7,
+            expected_offset: 1,
+            next_offset: 1,
+            received_ms: 1,
+            updates: &[],
+        })
+        .expect_err("initial state starts at zero");
+    assert_eq!(initial_gap.category(), "idempotency_conflict");
+
+    let updates = [telegram_update(
+        2,
+        "telegram:7:update:2",
+        "telegram:7:chat",
+        TelegramStoreDisposition::Admitted {
+            content: b"accepted",
+        },
+    )];
+    store
+        .ingest_telegram_batch(TelegramBatchIngestion {
+            bot_id: 7,
+            expected_offset: 0,
+            next_offset: 3,
+            received_ms: 2,
+            updates: &updates,
+        })
+        .expect("initial batch with platform ID gap");
+
+    for (expected_offset, next_offset, updates) in
+        [(0, 1, updates.as_slice()), (4, 4, &[][..]), (3, 4, &[][..])]
+    {
+        let error = store
+            .ingest_telegram_batch(TelegramBatchIngestion {
+                bot_id: 7,
+                expected_offset,
+                next_offset,
+                received_ms: 3,
+                updates,
+            })
+            .expect_err("offset refusal");
+        assert!(matches!(
+            error.category(),
+            "idempotency_conflict" | "invalid_field"
+        ));
+        assert_eq!(store.telegram_offset(7).expect("unchanged"), Some(3));
+    }
 }

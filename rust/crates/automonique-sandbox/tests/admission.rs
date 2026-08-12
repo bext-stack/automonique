@@ -4,9 +4,12 @@ use automonique_protocol::sandbox::{ImplementationDigest, WorkspaceContextHash};
 use automonique_sandbox::{
     AdmissionAttestation, AdmissionError, AdmissionPolicy, AdoptionOutcome, CompileError,
     CompileRequest, EvidenceSource, HostCapability, HostProbeReport, PlanUse, ProbedFeature,
-    ProviderEgressPolicy, QuarantineReason, ReuseDecision, StaticHostProbe, SupportedMode,
-    ToolEgressPolicy, adopt, compile, evaluate_reuse,
+    ProviderEgressPolicy, QuarantineReason, ReuseDecision, RunnerAdmissionError,
+    RunnerAdmissionSealer, RunnerBinding, StaticHostProbe, SupportedMode, ToolEgressPolicy, adopt,
+    compile, evaluate_reuse,
 };
+#[cfg(target_os = "linux")]
+use automonique_sandbox::{HostFeatureProbe, LinuxHostProbe};
 
 fn digest(seed: u8) -> String {
     format!("sha256:{seed:02x}{}", "00".repeat(31))
@@ -369,4 +372,58 @@ fn attestation_mismatch_quarantines_instead_of_adopting() {
         panic!("host report drift was adopted");
     };
     assert_eq!(quarantine.reason(), QuarantineReason::HostReportMismatch);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixed_linux_observation_is_independent_but_claims_no_enforcement_features() {
+    let first = LinuxHostProbe::new().probe().expect("fixed Linux probe");
+    let second = LinuxHostProbe::new()
+        .probe()
+        .expect("repeat fixed Linux probe");
+    assert_eq!(first.source(), EvidenceSource::IndependentlyObservedLinux);
+    assert_eq!(first.digest(), second.digest());
+    assert!(
+        HostCapability::ALL
+            .into_iter()
+            .all(|capability| first.implementation(capability).is_none()),
+        "process observations must not be promoted to enforcement features"
+    );
+
+    let error = compile(
+        request(
+            SupportedMode::WorkspaceOffline,
+            ProviderEgressPolicy::Denied,
+        ),
+        &policy(),
+        &LinuxHostProbe::new(),
+    )
+    .expect_err("observing the process is not workspace enforcement");
+    assert_eq!(
+        error,
+        CompileError::Admission(AdmissionError::MissingHostFeature(
+            HostCapability::PrivateMountView
+        ))
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_sealer_cannot_promote_a_caller_compiled_plan() {
+    let mut sealer = RunnerAdmissionSealer::observe().expect("observed sealer");
+    let observation_only = plan(
+        SupportedMode::WorkspaceOffline,
+        ProviderEgressPolicy::Denied,
+    );
+    let binding = RunnerBinding::new(
+        "runner-a",
+        "run-a",
+        implementation(HostCapability::IsolatedWritableWorkspace),
+        implementation(HostCapability::ProcessBoundary),
+    )
+    .expect("runner binding");
+    assert!(matches!(
+        sealer.issue(&observation_only, binding),
+        Err(RunnerAdmissionError::ObservationOnly)
+    ));
 }

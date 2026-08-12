@@ -1,15 +1,69 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 use automonique_protocol::admin::{
-    ADMIN_PROTOCOL, AdminCommand, AdminError, AdminInstanceId, AdminRequest, AdminResponse,
-    DaemonState, DaemonStatus, MAX_ADMIN_CANONICAL_BYTES, MAX_INSTANCE_ID_BYTES,
-    MAX_SYNTHETIC_KEY_BYTES, MAX_SYNTHETIC_SCOPE_BYTES, MAX_SYNTHETIC_TASK_BYTES,
+    ADMIN_PROTOCOL, AdminCommand, AdminError, AdminInstanceId, AdminReconciliationEvidence,
+    AdminRefusalCategory, AdminRequest, AdminResponse, DaemonState, DaemonStatus,
+    MAX_ADMIN_CANONICAL_BYTES, MAX_INSTANCE_ID_BYTES, MAX_SYNTHETIC_KEY_BYTES,
+    MAX_SYNTHETIC_SCOPE_BYTES, MAX_SYNTHETIC_TASK_BYTES, ReconciliationFailure,
     SyntheticSubmission,
 };
 use automonique_protocol::codec::{CodecError, FrameDecode, RequestId, decode_frame, encode_frame};
 
 fn request_id() -> RequestId {
     RequestId::new("req-admin-1").expect("valid request ID")
+}
+
+#[test]
+fn reconciliation_requests_and_receipts_are_exact_and_correlated() {
+    let inspect = AdminRequest::inspect_reconciliation(request_id(), 42).expect("inspect");
+    let bytes = inspect.to_message().expect("message").to_canonical_bytes();
+    let decoded = AdminRequest::from_canonical_bytes(&bytes).expect("decode inspect");
+    assert_eq!(decoded.command(), AdminCommand::InspectReconciliation);
+    assert_eq!(decoded.reconciliation_run_id(), Some(42));
+
+    let failure = ReconciliationFailure::new(
+        42,
+        "generation-old",
+        7,
+        3,
+        "operator:decision:42",
+        "execution_outcome_unknown",
+    )
+    .expect("failure");
+    let request = AdminRequest::fail_reconciliation(request_id(), failure.clone());
+    let decoded = AdminRequest::from_canonical_bytes(
+        &request.to_message().expect("message").to_canonical_bytes(),
+    )
+    .expect("decode failure");
+    assert_eq!(decoded.command(), AdminCommand::FailReconciliation);
+    assert_eq!(decoded.reconciliation_failure(), Some(&failure));
+
+    let evidence =
+        AdminReconciliationEvidence::new(42, "scope:one", "generation-old", 7, 3, false, 0)
+            .expect("evidence");
+    for response in [
+        AdminResponse::ReconciliationInspected {
+            request_id: request_id(),
+            evidence,
+        },
+        AdminResponse::ReconciliationFailed {
+            request_id: request_id(),
+            run_event_id: 10,
+            inbox_event_id: 11,
+            outbox_id: 12,
+            duplicate: false,
+        },
+        AdminResponse::Refused {
+            request_id: request_id(),
+            category: AdminRefusalCategory::new("stale_epoch").expect("category"),
+        },
+    ] {
+        let bytes = response.to_message().expect("message").to_canonical_bytes();
+        assert_eq!(
+            AdminResponse::from_canonical_bytes(&bytes).expect("decode"),
+            response
+        );
+    }
 }
 
 fn status() -> DaemonStatus {

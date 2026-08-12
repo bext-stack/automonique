@@ -2,19 +2,29 @@
 
 //! Fail-closed sandbox plan compilation for the first runner foundation.
 //!
-//! This crate compiles reviewed policy and a host feature report into a plan a
-//! runner may consume. It does **not** install or verify an operating-system
-//! boundary. In particular, a successful admission means “the reported host
-//! features match the pinned policy”, not “Landlock, namespaces or resource
-//! controls are active”. The runner must apply those controls and supply its
-//! own independently observed enforcement evidence in a later slice.
-//! The only policy and report constructors currently exposed accept
-//! caller-supplied inputs, so their plans remain observation-only and cannot be
-//! presented as production-runner admission.
+//! This crate compiles policy and host evidence into a plan a runner may
+//! consume. It does **not** install an operating-system boundary. The Linux
+//! probe added here reads fixed kernel-owned process interfaces without taking
+//! caller-supplied paths, but those observations do not prove that Landlock,
+//! mount isolation, or network denial has been applied to a future worker.
+//! Consequently every currently constructible plan remains observation-only.
+//!
+//! A sealed, runner-bound, one-use handoff is defined for a future enforcing
+//! runner. No public path can issue one from an observation-only plan. This
+//! keeps the binding and quarantine contract executable without mislabeling a
+//! host observation as enforcement.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(target_os = "linux")]
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::io::Read as _;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 
 use automonique_protocol::sandbox::{
     FilesystemAccess, ImplementationDigest, NetworkAccess, PolicyDigest, ProviderControlEgress,
@@ -246,6 +256,14 @@ impl HostProbeReport {
         })
     }
 
+    fn independently_observed_linux(observation: &[u8]) -> Self {
+        Self {
+            features: BTreeMap::new(),
+            digest: ReportDigest(hash_canonical(observation)),
+            source: EvidenceSource::IndependentlyObservedLinux,
+        }
+    }
+
     /// Lookup the reported implementation of a capability.
     #[must_use]
     pub fn implementation(&self, capability: HostCapability) -> Option<&ImplementationDigest> {
@@ -260,9 +278,8 @@ impl HostProbeReport {
 
     /// Provenance of this feature evidence.
     ///
-    /// Reports constructed by this first slice are caller-supplied fixture
-    /// inputs. They can be checked for internal consistency, but cannot make a
-    /// plan eligible for a production runner.
+    /// Caller-supplied fixtures and fixed-path Linux observations are distinct
+    /// evidence classes. Neither is an enforcement attestation.
     #[must_use]
     pub const fn source(&self) -> EvidenceSource {
         self.source
@@ -274,6 +291,22 @@ impl HostProbeReport {
 pub enum EvidenceSource {
     /// Supplied by the caller rather than independently observed or reviewed.
     CallerSupplied,
+    /// Read directly from fixed kernel-owned Linux process interfaces.
+    IndependentlyObservedLinux,
+    /// Pinned in reviewed product code rather than supplied at admission time.
+    EmbeddedReviewedPolicy,
+}
+
+impl EvidenceSource {
+    /// Stable spelling bound into plan and attestation digests.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CallerSupplied => "caller_supplied",
+            Self::IndependentlyObservedLinux => "independently_observed_linux",
+            Self::EmbeddedReviewedPolicy => "embedded_reviewed_policy",
+        }
+    }
 }
 
 /// A source of host feature evidence.
@@ -304,6 +337,31 @@ impl HostFeatureProbe for StaticHostProbe {
     }
 }
 
+/// Fixed-path, read-only observation of the current Linux process host.
+///
+/// The probe intentionally reports no [`HostCapability`]. Kernel release,
+/// namespace identities, security status, limits, and the current mount view
+/// are independently observed and digest-bound, but none proves that a future
+/// worker has had Landlock, private mounts, descriptor closure, or network
+/// denial applied. Admission therefore fails closed on the first required
+/// capability until a runner supplies real enforcement evidence.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxHostProbe;
+
+impl LinuxHostProbe {
+    /// Construct the fixed-path probe.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl HostFeatureProbe for LinuxHostProbe {
+    fn probe(&self) -> Result<HostProbeReport, ProbeError> {
+        independently_observe_linux()
+    }
+}
+
 /// Probe construction failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProbeError {
@@ -311,6 +369,12 @@ pub enum ProbeError {
     DuplicateFeature(HostCapability),
     /// An internally generated SHA-256 digest failed typed parsing.
     GeneratedDigestInvalid,
+    /// The independently observed probe is available only on Linux.
+    UnsupportedHost,
+    /// A fixed kernel-owned observation could not be read safely.
+    ObservationUnavailable(&'static str),
+    /// A fixed kernel-owned observation exceeded its defensive byte ceiling.
+    ObservationTooLarge(&'static str),
 }
 
 impl fmt::Display for ProbeError {
@@ -322,11 +386,130 @@ impl fmt::Display for ProbeError {
             Self::GeneratedDigestInvalid => {
                 formatter.write_str("generated admission digest was invalid")
             }
+            Self::UnsupportedHost => formatter.write_str("Linux host observation is unavailable"),
+            Self::ObservationUnavailable(observation) => {
+                write!(
+                    formatter,
+                    "Linux host observation {observation} is unavailable"
+                )
+            }
+            Self::ObservationTooLarge(observation) => {
+                write!(
+                    formatter,
+                    "Linux host observation {observation} exceeded its limit"
+                )
+            }
         }
     }
 }
 
 impl Error for ProbeError {}
+
+#[cfg(target_os = "linux")]
+fn independently_observe_linux() -> Result<HostProbeReport, ProbeError> {
+    const SMALL_LIMIT: usize = 64 * 1024;
+    const MOUNTINFO_LIMIT: usize = 1024 * 1024;
+
+    let os_release = read_fixed_linux_file(
+        Path::new("/proc/sys/kernel/osrelease"),
+        "kernel_release",
+        SMALL_LIMIT,
+    )?;
+    let status = read_fixed_linux_file(
+        Path::new("/proc/self/status"),
+        "process_status",
+        SMALL_LIMIT,
+    )?;
+    let limits = read_fixed_linux_file(
+        Path::new("/proc/self/limits"),
+        "process_limits",
+        SMALL_LIMIT,
+    )?;
+    let mountinfo = read_fixed_linux_file(
+        Path::new("/proc/self/mountinfo"),
+        "mount_view",
+        MOUNTINFO_LIMIT,
+    )?;
+    let security_status = selected_linux_status(&status)?;
+
+    let mut canonical = String::from("schema=automonique.sandbox.linux-observation/v1\n");
+    for (name, bytes) in [
+        ("kernel_release", os_release.as_slice()),
+        ("security_status", security_status.as_slice()),
+        ("process_limits", limits.as_slice()),
+        ("mount_view", mountinfo.as_slice()),
+    ] {
+        canonical.push_str("fact=");
+        canonical.push_str(name);
+        canonical.push('=');
+        canonical.push_str(&hash_canonical(bytes));
+        canonical.push('\n');
+    }
+    for (name, path) in [
+        ("mount_namespace", "/proc/self/ns/mnt"),
+        ("network_namespace", "/proc/self/ns/net"),
+        ("pid_namespace", "/proc/self/ns/pid"),
+        ("user_namespace", "/proc/self/ns/user"),
+    ] {
+        let identity =
+            std::fs::read_link(path).map_err(|_| ProbeError::ObservationUnavailable(name))?;
+        let identity = identity
+            .to_str()
+            .ok_or(ProbeError::ObservationUnavailable(name))?;
+        if identity.len() > 256 || identity.chars().any(char::is_control) {
+            return Err(ProbeError::ObservationUnavailable(name));
+        }
+        canonical.push_str("fact=");
+        canonical.push_str(name);
+        canonical.push('=');
+        canonical.push_str(&hash_canonical(identity.as_bytes()));
+        canonical.push('\n');
+    }
+    Ok(HostProbeReport::independently_observed_linux(
+        canonical.as_bytes(),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn independently_observe_linux() -> Result<HostProbeReport, ProbeError> {
+    Err(ProbeError::UnsupportedHost)
+}
+
+#[cfg(target_os = "linux")]
+fn read_fixed_linux_file(
+    path: &Path,
+    name: &'static str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ProbeError> {
+    let file = File::open(path).map_err(|_| ProbeError::ObservationUnavailable(name))?;
+    let limit = u64::try_from(max_bytes)
+        .map_err(|_| ProbeError::ObservationTooLarge(name))?
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    file.take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ProbeError::ObservationUnavailable(name))?;
+    if bytes.len() > max_bytes {
+        return Err(ProbeError::ObservationTooLarge(name));
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn selected_linux_status(status: &[u8]) -> Result<Vec<u8>, ProbeError> {
+    let status = std::str::from_utf8(status)
+        .map_err(|_| ProbeError::ObservationUnavailable("process_status"))?;
+    let mut selected = String::new();
+    for field in ["NoNewPrivs:", "Seccomp:", "Seccomp_filters:"] {
+        let line = status
+            .lines()
+            .find(|line| line.starts_with(field))
+            .ok_or(ProbeError::ObservationUnavailable("process_status"))?;
+        selected.push_str(line);
+        selected.push('\n');
+    }
+    Ok(selected.into_bytes())
+}
 
 /// Caller-supplied implementation pins for deterministic plan compilation.
 ///
@@ -427,10 +610,12 @@ pub struct AdmissionPlan {
     use_class: PlanUse,
     profile: SandboxProfile,
     policy_digest: PolicyDigest,
+    policy_source: EvidenceSource,
     workspace_context: WorkspaceContextHash,
     provider_egress: ProviderEgressPolicy,
     tool_egress: ToolEgressPolicy,
     host_report_digest: ReportDigest,
+    report_source: EvidenceSource,
     required_features: Vec<ProbedFeature>,
     digest: PlanDigest,
 }
@@ -458,6 +643,12 @@ impl AdmissionPlan {
     #[must_use]
     pub const fn policy_digest(&self) -> &PolicyDigest {
         &self.policy_digest
+    }
+
+    /// Provenance class of the exact policy bound into this plan.
+    #[must_use]
+    pub const fn policy_source(&self) -> EvidenceSource {
+        self.policy_source
     }
 
     /// Workspace security-context digest.
@@ -494,6 +685,12 @@ impl AdmissionPlan {
     #[must_use]
     pub const fn host_report_digest(&self) -> &ReportDigest {
         &self.host_report_digest
+    }
+
+    /// Provenance class of the host evidence bound into the plan.
+    #[must_use]
+    pub const fn report_source(&self) -> EvidenceSource {
+        self.report_source
     }
 
     /// Required features and their exact accepted implementations.
@@ -646,19 +843,20 @@ fn compile_report(
         tool_egress.protocol_value(),
     )
     .map_err(|error| AdmissionError::InvalidProfile(error.to_string()))?;
-    // Both report and policy constructors in this slice accept caller-supplied
-    // inputs. Matching those inputs proves deterministic compilation, not
-    // independent observation, policy review, or OS enforcement. Consequently
-    // neither supported mode is runner-admissible yet.
+    // Independent process observation is still not evidence that the runner
+    // applied a boundary to a worker. Consequently neither supported mode is
+    // runner-admissible in this slice.
     let use_class = PlanUse::ObservationOnly;
     let canonical = canonical_plan(CanonicalPlanParts {
         mode: request.mode,
         use_class,
         policy_digest: policy.digest(),
+        policy_source: policy.source(),
         workspace_context: &request.workspace_context,
         provider_egress: request.provider_egress,
         tool_egress,
         host_report: report.digest(),
+        report_source: report.source(),
         features: &admitted,
     });
     Ok(AdmissionPlan {
@@ -666,10 +864,12 @@ fn compile_report(
         use_class,
         profile,
         policy_digest: policy.digest.clone(),
+        policy_source: policy.source,
         workspace_context: request.workspace_context,
         provider_egress: request.provider_egress,
         tool_egress,
         host_report_digest: report.digest.clone(),
+        report_source: report.source,
         required_features: admitted,
         digest: PlanDigest(hash_canonical(canonical.as_bytes())),
     })
@@ -679,23 +879,27 @@ struct CanonicalPlanParts<'a> {
     mode: SupportedMode,
     use_class: PlanUse,
     policy_digest: &'a PolicyDigest,
+    policy_source: EvidenceSource,
     workspace_context: &'a WorkspaceContextHash,
     provider_egress: ProviderEgressPolicy,
     tool_egress: ToolEgressPolicy,
     host_report: &'a ReportDigest,
+    report_source: EvidenceSource,
     features: &'a [ProbedFeature],
 }
 
 fn canonical_plan(parts: CanonicalPlanParts<'_>) -> String {
     let mut value = format!(
-        "schema=automonique.sandbox.admission/v1\nmode={}\nuse={}\npolicy={}\nworkspace={}\nprovider_egress={}\ntool_egress={}\nhost_report={}\n",
+        "schema=automonique.sandbox.admission/v1\nmode={}\nuse={}\npolicy={}\npolicy_source={}\nworkspace={}\nprovider_egress={}\ntool_egress={}\nhost_report={}\nreport_source={}\n",
         parts.mode.as_str(),
         parts.use_class.as_str(),
         parts.policy_digest,
+        parts.policy_source.as_str(),
         parts.workspace_context,
         parts.provider_egress.as_str(),
         parts.tool_egress.as_str(),
         parts.host_report.as_str(),
+        parts.report_source.as_str(),
     );
     for feature in parts.features {
         value.push_str("feature=");
@@ -761,6 +965,18 @@ pub fn evaluate_reuse(existing: &AdmissionPlan, requested: &AdmissionPlan) -> Re
 pub enum AttestationEvidence {
     /// The admission compiler bound its own inputs; OS enforcement is unverified.
     AdmissionInputsOnly,
+    /// Fixed kernel-owned Linux process observations were bound; enforcement is
+    /// still unverified.
+    IndependentlyObservedLinux,
+}
+
+impl AttestationEvidence {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::AdmissionInputsOnly => "admission_inputs_only",
+            Self::IndependentlyObservedLinux => "independently_observed_linux",
+        }
+    }
 }
 
 /// Immutable evidence binding the exact plan and host report used at admission.
@@ -781,7 +997,14 @@ impl AdmissionAttestation {
         Self {
             plan_digest: plan.digest.clone(),
             host_report_digest: plan.host_report_digest.clone(),
-            evidence: AttestationEvidence::AdmissionInputsOnly,
+            evidence: match plan.report_source {
+                EvidenceSource::CallerSupplied | EvidenceSource::EmbeddedReviewedPolicy => {
+                    AttestationEvidence::AdmissionInputsOnly
+                }
+                EvidenceSource::IndependentlyObservedLinux => {
+                    AttestationEvidence::IndependentlyObservedLinux
+                }
+            },
         }
     }
 
@@ -890,5 +1113,571 @@ pub fn adopt(
     match reason {
         None => AdoptionOutcome::Adopted,
         Some(reason) => AdoptionOutcome::Quarantined(Quarantine { reason }),
+    }
+}
+
+const MAX_RUNNER_BINDING_ID_BYTES: usize = 160;
+static NEXT_SEALER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Exact runner, run, workspace root, and provider executable subject.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunnerBinding {
+    runner_id: String,
+    run_id: String,
+    workspace_root_digest: ImplementationDigest,
+    provider_executable_digest: ImplementationDigest,
+}
+
+impl RunnerBinding {
+    /// Construct a bounded runner subject.
+    pub fn new(
+        runner_id: impl Into<String>,
+        run_id: impl Into<String>,
+        workspace_root_digest: ImplementationDigest,
+        provider_executable_digest: ImplementationDigest,
+    ) -> Result<Self, RunnerBindingError> {
+        let runner_id = runner_id.into();
+        let run_id = run_id.into();
+        validate_runner_binding_id(&runner_id, "runner_id")?;
+        validate_runner_binding_id(&run_id, "run_id")?;
+        Ok(Self {
+            runner_id,
+            run_id,
+            workspace_root_digest,
+            provider_executable_digest,
+        })
+    }
+
+    /// Exact runner process identity selected by the control plane.
+    #[must_use]
+    pub fn runner_id(&self) -> &str {
+        &self.runner_id
+    }
+
+    /// Exact durable run identity.
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// Digest of the exact workspace root identity/manifest.
+    #[must_use]
+    pub const fn workspace_root_digest(&self) -> &ImplementationDigest {
+        &self.workspace_root_digest
+    }
+
+    /// Digest of the exact provider executable selected for the run.
+    #[must_use]
+    pub const fn provider_executable_digest(&self) -> &ImplementationDigest {
+        &self.provider_executable_digest
+    }
+}
+
+/// Invalid runner/run coordinate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunnerBindingError {
+    /// The named coordinate was empty, oversized, or contained a control.
+    InvalidField(&'static str),
+}
+
+impl fmt::Display for RunnerBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidField(field) => write!(formatter, "invalid runner binding field {field}"),
+        }
+    }
+}
+
+impl Error for RunnerBindingError {}
+
+/// In-process issuer for opaque runner handoffs.
+///
+/// Construction performs a fresh fixed-path Linux observation. The issuer
+/// cannot turn that observation into authority: [`Self::issue`] additionally
+/// requires a runner-admitted workspace-offline plan backed by reviewed policy
+/// and the exact same independently observed report. No public plan compiler in
+/// this slice produces such a plan.
+#[derive(Debug)]
+pub struct RunnerAdmissionSealer {
+    issuer_digest: String,
+    observed_report_digest: ReportDigest,
+    next_token_sequence: u64,
+}
+
+impl RunnerAdmissionSealer {
+    /// Independently observe the current Linux host and bind an issuer to it.
+    pub fn observe() -> Result<Self, ProbeError> {
+        let report = LinuxHostProbe::new().probe()?;
+        Self::from_observed_report(&report)
+    }
+
+    fn from_observed_report(report: &HostProbeReport) -> Result<Self, ProbeError> {
+        if report.source != EvidenceSource::IndependentlyObservedLinux {
+            return Err(ProbeError::ObservationUnavailable("evidence_source"));
+        }
+        let instance = NEXT_SEALER_ID.fetch_add(1, Ordering::Relaxed);
+        let issuer_digest = hash_canonical(
+            format!(
+                "schema=automonique.sandbox.runner-sealer/v1\nreport={}\nprocess={}\ninstance={}\n",
+                report.digest.as_str(),
+                std::process::id(),
+                instance
+            )
+            .as_bytes(),
+        );
+        Ok(Self {
+            issuer_digest,
+            observed_report_digest: report.digest.clone(),
+            next_token_sequence: 1,
+        })
+    }
+
+    /// Seal one exact, runner-bound handoff.
+    ///
+    /// This refuses every plan currently available from public compilation.
+    /// It becomes usable only when a later enforcing runner can produce an
+    /// admitted plan with reviewed policy and independently observed evidence.
+    pub fn issue(
+        &mut self,
+        plan: &AdmissionPlan,
+        binding: RunnerBinding,
+    ) -> Result<RunnerAdmissionToken, RunnerAdmissionError> {
+        if plan.use_class != PlanUse::AdmittedForRunner {
+            return Err(RunnerAdmissionError::ObservationOnly);
+        }
+        if plan.mode != SupportedMode::WorkspaceOffline {
+            return Err(RunnerAdmissionError::UnsupportedMode);
+        }
+        if plan.provider_egress != ProviderEgressPolicy::Denied
+            || plan.tool_egress != ToolEgressPolicy::Denied
+        {
+            return Err(RunnerAdmissionError::EgressNotDenied);
+        }
+        if plan.policy_source != EvidenceSource::EmbeddedReviewedPolicy {
+            return Err(RunnerAdmissionError::UnreviewedPolicy);
+        }
+        if plan.report_source != EvidenceSource::IndependentlyObservedLinux
+            || plan.host_report_digest != self.observed_report_digest
+        {
+            return Err(RunnerAdmissionError::ObservedReportMismatch);
+        }
+        let sequence = self.next_token_sequence;
+        self.next_token_sequence = self
+            .next_token_sequence
+            .checked_add(1)
+            .ok_or(RunnerAdmissionError::IssuerExhausted)?;
+        let attestation = AdmissionAttestation::record(plan);
+        let seal = runner_token_seal(&self.issuer_digest, sequence, plan, &binding, &attestation);
+        Ok(RunnerAdmissionToken {
+            issuer_digest: self.issuer_digest.clone(),
+            sequence,
+            plan_digest: plan.digest.clone(),
+            policy_digest: plan.policy_digest.clone(),
+            host_report_digest: plan.host_report_digest.clone(),
+            workspace_context: plan.workspace_context.clone(),
+            binding,
+            recorded_attestation: attestation,
+            seal,
+            used: false,
+        })
+    }
+
+    /// Consume one token for an exact subject and fresh observed attestation.
+    ///
+    /// Every attempt after seal validation consumes the token, including a
+    /// wrong-subject or stale-attestation attempt. The returned receipt states
+    /// only that the handoff matched; it is not OS enforcement evidence.
+    pub fn consume(
+        &self,
+        token: &mut RunnerAdmissionToken,
+        presented: &RunnerBinding,
+        observed: &AdmissionAttestation,
+    ) -> Result<RunnerAdmissionReceipt, RunnerAdmissionError> {
+        if token.used {
+            return Err(RunnerAdmissionError::AlreadyConsumed);
+        }
+        token.used = true;
+        if token.issuer_digest != self.issuer_digest
+            || token.seal != runner_token_seal_from_token(&self.issuer_digest, token)
+        {
+            return Err(RunnerAdmissionError::SealMismatch);
+        }
+        if token.binding.runner_id != presented.runner_id
+            || token.binding.run_id != presented.run_id
+        {
+            return Err(RunnerAdmissionError::WrongSubject);
+        }
+        if token.binding.workspace_root_digest != presented.workspace_root_digest {
+            return Err(RunnerAdmissionError::WorkspaceDigestMismatch);
+        }
+        if token.binding.provider_executable_digest != presented.provider_executable_digest {
+            return Err(RunnerAdmissionError::ProviderDigestMismatch);
+        }
+        if let AdoptionOutcome::Quarantined(quarantine) =
+            adopt(Some(&token.recorded_attestation), Some(observed))
+        {
+            return Err(RunnerAdmissionError::Quarantined(quarantine.reason()));
+        }
+        Ok(RunnerAdmissionReceipt {
+            plan_digest: token.plan_digest.clone(),
+            workspace_context: token.workspace_context.clone(),
+            binding: token.binding.clone(),
+        })
+    }
+}
+
+/// Opaque one-use handoff. It is deliberately neither cloneable nor serializable.
+pub struct RunnerAdmissionToken {
+    issuer_digest: String,
+    sequence: u64,
+    plan_digest: PlanDigest,
+    policy_digest: PolicyDigest,
+    host_report_digest: ReportDigest,
+    workspace_context: WorkspaceContextHash,
+    binding: RunnerBinding,
+    recorded_attestation: AdmissionAttestation,
+    seal: String,
+    used: bool,
+}
+
+impl fmt::Debug for RunnerAdmissionToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RunnerAdmissionToken")
+            .field("sequence", &self.sequence)
+            .field("plan_digest", &self.plan_digest)
+            .field("binding", &self.binding)
+            .field("used", &self.used)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Successful exact-token adoption by its selected runner.
+///
+/// This receipt is admission evidence only. It does not claim that the runner
+/// installed a mount, Landlock, network, process, or resource boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunnerAdmissionReceipt {
+    plan_digest: PlanDigest,
+    workspace_context: WorkspaceContextHash,
+    binding: RunnerBinding,
+}
+
+impl RunnerAdmissionReceipt {
+    /// Exact plan admitted for handoff.
+    #[must_use]
+    pub const fn plan_digest(&self) -> &PlanDigest {
+        &self.plan_digest
+    }
+
+    /// Exact workspace security context.
+    #[must_use]
+    pub const fn workspace_context(&self) -> &WorkspaceContextHash {
+        &self.workspace_context
+    }
+
+    /// Exact runner/run/workspace/provider subject.
+    #[must_use]
+    pub const fn binding(&self) -> &RunnerBinding {
+        &self.binding
+    }
+}
+
+/// Refusal to issue or consume runner admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunnerAdmissionError {
+    /// The plan carries no runner authority.
+    ObservationOnly,
+    /// Only the minimal workspace-offline mode is eligible.
+    UnsupportedMode,
+    /// Both provider and tool network must be denied.
+    EgressNotDenied,
+    /// Caller-supplied policy cannot mint runner authority.
+    UnreviewedPolicy,
+    /// The plan was not built from this issuer's independent observation.
+    ObservedReportMismatch,
+    /// The issuer exhausted its unique in-process sequence.
+    IssuerExhausted,
+    /// This exact token was already attempted.
+    AlreadyConsumed,
+    /// The token did not originate from this issuer or its immutable seal drifted.
+    SealMismatch,
+    /// Runner or durable run identity differed.
+    WrongSubject,
+    /// Workspace-root identity/manifest digest differed.
+    WorkspaceDigestMismatch,
+    /// Provider executable digest differed.
+    ProviderDigestMismatch,
+    /// Fresh observed evidence mismatched and execution is quarantined.
+    Quarantined(QuarantineReason),
+}
+
+impl fmt::Display for RunnerAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ObservationOnly => formatter.write_str("plan is observation-only"),
+            Self::UnsupportedMode => formatter.write_str("plan mode is not workspace-offline"),
+            Self::EgressNotDenied => formatter.write_str("runner admission requires denied egress"),
+            Self::UnreviewedPolicy => formatter.write_str("admission policy is caller-supplied"),
+            Self::ObservedReportMismatch => {
+                formatter.write_str("plan does not match this observed host report")
+            }
+            Self::IssuerExhausted => formatter.write_str("runner admission issuer is exhausted"),
+            Self::AlreadyConsumed => formatter.write_str("runner admission token was already used"),
+            Self::SealMismatch => formatter.write_str("runner admission token seal mismatched"),
+            Self::WrongSubject => formatter.write_str("runner admission subject mismatched"),
+            Self::WorkspaceDigestMismatch => {
+                formatter.write_str("workspace root digest mismatched")
+            }
+            Self::ProviderDigestMismatch => {
+                formatter.write_str("provider executable digest mismatched")
+            }
+            Self::Quarantined(reason) => {
+                write!(formatter, "runner admission quarantined: {reason:?}")
+            }
+        }
+    }
+}
+
+impl Error for RunnerAdmissionError {}
+
+fn validate_runner_binding_id(value: &str, field: &'static str) -> Result<(), RunnerBindingError> {
+    if value.is_empty()
+        || value.len() > MAX_RUNNER_BINDING_ID_BYTES
+        || value.chars().any(char::is_control)
+    {
+        Err(RunnerBindingError::InvalidField(field))
+    } else {
+        Ok(())
+    }
+}
+
+fn runner_token_seal(
+    issuer_digest: &str,
+    sequence: u64,
+    plan: &AdmissionPlan,
+    binding: &RunnerBinding,
+    attestation: &AdmissionAttestation,
+) -> String {
+    runner_token_seal_parts(RunnerTokenSealParts {
+        issuer_digest,
+        sequence,
+        plan_digest: &plan.digest,
+        policy_digest: &plan.policy_digest,
+        host_report_digest: &plan.host_report_digest,
+        workspace_context: &plan.workspace_context,
+        binding,
+        attestation,
+    })
+}
+
+fn runner_token_seal_from_token(issuer_digest: &str, token: &RunnerAdmissionToken) -> String {
+    runner_token_seal_parts(RunnerTokenSealParts {
+        issuer_digest,
+        sequence: token.sequence,
+        plan_digest: &token.plan_digest,
+        policy_digest: &token.policy_digest,
+        host_report_digest: &token.host_report_digest,
+        workspace_context: &token.workspace_context,
+        binding: &token.binding,
+        attestation: &token.recorded_attestation,
+    })
+}
+
+struct RunnerTokenSealParts<'a> {
+    issuer_digest: &'a str,
+    sequence: u64,
+    plan_digest: &'a PlanDigest,
+    policy_digest: &'a PolicyDigest,
+    host_report_digest: &'a ReportDigest,
+    workspace_context: &'a WorkspaceContextHash,
+    binding: &'a RunnerBinding,
+    attestation: &'a AdmissionAttestation,
+}
+
+fn runner_token_seal_parts(parts: RunnerTokenSealParts<'_>) -> String {
+    hash_canonical(
+        format!(
+            "schema=automonique.sandbox.runner-token/v1\nissuer={}\nsequence={}\nplan={}\npolicy={}\nreport={}\nworkspace_context={}\nrunner={}\nrun={}\nworkspace_root={}\nprovider_executable={}\nattested_plan={}\nattested_report={}\nattestation_evidence={}\n",
+            parts.issuer_digest,
+            parts.sequence,
+            parts.plan_digest,
+            parts.policy_digest,
+            parts.host_report_digest.as_str(),
+            parts.workspace_context,
+            parts.binding.runner_id,
+            parts.binding.run_id,
+            parts.binding.workspace_root_digest,
+            parts.binding.provider_executable_digest,
+            parts.attestation.plan_digest,
+            parts.attestation.host_report_digest.as_str(),
+            parts.attestation.evidence.as_str(),
+        )
+        .as_bytes(),
+    )
+}
+
+#[cfg(test)]
+mod runner_admission_tests {
+    use super::*;
+
+    fn typed_digest(seed: u8) -> ImplementationDigest {
+        ImplementationDigest::parse(&format!("sha256:{seed:02x}{}", "00".repeat(31)))
+            .expect("test digest")
+    }
+
+    fn observed_report() -> HostProbeReport {
+        let mut report = HostProbeReport::new(HostCapability::ALL.into_iter().enumerate().map(
+            |(index, capability)| ProbedFeature::new(capability, typed_digest(index as u8 + 1)),
+        ))
+        .expect("feature report");
+        report.source = EvidenceSource::IndependentlyObservedLinux;
+        report.digest = ReportDigest(hash_canonical(
+            format!("test-observed-report={}\n", report.digest.as_str()).as_bytes(),
+        ));
+        report
+    }
+
+    fn runner_plan(report: &HostProbeReport) -> AdmissionPlan {
+        let mut policy = AdmissionPolicy::new(HostCapability::ALL.into_iter().enumerate().map(
+            |(index, capability)| ProbedFeature::new(capability, typed_digest(index as u8 + 1)),
+        ))
+        .expect("policy");
+        policy.source = EvidenceSource::EmbeddedReviewedPolicy;
+        let mut plan = compile_report(
+            CompileRequest {
+                mode: SupportedMode::WorkspaceOffline,
+                policy_digest: policy.digest.clone(),
+                workspace_context: WorkspaceContextHash::parse(&format!(
+                    "sha256:41{}",
+                    "00".repeat(31)
+                ))
+                .expect("workspace context"),
+                provider_egress: ProviderEgressPolicy::Denied,
+            },
+            &policy,
+            report,
+        )
+        .expect("future runner plan inputs");
+        plan.use_class = PlanUse::AdmittedForRunner;
+        refresh_plan_digest(&mut plan);
+        plan
+    }
+
+    fn refresh_plan_digest(plan: &mut AdmissionPlan) {
+        let canonical = canonical_plan(CanonicalPlanParts {
+            mode: plan.mode,
+            use_class: plan.use_class,
+            policy_digest: &plan.policy_digest,
+            policy_source: plan.policy_source,
+            workspace_context: &plan.workspace_context,
+            provider_egress: plan.provider_egress,
+            tool_egress: plan.tool_egress,
+            host_report: &plan.host_report_digest,
+            report_source: plan.report_source,
+            features: &plan.required_features,
+        });
+        plan.digest = PlanDigest(hash_canonical(canonical.as_bytes()));
+    }
+
+    fn binding(runner: &str, run: &str, workspace_seed: u8, provider_seed: u8) -> RunnerBinding {
+        RunnerBinding::new(
+            runner,
+            run,
+            typed_digest(workspace_seed),
+            typed_digest(provider_seed),
+        )
+        .expect("binding")
+    }
+
+    fn fixture() -> (RunnerAdmissionSealer, AdmissionPlan, RunnerBinding) {
+        let report = observed_report();
+        let sealer = RunnerAdmissionSealer::from_observed_report(&report).expect("sealer");
+        let plan = runner_plan(&report);
+        let binding = binding("runner-a", "run-a", 31, 32);
+        (sealer, plan, binding)
+    }
+
+    #[test]
+    fn token_is_single_use_and_bound_to_exact_subject() {
+        let (mut sealer, plan, exact) = fixture();
+        let observed = AdmissionAttestation::record(&plan);
+        let mut token = sealer.issue(&plan, exact.clone()).expect("issued");
+        let receipt = sealer
+            .consume(&mut token, &exact, &observed)
+            .expect("consumed once");
+        assert_eq!(receipt.binding(), &exact);
+        assert_eq!(
+            sealer.consume(&mut token, &exact, &observed),
+            Err(RunnerAdmissionError::AlreadyConsumed)
+        );
+
+        let mut token = sealer.issue(&plan, exact.clone()).expect("issued");
+        let wrong_subject = binding("runner-b", "run-a", 31, 32);
+        assert_eq!(
+            sealer.consume(&mut token, &wrong_subject, &observed),
+            Err(RunnerAdmissionError::WrongSubject)
+        );
+        assert_eq!(
+            sealer.consume(&mut token, &exact, &observed),
+            Err(RunnerAdmissionError::AlreadyConsumed),
+            "a failed widening attempt also burns the token"
+        );
+    }
+
+    #[test]
+    fn workspace_and_provider_digest_widening_are_refused() {
+        let (mut sealer, plan, exact) = fixture();
+        let observed = AdmissionAttestation::record(&plan);
+        let mut workspace_token = sealer.issue(&plan, exact.clone()).expect("issued");
+        let wrong_workspace = binding("runner-a", "run-a", 33, 32);
+        assert_eq!(
+            sealer.consume(&mut workspace_token, &wrong_workspace, &observed),
+            Err(RunnerAdmissionError::WorkspaceDigestMismatch)
+        );
+
+        let mut provider_token = sealer.issue(&plan, exact).expect("issued");
+        let wrong_provider = binding("runner-a", "run-a", 31, 34);
+        assert_eq!(
+            sealer.consume(&mut provider_token, &wrong_provider, &observed),
+            Err(RunnerAdmissionError::ProviderDigestMismatch)
+        );
+    }
+
+    #[test]
+    fn observed_attestation_drift_quarantines() {
+        let (mut sealer, plan, exact) = fixture();
+        let mut changed = AdmissionAttestation::record(&plan);
+        changed.host_report_digest = ReportDigest(hash_canonical(b"changed observed report"));
+        let mut token = sealer.issue(&plan, exact.clone()).expect("issued");
+        assert_eq!(
+            sealer.consume(&mut token, &exact, &changed),
+            Err(RunnerAdmissionError::Quarantined(
+                QuarantineReason::HostReportMismatch
+            ))
+        );
+    }
+
+    #[test]
+    fn observation_only_and_caller_policy_cannot_issue() {
+        let report = observed_report();
+        let mut sealer =
+            RunnerAdmissionSealer::from_observed_report(&report).expect("observed sealer");
+        let mut plan = runner_plan(&report);
+        let exact = binding("runner-a", "run-a", 31, 32);
+        plan.use_class = PlanUse::ObservationOnly;
+        refresh_plan_digest(&mut plan);
+        assert!(matches!(
+            sealer.issue(&plan, exact.clone()),
+            Err(RunnerAdmissionError::ObservationOnly)
+        ));
+
+        plan.use_class = PlanUse::AdmittedForRunner;
+        plan.policy_source = EvidenceSource::CallerSupplied;
+        refresh_plan_digest(&mut plan);
+        assert!(matches!(
+            sealer.issue(&plan, exact),
+            Err(RunnerAdmissionError::UnreviewedPolicy)
+        ));
     }
 }

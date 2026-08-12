@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 
-const USAGE: &[u8] = b"usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique shutdown\n";
+const USAGE: &[u8] = b"usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique shutdown\n";
 
 fn private_runtime() -> tempfile::TempDir {
     let runtime = tempfile::tempdir().expect("runtime");

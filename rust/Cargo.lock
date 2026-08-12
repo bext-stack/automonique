@@ -32,6 +32,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "automonique-agents"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "automonique-cli"
 version = "0.1.0"
 dependencies = [
@@ -100,6 +111,14 @@ dependencies = [
  "nix",
  "rusqlite",
  "tempfile",
+]
+
+[[package]]
+name = "automonique-transports"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

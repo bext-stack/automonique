@@ -6,8 +6,8 @@
 //! server authenticates the Unix peer before it decodes a frame; putting a
 //! bearer secret in the payload would make that boundary weaker and easier to
 //! leak. Version one exposes only a read-only status query and an orderly
-//! shutdown request, plus a local no-effect synthetic intake used to exercise
-//! the durable control plane without granting provider or transport authority.
+//! shutdown request, a local no-effect synthetic intake, and an explicit
+//! fail-only reconciliation path for an ambiguously claimed synthetic run.
 
 use std::error::Error;
 use std::fmt;
@@ -38,6 +38,12 @@ pub const MAX_SYNTHETIC_KEY_BYTES: usize = 128;
 
 /// Maximum task bytes accepted by the local synthetic intake.
 pub const MAX_SYNTHETIC_TASK_BYTES: usize = 8 * 1024;
+
+/// Maximum byte length of reconciliation coordinates and reasons.
+pub const MAX_RECONCILIATION_FIELD_BYTES: usize = 256;
+
+/// Maximum stable refusal-category bytes returned to an authenticated client.
+pub const MAX_ADMIN_REFUSAL_CATEGORY_BYTES: usize = 64;
 
 /// A refusal while constructing or decoding an administration message.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,6 +184,10 @@ pub enum AdminCommand {
     Status,
     /// Durably enqueue a no-effect synthetic work item.
     SubmitSynthetic,
+    /// Inspect the durable evidence for one ambiguously claimed run.
+    InspectReconciliation,
+    /// Explicitly fail one exact old run observation under the daemon's fence.
+    FailReconciliation,
     /// Stop intake and request an orderly shutdown.
     Shutdown,
 }
@@ -187,8 +197,124 @@ impl AdminCommand {
         match self {
             Self::Status => "status",
             Self::SubmitSynthetic => "submit_synthetic",
+            Self::InspectReconciliation => "inspect_reconciliation",
+            Self::FailReconciliation => "fail_reconciliation",
             Self::Shutdown => "shutdown",
         }
+    }
+}
+
+/// Exact old-run coordinates carried into a fail-only reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconciliationFailure {
+    run_id: u64,
+    expected_generation_id: String,
+    expected_lease_epoch: u64,
+    expected_revision: u64,
+    decision_key: String,
+    reason: String,
+}
+
+impl ReconciliationFailure {
+    /// Construct a bounded compare-and-set decision.
+    pub fn new(
+        run_id: u64,
+        expected_generation_id: impl Into<String>,
+        expected_lease_epoch: u64,
+        expected_revision: u64,
+        decision_key: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<Self, AdminError> {
+        let expected_generation_id = expected_generation_id.into();
+        let decision_key = decision_key.into();
+        let reason = reason.into();
+        if run_id == 0
+            || expected_lease_epoch == 0
+            || expected_revision == 0
+            || !valid_coordinate(&expected_generation_id, MAX_RECONCILIATION_FIELD_BYTES)
+            || !valid_coordinate(&decision_key, MAX_RECONCILIATION_FIELD_BYTES)
+            || !valid_coordinate(&reason, MAX_RECONCILIATION_FIELD_BYTES)
+        {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self {
+            run_id,
+            expected_generation_id,
+            expected_lease_epoch,
+            expected_revision,
+            decision_key,
+            reason,
+        })
+    }
+
+    #[must_use]
+    pub const fn run_id(&self) -> u64 {
+        self.run_id
+    }
+    #[must_use]
+    pub fn expected_generation_id(&self) -> &str {
+        &self.expected_generation_id
+    }
+    #[must_use]
+    pub const fn expected_lease_epoch(&self) -> u64 {
+        self.expected_lease_epoch
+    }
+    #[must_use]
+    pub const fn expected_revision(&self) -> u64 {
+        self.expected_revision
+    }
+    #[must_use]
+    pub fn decision_key(&self) -> &str {
+        &self.decision_key
+    }
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    fn to_body(&self) -> Result<JsonValue, AdminError> {
+        Ok(JsonValue::Object(vec![
+            (
+                "decision_key".to_owned(),
+                JsonValue::String(self.decision_key.clone()),
+            ),
+            (
+                "expected_generation_id".to_owned(),
+                JsonValue::String(self.expected_generation_id.clone()),
+            ),
+            (
+                "expected_lease_epoch".to_owned(),
+                integer("expected_lease_epoch", self.expected_lease_epoch)?,
+            ),
+            (
+                "expected_revision".to_owned(),
+                integer("expected_revision", self.expected_revision)?,
+            ),
+            ("reason".to_owned(), JsonValue::String(self.reason.clone())),
+            ("run_id".to_owned(), integer("run_id", self.run_id)?),
+        ]))
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        exact_fields(
+            body,
+            &[
+                "decision_key",
+                "expected_generation_id",
+                "expected_lease_epoch",
+                "expected_revision",
+                "reason",
+                "run_id",
+            ],
+        )?;
+        Self::new(
+            unsigned(body, "run_id")?,
+            required_body_string(body, "expected_generation_id")?,
+            unsigned(body, "expected_lease_epoch")?,
+            unsigned(body, "expected_revision")?,
+            required_body_string(body, "decision_key")?,
+            required_body_string(body, "reason")?,
+        )
     }
 }
 
@@ -276,6 +402,8 @@ pub struct AdminRequest {
     request_id: RequestId,
     command: AdminCommand,
     submission: Option<SyntheticSubmission>,
+    reconciliation_run_id: Option<u64>,
+    reconciliation_failure: Option<ReconciliationFailure>,
 }
 
 impl AdminRequest {
@@ -286,6 +414,8 @@ impl AdminRequest {
             request_id,
             command,
             submission: None,
+            reconciliation_run_id: None,
+            reconciliation_failure: None,
         }
     }
 
@@ -296,6 +426,37 @@ impl AdminRequest {
             request_id,
             command: AdminCommand::SubmitSynthetic,
             submission: Some(submission),
+            reconciliation_run_id: None,
+            reconciliation_failure: None,
+        }
+    }
+
+    /// Construct a read-only reconciliation inspection.
+    pub fn inspect_reconciliation(request_id: RequestId, run_id: u64) -> Result<Self, AdminError> {
+        if run_id == 0 {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self {
+            request_id,
+            command: AdminCommand::InspectReconciliation,
+            submission: None,
+            reconciliation_run_id: Some(run_id),
+            reconciliation_failure: None,
+        })
+    }
+
+    /// Construct an exact fail-only reconciliation decision.
+    #[must_use]
+    pub const fn fail_reconciliation(
+        request_id: RequestId,
+        failure: ReconciliationFailure,
+    ) -> Self {
+        Self {
+            request_id,
+            command: AdminCommand::FailReconciliation,
+            submission: None,
+            reconciliation_run_id: None,
+            reconciliation_failure: Some(failure),
         }
     }
 
@@ -317,6 +478,16 @@ impl AdminRequest {
         self.submission.as_ref()
     }
 
+    #[must_use]
+    pub const fn reconciliation_run_id(&self) -> Option<u64> {
+        self.reconciliation_run_id
+    }
+
+    #[must_use]
+    pub const fn reconciliation_failure(&self) -> Option<&ReconciliationFailure> {
+        self.reconciliation_failure.as_ref()
+    }
+
     /// Encode this request as a canonical local-protocol message.
     ///
     /// # Errors
@@ -324,9 +495,20 @@ impl AdminRequest {
     /// Returns a shared codec error only if a compile-time protocol literal no
     /// longer satisfies the shared envelope grammar.
     pub fn to_message(&self) -> Result<Message, AdminError> {
-        let body = match (self.command, &self.submission) {
-            (AdminCommand::SubmitSynthetic, Some(submission)) => submission.to_body(),
-            (AdminCommand::Status | AdminCommand::Shutdown, None) => JsonValue::Object(Vec::new()),
+        let body = match (
+            self.command,
+            &self.submission,
+            self.reconciliation_run_id,
+            &self.reconciliation_failure,
+        ) {
+            (AdminCommand::SubmitSynthetic, Some(submission), None, None) => submission.to_body(),
+            (AdminCommand::InspectReconciliation, None, Some(run_id), None) => {
+                JsonValue::Object(vec![("run_id".to_owned(), integer("run_id", run_id)?)])
+            }
+            (AdminCommand::FailReconciliation, None, None, Some(failure)) => failure.to_body()?,
+            (AdminCommand::Status | AdminCommand::Shutdown, None, None, None) => {
+                JsonValue::Object(Vec::new())
+            }
             _ => return Err(AdminError::InvalidBody),
         };
         Ok(Message::new(
@@ -347,6 +529,17 @@ impl AdminRequest {
             "submit_synthetic" => Ok(Self::submit(
                 message.envelope().request_id().clone(),
                 SyntheticSubmission::from_body(message.body())?,
+            )),
+            "inspect_reconciliation" => {
+                exact_fields(message.body(), &["run_id"])?;
+                Self::inspect_reconciliation(
+                    message.envelope().request_id().clone(),
+                    unsigned(message.body(), "run_id")?,
+                )
+            }
+            "fail_reconciliation" => Ok(Self::fail_reconciliation(
+                message.envelope().request_id().clone(),
+                ReconciliationFailure::from_body(message.body())?,
             )),
             "status" | "shutdown" => {
                 if !matches!(message.body(), JsonValue::Object(entries) if entries.is_empty()) {
@@ -544,6 +737,162 @@ impl DaemonStatus {
     }
 }
 
+/// Bounded durable summary used to authorize a later exact reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminReconciliationEvidence {
+    run_id: u64,
+    scope: String,
+    generation_id: String,
+    lease_epoch: u64,
+    run_revision: u64,
+    terminal_payload_present: bool,
+    outbox_count: u64,
+}
+
+/// Redacted stable refusal category for a correlated admin operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRefusalCategory(String);
+
+impl AdminRefusalCategory {
+    pub fn new(value: impl Into<String>) -> Result<Self, AdminError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > MAX_ADMIN_REFUSAL_CATEGORY_BYTES
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AdminReconciliationEvidence {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        run_id: u64,
+        scope: impl Into<String>,
+        generation_id: impl Into<String>,
+        lease_epoch: u64,
+        run_revision: u64,
+        terminal_payload_present: bool,
+        outbox_count: u64,
+    ) -> Result<Self, AdminError> {
+        let scope = scope.into();
+        let generation_id = generation_id.into();
+        if run_id == 0
+            || lease_epoch == 0
+            || run_revision == 0
+            || !valid_coordinate(&scope, MAX_SYNTHETIC_SCOPE_BYTES)
+            || !valid_coordinate(&generation_id, MAX_RECONCILIATION_FIELD_BYTES)
+        {
+            return Err(AdminError::InvalidBody);
+        }
+        i64::try_from(outbox_count).map_err(|_| AdminError::CounterOutOfRange {
+            field: "outbox_count",
+        })?;
+        Ok(Self {
+            run_id,
+            scope,
+            generation_id,
+            lease_epoch,
+            run_revision,
+            terminal_payload_present,
+            outbox_count,
+        })
+    }
+
+    #[must_use]
+    pub const fn run_id(&self) -> u64 {
+        self.run_id
+    }
+    #[must_use]
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+    #[must_use]
+    pub fn generation_id(&self) -> &str {
+        &self.generation_id
+    }
+    #[must_use]
+    pub const fn lease_epoch(&self) -> u64 {
+        self.lease_epoch
+    }
+    #[must_use]
+    pub const fn run_revision(&self) -> u64 {
+        self.run_revision
+    }
+    #[must_use]
+    pub const fn terminal_payload_present(&self) -> bool {
+        self.terminal_payload_present
+    }
+    #[must_use]
+    pub const fn outbox_count(&self) -> u64 {
+        self.outbox_count
+    }
+
+    fn to_body(&self) -> Result<JsonValue, AdminError> {
+        Ok(JsonValue::Object(vec![
+            (
+                "generation_id".to_owned(),
+                JsonValue::String(self.generation_id.clone()),
+            ),
+            (
+                "lease_epoch".to_owned(),
+                integer("lease_epoch", self.lease_epoch)?,
+            ),
+            (
+                "outbox_count".to_owned(),
+                integer("outbox_count", self.outbox_count)?,
+            ),
+            ("run_id".to_owned(), integer("run_id", self.run_id)?),
+            (
+                "run_revision".to_owned(),
+                integer("run_revision", self.run_revision)?,
+            ),
+            ("scope".to_owned(), JsonValue::String(self.scope.clone())),
+            (
+                "terminal_payload_present".to_owned(),
+                JsonValue::Bool(self.terminal_payload_present),
+            ),
+        ]))
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        exact_fields(
+            body,
+            &[
+                "generation_id",
+                "lease_epoch",
+                "outbox_count",
+                "run_id",
+                "run_revision",
+                "scope",
+                "terminal_payload_present",
+            ],
+        )?;
+        let terminal_payload_present = match body.get("terminal_payload_present") {
+            Some(JsonValue::Bool(value)) => *value,
+            _ => return Err(AdminError::InvalidBody),
+        };
+        Self::new(
+            unsigned(body, "run_id")?,
+            required_body_string(body, "scope")?,
+            required_body_string(body, "generation_id")?,
+            unsigned(body, "lease_epoch")?,
+            unsigned(body, "run_revision")?,
+            terminal_payload_present,
+            unsigned(body, "outbox_count")?,
+        )
+    }
+}
+
 /// A correlated response from the local daemon.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdminResponse {
@@ -563,6 +912,24 @@ pub enum AdminResponse {
         /// Whether an identical stable-key submission already existed.
         duplicate: bool,
     },
+    /// Durable reconciliation evidence for one run.
+    ReconciliationInspected {
+        request_id: RequestId,
+        evidence: AdminReconciliationEvidence,
+    },
+    /// One explicit failure decision was committed or exactly replayed.
+    ReconciliationFailed {
+        request_id: RequestId,
+        run_event_id: u64,
+        inbox_event_id: u64,
+        outbox_id: u64,
+        duplicate: bool,
+    },
+    /// The request was definitely refused before a successful mutation.
+    Refused {
+        request_id: RequestId,
+        category: AdminRefusalCategory,
+    },
     /// The daemon accepted an orderly-shutdown request and closed intake.
     ShutdownAccepted {
         /// Correlation identifier from the request.
@@ -577,6 +944,9 @@ impl AdminResponse {
         match self {
             Self::Status { request_id, .. }
             | Self::SyntheticAccepted { request_id, .. }
+            | Self::ReconciliationInspected { request_id, .. }
+            | Self::ReconciliationFailed { request_id, .. }
+            | Self::Refused { request_id, .. }
             | Self::ShutdownAccepted { request_id } => request_id,
         }
     }
@@ -603,6 +973,44 @@ impl AdminResponse {
                     ("duplicate".to_owned(), JsonValue::Bool(*duplicate)),
                     ("inbox_id".to_owned(), integer("inbox_id", *inbox_id)?),
                 ]),
+            )),
+            Self::ReconciliationInspected {
+                request_id,
+                evidence,
+            } => Ok(Message::new(
+                envelope(request_id.clone(), "reconciliation_inspected")?,
+                evidence.to_body()?,
+            )),
+            Self::ReconciliationFailed {
+                request_id,
+                run_event_id,
+                inbox_event_id,
+                outbox_id,
+                duplicate,
+            } => Ok(Message::new(
+                envelope(request_id.clone(), "reconciliation_failed")?,
+                JsonValue::Object(vec![
+                    ("duplicate".to_owned(), JsonValue::Bool(*duplicate)),
+                    (
+                        "inbox_event_id".to_owned(),
+                        integer("inbox_event_id", *inbox_event_id)?,
+                    ),
+                    ("outbox_id".to_owned(), integer("outbox_id", *outbox_id)?),
+                    (
+                        "run_event_id".to_owned(),
+                        integer("run_event_id", *run_event_id)?,
+                    ),
+                ]),
+            )),
+            Self::Refused {
+                request_id,
+                category,
+            } => Ok(Message::new(
+                envelope(request_id.clone(), "refused")?,
+                JsonValue::Object(vec![(
+                    "category".to_owned(),
+                    JsonValue::String(category.as_str().to_owned()),
+                )]),
             )),
             Self::ShutdownAccepted { request_id } => Ok(Message::new(
                 envelope(request_id.clone(), "shutdown_accepted")?,
@@ -634,6 +1042,37 @@ impl AdminResponse {
                     request_id,
                     inbox_id: unsigned(message.body(), "inbox_id")?,
                     duplicate,
+                })
+            }
+            "reconciliation_inspected" => Ok(Self::ReconciliationInspected {
+                request_id,
+                evidence: AdminReconciliationEvidence::from_body(message.body())?,
+            }),
+            "reconciliation_failed" => {
+                exact_fields(
+                    message.body(),
+                    &["duplicate", "inbox_event_id", "outbox_id", "run_event_id"],
+                )?;
+                let duplicate = match message.body().get("duplicate") {
+                    Some(JsonValue::Bool(value)) => *value,
+                    _ => return Err(AdminError::InvalidBody),
+                };
+                Ok(Self::ReconciliationFailed {
+                    request_id,
+                    run_event_id: unsigned(message.body(), "run_event_id")?,
+                    inbox_event_id: unsigned(message.body(), "inbox_event_id")?,
+                    outbox_id: unsigned(message.body(), "outbox_id")?,
+                    duplicate,
+                })
+            }
+            "refused" => {
+                exact_fields(message.body(), &["category"])?;
+                Ok(Self::Refused {
+                    request_id,
+                    category: AdminRefusalCategory::new(required_body_string(
+                        message.body(),
+                        "category",
+                    )?)?,
                 })
             }
             "shutdown_accepted" => {

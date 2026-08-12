@@ -34,7 +34,7 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
-const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique shutdown\n";
+const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique shutdown\n";
 
 #[derive(Clone)]
 enum Command {
@@ -47,6 +47,16 @@ enum Command {
     Submit {
         scope: OsString,
         idempotency_key: OsString,
+    },
+    ReconcileInspect {
+        run_id: OsString,
+    },
+    ReconcileFail {
+        run_id: OsString,
+        generation_id: OsString,
+        epoch: OsString,
+        revision: OsString,
+        decision_key: OsString,
     },
     Shutdown,
 }
@@ -79,8 +89,8 @@ where
     let command = arguments.next();
     let first = arguments.next();
     let second = arguments.next();
-    let extra = arguments.next();
-    let command = match (command.as_deref(), first, second, extra) {
+    let third = arguments.next();
+    let command = match (command.as_deref(), first, second, third) {
         (Some(command), None, None, None) if command == "doctor" => Command::Doctor { json: false },
         (Some(command), Some(flag), None, None) if command == "doctor" && flag == "--json" => {
             Command::Doctor { json: true }
@@ -93,6 +103,32 @@ where
             Command::Submit {
                 scope,
                 idempotency_key,
+            }
+        }
+        (Some(command), Some(action), Some(run_id), None)
+            if command == "reconcile" && action == "inspect" =>
+        {
+            Command::ReconcileInspect { run_id }
+        }
+        (Some(command), Some(action), Some(run_id), Some(generation_id))
+            if command == "reconcile" && action == "fail" =>
+        {
+            let epoch = arguments.next();
+            let revision = arguments.next();
+            let decision_key = arguments.next();
+            let extra = arguments.next();
+            match (epoch, revision, decision_key, extra) {
+                (Some(epoch), Some(revision), Some(decision_key), None) => Command::ReconcileFail {
+                    run_id,
+                    generation_id,
+                    epoch,
+                    revision,
+                    decision_key,
+                },
+                _ => {
+                    let _ = stderr.write_all(USAGE.as_bytes());
+                    return 2;
+                }
             }
         }
         (Some(command), None, None, None) if command == "shutdown" => Command::Shutdown,
@@ -116,6 +152,27 @@ where
                 scope,
                 idempotency_key,
                 &mut input,
+                &mut stdout,
+                &mut stderr,
+            );
+        }
+        Command::ReconcileInspect { run_id } => {
+            return admin_reconcile_inspect(runtime.as_deref(), run_id, &mut stdout, &mut stderr);
+        }
+        Command::ReconcileFail {
+            run_id,
+            generation_id,
+            epoch,
+            revision,
+            decision_key,
+        } => {
+            return admin_reconcile_fail(
+                runtime.as_deref(),
+                run_id,
+                generation_id,
+                epoch,
+                revision,
+                decision_key,
                 &mut stdout,
                 &mut stderr,
             );
@@ -144,6 +201,117 @@ where
         0
     } else {
         1
+    }
+}
+
+fn parse_u64_coordinate(value: OsString, field: &str) -> Result<u64, String> {
+    value
+        .into_string()
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("invalid_{field}"))
+}
+
+fn admin_reconcile_inspect<W: Write, E: Write>(
+    runtime: Option<&OsStr>,
+    run_id: OsString,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> u8 {
+    let run_id = match parse_u64_coordinate(run_id, "run_id") {
+        Ok(value) => value,
+        Err(category) => {
+            let _ = writeln!(stderr, "automonique reconcile refused: {category}");
+            return 2;
+        }
+    };
+    match admin_client::request(runtime, admin_client::Operation::InspectReconciliation(run_id)) {
+        Ok(automonique_protocol::admin::AdminResponse::ReconciliationInspected { evidence, .. }) => {
+            if writeln!(
+                stdout,
+                "Automonique reconciliation: run_id={} scope={} generation={} epoch={} revision={} terminal_payload={} outbox_count={}",
+                evidence.run_id(),
+                evidence.scope(),
+                evidence.generation_id(),
+                evidence.lease_epoch(),
+                evidence.run_revision(),
+                evidence.terminal_payload_present(),
+                evidence.outbox_count(),
+            ).is_ok() { 0 } else { 1 }
+        }
+        Ok(_) => {
+            let _ = stderr.write_all(b"automonique reconcile refused: response_mismatch\n");
+            1
+        }
+        Err(error) => {
+            let _ = writeln!(stderr, "automonique reconcile refused: {}", error.category());
+            1
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admin_reconcile_fail<W: Write, E: Write>(
+    runtime: Option<&OsStr>,
+    run_id: OsString,
+    generation_id: OsString,
+    epoch: OsString,
+    revision: OsString,
+    decision_key: OsString,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> u8 {
+    let parsed = (
+        parse_u64_coordinate(run_id, "run_id"),
+        parse_u64_coordinate(epoch, "epoch"),
+        parse_u64_coordinate(revision, "revision"),
+        generation_id.into_string(),
+        decision_key.into_string(),
+    );
+    let (Ok(run_id), Ok(epoch), Ok(revision), Ok(generation_id), Ok(decision_key)) = parsed else {
+        let _ = stderr.write_all(b"automonique reconcile refused: invalid_coordinates\n");
+        return 2;
+    };
+    let failure = match automonique_protocol::admin::ReconciliationFailure::new(
+        run_id,
+        generation_id,
+        epoch,
+        revision,
+        decision_key,
+        "execution_outcome_unknown",
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = writeln!(
+                stderr,
+                "automonique reconcile refused: {}",
+                error.category()
+            );
+            return 2;
+        }
+    };
+    match admin_client::request(runtime, admin_client::Operation::FailReconciliation(failure)) {
+        Ok(automonique_protocol::admin::AdminResponse::ReconciliationFailed {
+            run_event_id,
+            inbox_event_id,
+            outbox_id,
+            duplicate,
+            ..
+        }) => {
+            if writeln!(
+                stdout,
+                "Automonique reconciliation failed: run_event_id={run_event_id} inbox_event_id={inbox_event_id} outbox_id={outbox_id} duplicate={duplicate}"
+            ).is_ok() { 0 } else { 1 }
+        }
+        Ok(_) => {
+            let _ = stderr.write_all(b"automonique reconcile refused: response_mismatch\n");
+            1
+        }
+        Err(error) => {
+            let _ = writeln!(stderr, "automonique reconcile refused: {}", error.category());
+            1
+        }
     }
 }
 

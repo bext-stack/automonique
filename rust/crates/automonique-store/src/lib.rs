@@ -21,13 +21,15 @@ use rusqlite::{
 };
 
 /// The only database schema this build can read and write.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 /// SQLite lock contention is bounded rather than waiting indefinitely.
 pub const BUSY_TIMEOUT: Duration = Duration::from_millis(2_000);
 
 const MAX_ID_BYTES: usize = 256;
 const MAX_KIND_BYTES: usize = 128;
 const MAX_PAYLOAD_BYTES: usize = 1_048_576;
+const MAX_TELEGRAM_BATCH_UPDATES: usize = 100;
+const MAX_TELEGRAM_CONTENT_BYTES: usize = 16 * 1024;
 
 #[cfg(test)]
 const SCHEMA_V1: &str = r#"
@@ -215,6 +217,52 @@ WHERE r.state IN ('succeeded', 'failed');
 CREATE UNIQUE INDEX runs_one_per_inbox ON runs(inbox_id);
 "#;
 
+const MIGRATE_V2_TO_V3: &str = r#"
+CREATE TABLE telegram_offsets (
+    bot_id INTEGER PRIMARY KEY CHECK (bot_id > 0),
+    next_offset BLOB NOT NULL CHECK (
+        typeof(next_offset) = 'blob' AND length(next_offset) = 8
+    ),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    updated_ms INTEGER NOT NULL CHECK (updated_ms >= 0)
+) STRICT;
+
+CREATE TABLE telegram_ingress (
+    bot_id INTEGER NOT NULL REFERENCES telegram_offsets(bot_id),
+    update_id BLOB NOT NULL CHECK (
+        typeof(update_id) = 'blob' AND length(update_id) = 8
+    ),
+    source_key TEXT NOT NULL UNIQUE,
+    scope TEXT NOT NULL,
+    disposition TEXT NOT NULL CHECK (
+        disposition IN ('admitted', 'denied', 'ignored_unsupported')
+    ),
+    content BLOB,
+    received_ms INTEGER NOT NULL CHECK (received_ms >= 0),
+    PRIMARY KEY (bot_id, update_id),
+    CHECK (
+        (disposition = 'admitted' AND content IS NOT NULL
+         AND length(content) > 0 AND length(content) <= 16384)
+        OR
+        (disposition != 'admitted' AND content IS NULL)
+    )
+) STRICT;
+
+CREATE TABLE telegram_batches (
+    bot_id INTEGER NOT NULL REFERENCES telegram_offsets(bot_id),
+    expected_offset BLOB NOT NULL CHECK (
+        typeof(expected_offset) = 'blob' AND length(expected_offset) = 8
+    ),
+    next_offset BLOB NOT NULL CHECK (
+        typeof(next_offset) = 'blob' AND length(next_offset) = 8
+    ),
+    disposition_count INTEGER NOT NULL CHECK (disposition_count > 0),
+    received_ms INTEGER NOT NULL CHECK (received_ms >= 0),
+    PRIMARY KEY (bot_id, expected_offset),
+    UNIQUE (bot_id, next_offset)
+) STRICT;
+"#;
+
 /// A durable store error with stable refusal categories.
 #[derive(Debug)]
 pub enum StoreError {
@@ -375,6 +423,55 @@ pub struct InboxReceipt {
     pub duplicate: bool,
 }
 
+/// Content-bearing or content-free durable Telegram disposition.
+///
+/// Denied and unsupported inputs cannot carry content in this type, preventing
+/// their payload from crossing the store adapter seam.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TelegramStoreDisposition<'a> {
+    /// An allowlisted text or callback payload.
+    Admitted { content: &'a [u8] },
+    /// A well-formed input from a principal outside the exact allowlist.
+    Denied,
+    /// A fresh update outside the supported input shapes.
+    IgnoredUnsupported,
+}
+
+/// One parsed Telegram update prepared for durable ingestion.
+pub struct TelegramStoreUpdate<'a> {
+    pub update_id: u64,
+    pub source_key: &'a str,
+    pub scope: &'a str,
+    pub disposition: TelegramStoreDisposition<'a>,
+}
+
+/// Compare-and-set ingestion of one complete parsed Telegram batch.
+pub struct TelegramBatchIngestion<'a> {
+    pub bot_id: i64,
+    pub expected_offset: u64,
+    pub next_offset: u64,
+    pub received_ms: i64,
+    pub updates: &'a [TelegramStoreUpdate<'a>],
+}
+
+/// Durable result of an atomic Telegram batch ingestion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TelegramBatchReceipt {
+    pub next_offset: u64,
+    pub disposition_count: usize,
+    pub duplicate: bool,
+}
+
+/// Content-minimizing persisted Telegram disposition for inspection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TelegramDispositionSnapshot {
+    pub source_key: String,
+    pub scope: String,
+    pub disposition: String,
+    pub content: Option<Vec<u8>>,
+    pub received_ms: i64,
+}
+
 /// One request to claim serialized work for a scope.
 pub struct WorkClaim<'a> {
     pub claim_key: &'a str,
@@ -420,6 +517,79 @@ pub struct ClaimedInbox {
     pub scope: String,
     pub payload: Vec<u8>,
     pub received_ms: i64,
+}
+
+/// Closed operator decision for one ambiguous running item.
+///
+/// There is deliberately no requeue decision: missing durable outcome rows do
+/// not prove that an external execution did not begin before a crash.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconciliationDecision<'a> {
+    /// Record an explicit failed outcome and one fake reconciliation receipt.
+    Fail { reason: &'a str },
+}
+
+/// Exact observation an operator must carry into a reconciliation decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconciliationRunState {
+    Running,
+    Failed,
+    Abandoned,
+}
+
+/// Closed inbox state observed during reconciliation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconciliationInboxState {
+    Pending,
+    Claimed,
+    Completed,
+    Failed,
+}
+
+/// Exact observation an operator must carry into a reconciliation decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconciliationEvidence {
+    pub run_id: i64,
+    pub inbox_id: i64,
+    pub transport: String,
+    pub transport_key: String,
+    pub scope: String,
+    pub inbox_state: ReconciliationInboxState,
+    pub inbox_revision: u64,
+    pub claimed_run_id: Option<i64>,
+    pub run_state: ReconciliationRunState,
+    pub run_revision: u64,
+    pub generation_id: String,
+    pub lease_epoch: u64,
+    pub lock_generation_id: Option<String>,
+    pub lock_epoch: Option<u64>,
+    pub lock_expires_ms: Option<i64>,
+    pub terminal_payload_present: bool,
+    pub outbox_intent_key: Option<String>,
+    pub outbox_count: u64,
+}
+
+/// Compare-and-set reconciliation request.
+pub struct ReconciliationRequest<'a> {
+    pub run_id: i64,
+    pub authority_generation_id: &'a str,
+    pub authority_holder_id: &'a str,
+    pub authority_lease_epoch: u64,
+    pub expected_generation_id: &'a str,
+    pub expected_lease_epoch: u64,
+    pub expected_revision: u64,
+    pub decision_key: &'a str,
+    pub now_ms: i64,
+    pub decision: ReconciliationDecision<'a>,
+}
+
+/// Durable identities committed by one reconciliation decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReconciliationReceipt {
+    pub run_event_id: i64,
+    pub inbox_event_id: i64,
+    pub outbox_id: i64,
+    pub duplicate: bool,
 }
 
 /// Closed terminal states accepted by the durable store.
@@ -809,6 +979,171 @@ impl Store {
         })
     }
 
+    /// Atomically persist every disposition in a parsed Telegram batch and
+    /// advance that bot's offset only after all rows are durable.
+    pub fn ingest_telegram_batch(
+        &mut self,
+        batch: TelegramBatchIngestion<'_>,
+    ) -> Result<TelegramBatchReceipt, StoreError> {
+        validate_telegram_batch(&batch)?;
+        let expected = telegram_offset_bytes(batch.expected_offset);
+        let next = telegram_offset_bytes(batch.next_offset);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row(
+                "SELECT next_offset FROM telegram_offsets WHERE bot_id = ?1",
+                [batch.bot_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|value| telegram_offset_from_bytes(&value))
+            .transpose()?;
+
+        match existing {
+            Some(current) if current == batch.next_offset => {
+                verify_telegram_retry(&transaction, &batch)?;
+                transaction.commit()?;
+                return Ok(TelegramBatchReceipt {
+                    next_offset: batch.next_offset,
+                    disposition_count: batch.updates.len(),
+                    duplicate: true,
+                });
+            }
+            Some(current) if current != batch.expected_offset => {
+                return Err(StoreError::IdempotencyConflict("telegram_offset"));
+            }
+            Some(_) => {}
+            None if batch.expected_offset != 0 => {
+                return Err(StoreError::IdempotencyConflict("telegram_offset"));
+            }
+            None => {
+                transaction.execute(
+                    "INSERT INTO telegram_offsets
+                     (bot_id, next_offset, revision, updated_ms)
+                     VALUES (?1, ?2, 1, ?3)",
+                    params![batch.bot_id, &expected[..], batch.received_ms],
+                )?;
+            }
+        }
+
+        for update in batch.updates {
+            if transaction
+                .query_row(
+                    "SELECT 1 FROM telegram_ingress
+                     WHERE bot_id = ?1 AND update_id = ?2",
+                    params![batch.bot_id, &telegram_offset_bytes(update.update_id)[..]],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+            {
+                return Err(StoreError::IdempotencyConflict("telegram_update"));
+            }
+            if transaction
+                .query_row(
+                    "SELECT 1 FROM telegram_ingress WHERE source_key = ?1",
+                    [update.source_key],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+            {
+                return Err(StoreError::IdempotencyConflict("telegram_source_key"));
+            }
+            let (disposition, content) = telegram_disposition_parts(update.disposition);
+            transaction.execute(
+                "INSERT INTO telegram_ingress
+                 (bot_id, update_id, source_key, scope, disposition, content, received_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    batch.bot_id,
+                    &telegram_offset_bytes(update.update_id)[..],
+                    update.source_key,
+                    update.scope,
+                    disposition,
+                    content,
+                    batch.received_ms
+                ],
+            )?;
+        }
+
+        if batch.next_offset != batch.expected_offset {
+            transaction.execute(
+                "INSERT INTO telegram_batches
+                 (bot_id, expected_offset, next_offset, disposition_count, received_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    batch.bot_id,
+                    &expected[..],
+                    &next[..],
+                    to_db_u64(batch.updates.len() as u64, "telegram_disposition_count")?,
+                    batch.received_ms
+                ],
+            )?;
+            let changed = transaction.execute(
+                "UPDATE telegram_offsets
+                 SET next_offset = ?3, revision = revision + 1, updated_ms = ?4
+                 WHERE bot_id = ?1 AND next_offset = ?2",
+                params![batch.bot_id, &expected[..], &next[..], batch.received_ms],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::IdempotencyConflict("telegram_offset"));
+            }
+        }
+        transaction.commit()?;
+        Ok(TelegramBatchReceipt {
+            next_offset: batch.next_offset,
+            disposition_count: batch.updates.len(),
+            duplicate: false,
+        })
+    }
+
+    /// Read one bot's last atomically committed Telegram offset.
+    pub fn telegram_offset(&self, bot_id: i64) -> Result<Option<u64>, StoreError> {
+        if bot_id <= 0 {
+            return Err(StoreError::InvalidField("telegram_bot_id"));
+        }
+        self.connection
+            .query_row(
+                "SELECT next_offset FROM telegram_offsets WHERE bot_id = ?1",
+                [bot_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|value| telegram_offset_from_bytes(&value))
+            .transpose()
+    }
+
+    /// Inspect one durable Telegram disposition without exposing unrelated rows.
+    pub fn telegram_disposition(
+        &self,
+        bot_id: i64,
+        update_id: u64,
+    ) -> Result<TelegramDispositionSnapshot, StoreError> {
+        if bot_id <= 0 {
+            return Err(StoreError::InvalidField("telegram_bot_id"));
+        }
+        self.connection
+            .query_row(
+                "SELECT source_key, scope, disposition, content, received_ms
+                 FROM telegram_ingress WHERE bot_id = ?1 AND update_id = ?2",
+                params![bot_id, &telegram_offset_bytes(update_id)[..]],
+                |row| {
+                    Ok(TelegramDispositionSnapshot {
+                        source_key: row.get(0)?,
+                        scope: row.get(1)?,
+                        disposition: row.get(2)?,
+                        content: row.get(3)?,
+                        received_ms: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound("telegram_disposition"))
+    }
+
     /// Atomically create a running run and acquire its exclusive scope lock.
     pub fn claim_work(&mut self, claim: WorkClaim<'_>) -> Result<RunClaim, StoreError> {
         validate_id(claim.claim_key, "claim_key")?;
@@ -1115,6 +1450,283 @@ impl Store {
             .ok_or(StoreError::NotFound("claimed_inbox"))?;
         transaction.commit()?;
         Ok(claimed)
+    }
+
+    /// Inspect exact durable evidence for one running or reconciled item.
+    pub fn inspect_reconciliation(
+        &mut self,
+        run_id: i64,
+    ) -> Result<ReconciliationEvidence, StoreError> {
+        if run_id <= 0 {
+            return Err(StoreError::InvalidField("run_id"));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let row = transaction
+            .query_row(
+                "SELECT r.run_id, i.inbox_id, i.transport, i.transport_key, r.scope,
+                        i.state, i.revision, i.claimed_run_id,
+                        r.state, r.revision, r.generation_id, r.lease_epoch,
+                        w.generation_id, w.lease_epoch, w.expires_ms,
+                        r.terminal_payload IS NOT NULL, r.outbox_intent_key,
+                        (SELECT count(*) FROM outbox o
+                         JOIN domain_events e ON e.event_id = o.event_id
+                         WHERE e.aggregate_kind = 'run'
+                           AND e.aggregate_id = CAST(r.run_id AS TEXT))
+                 FROM runs r JOIN inbox i ON i.inbox_id = r.inbox_id
+                 LEFT JOIN work_locks w ON w.run_id = r.run_id
+                 WHERE r.run_id = ?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<i64>>(13)?,
+                        row.get::<_, Option<i64>>(14)?,
+                        row.get::<_, bool>(15)?,
+                        row.get::<_, Option<String>>(16)?,
+                        row.get::<_, i64>(17)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound("run"))?;
+        let inbox_state = match row.5.as_str() {
+            "pending" => ReconciliationInboxState::Pending,
+            "claimed" => ReconciliationInboxState::Claimed,
+            "completed" => ReconciliationInboxState::Completed,
+            "failed" => ReconciliationInboxState::Failed,
+            _ => return Err(StoreError::MigrationInvariant("unknown_inbox_state")),
+        };
+        let run_state = match row.8.as_str() {
+            "running" => ReconciliationRunState::Running,
+            "failed" => ReconciliationRunState::Failed,
+            "abandoned" => ReconciliationRunState::Abandoned,
+            _ => return Err(StoreError::AlreadyTerminal),
+        };
+        let evidence = ReconciliationEvidence {
+            run_id: row.0,
+            inbox_id: row.1,
+            transport: row.2,
+            transport_key: row.3,
+            scope: row.4,
+            inbox_state,
+            inbox_revision: from_db_u64(row.6, "inbox_revision")?,
+            claimed_run_id: row.7,
+            run_state,
+            run_revision: from_db_u64(row.9, "run_revision")?,
+            generation_id: row.10,
+            lease_epoch: from_db_u64(row.11, "lease_epoch")?,
+            lock_generation_id: row.12,
+            lock_epoch: row
+                .13
+                .map(|epoch| from_db_u64(epoch, "lock_epoch"))
+                .transpose()?,
+            lock_expires_ms: row.14,
+            terminal_payload_present: row.15,
+            outbox_intent_key: row.16,
+            outbox_count: from_db_u64(row.17, "outbox_count")?,
+        };
+        transaction.commit()?;
+        Ok(evidence)
+    }
+
+    /// Resolve one exact ambiguous running item through a closed decision.
+    ///
+    /// The expected fields compare-and-set the old run, while the authority
+    /// fields must name the current live lease in this same transaction.
+    pub fn reconcile_run(
+        &mut self,
+        request: ReconciliationRequest<'_>,
+    ) -> Result<ReconciliationReceipt, StoreError> {
+        if request.run_id <= 0 {
+            return Err(StoreError::InvalidField("run_id"));
+        }
+        validate_id(request.authority_generation_id, "authority_generation_id")?;
+        validate_id(request.authority_holder_id, "authority_holder_id")?;
+        validate_id(request.expected_generation_id, "expected_generation_id")?;
+        validate_id(request.decision_key, "decision_key")?;
+        validate_time(request.now_ms)?;
+        let ReconciliationDecision::Fail { reason } = request.decision;
+        validate_id(reason, "reconciliation_reason")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_live_lease(
+            &transaction,
+            request.authority_generation_id,
+            request.authority_holder_id,
+            request.authority_lease_epoch,
+            request.now_ms,
+        )?;
+        let run = transaction
+            .query_row(
+                "SELECT r.state, r.revision, r.generation_id, r.lease_epoch,
+                        r.terminal_payload, r.outbox_intent_key, r.inbox_id, r.scope,
+                        w.generation_id, w.lease_epoch, w.expires_ms
+                 FROM runs r LEFT JOIN work_locks w ON w.run_id = r.run_id
+                 WHERE r.run_id = ?1",
+                [request.run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound("run"))?;
+        let revision = from_db_u64(run.1, "run_revision")?;
+        if run.0 != "running" {
+            let receipt = reconciliation_retry_receipt(&transaction, &request, &run)?;
+            transaction.commit()?;
+            return Ok(receipt);
+        }
+        if run.2 != request.expected_generation_id
+            || from_db_u64(run.3, "lease_epoch")? != request.expected_lease_epoch
+            || run.8.as_deref() != Some(request.expected_generation_id)
+            || run
+                .9
+                .map(|epoch| from_db_u64(epoch, "lock_epoch"))
+                .transpose()?
+                != Some(request.expected_lease_epoch)
+        {
+            return Err(StoreError::StaleEpoch);
+        }
+        if revision != request.expected_revision {
+            return Err(StoreError::IdempotencyConflict("expected_revision"));
+        }
+        if run.10.is_none_or(|expires_ms| expires_ms > request.now_ms) {
+            return Err(StoreError::LeaseHeld);
+        }
+        let outcome_rows: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM domain_events e
+                LEFT JOIN outbox o ON o.event_id = e.event_id
+                WHERE e.aggregate_kind = 'run' AND e.aggregate_id = ?1
+                  AND (e.kind != 'run.claimed' OR o.outbox_id IS NOT NULL)
+             )",
+            [request.run_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if run.4.is_some() || run.5.is_some() || outcome_rows {
+            return Err(StoreError::AlreadyTerminal);
+        }
+        let next_revision = revision
+            .checked_add(1)
+            .ok_or(StoreError::InvalidField("run_revision"))?;
+        let inbox_revision: i64 = transaction
+            .query_row(
+                "SELECT revision FROM inbox WHERE inbox_id = ?1 AND state = 'claimed'
+                 AND claimed_run_id = ?2",
+                params![run.6, request.run_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::MigrationInvariant(
+                "reconciliation_inbox_not_claimed",
+            ))?;
+        let next_inbox_revision = from_db_u64(inbox_revision, "inbox_revision")?
+            .checked_add(1)
+            .ok_or(StoreError::InvalidField("inbox_revision"))?;
+
+        let payload = reason.as_bytes();
+
+        let run_changed = transaction.execute(
+            "UPDATE runs SET state = ?2, revision = ?3, finished_ms = ?4,
+             terminal_payload = ?5, outbox_intent_key = ?6 WHERE run_id = ?1",
+            params![
+                request.run_id,
+                "failed",
+                to_db_u64(next_revision, "run_revision")?,
+                request.now_ms,
+                payload,
+                request.decision_key
+            ],
+        )?;
+        if run_changed != 1 {
+            return Err(StoreError::IdempotencyConflict("run_state"));
+        }
+        let inbox_changed = transaction.execute(
+            "UPDATE inbox SET state = ?2, claimed_run_id = NULL, revision = ?3
+             WHERE inbox_id = ?1 AND state = 'claimed' AND claimed_run_id = ?4",
+            params![
+                run.6,
+                "failed",
+                to_db_u64(next_inbox_revision, "inbox_revision")?,
+                request.run_id
+            ],
+        )?;
+        if inbox_changed != 1 {
+            return Err(StoreError::IdempotencyConflict("inbox_state"));
+        }
+        let run_event_id = append_event(
+            &transaction,
+            "run",
+            &request.run_id.to_string(),
+            next_revision,
+            request.now_ms,
+            "run.reconciliation_failed",
+            payload,
+        )?;
+        let inbox_event_id = append_event(
+            &transaction,
+            "inbox",
+            &run.6.to_string(),
+            next_inbox_revision,
+            request.now_ms,
+            "inbox.reconciliation_failed",
+            payload,
+        )?;
+        let insert = transaction.execute(
+            "INSERT INTO outbox
+             (intent_key, event_id, kind, payload, state, created_ms)
+             VALUES (?1, ?2, 'fake.reconciliation.receipt', ?3, 'pending', ?4)",
+            params![request.decision_key, run_event_id, payload, request.now_ms],
+        );
+        if let Err(error) = insert {
+            if error
+                .sqlite_error()
+                .is_some_and(|code| code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)
+            {
+                return Err(StoreError::OutboxConflict);
+            }
+            return Err(StoreError::Sqlite(error));
+        }
+        let outbox_id = transaction.last_insert_rowid();
+        let lock_deleted =
+            transaction.execute("DELETE FROM work_locks WHERE run_id = ?1", [request.run_id])?;
+        if lock_deleted != 1 {
+            return Err(StoreError::StaleEpoch);
+        }
+        transaction.commit()?;
+        Ok(ReconciliationReceipt {
+            run_event_id,
+            inbox_event_id,
+            outbox_id,
+            duplicate: false,
+        })
     }
 
     /// Recover the exact committed event/outbox receipt for a terminal run.
@@ -1512,7 +2124,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch(MIGRATE_V1_TO_V2)?;
-            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.pragma_update(None, "user_version", 2)?;
             transaction.commit()?;
             Ok(())
         })();
@@ -1526,7 +2138,10 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
         if foreign_key_violation {
             return Err(StoreError::MigrationInvariant("foreign_key_check"));
         }
-        return Ok(());
+        return migrate_v2_to_v3(connection);
+    }
+    if version == 2 {
+        return migrate_v2_to_v3(connection);
     }
     if version != 0 {
         return Err(StoreError::SchemaVersion {
@@ -1547,9 +2162,156 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(SCHEMA_V2)?;
+    transaction.execute_batch(MIGRATE_V2_TO_V3)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
+}
+
+fn migrate_v2_to_v3(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(MIGRATE_V2_TO_V3)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn validate_telegram_batch(batch: &TelegramBatchIngestion<'_>) -> Result<(), StoreError> {
+    if batch.bot_id <= 0 {
+        return Err(StoreError::InvalidField("telegram_bot_id"));
+    }
+    validate_time(batch.received_ms)?;
+    if batch.updates.len() > MAX_TELEGRAM_BATCH_UPDATES || batch.next_offset < batch.expected_offset
+    {
+        return Err(StoreError::InvalidField("telegram_batch"));
+    }
+    if batch.updates.is_empty() {
+        if batch.next_offset != batch.expected_offset {
+            return Err(StoreError::InvalidField("telegram_batch"));
+        }
+        return Ok(());
+    }
+    let mut previous = None;
+    for update in batch.updates {
+        validate_id(update.source_key, "telegram_source_key")?;
+        validate_id(update.scope, "telegram_scope")?;
+        if update.source_key != format!("telegram:{}:update:{}", batch.bot_id, update.update_id)
+            || !update
+                .scope
+                .starts_with(&format!("telegram:{}:", batch.bot_id))
+        {
+            return Err(StoreError::InvalidField("telegram_binding"));
+        }
+        if update.update_id < batch.expected_offset
+            || update.update_id >= batch.next_offset
+            || previous.is_some_and(|prior| update.update_id <= prior)
+        {
+            return Err(StoreError::InvalidField("telegram_update_id"));
+        }
+        if let TelegramStoreDisposition::Admitted { content } = update.disposition
+            && (content.is_empty() || content.len() > MAX_TELEGRAM_CONTENT_BYTES)
+        {
+            return Err(StoreError::InvalidField("telegram_content"));
+        }
+        previous = Some(update.update_id);
+    }
+    if previous.and_then(|value| value.checked_add(1)) != Some(batch.next_offset) {
+        return Err(StoreError::InvalidField("telegram_next_offset"));
+    }
+    Ok(())
+}
+
+fn verify_telegram_retry(
+    transaction: &Transaction<'_>,
+    batch: &TelegramBatchIngestion<'_>,
+) -> Result<(), StoreError> {
+    if batch.updates.is_empty() {
+        if batch.expected_offset == batch.next_offset {
+            return Ok(());
+        }
+        return Err(StoreError::IdempotencyConflict("telegram_batch"));
+    }
+    let metadata_matches: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM telegram_batches
+            WHERE bot_id = ?1 AND expected_offset = ?2 AND next_offset = ?3
+              AND disposition_count = ?4 AND received_ms = ?5
+         )",
+        params![
+            batch.bot_id,
+            &telegram_offset_bytes(batch.expected_offset)[..],
+            &telegram_offset_bytes(batch.next_offset)[..],
+            to_db_u64(batch.updates.len() as u64, "telegram_disposition_count")?,
+            batch.received_ms
+        ],
+        |row| row.get(0),
+    )?;
+    if !metadata_matches {
+        return Err(StoreError::IdempotencyConflict("telegram_batch"));
+    }
+    let count: i64 = transaction.query_row(
+        "SELECT count(*) FROM telegram_ingress
+         WHERE bot_id = ?1 AND update_id >= ?2 AND update_id < ?3",
+        params![
+            batch.bot_id,
+            &telegram_offset_bytes(batch.expected_offset)[..],
+            &telegram_offset_bytes(batch.next_offset)[..]
+        ],
+        |row| row.get(0),
+    )?;
+    if from_db_u64(count, "telegram_disposition_count")? != batch.updates.len() as u64 {
+        return Err(StoreError::IdempotencyConflict("telegram_batch"));
+    }
+    for update in batch.updates {
+        let stored = transaction
+            .query_row(
+                "SELECT source_key, scope, disposition, content, received_ms
+                 FROM telegram_ingress WHERE bot_id = ?1 AND update_id = ?2",
+                params![batch.bot_id, &telegram_offset_bytes(update.update_id)[..]],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::IdempotencyConflict("telegram_batch"))?;
+        let (disposition, content) = telegram_disposition_parts(update.disposition);
+        if stored.0 != update.source_key
+            || stored.1 != update.scope
+            || stored.2 != disposition
+            || stored.3.as_deref() != content
+            || stored.4 != batch.received_ms
+        {
+            return Err(StoreError::IdempotencyConflict("telegram_batch"));
+        }
+    }
+    Ok(())
+}
+
+const fn telegram_disposition_parts(
+    disposition: TelegramStoreDisposition<'_>,
+) -> (&'static str, Option<&[u8]>) {
+    match disposition {
+        TelegramStoreDisposition::Admitted { content } => ("admitted", Some(content)),
+        TelegramStoreDisposition::Denied => ("denied", None),
+        TelegramStoreDisposition::IgnoredUnsupported => ("ignored_unsupported", None),
+    }
+}
+
+const fn telegram_offset_bytes(offset: u64) -> [u8; 8] {
+    offset.to_be_bytes()
+}
+
+fn telegram_offset_from_bytes(bytes: &[u8]) -> Result<u64, StoreError> {
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| StoreError::MigrationInvariant("telegram_offset_width"))?;
+    Ok(u64::from_be_bytes(bytes))
 }
 
 fn validate_id(value: &str, field: &'static str) -> Result<(), StoreError> {
@@ -1710,6 +2472,78 @@ fn terminal_receipt(
         .ok_or(StoreError::AlreadyTerminal)
 }
 
+type ReconciliationRunRow = (
+    String,
+    i64,
+    String,
+    i64,
+    Option<Vec<u8>>,
+    Option<String>,
+    i64,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
+
+fn reconciliation_retry_receipt(
+    transaction: &Transaction<'_>,
+    request: &ReconciliationRequest<'_>,
+    run: &ReconciliationRunRow,
+) -> Result<ReconciliationReceipt, StoreError> {
+    if run.2 != request.expected_generation_id
+        || from_db_u64(run.3, "lease_epoch")? != request.expected_lease_epoch
+    {
+        return Err(StoreError::StaleEpoch);
+    }
+    let revision = from_db_u64(run.1, "run_revision")?;
+    let expected_revision = request
+        .expected_revision
+        .checked_add(1)
+        .ok_or(StoreError::InvalidField("expected_revision"))?;
+    if revision != expected_revision || run.5.as_deref() != Some(request.decision_key) {
+        return Err(StoreError::AlreadyTerminal);
+    }
+    let ReconciliationDecision::Fail { reason } = request.decision;
+    let expected_payload = reason.as_bytes();
+    if run.0 != "failed" || run.4.as_deref() != Some(expected_payload) {
+        return Err(StoreError::AlreadyTerminal);
+    }
+    let run_event_id: i64 = transaction.query_row(
+        "SELECT event_id FROM domain_events WHERE aggregate_kind = 'run'
+         AND aggregate_id = ?1 AND revision = ?2 AND kind = ?3 AND payload = ?4",
+        params![
+            request.run_id.to_string(),
+            to_db_u64(revision, "run_revision")?,
+            "run.reconciliation_failed",
+            expected_payload
+        ],
+        |row| row.get(0),
+    )?;
+    let outbox_id = transaction.query_row(
+        "SELECT outbox_id FROM outbox WHERE event_id = ?1 AND intent_key = ?2
+         AND kind = 'fake.reconciliation.receipt' AND payload = ?3",
+        params![run_event_id, request.decision_key, expected_payload],
+        |row| row.get(0),
+    )?;
+    let inbox_event_id = transaction.query_row(
+        "SELECT e.event_id FROM inbox i JOIN domain_events e
+           ON e.aggregate_kind = 'inbox'
+          AND e.aggregate_id = CAST(i.inbox_id AS TEXT)
+          AND e.revision = i.revision
+         WHERE i.inbox_id = ?1 AND i.state = 'failed' AND i.claimed_run_id IS NULL
+           AND e.kind = 'inbox.reconciliation_failed' AND e.payload = ?2",
+        params![run.6, expected_payload],
+        |row| row.get(0),
+    )?;
+    Ok(ReconciliationReceipt {
+        run_event_id,
+        inbox_event_id,
+        outbox_id,
+        duplicate: true,
+    })
+}
+
 fn count_table(connection: &Connection, table: &'static str) -> Result<u64, StoreError> {
     let sql = match table {
         "domain_events" => "SELECT count(*) FROM domain_events",
@@ -1728,6 +2562,44 @@ fn query_count(transaction: &Transaction<'_>, sql: &str) -> Result<u64, StoreErr
 #[cfg(test)]
 mod migration_tests {
     use super::*;
+
+    #[test]
+    fn canonical_v2_migrates_to_empty_telegram_state_without_changing_existing_rows() {
+        let mut connection = Connection::open_in_memory().expect("memory database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        connection
+            .execute_batch(SCHEMA_V2)
+            .expect("canonical v2 schema");
+        connection
+            .pragma_update(None, "user_version", 2)
+            .expect("v2 marker");
+        connection
+            .execute(
+                "INSERT INTO inbox
+                 (transport, transport_key, scope, payload, received_ms, state, revision)
+                 VALUES ('test', 'preserved', 'scope:test', X'01', 1, 'pending', 1)",
+                [],
+            )
+            .expect("existing v2 row");
+
+        initialize_or_validate_schema(&mut connection).expect("v3 migration");
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
+        let preserved: String = connection
+            .query_row("SELECT transport_key FROM inbox", [], |row| row.get(0))
+            .expect("preserved row");
+        assert_eq!(preserved, "preserved");
+        let telegram_rows: i64 = connection
+            .query_row("SELECT count(*) FROM telegram_offsets", [], |row| {
+                row.get(0)
+            })
+            .expect("telegram table");
+        assert_eq!(telegram_rows, 0);
+    }
 
     #[test]
     fn canonical_v1_schema_migrates_pending_and_claimed_rows() {

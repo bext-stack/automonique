@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use automonique_protocol::admin::{
-    AdminCommand, AdminRequest, AdminResponse, MAX_ADMIN_CANONICAL_BYTES, SyntheticSubmission,
+    AdminCommand, AdminRequest, AdminResponse, MAX_ADMIN_CANONICAL_BYTES, ReconciliationFailure,
+    SyntheticSubmission,
 };
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use nix::sys::socket::{getsockopt, sockopt};
@@ -25,6 +26,8 @@ static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub(crate) enum Operation {
     Status,
     Submit(SyntheticSubmission),
+    InspectReconciliation(u64),
+    FailReconciliation(ReconciliationFailure),
     Shutdown,
 }
 
@@ -34,15 +37,17 @@ pub(crate) enum ClientError {
     InsecureSocket,
     Io,
     Protocol(&'static str),
+    Refused(String),
 }
 
 impl ClientError {
-    pub(crate) const fn category(&self) -> &'static str {
+    pub(crate) fn category(&self) -> &str {
         match self {
             Self::RuntimeUnavailable => "runtime_unavailable",
             Self::InsecureSocket => "insecure_socket",
             Self::Io => "io",
             Self::Protocol(category) => category,
+            Self::Refused(category) => category,
         }
     }
 }
@@ -54,6 +59,8 @@ pub(crate) fn request(
     let operation_name = match &operation {
         Operation::Status => "status",
         Operation::Submit(_) => "submit",
+        Operation::InspectReconciliation(_) => "reconcile-inspect",
+        Operation::FailReconciliation(_) => "reconcile-fail",
         Operation::Shutdown => "shutdown",
     };
     let request_id = format!(
@@ -65,6 +72,13 @@ pub(crate) fn request(
         RequestId::new(&request_id).map_err(|error| ClientError::Protocol(error.category()))?;
     let request = match operation {
         Operation::Submit(submission) => AdminRequest::submit(request_id, submission),
+        Operation::InspectReconciliation(run_id) => {
+            AdminRequest::inspect_reconciliation(request_id, run_id)
+                .map_err(|error| ClientError::Protocol(error.category()))?
+        }
+        Operation::FailReconciliation(failure) => {
+            AdminRequest::fail_reconciliation(request_id, failure)
+        }
         Operation::Status => AdminRequest::new(request_id, AdminCommand::Status),
         Operation::Shutdown => AdminRequest::new(request_id, AdminCommand::Shutdown),
     };
@@ -128,6 +142,9 @@ pub(crate) fn request(
         .map_err(|error| ClientError::Protocol(error.category()))?;
     if response.request_id().as_str() != request_id {
         return Err(ClientError::Protocol("request_id_mismatch"));
+    }
+    if let AdminResponse::Refused { category, .. } = response {
+        return Err(ClientError::Refused(category.as_str().to_owned()));
     }
     Ok(response)
 }

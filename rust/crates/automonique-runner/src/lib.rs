@@ -7,11 +7,16 @@
 //! A separately named in-process simulation API records deterministic events
 //! without presenting itself as provider execution or sandbox enforcement.
 
+mod boundary;
 mod runner;
 mod simulation;
 mod spec;
 mod spool;
 
+pub use boundary::{
+    BoundaryProbeError, BoundaryRequirement, BoundaryStatus, BoundarySubject,
+    ExecutionBoundaryAssessment, LaunchRefusal, LinuxPrimitive,
+};
 pub use runner::{CancellationToken, ContainmentEvidence, Runner, RunnerError};
 pub use simulation::{
     MAX_SIMULATION_ID_BYTES, MAX_SIMULATION_RESULT_BYTES, MAX_SIMULATION_STEP_BYTES,

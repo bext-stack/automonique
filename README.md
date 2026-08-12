@@ -13,9 +13,12 @@ Automonique is in early implementation. Its first runnable control-plane slice
 now includes a foreground daemon, peer-authenticated local administration,
 durable SQLite state, a fenced FIFO scheduler, a deterministic no-effect
 execution lane, a bounded process-runner foundation, and fail-closed sandbox
-admission planning. Provider execution and external transports are not
-connected yet. Large historical planning and development-harness surfaces
-remain in the tree, but they are no longer prerequisites for product development.
+admission planning. It also has a strict Telegram update parser with atomic
+durable dispositions/offsets, fail-only reconciliation over the authenticated
+local admin endpoint, and a read-only Codex invocation normalizer. Provider
+execution and transport networking are not connected yet. Large historical
+planning and development-harness surfaces remain in the tree, but they are no
+longer prerequisites for product development.
 
 ```text
 docs/product-plan/       product goals, requirements, architecture, migration
@@ -83,6 +86,20 @@ printf '%s' 'local fixture' | cargo run --manifest-path rust/Cargo.toml -p autom
 cargo run --manifest-path rust/Cargo.toml -p automonique -- shutdown
 ```
 
+If a prior daemon died after claiming synthetic work but before committing its
+outcome, the successor stays online in `failed` state with intake closed. The
+operator can inspect the durable record and submit an exact fail-only decision:
+
+```sh
+cargo run --manifest-path rust/Cargo.toml -p automonique -- reconcile inspect <run-id>
+cargo run --manifest-path rust/Cargo.toml -p automonique -- \
+  reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>
+```
+
+The decision never requeues ambiguous work. It atomically records a failed run,
+failed inbox item, and fake reconciliation receipt; an exact retry replays the
+same receipt.
+
 The daemon creates only `automonique/` children under those roots, refuses
 permissive or foreign-owned paths, and exposes no network listener. The submit
 command accepts only bounded local synthetic work, reads its task from stdin,
@@ -90,7 +107,10 @@ serializes it by scope, and atomically records one deterministic terminal plus
 one pending `fake.receipt`. It cannot execute a process, call a provider, drain
 the outbox, or send an external effect. `accepting_intake=true` refers only to
 this local synthetic lane. The general runner remains fail-closed and sandbox
-plans still grant no OS-enforcement or production-runner authority.
+plans still grant no OS-enforcement or production-runner authority. The Codex
+adapter cannot spawn or probe a process, and the Telegram slice performs no
+HTTP call or token handling; those paths remain refused until enforcement and
+transport lease work are implemented.
 
 ## Clean-room and licensing
 
