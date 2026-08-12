@@ -306,9 +306,9 @@ ITEM_STATUS = {
     "R1-13": "done",
     "R1-14": "done",
     "R1-15": "done",
-    # R1-12 and R1-17 stay open on purpose. R1-12 needs owner acceptance of the
-    # two contract amendments it proposes; R1-17's last row is blocked on R0-13,
-    # which does not exist yet. Neither may be closed on the work done here.
+    # R1-12 and R1-17 were intentionally left open by their earlier partial
+    # slices. Later exact-tree completions may add their done entries once the
+    # amended R1-12 contract and the R0-13 consumer comparison respectively pass.
     "R1-16": "done",  # (*)
     "R1-18": "done",
     "R1-19": "done",  # (*)
@@ -319,6 +319,7 @@ ITEM_STATUS = {
     "R1-24": "done",
     "R1-25": "done",
     "R1-12": "done",
+    "R1-17": "done",
 }
 
 # Gates block a *class* of work, not the whole graph. A gate listed here must be

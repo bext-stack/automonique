@@ -742,7 +742,7 @@ summary = "generate Automonique names plus legacy forwarding aliases from one re
 depends_on = ["R0-18"]
 licence = "Elastic-2.0"
 allowed_paths = ["rust/crates/automonique-protocol/", "rust/crates/automonique-policy/", "rust/Cargo.toml", "sdk/typescript/packages/protocol/", "xtask/"]
-status = "blocked"
+status = "done"
 
 [[item]]
 id = "R1-18"
