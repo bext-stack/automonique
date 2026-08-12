@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: Elastic-2.0
 
+use automonique_protocol::host::{AttemptId, HostId, HostLifetime, WorkId};
+use automonique_protocol::sandbox::ExecutionBackendId;
+use automonique_protocol::tools::RunId;
 use automonique_runner::{
-    Authority, CancellationToken, ContainmentEvidence, EventKind, PromptDelivery, RunSpec,
-    RunSpecError, RunSpecParts, Runner, RunnerError, Spool, SpoolError,
+    Authority, BackendPromptSession, CancellationToken, ContainmentEvidence, EventKind,
+    PromptDeliveryPlan, ProtectedPromptReference, RunCoordinates, RunSpec, RunSpecError,
+    RunSpecParts, Runner, RunnerError, Spool, SpoolError,
 };
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,13 +44,17 @@ impl Drop for TempDir {
     }
 }
 
-fn parts(root: &Path, prompt: PromptDelivery) -> RunSpecParts {
+fn parts(root: &Path, prompt: PromptDeliveryPlan) -> RunSpecParts {
     RunSpecParts {
         protocol_version: 1,
-        work_id: "work-1".into(),
-        run_id: "run-1".into(),
-        attempt_id: "attempt-1".into(),
-        host_id: "host-1".into(),
+        coordinates: RunCoordinates::new(
+            WorkId::new("work-1").unwrap(),
+            RunId::new("run-1").unwrap(),
+            AttemptId::new("attempt-1").unwrap(),
+            HostId::new("host-1").unwrap(),
+            HostLifetime::Attempt,
+            ExecutionBackendId::new("local-direct").unwrap(),
+        ),
         executable: PathBuf::from("/bin/true"),
         arguments: Vec::new(),
         cwd: root.to_path_buf(),
@@ -61,7 +70,7 @@ fn parts(root: &Path, prompt: PromptDelivery) -> RunSpecParts {
 #[test]
 fn strict_run_spec_validation_rejects_unbounded_and_ambiguous_values() {
     let root = TempDir::new("validation");
-    let prompt = PromptDelivery::stdin(b"hello".to_vec()).unwrap();
+    let prompt = PromptDeliveryPlan::Stdin;
     let mut candidate = parts(root.path(), prompt.clone());
     candidate.protocol_version = 2;
     assert_eq!(
@@ -70,10 +79,10 @@ fn strict_run_spec_validation_rejects_unbounded_and_ambiguous_values() {
     );
 
     let mut candidate = parts(root.path(), prompt.clone());
-    candidate.run_id = "bad\nrun".into();
+    candidate.executable = PathBuf::from("/usr/bin/../bin/true");
     assert_eq!(
         RunSpec::new(candidate).unwrap_err(),
-        RunSpecError::FieldInvalid("run_id")
+        RunSpecError::PathNotCanonical("executable")
     );
 
     let mut candidate = parts(root.path(), prompt.clone());
@@ -90,27 +99,103 @@ fn strict_run_spec_validation_rejects_unbounded_and_ambiguous_values() {
         RunSpecError::ArgumentTooLarge
     );
 
-    let mut candidate = parts(root.path(), prompt);
+    let mut candidate = parts(root.path(), prompt.clone());
     candidate.environment = vec![("BAD=KEY".into(), "value".into())];
     assert_eq!(
         RunSpec::new(candidate).unwrap_err(),
         RunSpecError::EnvironmentKeyInvalid
     );
 
+    let mut candidate = parts(root.path(), prompt);
+    candidate.environment = vec![
+        ("PATH".into(), "/bin".into()),
+        ("PATH".into(), "/usr/bin".into()),
+    ];
     assert_eq!(
-        PromptDelivery::stdin(vec![0; 1024 * 1024 + 1]).unwrap_err(),
-        RunSpecError::PromptTooLarge
+        RunSpec::new(candidate).unwrap_err(),
+        RunSpecError::DuplicateEnvironmentKey
+    );
+}
+
+#[test]
+fn run_spec_partial_has_typed_coordinates_and_payload_free_prompt_modes() {
+    let root = TempDir::new("typed-coordinates");
+    let prompt = PromptDeliveryPlan::ProtectedReference(
+        ProtectedPromptReference::new("prompt-slot-1").unwrap(),
+    );
+    let spec = RunSpec::new(parts(root.path(), prompt)).unwrap();
+    assert_eq!(spec.work_id().as_str(), "work-1");
+    assert_eq!(spec.run_id().as_str(), "run-1");
+    assert_eq!(spec.attempt_id().as_str(), "attempt-1");
+    assert_eq!(spec.host_id().as_str(), "host-1");
+    assert_eq!(spec.host_lifetime(), HostLifetime::Attempt);
+    assert_eq!(spec.backend_id().as_str(), "local-direct");
+    assert!(matches!(
+        spec.prompt_delivery(),
+        PromptDeliveryPlan::ProtectedReference(_)
+    ));
+
+    assert_eq!(
+        ProtectedPromptReference::new("../prompt").unwrap_err(),
+        RunSpecError::FieldInvalid("protected_prompt_reference")
+    );
+    assert_eq!(
+        BackendPromptSession::new("/tmp/session").unwrap_err(),
+        RunSpecError::FieldInvalid("backend_prompt_session")
+    );
+}
+
+#[test]
+fn debug_redacts_argv_environment_and_prompt_coordinates() {
+    let root = TempDir::new("debug-redaction");
+    let mut candidate = parts(
+        root.path(),
+        PromptDeliveryPlan::BackendSession(BackendPromptSession::new("SESSION_SENTINEL").unwrap()),
+    );
+    candidate.arguments = vec!["ARG_SENTINEL".into()];
+    candidate.environment = vec![("SAFE_KEY".into(), "ENV_SENTINEL".into())];
+    let rendered_parts = format!("{candidate:?}");
+    let rendered_spec = format!("{:?}", RunSpec::new(candidate).unwrap());
+    for rendered in [&rendered_parts, &rendered_spec] {
+        assert!(!rendered.contains("ARG_SENTINEL"));
+        assert!(!rendered.contains("ENV_SENTINEL"));
+        assert!(!rendered.contains("SESSION_SENTINEL"));
+    }
+}
+
+#[test]
+fn path_and_environment_aggregate_bounds_fail_closed() {
+    let root = TempDir::new("aggregate-bounds");
+    let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+    candidate.executable = PathBuf::from(format!("/{}", "x".repeat(4_096)));
+    assert_eq!(
+        RunSpec::new(candidate).unwrap_err(),
+        RunSpecError::FieldInvalid("executable")
+    );
+
+    let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+    candidate.executable = PathBuf::from(format!("/{}", "x".repeat(4_095)));
+    assert_eq!(candidate.executable.as_os_str().as_bytes().len(), 4_096);
+    assert!(RunSpec::new(candidate).is_ok());
+
+    let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+    candidate.executable = PathBuf::from(OsString::from_vec(b"/bin/\xff".to_vec()));
+    assert!(RunSpec::new(candidate).is_ok());
+
+    let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+    candidate.environment = (0..17)
+        .map(|index| (format!("KEY_{index}").into(), "x".repeat(4_096).into()))
+        .collect();
+    assert_eq!(
+        RunSpec::new(candidate).unwrap_err(),
+        RunSpecError::EnvironmentTooLarge
     );
 }
 
 #[test]
 fn arbitrary_execution_is_refused_without_descendant_complete_containment() {
     let root = TempDir::new("containment-refusal");
-    let spec = RunSpec::new(parts(
-        root.path(),
-        PromptDelivery::stdin(b"must not execute".to_vec()).unwrap(),
-    ))
-    .unwrap();
+    let spec = RunSpec::new(parts(root.path(), PromptDeliveryPlan::Stdin)).unwrap();
     assert!(matches!(
         Runner.run(spec, &CancellationToken::new()),
         Err(RunnerError::ContainmentUnenforced(

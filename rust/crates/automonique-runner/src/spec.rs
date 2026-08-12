@@ -1,5 +1,51 @@
 // SPDX-License-Identifier: Elastic-2.0
 
+//! Admission-only execution specification values.
+//!
+//! This partial covers typed run coordinates, protected prompt routing and
+//! bounded argv/environment/path validation. A valid value is not launch or
+//! sandbox authority; [`Runner`](crate::Runner) remains fail-closed.
+//!
+//! Protocol identities remain distinct:
+//!
+//! ```compile_fail
+//! use automonique_protocol::host::{AttemptId, WorkId};
+//! let attempt = AttemptId::new("attempt-1").unwrap();
+//! let work: WorkId = attempt;
+//! ```
+//!
+//! ```
+//! use automonique_protocol::host::WorkId;
+//! let work = WorkId::new("work-1").unwrap();
+//! let same_domain: WorkId = work;
+//! assert_eq!(same_domain.as_str(), "work-1");
+//! ```
+//!
+//! Protected-reference and backend-session coordinates cannot be mixed:
+//!
+//! ```compile_fail
+//! use automonique_runner::{BackendPromptSession, ProtectedPromptReference};
+//! let protected = ProtectedPromptReference::new("prompt-slot-1").unwrap();
+//! let backend: BackendPromptSession = protected;
+//! ```
+//!
+//! ```
+//! use automonique_runner::{
+//!     BackendPromptSession, PromptDeliveryPlan, ProtectedPromptReference,
+//! };
+//! let protected = ProtectedPromptReference::new("prompt-slot-1").unwrap();
+//! let backend = BackendPromptSession::new("session-1").unwrap();
+//! let protected_plan = PromptDeliveryPlan::ProtectedReference(protected);
+//! let backend_plan = PromptDeliveryPlan::BackendSession(backend);
+//! assert!(matches!(protected_plan, PromptDeliveryPlan::ProtectedReference(_)));
+//! assert!(matches!(backend_plan, PromptDeliveryPlan::BackendSession(_)));
+//! ```
+
+use automonique_protocol::host::{AttemptId, HostId, HostLifetime, WorkId};
+use automonique_protocol::primitives::BoundedString;
+use automonique_protocol::sandbox::ExecutionBackendId;
+use automonique_protocol::tools::RunId;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::os::unix::ffi::OsStrExt;
@@ -7,11 +53,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const MAX_FIELD_BYTES: usize = 256;
+pub const MAX_PATH_BYTES: usize = 4_096;
 pub const MAX_ARG_COUNT: usize = 64;
 pub const MAX_ARG_BYTES: usize = 4_096;
 pub const MAX_TOTAL_ARG_BYTES: usize = 32 * 1_024;
 pub const MAX_ENV_COUNT: usize = 64;
-pub const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+pub const MAX_TOTAL_ENV_BYTES: usize = 64 * 1_024;
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_TERM_GRACE: Duration = Duration::from_secs(5);
 const MIN_SPOOL_BYTES: u64 = 4_096;
@@ -22,13 +69,15 @@ pub enum RunSpecError {
     UnsupportedProtocol(u32),
     FieldInvalid(&'static str),
     PathNotAbsolute(&'static str),
+    PathNotCanonical(&'static str),
     TooManyArguments,
     ArgumentTooLarge,
     ArgumentsTooLarge,
     TooManyEnvironmentVariables,
     EnvironmentKeyInvalid,
+    DuplicateEnvironmentKey,
     EnvironmentValueTooLarge,
-    PromptTooLarge,
+    EnvironmentTooLarge,
     TimeoutInvalid,
     TermGraceInvalid,
     SpoolLimitInvalid,
@@ -42,6 +91,9 @@ impl fmt::Display for RunSpecError {
             }
             Self::FieldInvalid(field) => write!(formatter, "field {field} is invalid"),
             Self::PathNotAbsolute(field) => write!(formatter, "path field {field} is not absolute"),
+            Self::PathNotCanonical(field) => {
+                write!(formatter, "path field {field} is not lexically canonical")
+            }
             Self::TooManyArguments => formatter.write_str("argument count exceeds the limit"),
             Self::ArgumentTooLarge => formatter.write_str("an argument exceeds the byte limit"),
             Self::ArgumentsTooLarge => formatter.write_str("total argument bytes exceed the limit"),
@@ -49,10 +101,15 @@ impl fmt::Display for RunSpecError {
                 formatter.write_str("environment variable count exceeds the limit")
             }
             Self::EnvironmentKeyInvalid => formatter.write_str("environment key is invalid"),
+            Self::DuplicateEnvironmentKey => {
+                formatter.write_str("environment contains a duplicate key")
+            }
             Self::EnvironmentValueTooLarge => {
                 formatter.write_str("environment value exceeds the byte limit")
             }
-            Self::PromptTooLarge => formatter.write_str("prompt exceeds the byte limit"),
+            Self::EnvironmentTooLarge => {
+                formatter.write_str("total environment bytes exceed the limit")
+            }
             Self::TimeoutInvalid => formatter.write_str("timeout is outside the supported range"),
             Self::TermGraceInvalid => {
                 formatter.write_str("termination grace is outside the supported range")
@@ -66,77 +123,200 @@ impl fmt::Display for RunSpecError {
 
 impl std::error::Error for RunSpecError {}
 
-/// Prompt material kept outside argv and environment values.
+/// Opaque coordinate for the protected R2-02 prompt handoff.
 #[derive(Clone, Eq, PartialEq)]
-pub enum PromptDelivery {
-    /// Bytes written directly to the child process's standard input.
-    Stdin(Vec<u8>),
-    /// A private, owner-only regular file connected to child standard input.
-    PrivateFile(PathBuf),
-}
+pub struct ProtectedPromptReference(BoundedString<MAX_FIELD_BYTES>);
 
-impl PromptDelivery {
-    pub fn stdin(bytes: impl Into<Vec<u8>>) -> Result<Self, RunSpecError> {
-        let bytes = bytes.into();
-        if bytes.len() > MAX_PROMPT_BYTES {
-            return Err(RunSpecError::PromptTooLarge);
-        }
-        Ok(Self::Stdin(bytes))
+impl ProtectedPromptReference {
+    pub fn new(value: impl Into<String>) -> Result<Self, RunSpecError> {
+        let value = value.into();
+        reject_path_shaped_reference(&value, "protected_prompt_reference")?;
+        let value = BoundedString::new(value)
+            .map_err(|_| RunSpecError::FieldInvalid("protected_prompt_reference"))?;
+        Ok(Self(value))
     }
 
-    pub fn private_file(path: impl Into<PathBuf>) -> Result<Self, RunSpecError> {
-        let path = path.into();
-        validate_absolute(&path, "prompt_file")?;
-        Ok(Self::PrivateFile(path))
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
     }
 }
 
-impl fmt::Debug for PromptDelivery {
+impl fmt::Debug for ProtectedPromptReference {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Stdin(bytes) => formatter
-                .debug_struct("Stdin")
-                .field("bytes", &format_args!("<redacted:{} bytes>", bytes.len()))
-                .finish(),
-            Self::PrivateFile(_) => formatter.write_str("PrivateFile(<protected>)"),
-        }
+        formatter.write_str("ProtectedPromptReference(<protected>)")
     }
 }
 
-#[derive(Clone, Debug)]
+/// Opaque provider-session coordinate for daemon-managed prompt delivery.
+#[derive(Clone, Eq, PartialEq)]
+pub struct BackendPromptSession(BoundedString<MAX_FIELD_BYTES>);
+
+impl BackendPromptSession {
+    pub fn new(value: impl Into<String>) -> Result<Self, RunSpecError> {
+        let value = value.into();
+        reject_path_shaped_reference(&value, "backend_prompt_session")?;
+        let value = BoundedString::new(value)
+            .map_err(|_| RunSpecError::FieldInvalid("backend_prompt_session"))?;
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for BackendPromptSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BackendPromptSession(<protected>)")
+    }
+}
+
+/// Prompt transport metadata only. No variant can contain prompt bytes or a
+/// filesystem path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PromptDeliveryPlan {
+    Stdin,
+    ProtectedReference(ProtectedPromptReference),
+    BackendSession(BackendPromptSession),
+}
+
+/// Canonical, domain-distinct lifecycle coordinates from the protocol crate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunCoordinates {
+    work_id: WorkId,
+    run_id: RunId,
+    attempt_id: AttemptId,
+    host_id: HostId,
+    host_lifetime: HostLifetime,
+    backend: ExecutionBackendId,
+}
+
+impl RunCoordinates {
+    #[must_use]
+    pub const fn new(
+        work_id: WorkId,
+        run_id: RunId,
+        attempt_id: AttemptId,
+        host_id: HostId,
+        host_lifetime: HostLifetime,
+        backend: ExecutionBackendId,
+    ) -> Self {
+        Self {
+            work_id,
+            run_id,
+            attempt_id,
+            host_id,
+            host_lifetime,
+            backend,
+        }
+    }
+
+    #[must_use]
+    pub const fn work_id(&self) -> &WorkId {
+        &self.work_id
+    }
+    #[must_use]
+    pub const fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+    #[must_use]
+    pub const fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
+    #[must_use]
+    pub const fn host_id(&self) -> &HostId {
+        &self.host_id
+    }
+    #[must_use]
+    pub const fn host_lifetime(&self) -> HostLifetime {
+        self.host_lifetime
+    }
+    #[must_use]
+    pub const fn backend(&self) -> &ExecutionBackendId {
+        &self.backend
+    }
+}
+
+#[derive(Clone)]
 pub struct RunSpecParts {
     pub protocol_version: u32,
-    pub work_id: String,
-    pub run_id: String,
-    pub attempt_id: String,
-    pub host_id: String,
+    pub coordinates: RunCoordinates,
     pub executable: PathBuf,
     pub arguments: Vec<OsString>,
     pub cwd: PathBuf,
     pub environment: Vec<(OsString, OsString)>,
-    pub prompt: PromptDelivery,
+    pub prompt: PromptDeliveryPlan,
     pub timeout: Duration,
     pub term_grace: Duration,
     pub spool_directory: PathBuf,
     pub max_spool_bytes: u64,
 }
 
-#[derive(Clone, Debug)]
+impl fmt::Debug for RunSpecParts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RunSpecParts")
+            .field("protocol_version", &self.protocol_version)
+            .field("coordinates", &self.coordinates)
+            .field("executable", &self.executable)
+            .field(
+                "arguments",
+                &format_args!("<redacted:{} entries>", self.arguments.len()),
+            )
+            .field("cwd", &self.cwd)
+            .field(
+                "environment",
+                &format_args!("<redacted:{} entries>", self.environment.len()),
+            )
+            .field("prompt", &self.prompt)
+            .field("timeout", &self.timeout)
+            .field("term_grace", &self.term_grace)
+            .field("spool_directory", &self.spool_directory)
+            .field("max_spool_bytes", &self.max_spool_bytes)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct RunSpec {
     protocol_version: u32,
-    work_id: String,
-    run_id: String,
-    attempt_id: String,
-    host_id: String,
+    coordinates: RunCoordinates,
     executable: PathBuf,
     arguments: Vec<OsString>,
     cwd: PathBuf,
     environment: Vec<(OsString, OsString)>,
-    prompt: PromptDelivery,
+    prompt: PromptDeliveryPlan,
     timeout: Duration,
     term_grace: Duration,
     spool_directory: PathBuf,
     max_spool_bytes: u64,
+}
+
+impl fmt::Debug for RunSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RunSpec")
+            .field("protocol_version", &self.protocol_version)
+            .field("coordinates", &self.coordinates)
+            .field("executable", &self.executable)
+            .field(
+                "arguments",
+                &format_args!("<redacted:{} entries>", self.arguments.len()),
+            )
+            .field("cwd", &self.cwd)
+            .field(
+                "environment",
+                &format_args!("<redacted:{} entries>", self.environment.len()),
+            )
+            .field("prompt", &self.prompt)
+            .field("timeout", &self.timeout)
+            .field("term_grace", &self.term_grace)
+            .field("spool_directory", &self.spool_directory)
+            .field("max_spool_bytes", &self.max_spool_bytes)
+            .finish()
+    }
 }
 
 impl RunSpec {
@@ -144,13 +324,9 @@ impl RunSpec {
         if parts.protocol_version != 1 {
             return Err(RunSpecError::UnsupportedProtocol(parts.protocol_version));
         }
-        validate_field(&parts.work_id, "work_id")?;
-        validate_field(&parts.run_id, "run_id")?;
-        validate_field(&parts.attempt_id, "attempt_id")?;
-        validate_field(&parts.host_id, "host_id")?;
-        validate_absolute(&parts.executable, "executable")?;
-        validate_absolute(&parts.cwd, "cwd")?;
-        validate_absolute(&parts.spool_directory, "spool_directory")?;
+        validate_absolute_canonical(&parts.executable, "executable")?;
+        validate_absolute_canonical(&parts.cwd, "cwd")?;
+        validate_absolute_canonical(&parts.spool_directory, "spool_directory")?;
         validate_arguments(&parts.arguments)?;
         validate_environment(&parts.environment)?;
         if parts.timeout.is_zero() || parts.timeout > MAX_TIMEOUT {
@@ -164,10 +340,7 @@ impl RunSpec {
         }
         Ok(Self {
             protocol_version: parts.protocol_version,
-            work_id: parts.work_id,
-            run_id: parts.run_id,
-            attempt_id: parts.attempt_id,
-            host_id: parts.host_id,
+            coordinates: parts.coordinates,
             executable: parts.executable,
             arguments: parts.arguments,
             cwd: parts.cwd,
@@ -183,17 +356,26 @@ impl RunSpec {
     pub const fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
-    pub fn work_id(&self) -> &str {
-        &self.work_id
+    pub const fn coordinates(&self) -> &RunCoordinates {
+        &self.coordinates
     }
-    pub fn run_id(&self) -> &str {
-        &self.run_id
+    pub const fn work_id(&self) -> &WorkId {
+        self.coordinates.work_id()
     }
-    pub fn attempt_id(&self) -> &str {
-        &self.attempt_id
+    pub const fn run_id(&self) -> &RunId {
+        self.coordinates.run_id()
     }
-    pub fn host_id(&self) -> &str {
-        &self.host_id
+    pub const fn attempt_id(&self) -> &AttemptId {
+        self.coordinates.attempt_id()
+    }
+    pub const fn host_id(&self) -> &HostId {
+        self.coordinates.host_id()
+    }
+    pub const fn host_lifetime(&self) -> HostLifetime {
+        self.coordinates.host_lifetime()
+    }
+    pub const fn backend_id(&self) -> &ExecutionBackendId {
+        self.coordinates.backend()
     }
     pub fn executable(&self) -> &Path {
         &self.executable
@@ -207,7 +389,7 @@ impl RunSpec {
     pub fn environment(&self) -> &[(OsString, OsString)] {
         &self.environment
     }
-    pub const fn prompt_delivery(&self) -> &PromptDelivery {
+    pub const fn prompt_delivery(&self) -> &PromptDeliveryPlan {
         &self.prompt
     }
     pub const fn timeout(&self) -> Duration {
@@ -224,22 +406,22 @@ impl RunSpec {
     }
 }
 
-fn validate_field(value: &str, field: &'static str) -> Result<(), RunSpecError> {
-    if value.is_empty()
-        || value.len() > MAX_FIELD_BYTES
-        || value.bytes().any(|byte| byte.is_ascii_control())
-    {
-        return Err(RunSpecError::FieldInvalid(field));
-    }
-    Ok(())
-}
-
-fn validate_absolute(path: &Path, field: &'static str) -> Result<(), RunSpecError> {
+fn validate_absolute_canonical(path: &Path, field: &'static str) -> Result<(), RunSpecError> {
     if !path.is_absolute() {
         return Err(RunSpecError::PathNotAbsolute(field));
     }
-    if path.as_os_str().as_bytes().contains(&0) {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() > MAX_PATH_BYTES || bytes.contains(&0) {
         return Err(RunSpecError::FieldInvalid(field));
+    }
+    if bytes != b"/" && (bytes.ends_with(b"/") || bytes.windows(2).any(|window| window == b"//")) {
+        return Err(RunSpecError::PathNotCanonical(field));
+    }
+    if bytes
+        .split(|byte| *byte == b'/')
+        .any(|component| matches!(component, b"." | b".."))
+    {
+        return Err(RunSpecError::PathNotCanonical(field));
     }
     Ok(())
 }
@@ -254,7 +436,9 @@ fn validate_arguments(arguments: &[OsString]) -> Result<(), RunSpecError> {
         if bytes.len() > MAX_ARG_BYTES || bytes.contains(&0) {
             return Err(RunSpecError::ArgumentTooLarge);
         }
-        total = total.saturating_add(bytes.len());
+        total = total
+            .checked_add(bytes.len())
+            .ok_or(RunSpecError::ArgumentsTooLarge)?;
     }
     if total > MAX_TOTAL_ARG_BYTES {
         return Err(RunSpecError::ArgumentsTooLarge);
@@ -266,16 +450,47 @@ fn validate_environment(environment: &[(OsString, OsString)]) -> Result<(), RunS
     if environment.len() > MAX_ENV_COUNT {
         return Err(RunSpecError::TooManyEnvironmentVariables);
     }
+    let mut keys = BTreeSet::new();
+    let mut total = 0usize;
     for (key, value) in environment {
         let key = key.as_bytes();
-        if key.is_empty() || key.len() > MAX_FIELD_BYTES || key.contains(&0) || key.contains(&b'=')
+        if key.is_empty()
+            || key.len() > MAX_FIELD_BYTES
+            || key.contains(&0)
+            || key.contains(&b'=')
+            || !key[0].is_ascii_alphabetic()
+            || !key
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
         {
             return Err(RunSpecError::EnvironmentKeyInvalid);
+        }
+        if !keys.insert(key.to_vec()) {
+            return Err(RunSpecError::DuplicateEnvironmentKey);
         }
         let value = value.as_os_str().as_bytes();
         if value.len() > MAX_ARG_BYTES || value.contains(&0) {
             return Err(RunSpecError::EnvironmentValueTooLarge);
         }
+        total = total
+            .checked_add(key.len())
+            .and_then(|size| size.checked_add(value.len()))
+            .ok_or(RunSpecError::EnvironmentTooLarge)?;
+    }
+    if total > MAX_TOTAL_ENV_BYTES {
+        return Err(RunSpecError::EnvironmentTooLarge);
+    }
+    Ok(())
+}
+
+fn reject_path_shaped_reference(value: &str, field: &'static str) -> Result<(), RunSpecError> {
+    if value.contains('/')
+        || value.contains('\\')
+        || value.contains("..")
+        || value.contains(':')
+        || value.starts_with('~')
+    {
+        return Err(RunSpecError::FieldInvalid(field));
     }
     Ok(())
 }
