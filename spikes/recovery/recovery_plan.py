@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Elastic-2.0
 
-"""Typed receipt model for the canonical R0-09 recovery order.
+"""Resolve real drill evidence against the canonical R0-09 recovery order.
 
-This module models evidence; it does not perform recovery work.  Entry IDs,
-ordering, prerequisites, and the enablement boundary come only from the
-canonical document accepted by :mod:`dependencies`.
+Entry IDs, ordering, prerequisites, objective citations, and the enablement
+boundary come only from the canonical document accepted by
+:mod:`dependencies`.  The resolver never accepts a caller-supplied disposition:
+it derives one receipt per position from a typed :class:`drill.Report` and
+leaves positions incomplete when the drill did not produce their evidence.
 """
 
 from __future__ import annotations
@@ -14,9 +16,11 @@ import dataclasses
 import enum
 import hashlib
 import json
+import pathlib
 import re
 
 import dependencies as dep
+import drill
 
 
 SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -54,6 +58,11 @@ class ReceiptRefusal(enum.Enum):
     UNRESOLVED_PREREQUISITE = "unresolved-prerequisite"
     EXTERNAL_AUTHORITY_GRANTED = "external-authority-granted"
     ENABLEMENT_NOT_DISABLED = "enablement-not-disabled"
+    STALE_PLAN_SOURCE = "stale-plan-source"
+    STALE_OBJECTIVE_CITATION = "stale-objective-citation"
+    INVALID_DRILL_REPORT = "invalid-drill-report"
+    STALE_DEPENDENCY_REPORT = "stale-dependency-report"
+    MISSING_TYPED_EVIDENCE = "missing-typed-evidence"
 
 
 class ReceiptRefused(Exception):
@@ -73,10 +82,19 @@ class CanonicalEntry:
 
 
 @dataclasses.dataclass(frozen=True)
+class ObjectiveCitation:
+    objective_id: str
+    path: str
+    quote: str
+    source_sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
 class RecoveryPlan:
     entries: tuple[CanonicalEntry, ...]
     source_path: str
     source_sha256: str
+    objective_citations: tuple[ObjectiveCitation, ...]
 
     @property
     def by_id(self) -> dict[str, CanonicalEntry]:
@@ -99,6 +117,9 @@ def load_plan() -> RecoveryPlan:
             ReceiptRefusal.CONSUMER_DISAGREEMENT,
             "consume() and load_inventory() disagree on the canonical order",
         )
+    citations = tuple(
+        _load_objective_citation(objective) for objective in document["objectives"]
+    )
     return RecoveryPlan(
         entries=tuple(
             CanonicalEntry(
@@ -112,6 +133,66 @@ def load_plan() -> RecoveryPlan:
         ),
         source_path=document["source"]["path"],
         source_sha256=document["source"]["sha256"],
+        objective_citations=citations,
+    )
+
+
+def _load_objective_citation(objective: dict[str, object]) -> ObjectiveCitation:
+    source = objective["source"]
+    if type(source) is not dict:
+        raise ReceiptRefused(
+            ReceiptRefusal.STALE_OBJECTIVE_CITATION,
+            f"objective {objective['id']!r} has no typed source",
+        )
+    path = source["path"]
+    quote = source["quote"]
+    if type(path) is not str or type(quote) is not str:
+        raise ReceiptRefused(
+            ReceiptRefusal.STALE_OBJECTIVE_CITATION,
+            f"objective {objective['id']!r} has malformed citation coordinates",
+        )
+    relative = pathlib.PurePosixPath(path)
+    if (
+        relative.is_absolute()
+        or relative.as_posix() != path
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ReceiptRefused(
+            ReceiptRefusal.STALE_OBJECTIVE_CITATION,
+            f"objective {objective['id']!r} source path is not canonical relative",
+        )
+    source_path = dep.REPOSITORY_ROOT
+    for part in relative.parts:
+        source_path /= part
+        if source_path.is_symlink():
+            raise ReceiptRefused(
+                ReceiptRefusal.STALE_OBJECTIVE_CITATION,
+                f"objective {objective['id']!r} source traverses a symlink",
+            )
+    try:
+        source_bytes = source_path.read_bytes()
+    except OSError as error:
+        raise ReceiptRefused(
+            ReceiptRefusal.STALE_OBJECTIVE_CITATION,
+            f"objective {objective['id']!r} source cannot be read: {type(error).__name__}",
+        ) from None
+    try:
+        source_text = source_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ReceiptRefused(
+            ReceiptRefusal.STALE_OBJECTIVE_CITATION,
+            f"objective {objective['id']!r} source is not UTF-8",
+        ) from None
+    if quote not in source_text:
+        raise ReceiptRefused(
+            ReceiptRefusal.STALE_OBJECTIVE_CITATION,
+            f"objective {objective['id']!r} quote is absent from {path}",
+        )
+    return ObjectiveCitation(
+        objective_id=str(objective["id"]),
+        path=path,
+        quote=quote,
+        source_sha256=hashlib.sha256(source_bytes).hexdigest(),
     )
 
 
@@ -170,6 +251,23 @@ class PlanAssessment:
     completion_eligible: bool
     required_but_not_exercised: tuple[str, ...]
     final_state: DisconnectedStartState
+
+
+@dataclasses.dataclass(frozen=True)
+class EvidenceBlocker:
+    entry_id: str
+    code: str
+    detail: str
+
+
+@dataclasses.dataclass(frozen=True)
+class DrillResolution:
+    plan: RecoveryPlan
+    report_sha256: str
+    receipt_set: ReceiptSet
+    assessment: PlanAssessment
+    blockers: tuple[EvidenceBlocker, ...]
+    enablement_verified_disabled: bool
 
 
 def _json_value(value: object) -> object:
@@ -271,10 +369,14 @@ def validate_receipts(plan: RecoveryPlan, receipt_set: ReceiptSet) -> PlanAssess
             )
 
         if entry.kind == "enablement-gate":
-            if receipt.disposition is not Disposition.VERIFIED_DISABLED:
+            if receipt.disposition not in {
+                Disposition.VERIFIED_DISABLED,
+                Disposition.REQUIRED_BUT_NOT_EXERCISED,
+            }:
                 raise ReceiptRefused(
                     ReceiptRefusal.ENABLEMENT_NOT_DISABLED,
-                    f"enablement gate {entry.id!r} must be verified-disabled",
+                    f"enablement gate {entry.id!r} must be verified-disabled or "
+                    "record an explicit evidence blocker",
                 )
         elif receipt.disposition is Disposition.VERIFIED_DISABLED:
             raise ReceiptRefused(
@@ -310,10 +412,7 @@ def validate_receipts(plan: RecoveryPlan, receipt_set: ReceiptSet) -> PlanAssess
             if dispositions[required]
             is Disposition.REQUIRED_BUT_NOT_EXERCISED
         )
-        if unresolved and receipt.disposition in {
-            Disposition.EXERCISED,
-            Disposition.VERIFIED_DISABLED,
-        }:
+        if unresolved and receipt.disposition is Disposition.EXERCISED:
             raise ReceiptRefused(
                 ReceiptRefusal.UNRESOLVED_PREREQUISITE,
                 f"{entry.id!r} claims {receipt.disposition.value} with unresolved "
@@ -342,3 +441,142 @@ def validate_receipts(plan: RecoveryPlan, receipt_set: ReceiptSet) -> PlanAssess
         required_but_not_exercised=tuple(incomplete),
         final_state=state,
     )
+
+
+def resolve_drill(*, plan: RecoveryPlan | None = None) -> DrillResolution:
+    """Run the fixed drill and derive all canonical dispositions from its result.
+
+    The caller supplies no disposition, reason, evidence hash, prerequisite
+    hash, transition, authority flag, or report object. The current local
+    fixture emits no direct enablement-state attestation, so its gate remains
+    explicitly blocked.
+    """
+    return _resolve_report(drill.run(drill.Options()), plan=plan)
+
+
+def _resolve_report(
+    report: drill.Report, *, plan: RecoveryPlan | None = None
+) -> DrillResolution:
+    """Validate one internally produced report; exposed only for negatives."""
+    if type(report) is not drill.Report:
+        raise ReceiptRefused(
+            ReceiptRefusal.INVALID_DRILL_REPORT,
+            "resolver accepts only the drill.Report type",
+        )
+    current_plan = load_plan()
+    if plan is not None and plan != current_plan:
+        raise ReceiptRefused(
+            ReceiptRefusal.STALE_PLAN_SOURCE,
+            "supplied plan does not match the freshly rendered canonical inventory "
+            "and objective citations",
+        )
+    plan = current_plan
+    document = report.as_document()
+    if document.get("schema") != drill.REPORT_SCHEMA:
+        raise ReceiptRefused(
+            ReceiptRefusal.INVALID_DRILL_REPORT,
+            "drill report schema is not current",
+        )
+    current_dependency_report = dep.consume()
+    if report.dependency_report != current_dependency_report:
+        raise ReceiptRefused(
+            ReceiptRefusal.STALE_DEPENDENCY_REPORT,
+            "drill dependency evidence differs from a fresh canonical consumption",
+        )
+    if report.outcome is not drill.Outcome.INCOMPLETE:
+        raise ReceiptRefused(
+            ReceiptRefusal.INVALID_DRILL_REPORT,
+            f"only a clean incomplete evidence run is resolvable; got {report.outcome.value}",
+        )
+    if report.fault is not drill.Fault.NONE or report.refusal is not None:
+        raise ReceiptRefused(
+            ReceiptRefusal.INVALID_DRILL_REPORT,
+            "faulted or refused drills cannot disposition canonical recovery work",
+        )
+    if report.residue or not report.invariants or any(
+        not result.ok for result in report.invariants
+    ):
+        raise ReceiptRefused(
+            ReceiptRefusal.INVALID_DRILL_REPORT,
+            "drill evidence is inconsistent, absent, or left residue",
+        )
+
+    report_bytes = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    report_sha256 = hashlib.sha256(report_bytes).hexdigest()
+    non_exercised = _typed_non_exercise_findings(report)
+    canonical_ids = {entry.id for entry in plan.entries}
+    missing = sorted(canonical_ids - set(non_exercised))
+    if missing:
+        raise ReceiptRefused(
+            ReceiptRefusal.MISSING_TYPED_EVIDENCE,
+            f"drill emitted neither typed proof nor typed blocker for {missing}",
+        )
+
+    receipts: list[StepReceipt] = []
+    receipt_hashes: dict[str, str] = {}
+    blockers: list[EvidenceBlocker] = []
+    state = initial_state()
+    for entry in plan.entries:
+        finding = non_exercised[entry.id]
+        blocker = EvidenceBlocker(
+            entry_id=entry.id,
+            code=finding["code"],
+            detail=finding["detail"],
+        )
+        blockers.append(blocker)
+        evidence_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "entry_id": entry.id,
+                    "finding": finding,
+                    "report_sha256": report_sha256,
+                    "source_path": plan.source_path,
+                    "source_sha256": plan.source_sha256,
+                    "objective_citations": [
+                        _json_value(citation) for citation in plan.objective_citations
+                    ],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        disposition = Disposition.REQUIRED_BUT_NOT_EXERCISED
+        receipt = StepReceipt(
+            entry_id=entry.id,
+            disposition=disposition,
+            prerequisite_receipt_hashes=tuple(
+                (required, receipt_hashes[required]) for required in entry.requires
+            ),
+            evidence_sha256=evidence_sha256,
+            transition=transition_for(state, entry, disposition),
+        )
+        receipts.append(receipt)
+        receipt_hashes[entry.id] = receipt.receipt_sha256()
+        state = receipt.transition.after
+
+    receipt_set = ReceiptSet(tuple(receipts))
+    assessment = validate_receipts(plan, receipt_set)
+    return DrillResolution(
+        plan=plan,
+        report_sha256=report_sha256,
+        receipt_set=receipt_set,
+        assessment=assessment,
+        blockers=tuple(blockers),
+        enablement_verified_disabled=False,
+    )
+
+
+def _typed_non_exercise_findings(
+    report: drill.Report,
+) -> dict[str, dict[str, str]]:
+    findings: dict[str, dict[str, str]] = {}
+    for finding in report.findings:
+        if finding.code is not drill.FindingCode.DEPENDENCY_NOT_EXERCISED:
+            continue
+        if finding.subject in findings:
+            raise ReceiptRefused(
+                ReceiptRefusal.INVALID_DRILL_REPORT,
+                f"drill repeats non-exercise evidence for {finding.subject!r}",
+            )
+        findings[finding.subject] = finding.as_document()
+    return findings
