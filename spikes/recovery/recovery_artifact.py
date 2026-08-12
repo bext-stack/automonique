@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import fcntl
 import hashlib
 import json
 import os
@@ -25,6 +26,7 @@ import stat
 
 
 SCHEMA = "automonique.synthetic-recovery-package/v1"
+ANONYMOUS_SCHEMA = "automonique.synthetic-recovery-package/anonymous-online-v1"
 SCHEMA_VERSION = 1
 APPLICATION_ID = 0x41524B31
 MAX_PACKAGE_BYTES = 16 * 1024 * 1024
@@ -100,6 +102,12 @@ class PackageReceipt:
     package_sha256: str
     package_size: int
     entry_count: int
+
+
+@dataclasses.dataclass(frozen=True)
+class SealedPackage:
+    descriptor: int
+    receipt: PackageReceipt
 
 
 @dataclasses.dataclass(frozen=True)
@@ -248,6 +256,35 @@ def create_package(path: pathlib.Path, entries: tuple[ArtifactEntry, ...]) -> Pa
     return PackageReceipt(SCHEMA, root_sha256, hashlib.sha256(image).hexdigest(), len(image), len(validated))
 
 
+def _create_sealed_anonymous_package(entries: tuple[ArtifactEntry, ...]) -> SealedPackage:
+    """Internal route for the closed anonymous producer; no caller payload API."""
+    validated = _validate_entries(entries)
+    _validate_anonymous_semantics(validated)
+    image, root_sha256 = _render_package(validated, ANONYMOUS_SCHEMA)
+    if len(image) > MAX_PACKAGE_BYTES:
+        raise ArtifactRefused(ArtifactRefusal.OVERSIZED, "rendered package exceeds byte limit")
+    descriptor = os.memfd_create("automonique-recovery-package", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    try:
+        _write_all(descriptor, image)
+        required = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+        fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, required)
+        receipt = PackageReceipt(ANONYMOUS_SCHEMA, root_sha256, hashlib.sha256(image).hexdigest(), len(image), len(validated))
+        if not attest_package_seals(descriptor) or verify_package_fd(descriptor).receipt != receipt:
+            raise ArtifactRefused(ArtifactRefusal.INVALID_PACKAGE, "sealed package attestation differs")
+        return SealedPackage(descriptor, receipt)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def attest_package_seals(descriptor: int) -> bool:
+    required = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+    try:
+        return fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) == required
+    except OSError:
+        return False
+
+
 def open_package(path: pathlib.Path) -> int:
     """Open a package read-only/no-follow and return the caller-owned FD."""
     parent_fd, leaf = _open_parent(path)
@@ -290,8 +327,10 @@ def verify_package_fd(descriptor: int) -> VerifiedPackage:
         if len(manifest) != 1:
             raise ArtifactRefused(ArtifactRefusal.INVALID_PACKAGE, "package has no unique manifest row")
         schema, recorded_root, entry_count = manifest[0]
-        if schema != SCHEMA or type(recorded_root) is not str or SHA256.fullmatch(recorded_root) is None or type(entry_count) is not int:
+        if schema not in {SCHEMA, ANONYMOUS_SCHEMA} or type(recorded_root) is not str or SHA256.fullmatch(recorded_root) is None or type(entry_count) is not int:
             raise ArtifactRefused(ArtifactRefusal.INVALID_PACKAGE, "manifest fields are malformed")
+        if schema == ANONYMOUS_SCHEMA and not attest_package_seals(descriptor):
+            raise ArtifactRefused(ArtifactRefusal.INVALID_PACKAGE, "anonymous package descriptor lacks exact seals")
         rows = connection.execute("SELECT entry_id, path_name, artifact_class, payload, size, sha256 FROM entries ORDER BY entry_id").fetchall()
     except ArtifactRefused:
         raise
@@ -301,23 +340,23 @@ def verify_package_fd(descriptor: int) -> VerifiedPackage:
         connection.close()
     entries = tuple(_entry_from_row(row) for row in rows)
     validated = _validate_entries(entries)
-    recovery_point = _validate_semantics(validated)
+    recovery_point = _validate_semantics(validated) if schema == SCHEMA else _validate_anonymous_semantics(validated)
     if entry_count != len(validated):
         raise ArtifactRefused(ArtifactRefusal.INVALID_PACKAGE, "manifest entry count disagrees")
     root_sha256 = _root_digest(validated)
     if root_sha256 != recorded_root:
         raise ArtifactRefused(ArtifactRefusal.DIGEST_MISMATCH, "package root digest disagrees")
-    return VerifiedPackage(PackageReceipt(SCHEMA, root_sha256, package_sha256, len(image), len(validated)), validated, recovery_point)
+    return VerifiedPackage(PackageReceipt(schema, root_sha256, package_sha256, len(image), len(validated)), validated, recovery_point)
 
 
-def _render_package(entries: tuple[ArtifactEntry, ...]) -> tuple[bytes, str]:
+def _render_package(entries: tuple[ArtifactEntry, ...], schema: str = SCHEMA) -> tuple[bytes, str]:
     root_sha256 = _root_digest(entries)
     connection = sqlite3.connect(":memory:")
     try:
         connection.executescript(SCHEMA_SQL)
         connection.execute(f"PRAGMA application_id = {APPLICATION_ID}")
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        connection.execute("INSERT INTO package_manifest VALUES (1, ?, ?, ?)", (SCHEMA, root_sha256, len(entries)))
+        connection.execute("INSERT INTO package_manifest VALUES (1, ?, ?, ?)", (schema, root_sha256, len(entries)))
         connection.executemany(
             "INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?)",
             [(entry.entry_id, entry.path_name, entry.artifact_class.value, entry.payload, entry.size, entry.sha256) for entry in entries],
@@ -454,6 +493,83 @@ def _validate_semantics(entries: tuple[ArtifactEntry, ...]) -> SyntheticRecovery
         snapshot["scope"],
         False,
     )
+
+
+def _validate_anonymous_semantics(entries: tuple[ArtifactEntry, ...]) -> SyntheticRecoveryPoint:
+    by_id = {entry.entry_id: entry for entry in entries}
+    canonical = {entry.entry_id: entry.payload for entry in canonical_fixture_entries()}
+    fixed = {"context-memory-automation", "corresponding-source-locks", "disconnected-start-bundle", "last-known-good-seed-verifier", "synthetic-credential-descriptor", "tool-extension-manifests"}
+    if any(by_id[name].payload != canonical[name] for name in fixed):
+        raise ArtifactRefused(ArtifactRefusal.SEMANTIC_MISMATCH, "anonymous fixed entries differ")
+    metadata = _json_document(by_id["artifact-metadata"].payload, "anonymous metadata")
+    blobs = _json_document(by_id["artifact-blob"].payload, "anonymous blobs")
+    snapshot = _json_document(by_id["snapshot-metadata"].payload, "anonymous snapshot")
+    config = _json_document(by_id["configuration-workspaces"].payload, "anonymous configuration")
+    policy = _json_document(by_id["policy-bundle-hashes"].payload, "anonymous policy")
+    release = _json_document(by_id["release-manifests-schemas"].payload, "anonymous release")
+    if set(metadata) != {"artifacts", "manifest", "profile", "tombstones"} or metadata["profile"] != "anonymous-online-v1" or metadata["tombstones"] != []:
+        raise ArtifactRefused(ArtifactRefusal.SEMANTIC_MISMATCH, "anonymous metadata shape differs")
+    if set(blobs) != {"blobs", "schema"} or blobs["schema"] != "automonique.anonymous-blobs/v1" or type(blobs["blobs"]) is not list:
+        raise ArtifactRefused(ArtifactRefusal.SEMANTIC_MISMATCH, "anonymous blob shape differs")
+    events, rows = _anonymous_database(by_id["control-database"].payload)
+    expected_rows = []
+    expected_members = {"control.db": by_id["control-database"].sha256, "config.json": by_id["configuration-workspaces"].sha256}
+    observed_blobs = {}
+    for item in blobs["blobs"]:
+        if type(item) is not dict or set(item) != {"payload_hex", "sha256", "size"}:
+            raise ArtifactRefused(ArtifactRefusal.SEMANTIC_MISMATCH, "anonymous blob member shape differs")
+        try:
+            payload = bytes.fromhex(item["payload_hex"])
+        except (TypeError, ValueError):
+            raise ArtifactRefused(ArtifactRefusal.SEMANTIC_MISMATCH, "anonymous blob encoding differs") from None
+        if item["payload_hex"] != payload.hex() or item["size"] != len(payload) or item["sha256"] != hashlib.sha256(payload).hexdigest():
+            raise ArtifactRefused(ArtifactRefusal.SEMANTIC_MISMATCH, "anonymous blob digest differs")
+        observed_blobs[item["sha256"]] = payload
+    for index, artifact_id, digest, size in rows:
+        seed = hashlib.sha256(f"20260811:{index}".encode()).digest()
+        expected_payload = (seed * 5)[:128]
+        if artifact_id != f"artifact-{index:06d}" or digest != hashlib.sha256(expected_payload).hexdigest() or size != 128 or observed_blobs.get(digest) != expected_payload:
+            raise ArtifactRefused(ArtifactRefusal.SEMANTIC_MISMATCH, "anonymous deterministic artifact differs")
+        expected_rows.append({"id": artifact_id, "sha256": digest, "size": size})
+        expected_members[f"blobs/{digest[:2]}/{digest}"] = digest
+    expected_digests = {row[2] for row in rows}
+    if len(blobs["blobs"]) != len(rows) or set(observed_blobs) != expected_digests:
+        raise ArtifactRefused(ArtifactRefusal.SEMANTIC_MISMATCH, "anonymous blob set differs from database rows")
+    if metadata["artifacts"] != expected_rows or metadata["manifest"] != {"members": expected_members, "schema": "automonique.anonymous-backup-manifest/v1", "watermark_event_id": 4, "watermark_ns": 4_000_000_000}:
+        raise ArtifactRefused(ArtifactRefusal.SEMANTIC_MISMATCH, "anonymous exact manifest differs")
+    journal = b"".join(_json({"artifact_id": row[2], "event_id": row[0], "kind": row[1], "written_ns": row[3]}) for row in events)
+    expected_events = [(index, "artifact_recorded", f"artifact-{index:06d}", index * 1_000_000_000) for index in range(1, 5)]
+    if by_id["audit-journal"].payload != journal or events != expected_events:
+        raise ArtifactRefused(ArtifactRefusal.SEMANTIC_MISMATCH, "anonymous journal differs")
+    if config != {"configuration_revision": 1, "history": [1], "schema": "automonique.anonymous-config/v1", "secret_values": None}:
+        raise ArtifactRefused(ArtifactRefusal.SEMANTIC_MISMATCH, "anonymous configuration differs")
+    if policy != {"configuration_revision": 1, "policy_revision": 1, "sha256": "5" * 64} or release != {"configuration_revision": 1, "policy_revision": 1, "release": "anonymous-v1", "schema_versions": [1]}:
+        raise ArtifactRefused(ArtifactRefusal.SEMANTIC_MISMATCH, "anonymous policy or release differs")
+    expected_snapshot = {"derived_rpo_seconds": 1.0, "fixed_backup_cadence_seconds": 60, "method": "anonymous-online-backup", "newest_durable_at_loss_unix_ns": 5_000_000_000, "objective_eligible": False, "scope": "anonymous-synthetic", "snapshot_watermark_unix_ns": 4_000_000_000, "watermark_event_id": 4}
+    if snapshot != expected_snapshot:
+        raise ArtifactRefused(ArtifactRefusal.SEMANTIC_MISMATCH, "anonymous cadence or endpoint differs")
+    return SyntheticRecoveryPoint(60, 4_000_000_000, 5_000_000_000, 1.0, "anonymous-synthetic", False)
+
+
+def _anonymous_database(payload: bytes) -> tuple[list[tuple[int, str, str, int]], list[tuple[int, str, str, int]]]:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.deserialize(payload)
+        connection.execute("PRAGMA query_only=ON")
+        objects = tuple(connection.execute("SELECT name,type,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_autoindex_%' ORDER BY name"))
+        expected = (
+            ("artifacts", "table", "CREATE TABLE artifacts (artifact_index INTEGER PRIMARY KEY, artifact_id TEXT NOT NULL UNIQUE, sha256 TEXT NOT NULL, size_bytes INTEGER NOT NULL) STRICT"),
+            ("events", "table", "CREATE TABLE events (event_id INTEGER PRIMARY KEY, kind TEXT NOT NULL, artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id), written_ns INTEGER NOT NULL) STRICT"),
+        )
+        if objects != expected:
+            raise ArtifactRefused(ArtifactRefusal.SEMANTIC_MISMATCH, "anonymous database schema differs")
+        events = list(connection.execute("SELECT event_id,kind,artifact_id,written_ns FROM events ORDER BY event_id"))
+        rows = list(connection.execute("SELECT artifact_index,artifact_id,sha256,size_bytes FROM artifacts ORDER BY artifact_index"))
+    except sqlite3.Error:
+        raise ArtifactRefused(ArtifactRefusal.SEMANTIC_MISMATCH, "anonymous database cannot be inspected") from None
+    finally:
+        connection.close()
+    return events, rows
 
 
 def _json_document(payload: bytes, subject: str) -> dict[str, object]:
