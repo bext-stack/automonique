@@ -1,0 +1,38 @@
+SPDX-License-Identifier: Elastic-2.0
+
+Artifact: run_spec_v1_full.cjson
+Purpose: independently authored, synthetic, non-authorizing RunSpec v1 golden bytes
+Canonical JSON byte count: 5472
+Trailing line feed: absent
+Raw SHA-256: 6ff8aca4c2713cb1a8fa13e7d35aa52173000c758801b8e770213bc8a947954c
+Digest domain text: automonique.run-spec/v1 followed by one NUL byte
+Digest domain prefix hex: 6175746f6d6f6e697175652e72756e2d737065632f763100
+Domain-separated SHA-256: 12a7a94d02665732ee3a205d443056359ca992bfa2ae923e6b6123e82e0ccc04
+Recorded at: 2026-08-12T20:53:02Z
+
+The fixture was written directly from the normative grammar in
+plan/contracts/R2-01.md. No Automonique encoder, decoder, canonical JSON
+builder, RunSpec constructor, digest helper, or generated fixture produced the
+expected bytes or either expected digest.
+
+Scope note: this golden proves a fully populated instance and preserves every
+array in its declared order. It does not claim to replace the separate codec
+matrix for domain-permitted duplicate array values.
+
+Calculator 1 (Python 3 standard library)
+Command:
+python3 -c 'import hashlib,pathlib; b=pathlib.Path("rust/crates/automonique-runner/tests/fixtures/run_spec_v1_full.cjson").read_bytes(); p=bytes.fromhex("6175746f6d6f6e697175652e72756e2d737065632f763100"); print("bytes",len(b)); print("raw",hashlib.sha256(b).hexdigest()); print("domain",hashlib.sha256(p+b).hexdigest())'
+Result:
+bytes 5472
+raw 6ff8aca4c2713cb1a8fa13e7d35aa52173000c758801b8e770213bc8a947954c
+domain 12a7a94d02665732ee3a205d443056359ca992bfa2ae923e6b6123e82e0ccc04
+
+Calculator 2 (OpenSSL 3, with Perl used only to stream the fixed prefix)
+Raw command:
+openssl dgst -sha256 rust/crates/automonique-runner/tests/fixtures/run_spec_v1_full.cjson
+Raw result:
+SHA2-256(rust/crates/automonique-runner/tests/fixtures/run_spec_v1_full.cjson)= 6ff8aca4c2713cb1a8fa13e7d35aa52173000c758801b8e770213bc8a947954c
+Domain command:
+perl -e 'print pack("H*", "6175746f6d6f6e697175652e72756e2d737065632f763100"); open my $fh, "<:raw", "rust/crates/automonique-runner/tests/fixtures/run_spec_v1_full.cjson" or die $!; print while <$fh>' | openssl dgst -sha256
+Domain result:
+SHA2-256(stdin)= 12a7a94d02665732ee3a205d443056359ca992bfa2ae923e6b6123e82e0ccc04
