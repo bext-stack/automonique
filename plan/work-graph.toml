@@ -870,9 +870,9 @@ epic = "R2"
 track = "core"
 title = "Runner control socket"
 summary = "inspect, subscribe, heartbeat and cancel."
-depends_on = ["R1-25"]
+depends_on = ["R1-04", "R2-03", "R2-06"]
 licence = "Elastic-2.0"
-allowed_paths = ["rust/crates/automonique-runner/", "rust/crates/automonique-sandbox/", "rust/crates/automonique-agents/", "rust/crates/automonique-workspaces/", "rust/crates/automonique-artifacts/"]
+allowed_paths = ["rust/crates/automonique-runner/", "rust/Cargo.lock"]
 status = "blocked"
 
 [[item]]

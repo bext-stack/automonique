@@ -252,6 +252,10 @@ ITEM_PATHS = {
         "rust/crates/automonique-protocol/",
         "rust/Cargo.lock",
     ],
+    "R2-04": [
+        "rust/crates/automonique-runner/",
+        "rust/Cargo.lock",
+    ],
     "R11-08": ["sdk/typescript/packages/extension/"],
     "R11-09": ["sdk/typescript/packages/ui/"],
 }
@@ -273,6 +277,7 @@ ITEM_DEPS = {
 ITEM_DEP_REPLACEMENTS = {
     "R2-02": ["R2-01"],
     "R2-03": ["R1-09", "R2-01"],
+    "R2-04": ["R1-04", "R2-03", "R2-06"],
 }
 
 # Completion is written here so regeneration cannot silently reopen landed

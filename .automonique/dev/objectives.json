@@ -2591,6 +2591,62 @@
         "plan/contracts/R2-03.md",
         "docs/product-plan/reference/work-breakdown.md"
       ]
+    },
+    {
+      "id": "objective:R2-04",
+      "work_id": "R2-04",
+      "objective": "Add one private, versioned Unix control endpoint for an R2-03 attempt spool. It authenticates kernel peer credentials before reading a request, serves bounded `inspect`, cursor-based `subscribe` and read-only `heartbeat` operations, and delivers an internal-service-admitted, durably idempotent cancel request to the exact R2-06 descendant-complete cancellation service. A cancel response says only whether the request was delivered or already delivered; process exit and terminal state remain separate evidence.",
+      "metric": {
+        "name": "required_contract_checks_passed",
+        "target": 16,
+        "anti_regression": "zero required checks failing, skipped, deleted, weakened, or omitted"
+      },
+      "baseline": {
+        "value": null,
+        "reason": "measure the immutable attempt base before mutation"
+      },
+      "budget": {
+        "max_iterations": 3,
+        "max_wall_seconds": 1800,
+        "max_worker_seconds": 1200,
+        "max_unchanged_results": 1,
+        "max_failures": 2
+      },
+      "tests": [
+        "Path safety",
+        "Stale cleanup",
+        "Auth ordering",
+        "Frame bounds",
+        "Closed codec",
+        "Target routing",
+        "Inspect",
+        "Subscribe",
+        "Observer isolation",
+        "Heartbeat purity",
+        "Cancel delivery",
+        "Backpressure",
+        "Restart",
+        "Leakage",
+        "Non-authority",
+        "Quality"
+      ],
+      "stop_conditions": [
+        "Stop if the immutable base, dependency, gate, contract, or allowed-path lease differs from the admitted packet.",
+        "Stop if a required check fails and the next correction is outside the declared paths or authority.",
+        "Stop when an iteration, wall-time, worker-time, unchanged-result, or failure budget is reached.",
+        "Stop on parsing before kernel credentials and peer admission; body-supplied identity/role/admission; caller-selected peer policy, wildcard or root peer access; peer admission represented as role/tenant authorization; cancel without exact peer admission, target, typed request and R2-06 service; cancel response claiming exit; disconnect-as-cancel; unbounded frame/client/thread/queue/page/allocation; request over 65,536 or response over 2,097,152 bytes; cursor advancing past omitted data; cursor ahead/gap silently succeeding; pushed subscription without bounded backpressure; heartbeat mutating state or claiming provider/process health; arbitrary socket path; unlink without exact inode revalidation; symlink/wrong-owner/wrong-mode acceptance; path/socket/payload in errors; FD without CLOEXEC; cleanup deleting a replacement; runner/spool/provider mutation; launch/adoption/network/credential/workspace/artifact activity; a new registry package/version or lock drift beyond the reviewed runner-to-policy path edge; unsafe/lint weakening; private-archive/network access; licence crossing; out-of-lease edit; or a required-check failure outside scope."
+      ],
+      "hill_climbability": 95,
+      "autonomous_eligible": true,
+      "allowed_paths": [
+        "rust/crates/automonique-runner/",
+        "rust/Cargo.lock"
+      ],
+      "licence": "Elastic-2.0",
+      "sources": [
+        "plan/contracts/R2-04.md",
+        "docs/product-plan/reference/work-breakdown.md"
+      ]
     }
   ]
 }
