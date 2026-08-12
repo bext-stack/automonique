@@ -2,9 +2,38 @@
 
 //! Admission-only execution specification values.
 //!
-//! This partial covers typed run coordinates, protected prompt routing and
-//! bounded argv/environment/path validation. A valid value is not launch or
-//! sandbox authority; [`Runner`](crate::Runner) remains fail-closed.
+//! The immutable document composes typed protocol values, protected prompt
+//! routing, bounded platform bytes and the closed canonical RunSpec v1 codec.
+//! A valid or decoded value is not launch or sandbox authority;
+//! [`Runner`](crate::Runner) remains fail-closed.
+//!
+//! Whole values cannot be constructed or mutated through their private fields:
+//!
+//! ```compile_fail
+//! use automonique_runner::RunSpec;
+//! let _ = RunSpec { protocol_version: 1 };
+//! ```
+//!
+//! ```compile_fail
+//! use automonique_runner::RunSpec;
+//! fn mutate(spec: &mut RunSpec) {
+//!     spec.protocol_version = 2;
+//! }
+//! ```
+//!
+//! Typed read-only projection is public:
+//!
+//! ```
+//! use automonique_protocol::host::{AttemptId, HostId, WorkId};
+//! use automonique_protocol::tools::RunId;
+//! use automonique_runner::RunSpec;
+//! fn inspect(spec: &RunSpec) {
+//!     let _: &WorkId = spec.work_id();
+//!     let _: &RunId = spec.run_id();
+//!     let _: &AttemptId = spec.attempt_id();
+//!     let _: &HostId = spec.host_id();
+//! }
+//! ```
 //!
 //! Protocol identities remain distinct:
 //!
@@ -85,10 +114,9 @@ pub const MAX_ARG_BYTES: usize = 4_096;
 pub const MAX_TOTAL_ARG_BYTES: usize = 32 * 1_024;
 pub const MAX_ENV_COUNT: usize = 64;
 pub const MAX_TOTAL_ENV_BYTES: usize = 64 * 1_024;
-/// Maximum byte length emitted by the canonical RunSpec v1 encoder.
+/// Maximum accepted or emitted canonical RunSpec v1 document length.
 ///
-/// This aliases the protocol frame ceiling. It does not imply that this crate
-/// provides a RunSpec decoder.
+/// This aliases the protocol frame ceiling used by both codec directions.
 pub const MAX_RUN_SPEC_BYTES: usize = automonique_protocol::codec::MAX_FRAME_BYTES;
 const _: [(); automonique_protocol::codec::MAX_FRAME_BYTES] = [(); MAX_RUN_SPEC_BYTES];
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
@@ -559,8 +587,8 @@ impl RunSpec {
 
     /// Encode this immutable admission document as canonical RunSpec v1 JSON.
     ///
-    /// This is an encode-only, declarative projection. It grants no execution
-    /// authority and does not imply that a RunSpec decoder exists.
+    /// Encoding is a declarative projection only and grants no execution or
+    /// use-time authority.
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, crate::RunSpecEncodeError> {
         crate::spec_encode::encode(self)
     }
