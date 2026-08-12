@@ -5,8 +5,9 @@ use automonique_protocol::admin::{
     AdminOutboxEvidenceParts, AdminReconciliationEvidence, AdminRefusalCategory, AdminRequest,
     AdminResponse, DaemonState, DaemonStatus, MAX_ADMIN_CANONICAL_BYTES, MAX_INSTANCE_ID_BYTES,
     MAX_SYNTHETIC_KEY_BYTES, MAX_SYNTHETIC_SCOPE_BYTES, MAX_SYNTHETIC_TASK_BYTES,
-    OutboxReconciliation, OutboxReconciliationDecision, OutboxReconciliationParts,
-    ReconciliationFailure, SyntheticSubmission,
+    OperationalMetric, OperationalStatus, OperationalStatusParts, OutboxReconciliation,
+    OutboxReconciliationDecision, OutboxReconciliationParts, ReconciliationFailure,
+    SyntheticSubmission,
 };
 use automonique_protocol::codec::{CodecError, FrameDecode, RequestId, decode_frame, encode_frame};
 
@@ -171,6 +172,27 @@ fn status() -> DaemonStatus {
         1,
         true,
     )
+    .and_then(|status| {
+        status.with_operational(
+            OperationalStatus::new(OperationalStatusParts {
+                observed_ms: 100,
+                reconciliation_pending: 0,
+                outbox_pending_ready: 2,
+                outbox_pending_delayed: 1,
+                outbox_in_flight_live: 4,
+                outbox_in_flight_ambiguous: 0,
+                outbox_delivered: 5,
+                outbox_dead_lettered: 6,
+                outbox_oldest_ready_age_ms: 7,
+                telegram_pollers_live: 0,
+                telegram_pollers_expired: 0,
+                telegram_offset_lag: OperationalMetric::Unavailable,
+                provider_available: OperationalMetric::Unavailable,
+                sandbox_launch_refusals: OperationalMetric::Unavailable,
+            })
+            .expect("operational status"),
+        )
+    })
     .expect("wire-representable status")
 }
 
@@ -291,6 +313,110 @@ fn status_response_is_exact_and_round_trips() {
         automonique_protocol::admin::TelegramState::DisabledNoClient
     );
     assert_eq!(status.telegram_poller_epoch(), None);
+    let operational = status.operational().expect("operational projection");
+    assert_eq!(operational.observed_ms(), 100);
+    assert_eq!(operational.outbox_in_flight_ambiguous(), 0);
+    assert_eq!(
+        operational.provider_available(),
+        OperationalMetric::Unavailable
+    );
+}
+
+#[test]
+fn status_without_a_real_operational_projection_cannot_be_encoded() {
+    let status = DaemonStatus::new(
+        AdminInstanceId::new("daemon-without-projection").expect("instance"),
+        DaemonState::Ready,
+        1,
+        1,
+        0,
+        0,
+        0,
+        true,
+    )
+    .expect("base status");
+    assert_eq!(status.operational(), None);
+    assert_eq!(
+        AdminResponse::Status {
+            request_id: request_id(),
+            status,
+        }
+        .to_message()
+        .expect_err("missing projection must fail closed"),
+        AdminError::InvalidBody
+    );
+    assert_eq!(
+        OperationalStatus::new(OperationalStatusParts {
+            observed_ms: 0,
+            reconciliation_pending: 0,
+            outbox_pending_ready: 0,
+            outbox_pending_delayed: 0,
+            outbox_in_flight_live: 0,
+            outbox_in_flight_ambiguous: 0,
+            outbox_delivered: 0,
+            outbox_dead_lettered: 0,
+            outbox_oldest_ready_age_ms: 0,
+            telegram_pollers_live: 0,
+            telegram_pollers_expired: 0,
+            telegram_offset_lag: OperationalMetric::Unavailable,
+            provider_available: OperationalMetric::Unavailable,
+            sandbox_launch_refusals: OperationalMetric::Unavailable,
+        })
+        .expect_err("zero observation cannot look measured"),
+        AdminError::InvalidBody
+    );
+}
+
+#[test]
+fn contradictory_operational_health_is_refused_on_construction_and_decode() {
+    assert_eq!(
+        OperationalStatus::new(OperationalStatusParts {
+            observed_ms: 1,
+            reconciliation_pending: 0,
+            outbox_pending_ready: 0,
+            outbox_pending_delayed: 0,
+            outbox_in_flight_live: 0,
+            outbox_in_flight_ambiguous: 0,
+            outbox_delivered: 0,
+            outbox_dead_lettered: 0,
+            outbox_oldest_ready_age_ms: 0,
+            telegram_pollers_live: 0,
+            telegram_pollers_expired: 0,
+            telegram_offset_lag: OperationalMetric::Unavailable,
+            provider_available: OperationalMetric::measured(2).expect("wire integer"),
+            sandbox_launch_refusals: OperationalMetric::Unavailable,
+        })
+        .expect_err("availability is boolean-valued"),
+        AdminError::InvalidBody
+    );
+
+    let response = AdminResponse::Status {
+        request_id: request_id(),
+        status: status(),
+    };
+    let payload = String::from_utf8(response.to_message().expect("message").to_canonical_bytes())
+        .expect("canonical UTF-8");
+    let contradictory = payload.replacen(
+        "\"reconciliation_pending\":0",
+        "\"reconciliation_pending\":1",
+        1,
+    );
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(contradictory.as_bytes())
+            .expect_err("ready status cannot carry reconciliation debt"),
+        AdminError::InvalidBody
+    );
+
+    let mismatched_queue = payload.replacen(
+        "\"outbox_pending_ready\":2",
+        "\"outbox_pending_ready\":1",
+        1,
+    );
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(mismatched_queue.as_bytes())
+            .expect_err("queue aggregate must match its projection"),
+        AdminError::InvalidBody
+    );
 }
 
 #[test]
@@ -361,9 +487,19 @@ fn status_body_rejects_missing_extra_wrong_and_negative_fields() {
 
 #[test]
 fn unknown_state_is_a_security_sensitive_refusal() {
-    let payload = br#"{"body":{"accepting_intake":true,"event_cursor":1,"generation":1,"inbox_pending":0,"instance_id":"d","outbox_pending":0,"running":0,"state":"recovering","telegram_poller_epoch":null,"telegram_state":"disabled_no_client"},"kind":"status_result","protocol":"automonique.admin","request_id":"r","version":1}"#;
+    let payload = String::from_utf8(
+        AdminResponse::Status {
+            request_id: request_id(),
+            status: status(),
+        }
+        .to_message()
+        .expect("status message")
+        .to_canonical_bytes(),
+    )
+    .expect("UTF-8")
+    .replace("\"state\":\"ready\"", "\"state\":\"recovering\"");
     assert_eq!(
-        AdminResponse::from_canonical_bytes(payload).expect_err("unknown state"),
+        AdminResponse::from_canonical_bytes(payload.as_bytes()).expect_err("unknown state"),
         AdminError::UnknownState
     );
 }
@@ -414,9 +550,20 @@ fn telegram_status_is_closed_and_epoch_coherent() {
             AdminError::InvalidBody
         );
     }
-    let unknown = br#"{"body":{"accepting_intake":true,"event_cursor":1,"generation":1,"inbox_pending":0,"instance_id":"d","outbox_pending":0,"running":0,"state":"ready","telegram_poller_epoch":null,"telegram_state":"enabled"},"kind":"status_result","protocol":"automonique.admin","request_id":"r","version":1}"#;
+    let unknown = String::from_utf8(
+        AdminResponse::Status {
+            request_id: request_id(),
+            status: status(),
+        }
+        .to_message()
+        .expect("status message")
+        .to_canonical_bytes(),
+    )
+    .expect("UTF-8")
+    .replace("disabled_no_client", "enabled");
     assert_eq!(
-        AdminResponse::from_canonical_bytes(unknown).expect_err("unknown telegram state"),
+        AdminResponse::from_canonical_bytes(unknown.as_bytes())
+            .expect_err("unknown telegram state"),
         AdminError::InvalidBody
     );
 }

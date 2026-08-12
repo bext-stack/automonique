@@ -10,7 +10,9 @@ publish.workspace = true
 [dependencies]
 automonique-store = { path = "../automonique-store" }
 automonique-transports = { path = "../automonique-transports" }
+log.workspace = true
 sha2.workspace = true
+ureq.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

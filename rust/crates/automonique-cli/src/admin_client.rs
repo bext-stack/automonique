@@ -198,7 +198,8 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     use automonique_protocol::admin::{
-        AdminInstanceId, AdminResponse, DaemonState, DaemonStatus, SyntheticSubmission,
+        AdminInstanceId, AdminResponse, DaemonState, DaemonStatus, OperationalMetric,
+        OperationalStatus, OperationalStatusParts, SyntheticSubmission,
     };
 
     #[test]
@@ -230,6 +231,27 @@ mod tests {
                 0,
                 false,
             )
+            .and_then(|status| {
+                status.with_operational(
+                    OperationalStatus::new(OperationalStatusParts {
+                        observed_ms: 1,
+                        reconciliation_pending: 0,
+                        outbox_pending_ready: 0,
+                        outbox_pending_delayed: 0,
+                        outbox_in_flight_live: 0,
+                        outbox_in_flight_ambiguous: 0,
+                        outbox_delivered: 0,
+                        outbox_dead_lettered: 0,
+                        outbox_oldest_ready_age_ms: 0,
+                        telegram_pollers_live: 0,
+                        telegram_pollers_expired: 0,
+                        telegram_offset_lag: OperationalMetric::Unavailable,
+                        provider_available: OperationalMetric::Unavailable,
+                        sandbox_launch_refusals: OperationalMetric::Unavailable,
+                    })
+                    .expect("operational"),
+                )
+            })
             .expect("status");
             let response = AdminResponse::Status {
                 request_id: RequestId::new("wrong-request").expect("request ID"),

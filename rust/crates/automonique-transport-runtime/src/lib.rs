@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Side-effect-free Telegram polling orchestration.
+//! Fenced Telegram polling orchestration and its bounded HTTPS boundary.
 //!
 //! This crate prepares one typed `getUpdates` request and coordinates an
-//! injected HTTP executor with an injected atomic durable sink. It contains no
-//! socket client, token-to-URL formatter, or database implementation.
+//! HTTP executor with an atomic durable sink. The concrete HTTPS client is
+//! deliberately limited to Telegram's exact `getUpdates` endpoint; hosts must
+//! still acquire and renew the durable poller lease before invoking it.
 
 use std::error::Error;
 use std::fmt;
@@ -17,12 +18,19 @@ use automonique_transports::{
 };
 use sha2::{Digest, Sha256};
 
+mod https_client;
 mod store_sink;
 
+pub use https_client::TelegramHttpsClient;
 pub use store_sink::{Clock, ClockFailure, StoreTelegramDurableSink, SystemClock};
 
 const MAX_LEASE_ID_BYTES: usize = 256;
 const MAX_LONG_POLL_SECONDS: u16 = 50;
+/// Lease headroom beyond Telegram's server-side long-poll timeout.
+///
+/// The concrete HTTPS client has a smaller three-second transport allowance,
+/// leaving two seconds for the host to observe completion before lease expiry.
+pub const TELEGRAM_HTTP_LEASE_MARGIN_MS: i64 = 5_000;
 
 /// Opaque bot credential carried only to the injected HTTP boundary.
 pub struct OpaqueBotToken(Vec<u8>);
@@ -31,7 +39,12 @@ impl OpaqueBotToken {
     /// Construct a bounded nonempty token.
     pub fn new(secret: impl Into<Vec<u8>>) -> Result<Self, RuntimeError> {
         let secret = secret.into();
-        if secret.is_empty() || secret.len() > 4 * 1024 || secret.contains(&0) {
+        if secret.is_empty()
+            || secret.len() > 256
+            || !secret
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-'))
+        {
             return Err(RuntimeError::InvalidConfiguration("bot_token"));
         }
         Ok(Self(secret))
@@ -162,6 +175,8 @@ pub enum HttpFailure {
     TimedOut,
     Cancelled,
     ResponseTooLarge,
+    UnexpectedStatus,
+    UnexpectedContentType,
 }
 
 /// An HTTP implementation consumes only the typed plan and cancellation flag.
@@ -681,6 +696,7 @@ where
         }
         let poll_deadline_ms = now_ms
             .checked_add(i64::from(self.long_poll_seconds) * 1_000)
+            .and_then(|deadline| deadline.checked_add(TELEGRAM_HTTP_LEASE_MARGIN_MS))
             .ok_or(RuntimeError::InvalidConfiguration("long_poll_deadline"))?;
         if lease.expires_ms <= poll_deadline_ms {
             return Err(RuntimeError::LeaseExpired);

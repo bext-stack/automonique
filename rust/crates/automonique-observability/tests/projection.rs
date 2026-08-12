@@ -6,8 +6,8 @@ use automonique_observability::{
     UnavailableReason,
 };
 use automonique_store::{
-    InboxSubmission, LeaseRequest, OutboxClaimRequest, SchedulerClaim, Store, TerminalRun,
-    TerminalState,
+    InboxSubmission, LeaseRequest, OutboxClaimRequest, SchedulerClaim, Store,
+    TelegramPollerLeaseIdentity, TelegramPollerLeaseRequest, TerminalRun, TerminalState,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -26,6 +26,53 @@ fn samples() -> Vec<MetricSample> {
             MetricSample::new(name, value).expect("sample")
         })
         .collect()
+}
+
+#[test]
+fn clean_released_poller_is_not_reconciliation_debt() {
+    let directory = tempfile::tempdir().expect("directory");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("private directory");
+    let mut store = Store::open(directory.path().join("store.sqlite3")).expect("store");
+    let generation = store
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            now_ms: 1,
+            ttl_ms: 100,
+        })
+        .expect("generation");
+    let poller = store
+        .acquire_telegram_poller_lease(TelegramPollerLeaseRequest {
+            bot_id: 7,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            authority_lease_epoch: generation.epoch,
+            now_ms: 2,
+            ttl_ms: 20,
+        })
+        .expect("poller");
+    store
+        .release_telegram_poller_lease(TelegramPollerLeaseIdentity {
+            bot_id: poller.bot_id,
+            generation_id: &poller.generation_id,
+            holder_id: &poller.holder_id,
+            poller_epoch: poller.epoch,
+            expected_expires_ms: poller.expires_ms,
+            now_ms: 3,
+        })
+        .expect("release");
+    let snapshot = store
+        .status_snapshot_at("generation-a", 4)
+        .expect("snapshot");
+    let projection = StoreProjection::from_status(&snapshot).expect("projection");
+    assert_eq!(projection.assessment(), StoreAssessment::Unknown);
+    assert_eq!(
+        projection
+            .metrics()
+            .value(MetricName::ReconciliationPending),
+        MetricValue::Measured(0)
+    );
 }
 
 #[test]

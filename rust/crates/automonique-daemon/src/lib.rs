@@ -17,10 +17,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use automonique_observability::{MetricName, MetricValue, StoreProjection};
 use automonique_protocol::admin::{
     AdminInstanceId, AdminOutboxEvidence, AdminOutboxEvidenceParts, AdminReconciliationEvidence,
     AdminRefusalCategory, AdminRequest, AdminResponse, DaemonState, DaemonStatus,
-    MAX_ADMIN_CANONICAL_BYTES, OutboxReconciliationDecision,
+    MAX_ADMIN_CANONICAL_BYTES, OperationalMetric, OperationalStatus, OperationalStatusParts,
+    OutboxReconciliationDecision,
 };
 use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, decode_frame, encode_frame};
 use automonique_store::{
@@ -439,6 +441,9 @@ impl Daemon {
                 }
                 let degraded = self.reconciliation_run_id.is_some()
                     || snapshot_requires_reconciliation(&snapshot);
+                let projection = StoreProjection::from_status(&snapshot)
+                    .map_err(|_| DaemonError::ProtocolRefused("operational_projection"))?;
+                let operational = operational_status(&projection)?;
                 let (telegram_state, telegram_poller_epoch) = self.telegram.status();
                 let status = DaemonStatus::new(
                     self.instance_id.clone(),
@@ -455,6 +460,7 @@ impl Daemon {
                     !degraded,
                 )
                 .and_then(|status| status.with_telegram(telegram_state, telegram_poller_epoch))
+                .and_then(|status| status.with_operational(operational))
                 .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
                 AdminResponse::Status {
                     request_id: request.request_id().clone(),
@@ -686,6 +692,38 @@ impl Daemon {
 
 fn snapshot_requires_reconciliation(snapshot: &StatusSnapshot) -> bool {
     snapshot.runs_reconciliation_pending() > 0 || snapshot.outbox_in_flight_ambiguous() > 0
+}
+
+fn operational_status(projection: &StoreProjection) -> Result<OperationalStatus, DaemonError> {
+    let metrics = projection.metrics();
+    let measured = |name| match metrics.value(name) {
+        MetricValue::Measured(value) => Ok(value),
+        MetricValue::Unavailable(_) => Err(DaemonError::ProtocolRefused("operational_projection")),
+    };
+    let projected = |name| match metrics.value(name) {
+        MetricValue::Measured(value) => OperationalMetric::measured(value),
+        MetricValue::Unavailable(_) => Ok(OperationalMetric::Unavailable),
+    };
+    OperationalStatus::new(OperationalStatusParts {
+        observed_ms: metrics.observed_ms(),
+        reconciliation_pending: measured(MetricName::ReconciliationPending)?,
+        outbox_pending_ready: measured(MetricName::OutboxPendingReady)?,
+        outbox_pending_delayed: measured(MetricName::OutboxPendingDelayed)?,
+        outbox_in_flight_live: measured(MetricName::OutboxInFlightLive)?,
+        outbox_in_flight_ambiguous: measured(MetricName::OutboxInFlightAmbiguous)?,
+        outbox_delivered: measured(MetricName::OutboxDelivered)?,
+        outbox_dead_lettered: measured(MetricName::OutboxDeadLettered)?,
+        outbox_oldest_ready_age_ms: measured(MetricName::OutboxOldestAgeMs)?,
+        telegram_pollers_live: measured(MetricName::TelegramPollersLive)?,
+        telegram_pollers_expired: measured(MetricName::TelegramPollersExpired)?,
+        telegram_offset_lag: projected(MetricName::TelegramOffsetLag)
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?,
+        provider_available: projected(MetricName::ProviderAvailable)
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?,
+        sandbox_launch_refusals: projected(MetricName::SandboxLaunchRefusals)
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?,
+    })
+    .map_err(|error| DaemonError::ProtocolRefused(error.category()))
 }
 
 impl Drop for Daemon {

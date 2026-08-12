@@ -126,7 +126,6 @@ impl StoreProjection {
         let reconciliation_pending = status
             .runs_reconciliation_pending()
             .checked_add(status.outbox_in_flight_ambiguous())
-            .and_then(|value| value.checked_add(status.telegram_pollers_expired()))
             .ok_or(ObservabilityError::MetricOverflow)?;
         let unavailable = |name| MetricSample::unavailable(name, UnavailableReason::NotIntegrated);
         let measured = |name, value| MetricSample::new(name, value);

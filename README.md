@@ -25,7 +25,12 @@ digest. A no-client lifecycle coordinator can acquire, renew, reconcile, and
 release that lease without enabling HTTP, while the foreground daemon reports
 Telegram as explicitly disabled. Store-derived operational snapshots classify
 ready, delayed, live, ambiguous, delivered, and dead-lettered work without
-inventing runtime health. Large historical
+inventing runtime health. The authenticated status command exposes those
+measurements while keeping provider readiness, sandbox launch authority, and
+Telegram offset lag explicitly unavailable until they are integrated. A
+direct, TLS-verified Telegram `getUpdates` HTTPS client now exists behind the
+poller interface, but the daemon still has no token/configuration loader and
+does not start it. Large historical
 planning and development-harness surfaces remain in the tree, but they are no
 longer prerequisites for product development.
 
@@ -132,14 +137,21 @@ this local synthetic lane. The general runner remains fail-closed and sandbox
 plans still grant no OS-enforcement or production-runner authority. A dedicated
 descriptor-closure helper exercises a fixed inert Bubblewrap/BusyBox boundary,
 but the product launch API still refuses with `missing_reviewed_helper_pin`;
-there is no provider execution success type. The Codex
-adapter cannot spawn or probe a process, and the Telegram slice performs no
-HTTP call. Its token reaches only an injected, trusted HTTP boundary through a
-short-lived redacted view; its concrete store adapter persists dispositions and
-the offset atomically, but neither it nor a network client is wired into the
+there is no provider execution success type. The Codex adapter cannot spawn or
+probe a process. The Telegram poller now has a concrete synchronous HTTPS
+client with WebPKI certificate verification, redirects and environment proxies
+disabled, bounded response headers/body, and a request deadline inside the
+lease margin. Telegram's required token-bearing URL exists only during that
+request and is absent from public errors and Debug output; the dependency graph
+statically disables Trace logging because the HTTP library exposes request
+paths at that level. The concrete store adapter persists dispositions and the
+offset atomically, but no token is loaded and the client is not wired into the
 daemon. The observability crate derives bounded metrics from one timestamped
-SQLite snapshot, but it remains a projection model rather than a live exporter
-or health authority. Those paths remain unavailable
+SQLite snapshot and serves them over the local authenticated status command,
+but it has no metrics exporter. A release-manifest candidate can bind the
+descriptor helper, boundary installer, fixture, workspace, and runner digests
+for review, but cannot mint launch authority; an independently authenticated
+release trust root is still missing. Those paths remain unavailable
 until enforcement and production integration are implemented.
 
 ## Clean-room and licensing

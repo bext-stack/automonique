@@ -885,6 +885,323 @@ pub struct DaemonStatus {
     accepting_intake: bool,
     telegram_state: TelegramState,
     telegram_poller_epoch: Option<u64>,
+    operational: Option<OperationalStatus>,
+}
+
+/// A bounded operational value that never substitutes zero for missing evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationalMetric {
+    Measured(u64),
+    Unavailable,
+}
+
+impl OperationalMetric {
+    pub fn measured(value: u64) -> Result<Self, AdminError> {
+        i64::try_from(value)
+            .map(|_| Self::Measured(value))
+            .map_err(|_| AdminError::CounterOutOfRange {
+                field: "operational_metric",
+            })
+    }
+
+    #[must_use]
+    pub const fn value(self) -> Option<u64> {
+        match self {
+            Self::Measured(value) => Some(value),
+            Self::Unavailable => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn state(self) -> &'static str {
+        match self {
+            Self::Measured(_) => "measured",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    fn to_body(self) -> Result<JsonValue, AdminError> {
+        Ok(JsonValue::Object(vec![
+            (
+                "state".to_owned(),
+                JsonValue::String(self.state().to_owned()),
+            ),
+            (
+                "value".to_owned(),
+                match self {
+                    Self::Measured(value) => integer("operational_metric", value)?,
+                    Self::Unavailable => JsonValue::Null,
+                },
+            ),
+        ]))
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        exact_fields(body, &["state", "value"])?;
+        match required_body_string(body, "state")?.as_str() {
+            "measured" => Self::measured(unsigned(body, "value")?),
+            "unavailable" if matches!(body.get("value"), Some(JsonValue::Null)) => {
+                Ok(Self::Unavailable)
+            }
+            _ => Err(AdminError::InvalidBody),
+        }
+    }
+}
+
+/// Durable low-cardinality operational projection attached to daemon status.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationalStatus {
+    observed_ms: u64,
+    reconciliation_pending: u64,
+    outbox_pending_ready: u64,
+    outbox_pending_delayed: u64,
+    outbox_in_flight_live: u64,
+    outbox_in_flight_ambiguous: u64,
+    outbox_delivered: u64,
+    outbox_dead_lettered: u64,
+    outbox_oldest_ready_age_ms: u64,
+    telegram_pollers_live: u64,
+    telegram_pollers_expired: u64,
+    telegram_offset_lag: OperationalMetric,
+    provider_available: OperationalMetric,
+    sandbox_launch_refusals: OperationalMetric,
+}
+
+/// Named constructor inputs for [`OperationalStatus`].
+pub struct OperationalStatusParts {
+    pub observed_ms: u64,
+    pub reconciliation_pending: u64,
+    pub outbox_pending_ready: u64,
+    pub outbox_pending_delayed: u64,
+    pub outbox_in_flight_live: u64,
+    pub outbox_in_flight_ambiguous: u64,
+    pub outbox_delivered: u64,
+    pub outbox_dead_lettered: u64,
+    pub outbox_oldest_ready_age_ms: u64,
+    pub telegram_pollers_live: u64,
+    pub telegram_pollers_expired: u64,
+    pub telegram_offset_lag: OperationalMetric,
+    pub provider_available: OperationalMetric,
+    pub sandbox_launch_refusals: OperationalMetric,
+}
+
+impl OperationalStatus {
+    pub fn new(parts: OperationalStatusParts) -> Result<Self, AdminError> {
+        for (field, value) in [
+            ("observed_ms", parts.observed_ms),
+            ("reconciliation_pending", parts.reconciliation_pending),
+            ("outbox_pending_ready", parts.outbox_pending_ready),
+            ("outbox_pending_delayed", parts.outbox_pending_delayed),
+            ("outbox_in_flight_live", parts.outbox_in_flight_live),
+            (
+                "outbox_in_flight_ambiguous",
+                parts.outbox_in_flight_ambiguous,
+            ),
+            ("outbox_delivered", parts.outbox_delivered),
+            ("outbox_dead_lettered", parts.outbox_dead_lettered),
+            (
+                "outbox_oldest_ready_age_ms",
+                parts.outbox_oldest_ready_age_ms,
+            ),
+            ("telegram_pollers_live", parts.telegram_pollers_live),
+            ("telegram_pollers_expired", parts.telegram_pollers_expired),
+        ] {
+            i64::try_from(value).map_err(|_| AdminError::CounterOutOfRange { field })?;
+        }
+        if parts.observed_ms == 0 {
+            return Err(AdminError::InvalidBody);
+        }
+        if matches!(parts.provider_available, OperationalMetric::Measured(value) if value > 1)
+            || parts.reconciliation_pending < parts.outbox_in_flight_ambiguous
+        {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self {
+            observed_ms: parts.observed_ms,
+            reconciliation_pending: parts.reconciliation_pending,
+            outbox_pending_ready: parts.outbox_pending_ready,
+            outbox_pending_delayed: parts.outbox_pending_delayed,
+            outbox_in_flight_live: parts.outbox_in_flight_live,
+            outbox_in_flight_ambiguous: parts.outbox_in_flight_ambiguous,
+            outbox_delivered: parts.outbox_delivered,
+            outbox_dead_lettered: parts.outbox_dead_lettered,
+            outbox_oldest_ready_age_ms: parts.outbox_oldest_ready_age_ms,
+            telegram_pollers_live: parts.telegram_pollers_live,
+            telegram_pollers_expired: parts.telegram_pollers_expired,
+            telegram_offset_lag: parts.telegram_offset_lag,
+            provider_available: parts.provider_available,
+            sandbox_launch_refusals: parts.sandbox_launch_refusals,
+        })
+    }
+
+    #[must_use]
+    pub const fn observed_ms(&self) -> u64 {
+        self.observed_ms
+    }
+    #[must_use]
+    pub const fn reconciliation_pending(&self) -> u64 {
+        self.reconciliation_pending
+    }
+    #[must_use]
+    pub const fn outbox_pending_ready(&self) -> u64 {
+        self.outbox_pending_ready
+    }
+    #[must_use]
+    pub const fn outbox_pending_delayed(&self) -> u64 {
+        self.outbox_pending_delayed
+    }
+    #[must_use]
+    pub const fn outbox_in_flight_live(&self) -> u64 {
+        self.outbox_in_flight_live
+    }
+    #[must_use]
+    pub const fn outbox_in_flight_ambiguous(&self) -> u64 {
+        self.outbox_in_flight_ambiguous
+    }
+    #[must_use]
+    pub const fn outbox_delivered(&self) -> u64 {
+        self.outbox_delivered
+    }
+    #[must_use]
+    pub const fn outbox_dead_lettered(&self) -> u64 {
+        self.outbox_dead_lettered
+    }
+    #[must_use]
+    pub const fn outbox_oldest_ready_age_ms(&self) -> u64 {
+        self.outbox_oldest_ready_age_ms
+    }
+    #[must_use]
+    pub const fn telegram_pollers_live(&self) -> u64 {
+        self.telegram_pollers_live
+    }
+    #[must_use]
+    pub const fn telegram_pollers_expired(&self) -> u64 {
+        self.telegram_pollers_expired
+    }
+    #[must_use]
+    pub const fn telegram_offset_lag(&self) -> OperationalMetric {
+        self.telegram_offset_lag
+    }
+    #[must_use]
+    pub const fn provider_available(&self) -> OperationalMetric {
+        self.provider_available
+    }
+    #[must_use]
+    pub const fn sandbox_launch_refusals(&self) -> OperationalMetric {
+        self.sandbox_launch_refusals
+    }
+
+    fn to_body(&self) -> Result<JsonValue, AdminError> {
+        Ok(JsonValue::Object(vec![
+            (
+                "observed_ms".to_owned(),
+                integer("observed_ms", self.observed_ms)?,
+            ),
+            (
+                "outbox_dead_lettered".to_owned(),
+                integer("outbox_dead_lettered", self.outbox_dead_lettered)?,
+            ),
+            (
+                "outbox_delivered".to_owned(),
+                integer("outbox_delivered", self.outbox_delivered)?,
+            ),
+            (
+                "outbox_in_flight_ambiguous".to_owned(),
+                integer(
+                    "outbox_in_flight_ambiguous",
+                    self.outbox_in_flight_ambiguous,
+                )?,
+            ),
+            (
+                "outbox_in_flight_live".to_owned(),
+                integer("outbox_in_flight_live", self.outbox_in_flight_live)?,
+            ),
+            (
+                "outbox_oldest_ready_age_ms".to_owned(),
+                integer(
+                    "outbox_oldest_ready_age_ms",
+                    self.outbox_oldest_ready_age_ms,
+                )?,
+            ),
+            (
+                "outbox_pending_delayed".to_owned(),
+                integer("outbox_pending_delayed", self.outbox_pending_delayed)?,
+            ),
+            (
+                "outbox_pending_ready".to_owned(),
+                integer("outbox_pending_ready", self.outbox_pending_ready)?,
+            ),
+            (
+                "provider_available".to_owned(),
+                self.provider_available.to_body()?,
+            ),
+            (
+                "reconciliation_pending".to_owned(),
+                integer("reconciliation_pending", self.reconciliation_pending)?,
+            ),
+            (
+                "sandbox_launch_refusals".to_owned(),
+                self.sandbox_launch_refusals.to_body()?,
+            ),
+            (
+                "telegram_offset_lag".to_owned(),
+                self.telegram_offset_lag.to_body()?,
+            ),
+            (
+                "telegram_pollers_expired".to_owned(),
+                integer("telegram_pollers_expired", self.telegram_pollers_expired)?,
+            ),
+            (
+                "telegram_pollers_live".to_owned(),
+                integer("telegram_pollers_live", self.telegram_pollers_live)?,
+            ),
+        ]))
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        const FIELDS: [&str; 14] = [
+            "observed_ms",
+            "outbox_dead_lettered",
+            "outbox_delivered",
+            "outbox_in_flight_ambiguous",
+            "outbox_in_flight_live",
+            "outbox_oldest_ready_age_ms",
+            "outbox_pending_delayed",
+            "outbox_pending_ready",
+            "provider_available",
+            "reconciliation_pending",
+            "sandbox_launch_refusals",
+            "telegram_offset_lag",
+            "telegram_pollers_expired",
+            "telegram_pollers_live",
+        ];
+        exact_fields(body, &FIELDS)?;
+        Self::new(OperationalStatusParts {
+            observed_ms: unsigned(body, "observed_ms")?,
+            reconciliation_pending: unsigned(body, "reconciliation_pending")?,
+            outbox_pending_ready: unsigned(body, "outbox_pending_ready")?,
+            outbox_pending_delayed: unsigned(body, "outbox_pending_delayed")?,
+            outbox_in_flight_live: unsigned(body, "outbox_in_flight_live")?,
+            outbox_in_flight_ambiguous: unsigned(body, "outbox_in_flight_ambiguous")?,
+            outbox_delivered: unsigned(body, "outbox_delivered")?,
+            outbox_dead_lettered: unsigned(body, "outbox_dead_lettered")?,
+            outbox_oldest_ready_age_ms: unsigned(body, "outbox_oldest_ready_age_ms")?,
+            telegram_pollers_live: unsigned(body, "telegram_pollers_live")?,
+            telegram_pollers_expired: unsigned(body, "telegram_pollers_expired")?,
+            telegram_offset_lag: OperationalMetric::from_body(
+                body.get("telegram_offset_lag")
+                    .ok_or(AdminError::InvalidBody)?,
+            )?,
+            provider_available: OperationalMetric::from_body(
+                body.get("provider_available")
+                    .ok_or(AdminError::InvalidBody)?,
+            )?,
+            sandbox_launch_refusals: OperationalMetric::from_body(
+                body.get("sandbox_launch_refusals")
+                    .ok_or(AdminError::InvalidBody)?,
+            )?,
+        })
+    }
 }
 
 impl DaemonStatus {
@@ -925,6 +1242,7 @@ impl DaemonStatus {
             accepting_intake,
             telegram_state: TelegramState::DisabledNoClient,
             telegram_poller_epoch: None,
+            operational: None,
         })
     }
 
@@ -943,6 +1261,29 @@ impl DaemonStatus {
         }
         self.telegram_state = telegram_state;
         self.telegram_poller_epoch = telegram_poller_epoch;
+        Ok(self)
+    }
+
+    /// Attach the projection observed in the same status transaction.
+    ///
+    /// The aggregate status and its operational detail must describe the same
+    /// durable snapshot. Contradictory readiness or queue counts are refused
+    /// rather than left for a client to interpret.
+    pub fn with_operational(mut self, operational: OperationalStatus) -> Result<Self, AdminError> {
+        let projected_pending = operational
+            .outbox_pending_ready
+            .checked_add(operational.outbox_pending_delayed)
+            .ok_or(AdminError::CounterOutOfRange {
+                field: "outbox_pending",
+            })?;
+        if projected_pending != self.outbox_pending
+            || (operational.reconciliation_pending > 0
+                && (self.state != DaemonState::Failed || self.accepting_intake))
+            || (self.accepting_intake && self.state != DaemonState::Ready)
+        {
+            return Err(AdminError::InvalidBody);
+        }
+        self.operational = Some(operational);
         Ok(self)
     }
 
@@ -1004,6 +1345,11 @@ impl DaemonStatus {
         self.telegram_poller_epoch
     }
 
+    #[must_use]
+    pub const fn operational(&self) -> Option<&OperationalStatus> {
+        self.operational.as_ref()
+    }
+
     fn to_body(&self) -> Result<JsonValue, AdminError> {
         Ok(JsonValue::Object(vec![
             (
@@ -1030,6 +1376,13 @@ impl DaemonStatus {
                 "outbox_pending".to_owned(),
                 integer("outbox_pending", self.outbox_pending)?,
             ),
+            (
+                "operational".to_owned(),
+                self.operational
+                    .as_ref()
+                    .ok_or(AdminError::InvalidBody)?
+                    .to_body()?,
+            ),
             ("running".to_owned(), integer("running", self.running)?),
             (
                 "state".to_owned(),
@@ -1047,13 +1400,14 @@ impl DaemonStatus {
     }
 
     fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
-        const FIELDS: [&str; 10] = [
+        const FIELDS: [&str; 11] = [
             "accepting_intake",
             "event_cursor",
             "generation",
             "inbox_pending",
             "instance_id",
             "outbox_pending",
+            "operational",
             "running",
             "state",
             "telegram_poller_epoch",
@@ -1096,6 +1450,11 @@ impl DaemonStatus {
                 TelegramState::parse(required_body_string(body, "telegram_state")?.as_str())?,
                 optional_unsigned(body, "telegram_poller_epoch")?,
             )
+        })
+        .and_then(|status| {
+            status.with_operational(OperationalStatus::from_body(
+                body.get("operational").ok_or(AdminError::InvalidBody)?,
+            )?)
         })
     }
 }

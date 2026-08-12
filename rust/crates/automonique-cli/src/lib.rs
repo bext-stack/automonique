@@ -620,6 +620,16 @@ fn admin_status<W: Write, E: Write>(
         let _ = stderr.write_all(b"automonique status unavailable: response_mismatch\n");
         return 1;
     };
+    let Some(operational) = status.operational() else {
+        let _ = stderr.write_all(b"automonique status unavailable: response_mismatch\n");
+        return 1;
+    };
+    let metric_json = |metric: automonique_protocol::admin::OperationalMetric| {
+        serde_json::json!({
+            "state": metric.state(),
+            "value": metric.value(),
+        })
+    };
     let rendered = if json {
         serde_json::json!({
             "accepting_intake": status.accepting_intake(),
@@ -628,6 +638,22 @@ fn admin_status<W: Write, E: Write>(
             "inbox_pending": status.inbox_pending(),
             "instance_id": status.instance_id().as_str(),
             "outbox_pending": status.outbox_pending(),
+            "operational": {
+                "observed_ms": operational.observed_ms(),
+                "outbox_dead_lettered": operational.outbox_dead_lettered(),
+                "outbox_delivered": operational.outbox_delivered(),
+                "outbox_in_flight_ambiguous": operational.outbox_in_flight_ambiguous(),
+                "outbox_in_flight_live": operational.outbox_in_flight_live(),
+                "outbox_oldest_ready_age_ms": operational.outbox_oldest_ready_age_ms(),
+                "outbox_pending_delayed": operational.outbox_pending_delayed(),
+                "outbox_pending_ready": operational.outbox_pending_ready(),
+                "provider_available": metric_json(operational.provider_available()),
+                "reconciliation_pending": operational.reconciliation_pending(),
+                "sandbox_launch_refusals": metric_json(operational.sandbox_launch_refusals()),
+                "telegram_offset_lag": metric_json(operational.telegram_offset_lag()),
+                "telegram_pollers_expired": operational.telegram_pollers_expired(),
+                "telegram_pollers_live": operational.telegram_pollers_live(),
+            },
             "running": status.running(),
             "state": status.state().as_str(),
             "telegram_poller_epoch": status.telegram_poller_epoch(),
@@ -637,7 +663,7 @@ fn admin_status<W: Write, E: Write>(
             + "\n"
     } else {
         format!(
-            "Automonique daemon: {}\ninstance: {}\ngeneration: {}\nevent cursor: {}\ninbox pending: {}\noutbox pending: {}\nrunning: {}\naccepting intake: {}\ntelegram: {}\ntelegram poller epoch: {}\n",
+            "Automonique daemon: {}\ninstance: {}\ngeneration: {}\nevent cursor: {}\ninbox pending: {}\noutbox pending: {}\nrunning: {}\naccepting intake: {}\ntelegram: {}\ntelegram poller epoch: {}\nobserved ms: {}\nreconciliation pending: {}\noutbox ready: {}\noutbox delayed: {}\noutbox live: {}\noutbox ambiguous: {}\noutbox delivered: {}\noutbox dead-lettered: {}\noutbox oldest ready age ms: {}\ntelegram pollers live: {}\ntelegram pollers expired: {}\ntelegram offset lag: {}\nprovider available: {}\nsandbox launch refusals: {}\n",
             status.state().as_str(),
             status.instance_id().as_str(),
             status.generation(),
@@ -650,6 +676,20 @@ fn admin_status<W: Write, E: Write>(
             status
                 .telegram_poller_epoch()
                 .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+            operational.observed_ms(),
+            operational.reconciliation_pending(),
+            operational.outbox_pending_ready(),
+            operational.outbox_pending_delayed(),
+            operational.outbox_in_flight_live(),
+            operational.outbox_in_flight_ambiguous(),
+            operational.outbox_delivered(),
+            operational.outbox_dead_lettered(),
+            operational.outbox_oldest_ready_age_ms(),
+            operational.telegram_pollers_live(),
+            operational.telegram_pollers_expired(),
+            operational.telegram_offset_lag().state(),
+            operational.provider_available().state(),
+            operational.sandbox_launch_refusals().state(),
         )
     };
     if stdout.write_all(rendered.as_bytes()).is_err() {

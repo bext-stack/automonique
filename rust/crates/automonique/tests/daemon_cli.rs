@@ -159,6 +159,18 @@ fn cli_inspects_and_dead_letters_exact_expired_outbox_without_exposing_payload()
     let (outbox_id, token, epoch, attempt, revision) = seed_expired_outbox(&state);
     let mut daemon = launch(&runtime, &state);
     wait_ready(&runtime, &state);
+    let degraded = run(&runtime, &state, &["status", "--json"]);
+    assert!(degraded.status.success());
+    let degraded: serde_json::Value =
+        serde_json::from_slice(&degraded.stdout).expect("degraded JSON status");
+    assert_eq!(degraded["state"], "failed");
+    assert_eq!(degraded["accepting_intake"], false);
+    assert_eq!(degraded["operational"]["reconciliation_pending"], 1);
+    assert_eq!(degraded["operational"]["outbox_in_flight_ambiguous"], 1);
+    assert_eq!(
+        degraded["operational"]["provider_available"],
+        serde_json::json!({"state": "unavailable", "value": null})
+    );
     let id = outbox_id.to_string();
     let inspect = run(&runtime, &state, &["outbox", "inspect", &id]);
     assert!(
@@ -251,6 +263,20 @@ fn the_product_binary_serves_status_and_shutdown_end_to_end() {
     assert!(human.contains("accepting intake: true"), "{human}");
     assert!(human.contains("telegram: disabled_no_client"), "{human}");
     assert!(human.contains("telegram poller epoch: -"), "{human}");
+    assert!(human.contains("reconciliation pending: 0\n"), "{human}");
+    assert!(human.contains("outbox ambiguous: 0\n"), "{human}");
+    assert!(
+        human.contains("telegram offset lag: unavailable\n"),
+        "{human}"
+    );
+    assert!(
+        human.contains("provider available: unavailable\n"),
+        "{human}"
+    );
+    assert!(
+        human.ends_with("sandbox launch refusals: unavailable\n"),
+        "{human}"
+    );
 
     let json = run(&runtime, &state, &["status", "--json"]);
     assert!(json.status.success());
@@ -259,6 +285,21 @@ fn the_product_binary_serves_status_and_shutdown_end_to_end() {
     assert_eq!(value["accepting_intake"], true);
     assert_eq!(value["telegram_state"], "disabled_no_client");
     assert_eq!(value["telegram_poller_epoch"], serde_json::Value::Null);
+    assert!(value["operational"]["observed_ms"].as_u64().is_some());
+    assert_eq!(value["operational"]["reconciliation_pending"], 0);
+    assert_eq!(value["operational"]["outbox_in_flight_ambiguous"], 0);
+    assert_eq!(value["operational"]["telegram_pollers_live"], 0);
+    assert_eq!(value["operational"]["telegram_pollers_expired"], 0);
+    for unavailable in [
+        "telegram_offset_lag",
+        "provider_available",
+        "sandbox_launch_refusals",
+    ] {
+        assert_eq!(
+            value["operational"][unavailable],
+            serde_json::json!({"state": "unavailable", "value": null})
+        );
+    }
     assert!(
         value["event_cursor"]
             .as_u64()

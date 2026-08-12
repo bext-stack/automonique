@@ -165,6 +165,13 @@ fn expired_outbox_requires_exact_fenced_operator_reconciliation_and_replays_afte
     };
     assert_eq!(status.state(), DaemonState::Failed);
     assert!(!status.accepting_intake());
+    let operational = status.operational().expect("operational projection");
+    assert_eq!(operational.outbox_in_flight_ambiguous(), 1);
+    assert_eq!(operational.reconciliation_pending(), 1);
+    assert_eq!(
+        operational.provider_available(),
+        automonique_protocol::admin::OperationalMetric::Unavailable
+    );
     let blocked_submission = SyntheticSubmission::new(
         "workspace:blocked",
         "outbox-ambiguity-blocks-intake",

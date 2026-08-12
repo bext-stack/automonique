@@ -32,6 +32,10 @@ use automonique_protocol::sandbox::{
 };
 use sha2::{Digest as _, Sha256};
 
+mod release_trust;
+
+pub use release_trust::{ReleaseBoundaryCandidate, ReleaseBoundaryError, ReleaseBoundaryParts};
+
 /// Stable feature names understood by this compiler.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum HostCapability {
@@ -1282,6 +1286,23 @@ impl RunnerAdmissionSealer {
         })
     }
 
+    /// Refuse a release-manifest candidate until an independent review trust
+    /// root can authenticate it.
+    ///
+    /// [`ReleaseBoundaryCandidate`] proves only that one canonical manifest
+    /// declares the helper digest and is consistently bound to caller-declared
+    /// boundary-installer, inert-fixture, workspace, provider, runner, and run
+    /// coordinates. The checked-in release protocol has no signature or
+    /// trusted release-store handle, so even a perfectly consistent
+    /// caller-built candidate cannot mint a one-use token.
+    pub fn issue_release_candidate(
+        &mut self,
+        _plan: &AdmissionPlan,
+        _candidate: &ReleaseBoundaryCandidate,
+    ) -> Result<RunnerAdmissionToken, RunnerAdmissionError> {
+        Err(RunnerAdmissionError::MissingIndependentReleaseReview)
+    }
+
     /// Consume one token for an exact subject and fresh observed attestation.
     ///
     /// Every attempt after seal validation consumes the token, including a
@@ -1396,6 +1417,9 @@ pub enum RunnerAdmissionError {
     UnreviewedPolicy,
     /// The plan was not built from this issuer's independent observation.
     ObservedReportMismatch,
+    /// A consistent release-manifest candidate lacks an independent release
+    /// review trust root and therefore cannot authorize execution.
+    MissingIndependentReleaseReview,
     /// The issuer exhausted its unique in-process sequence.
     IssuerExhausted,
     /// This exact token was already attempted.
@@ -1421,6 +1445,9 @@ impl fmt::Display for RunnerAdmissionError {
             Self::UnreviewedPolicy => formatter.write_str("admission policy is caller-supplied"),
             Self::ObservedReportMismatch => {
                 formatter.write_str("plan does not match this observed host report")
+            }
+            Self::MissingIndependentReleaseReview => {
+                formatter.write_str("release candidate lacks independent release review")
             }
             Self::IssuerExhausted => formatter.write_str("runner admission issuer is exhausted"),
             Self::AlreadyConsumed => formatter.write_str("runner admission token was already used"),
@@ -1526,7 +1553,7 @@ mod runner_admission_tests {
             .expect("test digest")
     }
 
-    fn observed_report() -> HostProbeReport {
+    pub(super) fn observed_report() -> HostProbeReport {
         let mut report = HostProbeReport::new(HostCapability::ALL.into_iter().enumerate().map(
             |(index, capability)| ProbedFeature::new(capability, typed_digest(index as u8 + 1)),
         ))
@@ -1538,7 +1565,7 @@ mod runner_admission_tests {
         report
     }
 
-    fn runner_plan(report: &HostProbeReport) -> AdmissionPlan {
+    pub(super) fn runner_plan(report: &HostProbeReport) -> AdmissionPlan {
         let mut policy = AdmissionPolicy::new(HostCapability::ALL.into_iter().enumerate().map(
             |(index, capability)| ProbedFeature::new(capability, typed_digest(index as u8 + 1)),
         ))
