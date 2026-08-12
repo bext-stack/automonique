@@ -14,16 +14,18 @@ use automonique_protocol::sandbox::{
     RequiredFeatures, SandboxProfile, SandboxSpec, SandboxSpecParts, ToolWorkloadEgress,
     WorkspaceContextHash,
 };
-use automonique_protocol::tools::{ApprovalRequirement, CausationId, NestedCause, RunId};
+use automonique_protocol::tools::{CausationId, NestedCause, RunId};
 use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
 use automonique_runner::{
-    AdmissionFields, AdmissionFieldsParts, Authority, BackendPromptSession, CancellationToken,
+    AdmissionFields, AdmissionFieldsParts, ArtifactGrantBinding, ArtifactGrantBindings,
+    ArtifactGrantDigest, ArtifactGrantId, Authority, BackendPromptSession, CancellationToken,
     ContainmentEvidence, CwdToken, EventKind, ExecutionPlanDigest, ExtensionSetDigest,
-    FallbackEligibility, IntegrationMode, IoReservation, ModelRoutingDigest, PersonaDigest,
-    PortabilityPolicy, ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference,
-    RemoteAttestationPolicy, RequiredCapabilities, RunCoordinates, RunOrigin, RunSpec,
-    RunSpecError, RunSpecParts, Runner, RunnerError, RunnerEventDialect, SkillsetDigest, Spool,
-    SpoolError, ToolsetDigest, WorkspaceRegistryId, WorkspaceReservation,
+    FallbackEligibility, IntegrationMode, IoReservation, ModelRoutingDigest, OriginCoordinate,
+    PersonaDigest, PortabilityPolicy, ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference,
+    RemoteAttestationPolicy, RequiredCapabilities, RunCoordinates, RunOrigin, RunOriginSource,
+    RunSpec, RunSpecError, RunSpecParts, Runner, RunnerError, RunnerEventDialect,
+    SchedulerDecisionDigest, SchedulerReservationBinding, SchedulerReservationId, SkillsetDigest,
+    Spool, SpoolError, ToolsetDigest, WorkspaceRegistryId, WorkspaceReservation,
 };
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -120,9 +122,14 @@ fn admission_parts(workspace_bytes: u64) -> AdmissionFieldsParts {
         remote_attestation_policy: RemoteAttestationPolicy::NotRequired,
         persona_digest: PersonaDigest::parse(&digest_text('b')).unwrap(),
         execution_plan_digest: ExecutionPlanDigest::parse(&digest_text('c')).unwrap(),
+        scheduler_reservation: SchedulerReservationBinding::new(
+            SchedulerReservationId::new("reservation-1").unwrap(),
+            Revision::FIRST,
+            SchedulerDecisionDigest::parse(&digest_text('d')).unwrap(),
+        ),
+        artifact_grants: ArtifactGrantBindings::declare(Vec::new()).unwrap(),
         credential_bindings: Vec::new(),
         event_dialect: RunnerEventDialect::AutomoniqueRunnerV1,
-        approval_requirement: ApprovalRequirement::None,
     }
 }
 
@@ -492,6 +499,119 @@ fn admission_field_constructors_refuse_unbounded_or_ambiguous_values() {
 }
 
 #[test]
+fn nonauthorizing_bindings_are_bounded_distinct_and_duplicate_free() {
+    for invalid in ["", ".", "..", "with/slash", "with:colon", "é", "-leading"] {
+        assert_eq!(
+            SchedulerReservationId::new(invalid).unwrap_err(),
+            RunSpecError::FieldInvalid("scheduler_reservation_id")
+        );
+    }
+    let boundary = format!("a{}", "z".repeat(255));
+    assert_eq!(
+        SchedulerReservationId::new(&boundary).unwrap().as_str(),
+        boundary
+    );
+    assert_eq!(
+        SchedulerReservationId::new(&format!("a{}", "z".repeat(256))).unwrap_err(),
+        RunSpecError::FieldInvalid("scheduler_reservation_id")
+    );
+
+    let grant = ArtifactGrantBinding::new(
+        ArtifactGrantId::new("grant-1").unwrap(),
+        Revision::FIRST,
+        ArtifactGrantDigest::parse(&digest_text('e')).unwrap(),
+    );
+    assert_eq!(grant.id().as_str(), "grant-1");
+    assert_eq!(grant.revision(), Revision::FIRST);
+    assert_eq!(grant.grant_digest().digest().to_string(), digest_text('e'));
+    assert_eq!(
+        ArtifactGrantBindings::declare(vec![grant.clone(), grant]).unwrap_err(),
+        RunSpecError::FieldInvalid("artifact_grants")
+    );
+    let duplicate_id_changed_coordinates = vec![
+        ArtifactGrantBinding::new(
+            ArtifactGrantId::new("same-grant").unwrap(),
+            Revision::FIRST,
+            ArtifactGrantDigest::parse(&digest_text('e')).unwrap(),
+        ),
+        ArtifactGrantBinding::new(
+            ArtifactGrantId::new("same-grant").unwrap(),
+            Revision::new(2).unwrap(),
+            ArtifactGrantDigest::parse(&digest_text('f')).unwrap(),
+        ),
+    ];
+    assert_eq!(
+        ArtifactGrantBindings::declare(duplicate_id_changed_coordinates).unwrap_err(),
+        RunSpecError::FieldInvalid("artifact_grants")
+    );
+    let exact_limit = (0..128)
+        .map(|index| {
+            ArtifactGrantBinding::new(
+                ArtifactGrantId::new(&format!("grant-{index}")).unwrap(),
+                Revision::FIRST,
+                ArtifactGrantDigest::parse(&digest_text('e')).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ArtifactGrantBindings::declare(exact_limit)
+            .unwrap()
+            .as_slice()
+            .len(),
+        128
+    );
+    let ordered = ArtifactGrantBindings::declare(vec![
+        ArtifactGrantBinding::new(
+            ArtifactGrantId::new("grant-first").unwrap(),
+            Revision::FIRST,
+            ArtifactGrantDigest::parse(&digest_text('e')).unwrap(),
+        ),
+        ArtifactGrantBinding::new(
+            ArtifactGrantId::new("grant-second").unwrap(),
+            Revision::FIRST,
+            ArtifactGrantDigest::parse(&digest_text('f')).unwrap(),
+        ),
+    ])
+    .unwrap();
+    assert_eq!(ordered.as_slice()[0].id().as_str(), "grant-first");
+    assert_eq!(ordered.as_slice()[1].id().as_str(), "grant-second");
+    let too_many = (0..129)
+        .map(|index| {
+            ArtifactGrantBinding::new(
+                ArtifactGrantId::new(&format!("grant-{index}")).unwrap(),
+                Revision::FIRST,
+                ArtifactGrantDigest::parse(&digest_text('e')).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ArtifactGrantBindings::declare(too_many).unwrap_err(),
+        RunSpecError::FieldInvalid("artifact_grants")
+    );
+
+    let root = TempDir::new("bindings");
+    let spec = RunSpec::new(parts(root.path(), PromptDeliveryPlan::Stdin)).unwrap();
+    assert_eq!(
+        spec.admission().scheduler_reservation().id().as_str(),
+        "reservation-1"
+    );
+    assert!(spec.admission().artifact_grants().is_empty());
+    let debug = format!("{:?}", spec.admission());
+    assert!(!debug.contains("reservation-1"));
+
+    for invalid in [
+        "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:AAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:aa",
+    ] {
+        assert_eq!(
+            SchedulerDecisionDigest::parse(invalid).unwrap_err(),
+            RunSpecError::FieldInvalid("scheduler_decision_digest")
+        );
+    }
+}
+
+#[test]
 fn remote_executor_classes_require_an_attestation_policy() {
     let root = TempDir::new("remote-attestation");
     for executor_class in [
@@ -619,9 +739,9 @@ fn noninteractive_origin_preserves_exact_read_only_coordinates() {
         CausationId::new("cause-1").unwrap(),
     );
     let origin = RunOrigin::non_interactive(
-        Some(automation.clone()),
-        Some(goal.clone()),
-        Some(trigger.clone()),
+        RunOriginSource::Automation,
+        event.clone(),
+        OriginCoordinate::Automation(automation.clone()),
         vec![event.clone()],
         cause.clone(),
     )
@@ -629,10 +749,12 @@ fn noninteractive_origin_preserves_exact_read_only_coordinates() {
     let RunOrigin::NonInteractive(origin_data) = &origin else {
         panic!("expected noninteractive origin");
     };
+    assert_eq!(origin_data.source(), RunOriginSource::Automation);
+    assert_eq!(origin_data.event_id(), &event);
     assert_eq!(origin_data.automation(), Some(&automation));
-    assert_eq!(origin_data.goal(), Some(&goal));
-    assert_eq!(origin_data.trigger(), Some(&trigger));
-    assert_eq!(origin_data.causal_events(), &[event]);
+    assert_eq!(origin_data.goal(), None);
+    assert_eq!(origin_data.trigger(), None);
+    assert_eq!(origin_data.causal_events(), std::slice::from_ref(&event));
     assert_eq!(origin_data.cause(), &cause);
 
     let root = TempDir::new("noninteractive-origin");
@@ -641,6 +763,164 @@ fn noninteractive_origin_preserves_exact_read_only_coordinates() {
     fields.origin = origin;
     candidate.admission = AdmissionFields::new(fields);
     assert!(RunSpec::new(candidate).is_ok());
+
+    for (source, coordinate) in [
+        (
+            RunOriginSource::Goal,
+            OriginCoordinate::Automation(goal.clone()),
+        ),
+        (
+            RunOriginSource::Trigger,
+            OriginCoordinate::Goal(trigger.clone()),
+        ),
+        (
+            RunOriginSource::Recovery,
+            OriginCoordinate::Trigger(trigger.clone()),
+        ),
+        (RunOriginSource::Interactive, OriginCoordinate::None),
+    ] {
+        assert_eq!(
+            RunOrigin::non_interactive(
+                source,
+                event.clone(),
+                coordinate,
+                vec![event.clone()],
+                cause.clone(),
+            )
+            .unwrap_err(),
+            RunSpecError::FieldInvalid("origin")
+        );
+    }
+
+    assert_eq!(
+        RunOrigin::Interactive.source(),
+        RunOriginSource::Interactive
+    );
+    assert!(RunOrigin::Interactive.non_interactive_details().is_none());
+
+    for source in [
+        RunOriginSource::Schedule,
+        RunOriginSource::Recovery,
+        RunOriginSource::GraphChild,
+        RunOriginSource::BackgroundCuration,
+        RunOriginSource::Media,
+        RunOriginSource::RemoteWakeup,
+        RunOriginSource::Batch,
+        RunOriginSource::Evaluation,
+    ] {
+        let generic = RunOrigin::non_interactive(
+            source,
+            event.clone(),
+            OriginCoordinate::None,
+            vec![event.clone()],
+            cause.clone(),
+        )
+        .unwrap();
+        assert_eq!(generic.source(), source);
+    }
+
+    for (source, coordinate) in [
+        (
+            RunOriginSource::Automation,
+            OriginCoordinate::Automation(automation),
+        ),
+        (RunOriginSource::Goal, OriginCoordinate::Goal(goal)),
+        (RunOriginSource::Trigger, OriginCoordinate::Trigger(trigger)),
+    ] {
+        let typed = RunOrigin::non_interactive(
+            source,
+            event.clone(),
+            coordinate,
+            vec![event.clone()],
+            cause.clone(),
+        )
+        .unwrap();
+        assert_eq!(typed.source(), source);
+        let details = typed.non_interactive_details().unwrap();
+        match source {
+            RunOriginSource::Automation => assert!(details.automation().is_some()),
+            RunOriginSource::Goal => assert!(details.goal().is_some()),
+            RunOriginSource::Trigger => assert!(details.trigger().is_some()),
+            _ => unreachable!(),
+        }
+    }
+
+    assert_eq!(
+        RunOrigin::non_interactive(
+            RunOriginSource::Recovery,
+            event.clone(),
+            OriginCoordinate::None,
+            Vec::new(),
+            cause.clone(),
+        )
+        .unwrap_err(),
+        RunSpecError::FieldInvalid("causal_events")
+    );
+    assert_eq!(
+        RunOrigin::non_interactive(
+            RunOriginSource::Recovery,
+            event.clone(),
+            OriginCoordinate::None,
+            vec![event.clone(), event.clone()],
+            cause.clone(),
+        )
+        .unwrap_err(),
+        RunSpecError::FieldInvalid("causal_events")
+    );
+    let too_many_events = (0..65)
+        .map(|index| DurableId::new(&format!("event-{index}")).unwrap())
+        .collect();
+    assert_eq!(
+        RunOrigin::non_interactive(
+            RunOriginSource::Recovery,
+            event.clone(),
+            OriginCoordinate::None,
+            too_many_events,
+            cause.clone(),
+        )
+        .unwrap_err(),
+        RunSpecError::FieldInvalid("causal_events")
+    );
+
+    let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+    let mut fields = admission_parts(0);
+    fields.origin = RunOrigin::non_interactive(
+        RunOriginSource::Recovery,
+        event.clone(),
+        OriginCoordinate::None,
+        vec![event],
+        NestedCause::root(
+            Actor::new("other", "actor-1").unwrap(),
+            RunId::new("run-1").unwrap(),
+            CausationId::new("cause-2").unwrap(),
+        ),
+    )
+    .unwrap();
+    candidate.admission = AdmissionFields::new(fields);
+    assert_eq!(
+        RunSpec::new(candidate).unwrap_err(),
+        RunSpecError::FieldInvalid("origin")
+    );
+
+    let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
+    let mut fields = admission_parts(0);
+    fields.origin = RunOrigin::non_interactive(
+        RunOriginSource::Recovery,
+        DurableId::new("event-run-mismatch").unwrap(),
+        OriginCoordinate::None,
+        vec![DurableId::new("event-run-mismatch").unwrap()],
+        NestedCause::root(
+            Actor::new("acme", "actor-1").unwrap(),
+            RunId::new("other-run").unwrap(),
+            CausationId::new("cause-3").unwrap(),
+        ),
+    )
+    .unwrap();
+    candidate.admission = AdmissionFields::new(fields);
+    assert_eq!(
+        RunSpec::new(candidate).unwrap_err(),
+        RunSpecError::FieldInvalid("origin")
+    );
 }
 
 #[test]

@@ -33,10 +33,13 @@ pub use spec::{
     WorkspaceRegistryId,
 };
 pub use spec_fields::{
-    AdmissionFields, AdmissionFieldsParts, CredentialBinding, ExecutionPlanDigest,
-    ExtensionSetDigest, FallbackEligibility, IntegrationMode, IoReservation, MAX_FALLBACK_MODES,
-    MAX_ORIGIN_CAUSES, MAX_RESERVATION_BYTES, ModelRoutingDigest, NonInteractiveOrigin,
-    PersonaDigest, PortabilityPolicy, ProfileDigest, RemoteAttestationPolicy, RequiredCapabilities,
-    RunOrigin, RunnerEventDialect, SkillsetDigest, ToolsetDigest, WorkspaceReservation,
+    AdmissionFields, AdmissionFieldsParts, ArtifactGrantBinding, ArtifactGrantBindings,
+    ArtifactGrantDigest, ArtifactGrantId, CredentialBinding, ExecutionPlanDigest,
+    ExtensionSetDigest, FallbackEligibility, IntegrationMode, IoReservation,
+    MAX_ARTIFACT_GRANT_BINDINGS, MAX_FALLBACK_MODES, MAX_ORIGIN_CAUSES, MAX_RESERVATION_BYTES,
+    ModelRoutingDigest, NonInteractiveOrigin, OriginCoordinate, PersonaDigest, PortabilityPolicy,
+    ProfileDigest, RemoteAttestationPolicy, RequiredCapabilities, RunOrigin, RunOriginSource,
+    RunnerEventDialect, SchedulerDecisionDigest, SchedulerReservationBinding,
+    SchedulerReservationId, SkillsetDigest, ToolsetDigest, WorkspaceReservation,
 };
 pub use spool::{Authority, Event, EventKind, RunState, Spool, SpoolError, Status};

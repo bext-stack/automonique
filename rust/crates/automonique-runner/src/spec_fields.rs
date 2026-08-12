@@ -1,21 +1,33 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 //! Runner-owned, admission-only RunSpec fields with no protocol equivalent.
+//!
+//! Binding IDs and digests are domain-distinct:
+//!
+//! ```compile_fail
+//! use automonique_runner::{ArtifactGrantDigest, SchedulerDecisionDigest};
+//! let scheduler = SchedulerDecisionDigest::parse(
+//!     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+//! ).unwrap();
+//! let artifact: ArtifactGrantDigest = scheduler;
+//! ```
 
 use crate::{PromptDeliveryPlan, RunCoordinates, RunSpecError};
 use automonique_protocol::automation::DurableId;
 use automonique_protocol::context::ContextManifest;
 use automonique_protocol::models::ExecutorClass;
 use automonique_protocol::models::{ArtifactTransfer, WorkspaceTransfer};
+use automonique_protocol::primitives::Revision;
 use automonique_protocol::provider::{Capability, MAX_CAPABILITIES, SessionBinding};
 use automonique_protocol::sandbox::{Digest, DigestAlgorithm, SandboxSpec};
-use automonique_protocol::tools::{ApprovalRequirement, CredentialAudiences, NestedCause};
+use automonique_protocol::tools::{CredentialAudiences, NestedCause};
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 
 pub const MAX_FALLBACK_MODES: usize = 16;
 pub const MAX_ORIGIN_CAUSES: usize = 64;
+pub const MAX_ARTIFACT_GRANT_BINDINGS: usize = 128;
 pub const MAX_RESERVATION_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_LOCAL_FIELD_BYTES: usize = 256;
 
@@ -28,6 +40,21 @@ fn bounded(value: &str, field: &'static str) -> Result<(), RunSpecError> {
     } else {
         Ok(())
     }
+}
+
+fn opaque_ascii(value: &str, field: &'static str) -> Result<(), RunSpecError> {
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return Err(RunSpecError::FieldInvalid(field));
+    };
+    if value.len() > MAX_LOCAL_FIELD_BYTES
+        || !first.is_ascii_alphanumeric()
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || matches!(value, "." | "..")
+    {
+        return Err(RunSpecError::FieldInvalid(field));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,6 +178,10 @@ pub struct ExtensionSetDomain;
 pub struct PersonaDomain;
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ExecutionPlanDomain;
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SchedulerDecisionDomain;
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ArtifactGrantDomain;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SpecDigest<D> {
@@ -208,6 +239,175 @@ digest_type!(
     ExecutionPlanDomain,
     "execution_plan_digest"
 );
+digest_type!(
+    SchedulerDecisionDigest,
+    SchedulerDecisionDomain,
+    "scheduler_decision_digest"
+);
+digest_type!(
+    ArtifactGrantDigest,
+    ArtifactGrantDomain,
+    "artifact_grant_digest"
+);
+
+macro_rules! opaque_id_type {
+    ($(#[$meta:meta])* $name:ident, $field:literal) => {
+        $(#[$meta])*
+        #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: &str) -> Result<Self, RunSpecError> {
+                opaque_ascii(value, $field)?;
+                Ok(Self(value.to_owned()))
+            }
+
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl core::fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                formatter.write_str(concat!(stringify!($name), "(<opaque>)"))
+            }
+        }
+    };
+}
+
+opaque_id_type!(
+    /// Opaque scheduler record coordinate, distinct from artifact grant IDs.
+    ///
+    /// ```compile_fail
+    /// use automonique_runner::{ArtifactGrantId, SchedulerReservationId};
+    /// let scheduler = SchedulerReservationId::new("reservation-1").unwrap();
+    /// let artifact: ArtifactGrantId = scheduler;
+    /// ```
+    SchedulerReservationId,
+    "scheduler_reservation_id"
+);
+opaque_id_type!(ArtifactGrantId, "artifact_grant_id");
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct SchedulerReservationBinding {
+    id: SchedulerReservationId,
+    revision: Revision,
+    decision_digest: SchedulerDecisionDigest,
+}
+
+impl SchedulerReservationBinding {
+    #[must_use]
+    pub const fn new(
+        id: SchedulerReservationId,
+        revision: Revision,
+        decision_digest: SchedulerDecisionDigest,
+    ) -> Self {
+        Self {
+            id,
+            revision,
+            decision_digest,
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> &SchedulerReservationId {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn decision_digest(&self) -> &SchedulerDecisionDigest {
+        &self.decision_digest
+    }
+}
+
+impl core::fmt::Debug for SchedulerReservationBinding {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("SchedulerReservationBinding(<non-authorizing>)")
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ArtifactGrantBinding {
+    id: ArtifactGrantId,
+    revision: Revision,
+    grant_digest: ArtifactGrantDigest,
+}
+
+impl ArtifactGrantBinding {
+    #[must_use]
+    pub const fn new(
+        id: ArtifactGrantId,
+        revision: Revision,
+        grant_digest: ArtifactGrantDigest,
+    ) -> Self {
+        Self {
+            id,
+            revision,
+            grant_digest,
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> &ArtifactGrantId {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn grant_digest(&self) -> &ArtifactGrantDigest {
+        &self.grant_digest
+    }
+}
+
+impl core::fmt::Debug for ArtifactGrantBinding {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("ArtifactGrantBinding(<non-authorizing>)")
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ArtifactGrantBindings(Vec<ArtifactGrantBinding>);
+
+impl ArtifactGrantBindings {
+    pub fn declare(bindings: Vec<ArtifactGrantBinding>) -> Result<Self, RunSpecError> {
+        if bindings.len() > MAX_ARTIFACT_GRANT_BINDINGS {
+            return Err(RunSpecError::FieldInvalid("artifact_grants"));
+        }
+        let mut ids = BTreeSet::new();
+        if bindings
+            .iter()
+            .any(|binding| !ids.insert(binding.id().as_str()))
+        {
+            return Err(RunSpecError::FieldInvalid("artifact_grants"));
+        }
+        Ok(Self(bindings))
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[ArtifactGrantBinding] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for ArtifactGrantBindings {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            formatter,
+            "ArtifactGrantBindings(<{} references>)",
+            self.0.len()
+        )
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunOrigin {
@@ -215,24 +415,65 @@ pub enum RunOrigin {
     NonInteractive(Box<NonInteractiveOrigin>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RunOriginSource {
+    Interactive,
+    Automation,
+    Goal,
+    Trigger,
+    Schedule,
+    Recovery,
+    GraphChild,
+    BackgroundCuration,
+    Media,
+    RemoteWakeup,
+    Batch,
+    Evaluation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OriginCoordinate {
+    None,
+    Automation(DurableId),
+    Goal(DurableId),
+    Trigger(DurableId),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NonInteractiveOrigin {
-    automation: Option<DurableId>,
-    goal: Option<DurableId>,
-    trigger: Option<DurableId>,
+    source: RunOriginSource,
+    event_id: DurableId,
+    coordinate: OriginCoordinate,
     causal_events: Vec<DurableId>,
     cause: NestedCause,
 }
 
 impl RunOrigin {
     pub fn non_interactive(
-        automation: Option<DurableId>,
-        goal: Option<DurableId>,
-        trigger: Option<DurableId>,
+        source: RunOriginSource,
+        event_id: DurableId,
+        coordinate: OriginCoordinate,
         causal_events: Vec<DurableId>,
         cause: NestedCause,
     ) -> Result<Self, RunSpecError> {
-        if automation.is_none() && goal.is_none() && trigger.is_none() {
+        let coordinate_matches = matches!(
+            (source, &coordinate),
+            (RunOriginSource::Automation, OriginCoordinate::Automation(_))
+                | (RunOriginSource::Goal, OriginCoordinate::Goal(_))
+                | (RunOriginSource::Trigger, OriginCoordinate::Trigger(_))
+                | (
+                    RunOriginSource::Schedule
+                        | RunOriginSource::Recovery
+                        | RunOriginSource::GraphChild
+                        | RunOriginSource::BackgroundCuration
+                        | RunOriginSource::Media
+                        | RunOriginSource::RemoteWakeup
+                        | RunOriginSource::Batch
+                        | RunOriginSource::Evaluation,
+                    OriginCoordinate::None
+                )
+        );
+        if !coordinate_matches {
             return Err(RunSpecError::FieldInvalid("origin"));
         }
         if causal_events.is_empty() || causal_events.len() > MAX_ORIGIN_CAUSES {
@@ -246,29 +487,64 @@ impl RunOrigin {
             return Err(RunSpecError::FieldInvalid("causal_events"));
         }
         Ok(Self::NonInteractive(Box::new(NonInteractiveOrigin {
-            automation,
-            goal,
-            trigger,
+            source,
+            event_id,
+            coordinate,
             causal_events,
             cause,
         })))
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> RunOriginSource {
+        match self {
+            Self::Interactive => RunOriginSource::Interactive,
+            Self::NonInteractive(origin) => origin.source,
+        }
+    }
+
+    #[must_use]
+    pub const fn non_interactive_details(&self) -> Option<&NonInteractiveOrigin> {
+        match self {
+            Self::Interactive => None,
+            Self::NonInteractive(origin) => Some(origin),
+        }
     }
 }
 
 impl NonInteractiveOrigin {
     #[must_use]
+    pub const fn source(&self) -> RunOriginSource {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn event_id(&self) -> &DurableId {
+        &self.event_id
+    }
+
+    #[must_use]
     pub const fn automation(&self) -> Option<&DurableId> {
-        self.automation.as_ref()
+        match &self.coordinate {
+            OriginCoordinate::Automation(id) => Some(id),
+            _ => None,
+        }
     }
 
     #[must_use]
     pub const fn goal(&self) -> Option<&DurableId> {
-        self.goal.as_ref()
+        match &self.coordinate {
+            OriginCoordinate::Goal(id) => Some(id),
+            _ => None,
+        }
     }
 
     #[must_use]
     pub const fn trigger(&self) -> Option<&DurableId> {
-        self.trigger.as_ref()
+        match &self.coordinate {
+            OriginCoordinate::Trigger(id) => Some(id),
+            _ => None,
+        }
     }
 
     #[must_use]
@@ -357,9 +633,10 @@ pub struct AdmissionFieldsParts {
     pub remote_attestation_policy: RemoteAttestationPolicy,
     pub persona_digest: PersonaDigest,
     pub execution_plan_digest: ExecutionPlanDigest,
+    pub scheduler_reservation: SchedulerReservationBinding,
+    pub artifact_grants: ArtifactGrantBindings,
     pub credential_bindings: Vec<CredentialBinding>,
     pub event_dialect: RunnerEventDialect,
-    pub approval_requirement: ApprovalRequirement,
 }
 
 #[derive(Clone)]
@@ -430,16 +707,18 @@ impl AdmissionFields {
     pub const fn execution_plan_digest(&self) -> &ExecutionPlanDigest {
         &self.0.execution_plan_digest
     }
+    pub const fn scheduler_reservation(&self) -> &SchedulerReservationBinding {
+        &self.0.scheduler_reservation
+    }
+    pub fn artifact_grants(&self) -> &[ArtifactGrantBinding] {
+        self.0.artifact_grants.as_slice()
+    }
     pub fn credential_bindings(&self) -> &[CredentialBinding] {
         &self.0.credential_bindings
     }
     pub const fn event_dialect(&self) -> RunnerEventDialect {
         self.0.event_dialect
     }
-    pub const fn approval_requirement(&self) -> ApprovalRequirement {
-        self.0.approval_requirement
-    }
-
     pub(crate) fn validate_against(
         &self,
         coordinates: &RunCoordinates,
