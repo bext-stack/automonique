@@ -3,13 +3,13 @@
   "counters": {
     "capability_ledger_fields_missing": 0,
     "parity_ledger_fields_missing": 0,
-    "contracts_missing": 91,
+    "contracts_missing": 90,
     "gates_open": 3,
     "links_broken": 0,
     "refs_undefined": 0,
     "evidence_missing": 0
   },
-  "total": 94,
+  "total": 93,
   "context": {
     "items": 375,
     "items_done": 38
@@ -31,5 +31,5 @@
       "open: GATE-SCRUB"
     ]
   },
-  "digest": "1a18155d6b0914aa25e20ffd5a1a6ec88cca20f952d52bc9b0dd3f0b74badf4c"
+  "digest": "e0df4aaf7508e444a1dce7a89aa45a2f29a47881442e36fcd70eaf908c528516"
 }

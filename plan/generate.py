@@ -242,6 +242,11 @@ ITEM_PATHS = {
         "rust/crates/automonique-protocol/", "rust/crates/automonique-policy/",
         "rust/Cargo.toml", "rust/Cargo.lock",
     ],
+    "R2-01": [
+        "rust/crates/automonique-runner/",
+        "rust/crates/automonique-protocol/",
+        "rust/Cargo.lock",
+    ],
     "R11-08": ["sdk/typescript/packages/extension/"],
     "R11-09": ["sdk/typescript/packages/ui/"],
 }

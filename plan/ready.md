@@ -6,8 +6,8 @@ An item is ready when every dependency is `done`. Selecting work means taking a 
 
 - items total: **375**
 - done: **38**
-- ready now: **5**
-- blocked: **332**
+- ready now: **6**
+- blocked: **331**
 
 ## Focus ledger
 
@@ -15,7 +15,7 @@ Product work is what ships. Discovery feeds the specification. Harness work buil
 
 | Class | Items | Done | Contracts | Ready |
 |---|---|---|---|---|
-| product | 330 | 25 | 25 | 0 |
+| product | 330 | 25 | 26 | 1 |
 | discovery | 23 | 13 | 18 | 5 |
 | harness | 22 | 0 | 5 | 0 |
 
@@ -28,6 +28,7 @@ Product work is what ships. Discovery feeds the specification. Harness work buil
 | `BOOT-004` | BOOT | Parity-oracle boundary | Elastic-2.0 | [contract](contracts/BOOT-004.md) |
 | `R0-10` | R0 | Baseline recovery drill | Elastic-2.0 | [contract](contracts/R0-10.md) |
 | `R0-11` | R0 | Shell decision fixture | Elastic-2.0 | [contract](contracts/R0-11.md) |
+| `R2-01` | R2 | RunSpec schema and validator | Elastic-2.0 | [contract](contracts/R2-01.md) |
 
 ## Next to unblock
 
@@ -48,7 +49,7 @@ The first blocked items behind the current ready set:
 
 Dependency- and gate-clear, but no contract exists, so they are not selectable. Writing one of these contracts is itself useful work and lowers `contracts_missing`. **Ordered product first** — specifying product work is what makes product work selectable, and nothing else in this repository does that.
 
-  `R2-01`, `R2-02`, `R2-03`, `R2-04`, `R2-05`, `R2-06`, `R2-07`, `R2-08`, `R2-09`, `R2-10`, `R2-11`, `R2-12`, `R2-13`, `R2-14`, `R2-15`, `R2-16`, `R2-17`, `R2-18`, `R2-19`, `R2-20`, `R2-21`, `R2-22`, `R2-23`, `R2-24` …and 23 more
+  `R2-02`, `R2-03`, `R2-04`, `R2-05`, `R2-06`, `R2-07`, `R2-08`, `R2-09`, `R2-10`, `R2-11`, `R2-12`, `R2-13`, `R2-14`, `R2-15`, `R2-16`, `R2-17`, `R2-18`, `R2-19`, `R2-20`, `R2-21`, `R2-22`, `R2-23`, `R2-24`, `R2-25` …and 22 more
 
 ## Gate-blocked work
 
