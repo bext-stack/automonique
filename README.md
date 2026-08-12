@@ -16,7 +16,12 @@ execution lane, a bounded process-runner foundation, and fail-closed sandbox
 admission planning. It also has a strict Telegram update parser with atomic
 durable dispositions/offsets, fail-only reconciliation over the authenticated
 local admin endpoint, and a read-only Codex invocation normalizer. Provider
-execution and transport networking are not connected yet. Large historical
+execution and transport networking are not connected yet. Delivery intents now
+have durable FIFO leases, exact provider receipts, retry/dead-letter outcomes,
+and explicit ambiguity reconciliation. A side-effect-free Telegram polling
+orchestrator binds parsed batches to an atomic sink with a fenced deadline and
+content digest, while a detached observability model provides closed,
+content-free metric and event vocabularies. Large historical
 planning and development-harness surfaces remain in the tree, but they are no
 longer prerequisites for product development.
 
@@ -109,8 +114,11 @@ the outbox, or send an external effect. `accepting_intake=true` refers only to
 this local synthetic lane. The general runner remains fail-closed and sandbox
 plans still grant no OS-enforcement or production-runner authority. The Codex
 adapter cannot spawn or probe a process, and the Telegram slice performs no
-HTTP call or token handling; those paths remain refused until enforcement and
-transport lease work are implemented.
+HTTP call. Its token reaches only an injected, trusted HTTP boundary through a
+short-lived redacted view; no concrete network client or store adapter is wired
+into the daemon. The observability crate is likewise a validated projection
+model, not a live exporter or health authority. Those paths remain unavailable
+until enforcement and production integration are implemented.
 
 ## Clean-room and licensing
 

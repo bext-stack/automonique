@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+[package]
+name = "automonique-transport-runtime"
+version = "0.1.0"
+edition = "2024"
+license = "Elastic-2.0"
+publish = false
+
+[dependencies]
+automonique-transports = { path = "../automonique-transports" }
+sha2.workspace = true

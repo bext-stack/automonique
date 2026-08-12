@@ -8,11 +8,13 @@ members = [
     "crates/automonique-core",
     "crates/automonique-daemon",
     "crates/automonique-lab",
+    "crates/automonique-observability",
     "crates/automonique-policy",
     "crates/automonique-protocol",
     "crates/automonique-runner",
     "crates/automonique-sandbox",
     "crates/automonique-store",
+    "crates/automonique-transport-runtime",
     "crates/automonique-transports",
 ]
 resolver = "2"

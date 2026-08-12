@@ -21,7 +21,7 @@ use rusqlite::{
 };
 
 /// The only database schema this build can read and write.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 /// SQLite lock contention is bounded rather than waiting indefinitely.
 pub const BUSY_TIMEOUT: Duration = Duration::from_millis(2_000);
 
@@ -263,6 +263,67 @@ CREATE TABLE telegram_batches (
 ) STRICT;
 "#;
 
+const MIGRATE_V3_TO_V4: &str = r#"
+ALTER TABLE outbox RENAME TO outbox_v3;
+CREATE TABLE outbox (
+    outbox_id INTEGER PRIMARY KEY,
+    intent_key TEXT NOT NULL UNIQUE,
+    event_id INTEGER NOT NULL REFERENCES domain_events(event_id),
+    transport TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN ('pending', 'in_flight', 'delivered', 'dead_lettered')
+    ),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    attempts INTEGER NOT NULL CHECK (attempts >= 0),
+    available_ms INTEGER NOT NULL CHECK (available_ms >= 0),
+    lease_token TEXT,
+    lease_generation_id TEXT REFERENCES generations(generation_id),
+    lease_holder TEXT,
+    lease_epoch INTEGER CHECK (lease_epoch >= 1),
+    lease_expires_ms INTEGER CHECK (lease_expires_ms >= 0),
+    delivery_receipt_key TEXT UNIQUE,
+    delivered_ms INTEGER CHECK (delivered_ms >= 0),
+    last_error TEXT,
+    created_ms INTEGER NOT NULL CHECK (created_ms >= 0),
+    CHECK (
+        (state = 'pending' AND lease_token IS NULL
+         AND lease_generation_id IS NULL AND lease_holder IS NULL
+         AND lease_epoch IS NULL AND lease_expires_ms IS NULL
+         AND delivery_receipt_key IS NULL AND delivered_ms IS NULL)
+        OR
+        (state = 'in_flight' AND lease_token IS NOT NULL
+         AND lease_generation_id IS NOT NULL AND lease_holder IS NOT NULL
+         AND lease_epoch IS NOT NULL AND lease_expires_ms IS NOT NULL
+         AND delivery_receipt_key IS NULL AND delivered_ms IS NULL)
+        OR
+        (state = 'delivered'
+         AND delivery_receipt_key IS NOT NULL AND delivered_ms IS NOT NULL)
+        OR
+        (state = 'dead_lettered' AND delivery_receipt_key IS NULL
+         AND delivered_ms IS NOT NULL)
+    )
+) STRICT;
+INSERT INTO outbox
+    (outbox_id, intent_key, event_id, transport, kind, payload, state,
+     revision, attempts, available_ms, lease_token, lease_generation_id,
+     lease_holder, lease_epoch, lease_expires_ms, delivery_receipt_key,
+     delivered_ms, last_error, created_ms)
+SELECT outbox_id, intent_key, event_id,
+       CASE WHEN instr(kind, '.') > 1 THEN substr(kind, 1, instr(kind, '.') - 1)
+            ELSE kind END,
+       kind, payload, state, 1, 0, created_ms,
+       NULL, NULL, NULL, NULL, NULL,
+       CASE WHEN state = 'delivered' THEN 'legacy-receipt:' || outbox_id ELSE NULL END,
+       CASE WHEN state = 'delivered' THEN created_ms ELSE NULL END,
+       NULL, created_ms
+FROM outbox_v3;
+DROP TABLE outbox_v3;
+CREATE INDEX outbox_ready_fifo
+    ON outbox(transport, kind, created_ms, outbox_id);
+"#;
+
 /// A durable store error with stable refusal categories.
 #[derive(Debug)]
 pub enum StoreError {
@@ -284,6 +345,8 @@ pub enum StoreError {
     ScopeLocked,
     /// A prior run's scope lease expired and its execution must be reconciled.
     ReconciliationRequired { run_id: i64 },
+    /// An in-flight external effect expired with an ambiguous outcome.
+    OutboxReconciliationRequired { outbox_id: i64 },
     /// The referenced durable row does not exist.
     NotFound(&'static str),
     /// A terminal transition was retried with different content.
@@ -310,6 +373,7 @@ impl StoreError {
             Self::StaleEpoch => "stale_epoch",
             Self::ScopeLocked => "scope_locked",
             Self::ReconciliationRequired { .. } => "reconciliation_required",
+            Self::OutboxReconciliationRequired { .. } => "outbox_reconciliation_required",
             Self::NotFound(_) => "not_found",
             Self::AlreadyTerminal => "already_terminal",
             Self::OutboxConflict => "outbox_conflict",
@@ -346,6 +410,12 @@ impl fmt::Display for StoreError {
                 write!(
                     formatter,
                     "run {run_id} requires reconciliation before scope reuse"
+                )
+            }
+            Self::OutboxReconciliationRequired { outbox_id } => {
+                write!(
+                    formatter,
+                    "outbox intent {outbox_id} requires reconciliation"
                 )
             }
             Self::NotFound(row) => write!(formatter, "durable row not found: {row}"),
@@ -645,6 +715,144 @@ pub struct RunSnapshot {
 pub struct OutboxSnapshot {
     pub kind: String,
     pub state: String,
+}
+
+/// Fenced FIFO claim for one external-effect transport and kind.
+pub struct OutboxClaimRequest<'a> {
+    pub transport: &'a str,
+    pub kind: &'a str,
+    pub generation_id: &'a str,
+    pub holder_id: &'a str,
+    pub lease_epoch: u64,
+    pub now_ms: i64,
+    pub ttl_ms: i64,
+}
+
+/// Durable lease identity; payload is intentionally returned separately.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutboxLease {
+    pub outbox_id: i64,
+    pub intent_key: String,
+    pub transport: String,
+    pub kind: String,
+    pub lease_token: String,
+    pub attempt: u64,
+    pub retry_after_ms: i64,
+    pub revision: u64,
+    pub duplicate: bool,
+}
+
+/// Payload disclosed only after rechecking the exact live generation lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeasedOutboxPayload {
+    pub outbox_id: i64,
+    pub intent_key: String,
+    pub payload: Vec<u8>,
+}
+
+pub struct OutboxPayloadRequest<'a> {
+    pub outbox_id: i64,
+    pub generation_id: &'a str,
+    pub holder_id: &'a str,
+    pub lease_epoch: u64,
+    pub lease_token: &'a str,
+    pub now_ms: i64,
+}
+
+/// Exact success receipt for an in-flight external effect.
+pub struct OutboxDelivery<'a> {
+    pub outbox_id: i64,
+    pub generation_id: &'a str,
+    pub holder_id: &'a str,
+    pub lease_epoch: u64,
+    pub lease_token: &'a str,
+    pub expected_attempt: u64,
+    pub receipt_key: &'a str,
+    pub now_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutboxDeliveryReceipt {
+    pub outbox_id: i64,
+    pub receipt_key: String,
+    pub revision: u64,
+    pub duplicate: bool,
+}
+
+/// Closed negative outcome while the delivery lease is still live.
+pub enum OutboxFailureDecision<'a> {
+    Retry {
+        reason: &'a str,
+        retry_after_ms: i64,
+    },
+    DeadLetter {
+        reason: &'a str,
+    },
+}
+
+pub struct OutboxFailure<'a> {
+    pub outbox_id: i64,
+    pub generation_id: &'a str,
+    pub holder_id: &'a str,
+    pub lease_epoch: u64,
+    pub lease_token: &'a str,
+    pub expected_attempt: u64,
+    pub now_ms: i64,
+    pub decision: OutboxFailureDecision<'a>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutboxOutcomeReceipt {
+    pub outbox_id: i64,
+    pub state: String,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutboxReconciliationReceipt {
+    pub outbox_id: i64,
+    pub state: String,
+    pub revision: u64,
+    pub duplicate: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutboxReconciliationEvidence {
+    pub outbox_id: i64,
+    pub intent_key: String,
+    pub transport: String,
+    pub kind: String,
+    pub state: String,
+    pub revision: u64,
+    pub attempt: u64,
+    pub lease_token: Option<String>,
+    pub lease_generation_id: Option<String>,
+    pub lease_holder: Option<String>,
+    pub lease_epoch: Option<u64>,
+    pub lease_expires_ms: Option<i64>,
+    pub delivery_receipt_key: Option<String>,
+    pub available_ms: i64,
+    pub last_error: Option<String>,
+}
+
+/// An ambiguous effect may only be closed, never automatically retried.
+pub enum OutboxReconciliationDecision<'a> {
+    Delivered { receipt_key: &'a str },
+    DeadLetter { reason: &'a str },
+}
+
+pub struct OutboxReconciliationRequest<'a> {
+    pub outbox_id: i64,
+    pub authority_generation_id: &'a str,
+    pub authority_holder_id: &'a str,
+    pub authority_lease_epoch: u64,
+    pub expected_generation_id: &'a str,
+    pub expected_lease_epoch: u64,
+    pub expected_lease_token: &'a str,
+    pub expected_attempt: u64,
+    pub expected_revision: u64,
+    pub now_ms: i64,
+    pub decision: OutboxReconciliationDecision<'a>,
 }
 
 /// One generation row in a consistent operator-status snapshot.
@@ -1701,8 +1909,10 @@ impl Store {
         )?;
         let insert = transaction.execute(
             "INSERT INTO outbox
-             (intent_key, event_id, kind, payload, state, created_ms)
-             VALUES (?1, ?2, 'fake.reconciliation.receipt', ?3, 'pending', ?4)",
+             (intent_key, event_id, transport, kind, payload, state, revision,
+              attempts, available_ms, created_ms)
+             VALUES (?1, ?2, 'fake', 'fake.reconciliation.receipt', ?3,
+                     'pending', 1, 0, ?4, ?4)",
             params![request.decision_key, run_event_id, payload, request.now_ms],
         );
         if let Err(error) = insert {
@@ -1906,11 +2116,14 @@ impl Store {
             terminal.event_payload,
         )?;
         let insert = transaction.execute(
-            "INSERT INTO outbox (intent_key, event_id, kind, payload, state, created_ms)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+            "INSERT INTO outbox
+             (intent_key, event_id, transport, kind, payload, state, revision,
+              attempts, available_ms, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, 0, ?6, ?6)",
             params![
                 terminal.outbox_intent_key,
                 event_id,
+                outbox_transport(terminal.outbox_kind),
                 terminal.outbox_kind,
                 terminal.outbox_payload,
                 terminal.now_ms
@@ -1966,6 +2179,537 @@ impl Store {
     /// Count pending and delivered effect intents.
     pub fn outbox_count(&self) -> Result<u64, StoreError> {
         count_table(&self.connection, "outbox")
+    }
+
+    /// Claim the oldest matching ready effect without exposing its payload.
+    pub fn claim_outbox(
+        &mut self,
+        request: OutboxClaimRequest<'_>,
+    ) -> Result<Option<OutboxLease>, StoreError> {
+        validate_id(request.transport, "outbox_transport")?;
+        validate_id(request.kind, "outbox_kind")?;
+        validate_id(request.generation_id, "generation_id")?;
+        validate_id(request.holder_id, "holder_id")?;
+        validate_time(request.now_ms)?;
+        let requested_expiry = checked_expiry(request.now_ms, request.ttl_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let generation_expiry = require_live_lease(
+            &transaction,
+            request.generation_id,
+            request.holder_id,
+            request.lease_epoch,
+            request.now_ms,
+        )?;
+        let row = transaction
+            .query_row(
+                "SELECT outbox_id, intent_key, transport, kind, state, revision,
+                        attempts, available_ms, lease_token, lease_generation_id,
+                        lease_holder, lease_epoch, lease_expires_ms
+                 FROM outbox
+                 WHERE transport = ?1 AND kind = ?2
+                   AND (state = 'in_flight'
+                        OR (state = 'pending' AND available_ms <= ?3))
+                 ORDER BY created_ms, outbox_id LIMIT 1",
+                params![request.transport, request.kind, request.now_ms],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                        row.get::<_, Option<i64>>(12)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(row) = row else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let revision = from_db_u64(row.5, "outbox_revision")?;
+        let attempt = from_db_u64(row.6, "outbox_attempt")?;
+        if row.4 == "in_flight" {
+            let expires_ms = row.12.ok_or(StoreError::MigrationInvariant(
+                "in_flight_outbox_without_expiry",
+            ))?;
+            if expires_ms <= request.now_ms {
+                return Err(StoreError::OutboxReconciliationRequired { outbox_id: row.0 });
+            }
+            if row.9.as_deref() != Some(request.generation_id)
+                || row.10.as_deref() != Some(request.holder_id)
+                || row
+                    .11
+                    .map(|epoch| from_db_u64(epoch, "outbox_lease_epoch"))
+                    .transpose()?
+                    != Some(request.lease_epoch)
+            {
+                return Err(StoreError::LeaseHeld);
+            }
+            let lease_token = row.8.ok_or(StoreError::MigrationInvariant(
+                "in_flight_outbox_without_token",
+            ))?;
+            transaction.commit()?;
+            return Ok(Some(OutboxLease {
+                outbox_id: row.0,
+                intent_key: row.1,
+                transport: row.2,
+                kind: row.3,
+                lease_token,
+                attempt,
+                retry_after_ms: expires_ms,
+                revision,
+                duplicate: true,
+            }));
+        }
+        let next_attempt = attempt
+            .checked_add(1)
+            .ok_or(StoreError::InvalidField("outbox_attempt"))?;
+        let next_revision = revision
+            .checked_add(1)
+            .ok_or(StoreError::InvalidField("outbox_revision"))?;
+        let expires_ms = requested_expiry.min(generation_expiry);
+        let lease_token = format!(
+            "outbox:{}:attempt:{}:epoch:{}",
+            row.0, next_attempt, request.lease_epoch
+        );
+        let changed = transaction.execute(
+            "UPDATE outbox SET state = 'in_flight', revision = ?2, attempts = ?3,
+                    lease_token = ?4, lease_generation_id = ?5, lease_holder = ?6,
+                    lease_epoch = ?7, lease_expires_ms = ?8, last_error = NULL
+             WHERE outbox_id = ?1 AND state = 'pending' AND revision = ?9",
+            params![
+                row.0,
+                to_db_u64(next_revision, "outbox_revision")?,
+                to_db_u64(next_attempt, "outbox_attempt")?,
+                lease_token,
+                request.generation_id,
+                request.holder_id,
+                to_db_u64(request.lease_epoch, "outbox_lease_epoch")?,
+                expires_ms,
+                row.5
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::IdempotencyConflict("outbox_claim"));
+        }
+        transaction.commit()?;
+        Ok(Some(OutboxLease {
+            outbox_id: row.0,
+            intent_key: row.1,
+            transport: row.2,
+            kind: row.3,
+            lease_token,
+            attempt: next_attempt,
+            retry_after_ms: expires_ms,
+            revision: next_revision,
+            duplicate: false,
+        }))
+    }
+
+    /// Read payload only for the exact still-live delivery lease.
+    pub fn leased_outbox_payload(
+        &mut self,
+        request: OutboxPayloadRequest<'_>,
+    ) -> Result<LeasedOutboxPayload, StoreError> {
+        validate_outbox_lease_request(
+            request.outbox_id,
+            request.generation_id,
+            request.holder_id,
+            request.lease_token,
+            request.now_ms,
+        )?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        require_live_lease(
+            &transaction,
+            request.generation_id,
+            request.holder_id,
+            request.lease_epoch,
+            request.now_ms,
+        )?;
+        let payload = transaction
+            .query_row(
+                "SELECT intent_key, payload FROM outbox
+                 WHERE outbox_id = ?1 AND state = 'in_flight'
+                   AND lease_generation_id = ?2 AND lease_holder = ?3
+                   AND lease_epoch = ?4 AND lease_token = ?5
+                   AND lease_expires_ms > ?6",
+                params![
+                    request.outbox_id,
+                    request.generation_id,
+                    request.holder_id,
+                    to_db_u64(request.lease_epoch, "outbox_lease_epoch")?,
+                    request.lease_token,
+                    request.now_ms
+                ],
+                |row| {
+                    Ok(LeasedOutboxPayload {
+                        outbox_id: request.outbox_id,
+                        intent_key: row.get(0)?,
+                        payload: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::StaleEpoch)?;
+        transaction.commit()?;
+        Ok(payload)
+    }
+
+    /// Commit an exact external delivery receipt idempotently.
+    pub fn deliver_outbox(
+        &mut self,
+        delivery: OutboxDelivery<'_>,
+    ) -> Result<OutboxDeliveryReceipt, StoreError> {
+        validate_outbox_lease_request(
+            delivery.outbox_id,
+            delivery.generation_id,
+            delivery.holder_id,
+            delivery.lease_token,
+            delivery.now_ms,
+        )?;
+        validate_id(delivery.receipt_key, "outbox_receipt_key")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_live_lease(
+            &transaction,
+            delivery.generation_id,
+            delivery.holder_id,
+            delivery.lease_epoch,
+            delivery.now_ms,
+        )?;
+        let row = outbox_delivery_row(&transaction, delivery.outbox_id)?;
+        let revision = from_db_u64(row.1, "outbox_revision")?;
+        let attempt = from_db_u64(row.2, "outbox_attempt")?;
+        if row.0 == "delivered" {
+            if attempt == delivery.expected_attempt
+                && row.3.as_deref() == Some(delivery.lease_token)
+                && row.4.as_deref() == Some(delivery.generation_id)
+                && row.5.as_deref() == Some(delivery.holder_id)
+                && row
+                    .8
+                    .map(|value| from_db_u64(value, "outbox_lease_epoch"))
+                    .transpose()?
+                    == Some(delivery.lease_epoch)
+                && row.6.as_deref() == Some(delivery.receipt_key)
+            {
+                transaction.commit()?;
+                return Ok(OutboxDeliveryReceipt {
+                    outbox_id: delivery.outbox_id,
+                    receipt_key: delivery.receipt_key.to_owned(),
+                    revision,
+                    duplicate: true,
+                });
+            }
+            return Err(StoreError::AlreadyTerminal);
+        }
+        require_exact_outbox_lease(
+            &row,
+            &OutboxLeaseIdentity {
+                outbox_id: delivery.outbox_id,
+                generation_id: delivery.generation_id,
+                holder_id: delivery.holder_id,
+                lease_epoch: delivery.lease_epoch,
+                lease_token: delivery.lease_token,
+                expected_attempt: delivery.expected_attempt,
+                now_ms: delivery.now_ms,
+            },
+        )?;
+        let next_revision = revision
+            .checked_add(1)
+            .ok_or(StoreError::InvalidField("outbox_revision"))?;
+        let changed = transaction.execute(
+            "UPDATE outbox SET state = 'delivered', revision = ?2,
+                    delivery_receipt_key = ?3, delivered_ms = ?4
+             WHERE outbox_id = ?1 AND state = 'in_flight' AND revision = ?5",
+            params![
+                delivery.outbox_id,
+                to_db_u64(next_revision, "outbox_revision")?,
+                delivery.receipt_key,
+                delivery.now_ms,
+                row.1
+            ],
+        );
+        map_outbox_unique(changed)?;
+        transaction.commit()?;
+        Ok(OutboxDeliveryReceipt {
+            outbox_id: delivery.outbox_id,
+            receipt_key: delivery.receipt_key.to_owned(),
+            revision: next_revision,
+            duplicate: false,
+        })
+    }
+
+    /// Record an explicit retry or dead-letter outcome while the lease is live.
+    ///
+    /// This transition is deliberately not presented as replayable: after an
+    /// acknowledgement loss the caller must inspect durable outbox state. An
+    /// identical second call refuses rather than claiming an unproven replay.
+    pub fn fail_outbox(
+        &mut self,
+        failure: OutboxFailure<'_>,
+    ) -> Result<OutboxOutcomeReceipt, StoreError> {
+        validate_outbox_lease_request(
+            failure.outbox_id,
+            failure.generation_id,
+            failure.holder_id,
+            failure.lease_token,
+            failure.now_ms,
+        )?;
+        let (state, reason, retry_after) = match failure.decision {
+            OutboxFailureDecision::Retry {
+                reason,
+                retry_after_ms,
+            } => {
+                validate_time(retry_after_ms)?;
+                if retry_after_ms <= failure.now_ms {
+                    return Err(StoreError::InvalidField("outbox_retry_after"));
+                }
+                ("pending", reason, Some(retry_after_ms))
+            }
+            OutboxFailureDecision::DeadLetter { reason } => ("dead_lettered", reason, None),
+        };
+        validate_id(reason, "outbox_failure_reason")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_live_lease(
+            &transaction,
+            failure.generation_id,
+            failure.holder_id,
+            failure.lease_epoch,
+            failure.now_ms,
+        )?;
+        let row = outbox_delivery_row(&transaction, failure.outbox_id)?;
+        require_exact_outbox_lease(
+            &row,
+            &OutboxLeaseIdentity {
+                outbox_id: failure.outbox_id,
+                generation_id: failure.generation_id,
+                holder_id: failure.holder_id,
+                lease_epoch: failure.lease_epoch,
+                lease_token: failure.lease_token,
+                expected_attempt: failure.expected_attempt,
+                now_ms: failure.now_ms,
+            },
+        )?;
+        let revision = from_db_u64(row.1, "outbox_revision")?;
+        let next_revision = revision
+            .checked_add(1)
+            .ok_or(StoreError::InvalidField("outbox_revision"))?;
+        let available_ms = retry_after.unwrap_or(failure.now_ms);
+        let delivered_ms = (state == "dead_lettered").then_some(failure.now_ms);
+        let changed = transaction.execute(
+            "UPDATE outbox SET state = ?2, revision = ?3, available_ms = ?4,
+                    lease_token = NULL, lease_generation_id = NULL,
+                    lease_holder = NULL, lease_epoch = NULL, lease_expires_ms = NULL,
+                    delivered_ms = ?5, last_error = ?6
+             WHERE outbox_id = ?1 AND state = 'in_flight' AND revision = ?7",
+            params![
+                failure.outbox_id,
+                state,
+                to_db_u64(next_revision, "outbox_revision")?,
+                available_ms,
+                delivered_ms,
+                reason,
+                row.1
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::IdempotencyConflict("outbox_failure"));
+        }
+        transaction.commit()?;
+        Ok(OutboxOutcomeReceipt {
+            outbox_id: failure.outbox_id,
+            state: state.to_owned(),
+            revision: next_revision,
+        })
+    }
+
+    /// Inspect exact durable state without exposing effect payload bytes.
+    pub fn inspect_outbox_reconciliation(
+        &self,
+        outbox_id: i64,
+    ) -> Result<OutboxReconciliationEvidence, StoreError> {
+        if outbox_id <= 0 {
+            return Err(StoreError::InvalidField("outbox_id"));
+        }
+        let row = self
+            .connection
+            .query_row(
+                "SELECT intent_key, transport, kind, state, revision, attempts,
+                        lease_token, lease_generation_id, lease_holder, lease_epoch,
+                        lease_expires_ms, delivery_receipt_key, available_ms,
+                        last_error
+                 FROM outbox WHERE outbox_id = ?1",
+                [outbox_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound("outbox"))?;
+        Ok(OutboxReconciliationEvidence {
+            outbox_id,
+            intent_key: row.0,
+            transport: row.1,
+            kind: row.2,
+            state: row.3,
+            revision: from_db_u64(row.4, "outbox_revision")?,
+            attempt: from_db_u64(row.5, "outbox_attempt")?,
+            lease_token: row.6,
+            lease_generation_id: row.7,
+            lease_holder: row.8,
+            lease_epoch: row
+                .9
+                .map(|value| from_db_u64(value, "outbox_lease_epoch"))
+                .transpose()?,
+            lease_expires_ms: row.10,
+            delivery_receipt_key: row.11,
+            available_ms: row.12,
+            last_error: row.13,
+        })
+    }
+
+    /// Close an expired ambiguous effect; reconciliation never requeues it.
+    pub fn reconcile_outbox(
+        &mut self,
+        request: OutboxReconciliationRequest<'_>,
+    ) -> Result<OutboxReconciliationReceipt, StoreError> {
+        validate_outbox_lease_request(
+            request.outbox_id,
+            request.authority_generation_id,
+            request.authority_holder_id,
+            request.expected_lease_token,
+            request.now_ms,
+        )?;
+        validate_id(request.expected_generation_id, "expected_generation_id")?;
+        let (state, value) = match request.decision {
+            OutboxReconciliationDecision::Delivered { receipt_key } => {
+                validate_id(receipt_key, "outbox_receipt_key")?;
+                ("delivered", receipt_key)
+            }
+            OutboxReconciliationDecision::DeadLetter { reason } => {
+                validate_id(reason, "outbox_failure_reason")?;
+                ("dead_lettered", reason)
+            }
+        };
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_live_lease(
+            &transaction,
+            request.authority_generation_id,
+            request.authority_holder_id,
+            request.authority_lease_epoch,
+            request.now_ms,
+        )?;
+        let row = outbox_delivery_row(&transaction, request.outbox_id)?;
+        let revision = from_db_u64(row.1, "outbox_revision")?;
+        let attempt = from_db_u64(row.2, "outbox_attempt")?;
+        if row.0 != "in_flight" {
+            let exact = revision
+                == request
+                    .expected_revision
+                    .checked_add(1)
+                    .ok_or(StoreError::InvalidField("expected_revision"))?
+                && attempt == request.expected_attempt
+                && row.3.as_deref() == Some(request.expected_lease_token)
+                && row.4.as_deref() == Some(request.expected_generation_id)
+                && row
+                    .8
+                    .map(|epoch| from_db_u64(epoch, "outbox_lease_epoch"))
+                    .transpose()?
+                    == Some(request.expected_lease_epoch)
+                && ((state == "delivered" && row.6.as_deref() == Some(value))
+                    || (state == "dead_lettered" && row.7.as_deref() == Some(value)))
+                && row.0 == state;
+            if !exact {
+                return Err(StoreError::AlreadyTerminal);
+            }
+            transaction.commit()?;
+            return Ok(OutboxReconciliationReceipt {
+                outbox_id: request.outbox_id,
+                state: state.to_owned(),
+                revision,
+                duplicate: true,
+            });
+        }
+        if revision != request.expected_revision || attempt != request.expected_attempt {
+            return Err(StoreError::IdempotencyConflict(
+                "outbox_reconciliation_revision",
+            ));
+        }
+        if row.3.as_deref() != Some(request.expected_lease_token)
+            || row.4.as_deref() != Some(request.expected_generation_id)
+            || row
+                .8
+                .map(|epoch| from_db_u64(epoch, "outbox_lease_epoch"))
+                .transpose()?
+                != Some(request.expected_lease_epoch)
+        {
+            return Err(StoreError::StaleEpoch);
+        }
+        if row.9.is_none_or(|expires_ms| expires_ms > request.now_ms) {
+            return Err(StoreError::LeaseHeld);
+        }
+        let next_revision = revision
+            .checked_add(1)
+            .ok_or(StoreError::InvalidField("outbox_revision"))?;
+        let (receipt_key, last_error) = if state == "delivered" {
+            (Some(value), None)
+        } else {
+            (None, Some(value))
+        };
+        let changed = transaction.execute(
+            "UPDATE outbox SET state = ?2, revision = ?3,
+                    delivery_receipt_key = ?4, delivered_ms = ?5, last_error = ?6
+             WHERE outbox_id = ?1 AND state = 'in_flight' AND revision = ?7",
+            params![
+                request.outbox_id,
+                state,
+                to_db_u64(next_revision, "outbox_revision")?,
+                receipt_key,
+                request.now_ms,
+                last_error,
+                row.1
+            ],
+        );
+        map_outbox_unique(changed)?;
+        transaction.commit()?;
+        Ok(OutboxReconciliationReceipt {
+            outbox_id: request.outbox_id,
+            state: state.to_owned(),
+            revision: next_revision,
+            duplicate: false,
+        })
     }
 
     /// Read one effect-intent classification without exposing its payload.
@@ -2138,10 +2882,15 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
         if foreign_key_violation {
             return Err(StoreError::MigrationInvariant("foreign_key_check"));
         }
-        return migrate_v2_to_v3(connection);
+        migrate_v2_to_v3(connection)?;
+        return migrate_v3_to_v4(connection);
     }
     if version == 2 {
-        return migrate_v2_to_v3(connection);
+        migrate_v2_to_v3(connection)?;
+        return migrate_v3_to_v4(connection);
+    }
+    if version == 3 {
+        return migrate_v3_to_v4(connection);
     }
     if version != 0 {
         return Err(StoreError::SchemaVersion {
@@ -2163,6 +2912,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(SCHEMA_V2)?;
     transaction.execute_batch(MIGRATE_V2_TO_V3)?;
+    transaction.execute_batch(MIGRATE_V3_TO_V4)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -2171,6 +2921,14 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
 fn migrate_v2_to_v3(connection: &mut Connection) -> Result<(), StoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(MIGRATE_V2_TO_V3)?;
+    transaction.pragma_update(None, "user_version", 3)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v3_to_v4(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(MIGRATE_V3_TO_V4)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -2326,6 +3084,120 @@ fn validate_payload(value: &[u8], field: &'static str) -> Result<(), StoreError>
         return Err(StoreError::InvalidField(field));
     }
     Ok(())
+}
+
+fn outbox_transport(kind: &str) -> &str {
+    kind.split_once('.')
+        .map_or(kind, |(transport, _)| transport)
+}
+
+fn validate_outbox_lease_request(
+    outbox_id: i64,
+    generation_id: &str,
+    holder_id: &str,
+    lease_token: &str,
+    now_ms: i64,
+) -> Result<(), StoreError> {
+    if outbox_id <= 0 {
+        return Err(StoreError::InvalidField("outbox_id"));
+    }
+    validate_id(generation_id, "generation_id")?;
+    validate_id(holder_id, "holder_id")?;
+    validate_id(lease_token, "outbox_lease_token")?;
+    validate_time(now_ms)
+}
+
+type OutboxDeliveryRow = (
+    String,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
+
+fn outbox_delivery_row(
+    transaction: &Transaction<'_>,
+    outbox_id: i64,
+) -> Result<OutboxDeliveryRow, StoreError> {
+    transaction
+        .query_row(
+            "SELECT state, revision, attempts, lease_token, lease_generation_id,
+                    lease_holder, delivery_receipt_key, last_error, lease_epoch,
+                    lease_expires_ms
+             FROM outbox WHERE outbox_id = ?1",
+            [outbox_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(StoreError::NotFound("outbox"))
+}
+
+struct OutboxLeaseIdentity<'a> {
+    outbox_id: i64,
+    generation_id: &'a str,
+    holder_id: &'a str,
+    lease_epoch: u64,
+    lease_token: &'a str,
+    expected_attempt: u64,
+    now_ms: i64,
+}
+
+fn require_exact_outbox_lease(
+    row: &OutboxDeliveryRow,
+    identity: &OutboxLeaseIdentity<'_>,
+) -> Result<(), StoreError> {
+    if row.0 != "in_flight"
+        || row.3.as_deref() != Some(identity.lease_token)
+        || row.4.as_deref() != Some(identity.generation_id)
+        || row.5.as_deref() != Some(identity.holder_id)
+        || row
+            .8
+            .map(|value| from_db_u64(value, "outbox_lease_epoch"))
+            .transpose()?
+            != Some(identity.lease_epoch)
+        || from_db_u64(row.2, "outbox_attempt")? != identity.expected_attempt
+    {
+        return Err(StoreError::StaleEpoch);
+    }
+    if row.9.is_none_or(|expires_ms| expires_ms <= identity.now_ms) {
+        return Err(StoreError::OutboxReconciliationRequired {
+            outbox_id: identity.outbox_id,
+        });
+    }
+    Ok(())
+}
+
+fn map_outbox_unique(result: Result<usize, rusqlite::Error>) -> Result<(), StoreError> {
+    match result {
+        Ok(1) => Ok(()),
+        Ok(_) => Err(StoreError::IdempotencyConflict("outbox_state")),
+        Err(error)
+            if error.sqlite_error().is_some_and(|code| {
+                code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+            }) =>
+        {
+            Err(StoreError::OutboxConflict)
+        }
+        Err(error) => Err(StoreError::Sqlite(error)),
+    }
 }
 
 fn validate_time(value: i64) -> Result<(), StoreError> {
@@ -2562,6 +3434,66 @@ fn query_count(transaction: &Transaction<'_>, sql: &str) -> Result<u64, StoreErr
 #[cfg(test)]
 mod migration_tests {
     use super::*;
+
+    #[test]
+    fn canonical_v3_outbox_migrates_without_making_delivered_work_ready() {
+        let mut connection = Connection::open_in_memory().expect("memory database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        connection.execute_batch(SCHEMA_V2).expect("v2 base");
+        connection
+            .execute_batch(MIGRATE_V2_TO_V3)
+            .expect("v3 schema");
+        connection
+            .pragma_update(None, "user_version", 3)
+            .expect("v3 marker");
+        connection
+            .execute(
+                "INSERT INTO domain_events
+                 (aggregate_kind, aggregate_id, revision, schema_version,
+                  occurred_ms, kind, payload)
+                 VALUES ('run', '1', 1, 1, 1, 'run.succeeded', X'01'),
+                        ('run', '2', 1, 1, 2, 'run.succeeded', X'02')",
+                [],
+            )
+            .expect("events");
+        connection
+            .execute(
+                "INSERT INTO outbox
+                 (intent_key, event_id, kind, payload, state, created_ms)
+                 VALUES ('pending', 1, 'telegram.reply', X'01', 'pending', 1),
+                        ('done', 2, 'telegram.reply', X'02', 'delivered', 2)",
+                [],
+            )
+            .expect("v3 outbox rows");
+
+        initialize_or_validate_schema(&mut connection).expect("v4 migration");
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
+        let pending: (String, String, i64, i64) = connection
+            .query_row(
+                "SELECT transport, state, revision, attempts FROM outbox
+                 WHERE intent_key = 'pending'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("pending migrated");
+        assert_eq!(pending, ("telegram".to_owned(), "pending".to_owned(), 1, 0));
+        let delivered: (String, Option<String>) = connection
+            .query_row(
+                "SELECT state, delivery_receipt_key FROM outbox WHERE intent_key = 'done'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("delivered migrated");
+        assert_eq!(
+            delivered,
+            ("delivered".to_owned(), Some("legacy-receipt:2".to_owned()))
+        );
+    }
 
     #[test]
     fn canonical_v2_migrates_to_empty_telegram_state_without_changing_existing_rows() {

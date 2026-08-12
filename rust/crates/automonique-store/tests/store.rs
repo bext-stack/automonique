@@ -5,7 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use automonique_store::{
-    InboxSubmission, LeaseRenewal, LeaseRequest, ReconciliationDecision, ReconciliationInboxState,
+    InboxSubmission, LeaseRenewal, LeaseRequest, OutboxClaimRequest, OutboxDelivery, OutboxFailure,
+    OutboxFailureDecision, OutboxPayloadRequest, OutboxReconciliationDecision,
+    OutboxReconciliationRequest, ReconciliationDecision, ReconciliationInboxState,
     ReconciliationRequest, ReconciliationRunState, SCHEMA_VERSION, SchedulerClaim, Store,
     TelegramBatchIngestion, TelegramStoreDisposition, TelegramStoreUpdate, TerminalRun,
     TerminalState, WorkClaim,
@@ -114,6 +116,39 @@ fn finish_scheduled(store: &mut Store, run_id: i64, epoch: u64, now_ms: i64, suf
             outbox_payload: suffix.as_bytes(),
         })
         .expect("finish scheduled run");
+}
+
+fn add_effect(store: &mut Store, epoch: u64, suffix: &str, received_ms: i64) -> i64 {
+    let inbox = submit_at(
+        store,
+        &format!("effect:{suffix}"),
+        &format!("scope:{suffix}"),
+        received_ms,
+    );
+    let run = claim_next(store, "holder-a", epoch, received_ms + 1).expect("effect claim");
+    assert_eq!(run.inbox_id, inbox);
+    finish_scheduled(store, run.run_id, epoch, received_ms + 2, suffix);
+    store.outbox_count().expect("effect count") as i64
+}
+
+fn claim_effect(
+    store: &mut Store,
+    holder: &str,
+    epoch: u64,
+    now_ms: i64,
+) -> automonique_store::OutboxLease {
+    store
+        .claim_outbox(OutboxClaimRequest {
+            transport: "test",
+            kind: "test.effect",
+            generation_id: "generation-a",
+            holder_id: holder,
+            lease_epoch: epoch,
+            now_ms,
+            ttl_ms: 10,
+        })
+        .expect("outbox claim")
+        .expect("ready effect")
 }
 
 fn telegram_update<'a>(
@@ -1202,6 +1237,535 @@ fn failed_reconciliation_survives_restart_and_scheduler_advances_fifo() {
         next_inbox
     );
     assert_eq!(reopened.outbox_count().expect("no duplicate outbox"), 1);
+}
+
+#[test]
+fn outbox_claim_is_filtered_fifo_and_payload_requires_exact_live_lease() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let epoch = lease(&mut store, "holder-a", 0);
+    let first = add_effect(&mut store, epoch, "fifo-first", 1);
+    let second = add_effect(&mut store, epoch, "fifo-second", 10);
+    assert!(second > first);
+    assert!(
+        store
+            .claim_outbox(OutboxClaimRequest {
+                transport: "other",
+                kind: "test.effect",
+                generation_id: "generation-a",
+                holder_id: "holder-a",
+                lease_epoch: epoch,
+                now_ms: 20,
+                ttl_ms: 10,
+            })
+            .expect("filter")
+            .is_none()
+    );
+    let claimed = claim_effect(&mut store, "holder-a", epoch, 20);
+    assert_eq!(claimed.outbox_id, first);
+    assert_eq!(claimed.attempt, 1);
+    assert!(!claimed.duplicate);
+    assert_eq!(claimed.retry_after_ms, 30);
+
+    let wrong = store
+        .leased_outbox_payload(OutboxPayloadRequest {
+            outbox_id: claimed.outbox_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch + 1,
+            lease_token: &claimed.lease_token,
+            now_ms: 21,
+        })
+        .expect_err("wrong epoch cannot read payload");
+    assert_eq!(wrong.category(), "stale_epoch");
+    let payload = store
+        .leased_outbox_payload(OutboxPayloadRequest {
+            outbox_id: claimed.outbox_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            lease_token: &claimed.lease_token,
+            now_ms: 21,
+        })
+        .expect("exact leased payload");
+    assert_eq!(payload.payload, b"fifo-first");
+    assert_eq!(
+        store
+            .inspect_outbox_reconciliation(second)
+            .expect("second untouched")
+            .state,
+        "pending"
+    );
+}
+
+#[test]
+fn outbox_claim_survives_restart_and_two_connections_never_double_claim() {
+    let database = PrivateDatabase::new();
+    let mut first_store = Store::open(database.path()).expect("open first");
+    let epoch = lease(&mut first_store, "holder-a", 0);
+    let outbox_id = add_effect(&mut first_store, epoch, "crash-after-claim", 1);
+    let first = claim_effect(&mut first_store, "holder-a", epoch, 5);
+    assert_eq!(first.outbox_id, outbox_id);
+    drop(first_store);
+
+    let mut reopened = Store::open(database.path()).expect("reopen");
+    let replay = claim_effect(&mut reopened, "holder-a", epoch, 6);
+    assert!(replay.duplicate);
+    assert_eq!(replay.outbox_id, first.outbox_id);
+    assert_eq!(replay.lease_token, first.lease_token);
+    assert_eq!(replay.attempt, first.attempt);
+
+    let mut competing = Store::open(database.path()).expect("competing connection");
+    let concurrent = claim_effect(&mut competing, "holder-a", epoch, 7);
+    assert!(concurrent.duplicate);
+    assert_eq!(concurrent.outbox_id, first.outbox_id);
+    assert_eq!(concurrent.lease_token, first.lease_token);
+    assert_eq!(
+        competing
+            .inspect_outbox_reconciliation(outbox_id)
+            .expect("single durable claim")
+            .attempt,
+        1
+    );
+}
+
+#[test]
+fn delivery_receipt_is_exact_idempotent_and_survives_reopen() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let epoch = lease(&mut store, "holder-a", 0);
+    let outbox_id = add_effect(&mut store, epoch, "delivered", 1);
+    let claimed = claim_effect(&mut store, "holder-a", epoch, 5);
+    let delivery = || OutboxDelivery {
+        outbox_id,
+        generation_id: "generation-a",
+        holder_id: "holder-a",
+        lease_epoch: epoch,
+        lease_token: &claimed.lease_token,
+        expected_attempt: claimed.attempt,
+        receipt_key: "provider-receipt:delivered",
+        now_ms: 6,
+    };
+    let first = store.deliver_outbox(delivery()).expect("delivery receipt");
+    assert!(!first.duplicate);
+    drop(store);
+
+    let mut reopened = Store::open(database.path()).expect("reopen after receipt");
+    let duplicate = reopened
+        .deliver_outbox(OutboxDelivery {
+            now_ms: 7,
+            ..delivery()
+        })
+        .expect("exact receipt retry");
+    assert!(duplicate.duplicate);
+    assert_eq!(duplicate.receipt_key, first.receipt_key);
+    assert_eq!(duplicate.revision, first.revision);
+    let altered_receipt = reopened
+        .deliver_outbox(OutboxDelivery {
+            receipt_key: "provider-receipt:altered",
+            now_ms: 7,
+            ..delivery()
+        })
+        .expect_err("terminal receipt cannot be replaced");
+    assert_eq!(altered_receipt.category(), "already_terminal");
+    let altered_attempt = reopened
+        .deliver_outbox(OutboxDelivery {
+            expected_attempt: claimed.attempt + 1,
+            now_ms: 7,
+            ..delivery()
+        })
+        .expect_err("terminal receipt cannot replay with another attempt");
+    assert_eq!(altered_attempt.category(), "already_terminal");
+    let altered_fence = reopened
+        .deliver_outbox(OutboxDelivery {
+            lease_epoch: epoch + 1,
+            now_ms: 7,
+            ..delivery()
+        })
+        .expect_err("terminal receipt cannot replay through another fence");
+    assert_eq!(altered_fence.category(), "stale_epoch");
+    let evidence = reopened
+        .inspect_outbox_reconciliation(outbox_id)
+        .expect("delivered evidence");
+    assert_eq!(evidence.state, "delivered");
+    assert_eq!(
+        evidence.delivery_receipt_key.as_deref(),
+        Some("provider-receipt:delivered")
+    );
+    assert!(
+        reopened
+            .claim_outbox(OutboxClaimRequest {
+                transport: "test",
+                kind: "test.effect",
+                generation_id: "generation-a",
+                holder_id: "holder-a",
+                lease_epoch: epoch,
+                now_ms: 8,
+                ttl_ms: 10,
+            })
+            .expect("delivered excluded")
+            .is_none()
+    );
+
+    let second_id = add_effect(&mut reopened, epoch, "receipt-collision", 20);
+    let second_claim = claim_effect(&mut reopened, "holder-a", epoch, 24);
+    assert_eq!(second_claim.outbox_id, second_id);
+    let collision = reopened
+        .deliver_outbox(OutboxDelivery {
+            outbox_id: second_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            lease_token: &second_claim.lease_token,
+            expected_attempt: second_claim.attempt,
+            receipt_key: "provider-receipt:delivered",
+            now_ms: 25,
+        })
+        .expect_err("one provider receipt cannot belong to two intents");
+    assert_eq!(collision.category(), "outbox_conflict");
+    assert_eq!(
+        reopened
+            .outbox_snapshot(second_id)
+            .expect("second intent")
+            .state,
+        "in_flight"
+    );
+}
+
+#[test]
+fn expired_effect_is_ambiguous_until_explicit_reconciliation() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let old_epoch = lease(&mut store, "holder-a", 0);
+    let outbox_id = add_effect(&mut store, old_epoch, "ambiguous", 1);
+    let claimed = claim_effect(&mut store, "holder-a", old_epoch, 5);
+    drop(store);
+
+    let mut reopened = Store::open(database.path()).expect("crash after external delivery");
+    let refusal = reopened
+        .claim_outbox(OutboxClaimRequest {
+            transport: "test",
+            kind: "test.effect",
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: old_epoch,
+            now_ms: 16,
+            ttl_ms: 10,
+        })
+        .expect_err("expired delivery is never silently redelivered");
+    assert_eq!(refusal.category(), "outbox_reconciliation_required");
+    let evidence = reopened
+        .inspect_outbox_reconciliation(outbox_id)
+        .expect("ambiguous evidence");
+    assert_eq!(evidence.state, "in_flight");
+    assert_eq!(evidence.attempt, 1);
+    assert_eq!(
+        evidence.lease_token.as_deref(),
+        Some(claimed.lease_token.as_str())
+    );
+
+    let stale_authority = reopened
+        .reconcile_outbox(OutboxReconciliationRequest {
+            outbox_id,
+            authority_generation_id: "generation-a",
+            authority_holder_id: "holder-a",
+            authority_lease_epoch: old_epoch,
+            expected_generation_id: "generation-a",
+            expected_lease_epoch: old_epoch,
+            expected_lease_token: &claimed.lease_token,
+            expected_attempt: claimed.attempt,
+            expected_revision: claimed.revision,
+            now_ms: 102,
+            decision: OutboxReconciliationDecision::Delivered {
+                receipt_key: "operator-confirmed:ambiguous",
+            },
+        })
+        .expect_err("expired old authority cannot reconcile");
+    assert_eq!(stale_authority.category(), "stale_epoch");
+    let successor = reopened
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "generation-b",
+            holder_id: "holder-b",
+            now_ms: 101,
+            ttl_ms: 100,
+        })
+        .expect("live successor generation");
+    let wrong_authority = reopened
+        .reconcile_outbox(OutboxReconciliationRequest {
+            outbox_id,
+            authority_generation_id: "generation-b",
+            authority_holder_id: "holder-c",
+            authority_lease_epoch: successor.epoch,
+            expected_generation_id: "generation-a",
+            expected_lease_epoch: old_epoch,
+            expected_lease_token: &claimed.lease_token,
+            expected_attempt: claimed.attempt,
+            expected_revision: claimed.revision,
+            now_ms: 102,
+            decision: OutboxReconciliationDecision::Delivered {
+                receipt_key: "operator-confirmed:ambiguous",
+            },
+        })
+        .expect_err("wrong successor holder cannot reconcile");
+    assert_eq!(wrong_authority.category(), "stale_epoch");
+    let resolved = reopened
+        .reconcile_outbox(OutboxReconciliationRequest {
+            outbox_id,
+            authority_generation_id: "generation-b",
+            authority_holder_id: "holder-b",
+            authority_lease_epoch: successor.epoch,
+            expected_generation_id: "generation-a",
+            expected_lease_epoch: old_epoch,
+            expected_lease_token: &claimed.lease_token,
+            expected_attempt: claimed.attempt,
+            expected_revision: claimed.revision,
+            now_ms: 102,
+            decision: OutboxReconciliationDecision::Delivered {
+                receipt_key: "operator-confirmed:ambiguous",
+            },
+        })
+        .expect("explicit delivered reconciliation");
+    assert_eq!(resolved.state, "delivered");
+    assert!(!resolved.duplicate);
+    let retry = reopened
+        .reconcile_outbox(OutboxReconciliationRequest {
+            outbox_id,
+            authority_generation_id: "generation-b",
+            authority_holder_id: "holder-b",
+            authority_lease_epoch: successor.epoch,
+            expected_generation_id: "generation-a",
+            expected_lease_epoch: old_epoch,
+            expected_lease_token: &claimed.lease_token,
+            expected_attempt: claimed.attempt,
+            expected_revision: claimed.revision,
+            now_ms: 103,
+            decision: OutboxReconciliationDecision::Delivered {
+                receipt_key: "operator-confirmed:ambiguous",
+            },
+        })
+        .expect("exact reconciliation retry");
+    assert!(retry.duplicate);
+    assert_eq!(retry.revision, resolved.revision);
+    let wrong_expected_generation = reopened
+        .reconcile_outbox(OutboxReconciliationRequest {
+            outbox_id,
+            authority_generation_id: "generation-b",
+            authority_holder_id: "holder-b",
+            authority_lease_epoch: successor.epoch,
+            expected_generation_id: "generation-c",
+            expected_lease_epoch: old_epoch,
+            expected_lease_token: &claimed.lease_token,
+            expected_attempt: claimed.attempt,
+            expected_revision: claimed.revision,
+            now_ms: 103,
+            decision: OutboxReconciliationDecision::Delivered {
+                receipt_key: "operator-confirmed:ambiguous",
+            },
+        })
+        .expect_err("altered expected generation cannot replay reconciliation");
+    assert_eq!(wrong_expected_generation.category(), "already_terminal");
+    let wrong_expected_epoch = reopened
+        .reconcile_outbox(OutboxReconciliationRequest {
+            outbox_id,
+            authority_generation_id: "generation-b",
+            authority_holder_id: "holder-b",
+            authority_lease_epoch: successor.epoch,
+            expected_generation_id: "generation-a",
+            expected_lease_epoch: old_epoch + 1,
+            expected_lease_token: &claimed.lease_token,
+            expected_attempt: claimed.attempt,
+            expected_revision: claimed.revision,
+            now_ms: 103,
+            decision: OutboxReconciliationDecision::Delivered {
+                receipt_key: "operator-confirmed:ambiguous",
+            },
+        })
+        .expect_err("altered expected epoch cannot replay reconciliation");
+    assert_eq!(wrong_expected_epoch.category(), "already_terminal");
+    let conflict = reopened
+        .reconcile_outbox(OutboxReconciliationRequest {
+            outbox_id,
+            authority_generation_id: "generation-b",
+            authority_holder_id: "holder-b",
+            authority_lease_epoch: successor.epoch,
+            expected_generation_id: "generation-a",
+            expected_lease_epoch: old_epoch,
+            expected_lease_token: &claimed.lease_token,
+            expected_attempt: claimed.attempt,
+            expected_revision: claimed.revision,
+            now_ms: 104,
+            decision: OutboxReconciliationDecision::DeadLetter {
+                reason: "conflicting_operator_decision",
+            },
+        })
+        .expect_err("conflicting closed reconciliation refused");
+    assert_eq!(conflict.category(), "already_terminal");
+    assert_eq!(
+        reopened
+            .inspect_outbox_reconciliation(outbox_id)
+            .expect("delivered state unchanged")
+            .delivery_receipt_key
+            .as_deref(),
+        Some("operator-confirmed:ambiguous")
+    );
+}
+
+#[test]
+fn explicit_failure_can_retry_or_dead_letter_but_expiry_cannot() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let epoch = lease(&mut store, "holder-a", 0);
+    let outbox_id = add_effect(&mut store, epoch, "retry-dead", 1);
+    let first = claim_effect(&mut store, "holder-a", epoch, 5);
+    let retry = store
+        .fail_outbox(OutboxFailure {
+            outbox_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            lease_token: &first.lease_token,
+            expected_attempt: first.attempt,
+            now_ms: 6,
+            decision: OutboxFailureDecision::Retry {
+                reason: "provider_unavailable",
+                retry_after_ms: 20,
+            },
+        })
+        .expect("explicit safe retry");
+    assert_eq!(retry.state, "pending");
+    drop(store);
+    let mut store = Store::open(database.path()).expect("reopen after retry acknowledgement loss");
+    let retry_evidence = store
+        .inspect_outbox_reconciliation(outbox_id)
+        .expect("exact persisted retry evidence");
+    assert_eq!(retry_evidence.available_ms, 20);
+    assert_eq!(
+        retry_evidence.last_error.as_deref(),
+        Some("provider_unavailable")
+    );
+    assert!(
+        store
+            .claim_outbox(OutboxClaimRequest {
+                transport: "test",
+                kind: "test.effect",
+                generation_id: "generation-a",
+                holder_id: "holder-a",
+                lease_epoch: epoch,
+                now_ms: 19,
+                ttl_ms: 10,
+            })
+            .expect("retry delay")
+            .is_none()
+    );
+    let second = claim_effect(&mut store, "holder-a", epoch, 20);
+    assert_eq!(second.attempt, 2);
+    assert_ne!(second.lease_token, first.lease_token);
+    let dead = store
+        .fail_outbox(OutboxFailure {
+            outbox_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            lease_token: &second.lease_token,
+            expected_attempt: second.attempt,
+            now_ms: 21,
+            decision: OutboxFailureDecision::DeadLetter {
+                reason: "permanent_refusal",
+            },
+        })
+        .expect("closed dead letter");
+    assert_eq!(dead.state, "dead_lettered");
+    drop(store);
+    let store =
+        Store::open(database.path()).expect("reopen after dead-letter acknowledgement loss");
+    assert_eq!(
+        store
+            .inspect_outbox_reconciliation(outbox_id)
+            .expect("dead evidence")
+            .state,
+        "dead_lettered"
+    );
+    assert_eq!(
+        store
+            .inspect_outbox_reconciliation(outbox_id)
+            .expect("dead-letter reason")
+            .last_error
+            .as_deref(),
+        Some("permanent_refusal")
+    );
+}
+
+#[test]
+fn a_delayed_retry_does_not_block_a_later_ready_effect() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let epoch = lease(&mut store, "holder-a", 0);
+    let delayed_id = add_effect(&mut store, epoch, "delayed-first", 1);
+    let delayed = claim_effect(&mut store, "holder-a", epoch, 5);
+    store
+        .fail_outbox(OutboxFailure {
+            outbox_id: delayed_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            lease_token: &delayed.lease_token,
+            expected_attempt: delayed.attempt,
+            now_ms: 6,
+            decision: OutboxFailureDecision::Retry {
+                reason: "provider_backoff",
+                retry_after_ms: 50,
+            },
+        })
+        .expect("schedule delayed retry");
+    let ready_id = add_effect(&mut store, epoch, "ready-second", 10);
+    let ready = claim_effect(&mut store, "holder-a", epoch, 14);
+    assert_eq!(ready.outbox_id, ready_id);
+    assert_ne!(ready.outbox_id, delayed_id);
+    assert_eq!(ready.attempt, 1);
+}
+
+#[test]
+fn stale_outbox_fences_refuse_without_mutation() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let old_epoch = lease(&mut store, "holder-a", 0);
+    let outbox_id = add_effect(&mut store, old_epoch, "stale-fence", 1);
+    let claimed = claim_effect(&mut store, "holder-a", old_epoch, 5);
+    let before = store
+        .inspect_outbox_reconciliation(outbox_id)
+        .expect("before stale calls");
+    let wrong_holder = store
+        .deliver_outbox(OutboxDelivery {
+            outbox_id,
+            generation_id: "generation-a",
+            holder_id: "holder-b",
+            lease_epoch: old_epoch,
+            lease_token: &claimed.lease_token,
+            expected_attempt: claimed.attempt,
+            receipt_key: "must-not-commit",
+            now_ms: 6,
+        })
+        .expect_err("wrong holder refused");
+    assert_eq!(wrong_holder.category(), "stale_epoch");
+    let wrong_token = store
+        .fail_outbox(OutboxFailure {
+            outbox_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: old_epoch,
+            lease_token: "wrong-token",
+            expected_attempt: claimed.attempt,
+            now_ms: 6,
+            decision: OutboxFailureDecision::DeadLetter { reason: "wrong" },
+        })
+        .expect_err("wrong lease token refused");
+    assert_eq!(wrong_token.category(), "stale_epoch");
+    assert_eq!(
+        store
+            .inspect_outbox_reconciliation(outbox_id)
+            .expect("unchanged after stale calls"),
+        before
+    );
 }
 
 #[test]

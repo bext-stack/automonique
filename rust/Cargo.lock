@@ -81,6 +81,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "automonique-observability"
+version = "0.1.0"
+
+[[package]]
 name = "automonique-policy"
 version = "0.1.0"
 
@@ -111,6 +115,14 @@ dependencies = [
  "nix",
  "rusqlite",
  "tempfile",
+]
+
+[[package]]
+name = "automonique-transport-runtime"
+version = "0.1.0"
+dependencies = [
+ "automonique-transports",
+ "sha2",
 ]
 
 [[package]]
