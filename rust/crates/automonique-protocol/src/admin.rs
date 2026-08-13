@@ -18,32 +18,33 @@
 //! Carrying is all it does: see that type's documentation for what a carried
 //! pair does *not* establish.
 //!
-//! # One socket, four protocols
+//! # One socket, five protocols
 //!
 //! [`LocalRequest`] is what a local endpoint decodes a frame into. The local
 //! socket serves this protocol, [`crate::runs_api`]'s read surface,
-//! [`crate::automation_api`]'s control surface *and*
-//! [`crate::approval_api`]'s decision surface, and the envelope's declared
-//! protocol name is what separates them — not a heuristic, not a fallback
-//! chain, and not a widening of [`AdminCommand`]. That is the arrangement
-//! `runs_api` asks for in as many words: its values travel "on the same
-//! canonical-JSON envelope [`crate::admin`] uses, under a separate protocol
+//! [`crate::automation_api`]'s control surface, [`crate::approval_api`]'s
+//! decision surface *and* [`crate::batch_api`]'s batch control surface, and the
+//! envelope's declared protocol name is what separates them — not a heuristic,
+//! not a fallback chain, and not a widening of [`AdminCommand`]. That is the
+//! arrangement `runs_api` asks for in as many words: its values travel "on the
+//! same canonical-JSON envelope [`crate::admin`] uses, under a separate protocol
 //! name so the admin lane's closed kind set stays closed." A run listing, an
-//! automation pause or a recorded approval is therefore not an admin command,
-//! does not appear in [`crate::command_registry`]'s admin surface, and cannot
-//! reach [`DaemonStatus`].
+//! automation pause, a recorded approval or a registered batch is therefore not
+//! an admin command, does not appear in [`crate::command_registry`]'s admin
+//! surface, and cannot reach [`DaemonStatus`].
 //!
 //! Adding the third lane cost this module one enum arm, one match arm and one
 //! frame-fit assertion, and cost the admin lane nothing at all — which is the
 //! property the arrangement was chosen for. The fourth cost exactly the same
-//! three lines, which is the evidence that the property holds rather than
-//! merely having held once.
+//! three lines, and so did the fifth, which is the evidence that the property
+//! holds rather than merely having held once.
 
 use std::error::Error;
 use std::fmt;
 
 use crate::approval_api::{APPROVAL_PROTOCOL, ApprovalApiError, ApprovalRequest};
 use crate::automation_api::{AUTOMATION_PROTOCOL, AutomationApiError, AutomationRequest};
+use crate::batch_api::{BATCH_CONTROL_PROTOCOL, BatchApiError, BatchRequest};
 use crate::codec::{
     CodecError, Envelope, MajorVersion, MessageKind, ProtocolName, RequestId, SupportedProtocol,
     VersionRange,
@@ -1501,14 +1502,30 @@ const _: () = assert!(
     "a maximal approval frame must fit the local administration read bound"
 );
 
+/// A maximal Batch control frame must fit the bound a local transport reads
+/// under.
+///
+/// The same dependency the other three ceilings have, stated for the same
+/// reason: a widened `batch_api` ceiling that outgrew this one would turn a
+/// legal Batch message into a `frame_size` refusal at the socket, which is a
+/// size failure discovered by a peer rather than by this build. It is the
+/// tightest of the four, because a maximal registration carries a whole
+/// membership — which is why `batch_api` derives its member ceiling from this
+/// number rather than inheriting the batch model's.
+const _: () = assert!(
+    crate::batch_api::MAX_BATCH_CONTROL_CANONICAL_BYTES <= MAX_ADMIN_CANONICAL_BYTES,
+    "a maximal batch control frame must fit the local administration read bound"
+);
+
 /// A refusal while deciding which protocol one local frame belongs to.
 ///
-/// The five variants say *who* refused, which is the distinction a metric
+/// The six variants say *who* refused, which is the distinction a metric
 /// label needs: an envelope this socket could not place at all, a well-placed
 /// administration message the admin lane refused, a well-placed Runs message
 /// the Runs lane refused, a well-placed Automation message the Automation lane
-/// refused, or a well-placed Approval message the Approval lane refused. Every
-/// category spelling is the refusing lane's own.
+/// refused, a well-placed Approval message the Approval lane refused, or a
+/// well-placed Batch message the Batch lane refused. Every category spelling is
+/// the refusing lane's own.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalRequestError {
     /// The payload is not a well-formed envelope, or names a protocol this
@@ -1522,6 +1539,8 @@ pub enum LocalRequestError {
     Automation(AutomationApiError),
     /// The Approval decision lane refused the message it was handed.
     Approval(ApprovalApiError),
+    /// The Batch control lane refused the message it was handed.
+    Batch(BatchApiError),
 }
 
 impl LocalRequestError {
@@ -1534,6 +1553,7 @@ impl LocalRequestError {
             Self::Runs(error) => error.category(),
             Self::Automation(error) => error.category(),
             Self::Approval(error) => error.category(),
+            Self::Batch(error) => error.category(),
         }
     }
 }
@@ -1546,6 +1566,7 @@ impl fmt::Display for LocalRequestError {
             Self::Runs(error) => write!(formatter, "{error}"),
             Self::Automation(error) => write!(formatter, "{error}"),
             Self::Approval(error) => write!(formatter, "{error}"),
+            Self::Batch(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -1595,6 +1616,12 @@ pub enum LocalRequest {
     /// Boxed for the same reason: an [`ApprovalRequest`] carries three maximal
     /// bounded identifiers inline.
     Approval(Box<ApprovalRequest>),
+    /// A control operation on the native Batch API.
+    ///
+    /// Boxed most of all: a [`BatchRequest`] carries a whole declared
+    /// membership inline, which is the largest body any lane on this socket
+    /// sends, and an unboxed arm would set this enum's size for every lane.
+    Batch(Box<BatchRequest>),
 }
 
 impl LocalRequest {
@@ -1625,6 +1652,9 @@ impl LocalRequest {
             APPROVAL_PROTOCOL => ApprovalRequest::from_canonical_bytes(payload)
                 .map(|request| Self::Approval(Box::new(request)))
                 .map_err(LocalRequestError::Approval),
+            BATCH_CONTROL_PROTOCOL => BatchRequest::from_canonical_bytes(payload)
+                .map(|request| Self::Batch(Box::new(request)))
+                .map_err(LocalRequestError::Batch),
             _ => Err(LocalRequestError::Envelope(CodecError::UnknownProtocol)),
         }
     }
@@ -1637,6 +1667,7 @@ impl LocalRequest {
             Self::Runs(_) => RUNS_PROTOCOL,
             Self::Automation(_) => AUTOMATION_PROTOCOL,
             Self::Approval(_) => APPROVAL_PROTOCOL,
+            Self::Batch(_) => BATCH_CONTROL_PROTOCOL,
         }
     }
 }

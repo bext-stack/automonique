@@ -9,6 +9,7 @@ pub mod admin;
 pub mod approval_api;
 pub mod automation;
 pub mod automation_api;
+pub mod batch_api;
 pub mod batch_runner;
 pub mod codec;
 pub mod codegen;

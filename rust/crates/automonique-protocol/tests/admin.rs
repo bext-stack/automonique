@@ -1394,14 +1394,14 @@ fn a_reported_pause_cannot_claim_intake_is_still_open() {
 }
 
 // ---------------------------------------------------------------------------
-// One socket, four protocols.
+// One socket, five protocols.
 //
 // A local endpoint serves administration, the native Runs API read surface, the
-// native Automation control surface *and* the native Approval decision surface.
-// `LocalRequest` is the only thing that decides which, and it decides by the
-// protocol name the frame itself declares. These pin that the decision is made
-// once, before any lane reads a body, and that no lane can be reached through
-// another's decoder.
+// native Automation control surface, the native Approval decision surface *and*
+// the native Batch control surface. `LocalRequest` is the only thing that
+// decides which, and it decides by the protocol name the frame itself declares.
+// These pin that the decision is made once, before any lane reads a body, and
+// that no lane can be reached through another's decoder.
 // ---------------------------------------------------------------------------
 
 mod local_dispatch {
@@ -1418,6 +1418,14 @@ mod local_dispatch {
         AUTOMATION_PROTOCOL, AutomationApiError, AutomationCursor, AutomationId,
         AutomationPageSize, AutomationRequest, AutomationStateFilter, ListAutomations,
         MAX_AUTOMATION_CANONICAL_BYTES, PauseReason, RegisterAutomation, SetEnablement,
+    };
+    use automonique_protocol::batch_api::{
+        AdvanceMember, BATCH_CONTROL_PROTOCOL, BatchApiError, BatchCursor, BatchPageSize,
+        BatchRequest, ListBatches, MAX_BATCH_CONTROL_CANONICAL_BYTES, MAX_BATCH_CONTROL_MEMBERS,
+        RegisterBatch,
+    };
+    use automonique_protocol::batch_runner::{
+        BatchId, BatchLabel, BatchMemberKey, ConcurrencyPolicy, MemberProgress,
     };
     use automonique_protocol::runs_api::{
         ListRuns, MAX_RUNS_CANONICAL_BYTES, PageSize, RUNS_PROTOCOL, RunStateFilter, RunsApiError,
@@ -1478,6 +1486,20 @@ mod local_dispatch {
         request
             .to_message()
             .expect("encode approval request")
+            .to_canonical_bytes()
+    }
+
+    fn batch_listing() -> BatchRequest {
+        BatchRequest::ListBatches {
+            request_id: request_id(),
+            query: ListBatches::new(BatchCursor::START, BatchPageSize::MAX),
+        }
+    }
+
+    fn batch_payload(request: &BatchRequest) -> Vec<u8> {
+        request
+            .to_message()
+            .expect("encode batch request")
             .to_canonical_bytes()
     }
 
@@ -1563,6 +1585,43 @@ mod local_dispatch {
                 .expect("an approval frame is placed");
             assert_eq!(placed.protocol(), APPROVAL_PROTOCOL);
             assert_eq!(placed, LocalRequest::Approval(Box::new(request)));
+        }
+
+        for request in [
+            batch_listing(),
+            BatchRequest::RegisterBatch {
+                request_id: request_id(),
+                registration: RegisterBatch::new(
+                    BatchId::new("nightly-eval").expect("batch identity"),
+                    Some(BatchLabel::new("nightly").expect("label")),
+                    ConcurrencyPolicy::bounded_parallel(4).expect("ceiling"),
+                    vec![
+                        BatchMemberKey::new("record-1").expect("member key"),
+                        BatchMemberKey::new("record-2").expect("member key"),
+                    ],
+                )
+                .expect("registration"),
+            },
+            BatchRequest::AdvanceMember {
+                request_id: request_id(),
+                advance: AdvanceMember::new(
+                    BatchId::new("nightly-eval").expect("batch identity"),
+                    BatchMemberKey::new("record-1").expect("member key"),
+                    2,
+                    MemberProgress::Run(automonique_protocol::runs_api::RunState::Running),
+                    7,
+                )
+                .expect("advance"),
+            },
+            BatchRequest::BatchDetail {
+                request_id: request_id(),
+                batch_id: BatchId::new("nightly-eval").expect("batch identity"),
+            },
+        ] {
+            let placed = LocalRequest::from_canonical_bytes(&batch_payload(&request))
+                .expect("a batch frame is placed");
+            assert_eq!(placed.protocol(), BATCH_CONTROL_PROTOCOL);
+            assert_eq!(placed, LocalRequest::Batch(Box::new(request)));
         }
     }
 
@@ -1719,6 +1778,68 @@ mod local_dispatch {
                 "a {kind} inside an approval envelope",
             );
         }
+
+        // The fifth lane refuses in its own vocabulary too. A registration body
+        // missing its declared `label` is the Batch lane's
+        // `batch_control_invalid_body`, which no other lane can produce.
+        let short = br#"{"body":{"batch_id":"b","concurrency":{"kind":"sequential","max_in_flight":null},"members":["m"]},"kind":"register_batch","protocol":"automonique.batch.control","request_id":"r","version":1}"#;
+        let error = LocalRequest::from_canonical_bytes(short).expect_err("short registration body");
+        assert_eq!(error, LocalRequestError::Batch(BatchApiError::InvalidBody));
+        assert_eq!(error.category(), "batch_control_invalid_body");
+
+        // A batch kind inside each of the other four envelopes stays that lane's
+        // refusal, and each of their kinds inside a batch envelope stays the
+        // batch lane's. Five lanes, and none falls through to another.
+        let batch_body = br#"{"batch_id":"b","concurrency":{"kind":"sequential","max_in_flight":null},"label":null,"members":["m"]}"#;
+        for (protocol, expected) in [
+            (
+                "automonique.admin",
+                LocalRequestError::Admin(AdminError::UnknownKind),
+            ),
+            (
+                "automonique.runs",
+                LocalRequestError::Runs(RunsApiError::UnknownKind),
+            ),
+            (
+                "automonique.automation",
+                LocalRequestError::Automation(AutomationApiError::UnknownKind),
+            ),
+            (
+                "automonique.approval",
+                LocalRequestError::Approval(ApprovalApiError::UnknownKind),
+            ),
+        ] {
+            let smuggled = [
+                br#"{"body":"#.as_slice(),
+                batch_body.as_slice(),
+                format!(
+                    r#","kind":"register_batch","protocol":"{protocol}","request_id":"r","version":1}}"#
+                )
+                .as_bytes(),
+            ]
+            .concat();
+            assert_eq!(
+                LocalRequest::from_canonical_bytes(&smuggled).expect_err("smuggled batch kind"),
+                expected,
+                "a batch kind inside a {protocol} envelope",
+            );
+        }
+        for kind in [
+            "shutdown",
+            "list_runs",
+            "register_automation",
+            "record_approval",
+        ] {
+            let inverted = format!(
+                r#"{{"body":{{}},"kind":"{kind}","protocol":"automonique.batch.control","request_id":"r","version":1}}"#
+            );
+            assert_eq!(
+                LocalRequest::from_canonical_bytes(inverted.as_bytes())
+                    .expect_err("smuggled foreign kind"),
+                LocalRequestError::Batch(BatchApiError::UnknownKind),
+                "a {kind} inside a batch envelope",
+            );
+        }
     }
 
     #[test]
@@ -1728,7 +1849,56 @@ mod local_dispatch {
         // bypassed `LocalRequest` could not mix them either.
         let automation = automation_payload(&automation_listing());
         let approval = approval_payload(&approval_listing());
+        let batch = batch_payload(&batch_listing());
         for (label, category) in [
+            (
+                "a batch frame is not an admin request",
+                AdminRequest::from_canonical_bytes(&batch)
+                    .expect_err("batch into admin")
+                    .category(),
+            ),
+            (
+                "a batch frame is not a runs request",
+                RunsRequest::from_canonical_bytes(&batch)
+                    .expect_err("batch into runs")
+                    .category(),
+            ),
+            (
+                "a batch frame is not an automation request",
+                AutomationRequest::from_canonical_bytes(&batch)
+                    .expect_err("batch into automation")
+                    .category(),
+            ),
+            (
+                "a batch frame is not an approval request",
+                ApprovalRequest::from_canonical_bytes(&batch)
+                    .expect_err("batch into approval")
+                    .category(),
+            ),
+            (
+                "an admin frame is not a batch request",
+                BatchRequest::from_canonical_bytes(&admin_payload())
+                    .expect_err("admin into batch")
+                    .category(),
+            ),
+            (
+                "a runs frame is not a batch request",
+                BatchRequest::from_canonical_bytes(&runs_payload(&listing()))
+                    .expect_err("runs into batch")
+                    .category(),
+            ),
+            (
+                "an automation frame is not a batch request",
+                BatchRequest::from_canonical_bytes(&automation)
+                    .expect_err("automation into batch")
+                    .category(),
+            ),
+            (
+                "an approval frame is not a batch request",
+                BatchRequest::from_canonical_bytes(&approval)
+                    .expect_err("approval into batch")
+                    .category(),
+            ),
             (
                 "a runs frame is not an admin request",
                 AdminRequest::from_canonical_bytes(&runs_payload(&listing()))
@@ -1857,6 +2027,42 @@ mod local_dispatch {
         assert!(
             frame.len() < MAX_APPROVAL_CANONICAL_BYTES && frame.len() < LOCAL_READ_BOUND,
             "a maximal recording framed to {} bytes",
+            frame.len(),
+        );
+    }
+
+    #[test]
+    fn a_maximal_batch_frame_fits_the_local_administration_read_bound() {
+        // The relation between the ceilings is a compile-time assertion in
+        // `admin.rs`, so this build could not have linked if it stopped holding.
+        // What is measured here is the consequence, and this lane is the one it
+        // actually binds on: a maximal registration carries a whole membership,
+        // which is the largest body any lane on this socket sends. The measured
+        // frame is what pins `batch_api`'s member ceiling to something real
+        // rather than to arithmetic nobody ran.
+        const LOCAL_READ_BOUND: usize = MAX_ADMIN_CANONICAL_BYTES;
+        let worst = "\"".repeat(BatchMemberKey::MAX_BYTES);
+        let members: Vec<BatchMemberKey> = (0..MAX_BATCH_CONTROL_MEMBERS)
+            .map(|index| {
+                BatchMemberKey::new(format!("{index:03}{}", &worst[..worst.len() - 3]))
+                    .expect("member key")
+            })
+            .collect();
+        let payload = batch_payload(&BatchRequest::RegisterBatch {
+            request_id: request_id(),
+            registration: RegisterBatch::new(
+                BatchId::new("\"".repeat(BatchId::MAX_BYTES)).expect("batch identity"),
+                Some(BatchLabel::new("\"".repeat(BatchLabel::MAX_BYTES)).expect("label")),
+                ConcurrencyPolicy::bounded_parallel(256).expect("ceiling"),
+                members,
+            )
+            .expect("maximal registration"),
+        });
+        let mut frame = Vec::new();
+        encode_frame(&payload, &mut frame).expect("a maximal registration fits one frame");
+        assert!(
+            frame.len() < MAX_BATCH_CONTROL_CANONICAL_BYTES && frame.len() < LOCAL_READ_BOUND,
+            "a maximal registration framed to {} bytes",
             frame.len(),
         );
     }

@@ -2,13 +2,13 @@
 
 //! Bounded client for the peer-authenticated local daemon endpoint.
 //!
-//! The endpoint serves four protocols over one socket — local administration,
-//! the native Runs API read surface, the native Automation control surface and
-//! the native Approval decision surface — so this module has one transport and
-//! four typed exchanges over it. [`exchange`] owns everything that is a property
-//! of the socket rather than of a protocol: the path judgement, the peer check,
-//! the deadlines, and the frame bound. No lane repeats any of it, so no lane can
-//! weaken it.
+//! The endpoint serves five protocols over one socket — local administration,
+//! the native Runs API read surface, the native Automation control surface, the
+//! native Approval decision surface and the native Batch control surface — so
+//! this module has one transport and five typed exchanges over it. [`exchange`]
+//! owns everything that is a property of the socket rather than of a protocol:
+//! the path judgement, the peer check, the deadlines, and the frame bound. No
+//! lane repeats any of it, so no lane can weaken it.
 
 use std::ffi::OsStr;
 use std::io::{Read, Write};
@@ -24,6 +24,7 @@ use automonique_protocol::admin::{
 };
 use automonique_protocol::approval_api::{ApprovalRequest, ApprovalResponse};
 use automonique_protocol::automation_api::{AutomationRequest, AutomationResponse};
+use automonique_protocol::batch_api::{BatchRequest, BatchResponse};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_protocol::runs_api::{RunsRequest, RunsResponse};
 use nix::sys::socket::{getsockopt, sockopt};
@@ -200,6 +201,35 @@ pub(crate) fn approval_request(
         return Err(ClientError::Protocol("request_id_mismatch"));
     }
     if let ApprovalResponse::Refused { refusal, .. } = response {
+        return Err(ClientError::Refused(refusal.as_str().to_owned()));
+    }
+    Ok(response)
+}
+
+/// Ask the daemon one bounded question on the native Batch control API.
+///
+/// The request travels under its own protocol name on the same socket, so the
+/// daemon places it by envelope rather than by which client sent it. A typed
+/// refusal is mapped onto [`ClientError::Refused`] exactly as the other four
+/// lanes' are; a `revision_conflict` answer is *not* a refusal — the request was
+/// well-formed and the member row simply moved — and is returned for the caller
+/// to report with the durable revision it carries.
+pub(crate) fn batch_request(
+    runtime: Option<&OsStr>,
+    request: &BatchRequest,
+) -> Result<BatchResponse, ClientError> {
+    let request_id = request.request_id().as_str().to_owned();
+    let payload = request
+        .to_message()
+        .map_err(|error| ClientError::Protocol(error.category()))?
+        .to_canonical_bytes();
+    let payload = exchange(runtime, &payload)?;
+    let response = BatchResponse::from_canonical_bytes(&payload)
+        .map_err(|error| ClientError::Protocol(error.category()))?;
+    if response.request_id().as_str() != request_id {
+        return Err(ClientError::Protocol("request_id_mismatch"));
+    }
+    if let BatchResponse::Refused { refusal, .. } = response {
         return Err(ClientError::Refused(refusal.as_str().to_owned()));
     }
     Ok(response)

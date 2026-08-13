@@ -42,6 +42,14 @@ use automonique_protocol::automation_api::{
     AutomationRequest, AutomationResponse, ListAutomations, PauseReason, RegisterAutomation,
     SetEnablement,
 };
+use automonique_protocol::batch_api::{
+    AdvanceMember, BatchApiError, BatchContinuation, BatchCursor, BatchDetailResult, BatchListPage,
+    BatchReceiptView, BatchRecordView, BatchRefusal, BatchRequest, BatchResponse, ListBatches,
+    MemberReceiptParts, MemberReceiptView, MemberView, RegisterBatch,
+};
+use automonique_protocol::batch_runner::{
+    BatchId, BatchLabel, BatchMemberKey, ConcurrencyPolicy, MemberProgress,
+};
 use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, RequestId, decode_frame, encode_frame};
 use automonique_protocol::digest::{ALGORITHM, Sha256, Sha256Digest};
 use automonique_protocol::journal::{CursorResume, RetainedRange};
@@ -59,6 +67,11 @@ use automonique_store::approval_ledger::{
 use automonique_store::automation_store::{
     AutomationRecord, AutomationRegistration, AutomationStore, AutomationStoreError,
     EnablementState as StoreEnablementState, EnablementTransition,
+};
+use automonique_store::batch_registry::{
+    BatchRecord, BatchRegistration, BatchRegistry, BatchRegistryError,
+    ConcurrencyPolicy as StoreConcurrencyPolicy, MemberAdvance, MemberProgress as StoreProgress,
+    MemberRecord,
 };
 use automonique_store::generation_audit::{
     GenerationAudit, GenerationAuditError, SelfEndKind, Succession, TenureEnding, TenureOpening,
@@ -140,6 +153,24 @@ pub const AUTOMATION_REGISTRY_NAME: &str = concat!("automations", ".sqlite3");
 /// `automonique_store::provider_journal`'s `provider_approvals` table is that,
 /// keyed on `(session_id, approval_key)` — and no transaction spans the two.
 pub const APPROVAL_LEDGER_NAME: &str = concat!("approvals", ".sqlite3");
+
+/// Durable batch registry, a sibling of [`DATABASE_NAME`].
+///
+/// One row per batch recording the membership it declared, and one row per
+/// member recording the progress a writer last reported for it. Separate for the
+/// reason every sibling log is separate — its schema versions independently —
+/// and because a declared membership is not scheduler state.
+///
+/// WHAT THIS FILE DOES NOT DO. It submits nothing: registering a batch writes no
+/// row to [`RUN_SUBMISSIONS_NAME`], reserves no run identity and takes custody of
+/// nothing, so a registered batch causes no run to exist. It schedules nothing
+/// and throttles nothing — the concurrency policy is stored because the batch
+/// declared it, and no executor in this build reads it, because there is no
+/// executor. And a member's progress is a *writer's claim*: [`RUN_INDEX_NAME`]
+/// is the true binding from a submission to the state its run reached, this file
+/// never joins it, and no transaction spans the two. A `completed` member here
+/// means somebody said so.
+pub const BATCH_REGISTRY_NAME: &str = concat!("batches", ".sqlite3");
 
 /// Durable host-wide cancellation ledger, a sibling of [`DATABASE_NAME`].
 ///
@@ -269,6 +300,12 @@ impl DaemonConfig {
         self.state_dir().join(APPROVAL_LEDGER_NAME)
     }
 
+    /// Durable batch registry path.
+    #[must_use]
+    pub fn batch_registry_path(&self) -> PathBuf {
+        self.state_dir().join(BATCH_REGISTRY_NAME)
+    }
+
     /// Durable generation hand-off audit path.
     #[must_use]
     pub fn generation_audit_path(&self) -> PathBuf {
@@ -335,6 +372,18 @@ pub enum DaemonError {
     /// as an operator error. [`refuse_approval`] is where the line is drawn. No
     /// variant of this error echoes any part of the payload that met it.
     ApprovalLedgerFailed(&'static str),
+    /// The durable batch registry failed in a way no client caused. The payload
+    /// is the stable category from that module.
+    ///
+    /// The same line [`ApprovalLedgerFailed`](Self::ApprovalLedgerFailed) draws:
+    /// a malformed field, a duplicate identity, an illegal member transition, an
+    /// incoherent sequence, a lost cursor and a full registry are the operator's
+    /// to fix and are answered to the client in one closed word, while
+    /// corruption, a schema mismatch, an unsafe path and storage failure say the
+    /// daemon's own durable state is unsound and must not be presented as an
+    /// operator error. [`refuse_batch`] is where the line is drawn. No variant of
+    /// this error echoes any part of the payload that met it.
+    BatchRegistryFailed(&'static str),
     /// The durable generation hand-off audit could not be opened, could not
     /// record this daemon's tenure, or could not close it. The payload is the
     /// stable category from that module.
@@ -364,6 +413,7 @@ impl DaemonError {
             Self::AttemptHostFailed(category) => category,
             Self::AutomationStoreFailed(category) => category,
             Self::ApprovalLedgerFailed(category) => category,
+            Self::BatchRegistryFailed(category) => category,
             Self::GenerationAuditFailed(category) => category,
         }
     }
@@ -407,6 +457,9 @@ impl fmt::Display for DaemonError {
             }
             Self::ApprovalLedgerFailed(category) => {
                 write!(formatter, "approval ledger failed: {category}")
+            }
+            Self::BatchRegistryFailed(category) => {
+                write!(formatter, "batch registry failed: {category}")
             }
             Self::GenerationAuditFailed(category) => {
                 write!(formatter, "generation audit failed: {category}")
@@ -476,6 +529,15 @@ pub struct Daemon {
     /// because no handler in this build acts on anybody's behalf — so its whole
     /// role here is to answer the approval lane truthfully across restarts.
     approvals: ApprovalLedger,
+    /// The durable record of which submissions each batch declared, and where
+    /// each of them was last reported to have got to.
+    ///
+    /// A plain field for the reason [`Daemon::run_index`] is: it owns no
+    /// dispatcher and needs no ordered disposal. Nothing in this daemon *reads*
+    /// it to decide anything — no executor consults a batch's concurrency
+    /// ceiling, because there is no executor — so its whole role here is to
+    /// answer the batch control lane truthfully across restarts.
+    batches: BatchRegistry,
     /// This host's one cancellation dispatcher over its one durable ledger.
     ///
     /// `Option` only so [`Daemon::serve`] can dispose of it explicitly while
@@ -659,6 +721,18 @@ impl Daemon {
         let approvals = ApprovalLedger::open(config.approval_ledger_path())
             .map_err(|error| DaemonError::ApprovalLedgerFailed(error.category()))?;
 
+        // The batch registry opens beside the ledger, under the same fence and
+        // before the socket guard is disarmed, for the same reason: a daemon
+        // that cannot durably record which submissions a batch declared must not
+        // publish an endpoint that accepts the declaration. A membership held in
+        // memory and forgotten by a restart is exactly the failure the registry
+        // exists to remove — `batch_runner` says plainly that a plan in memory
+        // makes "resume by stable record identity" impossible — and serving the
+        // lane from a registry that failed to open would reintroduce it
+        // silently.
+        let batches = BatchRegistry::open(config.batch_registry_path())
+            .map_err(|error| DaemonError::BatchRegistryFailed(error.category()))?;
+
         // The host's one cancellation dispatcher and its durable custody open
         // beneath the same fence and before the socket guard is disarmed, for
         // the same reason custody storage does: a daemon that cannot remember
@@ -685,6 +759,7 @@ impl Daemon {
             run_index,
             automations,
             approvals,
+            batches,
             attempt_host: Some(attempt_host),
             generation_audit,
             tenure_revision: tenure.revision,
@@ -916,12 +991,12 @@ impl Daemon {
     /// Authenticate the peer, read one bounded frame, and hand it to the lane
     /// its envelope names.
     ///
-    /// The socket serves four protocols. Which one a frame belongs to is read
+    /// The socket serves five protocols. Which one a frame belongs to is read
     /// off its declared protocol name by
     /// [`LocalRequest::from_canonical_bytes`], never guessed and never tried in
     /// sequence, so an administration client, a Runs client, an Automation
-    /// client and an Approval client receive their own lane's refusals rather
-    /// than each other's.
+    /// client, an Approval client and a Batch client receive their own lane's
+    /// refusals rather than each other's.
     fn handle_stream(
         &mut self,
         stream: &mut UnixStream,
@@ -938,6 +1013,7 @@ impl Daemon {
             LocalRequest::Runs(request) => self.handle_runs(stream, &request),
             LocalRequest::Automation(request) => self.handle_automation(stream, &request),
             LocalRequest::Approval(request) => self.handle_approval(stream, &request),
+            LocalRequest::Batch(request) => self.handle_batch(stream, &request),
         }
     }
 
@@ -2229,6 +2305,260 @@ impl Daemon {
         })
     }
 
+    /// Answer one operation on the native Batch control API.
+    ///
+    /// # What an accepted write here does, and what it does not
+    ///
+    /// A registration commits one batch row and one row per member, every member
+    /// at `unsubmitted`. An advance commits one member row at a new progress.
+    /// **Nothing else happens.** In particular:
+    ///
+    /// - **Registering a batch submits nothing.** No RunSpec document is
+    ///   accepted, no row is written to the run submission log, no run identity
+    ///   is reserved. A member key names a submission the caller intends; this
+    ///   daemon does not check that one exists and does not create one. A
+    ///   registered batch therefore causes no run to exist, and
+    ///   `tests/batch_live.rs` asserts that against the live Runs lane.
+    /// - **Nothing is scheduled and nothing is throttled.** The concurrency
+    ///   policy is stored because the batch declared it. No executor reads it,
+    ///   because there is no executor.
+    /// - **A member's progress is the caller's claim.** The run index is the true
+    ///   binding from a submission to the state its run reached; this lane never
+    ///   joins it and no transaction spans the two databases. What an accepted
+    ///   advance establishes is that a writer *said* the member is at that
+    ///   progress, at a sequence that did not go backwards, along a legal
+    ///   lattice.
+    ///
+    /// That is why a landed write answers `accepted` rather than `completed`.
+    ///
+    /// # The rolled-up state
+    ///
+    /// [`Self::batch_detail`] serves the batch-level state the registry
+    /// deliberately does not store. It is derived here, from the member slice
+    /// being served, by [`BatchDetailResult::new`] — which is the one caller of
+    /// `automonique_protocol::batch_runner::roll_up` on this path. This daemon
+    /// never assembles that word itself, and could not smuggle one past its own
+    /// wire format if it tried: the response decoder recomputes the rollup and
+    /// refuses a body whose carried state contradicts its own members.
+    ///
+    /// # Fencing
+    ///
+    /// Fenced exactly as [`Daemon::handle_approval`] is, and for the same reason:
+    /// this lane writes. A daemon that has lost its generation must not record a
+    /// membership into a database another generation now owns, and must not serve
+    /// one out of it either. Like the approval and automation lanes and unlike
+    /// the intake arms, it is *not* closed by an operator pause: an intake pause
+    /// stops the daemon taking custody of new work, and this lane takes custody
+    /// of nothing.
+    fn handle_batch(
+        &mut self,
+        stream: &mut UnixStream,
+        request: &BatchRequest,
+    ) -> Result<(), DaemonError> {
+        let now_ms = unix_millis()?;
+        let snapshot = self.store.status_snapshot_at(GENERATION_ID, now_ms)?;
+        let generation = snapshot.generation().ok_or(StoreError::StaleEpoch)?;
+        if generation.holder_id() != self.instance_id.as_str()
+            || generation.lease_epoch() != self.lease_epoch
+            || generation.lease_expires_ms() != self.lease_expires_ms
+            || generation.lease_expires_ms() <= now_ms
+        {
+            return Err(DaemonError::Store(StoreError::StaleEpoch));
+        }
+        let response = match request {
+            BatchRequest::RegisterBatch {
+                request_id,
+                registration,
+            } => self.register_batch(request_id, registration, now_ms)?,
+            BatchRequest::AdvanceMember {
+                request_id,
+                advance,
+            } => self.advance_batch_member(request_id, advance, now_ms)?,
+            BatchRequest::ListBatches { request_id, query } => {
+                self.list_batches(request_id, *query)?
+            }
+            BatchRequest::BatchDetail {
+                request_id,
+                batch_id,
+            } => self.batch_detail(request_id, batch_id)?,
+        };
+        let response = response
+            .to_message()
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
+            .to_canonical_bytes();
+        let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + response.len());
+        encode_frame(&response, &mut frame)
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
+        stream.write_all(&frame)?;
+        stream.flush()?;
+        Ok(())
+    }
+
+    /// Record one batch and its whole declared membership.
+    ///
+    /// The instant is the daemon's, not the caller's: the wire carries no
+    /// timestamp, so a client cannot date a registration to whenever it likes.
+    ///
+    /// The all-or-nothing is the registry's, not this function's — it writes the
+    /// batch row and every member row in one immediate transaction, so a reader
+    /// after a crash sees the whole membership or no batch at all. Nothing here
+    /// compensates, retries or half-writes.
+    ///
+    /// Every refusal that is a property of the request alone was already made by
+    /// the protocol's own decoder before this ran. The registry makes them again
+    /// and this function maps them anyway, because the two checks are not
+    /// redundant: the first refuses a malformed request before it touches durable
+    /// state, and the second refuses a malformed row without trusting us.
+    fn register_batch(
+        &mut self,
+        request_id: &RequestId,
+        registration: &RegisterBatch,
+        now_ms: i64,
+    ) -> Result<BatchResponse, DaemonError> {
+        let members: Vec<&str> = registration
+            .members()
+            .iter()
+            .map(BatchMemberKey::as_str)
+            .collect();
+        let receipt = match self.batches.register(BatchRegistration {
+            batch_id: registration.batch_id().as_str(),
+            label: registration.label().map(BatchLabel::as_str),
+            concurrency: store_concurrency(registration.concurrency()),
+            members: &members,
+            now_ms,
+        }) {
+            Ok(receipt) => receipt,
+            Err(error) => return refuse_batch(request_id, &error),
+        };
+        Ok(BatchResponse::Registered {
+            request_id: request_id.clone(),
+            receipt: BatchReceiptView::new(
+                checked_row_id(receipt.entry_id)?,
+                registration.batch_id().clone(),
+                receipt.member_count,
+                receipt.revision,
+                automonique_protocol::primitives::EpochMillis::from_millis(receipt.created_at_ms),
+            )
+            .map_err(batch_refused)?,
+        })
+    }
+
+    /// Move one member along the progress lattice.
+    ///
+    /// The sequence coupling was already decided by the protocol's own decoder —
+    /// a `ready` at a non-zero sequence never reaches this function — and the
+    /// registry decides it again, for the reason [`Daemon::set_enablement`] gives
+    /// for its cause coupling.
+    ///
+    /// A stale expected revision is a `conflict`, not a `rejected`: the caller's
+    /// request was well-formed and the row simply moved, and the two are retried
+    /// differently. The durable revision travels with the answer so a retry does
+    /// not need a second round trip.
+    fn advance_batch_member(
+        &mut self,
+        request_id: &RequestId,
+        advance: &AdvanceMember,
+        now_ms: i64,
+    ) -> Result<BatchResponse, DaemonError> {
+        let receipt = match self.batches.advance_member(MemberAdvance {
+            batch_id: advance.batch_id().as_str(),
+            member_key: advance.member_key().as_str(),
+            expected_revision: advance.expected_revision(),
+            new_progress: store_progress(advance.progress()),
+            last_sequence: advance.last_sequence(),
+            now_ms,
+        }) {
+            Ok(receipt) => receipt,
+            Err(BatchRegistryError::RevisionMismatch { expected, durable }) => {
+                return BatchResponse::conflict(request_id.clone(), expected, durable)
+                    .map_err(batch_refused);
+            }
+            Err(error) => return refuse_batch(request_id, &error),
+        };
+        Ok(BatchResponse::MemberAdvanced {
+            request_id: request_id.clone(),
+            receipt: MemberReceiptView::new(MemberReceiptParts {
+                batch_id: advance.batch_id().clone(),
+                member_key: advance.member_key().clone(),
+                ordinal: receipt.ordinal,
+                progress: member_progress(receipt.progress),
+                last_sequence: receipt.last_sequence,
+                revision: receipt.revision,
+                updated_at: automonique_protocol::primitives::EpochMillis::from_millis(
+                    receipt.updated_at_ms,
+                ),
+            })
+            .map_err(batch_refused)?,
+        })
+    }
+
+    /// One bounded page of batches.
+    ///
+    /// The wire cursor is the registry's own exclusive `entry_id` position, so
+    /// nothing is translated between two coordinate spaces and there is no
+    /// off-by-one to re-derive. A page carries batch rows and not their
+    /// memberships, exactly as the registry serves them: a maximal page of
+    /// maximal batches would be a listing that had to be paged again.
+    fn list_batches(
+        &self,
+        request_id: &RequestId,
+        query: ListBatches,
+    ) -> Result<BatchResponse, DaemonError> {
+        let page = match self
+            .batches
+            .page(query.since().position(), query.page_size().get())
+        {
+            Ok(page) => page,
+            Err(error) => return refuse_batch(request_id, &error),
+        };
+        let mut entries = Vec::with_capacity(page.entries.len());
+        for record in &page.entries {
+            entries.push(batch_record(record)?);
+        }
+        let continuation = match page.next_cursor {
+            Some(next) => BatchContinuation::More(BatchCursor::new(next)),
+            None => BatchContinuation::Complete,
+        };
+        let page = BatchListPage::new(entries, continuation).map_err(batch_refused)?;
+        BatchResponse::listing(request_id.clone(), query, page).map_err(batch_refused)
+    }
+
+    /// One batch, its whole membership in ordinal order, and their rollup.
+    ///
+    /// An absent batch is [`BatchRefusal::UnknownBatch`] and never an empty
+    /// membership: an unregistered batch and a batch whose members are all
+    /// `unsubmitted` are different answers, and this one makes the true one.
+    ///
+    /// The rolled-up state is not read from anywhere. The registry has no such
+    /// column, on purpose, and [`BatchDetailResult::new`] derives it from the
+    /// very members being served — so the answer cannot drift from what it
+    /// summarizes, and cannot be fabricated here.
+    fn batch_detail(
+        &self,
+        request_id: &RequestId,
+        batch_id: &BatchId,
+    ) -> Result<BatchResponse, DaemonError> {
+        let view = match self.batches.batch(batch_id.as_str()) {
+            Ok(Some(view)) => view,
+            Ok(None) => {
+                return Ok(BatchResponse::Refused {
+                    request_id: request_id.clone(),
+                    refusal: BatchRefusal::UnknownBatch,
+                });
+            }
+            Err(error) => return refuse_batch(request_id, &error),
+        };
+        let batch = batch_record(&view.batch)?;
+        let mut members = Vec::with_capacity(view.members.len());
+        for record in &view.members {
+            members.push(member_view(record)?);
+        }
+        Ok(BatchResponse::BatchDetail {
+            request_id: request_id.clone(),
+            detail: BatchDetailResult::new(batch, members).map_err(batch_refused)?,
+        })
+    }
+
     fn write_refusal(
         &self,
         stream: &mut UnixStream,
@@ -2519,6 +2849,151 @@ fn refuse_approval(
         }
     };
     Ok(ApprovalResponse::Refused {
+        request_id: request_id.clone(),
+        refusal,
+    })
+}
+
+fn batch_refused(error: BatchApiError) -> DaemonError {
+    DaemonError::ProtocolRefused(error.category())
+}
+
+/// Translate the wire's concurrency vocabulary into the registry's.
+///
+/// Two mirrored enums and one exhaustive match between them. Deliberately not a
+/// spelling comparison, and deliberately not a shared type: this crate can see
+/// both, but neither crate depends on the other, so the match is where a rename
+/// on either side becomes a compile failure rather than a row nobody can read.
+const fn store_concurrency(policy: ConcurrencyPolicy) -> StoreConcurrencyPolicy {
+    match policy {
+        ConcurrencyPolicy::Sequential => StoreConcurrencyPolicy::Sequential,
+        ConcurrencyPolicy::BoundedParallel { max_in_flight } => {
+            StoreConcurrencyPolicy::BoundedParallel { max_in_flight }
+        }
+    }
+}
+
+/// Translate the registry's concurrency vocabulary into the wire's.
+const fn concurrency_policy(policy: StoreConcurrencyPolicy) -> ConcurrencyPolicy {
+    match policy {
+        StoreConcurrencyPolicy::Sequential => ConcurrencyPolicy::Sequential,
+        StoreConcurrencyPolicy::BoundedParallel { max_in_flight } => {
+            ConcurrencyPolicy::BoundedParallel { max_in_flight }
+        }
+    }
+}
+
+/// Translate the wire's member progress into the registry's.
+///
+/// Six of the seven values are the run vocabulary, and they travel through the
+/// same [`spool_state`] the run index lane uses, so a batch member and the index
+/// row it mirrors cannot disagree about a word.
+const fn store_progress(progress: MemberProgress) -> StoreProgress {
+    match progress {
+        MemberProgress::Unsubmitted => StoreProgress::Unsubmitted,
+        MemberProgress::Run(state) => StoreProgress::Run(spool_state(state)),
+    }
+}
+
+/// Translate the registry's member progress into the wire's.
+const fn member_progress(progress: StoreProgress) -> MemberProgress {
+    match progress {
+        StoreProgress::Unsubmitted => MemberProgress::Unsubmitted,
+        StoreProgress::Run(state) => MemberProgress::Run(run_state(state)),
+    }
+}
+
+/// Project one validated batch row onto the wire.
+///
+/// Every field is re-validated by the protocol's own constructor rather than
+/// trusted through: the registry validated it against its grammar, and this
+/// validates it against the wire's, which is the one a client will decode under.
+/// A row the wire cannot carry is a typed daemon failure rather than a row
+/// silently omitted from a page.
+fn batch_record(record: &BatchRecord) -> Result<BatchRecordView, DaemonError> {
+    use automonique_protocol::primitives::EpochMillis;
+
+    BatchRecordView::new(
+        checked_row_id(record.entry_id)?,
+        BatchId::new(&record.batch_id)
+            .map_err(|_| DaemonError::BatchRegistryFailed("batch_id_ungrammatical"))?,
+        record
+            .label
+            .as_deref()
+            .map(BatchLabel::new)
+            .transpose()
+            .map_err(|_| DaemonError::BatchRegistryFailed("label_ungrammatical"))?,
+        concurrency_policy(record.concurrency),
+        EpochMillis::from_millis(record.created_at_ms),
+        record.revision,
+    )
+    .map_err(batch_refused)
+}
+
+/// Project one validated member row onto the wire.
+fn member_view(record: &MemberRecord) -> Result<MemberView, DaemonError> {
+    use automonique_protocol::primitives::EpochMillis;
+
+    MemberView::new(
+        BatchMemberKey::new(&record.member_key)
+            .map_err(|_| DaemonError::BatchRegistryFailed("member_key_ungrammatical"))?,
+        record.ordinal,
+        member_progress(record.progress),
+        record.last_sequence,
+        record.revision,
+        EpochMillis::from_millis(record.updated_at_ms),
+    )
+    .map_err(batch_refused)
+}
+
+/// Answer one batch-registry failure to the client, or report it as ours.
+///
+/// The same split the approval ledger gets: a malformed field, a duplicate
+/// identity, an empty or over-large membership, a repeated member, an incoherent
+/// concurrency ceiling, an unknown batch or member, an illegal transition, an
+/// incoherent or regressing sequence, a lost cursor and a full registry are the
+/// operator's to fix and are answered with one closed word carrying no echo of
+/// what they sent. Corruption, a schema mismatch, an unsafe path and storage
+/// failure are *ours* — they say the daemon's own durable state is unsound — and
+/// presenting them as a refusal would blame an operator for our broken database.
+///
+/// [`BatchRegistryError::RevisionMismatch`] never reaches here: it is the
+/// `conflict` answer, handled at the call site before this function is asked.
+///
+/// [`BatchRegistryError::NotFound`] names the entity the registry failed to
+/// find, and the registry looks the batch up first: anything that is not the
+/// member is the batch.
+fn refuse_batch(
+    request_id: &RequestId,
+    error: &BatchRegistryError,
+) -> Result<BatchResponse, DaemonError> {
+    let refusal = match error {
+        BatchRegistryError::InvalidField(_) => BatchRefusal::InvalidField,
+        BatchRegistryError::AlreadyRegistered { .. } => BatchRefusal::AlreadyRegistered,
+        BatchRegistryError::EmptyBatch => BatchRefusal::EmptyBatch,
+        BatchRegistryError::TooManyMembers { .. } => BatchRefusal::TooManyMembers,
+        BatchRegistryError::DuplicateMember { .. } => BatchRefusal::DuplicateMember,
+        BatchRegistryError::ConcurrencyCeilingZero
+        | BatchRegistryError::ConcurrencyCeilingUnreachable { .. } => {
+            BatchRefusal::ConcurrencyCeiling
+        }
+        BatchRegistryError::NotFound("batch member") => BatchRefusal::UnknownMember,
+        BatchRegistryError::NotFound(_) => BatchRefusal::UnknownBatch,
+        BatchRegistryError::IllegalTransition { .. } => BatchRefusal::IllegalTransition,
+        BatchRegistryError::SequenceCoupling { .. } => BatchRefusal::SequenceCoupling,
+        BatchRegistryError::SequenceRegression { .. } => BatchRefusal::SequenceRegression,
+        BatchRegistryError::CursorOutOfRange { .. } => BatchRefusal::CursorOutOfRange,
+        BatchRegistryError::RegistryFull { .. } => BatchRefusal::RegistryFull,
+        BatchRegistryError::RevisionMismatch { .. }
+        | BatchRegistryError::InsecurePath(_)
+        | BatchRegistryError::SchemaVersion { .. }
+        | BatchRegistryError::Corrupt(_)
+        | BatchRegistryError::Io(_)
+        | BatchRegistryError::Sqlite(_) => {
+            return Err(DaemonError::BatchRegistryFailed(error.category()));
+        }
+    };
+    Ok(BatchResponse::Refused {
         request_id: request_id.clone(),
         refusal,
     })

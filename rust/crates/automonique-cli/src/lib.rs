@@ -14,6 +14,7 @@ mod admin_client;
 mod approval;
 mod attempt;
 mod automation;
+mod batch;
 mod diagnostics;
 mod kernel;
 mod release;
@@ -42,7 +43,7 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
-const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique automation register <automation-id> <actor>\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique shutdown\n";
+const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique automation register <automation-id> <actor>\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique batch register <batch-id> [--label <label>] [--sequential | --parallel <ceiling>] <member-key>...\n       automonique batch advance <batch-id> <member-key> <revision> <state> <last-sequence>\n       automonique batch list [--cursor <entry-id>] [--page <size>]\n       automonique batch detail <batch-id>\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique shutdown\n";
 
 #[derive(Clone)]
 enum Command {
@@ -85,6 +86,7 @@ enum Command {
     Runs(runs::Operation),
     Automation(automation::Operation),
     Approval(approval::Operation),
+    Batch(batch::Operation),
 }
 
 /// Execute one closed product command. Arguments exclude the program name.
@@ -309,6 +311,44 @@ where
                 }
             }
         }
+        // `batch` is variadic for the reason `approval` is, and one degree more:
+        // `register` takes optional flags *and* a whole membership after them,
+        // so its arity is unbounded below one member. The remaining words are
+        // collected here and matched by the verb they belong to; `register`
+        // hands its own words on for the flag-and-membership split, which is
+        // that verb's grammar rather than this dispatch's.
+        (Some(command), Some(action), second, third) if command == "batch" => {
+            let words: Vec<OsString> = second
+                .into_iter()
+                .chain(third)
+                .chain(arguments.by_ref())
+                .collect();
+            match (action.to_str(), words.as_slice()) {
+                (Some("list"), _) => Command::Batch(batch::Operation::List { flags: words }),
+                (Some("detail"), [batch_id]) => Command::Batch(batch::Operation::Detail {
+                    batch_id: batch_id.clone(),
+                }),
+                (Some("register"), [batch_id, rest @ ..]) => {
+                    Command::Batch(batch::Operation::Register {
+                        batch_id: batch_id.clone(),
+                        words: rest.to_vec(),
+                    })
+                }
+                (Some("advance"), [batch_id, member_key, revision, state, last_sequence]) => {
+                    Command::Batch(batch::Operation::Advance {
+                        batch_id: batch_id.clone(),
+                        member_key: member_key.clone(),
+                        revision: revision.clone(),
+                        state: state.clone(),
+                        last_sequence: last_sequence.clone(),
+                    })
+                }
+                _ => {
+                    let _ = stderr.write_all(USAGE.as_bytes());
+                    return 2;
+                }
+            }
+        }
         (Some(command), Some(operation), Some(socket_path), None)
             if command == "attempt" && operation == "heartbeat" =>
         {
@@ -431,6 +471,9 @@ where
         }
         Command::Approval(operation) => {
             return approval::run(&operation, runtime.as_deref(), &mut stdout, &mut stderr);
+        }
+        Command::Batch(operation) => {
+            return batch::run(&operation, runtime.as_deref(), &mut stdout, &mut stderr);
         }
         Command::Shutdown => {
             return admin_shutdown(runtime.as_deref(), &mut stdout, &mut stderr);
