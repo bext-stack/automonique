@@ -25,6 +25,7 @@ pub mod host;
 pub mod identity;
 pub mod interaction;
 pub mod journal;
+pub mod memory_api;
 pub mod models;
 pub mod namespace;
 pub mod primitives;
