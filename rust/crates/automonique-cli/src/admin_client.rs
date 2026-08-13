@@ -318,8 +318,9 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     use automonique_protocol::admin::{
-        AdminInstanceId, AdminResponse, DaemonState, DaemonStatus, OperationalMetric,
-        OperationalStatus, OperationalStatusParts, SyntheticSubmission,
+        AdminInstanceId, AdminResponse, DaemonState, DaemonStatus, DurableStateCounts,
+        DurableStateCountsParts, OperationalMetric, OperationalStatus, OperationalStatusParts,
+        SyntheticSubmission,
     };
 
     #[test]
@@ -370,6 +371,21 @@ mod tests {
                         sandbox_launch_refusals: OperationalMetric::Unavailable,
                     })
                     .expect("operational"),
+                )
+            })
+            .and_then(|status| {
+                status.with_durable_state(
+                    DurableStateCounts::new(DurableStateCountsParts {
+                        approvals_recorded: OperationalMetric::Measured(0),
+                        automations_registered: OperationalMetric::Measured(0),
+                        // The generation above is one, and the tenure open over
+                        // it has to say the same.
+                        open_tenure_epoch: OperationalMetric::Measured(1),
+                        open_tenures: OperationalMetric::Measured(1),
+                        runs_registered: OperationalMetric::Measured(0),
+                        tenures_recorded: OperationalMetric::Measured(1),
+                    })
+                    .expect("durable counts"),
                 )
             })
             .expect("status");

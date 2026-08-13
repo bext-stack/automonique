@@ -14,8 +14,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use automonique_protocol::admin::{
-    AdminInstanceId, AdminResponse, DaemonState, DaemonStatus, MAX_ADMIN_CANONICAL_BYTES,
-    MAX_INSTANCE_ID_BYTES, OperationalMetric, OperationalStatus, OperationalStatusParts,
+    AdminInstanceId, AdminResponse, DaemonState, DaemonStatus, DurableStateCounts,
+    DurableStateCountsParts, MAX_ADMIN_CANONICAL_BYTES, MAX_INSTANCE_ID_BYTES, OperationalMetric,
+    OperationalStatus, OperationalStatusParts,
 };
 use automonique_protocol::codec::RequestId;
 use automonique_protocol::codegen::{SpikeSchema, emit_typescript, hostile_slice};
@@ -713,7 +714,21 @@ fn encoded_status() -> Message {
         })
         .expect("valid projection"),
     )
-    .expect("coherent snapshot");
+    .expect("coherent snapshot")
+    .with_durable_state(
+        DurableStateCounts::new(DurableStateCountsParts {
+            approvals_recorded: OperationalMetric::Measured(2),
+            automations_registered: OperationalMetric::Measured(1),
+            // The epoch is this snapshot's own generation, which is what the
+            // status carries above; any other number is refused.
+            open_tenure_epoch: OperationalMetric::Measured(7),
+            open_tenures: OperationalMetric::Measured(1),
+            runs_registered: OperationalMetric::Measured(3),
+            tenures_recorded: OperationalMetric::Unavailable,
+        })
+        .expect("coherent durable counts"),
+    )
+    .expect("coherent tenure observation");
     AdminResponse::Status {
         request_id: RequestId::new("req-codegen-1").expect("valid request ID"),
         status,
@@ -1103,6 +1118,20 @@ mod maintained_surface {
             "the generated OperationalStatus field set is not what the admin encoder writes; \
              regenerate with: {REGENERATE_COMMAND}"
         );
+
+        let Some(JsonValue::Object(durable_state)) = body
+            .iter()
+            .find(|(name, _)| name == "durable_state")
+            .map(|(_, value)| value.clone())
+        else {
+            panic!("the status body carries the durable-state counts");
+        };
+        assert_eq!(
+            generated_fields(&admin, "DurableStateCounts"),
+            keys(&durable_state),
+            "the generated DurableStateCounts field set is not what the admin encoder writes; \
+             regenerate with: {REGENERATE_COMMAND}"
+        );
     }
 
     /// Present-and-null is not the same fact as absent, and the status body
@@ -1117,6 +1146,17 @@ mod maintained_surface {
         assert!(
             admin.contains("  readonly operational: OperationalStatus;"),
             "the operational projection is required on the wire, not nullable"
+        );
+        assert!(
+            admin.contains("  readonly durable_state: DurableStateCounts;"),
+            "the durable-state counts are required on the wire, not nullable"
+        );
+        // A count that could not be read is `unavailable` inside the metric
+        // union, never a missing or null field: the absence is carried by the
+        // value, so a reader cannot mistake it for a store holding nothing.
+        assert!(
+            admin.contains("  readonly runs_registered: OperationalMetric;"),
+            "a durable count must carry its own unavailability, not be omitted"
         );
         assert!(
             !admin.contains("?:"),

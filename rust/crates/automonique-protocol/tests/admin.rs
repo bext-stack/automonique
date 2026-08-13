@@ -3,12 +3,13 @@
 use automonique_protocol::admin::{
     ADMIN_PROTOCOL, AdminCommand, AdminError, AdminInstanceId, AdminOutboxEvidence,
     AdminOutboxEvidenceParts, AdminReconciliationEvidence, AdminRefusalCategory, AdminRequest,
-    AdminResponse, DaemonState, DaemonStatus, IntakePause, IntakeResume, MAX_ADMIN_CANONICAL_BYTES,
-    MAX_INSTANCE_ID_BYTES, MAX_INTAKE_ACTOR_BYTES, MAX_INTAKE_REASON_BYTES,
-    MAX_RUN_SUBMISSION_KEY_BYTES, MAX_SUBMITTED_RUN_SPEC_BYTES, MAX_SYNTHETIC_KEY_BYTES,
-    MAX_SYNTHETIC_SCOPE_BYTES, MAX_SYNTHETIC_TASK_BYTES, OperationalMetric, OperationalStatus,
-    OperationalStatusParts, OutboxReconciliation, OutboxReconciliationDecision,
-    OutboxReconciliationParts, ReconciliationFailure, SubmittedRunSpec, SyntheticSubmission,
+    AdminResponse, DaemonState, DaemonStatus, DurableStateCounts, DurableStateCountsParts,
+    IntakePause, IntakeResume, MAX_ADMIN_CANONICAL_BYTES, MAX_INSTANCE_ID_BYTES,
+    MAX_INTAKE_ACTOR_BYTES, MAX_INTAKE_REASON_BYTES, MAX_RUN_SUBMISSION_KEY_BYTES,
+    MAX_SUBMITTED_RUN_SPEC_BYTES, MAX_SYNTHETIC_KEY_BYTES, MAX_SYNTHETIC_SCOPE_BYTES,
+    MAX_SYNTHETIC_TASK_BYTES, OperationalMetric, OperationalStatus, OperationalStatusParts,
+    OutboxReconciliation, OutboxReconciliationDecision, OutboxReconciliationParts,
+    ReconciliationFailure, SubmittedRunSpec, SyntheticSubmission,
 };
 use automonique_protocol::codec::{CodecError, FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_protocol::digest::Sha256;
@@ -196,7 +197,17 @@ fn status() -> DaemonStatus {
             .expect("operational status"),
         )
     })
+    .and_then(|status| status.with_durable_state(durable_state()))
     .expect("wire-representable status")
+}
+
+/// The durable counts a complete status carries, with one store unreadable.
+///
+/// `tenures_recorded` is [`OperationalMetric::Unavailable`] on purpose: the
+/// fixture every status test shares must exercise both arms of the metric, or
+/// the unavailable arm would only ever be encoded by the test that asks for it.
+fn durable_state() -> DurableStateCounts {
+    DurableStateCounts::new(parts()).expect("coherent durable counts")
 }
 
 #[test]
@@ -323,6 +334,278 @@ fn status_response_is_exact_and_round_trips() {
         operational.provider_available(),
         OperationalMetric::Unavailable
     );
+    let durable = status.durable_state().expect("durable-state counts");
+    assert_eq!(durable.runs_registered(), OperationalMetric::Measured(2));
+    assert_eq!(durable.approvals_recorded(), OperationalMetric::Measured(4));
+    // Zero automations is a measurement, and it survives the wire as one.
+    assert_eq!(
+        durable.automations_registered(),
+        OperationalMetric::Measured(0)
+    );
+    assert_eq!(durable.open_tenures(), OperationalMetric::Measured(1));
+    assert_eq!(durable.open_tenure_epoch(), OperationalMetric::Measured(7));
+    assert_eq!(durable.tenures_recorded(), OperationalMetric::Unavailable);
+}
+
+/// An unread store and an empty store are different facts, and stay different
+/// after a round trip.
+///
+/// The whole point of spending a union on a count is that `Measured(0)` and
+/// `Unavailable` never collapse into each other. This asserts it where it would
+/// actually be lost: on the wire, in both directions, and in the bytes.
+#[test]
+fn an_unavailable_count_never_decodes_as_a_measured_zero() {
+    let unread = |counts: DurableStateCounts| {
+        let response = AdminResponse::Status {
+            request_id: request_id(),
+            status: status()
+                .with_durable_state(counts)
+                .expect("coherent tenure observation"),
+        };
+        let payload = response
+            .to_message()
+            .expect("known literals")
+            .to_canonical_bytes();
+        let AdminResponse::Status { status, .. } =
+            AdminResponse::from_canonical_bytes(&payload).expect("admitted response")
+        else {
+            panic!("wrong response variant")
+        };
+        (
+            String::from_utf8(payload).expect("canonical UTF-8"),
+            status
+                .durable_state()
+                .expect("durable-state counts")
+                .runs_registered(),
+        )
+    };
+
+    let (unavailable_bytes, unavailable) = unread(
+        DurableStateCounts::new(DurableStateCountsParts {
+            runs_registered: OperationalMetric::Unavailable,
+            ..parts()
+        })
+        .expect("coherent counts"),
+    );
+    let (measured_bytes, measured) = unread(
+        DurableStateCounts::new(DurableStateCountsParts {
+            runs_registered: OperationalMetric::Measured(0),
+            ..parts()
+        })
+        .expect("coherent counts"),
+    );
+
+    assert_eq!(unavailable, OperationalMetric::Unavailable);
+    assert_eq!(measured, OperationalMetric::Measured(0));
+    assert_ne!(unavailable, measured);
+    assert_ne!(
+        unavailable_bytes, measured_bytes,
+        "an unread store and an empty store must not encode to the same bytes"
+    );
+    assert!(
+        unavailable_bytes.contains(r#""runs_registered":{"state":"unavailable","value":null}"#)
+    );
+    assert!(
+        measured_bytes.contains(r#""runs_registered":{"state":"measured","value":0}"#),
+        "a measured zero must stay a measurement"
+    );
+    assert_eq!(unavailable.value(), None);
+    assert_eq!(measured.value(), Some(0));
+}
+
+/// Every durable count is named in the decoder's field set, so a field the
+/// encoder writes and the decoder forgot refuses instead of being dropped.
+#[test]
+fn a_durable_count_missing_from_the_status_body_refuses_the_whole_decode() {
+    let payload = String::from_utf8(
+        AdminResponse::Status {
+            request_id: request_id(),
+            status: status(),
+        }
+        .to_message()
+        .expect("known literals")
+        .to_canonical_bytes(),
+    )
+    .expect("canonical UTF-8");
+
+    // Each replacement keeps the key's length and its place in the canonical
+    // key order, so the body stays canonical JSON of the same size and the only
+    // thing wrong with it is the name. A missing field caught by a length check
+    // would prove much less.
+    for (field, renamed_to) in [
+        ("approvals_recorded", "approvals_recordex"),
+        ("automations_registered", "automations_registerex"),
+        ("open_tenure_epoch", "open_tenure_epocx"),
+        ("open_tenures", "open_tenurex"),
+        ("runs_registered", "runs_registerex"),
+        ("tenures_recorded", "tenures_recordex"),
+    ] {
+        let renamed = payload.replacen(&format!("\"{field}\""), &format!("\"{renamed_to}\""), 1);
+        assert_ne!(renamed, payload, "the body never carried {field}");
+        assert_eq!(renamed.len(), payload.len(), "the rename resized the body");
+        assert_eq!(
+            AdminResponse::from_canonical_bytes(renamed.as_bytes())
+                .expect_err("a renamed durable count must refuse"),
+            AdminError::InvalidBody,
+            "{field} was decoded without being required"
+        );
+    }
+
+    // The whole sub-object is required, not merely its contents. `durable_stat`
+    // sorts where `durable_state` did, between `accepting_intake` and
+    // `event_cursor`, so this too is a well-formed body missing one name.
+    let without = payload.replacen("\"durable_state\"", "\"durable_statx\"", 1);
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(without.as_bytes())
+            .expect_err("status without durable counts must refuse"),
+        AdminError::InvalidBody
+    );
+}
+
+/// A tenure observation that contradicts itself, or the generation it sits
+/// beside, is refused on construction and on decode.
+#[test]
+fn an_incoherent_tenure_observation_is_refused_both_ways() {
+    for (open_tenures, open_tenure_epoch, why) in [
+        (
+            OperationalMetric::Measured(0),
+            OperationalMetric::Measured(7),
+            "an epoch with no open tenure belongs to nothing",
+        ),
+        (
+            OperationalMetric::Measured(1),
+            OperationalMetric::Unavailable,
+            "a tenure read without its epoch was not read",
+        ),
+        (
+            OperationalMetric::Unavailable,
+            OperationalMetric::Measured(7),
+            "an unread audit cannot produce an epoch",
+        ),
+        (
+            OperationalMetric::Measured(2),
+            OperationalMetric::Measured(7),
+            "a generation has at most one open tenure",
+        ),
+        (
+            OperationalMetric::Measured(1),
+            OperationalMetric::Measured(0),
+            "no lease is ever held at epoch zero",
+        ),
+    ] {
+        assert_eq!(
+            DurableStateCounts::new(DurableStateCountsParts {
+                open_tenures,
+                open_tenure_epoch,
+                ..parts()
+            })
+            .expect_err(why),
+            AdminError::InvalidBody,
+            "{why}"
+        );
+    }
+
+    // Coherent on its own, and still wrong beside a status: the fixture's
+    // generation is seven, so a tenure open at six says the lease and the audit
+    // describe different histories.
+    let disagreeing = DurableStateCounts::new(DurableStateCountsParts {
+        open_tenures: OperationalMetric::Measured(1),
+        open_tenure_epoch: OperationalMetric::Measured(6),
+        ..parts()
+    })
+    .expect("coherent in isolation");
+    assert_eq!(
+        status()
+            .with_durable_state(disagreeing)
+            .expect_err("the audit and the lease must agree on the generation"),
+        AdminError::InvalidBody
+    );
+
+    let payload = String::from_utf8(
+        AdminResponse::Status {
+            request_id: request_id(),
+            status: status(),
+        }
+        .to_message()
+        .expect("known literals")
+        .to_canonical_bytes(),
+    )
+    .expect("canonical UTF-8");
+    let regressed = payload.replacen(
+        r#""open_tenure_epoch":{"state":"measured","value":7}"#,
+        r#""open_tenure_epoch":{"state":"measured","value":6}"#,
+        1,
+    );
+    assert_ne!(regressed, payload, "the fixture lost its tenure epoch");
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(regressed.as_bytes())
+            .expect_err("a status cannot carry a tenure from another generation"),
+        AdminError::InvalidBody
+    );
+}
+
+/// A status that never counted its stores cannot be encoded at all.
+///
+/// The counts are not an optional embellishment a daemon may skip when a store
+/// is inconvenient: skipping is what [`OperationalMetric::Unavailable`] is for.
+/// A snapshot that carries neither has said nothing about its durable state,
+/// and it fails closed rather than reaching a client as a status with a hole.
+#[test]
+fn status_without_durable_counts_cannot_be_encoded() {
+    let status = DaemonStatus::new(
+        AdminInstanceId::new("daemon-without-counts").expect("instance"),
+        DaemonState::Ready,
+        1,
+        1,
+        0,
+        0,
+        0,
+        true,
+    )
+    .and_then(|status| {
+        status.with_operational(
+            OperationalStatus::new(OperationalStatusParts {
+                observed_ms: 1,
+                reconciliation_pending: 0,
+                outbox_pending_ready: 0,
+                outbox_pending_delayed: 0,
+                outbox_in_flight_live: 0,
+                outbox_in_flight_ambiguous: 0,
+                outbox_delivered: 0,
+                outbox_dead_lettered: 0,
+                outbox_oldest_ready_age_ms: 0,
+                telegram_pollers_live: 0,
+                telegram_pollers_expired: 0,
+                telegram_offset_lag: OperationalMetric::Unavailable,
+                provider_available: OperationalMetric::Unavailable,
+                sandbox_launch_refusals: OperationalMetric::Unavailable,
+            })
+            .expect("operational status"),
+        )
+    })
+    .expect("complete but for the counts");
+    assert_eq!(status.durable_state(), None);
+    assert_eq!(
+        AdminResponse::Status {
+            request_id: request_id(),
+            status,
+        }
+        .to_message()
+        .expect_err("missing durable counts must fail closed"),
+        AdminError::InvalidBody
+    );
+}
+
+/// The coherent counts the tests above vary one field of.
+fn parts() -> DurableStateCountsParts {
+    DurableStateCountsParts {
+        approvals_recorded: OperationalMetric::Measured(4),
+        automations_registered: OperationalMetric::Measured(0),
+        open_tenure_epoch: OperationalMetric::Measured(7),
+        open_tenures: OperationalMetric::Measured(1),
+        runs_registered: OperationalMetric::Measured(2),
+        tenures_recorded: OperationalMetric::Unavailable,
+    }
 }
 
 #[test]
@@ -337,7 +620,18 @@ fn status_without_a_real_operational_projection_cannot_be_encoded() {
         0,
         true,
     )
-    .expect("base status");
+    .expect("base status")
+    // Everything else this snapshot owes the wire is present, so the refusal
+    // below can only be the missing projection.
+    .with_durable_state(
+        DurableStateCounts::new(DurableStateCountsParts {
+            open_tenures: OperationalMetric::Measured(0),
+            open_tenure_epoch: OperationalMetric::Unavailable,
+            ..parts()
+        })
+        .expect("coherent counts"),
+    )
+    .expect("no tenure to disagree with");
     assert_eq!(status.operational(), None);
     assert_eq!(
         AdminResponse::Status {
@@ -874,6 +1168,7 @@ fn paused_status() -> DaemonStatus {
             .expect("operational status"),
         )
     })
+    .and_then(|status| status.with_durable_state(durable_state()))
     .expect("wire-representable paused status")
 }
 

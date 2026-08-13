@@ -1657,6 +1657,7 @@ pub struct DaemonStatus {
     telegram_poller_epoch: Option<u64>,
     execution_state: ExecutionState,
     operational: Option<OperationalStatus>,
+    durable_state: Option<DurableStateCounts>,
 }
 
 /// A bounded operational value that never substitutes zero for missing evidence.
@@ -1975,6 +1976,178 @@ impl OperationalStatus {
     }
 }
 
+/// The durable state a daemon is holding, counted rather than assumed.
+///
+/// # Each field is one read of one store
+///
+/// These stores are separate databases and this build opens no transaction
+/// across them, so two counts here may straddle a write that landed between
+/// them. The projection in [`OperationalStatus`] is a different kind of value —
+/// it comes from one status transaction over the main database — and the two
+/// are deliberately not merged, because presenting them together would claim an
+/// atomicity that does not exist.
+///
+/// # Why every field is an [`OperationalMetric`]
+///
+/// A store this daemon could not count reports
+/// [`OperationalMetric::Unavailable`]. It never reports zero: zero is a fact an
+/// operator would act on — nothing was registered, nothing to reconcile — and
+/// "the count could not be read" is the absence of any fact at all. Substituting
+/// one for the other is how a status starts lying about the state it exists to
+/// describe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableStateCounts {
+    approvals_recorded: OperationalMetric,
+    automations_registered: OperationalMetric,
+    open_tenure_epoch: OperationalMetric,
+    open_tenures: OperationalMetric,
+    runs_registered: OperationalMetric,
+    tenures_recorded: OperationalMetric,
+}
+
+/// Named constructor inputs for [`DurableStateCounts`].
+pub struct DurableStateCountsParts {
+    /// Decisions in the approval ledger.
+    pub approvals_recorded: OperationalMetric,
+    /// Automations in the registry, in every enablement state.
+    pub automations_registered: OperationalMetric,
+    /// Lease epoch of the open tenure, when there is one to read.
+    pub open_tenure_epoch: OperationalMetric,
+    /// Open tenure rows for this daemon's generation: zero or one.
+    pub open_tenures: OperationalMetric,
+    /// Rows in the run index, one per accepted run submission.
+    pub runs_registered: OperationalMetric,
+    /// Tenures the generation audit has recorded, open and closed alike.
+    pub tenures_recorded: OperationalMetric,
+}
+
+impl DurableStateCounts {
+    /// Construct the counts, refusing a tenure observation that contradicts
+    /// itself.
+    ///
+    /// A generation has at most one open tenure row, and an epoch is evidence
+    /// only when that row was actually read. The three coherent readings are
+    /// therefore: one open tenure at a measured epoch; no open tenure and no
+    /// epoch; and an audit that could not be read, which measures neither. An
+    /// epoch beside "no open tenure" would be an epoch belonging to nothing,
+    /// and a measured open tenure with no epoch would be a row this daemon
+    /// claims to have read without reading the one field that identifies it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::InvalidBody`] for any other pairing, including
+    /// more than one open tenure and an open tenure at epoch zero, which no
+    /// lease ever holds.
+    pub fn new(parts: DurableStateCountsParts) -> Result<Self, AdminError> {
+        if !matches!(
+            (parts.open_tenures, parts.open_tenure_epoch),
+            (
+                OperationalMetric::Measured(1),
+                OperationalMetric::Measured(1..)
+            ) | (
+                OperationalMetric::Measured(0) | OperationalMetric::Unavailable,
+                OperationalMetric::Unavailable
+            )
+        ) {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self {
+            approvals_recorded: parts.approvals_recorded,
+            automations_registered: parts.automations_registered,
+            open_tenure_epoch: parts.open_tenure_epoch,
+            open_tenures: parts.open_tenures,
+            runs_registered: parts.runs_registered,
+            tenures_recorded: parts.tenures_recorded,
+        })
+    }
+
+    /// Decisions the approval ledger holds.
+    #[must_use]
+    pub const fn approvals_recorded(&self) -> OperationalMetric {
+        self.approvals_recorded
+    }
+
+    /// Automations the registry holds, in every enablement state.
+    #[must_use]
+    pub const fn automations_registered(&self) -> OperationalMetric {
+        self.automations_registered
+    }
+
+    /// Lease epoch of the open tenure, and [`OperationalMetric::Unavailable`]
+    /// when no tenure is open or the audit could not be read.
+    #[must_use]
+    pub const fn open_tenure_epoch(&self) -> OperationalMetric {
+        self.open_tenure_epoch
+    }
+
+    /// Open tenure rows for this generation: zero or one.
+    #[must_use]
+    pub const fn open_tenures(&self) -> OperationalMetric {
+        self.open_tenures
+    }
+
+    /// Rows in the run index, one per accepted run submission.
+    #[must_use]
+    pub const fn runs_registered(&self) -> OperationalMetric {
+        self.runs_registered
+    }
+
+    /// Tenures the generation audit has recorded, open and closed alike.
+    #[must_use]
+    pub const fn tenures_recorded(&self) -> OperationalMetric {
+        self.tenures_recorded
+    }
+
+    fn to_body(&self) -> Result<JsonValue, AdminError> {
+        Ok(JsonValue::Object(vec![
+            (
+                "approvals_recorded".to_owned(),
+                self.approvals_recorded.to_body()?,
+            ),
+            (
+                "automations_registered".to_owned(),
+                self.automations_registered.to_body()?,
+            ),
+            (
+                "open_tenure_epoch".to_owned(),
+                self.open_tenure_epoch.to_body()?,
+            ),
+            ("open_tenures".to_owned(), self.open_tenures.to_body()?),
+            (
+                "runs_registered".to_owned(),
+                self.runs_registered.to_body()?,
+            ),
+            (
+                "tenures_recorded".to_owned(),
+                self.tenures_recorded.to_body()?,
+            ),
+        ]))
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        const FIELDS: [&str; 6] = [
+            "approvals_recorded",
+            "automations_registered",
+            "open_tenure_epoch",
+            "open_tenures",
+            "runs_registered",
+            "tenures_recorded",
+        ];
+        exact_fields(body, &FIELDS)?;
+        let metric = |field: &str| -> Result<OperationalMetric, AdminError> {
+            OperationalMetric::from_body(body.get(field).ok_or(AdminError::InvalidBody)?)
+        };
+        Self::new(DurableStateCountsParts {
+            approvals_recorded: metric("approvals_recorded")?,
+            automations_registered: metric("automations_registered")?,
+            open_tenure_epoch: metric("open_tenure_epoch")?,
+            open_tenures: metric("open_tenures")?,
+            runs_registered: metric("runs_registered")?,
+            tenures_recorded: metric("tenures_recorded")?,
+        })
+    }
+}
+
 impl DaemonStatus {
     /// Construct a snapshot, refusing counters the integer-only wire cannot carry.
     ///
@@ -2016,6 +2189,7 @@ impl DaemonStatus {
             telegram_poller_epoch: None,
             execution_state: ExecutionState::SandboxUnavailableNoLane,
             operational: None,
+            durable_state: None,
         })
     }
 
@@ -2088,6 +2262,41 @@ impl DaemonStatus {
             return Err(AdminError::InvalidBody);
         }
         self.operational = Some(operational);
+        Ok(self)
+    }
+
+    /// Attach the durable-state counts read while answering this status.
+    ///
+    /// The one cross-check available here is the tenure: a measured open-tenure
+    /// epoch is a claim about the same generation [`Self::generation`] reports,
+    /// so the two must be the same number. They come from different databases —
+    /// the lease from the main store, the tenure from the audit log — and a
+    /// disagreement between them means those files describe different histories
+    /// of this generation. That is refused rather than reported, for the reason
+    /// [`Self::with_operational`] refuses its own contradictions: a client
+    /// cannot be expected to arbitrate which of two durable records is the
+    /// authority.
+    ///
+    /// The counts themselves are cross-checked against nothing, and deliberately
+    /// so. Nothing in this build relates the run index, the automation registry
+    /// or the approval ledger to each other or to the queue depths above, and an
+    /// invented relation would refuse ordinary states.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::InvalidBody`] for a measured open-tenure epoch that
+    /// is not this snapshot's generation.
+    pub fn with_durable_state(
+        mut self,
+        durable_state: DurableStateCounts,
+    ) -> Result<Self, AdminError> {
+        if matches!(
+            durable_state.open_tenure_epoch,
+            OperationalMetric::Measured(epoch) if epoch != self.generation
+        ) {
+            return Err(AdminError::InvalidBody);
+        }
+        self.durable_state = Some(durable_state);
         Ok(self)
     }
 
@@ -2170,11 +2379,25 @@ impl DaemonStatus {
         self.operational.as_ref()
     }
 
+    /// The durable-state counts, absent only on a snapshot that was never
+    /// completed and therefore cannot be encoded.
+    #[must_use]
+    pub const fn durable_state(&self) -> Option<&DurableStateCounts> {
+        self.durable_state.as_ref()
+    }
+
     fn to_body(&self) -> Result<JsonValue, AdminError> {
         Ok(JsonValue::Object(vec![
             (
                 "accepting_intake".to_owned(),
                 JsonValue::Bool(self.accepting_intake),
+            ),
+            (
+                "durable_state".to_owned(),
+                self.durable_state
+                    .as_ref()
+                    .ok_or(AdminError::InvalidBody)?
+                    .to_body()?,
             ),
             (
                 "event_cursor".to_owned(),
@@ -2228,8 +2451,9 @@ impl DaemonStatus {
     }
 
     fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
-        const FIELDS: [&str; 13] = [
+        const FIELDS: [&str; 14] = [
             "accepting_intake",
+            "durable_state",
             "event_cursor",
             "execution_state",
             "generation",
@@ -2294,6 +2518,11 @@ impl DaemonStatus {
         .and_then(|status| {
             status.with_operational(OperationalStatus::from_body(
                 body.get("operational").ok_or(AdminError::InvalidBody)?,
+            )?)
+        })
+        .and_then(|status| {
+            status.with_durable_state(DurableStateCounts::from_body(
+                body.get("durable_state").ok_or(AdminError::InvalidBody)?,
             )?)
         })
     }

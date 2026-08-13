@@ -1941,6 +1941,22 @@ fn admin_status_module() -> GeneratedModule {
         }],
         interfaces: vec![
             Interface {
+                name: "DurableStateCounts".to_owned(),
+                doc: "What the daemon's durable stores hold, counted while the status was \
+                      answered. Each field is one read of one store and they are not one \
+                      transaction; a store that could not be counted is `unavailable`, never \
+                      zero."
+                    .to_owned(),
+                fields: vec![
+                    required("approvals_recorded", "OperationalMetric"),
+                    required("automations_registered", "OperationalMetric"),
+                    required("open_tenure_epoch", "OperationalMetric"),
+                    required("open_tenures", "OperationalMetric"),
+                    required("runs_registered", "OperationalMetric"),
+                    required("tenures_recorded", "OperationalMetric"),
+                ],
+            },
+            Interface {
                 name: "OperationalStatus".to_owned(),
                 doc: "The low-cardinality projection observed in the same status transaction."
                     .to_owned(),
@@ -1963,11 +1979,12 @@ fn admin_status_module() -> GeneratedModule {
             },
             Interface {
                 name: "DaemonStatus".to_owned(),
-                doc: "One consistent snapshot. `operational` is always present; only \
-                      `telegram_poller_epoch` may be null."
+                doc: "One consistent snapshot. `operational` and `durable_state` are always \
+                      present; only `telegram_poller_epoch` may be null."
                     .to_owned(),
                 fields: vec![
                     required("accepting_intake", "boolean"),
+                    required("durable_state", "DurableStateCounts"),
                     counter("event_cursor"),
                     required("execution_state", "ExecutionState"),
                     counter("generation"),

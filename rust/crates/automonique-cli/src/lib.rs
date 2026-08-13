@@ -815,15 +815,34 @@ fn admin_status<W: Write, E: Write>(
         let _ = stderr.write_all(b"automonique status unavailable: response_mismatch\n");
         return 1;
     };
+    let Some(durable) = status.durable_state() else {
+        let _ = stderr.write_all(b"automonique status unavailable: response_mismatch\n");
+        return 1;
+    };
     let metric_json = |metric: automonique_protocol::admin::OperationalMetric| {
         serde_json::json!({
             "state": metric.state(),
             "value": metric.value(),
         })
     };
+    // A count nobody could read prints as a dash, not as zero: the human
+    // rendering owes the reader the same distinction the wire keeps.
+    let metric_text = |metric: automonique_protocol::admin::OperationalMetric| {
+        metric
+            .value()
+            .map_or_else(|| metric.state().to_owned(), |value| value.to_string())
+    };
     let rendered = if json {
         serde_json::json!({
             "accepting_intake": status.accepting_intake(),
+            "durable_state": {
+                "approvals_recorded": metric_json(durable.approvals_recorded()),
+                "automations_registered": metric_json(durable.automations_registered()),
+                "open_tenure_epoch": metric_json(durable.open_tenure_epoch()),
+                "open_tenures": metric_json(durable.open_tenures()),
+                "runs_registered": metric_json(durable.runs_registered()),
+                "tenures_recorded": metric_json(durable.tenures_recorded()),
+            },
             "event_cursor": status.event_cursor(),
             "execution_state": status.execution_state().as_str(),
             "generation": status.generation(),
@@ -856,7 +875,7 @@ fn admin_status<W: Write, E: Write>(
             + "\n"
     } else {
         format!(
-            "Automonique daemon: {}\ninstance: {}\ngeneration: {}\nevent cursor: {}\ninbox pending: {}\noutbox pending: {}\nrunning: {}\naccepting intake: {}\nintake paused: {}\nexecution: {}\ntelegram: {}\ntelegram poller epoch: {}\nobserved ms: {}\nreconciliation pending: {}\noutbox ready: {}\noutbox delayed: {}\noutbox live: {}\noutbox ambiguous: {}\noutbox delivered: {}\noutbox dead-lettered: {}\noutbox oldest ready age ms: {}\ntelegram pollers live: {}\ntelegram pollers expired: {}\ntelegram offset lag: {}\nprovider available: {}\nsandbox launch refusals: {}\n",
+            "Automonique daemon: {}\ninstance: {}\ngeneration: {}\nevent cursor: {}\ninbox pending: {}\noutbox pending: {}\nrunning: {}\naccepting intake: {}\nintake paused: {}\nexecution: {}\ntelegram: {}\ntelegram poller epoch: {}\nobserved ms: {}\nreconciliation pending: {}\noutbox ready: {}\noutbox delayed: {}\noutbox live: {}\noutbox ambiguous: {}\noutbox delivered: {}\noutbox dead-lettered: {}\noutbox oldest ready age ms: {}\ntelegram pollers live: {}\ntelegram pollers expired: {}\ntelegram offset lag: {}\nprovider available: {}\nsandbox launch refusals: {}\nruns registered: {}\nautomations registered: {}\napprovals recorded: {}\ntenures recorded: {}\nopen tenures: {}\nopen tenure epoch: {}\n",
             status.state().as_str(),
             status.instance_id().as_str(),
             status.generation(),
@@ -885,6 +904,12 @@ fn admin_status<W: Write, E: Write>(
             operational.telegram_offset_lag().state(),
             operational.provider_available().state(),
             operational.sandbox_launch_refusals().state(),
+            metric_text(durable.runs_registered()),
+            metric_text(durable.automations_registered()),
+            metric_text(durable.approvals_recorded()),
+            metric_text(durable.tenures_recorded()),
+            metric_text(durable.open_tenures()),
+            metric_text(durable.open_tenure_epoch()),
         )
     };
     if stdout.write_all(rendered.as_bytes()).is_err() {
@@ -1186,4 +1211,183 @@ fn render_human(report: &DoctorReportV1) -> String {
         output.push('\n');
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    use automonique_protocol::admin::{
+        AdminInstanceId, AdminRequest, AdminResponse, DaemonState, DaemonStatus,
+        DurableStateCounts, DurableStateCountsParts, OperationalMetric, OperationalStatus,
+        OperationalStatusParts,
+    };
+    use automonique_protocol::codec::encode_frame;
+
+    /// One fake daemon that answers a single status request with `counts`.
+    ///
+    /// The daemon crate proves what the real counts are; this proves the CLI
+    /// renders whatever it was handed, including a count no store could answer.
+    fn rendered(counts: DurableStateCounts, json: bool) -> String {
+        let runtime = tempfile::tempdir().expect("runtime");
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("runtime mode");
+        let product = runtime.path().join("automonique");
+        std::fs::create_dir(&product).expect("product runtime");
+        std::fs::set_permissions(&product, std::fs::Permissions::from_mode(0o700))
+            .expect("product mode");
+        let socket = product.join("admin.sock");
+        let listener = UnixListener::bind(&socket).expect("listener");
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .expect("socket mode");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut prefix = [0_u8; 4];
+            stream.read_exact(&mut prefix).expect("request prefix");
+            let mut body = vec![0_u8; u32::from_be_bytes(prefix) as usize];
+            stream.read_exact(&mut body).expect("request body");
+            let request = AdminRequest::from_canonical_bytes(&body).expect("typed request");
+            let status = DaemonStatus::new(
+                AdminInstanceId::new("render-daemon").expect("instance"),
+                DaemonState::Ready,
+                3,
+                1,
+                0,
+                0,
+                0,
+                true,
+            )
+            .and_then(|status| {
+                status.with_operational(
+                    OperationalStatus::new(OperationalStatusParts {
+                        observed_ms: 1,
+                        reconciliation_pending: 0,
+                        outbox_pending_ready: 0,
+                        outbox_pending_delayed: 0,
+                        outbox_in_flight_live: 0,
+                        outbox_in_flight_ambiguous: 0,
+                        outbox_delivered: 0,
+                        outbox_dead_lettered: 0,
+                        outbox_oldest_ready_age_ms: 0,
+                        telegram_pollers_live: 0,
+                        telegram_pollers_expired: 0,
+                        telegram_offset_lag: OperationalMetric::Unavailable,
+                        provider_available: OperationalMetric::Unavailable,
+                        sandbox_launch_refusals: OperationalMetric::Unavailable,
+                    })
+                    .expect("operational"),
+                )
+            })
+            .and_then(|status| status.with_durable_state(counts))
+            .expect("status");
+            let response = AdminResponse::Status {
+                request_id: request.request_id().clone(),
+                status,
+            }
+            .to_message()
+            .expect("response")
+            .to_canonical_bytes();
+            let mut frame = Vec::new();
+            encode_frame(&response, &mut frame).expect("frame");
+            stream.write_all(&frame).expect("write");
+        });
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = super::admin_status(
+            Some(runtime.path().as_os_str()),
+            json,
+            &mut stdout,
+            &mut stderr,
+        );
+        server.join().expect("server");
+        assert_eq!(
+            code,
+            0,
+            "status failed: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(stderr.is_empty(), "status wrote to stderr");
+        String::from_utf8(stdout).expect("UTF-8 rendering")
+    }
+
+    fn counts(runs: OperationalMetric) -> DurableStateCounts {
+        DurableStateCounts::new(DurableStateCountsParts {
+            approvals_recorded: OperationalMetric::Measured(5),
+            automations_registered: OperationalMetric::Measured(0),
+            open_tenure_epoch: OperationalMetric::Measured(3),
+            open_tenures: OperationalMetric::Measured(1),
+            runs_registered: runs,
+            tenures_recorded: OperationalMetric::Measured(2),
+        })
+        .expect("coherent counts")
+    }
+
+    #[test]
+    fn status_json_carries_every_durable_count_with_its_state() {
+        let rendered = rendered(counts(OperationalMetric::Measured(4)), true);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rendered).expect("status --json is JSON");
+        let durable = parsed
+            .get("durable_state")
+            .expect("durable counts are reported");
+        for (field, value) in [
+            ("approvals_recorded", 5),
+            ("automations_registered", 0),
+            ("open_tenure_epoch", 3),
+            ("open_tenures", 1),
+            ("runs_registered", 4),
+            ("tenures_recorded", 2),
+        ] {
+            let metric = durable.get(field).unwrap_or_else(|| panic!("{field}"));
+            assert_eq!(metric["state"], "measured", "{field}");
+            assert_eq!(metric["value"], value, "{field}");
+        }
+    }
+
+    /// The distinction the wire keeps must survive both renderings.
+    ///
+    /// A count nobody could read prints as `unavailable` and carries a null
+    /// value, where a store holding nothing prints `0`. Collapsing the two in
+    /// the rendering would undo the whole point of carrying them apart.
+    #[test]
+    fn an_unavailable_count_never_renders_as_zero() {
+        let json = rendered(counts(OperationalMetric::Unavailable), true);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("status --json is JSON");
+        let runs = &parsed["durable_state"]["runs_registered"];
+        assert_eq!(runs["state"], "unavailable");
+        assert!(runs["value"].is_null(), "an unread count has no value");
+        // The empty store beside it still reports its zero.
+        assert_eq!(
+            parsed["durable_state"]["automations_registered"]["value"],
+            0
+        );
+
+        let human = rendered(counts(OperationalMetric::Unavailable), false);
+        assert!(
+            human.contains("runs registered: unavailable\n"),
+            "human status hid an unreadable store:\n{human}"
+        );
+        assert!(
+            human.contains("automations registered: 0\n"),
+            "human status lost a measured zero:\n{human}"
+        );
+    }
+
+    #[test]
+    fn human_status_shows_every_durable_count() {
+        let human = rendered(counts(OperationalMetric::Measured(4)), false);
+        for line in [
+            "runs registered: 4\n",
+            "automations registered: 0\n",
+            "approvals recorded: 5\n",
+            "tenures recorded: 2\n",
+            "open tenures: 1\n",
+            "open tenure epoch: 3\n",
+        ] {
+            assert!(human.contains(line), "missing {line:?} in:\n{human}");
+        }
+    }
 }

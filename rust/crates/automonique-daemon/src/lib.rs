@@ -25,9 +25,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use automonique_observability::{MetricName, MetricValue, StoreProjection};
 use automonique_protocol::admin::{
     AdminInstanceId, AdminOutboxEvidence, AdminOutboxEvidenceParts, AdminReconciliationEvidence,
-    AdminRefusalCategory, AdminRequest, AdminResponse, DaemonState, DaemonStatus, LocalRequest,
-    MAX_ADMIN_CANONICAL_BYTES, OperationalMetric, OperationalStatus, OperationalStatusParts,
-    OutboxReconciliationDecision,
+    AdminRefusalCategory, AdminRequest, AdminResponse, DaemonState, DaemonStatus,
+    DurableStateCounts, DurableStateCountsParts, LocalRequest, MAX_ADMIN_CANONICAL_BYTES,
+    OperationalMetric, OperationalStatus, OperationalStatusParts, OutboxReconciliationDecision,
 };
 use automonique_protocol::approval_api::{
     ApprovalContinuation, ApprovalCursor, ApprovalDecision, ApprovalDisposition, ApprovalKey,
@@ -941,6 +941,60 @@ impl Daemon {
         }
     }
 
+    /// Count what this daemon durably holds, without letting a store that will
+    /// not answer take the status down with it.
+    ///
+    /// Every count is a real read of the store that owns it. None of them is
+    /// derived from another, cached, or defaulted: a store that refuses reports
+    /// [`OperationalMetric::Unavailable`], and the status is still answered.
+    /// That trade is the point of the metric type — an operator asking what a
+    /// daemon is holding is better served by five counts and one honest gap
+    /// than by a connection error — and it is safe here precisely because
+    /// nothing in this build *decides* anything from these numbers.
+    ///
+    /// The generation audit is read once for a question the other three do not
+    /// have: which tenure is open, and at which epoch. A row read without a
+    /// usable epoch is reported as no reading at all rather than as a tenure
+    /// whose identity is missing.
+    fn durable_state_counts(&self) -> Result<DurableStateCounts, DaemonError> {
+        let (open_tenures, open_tenure_epoch) = match self
+            .generation_audit
+            .latest_open(GENERATION_ID)
+            .map(|tenure| tenure.map(|tenure| tenure.lease_epoch))
+        {
+            Ok(Some(epoch)) => match OperationalMetric::measured(epoch) {
+                Ok(measured @ OperationalMetric::Measured(1..)) => {
+                    (OperationalMetric::Measured(1), measured)
+                }
+                // An epoch of zero or one the wire cannot carry is not an epoch
+                // this daemon can report, and a tenure without one is not
+                // evidence of anything.
+                _ => (
+                    OperationalMetric::Unavailable,
+                    OperationalMetric::Unavailable,
+                ),
+            },
+            // No open row is a reading, and zero is what it counted.
+            Ok(None) => (
+                OperationalMetric::Measured(0),
+                OperationalMetric::Unavailable,
+            ),
+            Err(_) => (
+                OperationalMetric::Unavailable,
+                OperationalMetric::Unavailable,
+            ),
+        };
+        DurableStateCounts::new(DurableStateCountsParts {
+            approvals_recorded: durable_count(self.approvals.decision_count()),
+            automations_registered: durable_count(self.automations.automation_count()),
+            open_tenure_epoch,
+            open_tenures,
+            runs_registered: durable_count(self.run_index.entry_count()),
+            tenures_recorded: durable_count(self.generation_audit.tenure_count()),
+        })
+        .map_err(|error| DaemonError::ProtocolRefused(error.category()))
+    }
+
     fn handle_admin(
         &mut self,
         stream: &mut UnixStream,
@@ -969,6 +1023,10 @@ impl Daemon {
                 let projection = StoreProjection::from_status(&snapshot)
                     .map_err(|_| DaemonError::ProtocolRefused("operational_projection"))?;
                 let operational = operational_status(&projection)?;
+                // Counted here, beside the projection, and not in it: these are
+                // reads of four other databases, and this daemon opens no
+                // transaction spanning them.
+                let durable_state = self.durable_state_counts()?;
                 let (telegram_state, telegram_poller_epoch) = self.telegram.status();
                 let status = DaemonStatus::new(
                     self.instance_id.clone(),
@@ -988,6 +1046,7 @@ impl Daemon {
                 .and_then(|status| status.with_telegram(telegram_state, telegram_poller_epoch))
                 .map(|status| status.with_execution(self.execution_state))
                 .and_then(|status| status.with_operational(operational))
+                .and_then(|status| status.with_durable_state(durable_state))
                 .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
                 AdminResponse::Status {
                     request_id: request.request_id().clone(),
@@ -2543,6 +2602,29 @@ fn snapshot_requires_reconciliation(snapshot: &StatusSnapshot) -> bool {
     snapshot.runs_reconciliation_pending() > 0 || snapshot.outbox_in_flight_ambiguous() > 0
 }
 
+/// One durable count, or the honest absence of one.
+///
+/// Generic over the store error on purpose: the four stores this is used for
+/// have four unrelated error types and exactly one thing to say between them —
+/// that they did not answer. Naming each one here would invite a per-store
+/// interpretation of a failure this code has no business interpreting.
+///
+/// A store that could not be counted is [`OperationalMetric::Unavailable`], and
+/// never zero. Zero is a fact an operator acts on: nothing registered, nothing
+/// to clean up, nothing to worry about. A read that failed supports none of
+/// those conclusions, and substituting the friendlier of the two is how a
+/// status report becomes a thing nobody can trust.
+///
+/// A count above the wire's signed ceiling is unavailable for the same reason:
+/// this daemon cannot report the number it read, and reporting a different one
+/// would be worse than reporting none.
+fn durable_count<E>(read: Result<usize, E>) -> OperationalMetric {
+    read.ok()
+        .and_then(|count| u64::try_from(count).ok())
+        .and_then(|count| OperationalMetric::measured(count).ok())
+        .unwrap_or(OperationalMetric::Unavailable)
+}
+
 fn operational_status(projection: &StoreProjection) -> Result<OperationalStatus, DaemonError> {
     let metrics = projection.metrics();
     let measured = |name| match metrics.value(name) {
@@ -2830,4 +2912,41 @@ fn reconciliation_command_refusal(error: &StoreError) -> bool {
             | StoreError::OutboxConflict
             | StoreError::NotFound(_)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OperationalMetric, durable_count};
+
+    /// The seam where a failed read becomes a reported value.
+    ///
+    /// This is the one place a fabricated zero could enter the status, and no
+    /// integration test can reach it: the daemon holds its databases open for
+    /// its whole life, so a test cannot make one of them stop answering from
+    /// outside. So it is asserted here, on the conversion itself.
+    #[test]
+    fn an_unreadable_store_is_unavailable_and_an_empty_one_is_zero() {
+        struct Unreadable;
+
+        assert_eq!(
+            durable_count::<Unreadable>(Err(Unreadable)),
+            OperationalMetric::Unavailable,
+            "a store that did not answer must not be reported as empty"
+        );
+        assert_eq!(
+            durable_count::<Unreadable>(Ok(0)),
+            OperationalMetric::Measured(0),
+            "an empty store was counted, and zero is that count"
+        );
+        assert_eq!(
+            durable_count::<Unreadable>(Ok(7)),
+            OperationalMetric::Measured(7)
+        );
+        // A count the integer-only wire cannot carry is not reported as some
+        // other count.
+        assert_eq!(
+            durable_count::<Unreadable>(Ok(usize::MAX)),
+            OperationalMetric::Unavailable
+        );
+    }
 }

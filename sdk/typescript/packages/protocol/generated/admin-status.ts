@@ -75,9 +75,10 @@ export function assertNeverOperationalMetric(value: never): never {
   throw new ValidationError("OperationalMetric", `unhandled variant: ${JSON.stringify(value)}`);
 }
 
-/** One consistent snapshot. `operational` is always present; only `telegram_poller_epoch` may be null. */
+/** One consistent snapshot. `operational` and `durable_state` are always present; only `telegram_poller_epoch` may be null. */
 export interface DaemonStatus {
   readonly accepting_intake: boolean;
+  readonly durable_state: DurableStateCounts;
   readonly event_cursor: WireCounter;
   readonly execution_state: ExecutionState;
   readonly generation: WireCounter;
@@ -93,6 +94,7 @@ export interface DaemonStatus {
 }
 export const DaemonStatus_FIELDS: readonly string[] = [
   "accepting_intake",
+  "durable_state",
   "event_cursor",
   "execution_state",
   "generation",
@@ -105,6 +107,24 @@ export const DaemonStatus_FIELDS: readonly string[] = [
   "state",
   "telegram_poller_epoch",
   "telegram_state",
+];
+
+/** What the daemon's durable stores hold, counted while the status was answered. Each field is one read of one store and they are not one transaction; a store that could not be counted is `unavailable`, never zero. */
+export interface DurableStateCounts {
+  readonly approvals_recorded: OperationalMetric;
+  readonly automations_registered: OperationalMetric;
+  readonly open_tenure_epoch: OperationalMetric;
+  readonly open_tenures: OperationalMetric;
+  readonly runs_registered: OperationalMetric;
+  readonly tenures_recorded: OperationalMetric;
+}
+export const DurableStateCounts_FIELDS: readonly string[] = [
+  "approvals_recorded",
+  "automations_registered",
+  "open_tenure_epoch",
+  "open_tenures",
+  "runs_registered",
+  "tenures_recorded",
 ];
 
 /** The low-cardinality projection observed in the same status transaction. */
