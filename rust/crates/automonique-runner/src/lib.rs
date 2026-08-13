@@ -8,6 +8,12 @@
 //! without presenting itself as provider execution or sandbox enforcement.
 
 mod boundary;
+pub mod capability;
+mod containment;
+pub mod descriptors;
+pub mod filesystem;
+mod launch;
+pub mod network;
 mod runner;
 mod simulation;
 mod spec;
@@ -20,6 +26,15 @@ pub use boundary::{
     BoundaryProbeError, BoundaryRequirement, BoundaryStatus, BoundarySubject,
     ExecutionBoundaryAssessment, LaunchBlocker, LaunchRefusal, LinuxPrimitive,
     descriptor_closure_helper_main,
+};
+pub use containment::{
+    CGROUP_DIR_ENV, ContainmentDomain, ContainmentError, ContainmentLimits, Controller,
+    HELPER_REFUSED_EXIT, MAX_RUN_ID_BYTES, RunContainment, containment_entry_helper_main,
+    domain_is_owned, process_is_live,
+};
+pub use launch::{
+    FRAME_HEADER, FRAME_TERMINATOR, LaunchError, LaunchPlan, LaunchPlanError, MAX_FRAME_BYTES,
+    MAX_LAUNCH_ARG_BYTES, MAX_LAUNCH_ARGS, launch_entry_helper_main, spawn_sandboxed,
 };
 pub use runner::{CancellationToken, ContainmentEvidence, Runner, RunnerError};
 pub use simulation::{

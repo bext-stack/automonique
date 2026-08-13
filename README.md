@@ -74,6 +74,18 @@ cargo test --manifest-path rust/Cargo.toml --workspace --all-targets --locked
 cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --locked -- -D warnings
 ```
 
+The runner's containment proofs need a delegated cgroup v2 subtree, which an
+interactive login session does not have. Outside one they assert the fail-closed
+refusal instead. To actually exercise the boundary, run them in a delegated
+scope and require enforcement, so a host that cannot prove it fails loudly
+rather than reporting a green but vacuous run:
+
+```sh
+systemd-run --user --scope -p Delegate=yes \
+  --setenv=AUTOMONIQUE_REQUIRE_ENFORCED_CONTAINMENT=1 \
+  cargo test --manifest-path rust/Cargo.toml -p automonique-runner --test containment
+```
+
 Choose checks relevant to the changed area. Product CI remains authoritative
 for actual failures; the archived plan's self-consistency is not a product
 gate.
@@ -137,8 +149,43 @@ this local synthetic lane. The general runner remains fail-closed and sandbox
 plans still grant no OS-enforcement or production-runner authority. A dedicated
 descriptor-closure helper exercises a fixed inert Bubblewrap/BusyBox boundary,
 but the product launch API still refuses with `missing_reviewed_helper_pin`;
-there is no provider execution success type. The Codex adapter cannot spawn or
-probe a process. The Telegram poller now has a concrete synchronous HTTPS
+there is no provider execution success type.
+
+The runner now installs real, exercised kernel boundaries rather than only
+observing that kernel interfaces exist. A run cgroup provides descendant-complete
+containment on cgroup v2: placement is race-free because a self-migrating entry
+helper confirms its own membership before it `execv`s the workload, ceilings are
+applied before the cgroup can hold a process, `cgroup.kill` terminates the whole
+subtree atomically, and disposal leaves no kernel residue. A test proves that a
+`setsid` grandchild — which defeats process-group termination — is still reaped.
+On top of that, the runner has verified descriptor closure (close everything
+outside an explicit allowlist, then re-read `/proc/self/fd` to confirm), a
+Landlock filesystem allowlist with distinct read / read-write / read-execute
+grant intents that refuses partially enforced rulesets, and a Landlock ABI-4
+TCP policy that denies `bind`/`connect` by default. The TCP policy is
+deliberately not called network denial: UDP, raw sockets, `AF_UNIX`, and
+already-connected inherited sockets remain outside Landlock's reach, the tests
+record those gaps as executable fact, and closing them requires descriptor
+closure (done) plus a future seccomp socket filter. A read-only capability
+probe reports which of these mechanisms the host can actually enforce and a
+mode selector refuses or degrades loudly, never silently.
+
+A composed launch path ties the mechanisms together: a supervisor encodes a
+bounded, typed `LaunchPlan` (program, argv, filesystem grants, TCP exceptions —
+delivered over stdin, never argv), and a trusted entry helper joins the run
+cgroup, confirms membership from the kernel, replaces stdin with `/dev/null`,
+closes and verifies descriptors, installs both Landlock domains, and only then
+`execve`s the workload with an empty environment. An end-to-end test launches a
+real workload under all four boundaries at once and reads the workload's own
+observations to prove each held simultaneously; a truncated plan refuses before
+anything runs. Enforcement needs a delegated cgroup v2 subtree, which is what
+the daemon gets as a systemd user service with `Delegate=yes`; where no
+delegated domain exists every API refuses fail-closed and never reports partial
+enforcement. This launch path is exercised by tests only — the daemon does not
+yet call it, no provider is wired to it, and provider launch authority still
+requires the release-manifest trust chain that remains unbuilt.
+
+The Codex adapter cannot spawn or probe a process. The Telegram poller now has a concrete synchronous HTTPS
 client with WebPKI certificate verification, redirects and environment proxies
 disabled, bounded response headers/body, and a request deadline inside the
 lease margin. Telegram's required token-bearing URL exists only during that
