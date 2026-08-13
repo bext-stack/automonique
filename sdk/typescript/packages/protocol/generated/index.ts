@@ -13,6 +13,7 @@ export * from "./admin-command.ts";
 export * from "./admin-status.ts";
 export * from "./approval.ts";
 export * from "./automation.ts";
+export * from "./batch.ts";
 export * from "./doctor.ts";
 export * from "./runs.ts";
 export * from "./runtime.ts";

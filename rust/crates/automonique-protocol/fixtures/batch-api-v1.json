@@ -1,0 +1,1114 @@
+{
+  "decode_refusals": [
+    {
+      "category": "unknown_enum_value",
+      "id": "member-progress-undefined-spelling",
+      "note": "a member progress this build does not define fails closed rather than decoding to a default. There is no safe guess: counting it as finished invents a completion, and counting it as outstanding invents work still to do — and the rollup over it would carry the invention up to the batch",
+      "payload_hex": "7b22626f6479223a7b226261746368223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d2c226d656d62657273223a5b7b226b6579223a227375626d69742f6f6e6c79222c226c6173745f73657175656e6365223a372c226f7264696e616c223a302c227265766973696f6e223a322c227374617465223a22736b6970706564222c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c227374617465223a22636f6d706c65746564227d2c226b696e64223a2262617463685f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "unknown_enum_value",
+      "id": "batch-state-undefined-spelling",
+      "note": "a rolled-up batch state outside the six this build derives. The vocabulary is closed on both sides of the wire even though the value is derived, because a reader that retained an unnameable rollup would be holding a summary of work it cannot describe",
+      "payload_hex": "7b22626f6479223a7b226261746368223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d2c226d656d62657273223a5b7b226b6579223a227375626d69742f6f6e6c79222c226c6173745f73657175656e6365223a372c226f7264696e616c223a302c227265766973696f6e223a322c227374617465223a22636f6d706c65746564222c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c227374617465223a227061727469616c227d2c226b696e64223a2262617463685f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "unknown_enum_value",
+      "id": "concurrency-kind-undefined-spelling",
+      "note": "a concurrency word outside the two this build defines. `parallel` with no ceiling is exactly the unbounded policy this model refuses to have a spelling for",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22706172616c6c656c222c226d61785f696e5f666c69676874223a6e756c6c7d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "unknown_enum_value",
+      "id": "refusal-undefined-spelling",
+      "note": "a refusal word outside the thirteen this build carries",
+      "payload_hex": "7b22626f6479223a7b227265667573616c223a2271756f74615f6578636565646564227d2c226b696e64223a2272656675736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d72656769737465722d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_invalid_body",
+      "id": "concurrency-sequential-with-ceiling",
+      "note": "the discriminated coupling, met from one side: a sequential policy that carries a number is a policy this build cannot mean, and the generated union has no shape for it either",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a2273657175656e7469616c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_invalid_body",
+      "id": "concurrency-bounded-parallel-without-ceiling",
+      "note": "and from the other: a bounded parallelism with no bound is an unbounded policy wearing the bounded word",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a6e756c6c7d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_concurrency_ceiling_zero",
+      "id": "concurrency-ceiling-zero",
+      "note": "a ceiling that admits nothing in flight, refused rather than read as `no limit`. Its own category: a caller told only `invalid` cannot tell this from the ceiling above",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a307d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_concurrency_ceiling_unreachable",
+      "id": "concurrency-ceiling-above-membership",
+      "note": "one past the members a batch can hold, which is a ceiling that can never bind — an unbounded policy with a number written on it",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a3235377d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_invalid_body",
+      "id": "concurrency-ceiling-above-its-own-width",
+      "note": "a ceiling above the integer width it is carried in, which is a malformed body rather than an unreachable ceiling: the decoder converts before it judges the domain, and the two categories differ",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a343239343936373239367d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_unwritten_row",
+      "id": "entry-id-zero",
+      "note": "a durable identity starts at one; zero names a row no writer produced",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a302c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_invalid_body",
+      "id": "entry-id-negative",
+      "note": "a negative identity is a malformed body rather than an unwritten row: the decoder converts before it judges the domain",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a2d312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_unwritten_revision",
+      "id": "batch-revision-zero",
+      "note": "registration writes revision one and every accepted advance writes one higher, so zero names a row this product could not have written",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a307d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_unwritten_revision",
+      "id": "member-revision-zero",
+      "note": "the same pin on a member row, which the registry writes at one and advances from there",
+      "payload_hex": "7b22626f6479223a7b226261746368223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d2c226d656d62657273223a5b7b226b6579223a227375626d69742f6f6e6c79222c226c6173745f73657175656e6365223a372c226f7264696e616c223a302c227265766973696f6e223a302c227374617465223a22636f6d706c65746564222c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c227374617465223a22636f6d706c65746564227d2c226b696e64223a2262617463685f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_not_an_advance",
+      "id": "advance-receipt-at-revision-one",
+      "note": "registration is the only writer of revision one, so an advance receipt claiming it names a row no accepted advance could have left behind. This is the durable-row rule the generated surface *does* hold, because `two or above` is a bound on one field's own value",
+      "payload_hex": "7b22626f6479223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c226c6173745f73657175656e6365223a372c226d656d6265725f6b6579223a227375626d69742f6f6e6c79222c226f7264696e616c223a302c227265766973696f6e223a312c227374617465223a2272756e6e696e67222c22757064617465645f61745f6d73223a313730303030303030303030307d2c226b696e64223a226d656d6265725f616476616e636564222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d616476616e63652d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_not_an_advance",
+      "id": "advance-receipt-at-revision-zero",
+      "note": "the same pin met from below, and under the same category",
+      "payload_hex": "7b22626f6479223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c226c6173745f73657175656e6365223a372c226d656d6265725f6b6579223a227375626d69742f6f6e6c79222c226f7264696e616c223a302c227265766973696f6e223a302c227374617465223a2272756e6e696e67222c22757064617465645f61745f6d73223a313730303030303030303030307d2c226b696e64223a226d656d6265725f616476616e636564222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d616476616e63652d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_members_out_of_order",
+      "id": "member-ordinal-above-membership",
+      "note": "an ordinal past the last position this lane's membership admits. That the ordinals are contiguous is a relation between members and stays with the Rust decoder; that each one is inside the membership is a bound on its own value, and this side holds it",
+      "payload_hex": "7b22626f6479223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c226c6173745f73657175656e6365223a372c226d656d6265725f6b6579223a227375626d69742f6f6e6c79222c226f7264696e616c223a3132382c227265766973696f6e223a322c227374617465223a2272756e6e696e67222c22757064617465645f61745f6d73223a313730303030303030303030307d2c226b696e64223a226d656d6265725f616476616e636564222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d616476616e63652d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_time_before_epoch",
+      "id": "created-at-before-epoch",
+      "note": "an instant the registry's own `created_at_ms >= 0` constraint cannot hold",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a2d312c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_time_before_epoch",
+      "id": "updated-at-before-epoch",
+      "note": "the same constraint on the instant a member row records",
+      "payload_hex": "7b22626f6479223a7b226261746368223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d2c226d656d62657273223a5b7b226b6579223a227375626d69742f6f6e6c79222c226c6173745f73657175656e6365223a372c226f7264696e616c223a302c227265766973696f6e223a322c227374617465223a22636f6d706c65746564222c22757064617465645f61745f6d73223a2d317d5d2c227374617465223a22636f6d706c65746564227d2c226b696e64223a2262617463685f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_empty",
+      "id": "member-count-zero",
+      "note": "a registration that wrote no member is a unit with nothing in it, which is the batch model's own refusal rather than this lane's — and a different one from a count above the ceiling, which is why the two ends of this domain carry different categories",
+      "payload_hex": "7b22626f6479223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226d656d6265725f636f756e74223a302c227265766973696f6e223a317d2c226b696e64223a2262617463685f72656769737465726564222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d72656769737465722d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_membership_too_large",
+      "id": "member-count-above-bound",
+      "note": "one past MAX_BATCH_CONTROL_MEMBERS, which is this transport's ceiling rather than the registry's: the store still holds twice as many, and the two are deliberately not reconciled",
+      "payload_hex": "7b22626f6479223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226d656d6265725f636f756e74223a3132392c227265766973696f6e223a317d2c226b696e64223a2262617463685f72656769737465726564222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d72656769737465722d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_invalid_field",
+      "id": "batch-id-empty",
+      "note": "an empty identity names no batch",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a22222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_invalid_field",
+      "id": "label-control-character",
+      "note": "a control character in an operator-supplied label, which the wire never carries raw. A space *is* admitted, which is the difference between this lane's grammar and the correlation identifier's",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c795c75303030376576616c222c227265766973696f6e223a317d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_invalid_field",
+      "id": "member-key-over-bound-in-bytes-only",
+      "note": "65 two-byte characters: 65 UTF-16 code units, which a JavaScript `length` check would wave through, and 130 UTF-8 bytes, which is over the bound Rust and the registry both measure",
+      "payload_hex": "7b22626f6479223a7b226261746368223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d2c226d656d62657273223a5b7b226b6579223a22c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9222c226c6173745f73657175656e6365223a372c226f7264696e616c223a302c227265766973696f6e223a322c227374617465223a22636f6d706c65746564222c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c227374617465223a22636f6d706c65746564227d2c226b696e64223a2262617463685f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_page_too_large",
+      "id": "page-over-bound",
+      "note": "one row past MAX_BATCH_PAGE_ITEMS. The length is judged before any item is read, so what these items are does not matter",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b302c312c322c332c342c352c362c372c382c392c31302c31312c31322c31332c31342c31352c31362c31372c31382c31392c32302c32312c32322c32332c32342c32352c32362c32372c32382c32392c33302c33312c33325d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_membership_too_large",
+      "id": "detail-membership-over-bound",
+      "note": "one member past MAX_BATCH_CONTROL_MEMBERS on the way in, which is the same ceiling the registration encoder holds on the way out",
+      "payload_hex": "7b22626f6479223a7b226261746368223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d2c226d656d62657273223a5b302c312c322c332c342c352c362c372c382c392c31302c31312c31322c31332c31342c31352c31362c31372c31382c31392c32302c32312c32322c32332c32342c32352c32362c32372c32382c32392c33302c33312c33322c33332c33342c33352c33362c33372c33382c33392c34302c34312c34322c34332c34342c34352c34362c34372c34382c34392c35302c35312c35322c35332c35342c35352c35362c35372c35382c35392c36302c36312c36322c36332c36342c36352c36362c36372c36382c36392c37302c37312c37322c37332c37342c37352c37362c37372c37382c37392c38302c38312c38322c38332c38342c38352c38362c38372c38382c38392c39302c39312c39322c39332c39342c39352c39362c39372c39382c39392c3130302c3130312c3130322c3130332c3130342c3130352c3130362c3130372c3130382c3130392c3131302c3131312c3131322c3131332c3131342c3131352c3131362c3131372c3131382c3131392c3132302c3132312c3132322c3132332c3132342c3132352c3132362c3132372c3132385d2c227374617465223a22636f6d706c65746564227d2c226b696e64223a2262617463685f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_invalid_body",
+      "id": "next-cursor-negative",
+      "note": "a cursor below the beginning of the listing",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b5d2c226d6f7265223a747275652c226e6578745f637572736f72223a2d317d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_invalid_body",
+      "id": "more-not-a-boolean",
+      "note": "the wire carries true or false for a continuation and nothing else",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b5d2c226d6f7265223a312c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_unwritten_revision",
+      "id": "conflict-revision-zero",
+      "note": "a conflict naming a revision no writer produced tells a caller to retry against a row that does not exist",
+      "payload_hex": "7b22626f6479223a7b2264757261626c655f7265766973696f6e223a302c2265787065637465645f7265766973696f6e223a327d2c226b696e64223a227265766973696f6e5f636f6e666c696374222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d616476616e63652d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_invalid_body",
+      "id": "page-extra-field",
+      "note": "an unexpected key is refused rather than ignored",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c2c22746f74616c223a317d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_invalid_body",
+      "id": "record-missing-label",
+      "note": "a missing key is refused rather than defaulted, inside a nested body as much as at the top level: an absent label and a null one are different wire facts, and only the second is a batch nobody named",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a2273657175656e7469616c222c226d61785f696e5f666c69676874223a6e756c6c7d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c227265766973696f6e223a317d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_invalid_body",
+      "id": "concurrency-missing-ceiling-key",
+      "note": "the nested body's own exact key set: a policy carrying only its word is refused rather than read as a sequential one",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a2273657175656e7469616c227d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "batch_control_unknown_kind",
+      "id": "unknown-kind",
+      "note": "a kind this protocol version does not define, which is a different answer from a kind it defines and this surface does not decode",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f70726f67726573735f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "unknown_protocol",
+      "id": "approval-protocol-message",
+      "note": "the Approval lane's name on this lane's decoder, refused on the name axis so each protocol's closed kind set stays closed",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "unknown_protocol",
+      "id": "batch-document-schema-as-protocol",
+      "note": "the batch *document* schema is not this control lane's protocol name, and giving them one spelling would let a client admit either shape under the other's name",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6261746368222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "unsupported_version",
+      "id": "unsupported-version",
+      "note": "this protocol at a major version neither side implements",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a327d"
+    },
+    {
+      "category": "non_canonical_json",
+      "id": "non-canonical-key-order",
+      "note": "a payload that parses but is not canonical is refused, not normalized",
+      "payload_hex": "7b226b696e64223a2272656675736564222c22626f6479223a7b227265667573616c223a2272656769737472795f66756c6c227d2c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d72656769737465722d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "malformed_json",
+      "id": "empty-payload",
+      "note": "zero bytes is not an empty message",
+      "payload_hex": ""
+    }
+  ],
+  "encode_refusals": [
+    {
+      "category": "batch_empty",
+      "id": "register-batch-empty-membership",
+      "kind": "register_batch",
+      "note": "a batch that names no member is a unit with nothing in it. The builder holds the list, so this is refused before a frame is spent — and the refusal is the batch model's own rather than this lane's",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "concurrency": {
+          "kind": "sequential",
+          "max_in_flight": null
+        },
+        "label": null,
+        "members": []
+      },
+      "request_id": "req-register-1"
+    },
+    {
+      "category": "batch_control_membership_too_large",
+      "id": "register-batch-membership-above-bound",
+      "kind": "register_batch",
+      "note": "one member past MAX_BATCH_CONTROL_MEMBERS, built from the membership rule. The length is judged before any key is validated, so what these keys are does not matter",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "concurrency": {
+          "kind": "sequential",
+          "max_in_flight": null
+        },
+        "label": null,
+        "members_rule": "over-bound"
+      },
+      "request_id": "req-register-1"
+    },
+    {
+      "category": "batch_control_invalid_body",
+      "id": "register-batch-sequential-with-ceiling",
+      "kind": "register_batch",
+      "note": "the discriminated coupling on the way out: a sequential policy carrying a ceiling is refused rather than silently dropped, because dropping it would encode a policy the caller did not ask for. A typed caller cannot even write this — the union has no such shape — so the runtime check is what catches the untyped one",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "concurrency": {
+          "kind": "sequential",
+          "max_in_flight": "4"
+        },
+        "label": null,
+        "members": [
+          "submit/only"
+        ]
+      },
+      "request_id": "req-register-1"
+    },
+    {
+      "category": "batch_control_invalid_body",
+      "id": "register-batch-bounded-parallel-without-ceiling",
+      "kind": "register_batch",
+      "note": "and from the other side: the bounded word with no bound",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "concurrency": {
+          "kind": "bounded_parallel",
+          "max_in_flight": null
+        },
+        "label": null,
+        "members": [
+          "submit/only"
+        ]
+      },
+      "request_id": "req-register-1"
+    },
+    {
+      "category": "batch_concurrency_ceiling_zero",
+      "id": "register-batch-ceiling-zero",
+      "kind": "register_batch",
+      "note": "a ceiling that admits nothing in flight is a batch that never starts rather than a batch without limit",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "concurrency": {
+          "kind": "bounded_parallel",
+          "max_in_flight": "0"
+        },
+        "label": null,
+        "members": [
+          "submit/only"
+        ]
+      },
+      "request_id": "req-register-1"
+    },
+    {
+      "category": "batch_concurrency_ceiling_unreachable",
+      "id": "register-batch-ceiling-above-membership",
+      "kind": "register_batch",
+      "note": "one past the members a batch can hold, under its own category: a caller told only `invalid ceiling` could not tell this from a ceiling of zero, and the two are fixed differently",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "concurrency": {
+          "kind": "bounded_parallel",
+          "max_in_flight": "257"
+        },
+        "label": null,
+        "members": [
+          "submit/only"
+        ]
+      },
+      "request_id": "req-register-1"
+    },
+    {
+      "category": "unknown_enum_value",
+      "id": "register-batch-undefined-concurrency-kind",
+      "kind": "register_batch",
+      "note": "a brand exists only in the type checker, so the builder is where an untyped caller's undefined policy word is stopped rather than put on the wire",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "concurrency": {
+          "kind": "unbounded",
+          "max_in_flight": null
+        },
+        "label": null,
+        "members": [
+          "submit/only"
+        ]
+      },
+      "request_id": "req-register-1"
+    },
+    {
+      "category": "batch_control_invalid_field",
+      "id": "register-batch-label-empty",
+      "kind": "register_batch",
+      "note": "empty is refused rather than read as `no label`: a batch with no name carries an explicit null, and the two are different facts",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "concurrency": {
+          "kind": "sequential",
+          "max_in_flight": null
+        },
+        "label": "",
+        "members": [
+          "submit/only"
+        ]
+      },
+      "refused_by": "BatchLabel",
+      "refused_param": "label",
+      "request_id": "req-register-1",
+      "violation": "empty"
+    },
+    {
+      "category": "batch_control_invalid_field",
+      "id": "register-batch-member-key-over-bound",
+      "kind": "register_batch",
+      "note": "one member key inside the UTF-16 code-unit bound and outside the UTF-8 one the registry stores under. Every key in the list is validated, not only the first",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "concurrency": {
+          "kind": "sequential",
+          "max_in_flight": null
+        },
+        "label": null,
+        "members": [
+          "submit/only",
+          "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+        ]
+      },
+      "request_id": "req-register-1"
+    },
+    {
+      "category": "unknown_enum_value",
+      "id": "advance-member-undefined-progress",
+      "kind": "advance_member",
+      "note": "a member progress this build does not define, stopped at the builder. `skipped` is not a word this lattice has an edge to",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "expected_revision": "1",
+        "last_sequence": "3",
+        "member_key": "submit/only",
+        "state": "skipped"
+      },
+      "request_id": "req-advance-1"
+    },
+    {
+      "category": "unknown_enum_value",
+      "id": "advance-member-progress-title-case",
+      "kind": "advance_member",
+      "note": "the spelling is exact and lowercase: `Running` is not `running`, and a vocabulary that case-folded would admit words the registry's CHECK refuses",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "expected_revision": "1",
+        "last_sequence": "3",
+        "member_key": "submit/only",
+        "state": "Running"
+      },
+      "request_id": "req-advance-1"
+    },
+    {
+      "category": "batch_control_unwritten_revision",
+      "id": "advance-member-expected-revision-zero",
+      "kind": "advance_member",
+      "note": "a fence against a row no writer produced. Registration writes revision one, so zero is not a revision a caller could ever be advancing from",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "expected_revision": "0",
+        "last_sequence": "3",
+        "member_key": "submit/only",
+        "state": "running"
+      },
+      "refused_by": "BatchRevision",
+      "refused_param": "expected_revision",
+      "request_id": "req-advance-1",
+      "violation": "out_of_range"
+    },
+    {
+      "category": "batch_control_counter_out_of_range",
+      "id": "advance-member-sequence-above-wire-ceiling",
+      "kind": "advance_member",
+      "note": "a sequence one past the largest integer this wire carries, which is a counter refusal rather than a malformed body",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "expected_revision": "1",
+        "last_sequence": "9223372036854775808",
+        "member_key": "submit/only",
+        "state": "running"
+      },
+      "refused_by": "LastSequence",
+      "refused_param": "last_sequence",
+      "request_id": "req-advance-1",
+      "violation": "out_of_range"
+    },
+    {
+      "category": "batch_control_invalid_field",
+      "id": "advance-member-key-control-character",
+      "kind": "advance_member",
+      "note": "a control character in a member key, which the wire never carries raw",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "expected_revision": "1",
+        "last_sequence": "3",
+        "member_key": "submit\u0007only",
+        "state": "running"
+      },
+      "refused_by": "BatchMemberKey",
+      "refused_param": "member_key",
+      "request_id": "req-advance-1",
+      "violation": "invalid_character"
+    },
+    {
+      "category": "batch_control_page_size_out_of_range",
+      "id": "list-batches-page-size-zero",
+      "kind": "list_batches",
+      "note": "a page that admits nothing cannot make progress, so zero is refused rather than treated as a default",
+      "params": {
+        "page_size": "0",
+        "since": "0"
+      },
+      "refused_by": "BatchPageSize",
+      "refused_param": "page_size",
+      "request_id": "req-list-1",
+      "violation": "out_of_range"
+    },
+    {
+      "category": "batch_control_page_size_out_of_range",
+      "id": "list-batches-page-size-above-bound",
+      "kind": "list_batches",
+      "note": "one past MAX_BATCH_PAGE_ITEMS, which is a page bound derived from the frame arithmetic of the rows it carries rather than chosen",
+      "params": {
+        "page_size": "33",
+        "since": "0"
+      },
+      "refused_by": "BatchPageSize",
+      "refused_param": "page_size",
+      "request_id": "req-list-1",
+      "violation": "out_of_range"
+    },
+    {
+      "category": "batch_control_counter_out_of_range",
+      "id": "list-batches-cursor-above-wire-ceiling",
+      "kind": "list_batches",
+      "note": "a cursor one past the largest integer this wire carries",
+      "params": {
+        "page_size": "1",
+        "since": "9223372036854775808"
+      },
+      "refused_by": "BatchCursor",
+      "refused_param": "since",
+      "request_id": "req-list-1",
+      "violation": "out_of_range"
+    },
+    {
+      "category": "batch_control_invalid_field",
+      "id": "batch-detail-batch-id-empty",
+      "kind": "batch_detail",
+      "note": "an empty identity names no batch to read",
+      "params": {
+        "batch_id": ""
+      },
+      "refused_by": "BatchId",
+      "refused_param": "batch_id",
+      "request_id": "req-detail-1",
+      "violation": "empty"
+    },
+    {
+      "category": "field_invalid",
+      "id": "request-id-too-long",
+      "kind": "batch_detail",
+      "note": "the envelope's fields are judged by the shared codec, whose refusal for a bound is not the one this protocol uses for a body",
+      "params": {
+        "batch_id": "batch/nightly-eval"
+      },
+      "refused_by": "RequestId",
+      "refused_param": "request_id",
+      "request_id": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "violation": "too_long"
+    },
+    {
+      "category": "field_grammar",
+      "id": "request-id-outside-grammar",
+      "kind": "batch_detail",
+      "note": "a grammar refusal is not a bounds refusal, and the categories differ. A space is outside the correlation identifier's grammar and inside the batch identity's, which is the difference this lane's looser identifier makes",
+      "params": {
+        "batch_id": "batch/nightly eval"
+      },
+      "refused_by": "RequestId",
+      "refused_param": "request_id",
+      "request_id": "req 1",
+      "violation": "invalid_character"
+    }
+  ],
+  "generator": "automonique-protocol tests/codegen.rs, module batch_surface",
+  "membership_rules": [
+    {
+      "count": "128",
+      "id": "maximal",
+      "key_bytes": "128",
+      "note": "MAX_BATCH_CONTROL_MEMBERS keys, each at MAX_BATCH_MEMBER_KEY_BYTES and filled with the one character that escapes to two canonical bytes. This is the worst case this lane's frame arithmetic budgets for, and it is why this ceiling is half the batch model's own"
+    },
+    {
+      "count": "129",
+      "id": "over-bound",
+      "key_bytes": "0",
+      "note": "one member past MAX_BATCH_CONTROL_MEMBERS. The length is judged before any key is validated, so what these keys are does not matter and the refusal names the length"
+    }
+  ],
+  "membership_rules_note": "A maximal registration is MAX_BATCH_CONTROL_MEMBERS keys of MAX_BATCH_MEMBER_KEY_BYTES, which is 33 KiB of literal nobody can review. Each implementation builds the list from the rule instead: the key at one position is its three-digit decimal index, filled to key_bytes with the one character that escapes to two canonical bytes, or `member-NNN` where key_bytes is zero and what is being measured is the length of the list. That the two implementations read the rule the same way is measured rather than assumed, because the bytes the runner reports are compared against the bytes Rust built from the same rule.",
+  "note": "Generated from the shipped Rust constructors: every canonical byte string here was produced by encoding a real message and re-read through from_canonical_bytes before it was written, and every refusal category was read back from the error Rust returned for that exact input. Counters travel as decimal strings because a JSON reader using a double would round the largest of them without saying so. Rust is the wire source of truth, so a disagreement is fixed in whichever implementation is wrong — never in this file.",
+  "protocol": "automonique.batch.control",
+  "requests": [
+    {
+      "canonical_bytes": 33608,
+      "canonical_hex": "7b22626f6479223a7b2262617463685f6964223a225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a3235367d2c226c6162656c223a225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c226d656d62657273223a5b223030305c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223030315c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223030325c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223030335c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223030345c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223030355c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223030365c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223030375c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223030385c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223030395c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223031305c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223031315c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223031325c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223031335c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223031345c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223031355c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223031365c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223031375c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223031385c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223031395c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223032305c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223032315c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223032325c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223032335c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223032345c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223032355c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223032365c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223032375c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223032385c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223032395c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223033305c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223033315c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223033325c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223033335c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223033345c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223033355c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223033365c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223033375c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223033385c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223033395c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223034305c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223034315c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223034325c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223034335c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223034345c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223034355c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223034365c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223034375c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223034385c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223034395c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223035305c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223035315c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223035325c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223035335c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223035345c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223035355c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223035365c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223035375c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223035385c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223035395c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223036305c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223036315c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223036325c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223036335c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223036345c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223036355c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223036365c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223036375c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223036385c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223036395c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223037305c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223037315c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223037325c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223037335c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223037345c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223037355c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223037365c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223037375c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223037385c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223037395c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223038305c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223038315c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223038325c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223038335c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223038345c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223038355c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223038365c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223038375c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223038385c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223038395c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223039305c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223039315c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223039325c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223039335c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223039345c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223039355c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223039365c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223039375c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223039385c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223039395c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223130305c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223130315c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223130325c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223130335c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223130345c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223130355c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223130365c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223130375c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223130385c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223130395c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223131305c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223131315c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223131325c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223131335c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223131345c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223131355c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223131365c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223131375c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223131385c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223131395c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223132305c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223132315c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223132325c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223132335c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223132345c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223132355c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223132365c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c223132375c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22225d7d2c226b696e64223a2272656769737465725f6261746368222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c2276657273696f6e223a317d",
+      "id": "register-batch-maximal",
+      "kind": "register_batch",
+      "note": "every bound at once: MAX_BATCH_CONTROL_MEMBERS members built from the membership rule, a batch identity and a label whose every character escapes to two canonical bytes, a bounded-parallel ceiling at the batch model's own membership — the largest a policy can declare, and one this lane's own membership can never reach — and a correlation identifier at MAX_REQUEST_ID_BYTES. This is the registration the frame arithmetic is derived from",
+      "params": {
+        "batch_id": "\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"",
+        "concurrency": {
+          "kind": "bounded_parallel",
+          "max_in_flight": "256"
+        },
+        "label": "\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"",
+        "members_rule": "maximal"
+      },
+      "request_id": "req-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "canonical_bytes": 338,
+      "canonical_hex": "7b22626f6479223a7b2262617463685f6964223a2262617463682f5c226e696768746c79206576616c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c22636f6e63757272656e6379223a7b226b696e64223a2273657175656e7469616c222c226d61785f696e5f666c69676874223a6e756c6c7d2c226c6162656c223a6e756c6c2c226d656d62657273223a5b227375626d69742f5c2272756e2070726f645c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c227375626d69742f616172647661726b222c227375626d69742f7a65627261225d7d2c226b696e64223a2272656769737465725f6261746368222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d72656769737465722d31222c2276657273696f6e223a317d",
+      "id": "register-batch-sequential-unlabelled",
+      "kind": "register_batch",
+      "note": "the other half of the discriminated policy: `sequential` carries no ceiling at all, and the absent label is an explicit null rather than an empty string. Sequential is not `bounded_parallel` with a ceiling of one — it also fixes the order to the declaration's, which is why the member order below is kept rather than sorted",
+      "params": {
+        "batch_id": "batch/\"nightly eval\" \\ naïve 日本語 🚀",
+        "concurrency": {
+          "kind": "sequential",
+          "max_in_flight": null
+        },
+        "label": null,
+        "members": [
+          "submit/\"run prod\" \\ naïve 日本語 🚀",
+          "submit/aardvark",
+          "submit/zebra"
+        ]
+      },
+      "request_id": "req-register-1"
+    },
+    {
+      "canonical_bytes": 285,
+      "canonical_hex": "7b22626f6479223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a317d2c226c6162656c223a226e696768746c79205c226576616c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c226d656d62657273223a5b227375626d69742f6f6e6c79225d7d2c226b696e64223a2272656769737465725f6261746368222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d72656769737465722d32222c2276657273696f6e223a317d",
+      "id": "register-batch-bounded-parallel-one",
+      "kind": "register_batch",
+      "note": "a ceiling of one, which is the smallest a policy can declare and is still not `sequential`: this batch admits one member in flight and declares no order, and the two facts are recorded separately because they are separate",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "concurrency": {
+          "kind": "bounded_parallel",
+          "max_in_flight": "1"
+        },
+        "label": "nightly \"eval\" \\ naïve 日本語 🚀",
+        "members": [
+          "submit/only"
+        ]
+      },
+      "request_id": "req-register-2"
+    },
+    {
+      "canonical_bytes": 329,
+      "canonical_hex": "7b22626f6479223a7b2262617463685f6964223a2262617463682f5c226e696768746c79206576616c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c2265787065637465645f7265766973696f6e223a393232333337323033363835343737353830372c226c6173745f73657175656e6365223a393232333337323033363835343737353830372c226d656d6265725f6b6579223a227375626d69742f5c2272756e2070726f645c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c227374617465223a2272756e6e696e67227d2c226b696e64223a22616476616e63655f6d656d626572222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d616476616e63652d31222c2276657273696f6e223a317d",
+      "id": "advance-member-running-at-ceiling",
+      "kind": "advance_member",
+      "note": "one writer's claim that a member is running, at a spool sequence and an expected revision both at the wire's integer ceiling — which a reader carrying either in a double would round to an even neighbour. What this reports is what somebody observed after reading the run index, not a reading this lane took",
+      "params": {
+        "batch_id": "batch/\"nightly eval\" \\ naïve 日本語 🚀",
+        "expected_revision": "9223372036854775807",
+        "last_sequence": "9223372036854775807",
+        "member_key": "submit/\"run prod\" \\ naïve 日本語 🚀",
+        "state": "running"
+      },
+      "request_id": "req-advance-1"
+    },
+    {
+      "canonical_bytes": 229,
+      "canonical_hex": "7b22626f6479223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c2265787065637465645f7265766973696f6e223a312c226c6173745f73657175656e6365223a302c226d656d6265725f6b6579223a227375626d69742f6f6e6c79222c227374617465223a227265616479227d2c226b696e64223a22616476616e63655f6d656d626572222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d616476616e63652d32222c2276657273696f6e223a317d",
+      "id": "advance-member-ready-at-zero",
+      "kind": "advance_member",
+      "note": "the other side of the sequence coupling: `ready` means the daemon holds a document and no event has arrived, so the sequence is zero. Rust refuses the incoherent pairs and the generated encoder does not — that gap is recorded in rust_only_encode_refusals rather than described",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "expected_revision": "1",
+        "last_sequence": "0",
+        "member_key": "submit/only",
+        "state": "ready"
+      },
+      "request_id": "req-advance-2"
+    },
+    {
+      "canonical_bytes": 235,
+      "canonical_hex": "7b22626f6479223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c2265787065637465645f7265766973696f6e223a342c226c6173745f73657175656e6365223a39392c226d656d6265725f6b6579223a227375626d69742f7a65627261222c227374617465223a2274696d65645f6f7574227d2c226b696e64223a22616476616e63655f6d656d626572222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d616476616e63652d33222c2276657273696f6e223a317d",
+      "id": "advance-member-timed-out",
+      "kind": "advance_member",
+      "note": "a terminal claim carrying the one member progress spelling a run vocabulary reaches only through this lane's reuse of it",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "expected_revision": "4",
+        "last_sequence": "99",
+        "member_key": "submit/zebra",
+        "state": "timed_out"
+      },
+      "request_id": "req-advance-3"
+    },
+    {
+      "canonical_bytes": 152,
+      "canonical_hex": "7b22626f6479223a7b22706167655f73697a65223a33322c2273696e6365223a393232333337323033363835343737353830377d2c226b696e64223a226c6973745f62617463686573222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "id": "list-batches-maximal",
+      "kind": "list_batches",
+      "note": "a cursor at the wire's integer ceiling and the largest page this protocol serves. A reader carrying the cursor in a double would encode 9223372036854775808 here without a word of complaint",
+      "params": {
+        "page_size": "32",
+        "since": "9223372036854775807"
+      },
+      "request_id": "req-list-1"
+    },
+    {
+      "canonical_bytes": 133,
+      "canonical_hex": "7b22626f6479223a7b22706167655f73697a65223a312c2273696e6365223a307d2c226b696e64223a226c6973745f62617463686573222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d32222c2276657273696f6e223a317d",
+      "id": "list-batches-start",
+      "kind": "list_batches",
+      "note": "the beginning of the registry: a cursor of zero, which is a position rather than the absence of one, and the smallest page that can make progress",
+      "params": {
+        "page_size": "1",
+        "since": "0"
+      },
+      "request_id": "req-list-2"
+    },
+    {
+      "canonical_bytes": 172,
+      "canonical_hex": "7b22626f6479223a7b2262617463685f6964223a2262617463682f5c226e696768746c79206576616c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80227d2c226b696e64223a2262617463685f64657461696c222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d",
+      "id": "batch-detail-escaping",
+      "kind": "batch_detail",
+      "note": "one batch read by an identity carrying every reachable escape",
+      "params": {
+        "batch_id": "batch/\"nightly eval\" \\ naïve 日本語 🚀"
+      },
+      "request_id": "req-detail-1"
+    }
+  ],
+  "responses": [
+    {
+      "canonical_hex": "7b22626f6479223a7b2262617463685f6964223a2262617463682f5c226e696768746c79206576616c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226d656d6265725f636f756e74223a3132382c227265766973696f6e223a317d2c226b696e64223a2262617463685f72656769737465726564222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d72656769737465722d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "batch_id": "batch/\"nightly eval\" \\ naïve 日本語 🚀",
+        "created_at_ms": "1700000000000",
+        "entry_id": "1",
+        "member_count": "128",
+        "request_id": "req-register-1",
+        "revision": "1"
+      },
+      "id": "batch-registered-maximal-membership",
+      "kind": "batch_registered",
+      "note": "a maximal membership is durable, all of it `unsubmitted` at ordinals 0..member_count. `accepted` rather than `completed`: the rows are committed, and what they record has not taken effect and cannot, because registering a batch submits nothing and reserves no run identity",
+      "outcome": "accepted"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22637265617465645f61745f6d73223a393232333337323033363835343737353830372c22656e7472795f6964223a393232333337323033363835343737353830372c226d656d6265725f636f756e74223a312c227265766973696f6e223a393232333337323033363835343737353830377d2c226b696e64223a2262617463685f72656769737465726564222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d72656769737465722d32222c2276657273696f6e223a317d",
+      "decoded": {
+        "batch_id": "batch/nightly-eval",
+        "created_at_ms": "9223372036854775807",
+        "entry_id": "9223372036854775807",
+        "member_count": "1",
+        "request_id": "req-register-2",
+        "revision": "9223372036854775807"
+      },
+      "id": "batch-registered-at-ceiling",
+      "kind": "batch_registered",
+      "note": "the same answer with every counter at the wire's ceiling and the smallest membership a batch can have, which is one rather than none",
+      "outcome": "accepted"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b2262617463685f6964223a2262617463682f5c226e696768746c79206576616c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c226c6173745f73657175656e6365223a393232333337323033363835343737353830372c226d656d6265725f6b6579223a227375626d69742f5c2272756e2070726f645c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c226f7264696e616c223a3132372c227265766973696f6e223a322c227374617465223a2272756e6e696e67222c22757064617465645f61745f6d73223a393232333337323033363835343737353830377d2c226b696e64223a226d656d6265725f616476616e636564222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d616476616e63652d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "batch_id": "batch/\"nightly eval\" \\ naïve 日本語 🚀",
+        "last_sequence": "9223372036854775807",
+        "member_key": "submit/\"run prod\" \\ naïve 日本語 🚀",
+        "ordinal": "127",
+        "request_id": "req-advance-1",
+        "revision": "2",
+        "state": "running",
+        "updated_at_ms": "9223372036854775807"
+      },
+      "id": "member-advanced-running",
+      "kind": "member_advanced",
+      "note": "one member's row moved. The revision is the fence the *next* advance must expect, and it is two here because registration wrote one: an advance receipt at revision one would name a row no accepted advance could have left behind. The ordinal is the last position this lane's membership admits",
+      "outcome": "accepted"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c226c6173745f73657175656e6365223a372c226d656d6265725f6b6579223a227375626d69742f6f6e6c79222c226f7264696e616c223a302c227265766973696f6e223a393232333337323033363835343737353830372c227374617465223a2263616e63656c6c6564222c22757064617465645f61745f6d73223a307d2c226b696e64223a226d656d6265725f616476616e636564222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d616476616e63652d32222c2276657273696f6e223a317d",
+      "decoded": {
+        "batch_id": "batch/nightly-eval",
+        "last_sequence": "7",
+        "member_key": "submit/only",
+        "ordinal": "0",
+        "request_id": "req-advance-2",
+        "revision": "9223372036854775807",
+        "state": "cancelled",
+        "updated_at_ms": "0"
+      },
+      "id": "member-advanced-cancelled",
+      "kind": "member_advanced",
+      "note": "a terminal member at a revision at the wire's ceiling: a cancellation is a decision rather than a loss, which is why a batch of nothing but cancellations rolls up to `cancelled` and not to `failed`",
+      "outcome": "accepted"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6669727374222c22636f6e63757272656e6379223a7b226b696e64223a2273657175656e7469616c222c226d61785f696e5f666c69676874223a6e756c6c7d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a6e756c6c2c227265766973696f6e223a317d2c7b2262617463685f6964223a2262617463682f5c226e696768746c79206576616c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a3235367d2c22637265617465645f61745f6d73223a393232333337323033363835343737353830372c22656e7472795f6964223a393232333337323033363835343737353830362c226c6162656c223a226e696768746c79205c226576616c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c227265766973696f6e223a393232333337323033363835343737353830377d5d2c226d6f7265223a747275652c226e6578745f637572736f72223a393232333337323033363835343737353830377d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "batches.0.batch_id": "batch/first",
+        "batches.0.concurrency.kind": "sequential",
+        "batches.0.concurrency.max_in_flight": "null",
+        "batches.0.created_at_ms": "1700000000000",
+        "batches.0.entry_id": "1",
+        "batches.0.label": "null",
+        "batches.0.revision": "1",
+        "batches.1.batch_id": "batch/\"nightly eval\" \\ naïve 日本語 🚀",
+        "batches.1.concurrency.kind": "bounded_parallel",
+        "batches.1.concurrency.max_in_flight": "256",
+        "batches.1.created_at_ms": "9223372036854775807",
+        "batches.1.entry_id": "9223372036854775806",
+        "batches.1.label": "nightly \"eval\" \\ naïve 日本語 🚀",
+        "batches.1.revision": "9223372036854775807",
+        "batches.len": "2",
+        "more": "true",
+        "next_cursor": "9223372036854775807",
+        "request_id": "req-list-1"
+      },
+      "id": "batch-list-page-more",
+      "kind": "batch_list_result",
+      "note": "one page carrying both concurrency shapes at once: a sequential batch with no label and no ceiling, and a bounded-parallel one at the largest ceiling a policy can declare. The last row and the continuation cursor are both at the wire's ceiling",
+      "outcome": "completed"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6f6e6c79222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a302c22656e7472795f6964223a392c226c6162656c223a226e696768746c79222c227265766973696f6e223a337d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d32222c2276657273696f6e223a317d",
+      "decoded": {
+        "batches.0.batch_id": "batch/only",
+        "batches.0.concurrency.kind": "bounded_parallel",
+        "batches.0.concurrency.max_in_flight": "4",
+        "batches.0.created_at_ms": "0",
+        "batches.0.entry_id": "9",
+        "batches.0.label": "nightly",
+        "batches.0.revision": "3",
+        "batches.len": "1",
+        "more": "false",
+        "next_cursor": "null",
+        "request_id": "req-list-2"
+      },
+      "id": "batch-list-page-complete",
+      "kind": "batch_list_result",
+      "note": "the end of the registry: `more` false and an explicit null cursor. A batch registered at the epoch, which the registry's own `created_at_ms >= 0` constraint admits and one millisecond earlier does not",
+      "outcome": "completed"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b2262617463686573223a5b5d2c226d6f7265223a747275652c226e6578745f637572736f72223a34327d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "batches.len": "0",
+        "more": "true",
+        "next_cursor": "42",
+        "request_id": "req-list-1"
+      },
+      "id": "batch-list-page-empty-more",
+      "kind": "batch_list_result",
+      "note": "an empty page that still reports more. `more` is carried explicitly rather than inferred from a short page, because a short page is not the same statement as a last page",
+      "outcome": "completed"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b226261746368223a7b2262617463685f6964223a2262617463682f5c226e696768746c79206576616c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a327d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a342c226c6162656c223a226e696768746c79205c226576616c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c227265766973696f6e223a317d2c226d656d62657273223a5b7b226b6579223a227375626d69742f5c2272756e2070726f645c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c226c6173745f73657175656e6365223a31322c226f7264696e616c223a302c227265766973696f6e223a322c227374617465223a22636f6d706c65746564222c22757064617465645f61745f6d73223a313730303030303030303030307d2c7b226b6579223a227375626d69742f7a65627261222c226c6173745f73657175656e6365223a332c226f7264696e616c223a312c227265766973696f6e223a352c227374617465223a2263616e63656c6c6564222c22757064617465645f61745f6d73223a313730303030303030303030317d5d2c227374617465223a226d69786564227d2c226b696e64223a2262617463685f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "batch.batch_id": "batch/\"nightly eval\" \\ naïve 日本語 🚀",
+        "batch.concurrency.kind": "bounded_parallel",
+        "batch.concurrency.max_in_flight": "2",
+        "batch.created_at_ms": "1700000000000",
+        "batch.entry_id": "4",
+        "batch.label": "nightly \"eval\" \\ naïve 日本語 🚀",
+        "batch.revision": "1",
+        "members.0.key": "submit/\"run prod\" \\ naïve 日本語 🚀",
+        "members.0.last_sequence": "12",
+        "members.0.ordinal": "0",
+        "members.0.revision": "2",
+        "members.0.state": "completed",
+        "members.0.updated_at_ms": "1700000000000",
+        "members.1.key": "submit/zebra",
+        "members.1.last_sequence": "3",
+        "members.1.ordinal": "1",
+        "members.1.revision": "5",
+        "members.1.state": "cancelled",
+        "members.1.updated_at_ms": "1700000000001",
+        "members.len": "2",
+        "request_id": "req-detail-1",
+        "state": "mixed"
+      },
+      "id": "batch-detail-mixed",
+      "kind": "batch_detail_result",
+      "note": "the rollup that exists to be exactly one case: every member ended, nothing was lost, and the results are neither all completions nor all cancellations. The state is not a column anywhere — the registry deliberately does not store one — and it is derived beside the members that justify it, which is why a reader can check it",
+      "outcome": "completed"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b226261746368223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a2273657175656e7469616c222c226d61785f696e5f666c69676874223a6e756c6c7d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a352c226c6162656c223a6e756c6c2c227265766973696f6e223a317d2c226d656d62657273223a5b7b226b6579223a227375626d69742f616172647661726b222c226c6173745f73657175656e6365223a302c226f7264696e616c223a302c227265766973696f6e223a312c227374617465223a22756e7375626d6974746564222c22757064617465645f61745f6d73223a313730303030303030303030307d2c7b226b6579223a227375626d69742f7a65627261222c226c6173745f73657175656e6365223a302c226f7264696e616c223a312c227265766973696f6e223a342c227374617465223a227265616479222c22757064617465645f61745f6d73223a313730303030303030303030317d5d2c227374617465223a2270656e64696e67227d2c226b696e64223a2262617463685f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d32222c2276657273696f6e223a317d",
+      "decoded": {
+        "batch.batch_id": "batch/nightly-eval",
+        "batch.concurrency.kind": "sequential",
+        "batch.concurrency.max_in_flight": "null",
+        "batch.created_at_ms": "1700000000000",
+        "batch.entry_id": "5",
+        "batch.label": "null",
+        "batch.revision": "1",
+        "members.0.key": "submit/aardvark",
+        "members.0.last_sequence": "0",
+        "members.0.ordinal": "0",
+        "members.0.revision": "1",
+        "members.0.state": "unsubmitted",
+        "members.0.updated_at_ms": "1700000000000",
+        "members.1.key": "submit/zebra",
+        "members.1.last_sequence": "0",
+        "members.1.ordinal": "1",
+        "members.1.revision": "4",
+        "members.1.state": "ready",
+        "members.1.updated_at_ms": "1700000000001",
+        "members.len": "2",
+        "request_id": "req-detail-2",
+        "state": "pending"
+      },
+      "id": "batch-detail-pending",
+      "kind": "batch_detail_result",
+      "note": "no member has begun: one was never submitted and one is held with no event arrived. `ready` is not `unsubmitted` — the first presumes a submission happened — and both carry a zero sequence, which is the coupling the Rust decoder holds and this file's generated one does not",
+      "outcome": "completed"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b226261746368223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a387d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a362c226c6162656c223a226e696768746c79222c227265766973696f6e223a327d2c226d656d62657273223a5b7b226b6579223a227375626d69742f616172647661726b222c226c6173745f73657175656e6365223a392c226f7264696e616c223a302c227265766973696f6e223a332c227374617465223a22636f6d706c65746564222c22757064617465645f61745f6d73223a313730303030303030303030307d2c7b226b6579223a227375626d69742f7a65627261222c226c6173745f73657175656e6365223a393232333337323033363835343737353830372c226f7264696e616c223a312c227265766973696f6e223a322c227374617465223a2274696d65645f6f7574222c22757064617465645f61745f6d73223a313730303030303030303030317d5d2c227374617465223a226661696c6564227d2c226b696e64223a2262617463685f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d33222c2276657273696f6e223a317d",
+      "decoded": {
+        "batch.batch_id": "batch/nightly-eval",
+        "batch.concurrency.kind": "bounded_parallel",
+        "batch.concurrency.max_in_flight": "8",
+        "batch.created_at_ms": "1700000000000",
+        "batch.entry_id": "6",
+        "batch.label": "nightly",
+        "batch.revision": "2",
+        "members.0.key": "submit/aardvark",
+        "members.0.last_sequence": "9",
+        "members.0.ordinal": "0",
+        "members.0.revision": "3",
+        "members.0.state": "completed",
+        "members.0.updated_at_ms": "1700000000000",
+        "members.1.key": "submit/zebra",
+        "members.1.last_sequence": "9223372036854775807",
+        "members.1.ordinal": "1",
+        "members.1.revision": "2",
+        "members.1.state": "timed_out",
+        "members.1.updated_at_ms": "1700000000001",
+        "members.len": "2",
+        "request_id": "req-detail-3",
+        "state": "failed"
+      },
+      "id": "batch-detail-failed",
+      "kind": "batch_detail_result",
+      "note": "a batch that lost a member did not succeed, whatever the others did: one completion beside one timed-out member rolls up to `failed` rather than to `mixed`",
+      "outcome": "completed"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b2264757261626c655f7265766973696f6e223a372c2265787065637465645f7265766973696f6e223a327d2c226b696e64223a227265766973696f6e5f636f6e666c696374222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d616476616e63652d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "durable_revision": "7",
+        "expected_revision": "2",
+        "request_id": "req-advance-1"
+      },
+      "id": "revision-conflict",
+      "kind": "revision_conflict",
+      "note": "the caller's fence was stale and nothing was written. Not a refusal: a conflict is retried against the durable revision this answer carries, where a refusal is not retried at all until the request changes",
+      "outcome": "conflict"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b2264757261626c655f7265766973696f6e223a393232333337323033363835343737353830372c2265787065637465645f7265766973696f6e223a317d2c226b696e64223a227265766973696f6e5f636f6e666c696374222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d616476616e63652d32222c2276657273696f6e223a317d",
+      "decoded": {
+        "durable_revision": "9223372036854775807",
+        "expected_revision": "1",
+        "request_id": "req-advance-2"
+      },
+      "id": "revision-conflict-at-ceiling",
+      "kind": "revision_conflict",
+      "note": "the same answer with the durable revision at the wire's ceiling, which a reader carrying it in a double would round",
+      "outcome": "conflict"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b227265667573616c223a22756e6b6e6f776e5f6261746368227d2c226b696e64223a2272656675736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "refusal": "unknown_batch",
+        "request_id": "req-detail-1"
+      },
+      "id": "refused-unknown-batch",
+      "kind": "refused",
+      "note": "no batch is registered under that identity. Distinct from `unknown_member`, because the two are fixed differently: one is a batch nobody registered, the other is a key a registered batch never named and never will",
+      "outcome": "rejected"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b227265667573616c223a22616c72656164795f72656769737465726564227d2c226b696e64223a2272656675736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d72656769737465722d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "refusal": "already_registered",
+        "request_id": "req-register-1"
+      },
+      "id": "refused-already-registered",
+      "kind": "refused",
+      "note": "a repeated identity is never an overwrite: re-registering would reset member rows a writer may already have advanced, and silently discarding a batch's recorded progress is the one thing the registry exists to prevent",
+      "outcome": "rejected"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b227265667573616c223a22696c6c6567616c5f7472616e736974696f6e227d2c226b696e64223a2272656675736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d616476616e63652d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "refusal": "illegal_transition",
+        "request_id": "req-advance-1"
+      },
+      "id": "refused-illegal-transition",
+      "kind": "refused",
+      "note": "the reported progress does not follow the durable one along the lattice, which is a rejection rather than a conflict: the request does not become right by being retried against a newer revision",
+      "outcome": "rejected"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b227265667573616c223a2272656769737472795f66756c6c227d2c226b696e64223a2272656675736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d72656769737465722d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "refusal": "registry_full",
+        "request_id": "req-register-1"
+      },
+      "id": "refused-registry-full",
+      "kind": "refused",
+      "note": "capacity is a refusal and never an eviction: forgetting a batch would strand the only durable record of what it declared",
+      "outcome": "rejected"
+    }
+  ],
+  "rust_only_encode_refusals": [
+    {
+      "id": "advance-member-sequence-coupling",
+      "kind": "advance_member",
+      "note": "`ready` means the daemon holds a document and no event has arrived, so a non-zero sequence beside it describes a run index row that cannot exist. A property of the request alone, and one the generated encoder does not hold",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "expected_revision": "1",
+        "last_sequence": "5",
+        "member_key": "submit/only",
+        "state": "ready"
+      },
+      "request_id": "req-advance-1",
+      "rust_category": "batch_control_sequence_coupling"
+    },
+    {
+      "id": "advance-member-terminal-at-zero-sequence",
+      "kind": "advance_member",
+      "note": "the coupling from the other side: a member that reached a terminal state with no spool event behind it",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "expected_revision": "1",
+        "last_sequence": "0",
+        "member_key": "submit/only",
+        "state": "completed"
+      },
+      "request_id": "req-advance-1",
+      "rust_category": "batch_control_sequence_coupling"
+    },
+    {
+      "id": "register-batch-duplicate-member",
+      "kind": "register_batch",
+      "note": "one key named twice. A caller that named a submission twice believes it asked for something it did not, so the registration is refused rather than collapsed — a relation between two items of one list, which the generated encoder's per-item bounds cannot see",
+      "params": {
+        "batch_id": "batch/nightly-eval",
+        "concurrency": {
+          "kind": "sequential",
+          "max_in_flight": null
+        },
+        "label": null,
+        "members": [
+          "submit/only",
+          "submit/only"
+        ]
+      },
+      "request_id": "req-register-1",
+      "rust_category": "batch_duplicate_member"
+    }
+  ],
+  "rust_only_encode_refusals_note": "Requests the Rust constructors refuse and the generated encoder builds. Each breaks a rule relating two fields of a request, or two items of one list, which the generated surface does not hold. The runner asserts these encode, so the gap is measured rather than described.",
+  "rust_only_refusals": [
+    {
+      "id": "rollup-contradicts-members",
+      "note": "the rule that makes serving a derived state safe: the carried rollup is recomputed from the members beside it and refused when the two disagree. A daemon claiming `completed` over a running member cannot get that answer past its own decoder — and a client reading this file's decoder can only hold that the word is one of the six",
+      "payload_hex": "7b22626f6479223a7b226261746368223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d2c226d656d62657273223a5b7b226b6579223a227375626d69742f6f6e6c79222c226c6173745f73657175656e6365223a372c226f7264696e616c223a302c227265766973696f6e223a322c227374617465223a2272756e6e696e67222c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c227374617465223a22636f6d706c65746564227d2c226b696e64223a2262617463685f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d",
+      "rust_category": "batch_rollup_contradicts_members"
+    },
+    {
+      "id": "detail-empty-membership",
+      "note": "a batch with no member has no state to roll up: `completed` over nothing is vacuously true, which is why the empty slice answers nothing at all. The empty *registration* is refused on the way out, because a builder holds the list it is sending",
+      "payload_hex": "7b22626f6479223a7b226261746368223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d2c226d656d62657273223a5b5d2c227374617465223a22636f6d706c65746564227d2c226b696e64223a2262617463685f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d",
+      "rust_category": "batch_empty"
+    },
+    {
+      "id": "detail-duplicate-member",
+      "note": "one key named twice, refused rather than collapsed: a rollup over a membership that counted one submission twice would summarize the wrong set",
+      "payload_hex": "7b22626f6479223a7b226261746368223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d2c226d656d62657273223a5b7b226b6579223a227375626d69742f6f6e6c79222c226c6173745f73657175656e6365223a372c226f7264696e616c223a302c227265766973696f6e223a322c227374617465223a22636f6d706c65746564222c22757064617465645f61745f6d73223a313730303030303030303030307d2c7b226b6579223a227375626d69742f6f6e6c79222c226c6173745f73657175656e6365223a372c226f7264696e616c223a312c227265766973696f6e223a322c227374617465223a22636f6d706c65746564222c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c227374617465223a22636f6d706c65746564227d2c226b696e64223a2262617463685f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d",
+      "rust_category": "batch_duplicate_member"
+    },
+    {
+      "id": "detail-members-out-of-order",
+      "note": "ordinals that are not `0..n` in order. Registration is the only writer of ordinals and writes exactly that, so a gap names a membership nobody declared",
+      "payload_hex": "7b22626f6479223a7b226261746368223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d2c226d656d62657273223a5b7b226b6579223a227375626d69742f6f6e6c79222c226c6173745f73657175656e6365223a372c226f7264696e616c223a302c227265766973696f6e223a322c227374617465223a22636f6d706c65746564222c22757064617465645f61745f6d73223a313730303030303030303030307d2c7b226b6579223a227375626d69742f7a65627261222c226c6173745f73657175656e6365223a372c226f7264696e616c223a322c227265766973696f6e223a322c227374617465223a22636f6d706c65746564222c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c227374617465223a22636f6d706c65746564227d2c226b696e64223a2262617463685f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d",
+      "rust_category": "batch_control_members_out_of_order"
+    },
+    {
+      "id": "member-sequence-coupling",
+      "note": "`ready` means no event has arrived, so a non-zero spool sequence beside it describes a run index row that cannot exist",
+      "payload_hex": "7b22626f6479223a7b226261746368223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d2c226d656d62657273223a5b7b226b6579223a227375626d69742f6f6e6c79222c226c6173745f73657175656e6365223a352c226f7264696e616c223a302c227265766973696f6e223a322c227374617465223a227265616479222c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c227374617465223a22636f6d706c65746564227d2c226b696e64223a2262617463685f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d",
+      "rust_category": "batch_control_sequence_coupling"
+    },
+    {
+      "id": "member-unsubmitted-above-first-revision",
+      "note": "registration is the only writer of `unsubmitted` and it always writes revision one, and the lattice has no edge back, so an unsubmitted member at revision two names a row nothing here wrote",
+      "payload_hex": "7b22626f6479223a7b226261746368223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a312c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d2c226d656d62657273223a5b7b226b6579223a227375626d69742f6f6e6c79222c226c6173745f73657175656e6365223a302c226f7264696e616c223a302c227265766973696f6e223a322c227374617465223a22756e7375626d6974746564222c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c227374617465223a2270656e64696e67227d2c226b696e64223a2262617463685f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d",
+      "rust_category": "batch_control_unwritten_revision"
+    },
+    {
+      "id": "advance-receipt-claims-unsubmitted",
+      "note": "the other half of the advance pin: the revision is believable and the progress is not, because no advance can leave a member unsubmitted",
+      "payload_hex": "7b22626f6479223a7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c226c6173745f73657175656e6365223a302c226d656d6265725f6b6579223a227375626d69742f6f6e6c79222c226f7264696e616c223a302c227265766973696f6e223a322c227374617465223a22756e7375626d6974746564222c22757064617465645f61745f6d73223a313730303030303030303030307d2c226b696e64223a226d656d6265725f616476616e636564222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d616476616e63652d31222c2276657273696f6e223a317d",
+      "rust_category": "batch_control_not_an_advance"
+    },
+    {
+      "id": "page-out-of-order",
+      "note": "rows that do not strictly increase by durable row identity, so the next page would re-serve or skip",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a352c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d2c7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a322c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "rust_category": "batch_control_page_out_of_order"
+    },
+    {
+      "id": "continuation-incoherent",
+      "note": "rows follow, with no cursor to resume from",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b5d2c226d6f7265223a747275652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "rust_category": "batch_control_continuation_incoherent"
+    },
+    {
+      "id": "continuation-rewinds",
+      "note": "a continuation cursor below the last row on the page, which would re-serve it",
+      "payload_hex": "7b22626f6479223a7b2262617463686573223a5b7b2262617463685f6964223a2262617463682f6e696768746c792d6576616c222c22636f6e63757272656e6379223a7b226b696e64223a22626f756e6465645f706172616c6c656c222c226d61785f696e5f666c69676874223a347d2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e7472795f6964223a392c226c6162656c223a226e696768746c79222c227265766973696f6e223a317d5d2c226d6f7265223a747275652c226e6578745f637572736f72223a347d2c226b696e64223a2262617463685f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "rust_category": "batch_control_continuation_rewinds"
+    },
+    {
+      "id": "conflict-without-disagreement",
+      "note": "two revisions that agree is agreement rather than a conflict, and answering one would tell a caller to retry with the revision it already used. Unlike the approval lane's, this one *is* a decoder rule in Rust — the conflict frame carries both sides — so it is a real gap here rather than a constructor-only refusal",
+      "payload_hex": "7b22626f6479223a7b2264757261626c655f7265766973696f6e223a332c2265787065637465645f7265766973696f6e223a337d2c226b696e64223a227265766973696f6e5f636f6e666c696374222c2270726f746f636f6c223a226175746f6d6f6e697175652e62617463682e636f6e74726f6c222c22726571756573745f6964223a227265712d616476616e63652d31222c2276657273696f6e223a317d",
+      "rust_category": "batch_control_conflict_without_disagreement"
+    }
+  ],
+  "rust_only_refusals_note": "Payloads the Rust decoder refuses and the generated TypeScript accepts. Each breaks a rule relating two fields of a decoded message — and a batch has more of those than any lane before it, because a batch is a relation between its members. The rolled-up state is the one that matters most: it is recomputed from the members beside it in Rust and only held to the closed vocabulary here. The advance receipt's revision is deliberately absent from this list: `two or above` is a bound on one field's own value, the generated decoder does hold it, and decode_refusals is where that is proved from both ends. The runner asserts these decode, so teaching the generator one of these rules turns the suite red until the entry moves to decode_refusals.",
+  "version": 1
+}

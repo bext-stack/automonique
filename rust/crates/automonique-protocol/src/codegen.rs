@@ -75,6 +75,23 @@
 //!   [`crate::approval_api::ApprovalResponse::Refused`]), with the record body
 //!   they nest and the four closed vocabularies they carry.
 //!
+//! - The whole control surface of `automonique.batch.control` from
+//!   [`crate::batch_api`]: all four requests
+//!   ([`crate::batch_api::BatchRequest::RegisterBatch`],
+//!   [`crate::batch_api::BatchRequest::AdvanceMember`],
+//!   [`crate::batch_api::BatchRequest::ListBatches`] and
+//!   [`crate::batch_api::BatchRequest::BatchDetail`]) and all six answers
+//!   ([`crate::batch_api::BatchResponse::Registered`],
+//!   [`crate::batch_api::BatchResponse::MemberAdvanced`],
+//!   [`crate::batch_api::BatchResponse::BatchList`],
+//!   [`crate::batch_api::BatchResponse::BatchDetail`],
+//!   [`crate::batch_api::BatchResponse::Conflict`] and
+//!   [`crate::batch_api::BatchResponse::Refused`]), with the two row bodies they
+//!   nest, the discriminated concurrency policy all three of those carry, and
+//!   the four closed vocabularies — three of which are
+//!   [`crate::batch_runner`]'s rather than that lane's, reused rather than
+//!   re-spelled.
+//!
 //! # What it does not cover
 //!
 //! Everything else in the crate, including: `RunSpec` and the run surface,
@@ -201,6 +218,54 @@
 //! at the answering end, where both sides are in hand, and cannot be re-derived
 //! from a conflict frame that carries only the recorded side.
 //!
+//! `automonique.batch.control` brings a longer list than the approval lane and
+//! two rules that cross. The **advance receipt's revision** is one: registration
+//! is the only writer of revision one, so "an advance's revision is at least
+//! two" is a bound on one field's own value, emitted as a bounded integer of
+//! domain `2..` and refused under
+//! [`NotAnAdvance`](crate::batch_api::BatchApiError::NotAnAdvance) — the same
+//! category
+//! [`MemberReceiptView::new`](crate::batch_api::MemberReceiptView::new) answers.
+//! The **concurrency coupling** is the other, and it crosses in both directions:
+//! exactly one of the two words carries a ceiling, which the generated union
+//! makes unrepresentable in the type checker and the generated encoder and
+//! decoder both refuse at runtime, under the same categories
+//! [`concurrency_from_body`](crate::batch_api) and
+//! [`ConcurrencyPolicy::bounded_parallel`](crate::batch_runner::ConcurrencyPolicy::bounded_parallel)
+//! report.
+//!
+//! What stays outside is every relation between two fields of a decoded batch
+//! message, and this lane has more of them than any other, because a batch *is*
+//! a relation between its members:
+//!
+//! - the carried rollup agreeing with the members beside it
+//!   ([`RollupContradictsMembers`](crate::batch_runner::BatchError::RollupContradictsMembers)) —
+//!   the rule that makes serving a derived state safe, held by the Rust decoder
+//!   and by nothing here;
+//! - a membership that is the ordinals `0..n` in order
+//!   ([`MembersOutOfOrder`](crate::batch_api::BatchApiError::MembersOutOfOrder) —
+//!   the same variant also names an ordinal outside this lane's membership,
+//!   which the generated surface *does* refuse, because that is one field's own
+//!   bound);
+//! - a member key named twice
+//!   ([`DuplicateMember`](crate::batch_runner::BatchError::DuplicateMember));
+//! - a detail carrying no member at all
+//!   ([`EmptyBatch`](crate::batch_runner::BatchError::EmptyBatch) — the empty
+//!   *registration* is refused on the way out, because a builder holds the list);
+//! - a reported sequence agreeing with the progress beside it
+//!   ([`SequenceCoupling`](crate::batch_api::BatchApiError::SequenceCoupling)),
+//!   on a request and on a decoded row alike;
+//! - an `unsubmitted` member at a revision other than one, and an advance
+//!   receipt claiming `unsubmitted`
+//!   ([`UnwrittenRevision`](crate::batch_api::BatchApiError::UnwrittenRevision)
+//!   and [`NotAnAdvance`](crate::batch_api::BatchApiError::NotAnAdvance)'s other
+//!   half);
+//! - page rows strictly increasing by durable row identity, `more` agreeing with
+//!   `next_cursor`, and a continuation cursor reaching the last row it served;
+//!   and
+//! - a conflict naming two revisions that agree
+//!   ([`ConflictWithoutDisagreement`](crate::batch_api::BatchApiError::ConflictWithoutDisagreement)).
+//!
 //! [`WithdrawnAtFirstRevision`]: crate::automation_api::AutomationApiError::WithdrawnAtFirstRevision
 //! [`ContinuationIncoherent`]: crate::automation_api::AutomationApiError::ContinuationIncoherent
 //! [`ConflictWithoutDisagreement`]: crate::automation_api::AutomationApiError::ConflictWithoutDisagreement
@@ -232,6 +297,8 @@ use crate::automation::EnablementState;
 use crate::automation_api::{
     AutomationApiError, AutomationRefusal, ENABLEMENT_STATES, requires_cause,
 };
+use crate::batch_api::{BatchApiError, BatchRefusal};
+use crate::batch_runner::{BatchError, BatchState, ConcurrencyKind, MemberProgress};
 use crate::codec::CodecError;
 use crate::event::Authority;
 use crate::primitives::ValueError;
@@ -729,6 +796,9 @@ pub const AUTOMATION_MODULE: &str = "automation";
 /// The `automonique.approval` decision surface.
 pub const APPROVAL_MODULE: &str = "approval";
 
+/// The `automonique.batch.control` registration surface.
+pub const BATCH_MODULE: &str = "batch";
+
 /// The file one module is written to.
 #[must_use]
 pub fn module_file_name(module: &str) -> String {
@@ -910,6 +980,33 @@ pub enum RequestValue {
         /// Category answered for a value outside the bound.
         refusal_category: String,
     },
+    /// A nested body whose discriminant decides whether it carries a payload.
+    ///
+    /// The generated input is the union [`DiscriminatedBody`] declares, and the
+    /// encoder it emits is what turns that union into the two-key wire object.
+    /// The refusal categories live on the body rather than here, because the
+    /// same encoder serves every request that carries one.
+    Discriminated {
+        /// Generated union type, whose encoder this field calls.
+        type_name: String,
+    },
+    /// A bounded array of checked strings, in the order the caller supplied.
+    ///
+    /// The order is kept rather than sorted: a batch's declaration order
+    /// becomes its members' ordinals, so sorting here would silently renumber
+    /// them.
+    CheckedArray {
+        /// Generated checked-string type of each item.
+        type_name: String,
+        /// Category answered for an item the constructor refuses.
+        refusal_category: String,
+        /// Generated constant naming the largest admissible length.
+        max_items_constant: String,
+        /// Category answered above that length.
+        oversize_category: String,
+        /// Category answered for a list that names nothing.
+        empty_category: String,
+    },
     /// A set of enum spellings canonicalized into declaration order, or `null`.
     NullableEnumSet {
         /// Generated enumeration type.
@@ -947,7 +1044,9 @@ impl RequestField {
             RequestValue::Checked { type_name, .. }
             | RequestValue::Integer { type_name, .. }
             | RequestValue::RangedInteger { type_name, .. }
+            | RequestValue::Discriminated { type_name }
             | RequestValue::Enum { type_name, .. } => type_name.clone(),
+            RequestValue::CheckedArray { type_name, .. } => format!("readonly {type_name}[]"),
             RequestValue::HexBytes { .. } => "Uint8Array".to_owned(),
             RequestValue::NullableChecked { type_name, .. }
             | RequestValue::NullableInteger { type_name, .. } => format!("{type_name} | null"),
@@ -1058,6 +1157,23 @@ pub enum ResponseValue {
         /// would report the wrong one for every negative value.
         unsigned: bool,
     },
+    /// A bounded integer whose two bounds are *different* faults.
+    ///
+    /// [`Self::Integer`] answers one category for a value outside its domain,
+    /// which is right where one Rust refusal covers both ends. A member count
+    /// is not like that — zero is a batch with nothing in it, and a count above
+    /// this lane's ceiling is a membership the transport cannot carry — and the
+    /// two are the batch model's refusal and this lane's respectively.
+    RangedInteger {
+        /// Generated bounded-integer type.
+        type_name: String,
+        /// Category answered below the type's minimum.
+        below_category: String,
+        /// Category answered above the type's maximum.
+        above_category: String,
+        /// Whether the Rust decoder converts to `u64` before the domain bound.
+        unsigned: bool,
+    },
     /// A bounded integer that is always present and may be `null`.
     NullableInteger {
         /// Generated bounded-integer type.
@@ -1115,6 +1231,61 @@ pub struct BodyObject {
     pub fields: Vec<ResponseField>,
 }
 
+/// A nested wire body whose discriminant decides its payload.
+///
+/// One object with two keys — a closed word and a value that is present for
+/// exactly one of the words — read as a TypeScript discriminated union rather
+/// than as a struct with a nullable field. The two shapes are not the same
+/// claim: `{kind: "sequential", max_in_flight: null}` invites a reader to ask
+/// what a sequential policy's ceiling is, and the union says there is no such
+/// question.
+///
+/// The generated encoder and decoder both refuse the two incoherent
+/// combinations — a bare word carrying a payload, a carrying word without one —
+/// because the Rust decoder does, and because a caller that supplied either
+/// asked for something this protocol cannot mean.
+///
+/// The shape is deliberately narrow: any number of payload-free words and
+/// exactly one that carries the payload. A second carrying word would need a
+/// second payload type and a different emitted decoder, and `tests/codegen.rs`
+/// holds the generator to the shape it actually emits.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DiscriminatedBody {
+    /// TypeScript name of the union.
+    pub name: String,
+    /// One-line description emitted above the declarations.
+    pub doc: String,
+    /// Wire key carrying the discriminant.
+    pub tag_field: String,
+    /// Generated enumeration that closes the discriminant.
+    pub tag_type: String,
+    /// Category answered for a word this build does not define.
+    pub unknown_tag_category: String,
+    /// Wire key carrying the payload, `null` under every payload-free word.
+    pub payload_field: String,
+    /// Generated bounded-integer type of the payload.
+    pub payload_type: String,
+    /// Category answered below the payload's minimum.
+    pub payload_below_category: String,
+    /// Category answered above the payload's maximum.
+    pub payload_above_category: String,
+    /// Largest value the Rust decoder converts the payload through before it
+    /// judges the domain.
+    ///
+    /// The ceiling is a `u32` in Rust and the wire is signed 64-bit, so a value
+    /// outside the narrower width is a malformed body rather than a domain
+    /// refusal — a distinction a decoder that applied the domain first would
+    /// report the wrong category for.
+    pub payload_wire_max: i64,
+    /// Words that carry no payload, emitted in sorted order.
+    pub bare_tags: Vec<String>,
+    /// The one word that carries the payload.
+    pub carrying_tag: String,
+    /// Category for a body that is not the exact shape, or whose two keys
+    /// disagree.
+    pub invalid_body_category: String,
+}
+
 /// One response a client can decode.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ResponseDecoder {
@@ -1159,6 +1330,8 @@ pub struct CommandSurface {
     pub field_invalid_category: String,
     /// Category for an envelope field that breaks its own grammar.
     pub field_grammar_category: String,
+    /// Discriminated nested bodies, emitted before the objects that carry them.
+    pub discriminated_bodies: Vec<DiscriminatedBody>,
     /// Nested bodies the requests and responses carry, emitted in name order.
     pub body_objects: Vec<BodyObject>,
     /// Requests, emitted in kind order.
@@ -1573,6 +1746,35 @@ export function boundedBytes(
   }
   if (value.length === 0) throw new RefusalError(emptyCategory, "empty document");
   return value;
+}
+
+/**
+ * Bound a list before its items are encoded, keeping the order it was given in.
+ *
+ * The length is judged before any item is validated, which is the order the
+ * Rust constructors judge it in: a membership above the ceiling is refused for
+ * being too long, not for whatever its hundred-and-twenty-ninth key turns out
+ * to be. The two ends carry different categories because they are different
+ * faults — a unit with nothing in it, and a unit larger than the frame can
+ * carry — and they are the model's refusal and the transport's respectively.
+ *
+ * Nothing is sorted and nothing is deduplicated. Where a list's order is its
+ * items' ordinals, sorting would silently renumber them.
+ */
+export function boundedItems<T>(
+  values: readonly T[],
+  maxItems: number,
+  oversizeCategory: string,
+  emptyCategory: string,
+): readonly T[] {
+  if (values.length > maxItems) {
+    throw new RefusalError(
+      oversizeCategory,
+      `${values.length} items; maximum is ${maxItems}`,
+    );
+  }
+  if (values.length === 0) throw new RefusalError(emptyCategory, "empty list");
+  return values;
 }
 
 /**
@@ -2190,6 +2392,7 @@ fn admin_command_module() -> GeneratedModule {
             oversize_category: "ADMIN_FRAME_SIZE".to_owned(),
             field_invalid_category: "WIRE_FIELD_INVALID".to_owned(),
             field_grammar_category: "WIRE_FIELD_GRAMMAR".to_owned(),
+            discriminated_bodies: Vec::new(),
             body_objects: Vec::new(),
             requests: vec![
                 RequestCommand {
@@ -2726,6 +2929,7 @@ fn runs_module() -> GeneratedModule {
             oversize_category: "RUNS_FRAME_SIZE".to_owned(),
             field_invalid_category: "RUNS_FIELD_INVALID".to_owned(),
             field_grammar_category: "RUNS_FIELD_GRAMMAR".to_owned(),
+            discriminated_bodies: Vec::new(),
             body_objects: vec![
                 BodyObject {
                     name: "RunLifecycleEvent".to_owned(),
@@ -3370,6 +3574,7 @@ fn automation_module() -> GeneratedModule {
             oversize_category: "AUTOMATION_FRAME_SIZE".to_owned(),
             field_invalid_category: "AUTOMATION_FIELD_INVALID".to_owned(),
             field_grammar_category: "AUTOMATION_FIELD_GRAMMAR".to_owned(),
+            discriminated_bodies: Vec::new(),
             body_objects: vec![BodyObject {
                 name: "AutomationRecord".to_owned(),
                 doc: "One validated `automations` row. `actor` is the last operator to change \
@@ -4029,6 +4234,7 @@ fn approval_module() -> GeneratedModule {
             oversize_category: "APPROVAL_FRAME_SIZE".to_owned(),
             field_invalid_category: "APPROVAL_FIELD_INVALID".to_owned(),
             field_grammar_category: "APPROVAL_FIELD_GRAMMAR".to_owned(),
+            discriminated_bodies: Vec::new(),
             body_objects: vec![BodyObject {
                 name: "ApprovalRecord".to_owned(),
                 doc: "One validated `approval_decisions` row. `revision` is always one and this \
@@ -4257,6 +4463,921 @@ fn approval_module() -> GeneratedModule {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The `automonique.batch.control` registration surface
+//
+// Three of the four vocabularies below are `batch_runner`'s rather than this
+// lane's: a batch document and a batch control message use one set of words,
+// because there is one set of words. The `match`es are written out for the same
+// reason they are on every other lane — a state added to `RunState` reaches
+// `MemberProgress` automatically in Rust, and this file is where that silent
+// widening is turned into a compile error.
+// ---------------------------------------------------------------------------
+
+/// The declared [`ConcurrencyKind`] spellings, pinned to the Rust wire strings.
+fn concurrency_kind_values() -> Vec<String> {
+    ConcurrencyKind::ALL
+        .into_iter()
+        .map(|kind| match kind {
+            ConcurrencyKind::Sequential | ConcurrencyKind::BoundedParallel => {
+                kind.as_str().to_owned()
+            }
+        })
+        .collect()
+}
+
+/// The declared [`MemberProgress`] spellings, pinned to the Rust wire strings.
+///
+/// Seven: the six [`RunState`]s the runner's spool defines, reused rather than
+/// re-spelled, and the one a run vocabulary cannot express — a member for which
+/// no submission has been recorded at all. The inner `match` is exhaustive over
+/// [`RunState`] as well, so a seventh run state cannot widen this vocabulary
+/// without this file being asked about it.
+fn member_progress_values() -> Vec<String> {
+    MemberProgress::ALL
+        .into_iter()
+        .map(|progress| match progress {
+            MemberProgress::Unsubmitted
+            | MemberProgress::Run(
+                RunState::Ready
+                | RunState::Running
+                | RunState::Completed
+                | RunState::Failed
+                | RunState::Cancelled
+                | RunState::TimedOut,
+            ) => progress.as_str().to_owned(),
+        })
+        .collect()
+}
+
+/// The declared [`BatchState`] spellings, pinned to the Rust wire strings.
+fn batch_state_values() -> Vec<String> {
+    BatchState::ALL
+        .into_iter()
+        .map(|state| match state {
+            BatchState::Pending
+            | BatchState::Running
+            | BatchState::Completed
+            | BatchState::Failed
+            | BatchState::Cancelled
+            | BatchState::Mixed => state.as_str().to_owned(),
+        })
+        .collect()
+}
+
+/// The declared [`BatchRefusal`] spellings, pinned to the Rust wire strings.
+fn batch_refusal_values() -> Vec<String> {
+    BatchRefusal::ALL
+        .into_iter()
+        .map(|refusal| match refusal {
+            BatchRefusal::UnknownBatch
+            | BatchRefusal::UnknownMember
+            | BatchRefusal::AlreadyRegistered
+            | BatchRefusal::EmptyBatch
+            | BatchRefusal::TooManyMembers
+            | BatchRefusal::DuplicateMember
+            | BatchRefusal::ConcurrencyCeiling
+            | BatchRefusal::IllegalTransition
+            | BatchRefusal::SequenceCoupling
+            | BatchRefusal::SequenceRegression
+            | BatchRefusal::CursorOutOfRange
+            | BatchRefusal::RegistryFull
+            | BatchRefusal::InvalidField => refusal.as_str().to_owned(),
+        })
+        .collect()
+}
+
+/// A refusal category, pinned to the spelling the Batch control API reports.
+fn batch_category(name: &str, doc: &str, error: &BatchApiError) -> Constant {
+    Constant {
+        name: name.to_owned(),
+        doc: doc.to_owned(),
+        value: ConstantValue::Text(error.category().to_owned()),
+    }
+}
+
+/// A security-sensitive enumeration of the Batch control API.
+///
+/// All four are [`SecuritySensitiveEnum`](crate::codec::SecuritySensitiveEnum)
+/// in Rust and all four fail closed here. A reader that retained an undefined
+/// member progress would have to decide what an unnameable answer means for the
+/// rollup over it, and both available guesses are wrong: counting it as
+/// finished invents a completion, and counting it as outstanding invents work
+/// still to do.
+fn batch_enum(name: &str, values: Vec<String>) -> GeneratedEnum {
+    GeneratedEnum {
+        name: name.to_owned(),
+        sensitivity: EnumSensitivity::SecuritySensitive,
+        values,
+        // No set of these reaches the wire: this lane carries one word per
+        // field and never a filter over a vocabulary.
+        wire_order: None,
+    }
+}
+
+/// A response or nested-body field carrying one of this lane's vocabularies.
+fn batch_enum_field(name: &str, type_name: &str) -> ResponseField {
+    ResponseField {
+        name: name.to_owned(),
+        value: ResponseValue::Enum {
+            type_name: type_name.to_owned(),
+            unknown_category: "BATCH_UNKNOWN_ENUM_VALUE".to_owned(),
+        },
+    }
+}
+
+/// A response or nested-body field carrying one of this lane's identifiers.
+fn batch_checked_field(name: &str, type_name: &str) -> ResponseField {
+    ResponseField {
+        name: name.to_owned(),
+        value: ResponseValue::Checked {
+            type_name: type_name.to_owned(),
+            refusal_category: "BATCH_INVALID_FIELD".to_owned(),
+        },
+    }
+}
+
+/// A response or nested-body field carrying a bounded integer.
+///
+/// `unsigned` mirrors which Rust reader the field goes through, exactly as it
+/// does on the three lanes before this one: an ordinal, a revision and a row
+/// identity are read through `unsigned()`, which refuses a negative as a
+/// malformed body before the domain is consulted, while a durable instant is
+/// read signed and refused by the domain itself for being before the epoch.
+fn batch_integer_field(
+    name: &str,
+    type_name: &str,
+    refusal_category: &str,
+    unsigned: bool,
+) -> ResponseField {
+    ResponseField {
+        name: name.to_owned(),
+        value: ResponseValue::Integer {
+            type_name: type_name.to_owned(),
+            refusal_category: refusal_category.to_owned(),
+            unsigned,
+        },
+    }
+}
+
+/// TypeScript name of the branded batch identity.
+const BATCH_ID: &str = "BatchId";
+
+/// TypeScript name of the branded member key, which is a submission's own
+/// idempotency key.
+const BATCH_MEMBER_KEY: &str = "BatchMemberKey";
+
+/// TypeScript name of the bounded operator-supplied label.
+const BATCH_LABEL: &str = "BatchLabel";
+
+/// TypeScript name of the branded listing position.
+const BATCH_CURSOR: &str = "BatchCursor";
+
+/// TypeScript name of the durable revision a registration or a read reports.
+const BATCH_REVISION: &str = "BatchRevision";
+
+/// TypeScript name of the declared concurrency ceiling.
+const CONCURRENCY_CEILING: &str = "ConcurrencyCeiling";
+
+/// TypeScript name of the member's position in its batch's declaration order.
+const MEMBER_ORDINAL: &str = "MemberOrdinal";
+
+/// TypeScript name of the discriminated concurrency policy.
+const BATCH_CONCURRENCY: &str = "BatchConcurrency";
+
+/// The six columns one `batch_members` row carries, as a reader decodes them.
+fn batch_member_fields() -> Vec<ResponseField> {
+    vec![
+        batch_checked_field("key", BATCH_MEMBER_KEY),
+        batch_integer_field("last_sequence", "LastSequence", "BATCH_INVALID_BODY", true),
+        batch_integer_field(
+            "ordinal",
+            MEMBER_ORDINAL,
+            "BATCH_MEMBERS_OUT_OF_ORDER",
+            true,
+        ),
+        batch_integer_field("revision", BATCH_REVISION, "BATCH_UNWRITTEN_REVISION", true),
+        batch_enum_field("state", "MemberProgress"),
+        batch_integer_field(
+            "updated_at_ms",
+            EPOCH_MILLIS,
+            "BATCH_TIME_BEFORE_EPOCH",
+            false,
+        ),
+    ]
+}
+
+/// The six columns one `batches` row carries, as a reader decodes them.
+///
+/// One list, used twice: a batch row travels inside a listing page and inside a
+/// detail read's `batch` key, and the two readings cannot be allowed to drift
+/// into disagreeing about a column. The Rust side has the same shape for the
+/// same reason — `BatchRecordView::from_body` is what both go through.
+fn batch_record_fields() -> Vec<ResponseField> {
+    vec![
+        batch_checked_field("batch_id", BATCH_ID),
+        ResponseField {
+            name: "concurrency".to_owned(),
+            value: ResponseValue::Object {
+                type_name: BATCH_CONCURRENCY.to_owned(),
+            },
+        },
+        batch_integer_field(
+            "created_at_ms",
+            EPOCH_MILLIS,
+            "BATCH_TIME_BEFORE_EPOCH",
+            false,
+        ),
+        batch_integer_field("entry_id", DURABLE_ROW_ID, "BATCH_UNWRITTEN_ROW", true),
+        ResponseField {
+            name: "label".to_owned(),
+            value: ResponseValue::NullableChecked {
+                type_name: BATCH_LABEL.to_owned(),
+                refusal_category: "BATCH_INVALID_FIELD".to_owned(),
+            },
+        },
+        batch_integer_field("revision", BATCH_REVISION, "BATCH_UNWRITTEN_REVISION", true),
+    ]
+}
+
+/// The `automonique.batch.control` surface: what a batch declares, what a
+/// writer reports about one member, and what a reader gets back.
+fn batch_module() -> GeneratedModule {
+    GeneratedModule {
+        file_name: module_file_name(BATCH_MODULE),
+        doc: "The native Batch control surface: declare which submissions a batch tracks, report \
+              where each of them has got to, and read both back. It submits nothing, schedules \
+              nothing and runs nothing: a declared concurrency policy is a recorded intention, \
+              and a member's progress is a writer's claim rather than a reading of a run."
+            .to_owned(),
+        source: "automonique_protocol::batch_api".to_owned(),
+        // A correlation identifier, a durable row identity, a durable instant
+        // and a spool sequence are wire vocabularies rather than one lane's, so
+        // this module reads them from where they are already declared. The
+        // sequence in particular: a member's `last_sequence` *is* the runs
+        // lane's, because the number a writer reports here is the one it read
+        // there.
+        imports: vec![
+            ModuleImport {
+                module: ADMIN_COMMAND_MODULE.to_owned(),
+                values: vec![DURABLE_ROW_ID.to_owned(), "RequestId".to_owned()],
+                types: Vec::new(),
+            },
+            ModuleImport {
+                module: RUNS_MODULE.to_owned(),
+                values: vec![EPOCH_MILLIS.to_owned(), "LastSequence".to_owned()],
+                types: Vec::new(),
+            },
+        ],
+        constants: vec![
+            Constant {
+                name: "BATCH_CONTROL_API_SCHEMA_V1".to_owned(),
+                doc: "Stable schema identifier for the version-one batch control surface."
+                    .to_owned(),
+                value: ConstantValue::Text(
+                    crate::batch_api::BATCH_CONTROL_API_SCHEMA_V1.to_owned(),
+                ),
+            },
+            Constant {
+                name: "BATCH_CONTROL_PROTOCOL".to_owned(),
+                doc: "Stable protocol name for the native Batch control API. Dotted rather than \
+                      hyphenated, because the envelope's protocol grammar admits lowercase \
+                      letters, digits and dots and nothing else — and distinct from the batch \
+                      *document* schema, so a client cannot admit either shape under the other's \
+                      name."
+                    .to_owned(),
+                value: ConstantValue::Text(crate::batch_api::BATCH_CONTROL_PROTOCOL.to_owned()),
+            },
+            Constant {
+                name: "MAX_BATCH_CONTROL_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical message bytes this protocol will assemble or admit."
+                    .to_owned(),
+                value: ConstantValue::Count(crate::batch_api::MAX_BATCH_CONTROL_CANONICAL_BYTES),
+            },
+            Constant {
+                name: "MAX_BATCH_CONTROL_MEMBERS".to_owned(),
+                doc: "Maximum members one batch may declare *through this lane*. Half the batch \
+                      model's own ceiling, and derived rather than chosen: a maximal registration \
+                      of 256 maximal keys is about 66 KiB and the local socket reads 64 KiB. The \
+                      durable registry still holds 256; the two are deliberately not reconciled, \
+                      because that ceiling bounds a database write and this one bounds a wire \
+                      frame, and the smaller of the two is the one a client sees."
+                    .to_owned(),
+                value: ConstantValue::Count(crate::batch_api::MAX_BATCH_CONTROL_MEMBERS),
+            },
+            Constant {
+                name: "MAX_BATCH_PAGE_ITEMS".to_owned(),
+                doc: "Maximum batches one listing page may carry. Thirty-two, because a batch row \
+                      carries two maximal identifiers; the number is derived from this protocol's \
+                      frame arithmetic rather than chosen. A longer page is refused rather than \
+                      truncated: a truncated page that still answered `complete` is a silent drop."
+                    .to_owned(),
+                value: ConstantValue::Count(crate::batch_api::MAX_BATCH_PAGE_ITEMS),
+            },
+        ],
+        branded_ids: vec![
+            BrandedId {
+                // The registry's own grammar: non-empty, bounded, control-free,
+                // and nothing more. This protocol parses no identity and
+                // derives nothing from one, so a wire type stricter than the
+                // table would make a stored row unreadable through the only
+                // surface that serves it.
+                name: BATCH_ID.to_owned(),
+                max_bytes: crate::batch_runner::MAX_BATCH_ID_BYTES,
+                pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+            },
+            BrandedId {
+                // The idempotency key of the submission this member names,
+                // bounded by what the admin lane admits for one: a key this
+                // batch admitted and that lane refused would be a batch that
+                // could never be submitted.
+                name: BATCH_MEMBER_KEY.to_owned(),
+                max_bytes: crate::batch_runner::MAX_BATCH_MEMBER_KEY_BYTES,
+                pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+            },
+        ],
+        bounded_strings: vec![BoundedString {
+            // Operator-supplied and recorded verbatim. Absent is a fact rather
+            // than an empty string: a batch with no label carries null, and
+            // empty is refused.
+            name: BATCH_LABEL.to_owned(),
+            max_bytes: crate::batch_runner::MAX_BATCH_LABEL_BYTES,
+            pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+        }],
+        bounded_integers: vec![
+            BoundedInteger {
+                // Zero is the beginning of the listing rather than the absence
+                // of a cursor: this lane carries the registry's own exclusive
+                // cursor, so there is no coordinate to convert.
+                name: BATCH_CURSOR.to_owned(),
+                min: 0,
+                max: i64::MAX,
+            },
+            BoundedInteger {
+                name: "BatchPageSize".to_owned(),
+                min: 1,
+                max: i64::try_from(crate::batch_api::MAX_BATCH_PAGE_ITEMS)
+                    .expect("the page bound is within the wire range"),
+            },
+            BoundedInteger {
+                // Registration writes one and every accepted advance writes one
+                // higher, so zero names a row this product could not have
+                // written.
+                name: BATCH_REVISION.to_owned(),
+                min: 1,
+                max: i64::MAX,
+            },
+            BoundedInteger {
+                // An advance receipt's revision, which is a *stricter* domain
+                // than a row's: registration is the only writer of revision
+                // one, so an advance that claimed it would name a row no
+                // accepted advance could have left behind. The second half of
+                // that Rust rule — an advance cannot claim `unsubmitted` — is a
+                // relation between two fields and stays with the Rust decoder.
+                name: "AdvancedRevision".to_owned(),
+                min: 2,
+                max: i64::MAX,
+            },
+            BoundedInteger {
+                // A ceiling of zero admits nothing, and one above the batch
+                // model's own membership can never bind — an unbounded policy
+                // with a number written on it. The two are different refusals
+                // and the generated decoder reports them separately.
+                name: CONCURRENCY_CEILING.to_owned(),
+                min: 1,
+                max: i64::try_from(crate::batch_runner::MAX_BATCH_MEMBERS)
+                    .expect("the membership ceiling is within the wire range"),
+            },
+            BoundedInteger {
+                // A position in the declaration order, from zero. The ordinals
+                // being `0..n` in order is what makes a rollup over them mean
+                // anything; that they are contiguous is a relation between
+                // members and stays with the Rust decoder, but that each one is
+                // inside the membership this lane carries is a bound on its own
+                // value.
+                name: MEMBER_ORDINAL.to_owned(),
+                min: 0,
+                max: i64::try_from(crate::batch_api::MAX_BATCH_CONTROL_MEMBERS - 1)
+                    .expect("the ordinal ceiling is within the wire range"),
+            },
+            BoundedInteger {
+                name: "MemberCount".to_owned(),
+                min: 1,
+                max: i64::try_from(crate::batch_api::MAX_BATCH_CONTROL_MEMBERS)
+                    .expect("the membership ceiling is within the wire range"),
+            },
+        ],
+        enums: vec![
+            batch_enum("ConcurrencyKind", concurrency_kind_values()),
+            batch_enum("MemberProgress", member_progress_values()),
+            batch_enum("BatchState", batch_state_values()),
+            batch_enum("BatchRefusal", batch_refusal_values()),
+        ],
+        command_surface: Some(CommandSurface {
+            name: "Batch".to_owned(),
+            protocol_constant: "BATCH_CONTROL_PROTOCOL".to_owned(),
+            protocol: crate::batch_api::BATCH_CONTROL_PROTOCOL.to_owned(),
+            version: crate::codec::MajorVersion::FIRST.get(),
+            max_message_bytes_constant: "MAX_BATCH_CONTROL_CANONICAL_BYTES".to_owned(),
+            request_id_type: "RequestId".to_owned(),
+            categories: vec![
+                batch_category(
+                    "BATCH_COUNTER_OUT_OF_RANGE",
+                    "A counter is outside the range the integer-only wire codec carries.",
+                    &BatchApiError::CounterOutOfRange { field: "since" },
+                ),
+                batch_category(
+                    "BATCH_INVALID_BODY",
+                    "A body was not the exact shape defined for its kind, which includes a \
+                     concurrency policy whose two keys contradict each other.",
+                    &BatchApiError::InvalidBody,
+                ),
+                batch_category(
+                    "BATCH_INVALID_FIELD",
+                    "A bounded identity, member key or label was empty, over-long or \
+                     control-bearing.",
+                    &BatchApiError::Field {
+                        field: "batch_id",
+                        error: ValueError::Empty,
+                    },
+                ),
+                batch_category(
+                    "BATCH_MEMBERS_OUT_OF_ORDER",
+                    "A member carried an ordinal outside the membership this lane admits.",
+                    &BatchApiError::MembersOutOfOrder { position: 0 },
+                ),
+                batch_category(
+                    "BATCH_MEMBERSHIP_TOO_LARGE",
+                    "A membership was larger than this lane carries. The transport's ceiling \
+                     rather than the registry's, and the two are not reconciled.",
+                    &BatchApiError::MembershipTooLarge {
+                        max_members: 0,
+                        actual_members: 0,
+                    },
+                ),
+                batch_category(
+                    "BATCH_NOT_AN_ADVANCE",
+                    "An advance receipt described a row registration wrote rather than one an \
+                     advance produced.",
+                    &BatchApiError::NotAnAdvance {
+                        progress: MemberProgress::Unsubmitted,
+                        revision: 1,
+                    },
+                ),
+                batch_category(
+                    "BATCH_PAGE_SIZE_OUT_OF_RANGE",
+                    "A requested page size was zero — a page that admits nothing cannot make \
+                     progress — or above the largest page this protocol serves.",
+                    &BatchApiError::PageSizeOutOfRange {
+                        max_items: 0,
+                        requested: 0,
+                    },
+                ),
+                batch_category(
+                    "BATCH_PAGE_TOO_LARGE",
+                    "A page carried more batches than one page holds.",
+                    &BatchApiError::PageTooLarge {
+                        max_items: 0,
+                        actual_items: 0,
+                    },
+                ),
+                batch_category(
+                    "BATCH_TIME_BEFORE_EPOCH",
+                    "A durable instant was before the epoch, which the registry cannot hold.",
+                    &BatchApiError::TimeBeforeEpoch {
+                        field: "created_at_ms",
+                    },
+                ),
+                batch_category(
+                    "BATCH_UNKNOWN_KIND",
+                    "The message kind is not part of this closed protocol version.",
+                    &BatchApiError::UnknownKind,
+                ),
+                batch_category(
+                    "BATCH_UNWRITTEN_REVISION",
+                    "A revision was zero, which names a row no writer produced: registration \
+                     writes one and every accepted advance writes one higher.",
+                    &BatchApiError::UnwrittenRevision,
+                ),
+                batch_category(
+                    "BATCH_UNWRITTEN_ROW",
+                    "A durable row identity was zero, which names a row no writer produced.",
+                    &BatchApiError::UnwrittenRow { field: "entry_id" },
+                ),
+                // The three below are the batch *model*'s categories, which
+                // this lane reports unchanged: they are properties of a batch
+                // rather than of this transport, and restating them here would
+                // create a second authority for one vocabulary. They keep the
+                // model's own `batch_` prefix for exactly that reason.
+                batch_category(
+                    "BATCH_CONCURRENCY_CEILING_UNREACHABLE",
+                    "A concurrency ceiling above what a batch could ever place in flight, which \
+                     is an unbounded policy with a number written on it.",
+                    &BatchApiError::Model(BatchError::ConcurrencyCeilingUnreachable {
+                        max_members: 0,
+                        requested: 0,
+                    }),
+                ),
+                batch_category(
+                    "BATCH_CONCURRENCY_CEILING_ZERO",
+                    "A concurrency ceiling of zero, which admits no work at all rather than \
+                     meaning `no limit`.",
+                    &BatchApiError::Model(BatchError::ConcurrencyCeilingZero),
+                ),
+                batch_category(
+                    "BATCH_EMPTY_BATCH",
+                    "A batch named no member, which is a unit with nothing in it. An empty batch \
+                     has no rolled-up state either, because `completed` over nothing would be \
+                     vacuously true.",
+                    &BatchApiError::Model(BatchError::EmptyBatch),
+                ),
+                // And these three are the shared codec's own, reported
+                // unchanged under this lane's prefix because one name has one
+                // declaring module.
+                batch_category(
+                    "BATCH_FIELD_GRAMMAR",
+                    "An envelope field cleared the bounded-value rules and broke its own grammar.",
+                    &BatchApiError::Codec(CodecError::Grammar {
+                        field: "request_id",
+                    }),
+                ),
+                batch_category(
+                    "BATCH_FIELD_INVALID",
+                    "An envelope field was empty, too long, or carried a control character.",
+                    &BatchApiError::Codec(CodecError::Field {
+                        field: "request_id",
+                        error: ValueError::Empty,
+                    }),
+                ),
+                batch_category(
+                    "BATCH_UNKNOWN_ENUM_VALUE",
+                    "A concurrency kind, member progress, batch state or refusal this build does \
+                     not define. All four vocabularies fail closed: a member state nobody can \
+                     name has no safe reading, and the rollup over it would be a claim about work \
+                     this build cannot describe.",
+                    &BatchApiError::Codec(CodecError::UnknownEnumValue { field: "state" }),
+                ),
+                Constant {
+                    // As on the three lanes before this one, nothing pins this
+                    // spelling: the local admin transport reports it for the
+                    // same fault, and this protocol's own frames are read under
+                    // that transport's ceiling.
+                    name: "BATCH_FRAME_SIZE".to_owned(),
+                    doc: "A canonical payload above this protocol's ceiling. It is the spelling \
+                          the local admin transport reports for the same fault."
+                        .to_owned(),
+                    value: ConstantValue::Text("frame_size".to_owned()),
+                },
+            ],
+            invalid_body_category: "BATCH_INVALID_BODY".to_owned(),
+            unknown_kind_category: "BATCH_UNKNOWN_KIND".to_owned(),
+            oversize_category: "BATCH_FRAME_SIZE".to_owned(),
+            field_invalid_category: "BATCH_FIELD_INVALID".to_owned(),
+            field_grammar_category: "BATCH_FIELD_GRAMMAR".to_owned(),
+            discriminated_bodies: vec![DiscriminatedBody {
+                name: BATCH_CONCURRENCY.to_owned(),
+                doc: "How many members of a batch may be in flight, and in what order. Recorded, \
+                      never enforced: nothing in this build counts what is in flight. There is \
+                      deliberately no word meaning `unbounded` — the only word that admits more \
+                      than one member carries a declared ceiling — and `sequential` is not \
+                      `bounded_parallel` with a ceiling of one, because sequential also fixes the \
+                      order to the declaration's and bounded parallelism declares none."
+                    .to_owned(),
+                tag_field: "kind".to_owned(),
+                tag_type: "ConcurrencyKind".to_owned(),
+                unknown_tag_category: "BATCH_UNKNOWN_ENUM_VALUE".to_owned(),
+                payload_field: "max_in_flight".to_owned(),
+                payload_type: CONCURRENCY_CEILING.to_owned(),
+                payload_below_category: "BATCH_CONCURRENCY_CEILING_ZERO".to_owned(),
+                payload_above_category: "BATCH_CONCURRENCY_CEILING_UNREACHABLE".to_owned(),
+                payload_wire_max: i64::from(u32::MAX),
+                bare_tags: vec!["sequential".to_owned()],
+                carrying_tag: "bounded_parallel".to_owned(),
+                invalid_body_category: "BATCH_INVALID_BODY".to_owned(),
+            }],
+            body_objects: vec![
+                BodyObject {
+                    name: "BatchMemberRecord".to_owned(),
+                    doc: "One validated `batch_members` row. `state` is the last progress a \
+                          writer reported and never a reading of a run: the durable run index is \
+                          the true binding from a submission to the state its run reached, and \
+                          this lane never joins it."
+                        .to_owned(),
+                    fields: batch_member_fields(),
+                },
+                BodyObject {
+                    name: "BatchRecord".to_owned(),
+                    doc: "One validated `batches` row. There is no rolled-up state here and \
+                          deliberately so: a listing carries batch rows and not their members, so \
+                          it has nothing to roll up *from*."
+                        .to_owned(),
+                    fields: batch_record_fields(),
+                },
+            ],
+            requests: vec![
+                RequestCommand {
+                    kind: "advance_member".to_owned(),
+                    name: "AdvanceMember".to_owned(),
+                    doc: "Report that one member moved. What this presents is a claim: it says \
+                          what a writer observed after reading the run index, and no transaction \
+                          spans the two. The revision is the fence — the value the last accepted \
+                          write left behind — and a stale one is answered with a conflict rather \
+                          than a refusal, because the two are retried differently."
+                        .to_owned(),
+                    fields: vec![
+                        checked_field("batch_id", BATCH_ID, "BATCH_INVALID_FIELD"),
+                        RequestField {
+                            name: "expected_revision".to_owned(),
+                            input_name: "expected_revision".to_owned(),
+                            value: RequestValue::Integer {
+                                type_name: BATCH_REVISION.to_owned(),
+                                refusal_category: "BATCH_UNWRITTEN_REVISION".to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "last_sequence".to_owned(),
+                            input_name: "last_sequence".to_owned(),
+                            value: RequestValue::Integer {
+                                type_name: "LastSequence".to_owned(),
+                                refusal_category: "BATCH_COUNTER_OUT_OF_RANGE".to_owned(),
+                            },
+                        },
+                        checked_field("member_key", BATCH_MEMBER_KEY, "BATCH_INVALID_FIELD"),
+                        RequestField {
+                            name: "state".to_owned(),
+                            input_name: "state".to_owned(),
+                            value: RequestValue::Enum {
+                                type_name: "MemberProgress".to_owned(),
+                                unknown_category: "BATCH_UNKNOWN_ENUM_VALUE".to_owned(),
+                            },
+                        },
+                    ],
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "batch_detail".to_owned(),
+                    name: "BatchDetail".to_owned(),
+                    doc: "Read one batch, its whole membership, and the state that membership \
+                          rolls up to."
+                        .to_owned(),
+                    fields: vec![checked_field("batch_id", BATCH_ID, "BATCH_INVALID_FIELD")],
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "list_batches".to_owned(),
+                    name: "ListBatches".to_owned(),
+                    doc: "Ask for one bounded page of every registered batch. `since` is the \
+                          entry this listing resumes *after*, and zero is the beginning rather \
+                          than the absence of a cursor."
+                        .to_owned(),
+                    fields: vec![
+                        RequestField {
+                            name: "page_size".to_owned(),
+                            input_name: "page_size".to_owned(),
+                            value: RequestValue::Integer {
+                                type_name: "BatchPageSize".to_owned(),
+                                refusal_category: "BATCH_PAGE_SIZE_OUT_OF_RANGE".to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "since".to_owned(),
+                            input_name: "since".to_owned(),
+                            value: RequestValue::Integer {
+                                type_name: BATCH_CURSOR.to_owned(),
+                                refusal_category: "BATCH_COUNTER_OUT_OF_RANGE".to_owned(),
+                            },
+                        },
+                    ],
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "register_batch".to_owned(),
+                    name: "RegisterBatch".to_owned(),
+                    doc: "Declare one batch and its whole membership. It submits nothing: the \
+                          members are submission *keys*, no RunSpec document travels here, and a \
+                          registered batch causes no run to exist. The membership is fixed at \
+                          registration and every member starts `unsubmitted`, so there is no \
+                          initial-progress field; there is no instant field either, because the \
+                          daemon stamps it from its own clock rather than letting a caller date a \
+                          registration to whenever it liked."
+                        .to_owned(),
+                    fields: vec![
+                        checked_field("batch_id", BATCH_ID, "BATCH_INVALID_FIELD"),
+                        RequestField {
+                            name: "concurrency".to_owned(),
+                            input_name: "concurrency".to_owned(),
+                            value: RequestValue::Discriminated {
+                                type_name: BATCH_CONCURRENCY.to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "label".to_owned(),
+                            input_name: "label".to_owned(),
+                            value: RequestValue::NullableChecked {
+                                type_name: BATCH_LABEL.to_owned(),
+                                refusal_category: "BATCH_INVALID_FIELD".to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "members".to_owned(),
+                            input_name: "members".to_owned(),
+                            value: RequestValue::CheckedArray {
+                                type_name: BATCH_MEMBER_KEY.to_owned(),
+                                refusal_category: "BATCH_INVALID_FIELD".to_owned(),
+                                max_items_constant: "MAX_BATCH_CONTROL_MEMBERS".to_owned(),
+                                oversize_category: "BATCH_MEMBERSHIP_TOO_LARGE".to_owned(),
+                                empty_category: "BATCH_EMPTY_BATCH".to_owned(),
+                            },
+                        },
+                    ],
+                    coupling: None,
+                },
+            ],
+            // This protocol version defines exactly the four requests above.
+            // `tests/codegen.rs` proves the list against the Rust encoders
+            // themselves rather than against this claim.
+            request_kinds_not_generated: Vec::new(),
+            responses: vec![
+                ResponseDecoder {
+                    kind: "batch_detail_result".to_owned(),
+                    name: "BatchDetailView".to_owned(),
+                    doc: "One batch, its whole membership, and what that membership rolls up to. \
+                          The rolled-up state is never stored: the durable registry has no such \
+                          column, because the rollup is a total function of the member states and \
+                          a column would be a second copy of an answer that can drift. It travels \
+                          here because the members that justify it travel beside it — and the \
+                          Rust decoder re-derives it and refuses a body whose carried state \
+                          contradicts its own members, which is a relation between two fields and \
+                          therefore one this file does not hold."
+                        .to_owned(),
+                    fields: vec![
+                        ResponseField {
+                            name: "batch".to_owned(),
+                            value: ResponseValue::Object {
+                                type_name: "BatchRecord".to_owned(),
+                            },
+                        },
+                        ResponseField {
+                            name: "members".to_owned(),
+                            value: ResponseValue::ObjectArray {
+                                type_name: "BatchMemberRecord".to_owned(),
+                                max_items_constant: "MAX_BATCH_CONTROL_MEMBERS".to_owned(),
+                                oversize_category: "BATCH_MEMBERSHIP_TOO_LARGE".to_owned(),
+                            },
+                        },
+                        batch_enum_field("state", "BatchState"),
+                    ],
+                },
+                ResponseDecoder {
+                    kind: "batch_list_result".to_owned(),
+                    name: "BatchListPage".to_owned(),
+                    doc: "One bounded page of batch rows, in registration order. `more` is \
+                          carried explicitly rather than inferred from a short page: a short page \
+                          is not the same statement as a last page, and a client that inferred \
+                          `done` from one would stop early."
+                        .to_owned(),
+                    fields: vec![
+                        ResponseField {
+                            name: "batches".to_owned(),
+                            value: ResponseValue::ObjectArray {
+                                type_name: "BatchRecord".to_owned(),
+                                max_items_constant: "MAX_BATCH_PAGE_ITEMS".to_owned(),
+                                oversize_category: "BATCH_PAGE_TOO_LARGE".to_owned(),
+                            },
+                        },
+                        ResponseField {
+                            name: "more".to_owned(),
+                            value: ResponseValue::Bool,
+                        },
+                        ResponseField {
+                            name: "next_cursor".to_owned(),
+                            value: ResponseValue::NullableInteger {
+                                type_name: BATCH_CURSOR.to_owned(),
+                                refusal_category: "BATCH_INVALID_BODY".to_owned(),
+                            },
+                        },
+                    ],
+                },
+                ResponseDecoder {
+                    kind: "batch_registered".to_owned(),
+                    name: "BatchReceipt".to_owned(),
+                    doc: "One batch and its whole membership are durable. `accepted` rather than \
+                          `completed`: the rows are committed, and what they record has not taken \
+                          effect and cannot, because registering a batch submits nothing. Every \
+                          member was written `unsubmitted`, at ordinals `0..member_count`."
+                        .to_owned(),
+                    fields: vec![
+                        batch_checked_field("batch_id", BATCH_ID),
+                        batch_integer_field(
+                            "created_at_ms",
+                            EPOCH_MILLIS,
+                            "BATCH_TIME_BEFORE_EPOCH",
+                            false,
+                        ),
+                        batch_integer_field(
+                            "entry_id",
+                            DURABLE_ROW_ID,
+                            "BATCH_UNWRITTEN_ROW",
+                            true,
+                        ),
+                        ResponseField {
+                            name: "member_count".to_owned(),
+                            value: ResponseValue::RangedInteger {
+                                type_name: "MemberCount".to_owned(),
+                                below_category: "BATCH_EMPTY_BATCH".to_owned(),
+                                above_category: "BATCH_MEMBERSHIP_TOO_LARGE".to_owned(),
+                                unsigned: true,
+                            },
+                        },
+                        batch_integer_field(
+                            "revision",
+                            BATCH_REVISION,
+                            "BATCH_UNWRITTEN_REVISION",
+                            true,
+                        ),
+                    ],
+                },
+                ResponseDecoder {
+                    kind: "member_advanced".to_owned(),
+                    name: "MemberReceipt".to_owned(),
+                    doc: "One member's row moved. The revision is the fencing value the *next* \
+                          advance of this member must expect, and it is at least two: \
+                          registration is the only writer of revision one, so an advance receipt \
+                          below that names a row no accepted advance could have left behind."
+                        .to_owned(),
+                    fields: vec![
+                        batch_checked_field("batch_id", BATCH_ID),
+                        batch_integer_field(
+                            "last_sequence",
+                            "LastSequence",
+                            "BATCH_INVALID_BODY",
+                            true,
+                        ),
+                        batch_checked_field("member_key", BATCH_MEMBER_KEY),
+                        batch_integer_field(
+                            "ordinal",
+                            MEMBER_ORDINAL,
+                            "BATCH_MEMBERS_OUT_OF_ORDER",
+                            true,
+                        ),
+                        batch_integer_field(
+                            "revision",
+                            "AdvancedRevision",
+                            "BATCH_NOT_AN_ADVANCE",
+                            true,
+                        ),
+                        batch_enum_field("state", "MemberProgress"),
+                        batch_integer_field(
+                            "updated_at_ms",
+                            EPOCH_MILLIS,
+                            "BATCH_TIME_BEFORE_EPOCH",
+                            false,
+                        ),
+                    ],
+                },
+                ResponseDecoder {
+                    kind: "refused".to_owned(),
+                    name: "BatchRefused".to_owned(),
+                    doc: "The operation was refused. Nothing was written and nothing was read. A \
+                          stale expected revision is deliberately not among these words: that is \
+                          a conflict, which a caller retries against the durable revision the \
+                          answer carries, where a refusal is not retried at all until the request \
+                          changes."
+                        .to_owned(),
+                    fields: vec![batch_enum_field("refusal", "BatchRefusal")],
+                },
+                ResponseDecoder {
+                    kind: "revision_conflict".to_owned(),
+                    name: "BatchRevisionConflict".to_owned(),
+                    doc: "The caller's expected revision did not match the durable one and \
+                          nothing was written. Retry against `durable_revision`. Two revisions \
+                          that agree would be agreement rather than a conflict, and the Rust \
+                          constructor refuses to answer one — a relation between two fields, and \
+                          therefore not a rule this file holds."
+                        .to_owned(),
+                    fields: vec![
+                        batch_integer_field(
+                            "durable_revision",
+                            BATCH_REVISION,
+                            "BATCH_UNWRITTEN_REVISION",
+                            true,
+                        ),
+                        batch_integer_field(
+                            "expected_revision",
+                            BATCH_REVISION,
+                            "BATCH_UNWRITTEN_REVISION",
+                            true,
+                        ),
+                    ],
+                },
+            ],
+            // Every kind this protocol version answers with is decoded above.
+            response_kinds_not_decoded: Vec::new(),
+        }),
+        ..GeneratedModule::default()
+    }
+}
+
 /// Every maintained module, in file-name order.
 #[must_use]
 pub fn maintained_modules() -> Vec<GeneratedModule> {
@@ -4268,6 +5389,7 @@ pub fn maintained_modules() -> Vec<GeneratedModule> {
         runs_module(),
         automation_module(),
         approval_module(),
+        batch_module(),
     ];
     modules.sort_by(|left, right| left.file_name.cmp(&right.file_name));
     modules
@@ -4311,8 +5433,22 @@ fn runtime_imports(module: &GeneratedModule) -> (Vec<&'static str>, Vec<&'static
                 RequestValue::HexBytes { .. } => {
                     names.extend(["boundedBytes", "hexEncode", "refuse"]);
                 }
+                RequestValue::CheckedArray { .. } => names.extend(["boundedItems", "refuse"]),
+                // The encoder the field calls is declared in this module; the
+                // helpers it needs are pulled in with the body below.
+                RequestValue::Discriminated { .. } => {}
                 RequestValue::NullableEnumSet { .. } => names.push("orderedEnumSet"),
             }
+        }
+        if !surface.discriminated_bodies.is_empty() {
+            names.extend([
+                "bodyIntegerOrNull",
+                "bodyString",
+                "exactFields",
+                "rangedInteger",
+                "refuse",
+            ]);
+            types.push("JsonValue");
         }
         if surface
             .requests
@@ -4356,6 +5492,16 @@ fn runtime_imports(module: &GeneratedModule) -> (Vec<&'static str>, Vec<&'static
                             "bodyInteger"
                         },
                         "refuse",
+                    ]);
+                }
+                ResponseValue::RangedInteger { unsigned, .. } => {
+                    names.extend([
+                        if *unsigned {
+                            "bodyUnsigned"
+                        } else {
+                            "bodyInteger"
+                        },
+                        "rangedInteger",
                     ]);
                 }
                 ResponseValue::NullableInteger { .. } => {
@@ -4781,6 +5927,19 @@ fn emit_request(out: &mut String, surface: &CommandSurface, request: &RequestCom
                 "{input} === null\n        ? {{kind: \"null\"}}\n        : {{kind: \
                  \"integer\", value: refuse({refusal_category}, () => {type_name}({input}))}}"
             ),
+            RequestValue::Discriminated { type_name } => format!("encode{type_name}({input})"),
+            RequestValue::CheckedArray {
+                type_name,
+                refusal_category,
+                max_items_constant,
+                oversize_category,
+                empty_category,
+            } => format!(
+                "{{\n        kind: \"array\",\n        items: boundedItems({input}, \
+                 {max_items_constant}, {oversize_category}, {empty_category}).map(\n          \
+                 (value): JsonValue => ({{kind: \"string\", value: refuse({refusal_category}, () \
+                 => {type_name}(value))}}),\n        ),\n      }}"
+            ),
             RequestValue::NullableEnumSet {
                 order_constant,
                 empty_category,
@@ -4853,11 +6012,154 @@ fn emit_body_object(out: &mut String, surface: &CommandSurface, object: &BodyObj
     out.push_str("  };\n}\n");
 }
 
+/// Emit one discriminated nested body: its union, its encoder and its decoder.
+///
+/// The union is the point. A struct with a nullable payload would type-check a
+/// program that asked a payload-free variant for its payload; this shape makes
+/// that a compile error on one side of the wire and a refusal on the other.
+fn emit_discriminated_body(out: &mut String, body: &DiscriminatedBody) {
+    let DiscriminatedBody {
+        name,
+        doc,
+        tag_field,
+        tag_type,
+        unknown_tag_category,
+        payload_field,
+        payload_type,
+        payload_below_category,
+        payload_above_category,
+        payload_wire_max,
+        bare_tags,
+        carrying_tag,
+        invalid_body_category,
+    } = body;
+    let mut arms: Vec<String> = bare_tags
+        .iter()
+        .map(|tag| format!("  | {{readonly {tag_field}: \"{tag}\"}}"))
+        .chain(std::iter::once(format!(
+            "  | {{readonly {tag_field}: \"{carrying_tag}\"; readonly {payload_field}: \
+             {payload_type}}}"
+        )))
+        .collect();
+    arms.sort();
+    let _ = write!(
+        out,
+        "\n/** {doc} */\nexport type {name} =\n{arms};\n",
+        arms = arms.join("\n")
+    );
+    emit_name_list(
+        out,
+        &format!("{name}_FIELDS"),
+        "The exact key set this nested body carries. Both keys are always \
+         present: the payload travels as an explicit null under every word that \
+         declares none.",
+        &[tag_field.clone(), payload_field.clone()],
+    );
+    let _ = write!(
+        out,
+        "\nexport function assertNever{name}(value: never): never {{\n  \
+         throw new ValidationError(\"{name}\", `unhandled variant: ${{JSON.stringify(value)}}`);\n\
+         }}\n"
+    );
+
+    // The payload is read off a cast rather than off the narrowed union,
+    // because a brand exists only in the type checker: an untyped caller
+    // reaches this function with a payload-free word carrying a payload, and
+    // dropping it silently would encode a policy the caller did not ask for.
+    let _ = write!(
+        out,
+        "\n/**\n \
+         * Encode one `{name}`, refusing the two shapes the wire cannot mean.\n \
+         *\n \
+         * A word that declares no `{payload_field}` and carries one, and \
+         `{carrying_tag}`\n \
+         * without one, are both refused rather than repaired: each says the caller \
+         asked\n \
+         * for something this protocol has no way to record.\n \
+         */\n\
+         export function encode{name}(value: {name}): JsonValue {{\n  \
+         const {tag_field} = refuse({unknown_tag_category}, () => \
+         decode{tag_type}(value.{tag_field}));\n  \
+         const declared: unknown = (value as {{readonly {payload_field}?: unknown}}).\
+         {payload_field};\n  \
+         if ({tag_field} === \"{carrying_tag}\") {{\n    \
+         if (typeof declared !== \"bigint\") {{\n      \
+         throw new RefusalError({invalid_body_category}, \"{carrying_tag} declares a \
+         {payload_field}\");\n    \
+         }}\n    \
+         return {{\n      \
+         kind: \"object\",\n      \
+         entries: [\n        \
+         [\"{tag_field}\", {{kind: \"string\", value: {tag_field}}}],\n        \
+         [\n          \"{payload_field}\",\n          \
+         {{\n            kind: \"integer\",\n            \
+         value: rangedInteger(\n              declared,\n              {payload_type}_MIN,\n\
+         {tab}{payload_below_category},\n              {payload_above_category},\n              \
+         {payload_type},\n            ),\n          }},\n        ],\n      ],\n    \
+         }};\n  \
+         }}\n  \
+         if (declared !== undefined) {{\n    \
+         throw new RefusalError({invalid_body_category}, `${{{tag_field}}} declares no \
+         {payload_field}`);\n  \
+         }}\n  \
+         return {{\n    \
+         kind: \"object\",\n    \
+         entries: [\n      \
+         [\"{tag_field}\", {{kind: \"string\", value: {tag_field}}}],\n      \
+         [\"{payload_field}\", {{kind: \"null\"}}],\n    ],\n  \
+         }};\n\
+         }}\n",
+        // A line continuation eats the indentation that follows it, so the one
+        // deep-nested argument that lands on its own source line names its
+        // indent rather than writing it.
+        tab = " ".repeat(14),
+    );
+
+    // The width conversion is judged before the domain, because that is the
+    // order the Rust decoder settles it in: a value outside the payload's own
+    // integer width is a malformed body, and only a value inside it can be
+    // refused for being outside the domain.
+    let _ = write!(
+        out,
+        "\nexport function decode{name}(body: JsonValue): {name} {{\n  \
+         const fields = exactFields(body, {name}_FIELDS, {invalid_body_category});\n  \
+         const {tag_field} = refuse({unknown_tag_category}, () =>\n    \
+         decode{tag_type}(bodyString(fields, \"{tag_field}\", {invalid_body_category})),\n  \
+         );\n  \
+         const declared = bodyIntegerOrNull(fields, \"{payload_field}\", \
+         {invalid_body_category});\n  \
+         if ({tag_field} === \"{carrying_tag}\") {{\n    \
+         if (declared === null) {{\n      \
+         throw new RefusalError({invalid_body_category}, \"{carrying_tag} declares a \
+         {payload_field}\");\n    \
+         }}\n    \
+         if (declared < 0n || declared > {payload_wire_max}n) {{\n      \
+         throw new RefusalError(\n        {invalid_body_category},\n        \
+         \"{payload_field} is outside the width it is carried in\",\n      \
+         );\n    \
+         }}\n    \
+         return {{\n      \
+         {tag_field},\n      \
+         {payload_field}: rangedInteger(\n        declared,\n        {payload_type}_MIN,\n        \
+         {payload_below_category},\n        {payload_above_category},\n        \
+         {payload_type},\n      ),\n    \
+         }};\n  \
+         }}\n  \
+         if (declared !== null) {{\n    \
+         throw new RefusalError({invalid_body_category}, `${{{tag_field}}} declares no \
+         {payload_field}`);\n  \
+         }}\n  \
+         return {{{tag_field}}};\n\
+         }}\n"
+    );
+}
+
 /// The TypeScript type one decoded response field has.
 fn response_field_type(value: &ResponseValue) -> String {
     match value {
         ResponseValue::Checked { type_name, .. }
         | ResponseValue::Integer { type_name, .. }
+        | ResponseValue::RangedInteger { type_name, .. }
         | ResponseValue::Enum { type_name, .. }
         | ResponseValue::Object { type_name } => type_name.clone(),
         ResponseValue::NullableChecked { type_name, .. }
@@ -4887,6 +6189,21 @@ fn response_field_reader(surface: &CommandSurface, field: &ResponseField) -> Str
         } => format!(
             "refuse({refusal_category}, () => {type_name}({reader}(fields, \"{name}\", \
              {invalid})))",
+            reader = if *unsigned {
+                "bodyUnsigned"
+            } else {
+                "bodyInteger"
+            }
+        ),
+        ResponseValue::RangedInteger {
+            type_name,
+            below_category,
+            above_category,
+            unsigned,
+        } => format!(
+            "rangedInteger(\n      {reader}(fields, \"{name}\", {invalid}),\n      \
+             {type_name}_MIN,\n      {below_category},\n      {above_category},\n      \
+             {type_name},\n    )",
             reader = if *unsigned {
                 "bodyUnsigned"
             } else {
@@ -5131,6 +6448,15 @@ fn emit_command_surface(out: &mut String, surface: &CommandSurface) {
     categories.sort_by(|left, right| left.name.cmp(&right.name));
     for constant in &categories {
         emit_constant(out, constant);
+    }
+
+    // Before the objects that carry them, which are themselves before the
+    // messages: a batch row names the concurrency decoder, so a reader
+    // following the file top to bottom meets each declaration before its use.
+    let mut discriminated = surface.discriminated_bodies.clone();
+    discriminated.sort_by(|left, right| left.name.cmp(&right.name));
+    for body in &discriminated {
+        emit_discriminated_body(out, body);
     }
 
     // Before the messages that carry them: a response decoder names its nested

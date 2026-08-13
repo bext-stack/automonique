@@ -143,6 +143,20 @@ fn referenced_categories(surface: &automonique_protocol::codegen::CommandSurface
             RequestValue::HexBytes {
                 oversize_category, ..
             } => referenced.push(oversize_category.clone()),
+            RequestValue::CheckedArray {
+                refusal_category,
+                oversize_category,
+                empty_category,
+                ..
+            } => referenced.extend([
+                refusal_category.clone(),
+                oversize_category.clone(),
+                empty_category.clone(),
+            ]),
+            // The categories a discriminated body refuses with belong to the
+            // body rather than to the field that carries it, and are collected
+            // from the surface's own list below.
+            RequestValue::Discriminated { .. } => {}
             RequestValue::NullableEnumSet {
                 empty_category,
                 repeat_category,
@@ -195,10 +209,26 @@ fn referenced_categories(surface: &automonique_protocol::codegen::CommandSurface
             ResponseValue::Enum {
                 unknown_category, ..
             } => referenced.push(unknown_category.clone()),
+            ResponseValue::RangedInteger {
+                below_category,
+                above_category,
+                ..
+            } => referenced.extend([below_category.clone(), above_category.clone()]),
             ResponseValue::ObjectArray {
                 oversize_category, ..
             } => referenced.push(oversize_category.clone()),
         }
+    }
+    // A discriminated body refuses under four categories of its own: the two
+    // ends of its payload's domain, the closed word it is discriminated on, and
+    // the body shape its two keys can contradict.
+    for body in &surface.discriminated_bodies {
+        referenced.extend([
+            body.unknown_tag_category.clone(),
+            body.payload_below_category.clone(),
+            body.payload_above_category.clone(),
+            body.invalid_body_category.clone(),
+        ]);
     }
     referenced
 }
@@ -9354,6 +9384,3508 @@ mod approval_surface {
         );
         println!(
             "approval api surface under {runtime}: {}",
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+    }
+}
+
+/// The `automonique.batch.control` surface, measured across two languages.
+///
+/// The mechanism is the one [`command_surface`] established and
+/// [`approval_surface`] last applied: `fixtures/batch-api-v1.json` is generated
+/// from the shipped Rust constructors — every canonical byte string was produced
+/// by encoding a real message and re-read through `from_canonical_bytes` before
+/// it was written, every refusal category was read back from the error Rust
+/// returned for that exact input, and every decoded spelling came out of
+/// `BatchResponse::from_canonical_bytes` rather than out of the value this file
+/// constructed.
+///
+/// # What this lane adds to what the four before it measured
+///
+/// **A discriminated body.** A concurrency policy is one wire object with two
+/// keys where exactly one word carries a number, and the generated surface
+/// carries it as a TypeScript discriminated union rather than as a struct with a
+/// nullable field. The two shapes are not the same claim, and the difference is
+/// measured from four sides: the union round-trips through both languages, a
+/// `sequential` carrying a ceiling and a `bounded_parallel` without one are
+/// refused on the way out *and* on the way in, and the ceiling's two ends —
+/// zero, and above what a batch could ever place in flight — are different
+/// refusals rather than one.
+///
+/// **A bounded list on the way out.** `register_batch` carries the membership
+/// itself, so the generated encoder holds this lane's own ceiling: the maximal
+/// registration in this corpus is `MAX_BATCH_CONTROL_MEMBERS` keys at
+/// `MAX_BATCH_MEMBER_KEY_BYTES`, every character of which escapes to two
+/// canonical bytes. That is the frame arithmetic
+/// [`MAX_BATCH_CONTROL_MEMBERS`](automonique_protocol::batch_api::MAX_BATCH_CONTROL_MEMBERS)
+/// is derived from, exercised rather than asserted — and it is built on both
+/// sides from a rule rather than recorded as a 33 KiB literal, exactly as the
+/// admin lane's maximal document is.
+///
+/// **Three vocabularies that are not this lane's.** `ConcurrencyKind`,
+/// `MemberProgress` and `BatchState` come from
+/// [`automonique_protocol::batch_runner`], and `MemberProgress` in turn reuses
+/// [`RunState`](automonique_protocol::runs_api::RunState)'s six spellings. The
+/// generated enums are asserted against those Rust arrays rather than against a
+/// list retyped here, so a word cannot drift between a batch document and a
+/// batch control message — there is only one word.
+///
+/// `rust_only_refusals` is longer here than on any lane before it, and that is
+/// the honest shape of a batch: a batch *is* a relation between its members, so
+/// most of what makes one believable relates two fields. The rollup that a
+/// detail read carries is the one that matters most, and
+/// [`the_rust_only_list_is_the_whole_of_the_gap`] holds the list to exactly what
+/// it claims.
+mod batch_surface {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use automonique_protocol::batch_api::{
+        AdvanceMember, BATCH_CONTROL_PROTOCOL, BatchApiError, BatchContinuation, BatchCursor,
+        BatchDetailResult, BatchListPage, BatchPageSize, BatchReceiptView, BatchRecordView,
+        BatchRefusal, BatchRequest, BatchResponse, ListBatches, MAX_BATCH_CONTROL_CANONICAL_BYTES,
+        MAX_BATCH_CONTROL_MEMBERS, MAX_BATCH_PAGE_ITEMS, MemberReceiptParts, MemberReceiptView,
+        MemberView, RegisterBatch,
+    };
+    use automonique_protocol::batch_runner::{
+        BatchId, BatchLabel, BatchMemberKey, BatchState, ConcurrencyKind, ConcurrencyPolicy,
+        MAX_BATCH_ID_BYTES, MAX_BATCH_LABEL_BYTES, MAX_BATCH_MEMBER_KEY_BYTES, MAX_BATCH_MEMBERS,
+        MemberProgress,
+    };
+    use automonique_protocol::codec::{MAX_REQUEST_ID_BYTES, MajorVersion};
+    use automonique_protocol::codegen::{
+        BATCH_MODULE, CommandSurface, ConstantValue, REGENERATE_COMMAND, generated_files,
+        maintained_modules, module_file_name,
+    };
+    use automonique_protocol::primitives::{EpochMillis, ValueError};
+    use automonique_protocol::runs_api::RunState;
+
+    use super::command_surface::{count, hex, raw_message, request_id, text, unhex, write_pretty};
+    use super::*;
+
+    fn corpus_path() -> PathBuf {
+        crate_root().join("fixtures/batch-api-v1.json")
+    }
+
+    fn runner_path() -> PathBuf {
+        package_root().join("conformance/batch-api.ts")
+    }
+
+    fn regenerating() -> bool {
+        std::env::var(automonique_protocol::codegen::REGENERATE_ENV)
+            .is_ok_and(|value| !value.is_empty() && value != "0")
+    }
+
+    /// The command surface the generator describes for this protocol.
+    fn surface() -> CommandSurface {
+        maintained_modules()
+            .into_iter()
+            .find(|module| module.file_name == module_file_name(BATCH_MODULE))
+            .and_then(|module| module.command_surface)
+            .expect("the batch module describes a command surface")
+    }
+
+    /// The generated TypeScript of the batch module.
+    fn generated_batch() -> String {
+        generated_files()
+            .into_iter()
+            .find(|(name, _)| *name == module_file_name(BATCH_MODULE))
+            .map(|(_, contents)| contents)
+            .expect("the batch module is generated")
+    }
+
+    fn batch(value: &str) -> BatchId {
+        BatchId::new(value).expect("a valid batch identity")
+    }
+
+    fn member(value: &str) -> BatchMemberKey {
+        BatchMemberKey::new(value).expect("a valid member key")
+    }
+
+    fn label(value: &str) -> BatchLabel {
+        BatchLabel::new(value).expect("a valid label")
+    }
+
+    fn page_size(items: usize) -> BatchPageSize {
+        BatchPageSize::new(items).expect("a page size within the bound")
+    }
+
+    fn bounded_parallel(ceiling: u32) -> ConcurrencyPolicy {
+        ConcurrencyPolicy::bounded_parallel(ceiling).expect("a ceiling a batch could reach")
+    }
+
+    /// A decimal string, because the wire carries 64-bit values and a JSON
+    /// reader that used a double would round the largest of them without saying
+    /// so. Every counter in this corpus travels as text for that reason.
+    fn number(value: u64) -> JsonValue {
+        JsonValue::String(value.to_string())
+    }
+
+    /// The wire ceiling, which a decoder carrying counters in a double rounds.
+    fn wire_ceiling() -> u64 {
+        u64::try_from(i64::MAX).expect("the wire ceiling is positive")
+    }
+
+    /// A batch identity carrying every escape a bounded identifier can reach, a
+    /// three-byte character, a surrogate pair — and a space.
+    ///
+    /// The identity is opaque to this protocol: it parses nothing and derives
+    /// nothing from it, so its grammar is the registry's own and admits
+    /// whitespace.
+    fn escaping_batch_id() -> String {
+        "batch/\"nightly eval\" \\ naïve 日本語 🚀".to_owned()
+    }
+
+    fn escaping_member_key() -> String {
+        "submit/\"run prod\" \\ naïve 日本語 🚀".to_owned()
+    }
+
+    fn escaping_label() -> String {
+        "nightly \"eval\" \\ naïve 日本語 🚀".to_owned()
+    }
+
+    /// A value inside the UTF-16 code-unit bound and outside the UTF-8 one.
+    ///
+    /// Sixty-five two-byte characters: `value.length` in JavaScript counts 65,
+    /// well under the bound, while the UTF-8 length Rust measures is 130 and
+    /// over it. A generated constructor that measured code units would accept a
+    /// value the daemon refuses, which is the one direction that matters.
+    fn over_bound_by_bytes_only() -> String {
+        "é".repeat(MAX_BATCH_MEMBER_KEY_BYTES / 2 + 1)
+    }
+
+    // -----------------------------------------------------------------------
+    // The membership rule
+    //
+    // A maximal registration is a hundred and twenty-eight keys of a hundred
+    // and twenty-eight bytes, which is 33 KiB of literal nobody can review. The
+    // corpus carries a rule instead and each implementation builds the list
+    // from it, exactly as the admin lane's maximal RunSpec document is built —
+    // and that the two read the rule the same way is measured rather than
+    // assumed, because the bytes the runner reports are compared against the
+    // bytes Rust built from the same rule.
+    // -----------------------------------------------------------------------
+
+    struct MembershipRule {
+        id: &'static str,
+        note: &'static str,
+        count: usize,
+        /// UTF-8 bytes of each key, or zero for the short shape.
+        key_bytes: usize,
+    }
+
+    fn membership_rules() -> Vec<MembershipRule> {
+        vec![
+            MembershipRule {
+                id: "maximal",
+                note: "MAX_BATCH_CONTROL_MEMBERS keys, each at MAX_BATCH_MEMBER_KEY_BYTES and \
+                       filled with the one character that escapes to two canonical bytes. This is \
+                       the worst case this lane's frame arithmetic budgets for, and it is why \
+                       this ceiling is half the batch model's own",
+                count: MAX_BATCH_CONTROL_MEMBERS,
+                key_bytes: MAX_BATCH_MEMBER_KEY_BYTES,
+            },
+            MembershipRule {
+                id: "over-bound",
+                note: "one member past MAX_BATCH_CONTROL_MEMBERS. The length is judged before any \
+                       key is validated, so what these keys are does not matter and the refusal \
+                       names the length",
+                count: MAX_BATCH_CONTROL_MEMBERS + 1,
+                key_bytes: 0,
+            },
+        ]
+    }
+
+    /// The key at one position, spelled once and read the same way by both
+    /// implementations.
+    ///
+    /// The three-digit index is what keeps the keys distinct: a membership that
+    /// named one key twice is refused rather than collapsed, so a rule that
+    /// produced a hundred and twenty-eight identical maximal keys would build a
+    /// registration no daemon would admit.
+    fn ruled_member_key(index: usize, key_bytes: usize) -> String {
+        let prefix = format!("{index:03}");
+        if key_bytes == 0 {
+            return format!("member-{prefix}");
+        }
+        let filler = key_bytes
+            .checked_sub(prefix.len())
+            .expect("a ruled key is longer than its index");
+        format!("{prefix}{}", "\"".repeat(filler))
+    }
+
+    fn ruled_membership(id: &str) -> Vec<String> {
+        let rule = membership_rules()
+            .into_iter()
+            .find(|rule| rule.id == id)
+            .unwrap_or_else(|| panic!("{id} is not a membership rule"));
+        (0..rule.count)
+            .map(|index| ruled_member_key(index, rule.key_bytes))
+            .collect()
+    }
+
+    fn ruled_members(id: &str) -> Vec<BatchMemberKey> {
+        ruled_membership(id).iter().map(|key| member(key)).collect()
+    }
+
+    fn membership_rule_entry(rule: &MembershipRule) -> JsonValue {
+        JsonValue::Object(vec![
+            ("count".to_owned(), number(rule.count as u64)),
+            ("id".to_owned(), text(rule.id)),
+            ("key_bytes".to_owned(), number(rule.key_bytes as u64)),
+            ("note".to_owned(), text(rule.note)),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // Requests
+    // -----------------------------------------------------------------------
+
+    struct RequestCase {
+        id: &'static str,
+        note: &'static str,
+        request: BatchRequest,
+        /// Builder parameters, in the shape the runner reads for this kind.
+        params: JsonValue,
+    }
+
+    /// The two-key wire shape of a concurrency policy, as the corpus spells it.
+    fn concurrency_params(kind: &str, ceiling: Option<u64>) -> JsonValue {
+        JsonValue::Object(vec![
+            ("kind".to_owned(), text(kind)),
+            (
+                "max_in_flight".to_owned(),
+                match ceiling {
+                    Some(value) => number(value),
+                    None => JsonValue::Null,
+                },
+            ),
+        ])
+    }
+
+    fn members_params(keys: &[String]) -> JsonValue {
+        JsonValue::Array(keys.iter().map(|key| text(key)).collect())
+    }
+
+    fn request_cases() -> Vec<RequestCase> {
+        let maximal_request_id = format!("req-{}", "a".repeat(MAX_REQUEST_ID_BYTES - 4));
+        let maximal_batch_id = "\"".repeat(MAX_BATCH_ID_BYTES);
+        let maximal_label = "\"".repeat(MAX_BATCH_LABEL_BYTES);
+
+        vec![
+            RequestCase {
+                id: "register-batch-maximal",
+                note: "every bound at once: MAX_BATCH_CONTROL_MEMBERS members built from the \
+                       membership rule, a batch identity and a label whose every character \
+                       escapes to two canonical bytes, a bounded-parallel ceiling at the batch \
+                       model's own membership — the largest a policy can declare, and one this \
+                       lane's own membership can never reach — and a correlation identifier at \
+                       MAX_REQUEST_ID_BYTES. This is the registration the frame arithmetic is \
+                       derived from",
+                request: BatchRequest::RegisterBatch {
+                    request_id: request_id(&maximal_request_id),
+                    registration: RegisterBatch::new(
+                        batch(&maximal_batch_id),
+                        Some(label(&maximal_label)),
+                        bounded_parallel(
+                            u32::try_from(MAX_BATCH_MEMBERS).expect("the ceiling fits a u32"),
+                        ),
+                        ruled_members("maximal"),
+                    )
+                    .expect("a well-formed maximal registration"),
+                },
+                params: JsonValue::Object(vec![
+                    ("batch_id".to_owned(), text(&maximal_batch_id)),
+                    (
+                        "concurrency".to_owned(),
+                        concurrency_params("bounded_parallel", Some(MAX_BATCH_MEMBERS as u64)),
+                    ),
+                    ("label".to_owned(), text(&maximal_label)),
+                    ("members_rule".to_owned(), text("maximal")),
+                ]),
+            },
+            RequestCase {
+                id: "register-batch-sequential-unlabelled",
+                note: "the other half of the discriminated policy: `sequential` carries no \
+                       ceiling at all, and the absent label is an explicit null rather than an \
+                       empty string. Sequential is not `bounded_parallel` with a ceiling of one — \
+                       it also fixes the order to the declaration's, which is why the member \
+                       order below is kept rather than sorted",
+                request: BatchRequest::RegisterBatch {
+                    request_id: request_id("req-register-1"),
+                    registration: RegisterBatch::new(
+                        batch(&escaping_batch_id()),
+                        None,
+                        ConcurrencyPolicy::Sequential,
+                        vec![
+                            member(&escaping_member_key()),
+                            member("submit/aardvark"),
+                            member("submit/zebra"),
+                        ],
+                    )
+                    .expect("a well-formed registration"),
+                },
+                params: JsonValue::Object(vec![
+                    ("batch_id".to_owned(), text(&escaping_batch_id())),
+                    (
+                        "concurrency".to_owned(),
+                        concurrency_params("sequential", None),
+                    ),
+                    ("label".to_owned(), JsonValue::Null),
+                    (
+                        "members".to_owned(),
+                        members_params(&[
+                            escaping_member_key(),
+                            "submit/aardvark".to_owned(),
+                            "submit/zebra".to_owned(),
+                        ]),
+                    ),
+                ]),
+            },
+            RequestCase {
+                id: "register-batch-bounded-parallel-one",
+                note: "a ceiling of one, which is the smallest a policy can declare and is still \
+                       not `sequential`: this batch admits one member in flight and declares no \
+                       order, and the two facts are recorded separately because they are separate",
+                request: BatchRequest::RegisterBatch {
+                    request_id: request_id("req-register-2"),
+                    registration: RegisterBatch::new(
+                        batch("batch/nightly-eval"),
+                        Some(label(&escaping_label())),
+                        bounded_parallel(1),
+                        vec![member("submit/only")],
+                    )
+                    .expect("a well-formed registration"),
+                },
+                params: JsonValue::Object(vec![
+                    ("batch_id".to_owned(), text("batch/nightly-eval")),
+                    (
+                        "concurrency".to_owned(),
+                        concurrency_params("bounded_parallel", Some(1)),
+                    ),
+                    ("label".to_owned(), text(&escaping_label())),
+                    (
+                        "members".to_owned(),
+                        members_params(&["submit/only".to_owned()]),
+                    ),
+                ]),
+            },
+            RequestCase {
+                id: "advance-member-running-at-ceiling",
+                note: "one writer's claim that a member is running, at a spool sequence and an \
+                       expected revision both at the wire's integer ceiling — which a reader \
+                       carrying either in a double would round to an even neighbour. What this \
+                       reports is what somebody observed after reading the run index, not a \
+                       reading this lane took",
+                request: BatchRequest::AdvanceMember {
+                    request_id: request_id("req-advance-1"),
+                    advance: AdvanceMember::new(
+                        batch(&escaping_batch_id()),
+                        member(&escaping_member_key()),
+                        wire_ceiling(),
+                        MemberProgress::Run(RunState::Running),
+                        wire_ceiling(),
+                    )
+                    .expect("a well-formed advance"),
+                },
+                params: JsonValue::Object(vec![
+                    ("batch_id".to_owned(), text(&escaping_batch_id())),
+                    ("expected_revision".to_owned(), number(wire_ceiling())),
+                    ("last_sequence".to_owned(), number(wire_ceiling())),
+                    ("member_key".to_owned(), text(&escaping_member_key())),
+                    ("state".to_owned(), text("running")),
+                ]),
+            },
+            RequestCase {
+                id: "advance-member-ready-at-zero",
+                note: "the other side of the sequence coupling: `ready` means the daemon holds a \
+                       document and no event has arrived, so the sequence is zero. Rust refuses \
+                       the incoherent pairs and the generated encoder does not — that gap is \
+                       recorded in rust_only_encode_refusals rather than described",
+                request: BatchRequest::AdvanceMember {
+                    request_id: request_id("req-advance-2"),
+                    advance: AdvanceMember::new(
+                        batch("batch/nightly-eval"),
+                        member("submit/only"),
+                        1,
+                        MemberProgress::Run(RunState::Ready),
+                        0,
+                    )
+                    .expect("a well-formed advance"),
+                },
+                params: JsonValue::Object(vec![
+                    ("batch_id".to_owned(), text("batch/nightly-eval")),
+                    ("expected_revision".to_owned(), number(1)),
+                    ("last_sequence".to_owned(), number(0)),
+                    ("member_key".to_owned(), text("submit/only")),
+                    ("state".to_owned(), text("ready")),
+                ]),
+            },
+            RequestCase {
+                id: "advance-member-timed-out",
+                note: "a terminal claim carrying the one member progress spelling a run \
+                       vocabulary reaches only through this lane's reuse of it",
+                request: BatchRequest::AdvanceMember {
+                    request_id: request_id("req-advance-3"),
+                    advance: AdvanceMember::new(
+                        batch("batch/nightly-eval"),
+                        member("submit/zebra"),
+                        4,
+                        MemberProgress::Run(RunState::TimedOut),
+                        99,
+                    )
+                    .expect("a well-formed advance"),
+                },
+                params: JsonValue::Object(vec![
+                    ("batch_id".to_owned(), text("batch/nightly-eval")),
+                    ("expected_revision".to_owned(), number(4)),
+                    ("last_sequence".to_owned(), number(99)),
+                    ("member_key".to_owned(), text("submit/zebra")),
+                    ("state".to_owned(), text("timed_out")),
+                ]),
+            },
+            RequestCase {
+                id: "list-batches-maximal",
+                note: "a cursor at the wire's integer ceiling and the largest page this protocol \
+                       serves. A reader carrying the cursor in a double would encode \
+                       9223372036854775808 here without a word of complaint",
+                request: BatchRequest::ListBatches {
+                    request_id: request_id("req-list-1"),
+                    query: ListBatches::new(
+                        BatchCursor::new(wire_ceiling()),
+                        page_size(MAX_BATCH_PAGE_ITEMS),
+                    ),
+                },
+                params: JsonValue::Object(vec![
+                    ("page_size".to_owned(), number(MAX_BATCH_PAGE_ITEMS as u64)),
+                    ("since".to_owned(), number(wire_ceiling())),
+                ]),
+            },
+            RequestCase {
+                id: "list-batches-start",
+                note: "the beginning of the registry: a cursor of zero, which is a position \
+                       rather than the absence of one, and the smallest page that can make \
+                       progress",
+                request: BatchRequest::ListBatches {
+                    request_id: request_id("req-list-2"),
+                    query: ListBatches::new(BatchCursor::START, page_size(1)),
+                },
+                params: JsonValue::Object(vec![
+                    ("page_size".to_owned(), number(1)),
+                    ("since".to_owned(), number(0)),
+                ]),
+            },
+            RequestCase {
+                id: "batch-detail-escaping",
+                note: "one batch read by an identity carrying every reachable escape",
+                request: BatchRequest::BatchDetail {
+                    request_id: request_id("req-detail-1"),
+                    batch_id: batch(&escaping_batch_id()),
+                },
+                params: JsonValue::Object(vec![(
+                    "batch_id".to_owned(),
+                    text(&escaping_batch_id()),
+                )]),
+            },
+        ]
+    }
+
+    fn request_entry(case: &RequestCase) -> JsonValue {
+        let message = case.request.to_message().expect("the request encodes");
+        let canonical = message.to_canonical_bytes();
+        // What the corpus records is checked against the shipped decoder before
+        // it is written: a fixture Rust would not itself admit proves nothing.
+        assert_eq!(
+            BatchRequest::from_canonical_bytes(&canonical).expect("Rust admits its own encoding"),
+            case.request,
+            "{}: the Rust decoder does not admit the Rust encoding",
+            case.id
+        );
+        assert!(
+            canonical.len() <= MAX_BATCH_CONTROL_CANONICAL_BYTES,
+            "{}: the encoding does not fit one batch control frame",
+            case.id
+        );
+        JsonValue::Object(vec![
+            ("canonical_bytes".to_owned(), count(canonical.len())),
+            ("canonical_hex".to_owned(), text(&hex(&canonical))),
+            ("id".to_owned(), text(case.id)),
+            ("kind".to_owned(), text(message.envelope().kind().as_str())),
+            ("note".to_owned(), text(case.note)),
+            ("params".to_owned(), case.params.clone()),
+            (
+                "request_id".to_owned(),
+                text(message.envelope().request_id().as_str()),
+            ),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // Responses
+    // -----------------------------------------------------------------------
+
+    struct ResponseCase {
+        id: &'static str,
+        note: &'static str,
+        response: BatchResponse,
+    }
+
+    /// One batch row's six columns, in the shape the fixtures name them.
+    ///
+    /// A parameter object because two bounded identifiers sit beside one
+    /// another and a transposed pair would type-check into a fixture that
+    /// measured the wrong thing.
+    struct Row<'a> {
+        entry_id: u64,
+        batch_id: &'a str,
+        label: Option<&'a str>,
+        concurrency: ConcurrencyPolicy,
+        created_at_ms: i64,
+        revision: u64,
+    }
+
+    fn record(row: Row<'_>) -> BatchRecordView {
+        BatchRecordView::new(
+            row.entry_id,
+            batch(row.batch_id),
+            row.label.map(label),
+            row.concurrency,
+            EpochMillis::from_millis(row.created_at_ms),
+            row.revision,
+        )
+        .expect("a well-formed batch row")
+    }
+
+    /// One member row, at the ordinal its position in the membership declares.
+    fn member_row(
+        ordinal: u32,
+        key: &str,
+        progress: MemberProgress,
+        last_sequence: u64,
+        revision: u64,
+    ) -> MemberView {
+        MemberView::new(
+            member(key),
+            ordinal,
+            progress,
+            last_sequence,
+            revision,
+            EpochMillis::from_millis(1_700_000_000_000 + i64::from(ordinal)),
+        )
+        .expect("a well-formed member row")
+    }
+
+    /// A listing answer built through the enforcement path rather than around
+    /// it: `BatchResponse::listing` is what refuses a page longer than the query
+    /// asked for, so a corpus entry that constructed the variant directly would
+    /// record bytes no daemon could have produced.
+    fn listing(id: &str, query: ListBatches, page: BatchListPage) -> BatchResponse {
+        BatchResponse::listing(request_id(id), query, page)
+            .expect("the page answers the query it was built for")
+    }
+
+    fn detail(id: &str, batch_row: BatchRecordView, members: Vec<MemberView>) -> BatchResponse {
+        BatchResponse::BatchDetail {
+            request_id: request_id(id),
+            detail: BatchDetailResult::new(batch_row, members).expect("a well-formed batch detail"),
+        }
+    }
+
+    fn response_cases() -> Vec<ResponseCase> {
+        let whole_registry = ListBatches::new(BatchCursor::START, page_size(MAX_BATCH_PAGE_ITEMS));
+
+        vec![
+            ResponseCase {
+                id: "batch-registered-maximal-membership",
+                note: "a maximal membership is durable, all of it `unsubmitted` at ordinals \
+                       0..member_count. `accepted` rather than `completed`: the rows are \
+                       committed, and what they record has not taken effect and cannot, because \
+                       registering a batch submits nothing and reserves no run identity",
+                response: BatchResponse::Registered {
+                    request_id: request_id("req-register-1"),
+                    receipt: BatchReceiptView::new(
+                        1,
+                        batch(&escaping_batch_id()),
+                        MAX_BATCH_CONTROL_MEMBERS,
+                        1,
+                        EpochMillis::from_millis(1_700_000_000_000),
+                    )
+                    .expect("a well-formed receipt"),
+                },
+            },
+            ResponseCase {
+                id: "batch-registered-at-ceiling",
+                note: "the same answer with every counter at the wire's ceiling and the smallest \
+                       membership a batch can have, which is one rather than none",
+                response: BatchResponse::Registered {
+                    request_id: request_id("req-register-2"),
+                    receipt: BatchReceiptView::new(
+                        wire_ceiling(),
+                        batch("batch/nightly-eval"),
+                        1,
+                        wire_ceiling(),
+                        EpochMillis::from_millis(i64::MAX),
+                    )
+                    .expect("a well-formed receipt"),
+                },
+            },
+            ResponseCase {
+                id: "member-advanced-running",
+                note: "one member's row moved. The revision is the fence the *next* advance must \
+                       expect, and it is two here because registration wrote one: an advance \
+                       receipt at revision one would name a row no accepted advance could have \
+                       left behind. The ordinal is the last position this lane's membership \
+                       admits",
+                response: BatchResponse::MemberAdvanced {
+                    request_id: request_id("req-advance-1"),
+                    receipt: MemberReceiptView::new(MemberReceiptParts {
+                        batch_id: batch(&escaping_batch_id()),
+                        member_key: member(&escaping_member_key()),
+                        ordinal: u32::try_from(MAX_BATCH_CONTROL_MEMBERS - 1)
+                            .expect("the last ordinal fits a u32"),
+                        progress: MemberProgress::Run(RunState::Running),
+                        last_sequence: wire_ceiling(),
+                        revision: 2,
+                        updated_at: EpochMillis::from_millis(i64::MAX),
+                    })
+                    .expect("a well-formed advance receipt"),
+                },
+            },
+            ResponseCase {
+                id: "member-advanced-cancelled",
+                note: "a terminal member at a revision at the wire's ceiling: a cancellation is a \
+                       decision rather than a loss, which is why a batch of nothing but \
+                       cancellations rolls up to `cancelled` and not to `failed`",
+                response: BatchResponse::MemberAdvanced {
+                    request_id: request_id("req-advance-2"),
+                    receipt: MemberReceiptView::new(MemberReceiptParts {
+                        batch_id: batch("batch/nightly-eval"),
+                        member_key: member("submit/only"),
+                        ordinal: 0,
+                        progress: MemberProgress::Run(RunState::Cancelled),
+                        last_sequence: 7,
+                        revision: wire_ceiling(),
+                        updated_at: EpochMillis::from_millis(0),
+                    })
+                    .expect("a well-formed advance receipt"),
+                },
+            },
+            ResponseCase {
+                id: "batch-list-page-more",
+                note: "one page carrying both concurrency shapes at once: a sequential batch with \
+                       no label and no ceiling, and a bounded-parallel one at the largest ceiling \
+                       a policy can declare. The last row and the continuation cursor are both at \
+                       the wire's ceiling",
+                response: listing(
+                    "req-list-1",
+                    whole_registry,
+                    BatchListPage::new(
+                        vec![
+                            record(Row {
+                                entry_id: 1,
+                                batch_id: "batch/first",
+                                label: None,
+                                concurrency: ConcurrencyPolicy::Sequential,
+                                created_at_ms: 1_700_000_000_000,
+                                revision: 1,
+                            }),
+                            record(Row {
+                                entry_id: wire_ceiling() - 1,
+                                batch_id: &escaping_batch_id(),
+                                label: Some(&escaping_label()),
+                                concurrency: bounded_parallel(
+                                    u32::try_from(MAX_BATCH_MEMBERS)
+                                        .expect("the ceiling fits a u32"),
+                                ),
+                                created_at_ms: i64::MAX,
+                                revision: wire_ceiling(),
+                            }),
+                        ],
+                        BatchContinuation::More(BatchCursor::new(wire_ceiling())),
+                    )
+                    .expect("a well-formed page"),
+                ),
+            },
+            ResponseCase {
+                id: "batch-list-page-complete",
+                note: "the end of the registry: `more` false and an explicit null cursor. A batch \
+                       registered at the epoch, which the registry's own `created_at_ms >= 0` \
+                       constraint admits and one millisecond earlier does not",
+                response: listing(
+                    "req-list-2",
+                    whole_registry,
+                    BatchListPage::new(
+                        vec![record(Row {
+                            entry_id: 9,
+                            batch_id: "batch/only",
+                            label: Some("nightly"),
+                            concurrency: bounded_parallel(4),
+                            created_at_ms: 0,
+                            revision: 3,
+                        })],
+                        BatchContinuation::Complete,
+                    )
+                    .expect("a well-formed page"),
+                ),
+            },
+            ResponseCase {
+                id: "batch-list-page-empty-more",
+                note: "an empty page that still reports more. `more` is carried explicitly rather \
+                       than inferred from a short page, because a short page is not the same \
+                       statement as a last page",
+                response: listing(
+                    "req-list-1",
+                    whole_registry,
+                    BatchListPage::new(Vec::new(), BatchContinuation::More(BatchCursor::new(42)))
+                        .expect("an empty page may continue"),
+                ),
+            },
+            ResponseCase {
+                id: "batch-detail-mixed",
+                note: "the rollup that exists to be exactly one case: every member ended, nothing \
+                       was lost, and the results are neither all completions nor all \
+                       cancellations. The state is not a column anywhere — the registry \
+                       deliberately does not store one — and it is derived beside the members \
+                       that justify it, which is why a reader can check it",
+                response: detail(
+                    "req-detail-1",
+                    record(Row {
+                        entry_id: 4,
+                        batch_id: &escaping_batch_id(),
+                        label: Some(&escaping_label()),
+                        concurrency: bounded_parallel(2),
+                        created_at_ms: 1_700_000_000_000,
+                        revision: 1,
+                    }),
+                    vec![
+                        member_row(
+                            0,
+                            &escaping_member_key(),
+                            MemberProgress::Run(RunState::Completed),
+                            12,
+                            2,
+                        ),
+                        member_row(
+                            1,
+                            "submit/zebra",
+                            MemberProgress::Run(RunState::Cancelled),
+                            3,
+                            5,
+                        ),
+                    ],
+                ),
+            },
+            ResponseCase {
+                id: "batch-detail-pending",
+                note: "no member has begun: one was never submitted and one is held with no event \
+                       arrived. `ready` is not `unsubmitted` — the first presumes a submission \
+                       happened — and both carry a zero sequence, which is the coupling the Rust \
+                       decoder holds and this file's generated one does not",
+                response: detail(
+                    "req-detail-2",
+                    record(Row {
+                        entry_id: 5,
+                        batch_id: "batch/nightly-eval",
+                        label: None,
+                        concurrency: ConcurrencyPolicy::Sequential,
+                        created_at_ms: 1_700_000_000_000,
+                        revision: 1,
+                    }),
+                    vec![
+                        member_row(0, "submit/aardvark", MemberProgress::Unsubmitted, 0, 1),
+                        member_row(
+                            1,
+                            "submit/zebra",
+                            MemberProgress::Run(RunState::Ready),
+                            0,
+                            4,
+                        ),
+                    ],
+                ),
+            },
+            ResponseCase {
+                id: "batch-detail-failed",
+                note: "a batch that lost a member did not succeed, whatever the others did: one \
+                       completion beside one timed-out member rolls up to `failed` rather than to \
+                       `mixed`",
+                response: detail(
+                    "req-detail-3",
+                    record(Row {
+                        entry_id: 6,
+                        batch_id: "batch/nightly-eval",
+                        label: Some("nightly"),
+                        concurrency: bounded_parallel(8),
+                        created_at_ms: 1_700_000_000_000,
+                        revision: 2,
+                    }),
+                    vec![
+                        member_row(
+                            0,
+                            "submit/aardvark",
+                            MemberProgress::Run(RunState::Completed),
+                            9,
+                            3,
+                        ),
+                        member_row(
+                            1,
+                            "submit/zebra",
+                            MemberProgress::Run(RunState::TimedOut),
+                            wire_ceiling(),
+                            2,
+                        ),
+                    ],
+                ),
+            },
+            ResponseCase {
+                id: "revision-conflict",
+                note: "the caller's fence was stale and nothing was written. Not a refusal: a \
+                       conflict is retried against the durable revision this answer carries, \
+                       where a refusal is not retried at all until the request changes",
+                response: BatchResponse::conflict(request_id("req-advance-1"), 2, 7)
+                    .expect("two revisions that disagree"),
+            },
+            ResponseCase {
+                id: "revision-conflict-at-ceiling",
+                note: "the same answer with the durable revision at the wire's ceiling, which a \
+                       reader carrying it in a double would round",
+                response: BatchResponse::conflict(request_id("req-advance-2"), 1, wire_ceiling())
+                    .expect("two revisions that disagree"),
+            },
+            ResponseCase {
+                id: "refused-unknown-batch",
+                note: "no batch is registered under that identity. Distinct from `unknown_member`, \
+                       because the two are fixed differently: one is a batch nobody registered, \
+                       the other is a key a registered batch never named and never will",
+                response: BatchResponse::Refused {
+                    request_id: request_id("req-detail-1"),
+                    refusal: BatchRefusal::UnknownBatch,
+                },
+            },
+            ResponseCase {
+                id: "refused-already-registered",
+                note: "a repeated identity is never an overwrite: re-registering would reset \
+                       member rows a writer may already have advanced, and silently discarding a \
+                       batch's recorded progress is the one thing the registry exists to prevent",
+                response: BatchResponse::Refused {
+                    request_id: request_id("req-register-1"),
+                    refusal: BatchRefusal::AlreadyRegistered,
+                },
+            },
+            ResponseCase {
+                id: "refused-illegal-transition",
+                note: "the reported progress does not follow the durable one along the lattice, \
+                       which is a rejection rather than a conflict: the request does not become \
+                       right by being retried against a newer revision",
+                response: BatchResponse::Refused {
+                    request_id: request_id("req-advance-1"),
+                    refusal: BatchRefusal::IllegalTransition,
+                },
+            },
+            ResponseCase {
+                id: "refused-registry-full",
+                note: "capacity is a refusal and never an eviction: forgetting a batch would \
+                       strand the only durable record of what it declared",
+                response: BatchResponse::Refused {
+                    request_id: request_id("req-register-1"),
+                    refusal: BatchRefusal::RegistryFull,
+                },
+            },
+        ]
+    }
+
+    /// How one concurrency policy is spelled, under the corpus's dotted keys.
+    fn concurrency_spelling(prefix: &str, policy: ConcurrencyPolicy) -> Vec<(String, JsonValue)> {
+        vec![
+            (
+                format!("{prefix}concurrency.kind"),
+                text(policy.kind().as_str()),
+            ),
+            (
+                format!("{prefix}concurrency.max_in_flight"),
+                match policy.declared_ceiling() {
+                    Some(ceiling) => number(u64::from(ceiling)),
+                    None => text("null"),
+                },
+            ),
+        ]
+    }
+
+    fn record_spelling(prefix: &str, value: &BatchRecordView) -> Vec<(String, JsonValue)> {
+        let mut fields = vec![
+            (format!("{prefix}batch_id"), text(value.batch_id().as_str())),
+            (
+                format!("{prefix}created_at_ms"),
+                JsonValue::String(value.created_at().as_millis().to_string()),
+            ),
+            (format!("{prefix}entry_id"), number(value.entry_id())),
+            (
+                format!("{prefix}label"),
+                match value.label() {
+                    Some(label) => text(label.as_str()),
+                    None => text("null"),
+                },
+            ),
+            (format!("{prefix}revision"), number(value.revision())),
+        ];
+        fields.extend(concurrency_spelling(prefix, value.concurrency()));
+        fields
+    }
+
+    fn member_spelling(prefix: &str, value: &MemberView) -> Vec<(String, JsonValue)> {
+        vec![
+            (format!("{prefix}key"), text(value.key().as_str())),
+            (
+                format!("{prefix}last_sequence"),
+                number(value.last_sequence()),
+            ),
+            (
+                format!("{prefix}ordinal"),
+                number(u64::from(value.ordinal())),
+            ),
+            (format!("{prefix}revision"), number(value.revision())),
+            (format!("{prefix}state"), text(value.progress().as_str())),
+            (
+                format!("{prefix}updated_at_ms"),
+                JsonValue::String(value.updated_at().as_millis().to_string()),
+            ),
+        ]
+    }
+
+    /// How one decoded response is spelled in the corpus.
+    ///
+    /// Built from the value the *Rust decoder* recovered, and flattened with
+    /// dotted keys so a nested page or membership compares field by field
+    /// rather than as one opaque blob.
+    fn decoded_spelling(response: &BatchResponse) -> JsonValue {
+        let mut fields = vec![(
+            "request_id".to_owned(),
+            text(response.request_id().as_str()),
+        )];
+        match response {
+            BatchResponse::Registered { receipt, .. } => {
+                fields.push(("batch_id".to_owned(), text(receipt.batch_id().as_str())));
+                fields.push((
+                    "created_at_ms".to_owned(),
+                    JsonValue::String(receipt.created_at().as_millis().to_string()),
+                ));
+                fields.push(("entry_id".to_owned(), number(receipt.entry_id())));
+                fields.push((
+                    "member_count".to_owned(),
+                    number(receipt.member_count() as u64),
+                ));
+                fields.push(("revision".to_owned(), number(receipt.revision())));
+            }
+            BatchResponse::MemberAdvanced { receipt, .. } => {
+                fields.push(("batch_id".to_owned(), text(receipt.batch_id().as_str())));
+                fields.push(("last_sequence".to_owned(), number(receipt.last_sequence())));
+                fields.push(("member_key".to_owned(), text(receipt.member_key().as_str())));
+                fields.push(("ordinal".to_owned(), number(u64::from(receipt.ordinal()))));
+                fields.push(("revision".to_owned(), number(receipt.revision())));
+                fields.push(("state".to_owned(), text(receipt.progress().as_str())));
+                fields.push((
+                    "updated_at_ms".to_owned(),
+                    JsonValue::String(receipt.updated_at().as_millis().to_string()),
+                ));
+            }
+            BatchResponse::BatchList { page, .. } => {
+                fields.push((
+                    "batches.len".to_owned(),
+                    number(page.entries().len() as u64),
+                ));
+                fields.push((
+                    "more".to_owned(),
+                    text(&page.continuation().has_more().to_string()),
+                ));
+                fields.push((
+                    "next_cursor".to_owned(),
+                    match page.continuation().cursor() {
+                        Some(cursor) => number(cursor.position()),
+                        None => text("null"),
+                    },
+                ));
+                for (index, carried) in page.entries().iter().enumerate() {
+                    fields.extend(record_spelling(&format!("batches.{index}."), carried));
+                }
+            }
+            BatchResponse::BatchDetail { detail, .. } => {
+                fields.extend(record_spelling("batch.", detail.batch()));
+                fields.push((
+                    "members.len".to_owned(),
+                    number(detail.members().len() as u64),
+                ));
+                fields.push(("state".to_owned(), text(detail.rolled_up_state().as_str())));
+                for (index, carried) in detail.members().iter().enumerate() {
+                    fields.extend(member_spelling(&format!("members.{index}."), carried));
+                }
+            }
+            BatchResponse::Conflict {
+                expected_revision,
+                durable_revision,
+                ..
+            } => {
+                fields.push(("durable_revision".to_owned(), number(*durable_revision)));
+                fields.push(("expected_revision".to_owned(), number(*expected_revision)));
+            }
+            BatchResponse::Refused { refusal, .. } => {
+                fields.push(("refusal".to_owned(), text(refusal.as_str())));
+            }
+        }
+        JsonValue::Object(fields)
+    }
+
+    fn response_entry(case: &ResponseCase) -> JsonValue {
+        let message = case.response.to_message().expect("the response encodes");
+        let canonical = message.to_canonical_bytes();
+        let decoded =
+            BatchResponse::from_canonical_bytes(&canonical).expect("Rust admits its own encoding");
+        assert_eq!(
+            decoded, case.response,
+            "{}: the Rust decoder does not recover what it encoded",
+            case.id
+        );
+        JsonValue::Object(vec![
+            ("canonical_hex".to_owned(), text(&hex(&canonical))),
+            ("decoded".to_owned(), decoded_spelling(&decoded)),
+            ("id".to_owned(), text(case.id)),
+            ("kind".to_owned(), text(message.envelope().kind().as_str())),
+            ("note".to_owned(), text(case.note)),
+            ("outcome".to_owned(), text(decoded.outcome().as_str())),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // Bodies, for the payloads no constructor would produce
+    // -----------------------------------------------------------------------
+
+    fn concurrency_body(kind: &str, ceiling: Option<i64>) -> JsonValue {
+        JsonValue::Object(vec![
+            ("kind".to_owned(), text(kind)),
+            (
+                "max_in_flight".to_owned(),
+                match ceiling {
+                    Some(value) => JsonValue::Integer(value),
+                    None => JsonValue::Null,
+                },
+            ),
+        ])
+    }
+
+    /// A well-formed batch row body, as a starting point for one that is not.
+    fn record_body(overrides: &[(&str, JsonValue)]) -> JsonValue {
+        let mut entries: Vec<(String, JsonValue)> = vec![
+            ("batch_id".to_owned(), text("batch/nightly-eval")),
+            (
+                "concurrency".to_owned(),
+                concurrency_body("bounded_parallel", Some(4)),
+            ),
+            (
+                "created_at_ms".to_owned(),
+                JsonValue::Integer(1_700_000_000_000),
+            ),
+            ("entry_id".to_owned(), JsonValue::Integer(1)),
+            ("label".to_owned(), text("nightly")),
+            ("revision".to_owned(), JsonValue::Integer(1)),
+        ];
+        for (name, value) in overrides {
+            let slot = entries
+                .iter_mut()
+                .find(|(existing, _)| existing == name)
+                .unwrap_or_else(|| panic!("{name} is not a batch row field"));
+            slot.1 = value.clone();
+        }
+        JsonValue::Object(entries)
+    }
+
+    /// A well-formed member row body.
+    fn member_body(overrides: &[(&str, JsonValue)]) -> JsonValue {
+        let mut entries: Vec<(String, JsonValue)> = vec![
+            ("key".to_owned(), text("submit/only")),
+            ("last_sequence".to_owned(), JsonValue::Integer(7)),
+            ("ordinal".to_owned(), JsonValue::Integer(0)),
+            ("revision".to_owned(), JsonValue::Integer(2)),
+            ("state".to_owned(), text("completed")),
+            (
+                "updated_at_ms".to_owned(),
+                JsonValue::Integer(1_700_000_000_000),
+            ),
+        ];
+        for (name, value) in overrides {
+            let slot = entries
+                .iter_mut()
+                .find(|(existing, _)| existing == name)
+                .unwrap_or_else(|| panic!("{name} is not a member row field"));
+            slot.1 = value.clone();
+        }
+        JsonValue::Object(entries)
+    }
+
+    /// A well-formed advance receipt body.
+    fn receipt_body(overrides: &[(&str, JsonValue)]) -> JsonValue {
+        let mut entries: Vec<(String, JsonValue)> = vec![
+            ("batch_id".to_owned(), text("batch/nightly-eval")),
+            ("last_sequence".to_owned(), JsonValue::Integer(7)),
+            ("member_key".to_owned(), text("submit/only")),
+            ("ordinal".to_owned(), JsonValue::Integer(0)),
+            ("revision".to_owned(), JsonValue::Integer(2)),
+            ("state".to_owned(), text("running")),
+            (
+                "updated_at_ms".to_owned(),
+                JsonValue::Integer(1_700_000_000_000),
+            ),
+        ];
+        for (name, value) in overrides {
+            let slot = entries
+                .iter_mut()
+                .find(|(existing, _)| existing == name)
+                .unwrap_or_else(|| panic!("{name} is not an advance receipt field"));
+            slot.1 = value.clone();
+        }
+        JsonValue::Object(entries)
+    }
+
+    /// A well-formed registration receipt body.
+    fn registered_body(overrides: &[(&str, JsonValue)]) -> JsonValue {
+        let mut entries: Vec<(String, JsonValue)> = vec![
+            ("batch_id".to_owned(), text("batch/nightly-eval")),
+            (
+                "created_at_ms".to_owned(),
+                JsonValue::Integer(1_700_000_000_000),
+            ),
+            ("entry_id".to_owned(), JsonValue::Integer(1)),
+            ("member_count".to_owned(), JsonValue::Integer(2)),
+            ("revision".to_owned(), JsonValue::Integer(1)),
+        ];
+        for (name, value) in overrides {
+            let slot = entries
+                .iter_mut()
+                .find(|(existing, _)| existing == name)
+                .unwrap_or_else(|| panic!("{name} is not a registration receipt field"));
+            slot.1 = value.clone();
+        }
+        JsonValue::Object(entries)
+    }
+
+    fn page_body(batches: Vec<JsonValue>, more: bool, next_cursor: JsonValue) -> JsonValue {
+        JsonValue::Object(vec![
+            ("batches".to_owned(), JsonValue::Array(batches)),
+            ("more".to_owned(), JsonValue::Bool(more)),
+            ("next_cursor".to_owned(), next_cursor),
+        ])
+    }
+
+    fn detail_body(members: Vec<JsonValue>, state: &str) -> JsonValue {
+        JsonValue::Object(vec![
+            ("batch".to_owned(), record_body(&[])),
+            ("members".to_owned(), JsonValue::Array(members)),
+            ("state".to_owned(), text(state)),
+        ])
+    }
+
+    fn batch_message(kind: &str, id: &str, body: JsonValue) -> Vec<u8> {
+        raw_message(BATCH_CONTROL_PROTOCOL, 1, kind, id, body)
+    }
+
+    /// One batch row wrapped in the smallest page that can carry it.
+    fn one_row_page(row: JsonValue) -> Vec<u8> {
+        batch_message(
+            "batch_list_result",
+            "req-list-1",
+            page_body(vec![row], false, JsonValue::Null),
+        )
+    }
+
+    /// One member row wrapped in the smallest detail that can carry it.
+    ///
+    /// The carried rollup is `completed`, which is what one completed member
+    /// rolls up to: a detail whose state contradicted its members would be
+    /// refused for *that* instead of for the fault under test.
+    fn one_member_detail(row: JsonValue) -> Vec<u8> {
+        batch_message(
+            "batch_detail_result",
+            "req-detail-1",
+            detail_body(vec![row], "completed"),
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Refusals both implementations make
+    // -----------------------------------------------------------------------
+
+    struct DecodeRefusal {
+        id: &'static str,
+        note: &'static str,
+        payload: Vec<u8>,
+    }
+
+    fn decode_refusals() -> Vec<DecodeRefusal> {
+        // The page and membership bounds are judged before any item is read, in
+        // Rust and in the generated TypeScript alike, so the over-bound payloads
+        // carry integers rather than bodies: what is wrong with them is length.
+        let page_filler: Vec<JsonValue> = (0..=MAX_BATCH_PAGE_ITEMS)
+            .map(|index| JsonValue::Integer(index as i64))
+            .collect();
+        let member_filler: Vec<JsonValue> = (0..=MAX_BATCH_CONTROL_MEMBERS)
+            .map(|index| JsonValue::Integer(index as i64))
+            .collect();
+
+        vec![
+            DecodeRefusal {
+                id: "member-progress-undefined-spelling",
+                note: "a member progress this build does not define fails closed rather than \
+                       decoding to a default. There is no safe guess: counting it as finished \
+                       invents a completion, and counting it as outstanding invents work still to \
+                       do — and the rollup over it would carry the invention up to the batch",
+                payload: one_member_detail(member_body(&[("state", text("skipped"))])),
+            },
+            DecodeRefusal {
+                id: "batch-state-undefined-spelling",
+                note: "a rolled-up batch state outside the six this build derives. The vocabulary \
+                       is closed on both sides of the wire even though the value is derived, \
+                       because a reader that retained an unnameable rollup would be holding a \
+                       summary of work it cannot describe",
+                payload: batch_message(
+                    "batch_detail_result",
+                    "req-detail-1",
+                    detail_body(vec![member_body(&[])], "partial"),
+                ),
+            },
+            DecodeRefusal {
+                id: "concurrency-kind-undefined-spelling",
+                note: "a concurrency word outside the two this build defines. `parallel` with no \
+                       ceiling is exactly the unbounded policy this model refuses to have a \
+                       spelling for",
+                payload: one_row_page(record_body(&[(
+                    "concurrency",
+                    concurrency_body("parallel", None),
+                )])),
+            },
+            DecodeRefusal {
+                id: "refusal-undefined-spelling",
+                note: "a refusal word outside the thirteen this build carries",
+                payload: batch_message(
+                    "refused",
+                    "req-register-1",
+                    JsonValue::Object(vec![("refusal".to_owned(), text("quota_exceeded"))]),
+                ),
+            },
+            DecodeRefusal {
+                id: "concurrency-sequential-with-ceiling",
+                note: "the discriminated coupling, met from one side: a sequential policy that \
+                       carries a number is a policy this build cannot mean, and the generated \
+                       union has no shape for it either",
+                payload: one_row_page(record_body(&[(
+                    "concurrency",
+                    concurrency_body("sequential", Some(4)),
+                )])),
+            },
+            DecodeRefusal {
+                id: "concurrency-bounded-parallel-without-ceiling",
+                note: "and from the other: a bounded parallelism with no bound is an unbounded \
+                       policy wearing the bounded word",
+                payload: one_row_page(record_body(&[(
+                    "concurrency",
+                    concurrency_body("bounded_parallel", None),
+                )])),
+            },
+            DecodeRefusal {
+                id: "concurrency-ceiling-zero",
+                note: "a ceiling that admits nothing in flight, refused rather than read as `no \
+                       limit`. Its own category: a caller told only `invalid` cannot tell this \
+                       from the ceiling above",
+                payload: one_row_page(record_body(&[(
+                    "concurrency",
+                    concurrency_body("bounded_parallel", Some(0)),
+                )])),
+            },
+            DecodeRefusal {
+                id: "concurrency-ceiling-above-membership",
+                note: "one past the members a batch can hold, which is a ceiling that can never \
+                       bind — an unbounded policy with a number written on it",
+                payload: one_row_page(record_body(&[(
+                    "concurrency",
+                    concurrency_body("bounded_parallel", Some(MAX_BATCH_MEMBERS as i64 + 1)),
+                )])),
+            },
+            DecodeRefusal {
+                id: "concurrency-ceiling-above-its-own-width",
+                note: "a ceiling above the integer width it is carried in, which is a malformed \
+                       body rather than an unreachable ceiling: the decoder converts before it \
+                       judges the domain, and the two categories differ",
+                payload: one_row_page(record_body(&[(
+                    "concurrency",
+                    concurrency_body("bounded_parallel", Some(i64::from(u32::MAX) + 1)),
+                )])),
+            },
+            DecodeRefusal {
+                id: "entry-id-zero",
+                note: "a durable identity starts at one; zero names a row no writer produced",
+                payload: one_row_page(record_body(&[("entry_id", JsonValue::Integer(0))])),
+            },
+            DecodeRefusal {
+                id: "entry-id-negative",
+                note: "a negative identity is a malformed body rather than an unwritten row: the \
+                       decoder converts before it judges the domain",
+                payload: one_row_page(record_body(&[("entry_id", JsonValue::Integer(-1))])),
+            },
+            DecodeRefusal {
+                id: "batch-revision-zero",
+                note: "registration writes revision one and every accepted advance writes one \
+                       higher, so zero names a row this product could not have written",
+                payload: one_row_page(record_body(&[("revision", JsonValue::Integer(0))])),
+            },
+            DecodeRefusal {
+                id: "member-revision-zero",
+                note: "the same pin on a member row, which the registry writes at one and \
+                       advances from there",
+                payload: one_member_detail(member_body(&[("revision", JsonValue::Integer(0))])),
+            },
+            DecodeRefusal {
+                id: "advance-receipt-at-revision-one",
+                note: "registration is the only writer of revision one, so an advance receipt \
+                       claiming it names a row no accepted advance could have left behind. This \
+                       is the durable-row rule the generated surface *does* hold, because `two or \
+                       above` is a bound on one field's own value",
+                payload: batch_message(
+                    "member_advanced",
+                    "req-advance-1",
+                    receipt_body(&[("revision", JsonValue::Integer(1))]),
+                ),
+            },
+            DecodeRefusal {
+                id: "advance-receipt-at-revision-zero",
+                note: "the same pin met from below, and under the same category",
+                payload: batch_message(
+                    "member_advanced",
+                    "req-advance-1",
+                    receipt_body(&[("revision", JsonValue::Integer(0))]),
+                ),
+            },
+            DecodeRefusal {
+                id: "member-ordinal-above-membership",
+                note: "an ordinal past the last position this lane's membership admits. That the \
+                       ordinals are contiguous is a relation between members and stays with the \
+                       Rust decoder; that each one is inside the membership is a bound on its own \
+                       value, and this side holds it",
+                payload: batch_message(
+                    "member_advanced",
+                    "req-advance-1",
+                    receipt_body(&[(
+                        "ordinal",
+                        JsonValue::Integer(MAX_BATCH_CONTROL_MEMBERS as i64),
+                    )]),
+                ),
+            },
+            DecodeRefusal {
+                id: "created-at-before-epoch",
+                note: "an instant the registry's own `created_at_ms >= 0` constraint cannot hold",
+                payload: one_row_page(record_body(&[("created_at_ms", JsonValue::Integer(-1))])),
+            },
+            DecodeRefusal {
+                id: "updated-at-before-epoch",
+                note: "the same constraint on the instant a member row records",
+                payload: one_member_detail(member_body(&[(
+                    "updated_at_ms",
+                    JsonValue::Integer(-1),
+                )])),
+            },
+            DecodeRefusal {
+                id: "member-count-zero",
+                note: "a registration that wrote no member is a unit with nothing in it, which is \
+                       the batch model's own refusal rather than this lane's — and a different \
+                       one from a count above the ceiling, which is why the two ends of this \
+                       domain carry different categories",
+                payload: batch_message(
+                    "batch_registered",
+                    "req-register-1",
+                    registered_body(&[("member_count", JsonValue::Integer(0))]),
+                ),
+            },
+            DecodeRefusal {
+                id: "member-count-above-bound",
+                note: "one past MAX_BATCH_CONTROL_MEMBERS, which is this transport's ceiling \
+                       rather than the registry's: the store still holds twice as many, and the \
+                       two are deliberately not reconciled",
+                payload: batch_message(
+                    "batch_registered",
+                    "req-register-1",
+                    registered_body(&[(
+                        "member_count",
+                        JsonValue::Integer(MAX_BATCH_CONTROL_MEMBERS as i64 + 1),
+                    )]),
+                ),
+            },
+            DecodeRefusal {
+                id: "batch-id-empty",
+                note: "an empty identity names no batch",
+                payload: one_row_page(record_body(&[("batch_id", text(""))])),
+            },
+            DecodeRefusal {
+                id: "label-control-character",
+                note: "a control character in an operator-supplied label, which the wire never \
+                       carries raw. A space *is* admitted, which is the difference between this \
+                       lane's grammar and the correlation identifier's",
+                payload: one_row_page(record_body(&[("label", text("nightly\u{7}eval"))])),
+            },
+            DecodeRefusal {
+                id: "member-key-over-bound-in-bytes-only",
+                note: "65 two-byte characters: 65 UTF-16 code units, which a JavaScript `length` \
+                       check would wave through, and 130 UTF-8 bytes, which is over the bound Rust \
+                       and the registry both measure",
+                payload: one_member_detail(member_body(&[(
+                    "key",
+                    text(&over_bound_by_bytes_only()),
+                )])),
+            },
+            DecodeRefusal {
+                id: "page-over-bound",
+                note: "one row past MAX_BATCH_PAGE_ITEMS. The length is judged before any item is \
+                       read, so what these items are does not matter",
+                payload: batch_message(
+                    "batch_list_result",
+                    "req-list-1",
+                    page_body(page_filler, false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "detail-membership-over-bound",
+                note: "one member past MAX_BATCH_CONTROL_MEMBERS on the way in, which is the same \
+                       ceiling the registration encoder holds on the way out",
+                payload: batch_message(
+                    "batch_detail_result",
+                    "req-detail-1",
+                    detail_body(member_filler, "completed"),
+                ),
+            },
+            DecodeRefusal {
+                id: "next-cursor-negative",
+                note: "a cursor below the beginning of the listing",
+                payload: batch_message(
+                    "batch_list_result",
+                    "req-list-1",
+                    page_body(Vec::new(), true, JsonValue::Integer(-1)),
+                ),
+            },
+            DecodeRefusal {
+                id: "more-not-a-boolean",
+                note: "the wire carries true or false for a continuation and nothing else",
+                payload: batch_message(
+                    "batch_list_result",
+                    "req-list-1",
+                    JsonValue::Object(vec![
+                        ("batches".to_owned(), JsonValue::Array(Vec::new())),
+                        ("more".to_owned(), JsonValue::Integer(1)),
+                        ("next_cursor".to_owned(), JsonValue::Null),
+                    ]),
+                ),
+            },
+            DecodeRefusal {
+                id: "conflict-revision-zero",
+                note: "a conflict naming a revision no writer produced tells a caller to retry \
+                       against a row that does not exist",
+                payload: batch_message(
+                    "revision_conflict",
+                    "req-advance-1",
+                    JsonValue::Object(vec![
+                        ("durable_revision".to_owned(), JsonValue::Integer(0)),
+                        ("expected_revision".to_owned(), JsonValue::Integer(2)),
+                    ]),
+                ),
+            },
+            DecodeRefusal {
+                id: "page-extra-field",
+                note: "an unexpected key is refused rather than ignored",
+                payload: batch_message(
+                    "batch_list_result",
+                    "req-list-1",
+                    JsonValue::Object(vec![
+                        ("batches".to_owned(), JsonValue::Array(Vec::new())),
+                        ("more".to_owned(), JsonValue::Bool(false)),
+                        ("next_cursor".to_owned(), JsonValue::Null),
+                        ("total".to_owned(), JsonValue::Integer(1)),
+                    ]),
+                ),
+            },
+            DecodeRefusal {
+                id: "record-missing-label",
+                note: "a missing key is refused rather than defaulted, inside a nested body as \
+                       much as at the top level: an absent label and a null one are different \
+                       wire facts, and only the second is a batch nobody named",
+                payload: one_row_page(JsonValue::Object(vec![
+                    ("batch_id".to_owned(), text("batch/nightly-eval")),
+                    (
+                        "concurrency".to_owned(),
+                        concurrency_body("sequential", None),
+                    ),
+                    (
+                        "created_at_ms".to_owned(),
+                        JsonValue::Integer(1_700_000_000_000),
+                    ),
+                    ("entry_id".to_owned(), JsonValue::Integer(1)),
+                    ("revision".to_owned(), JsonValue::Integer(1)),
+                ])),
+            },
+            DecodeRefusal {
+                id: "concurrency-missing-ceiling-key",
+                note: "the nested body's own exact key set: a policy carrying only its word is \
+                       refused rather than read as a sequential one",
+                payload: one_row_page(record_body(&[(
+                    "concurrency",
+                    JsonValue::Object(vec![("kind".to_owned(), text("sequential"))]),
+                )])),
+            },
+            DecodeRefusal {
+                id: "unknown-kind",
+                note: "a kind this protocol version does not define, which is a different answer \
+                       from a kind it defines and this surface does not decode",
+                payload: batch_message(
+                    "batch_progress_result",
+                    "req-detail-1",
+                    page_body(Vec::new(), false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "approval-protocol-message",
+                note: "the Approval lane's name on this lane's decoder, refused on the name axis \
+                       so each protocol's closed kind set stays closed",
+                payload: raw_message(
+                    "automonique.approval",
+                    1,
+                    "batch_list_result",
+                    "req-list-1",
+                    page_body(Vec::new(), false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "batch-document-schema-as-protocol",
+                note: "the batch *document* schema is not this control lane's protocol name, and \
+                       giving them one spelling would let a client admit either shape under the \
+                       other's name",
+                payload: raw_message(
+                    "automonique.batch",
+                    1,
+                    "batch_list_result",
+                    "req-list-1",
+                    page_body(Vec::new(), false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "unsupported-version",
+                note: "this protocol at a major version neither side implements",
+                payload: raw_message(
+                    BATCH_CONTROL_PROTOCOL,
+                    2,
+                    "batch_list_result",
+                    "req-list-1",
+                    page_body(Vec::new(), false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "non-canonical-key-order",
+                note: "a payload that parses but is not canonical is refused, not normalized",
+                payload: br#"{"kind":"refused","body":{"refusal":"registry_full"},"protocol":"automonique.batch.control","request_id":"req-register-1","version":1}"#.to_vec(),
+            },
+            DecodeRefusal {
+                id: "empty-payload",
+                note: "zero bytes is not an empty message",
+                payload: Vec::new(),
+            },
+        ]
+    }
+
+    fn decode_refusal_entry(refusal: &DecodeRefusal) -> JsonValue {
+        let category = BatchResponse::from_canonical_bytes(&refusal.payload)
+            .err()
+            .unwrap_or_else(|| panic!("{}: Rust accepted a payload it must refuse", refusal.id))
+            .category()
+            .to_owned();
+        JsonValue::Object(vec![
+            ("category".to_owned(), text(&category)),
+            ("id".to_owned(), text(refusal.id)),
+            ("note".to_owned(), text(refusal.note)),
+            ("payload_hex".to_owned(), text(&hex(&refusal.payload))),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // The measured gap, on the way in
+    // -----------------------------------------------------------------------
+
+    /// A payload the Rust decoder refuses and the generated TypeScript accepts.
+    ///
+    /// Every one of these breaks a rule relating two fields of a *decoded*
+    /// message — and a batch has more of those than any lane before it, because
+    /// a batch is a relation between its members.
+    struct RustOnlyRefusal {
+        id: &'static str,
+        note: &'static str,
+        payload: Vec<u8>,
+    }
+
+    fn rust_only_refusals() -> Vec<RustOnlyRefusal> {
+        vec![
+            RustOnlyRefusal {
+                id: "rollup-contradicts-members",
+                note: "the rule that makes serving a derived state safe: the carried rollup is \
+                       recomputed from the members beside it and refused when the two disagree. A \
+                       daemon claiming `completed` over a running member cannot get that answer \
+                       past its own decoder — and a client reading this file's decoder can only \
+                       hold that the word is one of the six",
+                payload: batch_message(
+                    "batch_detail_result",
+                    "req-detail-1",
+                    detail_body(
+                        vec![member_body(&[("state", text("running"))])],
+                        "completed",
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "detail-empty-membership",
+                note: "a batch with no member has no state to roll up: `completed` over nothing \
+                       is vacuously true, which is why the empty slice answers nothing at all. \
+                       The empty *registration* is refused on the way out, because a builder \
+                       holds the list it is sending",
+                payload: batch_message(
+                    "batch_detail_result",
+                    "req-detail-1",
+                    detail_body(Vec::new(), "completed"),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "detail-duplicate-member",
+                note: "one key named twice, refused rather than collapsed: a rollup over a \
+                       membership that counted one submission twice would summarize the wrong set",
+                payload: batch_message(
+                    "batch_detail_result",
+                    "req-detail-1",
+                    detail_body(
+                        vec![
+                            member_body(&[]),
+                            member_body(&[("ordinal", JsonValue::Integer(1))]),
+                        ],
+                        "completed",
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "detail-members-out-of-order",
+                note: "ordinals that are not `0..n` in order. Registration is the only writer of \
+                       ordinals and writes exactly that, so a gap names a membership nobody \
+                       declared",
+                payload: batch_message(
+                    "batch_detail_result",
+                    "req-detail-1",
+                    detail_body(
+                        vec![
+                            member_body(&[]),
+                            member_body(&[
+                                ("key", text("submit/zebra")),
+                                ("ordinal", JsonValue::Integer(2)),
+                            ]),
+                        ],
+                        "completed",
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "member-sequence-coupling",
+                note: "`ready` means no event has arrived, so a non-zero spool sequence beside it \
+                       describes a run index row that cannot exist",
+                payload: one_member_detail(member_body(&[
+                    ("state", text("ready")),
+                    ("last_sequence", JsonValue::Integer(5)),
+                ])),
+            },
+            RustOnlyRefusal {
+                id: "member-unsubmitted-above-first-revision",
+                note: "registration is the only writer of `unsubmitted` and it always writes \
+                       revision one, and the lattice has no edge back, so an unsubmitted member \
+                       at revision two names a row nothing here wrote",
+                payload: batch_message(
+                    "batch_detail_result",
+                    "req-detail-1",
+                    detail_body(
+                        vec![member_body(&[
+                            ("state", text("unsubmitted")),
+                            ("last_sequence", JsonValue::Integer(0)),
+                            ("revision", JsonValue::Integer(2)),
+                        ])],
+                        "pending",
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "advance-receipt-claims-unsubmitted",
+                note: "the other half of the advance pin: the revision is believable and the \
+                       progress is not, because no advance can leave a member unsubmitted",
+                payload: batch_message(
+                    "member_advanced",
+                    "req-advance-1",
+                    receipt_body(&[
+                        ("state", text("unsubmitted")),
+                        ("last_sequence", JsonValue::Integer(0)),
+                    ]),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "page-out-of-order",
+                note: "rows that do not strictly increase by durable row identity, so the next \
+                       page would re-serve or skip",
+                payload: batch_message(
+                    "batch_list_result",
+                    "req-list-1",
+                    page_body(
+                        vec![
+                            record_body(&[("entry_id", JsonValue::Integer(5))]),
+                            record_body(&[("entry_id", JsonValue::Integer(2))]),
+                        ],
+                        false,
+                        JsonValue::Null,
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "continuation-incoherent",
+                note: "rows follow, with no cursor to resume from",
+                payload: batch_message(
+                    "batch_list_result",
+                    "req-list-1",
+                    page_body(Vec::new(), true, JsonValue::Null),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "continuation-rewinds",
+                note: "a continuation cursor below the last row on the page, which would re-serve \
+                       it",
+                payload: batch_message(
+                    "batch_list_result",
+                    "req-list-1",
+                    page_body(
+                        vec![record_body(&[("entry_id", JsonValue::Integer(9))])],
+                        true,
+                        JsonValue::Integer(4),
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "conflict-without-disagreement",
+                note: "two revisions that agree is agreement rather than a conflict, and \
+                       answering one would tell a caller to retry with the revision it already \
+                       used. Unlike the approval lane's, this one *is* a decoder rule in Rust — \
+                       the conflict frame carries both sides — so it is a real gap here rather \
+                       than a constructor-only refusal",
+                payload: batch_message(
+                    "revision_conflict",
+                    "req-advance-1",
+                    JsonValue::Object(vec![
+                        ("durable_revision".to_owned(), JsonValue::Integer(3)),
+                        ("expected_revision".to_owned(), JsonValue::Integer(3)),
+                    ]),
+                ),
+            },
+        ]
+    }
+
+    fn rust_only_entry(refusal: &RustOnlyRefusal) -> JsonValue {
+        let category = BatchResponse::from_canonical_bytes(&refusal.payload)
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: Rust accepts this, so it is not a rule the generated surface is missing",
+                    refusal.id
+                )
+            })
+            .category()
+            .to_owned();
+        JsonValue::Object(vec![
+            ("id".to_owned(), text(refusal.id)),
+            ("note".to_owned(), text(refusal.note)),
+            ("payload_hex".to_owned(), text(&hex(&refusal.payload))),
+            ("rust_category".to_owned(), text(&category)),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // Encode refusals
+    // -----------------------------------------------------------------------
+
+    /// A request the other implementation must refuse while building it.
+    struct EncodeRefusal {
+        id: &'static str,
+        note: &'static str,
+        kind: &'static str,
+        request_id: String,
+        params: JsonValue,
+        category: String,
+        /// The generated constructor that refuses the value on its own, the
+        /// parameter it is applied to, and the violation it names.
+        constructor: Option<(&'static str, &'static str, &'static str)>,
+    }
+
+    /// The category Rust reports for a request body carrying this exact value.
+    ///
+    /// Read back from the shipped decoder rather than constructed here.
+    fn wire_category(kind: &str, body: JsonValue) -> String {
+        BatchRequest::from_canonical_bytes(&batch_message(kind, "req-1", body))
+            .err()
+            .unwrap_or_else(|| panic!("{kind}: Rust accepted a body it must refuse"))
+            .category()
+            .to_owned()
+    }
+
+    /// A registration body, in the shape both the wire and the runner read.
+    fn register_body(
+        batch_id: &str,
+        concurrency: JsonValue,
+        label_value: JsonValue,
+        members: Vec<JsonValue>,
+    ) -> JsonValue {
+        JsonValue::Object(vec![
+            ("batch_id".to_owned(), text(batch_id)),
+            ("concurrency".to_owned(), concurrency),
+            ("label".to_owned(), label_value),
+            ("members".to_owned(), JsonValue::Array(members)),
+        ])
+    }
+
+    fn register_params(
+        batch_id: &str,
+        concurrency: JsonValue,
+        label_value: JsonValue,
+        members: Vec<JsonValue>,
+    ) -> JsonValue {
+        register_body(batch_id, concurrency, label_value, members)
+    }
+
+    fn advance_params(
+        batch_id: &str,
+        expected_revision: JsonValue,
+        last_sequence: JsonValue,
+        member_key: &str,
+        state: &str,
+    ) -> JsonValue {
+        JsonValue::Object(vec![
+            ("batch_id".to_owned(), text(batch_id)),
+            ("expected_revision".to_owned(), expected_revision),
+            ("last_sequence".to_owned(), last_sequence),
+            ("member_key".to_owned(), text(member_key)),
+            ("state".to_owned(), text(state)),
+        ])
+    }
+
+    /// The same body with its counters as wire integers rather than as the
+    /// decimal strings the runner reads.
+    fn advance_body(
+        batch_id: &str,
+        expected_revision: i64,
+        last_sequence: i64,
+        member_key: &str,
+        state: &str,
+    ) -> JsonValue {
+        JsonValue::Object(vec![
+            ("batch_id".to_owned(), text(batch_id)),
+            (
+                "expected_revision".to_owned(),
+                JsonValue::Integer(expected_revision),
+            ),
+            (
+                "last_sequence".to_owned(),
+                JsonValue::Integer(last_sequence),
+            ),
+            ("member_key".to_owned(), text(member_key)),
+            ("state".to_owned(), text(state)),
+        ])
+    }
+
+    fn list_params(size: JsonValue, since: JsonValue) -> JsonValue {
+        JsonValue::Object(vec![
+            ("page_size".to_owned(), size),
+            ("since".to_owned(), since),
+        ])
+    }
+
+    fn encode_refusals() -> Vec<EncodeRefusal> {
+        let over_bound = over_bound_by_bytes_only();
+        let long_request_id = "r".repeat(MAX_REQUEST_ID_BYTES + 1);
+        let one_member = || vec![text("submit/only")];
+        let sequential = || concurrency_params("sequential", None);
+
+        let page_size_out_of_range = BatchPageSize::new(0)
+            .expect_err("a page that admits nothing is refused")
+            .category()
+            .to_owned();
+        let cursor_out_of_range = BatchRequest::ListBatches {
+            request_id: request_id("req-list-1"),
+            query: ListBatches::new(BatchCursor::new(wire_ceiling() + 1), page_size(1)),
+        }
+        .to_message()
+        .expect_err("a cursor above the wire ceiling is refused")
+        .category()
+        .to_owned();
+        let sequence_out_of_range = BatchRequest::AdvanceMember {
+            request_id: request_id("req-advance-1"),
+            advance: AdvanceMember::new(
+                batch("batch/nightly-eval"),
+                member("submit/only"),
+                1,
+                MemberProgress::Run(RunState::Running),
+                wire_ceiling() + 1,
+            )
+            .expect("the coupling admits a non-zero sequence"),
+        }
+        .to_message()
+        .expect_err("a sequence above the wire ceiling is refused")
+        .category()
+        .to_owned();
+        let long_id_refusal = BatchApiError::Codec(
+            RequestId::new(&long_request_id).expect_err("an overlong request id is refused"),
+        )
+        .category()
+        .to_owned();
+        let bad_id_refusal = BatchApiError::Codec(
+            RequestId::new("req 1").expect_err("a space is outside the request id grammar"),
+        )
+        .category()
+        .to_owned();
+
+        vec![
+            EncodeRefusal {
+                id: "register-batch-empty-membership",
+                note: "a batch that names no member is a unit with nothing in it. The builder \
+                       holds the list, so this is refused before a frame is spent — and the \
+                       refusal is the batch model's own rather than this lane's",
+                kind: "register_batch",
+                request_id: "req-register-1".to_owned(),
+                params: register_params(
+                    "batch/nightly-eval",
+                    sequential(),
+                    JsonValue::Null,
+                    Vec::new(),
+                ),
+                category: wire_category(
+                    "register_batch",
+                    register_body(
+                        "batch/nightly-eval",
+                        concurrency_body("sequential", None),
+                        JsonValue::Null,
+                        Vec::new(),
+                    ),
+                ),
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "register-batch-membership-above-bound",
+                note: "one member past MAX_BATCH_CONTROL_MEMBERS, built from the membership rule. \
+                       The length is judged before any key is validated, so what these keys are \
+                       does not matter",
+                kind: "register_batch",
+                request_id: "req-register-1".to_owned(),
+                params: JsonValue::Object(vec![
+                    ("batch_id".to_owned(), text("batch/nightly-eval")),
+                    ("concurrency".to_owned(), sequential()),
+                    ("label".to_owned(), JsonValue::Null),
+                    ("members_rule".to_owned(), text("over-bound")),
+                ]),
+                category: wire_category(
+                    "register_batch",
+                    register_body(
+                        "batch/nightly-eval",
+                        concurrency_body("sequential", None),
+                        JsonValue::Null,
+                        ruled_membership("over-bound")
+                            .iter()
+                            .map(|key| text(key))
+                            .collect(),
+                    ),
+                ),
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "register-batch-sequential-with-ceiling",
+                note: "the discriminated coupling on the way out: a sequential policy carrying a \
+                       ceiling is refused rather than silently dropped, because dropping it would \
+                       encode a policy the caller did not ask for. A typed caller cannot even \
+                       write this — the union has no such shape — so the runtime check is what \
+                       catches the untyped one",
+                kind: "register_batch",
+                request_id: "req-register-1".to_owned(),
+                params: register_params(
+                    "batch/nightly-eval",
+                    concurrency_params("sequential", Some(4)),
+                    JsonValue::Null,
+                    one_member(),
+                ),
+                category: wire_category(
+                    "register_batch",
+                    register_body(
+                        "batch/nightly-eval",
+                        concurrency_body("sequential", Some(4)),
+                        JsonValue::Null,
+                        vec![text("submit/only")],
+                    ),
+                ),
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "register-batch-bounded-parallel-without-ceiling",
+                note: "and from the other side: the bounded word with no bound",
+                kind: "register_batch",
+                request_id: "req-register-1".to_owned(),
+                params: register_params(
+                    "batch/nightly-eval",
+                    concurrency_params("bounded_parallel", None),
+                    JsonValue::Null,
+                    one_member(),
+                ),
+                category: wire_category(
+                    "register_batch",
+                    register_body(
+                        "batch/nightly-eval",
+                        concurrency_body("bounded_parallel", None),
+                        JsonValue::Null,
+                        vec![text("submit/only")],
+                    ),
+                ),
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "register-batch-ceiling-zero",
+                note: "a ceiling that admits nothing in flight is a batch that never starts \
+                       rather than a batch without limit",
+                kind: "register_batch",
+                request_id: "req-register-1".to_owned(),
+                params: register_params(
+                    "batch/nightly-eval",
+                    concurrency_params("bounded_parallel", Some(0)),
+                    JsonValue::Null,
+                    one_member(),
+                ),
+                category: ConcurrencyPolicy::bounded_parallel(0)
+                    .expect_err("a ceiling of zero is refused")
+                    .category()
+                    .to_owned(),
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "register-batch-ceiling-above-membership",
+                note: "one past the members a batch can hold, under its own category: a caller \
+                       told only `invalid ceiling` could not tell this from a ceiling of zero, \
+                       and the two are fixed differently",
+                kind: "register_batch",
+                request_id: "req-register-1".to_owned(),
+                params: register_params(
+                    "batch/nightly-eval",
+                    concurrency_params("bounded_parallel", Some(MAX_BATCH_MEMBERS as u64 + 1)),
+                    JsonValue::Null,
+                    one_member(),
+                ),
+                category: ConcurrencyPolicy::bounded_parallel(
+                    u32::try_from(MAX_BATCH_MEMBERS + 1).expect("the ceiling fits a u32"),
+                )
+                .expect_err("an unreachable ceiling is refused")
+                .category()
+                .to_owned(),
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "register-batch-undefined-concurrency-kind",
+                note: "a brand exists only in the type checker, so the builder is where an \
+                       untyped caller's undefined policy word is stopped rather than put on the \
+                       wire",
+                kind: "register_batch",
+                request_id: "req-register-1".to_owned(),
+                params: register_params(
+                    "batch/nightly-eval",
+                    concurrency_params("unbounded", None),
+                    JsonValue::Null,
+                    one_member(),
+                ),
+                category: wire_category(
+                    "register_batch",
+                    register_body(
+                        "batch/nightly-eval",
+                        concurrency_body("unbounded", None),
+                        JsonValue::Null,
+                        vec![text("submit/only")],
+                    ),
+                ),
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "register-batch-label-empty",
+                note: "empty is refused rather than read as `no label`: a batch with no name \
+                       carries an explicit null, and the two are different facts",
+                kind: "register_batch",
+                request_id: "req-register-1".to_owned(),
+                params: register_params("batch/nightly-eval", sequential(), text(""), one_member()),
+                // The message-level category, not the bounded type's own: this
+                // lane wraps every bounded-value refusal in one field category,
+                // and a client is told what the daemon would tell it.
+                category: wire_category(
+                    "register_batch",
+                    register_body(
+                        "batch/nightly-eval",
+                        concurrency_body("sequential", None),
+                        text(""),
+                        vec![text("submit/only")],
+                    ),
+                ),
+                constructor: Some(("BatchLabel", "label", "empty")),
+            },
+            EncodeRefusal {
+                id: "register-batch-member-key-over-bound",
+                note: "one member key inside the UTF-16 code-unit bound and outside the UTF-8 one \
+                       the registry stores under. Every key in the list is validated, not only \
+                       the first",
+                kind: "register_batch",
+                request_id: "req-register-1".to_owned(),
+                params: register_params(
+                    "batch/nightly-eval",
+                    sequential(),
+                    JsonValue::Null,
+                    vec![text("submit/only"), text(&over_bound)],
+                ),
+                category: wire_category(
+                    "register_batch",
+                    register_body(
+                        "batch/nightly-eval",
+                        concurrency_body("sequential", None),
+                        JsonValue::Null,
+                        vec![text("submit/only"), text(&over_bound)],
+                    ),
+                ),
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "advance-member-undefined-progress",
+                note: "a member progress this build does not define, stopped at the builder. \
+                       `skipped` is not a word this lattice has an edge to",
+                kind: "advance_member",
+                request_id: "req-advance-1".to_owned(),
+                params: advance_params(
+                    "batch/nightly-eval",
+                    number(1),
+                    number(3),
+                    "submit/only",
+                    "skipped",
+                ),
+                category: wire_category(
+                    "advance_member",
+                    advance_body("batch/nightly-eval", 1, 3, "submit/only", "skipped"),
+                ),
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "advance-member-progress-title-case",
+                note: "the spelling is exact and lowercase: `Running` is not `running`, and a \
+                       vocabulary that case-folded would admit words the registry's CHECK refuses",
+                kind: "advance_member",
+                request_id: "req-advance-1".to_owned(),
+                params: advance_params(
+                    "batch/nightly-eval",
+                    number(1),
+                    number(3),
+                    "submit/only",
+                    "Running",
+                ),
+                category: wire_category(
+                    "advance_member",
+                    advance_body("batch/nightly-eval", 1, 3, "submit/only", "Running"),
+                ),
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "advance-member-expected-revision-zero",
+                note: "a fence against a row no writer produced. Registration writes revision \
+                       one, so zero is not a revision a caller could ever be advancing from",
+                kind: "advance_member",
+                request_id: "req-advance-1".to_owned(),
+                params: advance_params(
+                    "batch/nightly-eval",
+                    number(0),
+                    number(3),
+                    "submit/only",
+                    "running",
+                ),
+                category: wire_category(
+                    "advance_member",
+                    advance_body("batch/nightly-eval", 0, 3, "submit/only", "running"),
+                ),
+                constructor: Some(("BatchRevision", "expected_revision", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "advance-member-sequence-above-wire-ceiling",
+                note: "a sequence one past the largest integer this wire carries, which is a \
+                       counter refusal rather than a malformed body",
+                kind: "advance_member",
+                request_id: "req-advance-1".to_owned(),
+                params: advance_params(
+                    "batch/nightly-eval",
+                    number(1),
+                    number(wire_ceiling() + 1),
+                    "submit/only",
+                    "running",
+                ),
+                category: sequence_out_of_range,
+                constructor: Some(("LastSequence", "last_sequence", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "advance-member-key-control-character",
+                note: "a control character in a member key, which the wire never carries raw",
+                kind: "advance_member",
+                request_id: "req-advance-1".to_owned(),
+                params: advance_params(
+                    "batch/nightly-eval",
+                    number(1),
+                    number(3),
+                    "submit\u{7}only",
+                    "running",
+                ),
+                category: wire_category(
+                    "advance_member",
+                    advance_body("batch/nightly-eval", 1, 3, "submit\u{7}only", "running"),
+                ),
+                constructor: Some(("BatchMemberKey", "member_key", "invalid_character")),
+            },
+            EncodeRefusal {
+                id: "list-batches-page-size-zero",
+                note: "a page that admits nothing cannot make progress, so zero is refused rather \
+                       than treated as a default",
+                kind: "list_batches",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(number(0), number(0)),
+                category: page_size_out_of_range.clone(),
+                constructor: Some(("BatchPageSize", "page_size", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "list-batches-page-size-above-bound",
+                note: "one past MAX_BATCH_PAGE_ITEMS, which is a page bound derived from the \
+                       frame arithmetic of the rows it carries rather than chosen",
+                kind: "list_batches",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(number(MAX_BATCH_PAGE_ITEMS as u64 + 1), number(0)),
+                category: page_size_out_of_range,
+                constructor: Some(("BatchPageSize", "page_size", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "list-batches-cursor-above-wire-ceiling",
+                note: "a cursor one past the largest integer this wire carries",
+                kind: "list_batches",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(number(1), number(wire_ceiling() + 1)),
+                category: cursor_out_of_range,
+                constructor: Some(("BatchCursor", "since", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "batch-detail-batch-id-empty",
+                note: "an empty identity names no batch to read",
+                kind: "batch_detail",
+                request_id: "req-detail-1".to_owned(),
+                params: JsonValue::Object(vec![("batch_id".to_owned(), text(""))]),
+                category: wire_category(
+                    "batch_detail",
+                    JsonValue::Object(vec![("batch_id".to_owned(), text(""))]),
+                ),
+                constructor: Some(("BatchId", "batch_id", "empty")),
+            },
+            EncodeRefusal {
+                id: "request-id-too-long",
+                note: "the envelope's fields are judged by the shared codec, whose refusal for a \
+                       bound is not the one this protocol uses for a body",
+                kind: "batch_detail",
+                request_id: long_request_id,
+                params: JsonValue::Object(vec![(
+                    "batch_id".to_owned(),
+                    text("batch/nightly-eval"),
+                )]),
+                category: long_id_refusal,
+                constructor: Some(("RequestId", "request_id", "too_long")),
+            },
+            EncodeRefusal {
+                id: "request-id-outside-grammar",
+                note: "a grammar refusal is not a bounds refusal, and the categories differ. A \
+                       space is outside the correlation identifier's grammar and inside the batch \
+                       identity's, which is the difference this lane's looser identifier makes",
+                kind: "batch_detail",
+                request_id: "req 1".to_owned(),
+                params: JsonValue::Object(vec![(
+                    "batch_id".to_owned(),
+                    text("batch/nightly eval"),
+                )]),
+                category: bad_id_refusal,
+                constructor: Some(("RequestId", "request_id", "invalid_character")),
+            },
+        ]
+    }
+
+    fn encode_refusal_entry(refusal: &EncodeRefusal) -> JsonValue {
+        let mut entry = vec![
+            ("category".to_owned(), text(&refusal.category)),
+            ("id".to_owned(), text(refusal.id)),
+            ("kind".to_owned(), text(refusal.kind)),
+            ("note".to_owned(), text(refusal.note)),
+            ("params".to_owned(), refusal.params.clone()),
+            ("request_id".to_owned(), text(&refusal.request_id)),
+        ];
+        if let Some((constructor, parameter, violation)) = refusal.constructor {
+            // Named `refused_by` rather than `constructor`: a JSON object parsed
+            // by a JavaScript reader inherits `constructor` from its prototype.
+            entry.push(("refused_by".to_owned(), text(constructor)));
+            entry.push(("refused_param".to_owned(), text(parameter)));
+            entry.push(("violation".to_owned(), text(violation)));
+        }
+        JsonValue::Object(entry)
+    }
+
+    // -----------------------------------------------------------------------
+    // The measured gap, on the way out
+    // -----------------------------------------------------------------------
+
+    /// A request Rust refuses to build and the generated encoder accepts.
+    ///
+    /// The encode side has a gap of its own on this lane, and one entry is the
+    /// whole of it: the sequence coupling relates two fields of a request, and
+    /// the generated encoder holds each field's own bounds. The runner asserts
+    /// these *encode*, so teaching the generator the rule turns the suite red
+    /// until the entry moves to `encode_refusals`.
+    struct RustOnlyEncodeRefusal {
+        id: &'static str,
+        note: &'static str,
+        kind: &'static str,
+        request_id: String,
+        params: JsonValue,
+        /// The body Rust is asked to admit, with wire integers.
+        body: JsonValue,
+    }
+
+    fn rust_only_encode_refusals() -> Vec<RustOnlyEncodeRefusal> {
+        vec![
+            RustOnlyEncodeRefusal {
+                id: "advance-member-sequence-coupling",
+                note: "`ready` means the daemon holds a document and no event has arrived, so a \
+                       non-zero sequence beside it describes a run index row that cannot exist. A \
+                       property of the request alone, and one the generated encoder does not hold",
+                kind: "advance_member",
+                request_id: "req-advance-1".to_owned(),
+                params: advance_params(
+                    "batch/nightly-eval",
+                    number(1),
+                    number(5),
+                    "submit/only",
+                    "ready",
+                ),
+                body: advance_body("batch/nightly-eval", 1, 5, "submit/only", "ready"),
+            },
+            RustOnlyEncodeRefusal {
+                id: "advance-member-terminal-at-zero-sequence",
+                note: "the coupling from the other side: a member that reached a terminal state \
+                       with no spool event behind it",
+                kind: "advance_member",
+                request_id: "req-advance-1".to_owned(),
+                params: advance_params(
+                    "batch/nightly-eval",
+                    number(1),
+                    number(0),
+                    "submit/only",
+                    "completed",
+                ),
+                body: advance_body("batch/nightly-eval", 1, 0, "submit/only", "completed"),
+            },
+            RustOnlyEncodeRefusal {
+                id: "register-batch-duplicate-member",
+                note: "one key named twice. A caller that named a submission twice believes it \
+                       asked for something it did not, so the registration is refused rather than \
+                       collapsed — a relation between two items of one list, which the generated \
+                       encoder's per-item bounds cannot see",
+                kind: "register_batch",
+                request_id: "req-register-1".to_owned(),
+                params: register_params(
+                    "batch/nightly-eval",
+                    concurrency_params("sequential", None),
+                    JsonValue::Null,
+                    vec![text("submit/only"), text("submit/only")],
+                ),
+                body: register_body(
+                    "batch/nightly-eval",
+                    concurrency_body("sequential", None),
+                    JsonValue::Null,
+                    vec![text("submit/only"), text("submit/only")],
+                ),
+            },
+        ]
+    }
+
+    fn rust_only_encode_entry(refusal: &RustOnlyEncodeRefusal) -> JsonValue {
+        let category = BatchRequest::from_canonical_bytes(&batch_message(
+            refusal.kind,
+            &refusal.request_id,
+            refusal.body.clone(),
+        ))
+        .err()
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: Rust accepts this body, so it is not a rule the generated encoder is missing",
+                refusal.id
+            )
+        })
+        .category()
+        .to_owned();
+        JsonValue::Object(vec![
+            ("id".to_owned(), text(refusal.id)),
+            ("kind".to_owned(), text(refusal.kind)),
+            ("note".to_owned(), text(refusal.note)),
+            ("params".to_owned(), refusal.params.clone()),
+            ("request_id".to_owned(), text(&refusal.request_id)),
+            ("rust_category".to_owned(), text(&category)),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // The corpus file
+    // -----------------------------------------------------------------------
+
+    fn corpus() -> String {
+        let document = JsonValue::Object(vec![
+            (
+                "decode_refusals".to_owned(),
+                JsonValue::Array(decode_refusals().iter().map(decode_refusal_entry).collect()),
+            ),
+            (
+                "encode_refusals".to_owned(),
+                JsonValue::Array(encode_refusals().iter().map(encode_refusal_entry).collect()),
+            ),
+            (
+                "generator".to_owned(),
+                text("automonique-protocol tests/codegen.rs, module batch_surface"),
+            ),
+            (
+                "membership_rules".to_owned(),
+                JsonValue::Array(
+                    membership_rules()
+                        .iter()
+                        .map(membership_rule_entry)
+                        .collect(),
+                ),
+            ),
+            (
+                "membership_rules_note".to_owned(),
+                text(
+                    "A maximal registration is MAX_BATCH_CONTROL_MEMBERS keys of \
+                     MAX_BATCH_MEMBER_KEY_BYTES, which is 33 KiB of literal nobody can review. \
+                     Each implementation builds the list from the rule instead: the key at one \
+                     position is its three-digit decimal index, filled to key_bytes with the one \
+                     character that escapes to two canonical bytes, or `member-NNN` where \
+                     key_bytes is zero and what is being measured is the length of the list. That \
+                     the two implementations read the rule the same way is measured rather than \
+                     assumed, because the bytes the runner reports are compared against the bytes \
+                     Rust built from the same rule.",
+                ),
+            ),
+            (
+                "note".to_owned(),
+                text(
+                    "Generated from the shipped Rust constructors: every canonical byte string \
+                     here was produced by encoding a real message and re-read through \
+                     from_canonical_bytes before it was written, and every refusal category was \
+                     read back from the error Rust returned for that exact input. Counters travel \
+                     as decimal strings because a JSON reader using a double would round the \
+                     largest of them without saying so. Rust is the wire source of truth, so a \
+                     disagreement is fixed in whichever implementation is wrong — never in this \
+                     file.",
+                ),
+            ),
+            ("protocol".to_owned(), text(BATCH_CONTROL_PROTOCOL)),
+            (
+                "requests".to_owned(),
+                JsonValue::Array(request_cases().iter().map(request_entry).collect()),
+            ),
+            (
+                "responses".to_owned(),
+                JsonValue::Array(response_cases().iter().map(response_entry).collect()),
+            ),
+            (
+                "rust_only_encode_refusals".to_owned(),
+                JsonValue::Array(
+                    rust_only_encode_refusals()
+                        .iter()
+                        .map(rust_only_encode_entry)
+                        .collect(),
+                ),
+            ),
+            (
+                "rust_only_encode_refusals_note".to_owned(),
+                text(
+                    "Requests the Rust constructors refuse and the generated encoder builds. Each \
+                     breaks a rule relating two fields of a request, or two items of one list, \
+                     which the generated surface does not hold. The runner asserts these encode, \
+                     so the gap is measured rather than described.",
+                ),
+            ),
+            (
+                "rust_only_refusals".to_owned(),
+                JsonValue::Array(rust_only_refusals().iter().map(rust_only_entry).collect()),
+            ),
+            (
+                "rust_only_refusals_note".to_owned(),
+                text(
+                    "Payloads the Rust decoder refuses and the generated TypeScript accepts. Each \
+                     breaks a rule relating two fields of a decoded message — and a batch has \
+                     more of those than any lane before it, because a batch is a relation between \
+                     its members. The rolled-up state is the one that matters most: it is \
+                     recomputed from the members beside it in Rust and only held to the closed \
+                     vocabulary here. The advance receipt's revision is deliberately absent from \
+                     this list: `two or above` is a bound on one field's own value, the generated \
+                     decoder does hold it, and decode_refusals is where that is proved from both \
+                     ends. The runner asserts these decode, so teaching the generator one of \
+                     these rules turns the suite red until the entry moves to decode_refusals.",
+                ),
+            ),
+            (
+                "version".to_owned(),
+                JsonValue::Integer(i64::from(MajorVersion::FIRST.get())),
+            ),
+        ]);
+        let mut out = String::new();
+        write_pretty(&document, 0, &mut out);
+        out.push('\n');
+        out
+    }
+
+    /// The drift gate over the corpus, and the regeneration that closes it.
+    #[test]
+    fn the_checked_in_corpus_matches_regeneration() {
+        let expected = corpus();
+        let path = corpus_path();
+        if regenerating() {
+            let staging = path.with_extension("json.staging");
+            std::fs::write(&staging, &expected).expect("stage the corpus");
+            std::fs::rename(&staging, &path).expect("publish the corpus");
+            return;
+        }
+        let actual = std::fs::read_to_string(&path)
+            .expect("the corpus is checked in — regenerate it to create it");
+        if actual != expected {
+            let difference = actual
+                .lines()
+                .zip(expected.lines())
+                .enumerate()
+                .find(|(_, (left, right))| left != right)
+                .map_or_else(
+                    || {
+                        format!(
+                            "{} lines on disk, {} lines generated",
+                            actual.lines().count(),
+                            expected.lines().count()
+                        )
+                    },
+                    |(index, (left, right))| {
+                        let shorten = |line: &str| line.chars().take(120).collect::<String>();
+                        format!(
+                            "line {}: on disk {:?}, generated {:?}",
+                            index + 1,
+                            shorten(left),
+                            shorten(right)
+                        )
+                    },
+                );
+            panic!(
+                "the checked-in batch corpus no longer matches the Rust encoders: \
+                 {difference}\n\nRegenerate with: {REGENERATE_COMMAND}"
+            );
+        }
+    }
+
+    /// Every request this protocol version defines is generated or named absent.
+    #[test]
+    fn every_request_kind_is_generated_or_named_as_absent() {
+        let id = request_id("req-coverage-1");
+        let requests = vec![
+            BatchRequest::RegisterBatch {
+                request_id: id.clone(),
+                registration: RegisterBatch::new(
+                    batch("batch/one"),
+                    None,
+                    ConcurrencyPolicy::Sequential,
+                    vec![member("submit/one")],
+                )
+                .expect("a registration"),
+            },
+            BatchRequest::AdvanceMember {
+                request_id: id.clone(),
+                advance: AdvanceMember::new(
+                    batch("batch/one"),
+                    member("submit/one"),
+                    1,
+                    MemberProgress::Run(RunState::Running),
+                    2,
+                )
+                .expect("an advance"),
+            },
+            BatchRequest::ListBatches {
+                request_id: id.clone(),
+                query: ListBatches::new(BatchCursor::START, page_size(1)),
+            },
+            BatchRequest::BatchDetail {
+                request_id: id,
+                batch_id: batch("batch/one"),
+            },
+        ];
+        // The match is the point: a request added to `BatchRequest` fails to
+        // compile here rather than quietly falling outside the generated
+        // surface.
+        for request in &requests {
+            match request {
+                BatchRequest::RegisterBatch { .. }
+                | BatchRequest::AdvanceMember { .. }
+                | BatchRequest::ListBatches { .. }
+                | BatchRequest::BatchDetail { .. } => {}
+            }
+        }
+        let encoded: BTreeSet<String> = requests
+            .iter()
+            .map(|request| {
+                request
+                    .to_message()
+                    .expect("each request encodes")
+                    .envelope()
+                    .kind()
+                    .as_str()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            encoded.len(),
+            requests.len(),
+            "one request per variant is required, each with its own kind"
+        );
+
+        let surface = surface();
+        let mut covered: BTreeSet<String> = surface
+            .requests
+            .iter()
+            .map(|request| request.kind.clone())
+            .collect();
+        for kind in &surface.request_kinds_not_generated {
+            assert!(
+                covered.insert(kind.clone()),
+                "{kind} is both generated and named as absent"
+            );
+        }
+        assert_eq!(
+            covered, encoded,
+            "the generated batch surface does not account for every request kind the Rust \
+             encoders produce; regenerate with: {REGENERATE_COMMAND}"
+        );
+    }
+
+    /// Every answer this protocol version defines is decoded or named undecoded.
+    #[test]
+    fn every_response_kind_is_decoded_or_named_as_undecoded() {
+        let id = request_id("req-coverage-1");
+        let responses = vec![
+            BatchResponse::Registered {
+                request_id: id.clone(),
+                receipt: BatchReceiptView::new(
+                    1,
+                    batch("batch/one"),
+                    1,
+                    1,
+                    EpochMillis::from_millis(0),
+                )
+                .expect("a receipt"),
+            },
+            BatchResponse::MemberAdvanced {
+                request_id: id.clone(),
+                receipt: MemberReceiptView::new(MemberReceiptParts {
+                    batch_id: batch("batch/one"),
+                    member_key: member("submit/one"),
+                    ordinal: 0,
+                    progress: MemberProgress::Run(RunState::Running),
+                    last_sequence: 1,
+                    revision: 2,
+                    updated_at: EpochMillis::from_millis(0),
+                })
+                .expect("an advance receipt"),
+            },
+            BatchResponse::BatchList {
+                request_id: id.clone(),
+                page: BatchListPage::new(Vec::new(), BatchContinuation::Complete).expect("a page"),
+            },
+            BatchResponse::BatchDetail {
+                request_id: id.clone(),
+                detail: BatchDetailResult::new(
+                    record(Row {
+                        entry_id: 1,
+                        batch_id: "batch/one",
+                        label: None,
+                        concurrency: ConcurrencyPolicy::Sequential,
+                        created_at_ms: 0,
+                        revision: 1,
+                    }),
+                    vec![member_row(
+                        0,
+                        "submit/one",
+                        MemberProgress::Unsubmitted,
+                        0,
+                        1,
+                    )],
+                )
+                .expect("a detail"),
+            },
+            BatchResponse::conflict(id.clone(), 1, 2).expect("a conflict"),
+            BatchResponse::Refused {
+                request_id: id,
+                refusal: BatchRefusal::UnknownBatch,
+            },
+        ];
+        // The match is the point: a variant added to `BatchResponse` fails to
+        // compile here rather than slipping past a surface that ignores it.
+        for response in &responses {
+            match response {
+                BatchResponse::Registered { .. }
+                | BatchResponse::MemberAdvanced { .. }
+                | BatchResponse::BatchList { .. }
+                | BatchResponse::BatchDetail { .. }
+                | BatchResponse::Conflict { .. }
+                | BatchResponse::Refused { .. } => {}
+            }
+        }
+        let encoded: BTreeSet<String> = responses
+            .iter()
+            .map(|response| {
+                response
+                    .to_message()
+                    .expect("each response encodes")
+                    .envelope()
+                    .kind()
+                    .as_str()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            encoded.len(),
+            responses.len(),
+            "one response per variant is required, each with its own kind"
+        );
+
+        let surface = surface();
+        let mut covered: BTreeSet<String> = surface
+            .responses
+            .iter()
+            .map(|response| response.kind.clone())
+            .collect();
+        for kind in &surface.response_kinds_not_decoded {
+            assert!(
+                covered.insert(kind.clone()),
+                "{kind} is both decoded and named as undecoded"
+            );
+        }
+        assert_eq!(
+            covered, encoded,
+            "the generated batch surface does not account for every answer the daemon can \
+             produce; regenerate with: {REGENERATE_COMMAND}"
+        );
+    }
+
+    /// The four closed vocabularies, restated here rather than read back from
+    /// the generator — and then checked against the Rust arrays themselves.
+    ///
+    /// Three of the four are `batch_runner`'s rather than this lane's, and
+    /// `MemberProgress` is in turn `runs_api`'s six spellings plus one. A
+    /// generator that dropped a variant would agree with itself perfectly; this
+    /// is the second opinion, and the third is the assertion against
+    /// `RunState::ALL` below, which is what makes a word impossible to drift
+    /// between a batch document and a run.
+    #[test]
+    fn every_closed_vocabulary_carries_all_of_its_variants() {
+        let generated = generated_batch();
+        let expected: [(&str, &[&str]); 4] = [
+            (
+                "BatchRefusal",
+                &[
+                    "already_registered",
+                    "concurrency_ceiling",
+                    "cursor_out_of_range",
+                    "duplicate_member",
+                    "empty_batch",
+                    "illegal_transition",
+                    "invalid_field",
+                    "registry_full",
+                    "sequence_coupling",
+                    "sequence_regression",
+                    "too_many_members",
+                    "unknown_batch",
+                    "unknown_member",
+                ],
+            ),
+            (
+                "BatchState",
+                &[
+                    "cancelled",
+                    "completed",
+                    "failed",
+                    "mixed",
+                    "pending",
+                    "running",
+                ],
+            ),
+            ("ConcurrencyKind", &["bounded_parallel", "sequential"]),
+            (
+                "MemberProgress",
+                &[
+                    "cancelled",
+                    "completed",
+                    "failed",
+                    "ready",
+                    "running",
+                    "timed_out",
+                    "unsubmitted",
+                ],
+            ),
+        ];
+        for (name, values) in expected {
+            let literals: Vec<String> = values.iter().map(|value| format!("\"{value}\"")).collect();
+            let declaration = format!("export type {name} = {};", literals.join(" | "));
+            assert!(
+                generated.contains(&declaration),
+                "the batch surface lost a {name} variant.\nexpected: {declaration}"
+            );
+            assert!(
+                generated.contains(&format!(
+                    "export const {name}_VALUES: readonly {name}[] = [{}];",
+                    literals.join(", ")
+                )),
+                "the {name} table does not match its type"
+            );
+            assert!(
+                generated.contains(&format!(
+                    "export function decode{name}(value: string): {name} {{"
+                )),
+                "the batch surface does not refuse an undefined {name}"
+            );
+        }
+        // The spellings themselves, read from the Rust enums rather than from
+        // the literals above, so the two can never drift into agreeing with
+        // each other while disagreeing with the wire.
+        assert_eq!(
+            ConcurrencyKind::ALL.map(ConcurrencyKind::as_str),
+            ["sequential", "bounded_parallel"],
+            "the concurrency vocabulary is the pair the batch model declares"
+        );
+        assert_eq!(
+            BatchState::ALL.map(BatchState::as_str),
+            [
+                "pending",
+                "running",
+                "completed",
+                "failed",
+                "cancelled",
+                "mixed"
+            ],
+            "the rollup vocabulary is the six the batch model derives"
+        );
+        // Six of the seven member spellings are the run states, reused rather
+        // than re-spelled: this is what makes a member's word and a run's word
+        // impossible to tell apart, because they are the same word.
+        let progresses: Vec<&str> = MemberProgress::ALL
+            .iter()
+            .map(|progress| progress.as_str())
+            .collect();
+        let runs: Vec<&str> = RunState::ALL.iter().map(|state| state.as_str()).collect();
+        assert_eq!(
+            progresses[0], "unsubmitted",
+            "the one member spelling a run vocabulary cannot express comes first"
+        );
+        assert_eq!(
+            &progresses[1..],
+            runs.as_slice(),
+            "the member vocabulary is RunState's own spellings after the unsubmitted one"
+        );
+        for spelling in &runs {
+            assert!(
+                generated.contains(&format!("\"{spelling}\"")),
+                "the batch surface lost the run spelling {spelling}, which a member reuses"
+            );
+        }
+        // An unbounded concurrency policy has no spelling, in either language.
+        for absent in ["unbounded", "parallel", "unlimited", "skipped", "partial"] {
+            assert!(
+                !generated.contains(&format!("\"{absent}\"")),
+                "the batch surface carries a spelling this product does not define: {absent}"
+            );
+        }
+    }
+
+    /// The bounds in the output are the Rust constants, and they are applied.
+    #[test]
+    fn the_generated_batch_bounds_are_the_rust_constants() {
+        let generated = generated_batch();
+        for declaration in [
+            format!("export const MAX_BATCH_CONTROL_MEMBERS = {MAX_BATCH_CONTROL_MEMBERS};"),
+            format!("export const MAX_BATCH_PAGE_ITEMS = {MAX_BATCH_PAGE_ITEMS};"),
+            format!(
+                "export const MAX_BATCH_CONTROL_CANONICAL_BYTES = \
+                 {MAX_BATCH_CONTROL_CANONICAL_BYTES};"
+            ),
+            format!("export const BatchId_MAX_BYTES = {MAX_BATCH_ID_BYTES};"),
+            format!("export const BatchMemberKey_MAX_BYTES = {MAX_BATCH_MEMBER_KEY_BYTES};"),
+            format!("export const BatchLabel_MAX_BYTES = {MAX_BATCH_LABEL_BYTES};"),
+            format!("export const BatchPageSize_MAX = {MAX_BATCH_PAGE_ITEMS}n;"),
+            "export const BatchPageSize_MIN = 1n;".to_owned(),
+            "export const BatchCursor_MIN = 0n;".to_owned(),
+            format!("export const BatchCursor_MAX = {}n;", i64::MAX),
+            // The concurrency ceiling is the *model*'s membership, not this
+            // lane's: a policy may declare more members in flight than this
+            // transport can register in one frame.
+            "export const ConcurrencyCeiling_MIN = 1n;".to_owned(),
+            format!("export const ConcurrencyCeiling_MAX = {MAX_BATCH_MEMBERS}n;"),
+            "export const BatchRevision_MIN = 1n;".to_owned(),
+            // The advance pin: registration owns revision one.
+            "export const AdvancedRevision_MIN = 2n;".to_owned(),
+            "export const MemberOrdinal_MIN = 0n;".to_owned(),
+            format!(
+                "export const MemberOrdinal_MAX = {}n;",
+                MAX_BATCH_CONTROL_MEMBERS - 1
+            ),
+            "export const MemberCount_MIN = 1n;".to_owned(),
+            format!("export const MemberCount_MAX = {MAX_BATCH_CONTROL_MEMBERS}n;"),
+            format!("export const BATCH_CONTROL_PROTOCOL = \"{BATCH_CONTROL_PROTOCOL}\";"),
+            format!(
+                "export const BATCH_CONTROL_API_SCHEMA_V1 = \"{}\";",
+                automonique_protocol::batch_api::BATCH_CONTROL_API_SCHEMA_V1
+            ),
+        ] {
+            assert!(
+                generated.contains(&declaration),
+                "the batch surface does not carry the Rust bound: {declaration}"
+            );
+        }
+        // Declaring a bound is not applying it.
+        for application in [
+            format!(
+                "  if (byteLength(value) > {MAX_BATCH_MEMBER_KEY_BYTES}) throw new \
+                 ValidationError(\"BatchMemberKey\", \"too_long\");"
+            ),
+            format!(
+                "  if (byteLength(value) > {MAX_BATCH_LABEL_BYTES}) throw new \
+                 ValidationError(\"BatchLabel\", \"too_long\");"
+            ),
+            format!(
+                "  if (value < 1n || value > {MAX_BATCH_PAGE_ITEMS}n) throw new \
+                 ValidationError(\"BatchPageSize\", \"out_of_range\");"
+            ),
+            format!(
+                "  if (value < 1n || value > {MAX_BATCH_MEMBERS}n) throw new \
+                 ValidationError(\"ConcurrencyCeiling\", \"out_of_range\");"
+            ),
+            format!(
+                "  if (value < 0n || value > {}n) throw new ValidationError(\"MemberOrdinal\", \
+                 \"out_of_range\");",
+                MAX_BATCH_CONTROL_MEMBERS - 1
+            ),
+            "  if (value < 2n || value > 9223372036854775807n) throw new \
+             ValidationError(\"AdvancedRevision\", \"out_of_range\");"
+                .to_owned(),
+            // The membership bound is applied on the way out, over the list the
+            // caller supplied, before any key in it is validated.
+            "boundedItems(body.members, MAX_BATCH_CONTROL_MEMBERS, BATCH_MEMBERSHIP_TOO_LARGE, \
+             BATCH_EMPTY_BATCH)"
+                .to_owned(),
+            // And on the way in, over the membership a detail read carries.
+            "bodyArray(fields, \"members\", BATCH_INVALID_BODY, MAX_BATCH_CONTROL_MEMBERS, \
+             BATCH_MEMBERSHIP_TOO_LARGE)"
+                .to_owned(),
+            "bodyArray(fields, \"batches\", BATCH_INVALID_BODY, MAX_BATCH_PAGE_ITEMS, \
+             BATCH_PAGE_TOO_LARGE)"
+                .to_owned(),
+        ] {
+            assert!(
+                generated.contains(&application),
+                "the batch surface declares a bound it does not apply: {application}"
+            );
+        }
+        // The grammars are the registry's own looser ones, not `DurableId`'s:
+        // the registry stores any bounded control-free identifier.
+        for name in ["BatchId", "BatchMemberKey", "BatchLabel"] {
+            assert!(
+                generated.contains(&format!(
+                    "export const {name}_PATTERN = /^[^\\p{{Cc}}]+$/u;"
+                )),
+                "{name} does not carry the control-free grammar the durable registry stores under"
+            );
+        }
+        // This lane's membership ceiling is deliberately *not* the model's, and
+        // this check is only worth making while the two differ.
+        assert_ne!(
+            MAX_BATCH_CONTROL_MEMBERS, MAX_BATCH_MEMBERS,
+            "the transport ceiling and the model ceiling are reconciled, which the module \
+             documentation says they must not be"
+        );
+    }
+
+    /// The discriminated concurrency policy is a union, not a nullable field.
+    ///
+    /// This is the shape claim, and it is worth asserting literally: a generator
+    /// that emitted `{kind: ConcurrencyKind; max_in_flight: ConcurrencyCeiling |
+    /// null}` would satisfy every byte-for-byte check in this suite while
+    /// type-checking a program that asked a sequential policy for its ceiling.
+    #[test]
+    fn the_concurrency_policy_is_carried_as_a_discriminated_union() {
+        let generated = generated_batch();
+        for declaration in [
+            "export type BatchConcurrency =",
+            "  | {readonly kind: \"bounded_parallel\"; readonly max_in_flight: \
+             ConcurrencyCeiling}",
+            "  | {readonly kind: \"sequential\"};",
+            "export function assertNeverBatchConcurrency(value: never): never {",
+            "export function encodeBatchConcurrency(value: BatchConcurrency): JsonValue {",
+            "export function decodeBatchConcurrency(body: JsonValue): BatchConcurrency {",
+        ] {
+            assert!(
+                generated.contains(declaration),
+                "the concurrency policy lost part of its discriminated shape.\nexpected: \
+                 {declaration}"
+            );
+        }
+        // The coupling is refused in both directions and in both languages. The
+        // categories are the ones Rust reports, which the corpus proves; these
+        // are the two branches that report them.
+        for refusal in [
+            "throw new RefusalError(BATCH_INVALID_BODY, \"bounded_parallel declares a \
+             max_in_flight\");",
+            "throw new RefusalError(BATCH_INVALID_BODY, `${kind} declares no max_in_flight`);",
+        ] {
+            assert!(
+                generated.contains(refusal),
+                "the concurrency coupling is not refused: {refusal}"
+            );
+        }
+        // A nullable ceiling would be the other shape, and it is not emitted.
+        assert!(
+            !generated.contains("readonly max_in_flight: ConcurrencyCeiling | null;"),
+            "the concurrency policy is carried as a struct with a nullable ceiling, which \
+             type-checks a program that asks a sequential policy for its bound"
+        );
+        // The ceiling's two ends are different faults.
+        assert_ne!(
+            BatchApiError::Model(
+                automonique_protocol::batch_runner::BatchError::ConcurrencyCeilingZero
+            )
+            .category(),
+            BatchApiError::Model(
+                automonique_protocol::batch_runner::BatchError::ConcurrencyCeilingUnreachable {
+                    max_members: 0,
+                    requested: 0,
+                }
+            )
+            .category(),
+            "a ceiling of zero and an unreachable one are different mistakes"
+        );
+    }
+
+    /// Every category the generated code refuses with is declared, and every
+    /// declared category is a spelling Rust actually produces.
+    #[test]
+    fn every_refusal_category_is_declared_and_is_the_rust_spelling() {
+        let surface = surface();
+        let declared: BTreeMap<String, String> = surface
+            .categories
+            .iter()
+            .map(|constant| {
+                let ConstantValue::Text(value) = &constant.value else {
+                    panic!("{} is a refusal category, which is text", constant.name)
+                };
+                (constant.name.clone(), value.clone())
+            })
+            .collect();
+
+        let mut referenced = vec![
+            surface.invalid_body_category.clone(),
+            surface.unknown_kind_category.clone(),
+            surface.oversize_category.clone(),
+            surface.field_invalid_category.clone(),
+            surface.field_grammar_category.clone(),
+        ];
+        referenced.extend(referenced_categories(&surface));
+        for name in &referenced {
+            assert!(
+                declared.contains_key(name),
+                "the batch surface refuses with {name}, which it does not declare"
+            );
+        }
+
+        let generated = generated_batch();
+        for (name, expected) in [
+            ("BATCH_INVALID_BODY", BatchApiError::InvalidBody.category()),
+            ("BATCH_UNKNOWN_KIND", BatchApiError::UnknownKind.category()),
+            (
+                "BATCH_UNWRITTEN_ROW",
+                BatchApiError::UnwrittenRow { field: "entry_id" }.category(),
+            ),
+            (
+                "BATCH_UNWRITTEN_REVISION",
+                BatchApiError::UnwrittenRevision.category(),
+            ),
+            (
+                "BATCH_NOT_AN_ADVANCE",
+                BatchApiError::NotAnAdvance {
+                    progress: MemberProgress::Unsubmitted,
+                    revision: 1,
+                }
+                .category(),
+            ),
+            (
+                "BATCH_MEMBERS_OUT_OF_ORDER",
+                BatchApiError::MembersOutOfOrder { position: 0 }.category(),
+            ),
+            (
+                "BATCH_MEMBERSHIP_TOO_LARGE",
+                BatchApiError::MembershipTooLarge {
+                    max_members: 0,
+                    actual_members: 0,
+                }
+                .category(),
+            ),
+            (
+                "BATCH_PAGE_TOO_LARGE",
+                BatchApiError::PageTooLarge {
+                    max_items: 0,
+                    actual_items: 0,
+                }
+                .category(),
+            ),
+            (
+                "BATCH_PAGE_SIZE_OUT_OF_RANGE",
+                BatchApiError::PageSizeOutOfRange {
+                    max_items: 0,
+                    requested: 0,
+                }
+                .category(),
+            ),
+            (
+                "BATCH_TIME_BEFORE_EPOCH",
+                BatchApiError::TimeBeforeEpoch {
+                    field: "created_at_ms",
+                }
+                .category(),
+            ),
+            (
+                "BATCH_COUNTER_OUT_OF_RANGE",
+                BatchApiError::CounterOutOfRange { field: "since" }.category(),
+            ),
+            (
+                "BATCH_INVALID_FIELD",
+                BatchApiError::Field {
+                    field: "batch_id",
+                    error: ValueError::Empty,
+                }
+                .category(),
+            ),
+            (
+                "BATCH_UNKNOWN_ENUM_VALUE",
+                BatchApiError::Codec(automonique_protocol::codec::CodecError::UnknownEnumValue {
+                    field: "state",
+                })
+                .category(),
+            ),
+        ] {
+            assert_eq!(
+                declared.get(name).map(String::as_str),
+                Some(expected),
+                "{name} is not the category Rust reports"
+            );
+            assert!(
+                generated.contains(&format!("export const {name} = \"{expected}\";")),
+                "the generated file does not carry {name} as {expected}"
+            );
+        }
+        // The three the batch *model* owns keep the model's own prefix, which is
+        // how a metric says the batch was wrong rather than the frame.
+        for name in [
+            "BATCH_EMPTY_BATCH",
+            "BATCH_CONCURRENCY_CEILING_ZERO",
+            "BATCH_CONCURRENCY_CEILING_UNREACHABLE",
+        ] {
+            let spelling = declared
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is declared"));
+            assert!(
+                spelling.starts_with("batch_") && !spelling.starts_with("batch_control_"),
+                "{name} is {spelling}, which claims this transport's prefix for the batch model's \
+                 own refusal"
+            );
+        }
+        // An unwritten row and a revision no writer produced are different
+        // faults, and a caller told the wrong one cannot act on it.
+        assert_ne!(
+            declared.get("BATCH_UNWRITTEN_ROW"),
+            declared.get("BATCH_UNWRITTEN_REVISION"),
+            "a row identity of zero and a revision of zero are different faults"
+        );
+        assert_eq!(
+            declared.get(&surface.oversize_category).map(String::as_str),
+            Some("frame_size"),
+            "the oversize category is the spelling the local admin transport reports for a payload \
+             above its ceiling"
+        );
+    }
+
+    /// The gap lists are the whole of the gap, and the refusals absent from them
+    /// are absent for a stated reason.
+    #[test]
+    fn the_rust_only_list_is_the_whole_of_the_gap() {
+        let decoded: BTreeSet<&str> = rust_only_refusals()
+            .iter()
+            .map(|refusal| refusal.id)
+            .collect();
+        assert_eq!(
+            decoded,
+            BTreeSet::from([
+                "advance-receipt-claims-unsubmitted",
+                "conflict-without-disagreement",
+                "continuation-incoherent",
+                "continuation-rewinds",
+                "detail-duplicate-member",
+                "detail-empty-membership",
+                "detail-members-out-of-order",
+                "member-sequence-coupling",
+                "member-unsubmitted-above-first-revision",
+                "page-out-of-order",
+                "rollup-contradicts-members",
+            ]),
+            "the measured decode gap changed without the reason for it changing"
+        );
+        let encoded: BTreeSet<&str> = rust_only_encode_refusals()
+            .iter()
+            .map(|refusal| refusal.id)
+            .collect();
+        assert_eq!(
+            encoded,
+            BTreeSet::from([
+                "advance-member-sequence-coupling",
+                "advance-member-terminal-at-zero-sequence",
+                "register-batch-duplicate-member",
+            ]),
+            "the measured encode gap changed without the reason for it changing"
+        );
+
+        // A page longer than the query asked for: refused by the *constructor*
+        // that answers a listing, not by any decoder, because a decoded frame
+        // does not carry the query it answers. Listing it as a gap would claim
+        // the generated surface is missing something Rust has on the same side.
+        let query = ListBatches::new(BatchCursor::START, page_size(1));
+        let page = BatchListPage::new(
+            vec![
+                record(Row {
+                    entry_id: 1,
+                    batch_id: "batch/one",
+                    label: None,
+                    concurrency: ConcurrencyPolicy::Sequential,
+                    created_at_ms: 0,
+                    revision: 1,
+                }),
+                record(Row {
+                    entry_id: 2,
+                    batch_id: "batch/two",
+                    label: None,
+                    concurrency: ConcurrencyPolicy::Sequential,
+                    created_at_ms: 0,
+                    revision: 1,
+                }),
+            ],
+            BatchContinuation::Complete,
+        )
+        .expect("a well-formed page");
+        let refused = BatchResponse::listing(request_id("req-list-1"), query, page.clone())
+            .expect_err("a page longer than the query asked for is refused");
+        assert_eq!(
+            refused.category(),
+            "batch_control_page_above_requested_size"
+        );
+        // And the same bytes decode, on both sides: the encoded form of that
+        // very page carries nothing a decoder could judge it by.
+        let served = BatchResponse::BatchList {
+            request_id: request_id("req-list-1"),
+            page,
+        };
+        let canonical = served
+            .to_message()
+            .expect("the page encodes")
+            .to_canonical_bytes();
+        assert!(
+            BatchResponse::from_canonical_bytes(&canonical).is_ok(),
+            "the Rust decoder judges a page against a query it cannot see"
+        );
+    }
+
+    /// The SDK has no transport, and the generated file says so.
+    #[test]
+    fn the_generated_surface_says_the_framing_is_excluded() {
+        let generated = generated_batch();
+        for statement in [
+            "The length-delimited framing this protocol travels under is not applied",
+            "This package has no transport.",
+            "The payload is the framed transport's payload, without its length prefix.",
+        ] {
+            assert!(
+                generated.contains(statement),
+                "the generated batch surface does not state where framing lives: {statement}"
+            );
+        }
+        // And it says what the surface does not do, which is most of what a
+        // batch runner would be expected to do.
+        for honesty in [
+            "It submits nothing, schedules nothing and runs nothing",
+            "a member's progress is a writer's claim rather than a reading of a run",
+        ] {
+            assert!(
+                generated.contains(honesty),
+                "the generated batch surface overstates what it does: {honesty}"
+            );
+        }
+    }
+
+    /// The package typecheck actually reads the new files.
+    #[test]
+    fn the_typecheck_reads_the_batch_surface_and_its_runner() {
+        let output = Command::new("npx")
+            .arg("--offline")
+            .arg("tsc")
+            .arg("-p")
+            .arg("./tsconfig.json")
+            .arg("--listFiles")
+            .current_dir(package_root())
+            .output();
+        let Ok(output) = output else {
+            eprintln!("GAP: tsc is unavailable; the batch surface is untypechecked");
+            return;
+        };
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "the protocol package does not typecheck with the batch surface:\n{combined}"
+        );
+        for expected in [
+            "generated/batch.ts",
+            "generated/runtime.ts",
+            "conformance/batch-api.ts",
+        ] {
+            assert!(
+                combined.lines().any(|line| line.trim().ends_with(expected)),
+                "tsc did not read {expected}; it is outside the tsconfig include globs, so \
+                 nothing typechecks it.\n{combined}"
+            );
+        }
+    }
+
+    /// The heart of the lane: the generated TypeScript encodes the same bytes
+    /// Rust does, decodes what Rust answers, refuses what Rust refuses, and
+    /// accepts exactly the cross-field payloads it is documented not to judge.
+    #[test]
+    fn the_generated_typescript_agrees_with_rust_byte_for_byte() {
+        let Some(runtime) = javascript_runtime() else {
+            eprintln!(
+                "GAP: no JavaScript runtime; the batch surface is unmeasured across languages"
+            );
+            return;
+        };
+        let directory =
+            std::env::temp_dir().join(format!("automonique-batch-api-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("scratch directory");
+        let produced_path = directory.join("typescript-encodings.txt");
+
+        let output = Command::new(runtime)
+            .arg(runner_path())
+            .arg(corpus_path())
+            .arg(&produced_path)
+            .current_dir(package_root())
+            .output()
+            .expect("the conformance runner starts");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "the generated batch surface disagrees with the Rust corpus under {runtime}:\n\
+             {combined}"
+        );
+
+        // The second direction: the runner reports the bytes it produced, and
+        // they are compared here against what Rust encodes and then fed to the
+        // shipped decoder. The maximal registration is the one that matters
+        // most — both sides built its 128 members from the corpus's rule, so
+        // this is where a disagreement about the rule would surface.
+        let reported = std::fs::read_to_string(&produced_path)
+            .expect("the runner reports the payloads it produced");
+        let mut produced: BTreeMap<String, Vec<u8>> = reported
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let (id, payload) = line
+                    .split_once(' ')
+                    .unwrap_or_else(|| panic!("a reported line is `<id> <hex>`: {line:?}"));
+                (id.to_owned(), unhex(payload))
+            })
+            .collect();
+
+        for case in request_cases() {
+            let expected = case
+                .request
+                .to_message()
+                .expect("the request encodes")
+                .to_canonical_bytes();
+            let actual = produced
+                .remove(case.id)
+                .unwrap_or_else(|| panic!("the runner did not report {}", case.id));
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "{}: {runtime} produced {} canonical bytes, Rust produced {}",
+                case.id,
+                actual.len(),
+                expected.len()
+            );
+            if let Some(index) = actual
+                .iter()
+                .zip(expected.iter())
+                .position(|(left, right)| left != right)
+            {
+                let window = |bytes: &[u8]| {
+                    String::from_utf8_lossy(
+                        &bytes[index.saturating_sub(24)..(index + 24).min(bytes.len())],
+                    )
+                    .into_owned()
+                };
+                panic!(
+                    "{}: the two encodings first differ at byte {index}\n  {runtime}: {}\n  \
+                     rust: {}",
+                    case.id,
+                    window(&actual),
+                    window(&expected)
+                );
+            }
+            assert_eq!(
+                BatchRequest::from_canonical_bytes(&actual).unwrap_or_else(|error| panic!(
+                    "{}: Rust refuses what {runtime} produced: {error}",
+                    case.id
+                )),
+                case.request,
+                "{}: Rust decodes what {runtime} produced as a different request",
+                case.id
+            );
+        }
+        assert!(
+            produced.is_empty(),
+            "the runner reported payloads the corpus has no cases for: {:?}",
+            produced.keys().collect::<Vec<_>>()
+        );
+        println!(
+            "batch control surface under {runtime}: {}",
             String::from_utf8_lossy(&output.stdout).trim()
         );
     }

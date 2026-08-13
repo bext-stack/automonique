@@ -231,6 +231,35 @@ export function boundedBytes(
 }
 
 /**
+ * Bound a list before its items are encoded, keeping the order it was given in.
+ *
+ * The length is judged before any item is validated, which is the order the
+ * Rust constructors judge it in: a membership above the ceiling is refused for
+ * being too long, not for whatever its hundred-and-twenty-ninth key turns out
+ * to be. The two ends carry different categories because they are different
+ * faults — a unit with nothing in it, and a unit larger than the frame can
+ * carry — and they are the model's refusal and the transport's respectively.
+ *
+ * Nothing is sorted and nothing is deduplicated. Where a list's order is its
+ * items' ordinals, sorting would silently renumber them.
+ */
+export function boundedItems<T>(
+  values: readonly T[],
+  maxItems: number,
+  oversizeCategory: string,
+  emptyCategory: string,
+): readonly T[] {
+  if (values.length > maxItems) {
+    throw new RefusalError(
+      oversizeCategory,
+      `${values.length} items; maximum is ${maxItems}`,
+    );
+  }
+  if (values.length === 0) throw new RefusalError(emptyCategory, "empty list");
+  return values;
+}
+
+/**
  * Read a body whose key set must be exactly `fields`.
  *
  * The Rust decoders refuse a body with a missing or unexpected key rather than
