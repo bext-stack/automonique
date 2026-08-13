@@ -272,6 +272,14 @@ pub enum SocketGrant {
     UnixSeqPacket,
     /// IPv4/IPv6 `SOCK_STREAM` TCP sockets only.
     Tcp,
+    /// IPv4/IPv6 `SOCK_DGRAM` UDP sockets only — the DNS-resolution grant.
+    ///
+    /// Wider than [`Self::Tcp`]: the TCP `bind`/`connect` policy cannot bound
+    /// where a UDP socket sends, so this permits a workload to reach any
+    /// nameserver on port 53. It exists for the pre-broker provider-launch
+    /// path where a provider does its own DNS; see
+    /// [`crate::seccomp::SocketFamilyPolicy::allowing_inet_datagram_sockets`].
+    InetDatagram,
 }
 
 impl SocketGrant {
@@ -282,6 +290,7 @@ impl SocketGrant {
             Self::Unix => "unix",
             Self::UnixSeqPacket => "unix-seqpacket",
             Self::Tcp => "tcp",
+            Self::InetDatagram => "inet-datagram",
         }
     }
 
@@ -290,6 +299,7 @@ impl SocketGrant {
             "unix" => Some(Self::Unix),
             "unix-seqpacket" => Some(Self::UnixSeqPacket),
             "tcp" => Some(Self::Tcp),
+            "inet-datagram" => Some(Self::InetDatagram),
             _ => None,
         }
     }
@@ -931,6 +941,7 @@ fn socket_policy_from_grants(
             SocketGrant::Unix => policy.allowing_unix_sockets()?,
             SocketGrant::UnixSeqPacket => policy.allowing_unix_seqpacket_sockets()?,
             SocketGrant::Tcp => policy.allowing_tcp_sockets()?,
+            SocketGrant::InetDatagram => policy.allowing_inet_datagram_sockets()?,
         };
     }
     Ok(policy)

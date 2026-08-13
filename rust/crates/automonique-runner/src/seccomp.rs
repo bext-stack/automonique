@@ -614,6 +614,28 @@ impl SocketFamilyPolicy {
             .allowing(SocketDomain::Inet6, SocketKind::Stream, tcp)
     }
 
+    /// Permit IPv4 and IPv6 UDP sockets, and nothing else on those families.
+    ///
+    /// Grants `SOCK_DGRAM` with protocol `0` (the family default, UDP) or
+    /// `IPPROTO_UDP`. Every other protocol number on these families — including
+    /// `SOCK_RAW` — stays denied.
+    ///
+    /// This is the DNS-resolution grant, and it is deliberately kept separate
+    /// from [`Self::allowing_tcp_sockets`] because it is a wider hole than TCP:
+    /// [`crate::network::TcpBindConnectPolicy`] governs only `bind`/`connect` on
+    /// TCP sockets, so it cannot bound where a UDP socket sends. A workload that
+    /// resolves names itself opens these sockets to its nameservers on port 53,
+    /// and nothing in this crate confines that destination. The product's design
+    /// closes this hole by resolving names in the egress broker rather than in
+    /// the workload; this grant exists only for the pre-broker provider-launch
+    /// path, where a provider CLI does its own DNS, and it should be paired only
+    /// with a workload whose network egress is being deliberately relaxed.
+    pub fn allowing_inet_datagram_sockets(self) -> Result<Self, SocketFilterError> {
+        let udp: &[u32] = &[0, nix::libc::IPPROTO_UDP as u32];
+        self.allowing(SocketDomain::Inet, SocketKind::Datagram, udp)?
+            .allowing(SocketDomain::Inet6, SocketKind::Datagram, udp)
+    }
+
     fn allowing(
         mut self,
         domain: SocketDomain,
@@ -1237,6 +1259,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The UDP grant permits inet datagram sockets on both families, at the two
+    /// spellings a resolver uses, and nothing wider — not raw, not a foreign
+    /// protocol, and not TCP, which is a separate grant.
+    #[test]
+    fn the_datagram_grant_is_udp_on_the_inet_families_and_nothing_wider() {
+        let policy = SocketFamilyPolicy::deny_all()
+            .allowing_inet_datagram_sockets()
+            .expect("inet datagram policy");
+        for domain in [nix::libc::AF_INET, nix::libc::AF_INET6] {
+            assert!(policy.permits(domain, nix::libc::SOCK_DGRAM, 0));
+            assert!(policy.permits(domain, nix::libc::SOCK_DGRAM, nix::libc::IPPROTO_UDP));
+            for protocol in [nix::libc::IPPROTO_ICMP, 262, nix::libc::IPPROTO_TCP, -1] {
+                assert!(
+                    !policy.permits(domain, nix::libc::SOCK_DGRAM, protocol),
+                    "protocol {protocol} came along with the UDP grant"
+                );
+            }
+            // The grant does not widen into raw sockets or TCP on these families.
+            assert!(!policy.permits(domain, nix::libc::SOCK_RAW, 0));
+            assert!(!policy.permits(domain, nix::libc::SOCK_STREAM, 0));
+        }
+        // It is confined to the inet families: no AF_UNIX datagram comes with it.
+        assert!(!policy.permits(nix::libc::AF_UNIX, nix::libc::SOCK_DGRAM, 0));
     }
 
     /// Grants are bounded and duplicate-free, and refusals are typed.

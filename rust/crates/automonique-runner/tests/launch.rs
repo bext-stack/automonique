@@ -962,6 +962,38 @@ fn frames_round_trip_with_environment_and_prompt() {
 }
 
 #[test]
+fn the_inet_datagram_grant_round_trips_and_coexists_with_tcp() {
+    // A provider that does its own DNS needs both the TCP grant (for the HTTPS
+    // connection) and the UDP grant (for name resolution). The pair must survive
+    // the frame, and building the plan at all exercises the grant->policy
+    // mapping, which refuses at construction if the seccomp layer would.
+    let plan = busybox_plan("true", |plan| {
+        plan.socket_grant(SocketGrant::Tcp)
+            .unwrap()
+            .socket_grant(SocketGrant::InetDatagram)
+            .unwrap()
+            .allow_connect_port(443)
+            .unwrap()
+    });
+    let frame = plan.encode().unwrap();
+    let text = String::from_utf8(frame.clone()).unwrap();
+    assert!(
+        text.contains("socket=inet-datagram"),
+        "the datagram grant is spelled in the frame"
+    );
+    let decoded = LaunchPlan::decode(&frame).expect("round trip");
+    assert_eq!(decoded, plan);
+    // The grant is duplicate-refused like every other, at the plan layer.
+    assert!(matches!(
+        busybox_plan("true", |plan| plan)
+            .socket_grant(SocketGrant::InetDatagram)
+            .unwrap()
+            .socket_grant(SocketGrant::InetDatagram),
+        Err(LaunchPlanError::PolicyRejected(_))
+    ));
+}
+
+#[test]
 fn secrets_stay_out_of_argv_out_of_the_frame_text_and_out_of_debug() {
     let plan = busybox_plan("true", |plan| {
         plan.environment("CODEX_HOME", "/opaque/config")
