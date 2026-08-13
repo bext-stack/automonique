@@ -9,14 +9,18 @@
 //! name the doc test that carries the compile-time half.
 
 use automonique_protocol::automation::{
-    AnyCompletionEvidence, ArtifactEvidence, AuthorizedDestination, AutomationError, AutomationJob,
-    AutomationRevision, BoardClaim, BoardClaimParts, CanonicalSchedule, ClaimLabel, ClaimState,
-    CompletedEffect, CompletionEvidence, CompletionEvidenceKind, CronExpression, DeliveryMode,
-    DstPolicy, DurableId, EventFilter, EventFilters, FailureLedger, FixedInterval, Goal,
-    GoalOutcome, GoalVerdict, IdempotencySource, JobKind, JobObligations, NarrativeEvidence,
-    OccurrenceKey, OutboxObligation, ReceiptEvidence, RouteTransform, Tenancy, TestEvidence,
-    Timezone, TriggerRoute, TriggerRouteParts, UnattendedDecision, VerdictEvidence,
-    VerificationMethod, WaitCondition, Wake, WakeContext,
+    ActionBinding, ActionKind, AnyCompletionEvidence, ArtifactEvidence, AuthorizedDestination,
+    AutomationAction, AutomationActor, AutomationEnablement, AutomationError, AutomationJob,
+    AutomationRevision, BoardClaim, BoardClaimParts, BoundedPattern, CanonicalSchedule, ClaimLabel,
+    ClaimState, CompletedEffect, CompletionEvidence, CompletionEvidenceKind, CronExpression,
+    DeliveryMode, DstPolicy, DurableId, EnablementState, EventFilter, EventFilters, FailureLedger,
+    FilterExpression, FilterField, FilterPredicate, FixedInterval, Goal, GoalOutcome, GoalVerdict,
+    IdempotencySource, JobKind, JobObligations, MAX_FILTER_DEPTH, MAX_FILTER_FIELD_SEGMENTS,
+    MAX_FILTER_NODES, MAX_FILTER_RENDERING_BYTES, MAX_MEMBERSHIP_VALUES, MAX_PATTERN_EXPANSION,
+    NarrativeEvidence, OccurrenceKey, OutboxObligation, OverlapKind, OverlapPolicy, PauseCause,
+    PredicateKind, ReceiptEvidence, RouteTransform, Tenancy, TestEvidence, Timezone, TriggerKind,
+    TriggerRoute, TriggerRouteParts, TriggerSpec, UnattendedDecision, VerdictEvidence,
+    VerificationMethod, WaitCondition, Wake, WakeContext, WatchedSource,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 
@@ -1395,6 +1399,1196 @@ mod fenced_claims {
         assert_eq!(
             ledger.after_failure().state(),
             ClaimState::Blocked { failures: 1 }
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Extension: the automation surface the R1-22 evidence recorded as not done.
+//
+// `plan/evidence/R1-22.json` states under "WHAT IS NOT DONE" that an
+// `AutomationRevision` carries no enabled state and no concurrency or overlap
+// policy, both of which `docs/product-plan/requirements/
+// automation-goals-and-triggers.md` § Durable automations requires (lines 7 and
+// 11). The same requirement's line 43 lists a filter vocabulary — equals,
+// contains, existence, membership and bounded regex with all/any/not — of which
+// only equality was modelled, and lines 11 and 50-52 name run-now and the
+// registered watcher sources that no type spelled. The modules below close
+// those, and each names the requirement line it answers to.
+// ---------------------------------------------------------------------------
+
+/// § Durable automations, lines 7 and 11: an automation revision stores its
+/// enabled state, and the operation set includes pause, resume and archive.
+mod enablement {
+    use super::*;
+
+    fn automation() -> AutomationRevision {
+        AutomationRevision::new(
+            "auto-1",
+            Revision::FIRST,
+            CanonicalSchedule::every(60_000).expect("positive interval"),
+            &["notify:slack"],
+        )
+        .expect("valid automation")
+    }
+
+    fn cause() -> PauseCause {
+        PauseCause::new("ada", "the upstream feed is replaying").expect("valid cause")
+    }
+
+    #[test]
+    fn a_newly_declared_automation_is_enabled_and_names_no_resumer() {
+        let automation = automation();
+        assert_eq!(
+            automation.enablement(),
+            &AutomationEnablement::Enabled { resumed_by: None }
+        );
+        assert_eq!(automation.enablement().state(), EnablementState::Enabled);
+        assert!(automation.enablement().admits_occurrence());
+        assert_eq!(automation.enablement().cause(), None);
+    }
+
+    #[test]
+    fn the_lifecycle_is_closed_and_every_state_is_reachable_or_refused() {
+        // Exhaustive over the nine ordered pairs of the three states. The match
+        // has no wildcard arm, so a fourth state would stop this compiling.
+        let mut reached: Vec<EnablementState> = Vec::new();
+        for state in EnablementState::ALL {
+            let held = match state {
+                EnablementState::Enabled => automation(),
+                EnablementState::Paused => automation()
+                    .paused(Revision::FIRST, cause())
+                    .expect("enabled pauses"),
+                EnablementState::Archived => automation()
+                    .archived(Revision::FIRST, cause())
+                    .expect("enabled archives"),
+            };
+            assert_eq!(held.enablement().state(), state);
+            reached.push(state);
+
+            let at = held.revision();
+            for target in EnablementState::ALL {
+                let attempt = match target {
+                    EnablementState::Enabled => held.resumed(at, "grace"),
+                    EnablementState::Paused => held.paused(at, cause()),
+                    EnablementState::Archived => held.archived(at, cause()),
+                };
+                let permitted = matches!(
+                    (state, target),
+                    (EnablementState::Enabled, EnablementState::Paused)
+                        | (EnablementState::Paused, EnablementState::Enabled)
+                        | (
+                            EnablementState::Enabled | EnablementState::Paused,
+                            EnablementState::Archived
+                        )
+                );
+                match attempt {
+                    Ok(next) => {
+                        assert!(
+                            permitted,
+                            "{} -> {} was accepted and should not be",
+                            state.as_str(),
+                            target.as_str()
+                        );
+                        assert_eq!(next.enablement().state(), target);
+                        assert_eq!(next.revision().get(), at.get() + 1);
+                    }
+                    Err(error) => {
+                        assert!(
+                            !permitted,
+                            "{} -> {} was refused and should not be",
+                            state.as_str(),
+                            target.as_str()
+                        );
+                        assert_eq!(error.category(), "invalid_transition");
+                        assert_eq!(
+                            error,
+                            AutomationError::InvalidTransition {
+                                from: state.as_str(),
+                                to: target.as_str(),
+                            }
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(reached.len(), 3);
+    }
+
+    #[test]
+    fn archived_is_terminal() {
+        let archived = automation()
+            .archived(Revision::FIRST, cause())
+            .expect("enabled archives");
+        let at = archived.revision();
+        for attempt in [
+            archived.resumed(at, "grace"),
+            archived.paused(at, cause()),
+            archived.archived(at, cause()),
+        ] {
+            assert_eq!(
+                attempt.expect_err("archived is terminal").category(),
+                "invalid_transition"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pause_names_who_and_why_and_a_resume_names_who() {
+        let paused = automation()
+            .paused(Revision::FIRST, cause())
+            .expect("enabled pauses");
+        let recorded = paused.enablement().cause().expect("a paused cause");
+        assert_eq!(recorded.actor().as_str(), "ada");
+        assert_eq!(recorded.reason(), "the upstream feed is replaying");
+
+        let resumed = paused
+            .resumed(paused.revision(), "grace")
+            .expect("paused resumes");
+        assert_eq!(
+            resumed.enablement(),
+            &AutomationEnablement::Enabled {
+                resumed_by: Some(AutomationActor::new("grace").expect("valid actor")),
+            }
+        );
+        // The resumer is carried, not dropped: the record says who reopened it.
+        assert_eq!(resumed.enablement().cause(), None);
+
+        // A pause with no stated cause is not constructible.
+        for (actor, reason) in [("", "why"), ("ada", ""), ("ada", "a\u{7}b")] {
+            assert_eq!(
+                PauseCause::new(actor, reason)
+                    .expect_err("a pause states who and why")
+                    .category(),
+                "field_invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn a_withdrawn_automation_produces_no_occurrence_key() {
+        let automation = automation();
+        assert_eq!(
+            automation
+                .occurrence_at(at(1_700_000_000_000))
+                .expect("enabled fires")
+                .as_str(),
+            "auto-1@1700000000000"
+        );
+
+        for withdrawn in [
+            automation.paused(Revision::FIRST, cause()).expect("pauses"),
+            automation
+                .archived(Revision::FIRST, cause())
+                .expect("archives"),
+        ] {
+            let state = withdrawn.enablement().state();
+            let refusal = withdrawn
+                .occurrence_at(at(1_700_000_000_000))
+                .expect_err("a withdrawn automation fires nothing");
+            assert_eq!(refusal.category(), "not_enabled");
+            assert_eq!(
+                refusal,
+                AutomationError::NotEnabled {
+                    state: state.as_str(),
+                }
+            );
+            assert!(!state.admits_occurrence());
+        }
+    }
+
+    #[test]
+    fn a_lifecycle_transition_requires_the_expected_revision() {
+        let automation = automation();
+        let stale = revision(9);
+        assert_eq!(
+            automation
+                .paused(stale, cause())
+                .expect_err("stale expectation")
+                .category(),
+            "revision_conflict"
+        );
+        // The receiver is unchanged by the refused edit.
+        assert_eq!(automation.revision(), Revision::FIRST);
+        assert_eq!(automation.enablement().state(), EnablementState::Enabled);
+    }
+
+    #[test]
+    fn a_pause_carries_the_rest_of_the_revision_forward() {
+        let paused = automation()
+            .paused(Revision::FIRST, cause())
+            .expect("enabled pauses");
+        assert_eq!(paused.id(), "auto-1");
+        assert_eq!(paused.approved_effects(), ["notify:slack"]);
+        assert_eq!(
+            paused.schedule(),
+            &CanonicalSchedule::every(60_000).expect("positive interval")
+        );
+        assert_eq!(paused.overlap(), OverlapPolicy::Skip);
+    }
+}
+
+/// § Durable automations, line 7: an automation revision stores a concurrency
+/// or overlap policy.
+mod overlap_policy {
+    use super::*;
+
+    #[test]
+    fn the_policy_set_is_closed_and_every_kind_names_a_ceiling() {
+        let mut seen: Vec<OverlapKind> = Vec::new();
+        for kind in OverlapKind::ALL {
+            // No wildcard arm: a fifth kind would stop this compiling.
+            let policy = match kind {
+                OverlapKind::Skip => OverlapPolicy::Skip,
+                OverlapKind::Queue => OverlapPolicy::queue(4).expect("positive queue"),
+                OverlapKind::CancelPrevious => OverlapPolicy::CancelPrevious,
+                OverlapKind::Concurrent => OverlapPolicy::concurrent(3).expect("positive limit"),
+            };
+            assert_eq!(policy.kind(), kind);
+            assert!(
+                policy.live_ceiling() >= 1,
+                "{} named no ceiling",
+                kind.as_str()
+            );
+            seen.push(kind);
+        }
+        assert_eq!(seen.len(), 4);
+        assert_eq!(OverlapPolicy::Skip.live_ceiling(), 1);
+        assert_eq!(OverlapPolicy::CancelPrevious.live_ceiling(), 1);
+        assert_eq!(
+            OverlapPolicy::queue(4).expect("valid").live_ceiling(),
+            5,
+            "a queue of four plus the one running"
+        );
+        assert_eq!(
+            OverlapPolicy::concurrent(3).expect("valid").live_ceiling(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_zero_ceiling_is_refused_rather_than_read_as_no_limit() {
+        for refusal in [OverlapPolicy::queue(0), OverlapPolicy::concurrent(0)] {
+            assert_eq!(
+                refusal
+                    .expect_err("a ceiling admits at least one")
+                    .category(),
+                "not_canonical"
+            );
+        }
+        assert!(OverlapPolicy::queue(1).is_ok());
+        assert!(OverlapPolicy::concurrent(1).is_ok());
+    }
+
+    #[test]
+    fn the_policy_is_part_of_the_revision_and_edits_conflict() {
+        let automation = AutomationRevision::new(
+            "auto-1",
+            Revision::FIRST,
+            CanonicalSchedule::every(60_000).expect("positive interval"),
+            &[],
+        )
+        .expect("valid automation");
+        assert_eq!(automation.overlap(), OverlapPolicy::Skip);
+
+        let policy = OverlapPolicy::concurrent(2).expect("positive limit");
+        let next = automation
+            .with_overlap(Revision::FIRST, policy)
+            .expect("expected revision");
+        assert_eq!(next.overlap(), policy);
+        assert_eq!(next.revision().get(), 2);
+        assert_eq!(
+            automation.overlap(),
+            OverlapPolicy::Skip,
+            "the receiver was mutated"
+        );
+        assert_eq!(
+            automation
+                .with_overlap(revision(9), policy)
+                .expect_err("stale expectation")
+                .category(),
+            "revision_conflict"
+        );
+    }
+}
+
+/// § Durable automations, line 11 (run-now) and § Hooks, watchers and wakeups,
+/// lines 50-52 (the registered sources that can wake an automation).
+mod trigger_vocabulary {
+    use super::*;
+
+    fn corpus() -> Vec<TriggerSpec> {
+        let mut triggers = vec![
+            TriggerSpec::schedule(CanonicalSchedule::once(at(0))),
+            TriggerSpec::schedule(CanonicalSchedule::once(at(-1_000))),
+            TriggerSpec::schedule(CanonicalSchedule::every(86_400_000).expect("positive")),
+            TriggerSpec::schedule(
+                CanonicalSchedule::cron(
+                    "0 3 * * MON",
+                    "Europe/Paris",
+                    DstPolicy::ShiftMissingFireSecond,
+                )
+                .expect("valid cron"),
+            ),
+            TriggerSpec::inbound("route-1").expect("valid route"),
+            TriggerSpec::inbound("route:with:colons").expect("valid route"),
+            TriggerSpec::manual("ada").expect("valid actor"),
+            TriggerSpec::manual("Ada Lovelace <ada@example.test>").expect("valid actor"),
+        ];
+        for source in WatchedSource::ALL {
+            triggers.push(TriggerSpec::watch(source, "watcher-1").expect("valid watcher"));
+        }
+        triggers
+    }
+
+    #[test]
+    fn the_trigger_set_is_closed_and_exhaustively_covered() {
+        let mut seen: Vec<TriggerKind> = Vec::new();
+        for kind in TriggerKind::ALL {
+            // No wildcard arm: a fifth trigger kind would stop this compiling.
+            let trigger = match kind {
+                TriggerKind::Schedule => {
+                    TriggerSpec::schedule(CanonicalSchedule::every(1).expect("positive"))
+                }
+                TriggerKind::Inbound => TriggerSpec::inbound("route-1").expect("valid"),
+                TriggerKind::Watch => {
+                    TriggerSpec::watch(WatchedSource::GitHub, "watcher-1").expect("valid")
+                }
+                TriggerKind::Manual => TriggerSpec::manual("ada").expect("valid"),
+            };
+            assert_eq!(trigger.kind(), kind);
+            assert_eq!(trigger.is_unattended(), kind.is_unattended());
+            seen.push(kind);
+        }
+        assert_eq!(seen.len(), 4);
+
+        let spellings: Vec<&str> = TriggerKind::ALL.iter().map(|k| k.as_str()).collect();
+        let mut sorted = spellings.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), spellings.len(), "two kinds share a spelling");
+    }
+
+    #[test]
+    fn exactly_one_trigger_kind_is_attended() {
+        let unattended: Vec<&str> = TriggerKind::ALL
+            .iter()
+            .filter(|kind| kind.is_unattended())
+            .map(|kind| kind.as_str())
+            .collect();
+        assert_eq!(unattended, ["schedule", "inbound", "watch"]);
+        assert!(!TriggerKind::Manual.is_unattended());
+    }
+
+    #[test]
+    fn every_trigger_round_trips_through_its_canonical_rendering() {
+        for trigger in corpus() {
+            let rendered = trigger.render();
+            let read = TriggerSpec::from_rendering(&rendered)
+                .unwrap_or_else(|error| panic!("{rendered} did not read back: {error}"));
+            assert_eq!(read, trigger);
+            assert_eq!(read.render(), rendered, "re-rendering was not identical");
+            assert!(
+                rendered.starts_with(trigger.kind().as_str()),
+                "{rendered} does not open with its kind"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_triggers_render_identically_and_unequal_ones_do_not() {
+        let corpus = corpus();
+        assert!(corpus.len() >= 16, "the corpus was shrunk");
+        for left in &corpus {
+            for right in &corpus {
+                assert_eq!(
+                    left == right,
+                    left.render() == right.render(),
+                    "{} and {} disagree",
+                    left.render(),
+                    right.render()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_watched_source_set_is_exactly_the_eight_the_requirement_names() {
+        let spellings: Vec<&str> = WatchedSource::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            spellings,
+            [
+                "github",
+                "ci",
+                "monitoring",
+                "filesystem",
+                "rss",
+                "calendar",
+                "email",
+                "platform"
+            ]
+        );
+        for source in WatchedSource::ALL {
+            assert_eq!(
+                WatchedSource::from_name(source.as_str()).expect("declared source"),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_name_is_refused_rather_than_defaulted() {
+        for (vocabulary, name) in [
+            ("watched_source", "gitlab"),
+            ("watched_source", "GitHub"),
+            ("watched_source", "github "),
+            ("watched_source", ""),
+        ] {
+            let refusal = WatchedSource::from_name(name).expect_err("not a declared source");
+            assert_eq!(refusal.category(), "unknown_vocabulary");
+            assert_eq!(
+                refusal,
+                AutomationError::UnknownVocabulary {
+                    vocabulary,
+                    requested: name.to_owned(),
+                }
+            );
+        }
+        for name in ["webhook", "cron", "Manual", "manual "] {
+            assert_eq!(
+                TriggerKind::from_name(name)
+                    .expect_err("not a declared kind")
+                    .category(),
+                "unknown_vocabulary"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_rendering_is_refused() {
+        for rendered in [
+            "manual",                 // no separator at all
+            "webhook:route-1",        // unknown kind
+            "watch:gitlab:watcher-1", // unknown source
+            "watch:github",           // no watcher
+            "schedule:weekly@1",      // not a canonical schedule
+            "schedule:",              // empty schedule
+            "inbound:",               // empty route
+            "inbound:route 1",        // whitespace in an identity
+            "manual:",                // anonymous run-now
+        ] {
+            let refusal = TriggerSpec::from_rendering(rendered)
+                .expect_err("a malformed rendering was accepted");
+            assert!(
+                matches!(
+                    refusal.category(),
+                    "unknown_vocabulary" | "not_canonical" | "field_invalid"
+                ),
+                "{rendered} was refused as {}",
+                refusal.category()
+            );
+        }
+        // The paired accepting cases, differing only in the rejected thing.
+        assert!(TriggerSpec::from_rendering("manual:ada").is_ok());
+        assert!(TriggerSpec::from_rendering("watch:github:watcher-1").is_ok());
+        assert!(TriggerSpec::from_rendering("schedule:every@1").is_ok());
+        assert!(TriggerSpec::from_rendering("inbound:route-1").is_ok());
+    }
+}
+
+/// § Durable automations, lines 13-22: what a job can do, and that creating a
+/// schedule is never blanket authority for future arbitrary effects.
+mod action_binding {
+    use super::*;
+
+    fn automation(effects: &[&str]) -> AutomationRevision {
+        AutomationRevision::new(
+            "auto-1",
+            Revision::FIRST,
+            CanonicalSchedule::every(60_000).expect("positive interval"),
+            effects,
+        )
+        .expect("valid automation")
+    }
+
+    fn destination() -> AuthorizedDestination {
+        AuthorizedDestination::new("slack:C1", "grant:slack-post").expect("authorized")
+    }
+
+    fn every_action() -> Vec<AutomationAction> {
+        vec![
+            AutomationAction::agent_turn("prompt-nightly").expect("valid prompt"),
+            AutomationAction::script("workflow-backup").expect("valid workflow"),
+            AutomationAction::command("pause_intake").expect("valid command"),
+            AutomationAction::notify(destination()),
+        ]
+    }
+
+    #[test]
+    fn the_action_set_is_closed_and_exhaustively_covered() {
+        let mut seen: Vec<ActionKind> = Vec::new();
+        for kind in ActionKind::ALL {
+            // No wildcard arm: a fifth action kind would stop this compiling.
+            let action = match kind {
+                ActionKind::AgentTurn => AutomationAction::agent_turn("p-1").expect("valid"),
+                ActionKind::Script => AutomationAction::script("w-1").expect("valid"),
+                ActionKind::Command => AutomationAction::command("status").expect("valid"),
+                ActionKind::Notify => AutomationAction::notify(destination()),
+            };
+            assert_eq!(action.kind(), kind);
+            assert_eq!(action.reaches_model(), kind.reaches_model());
+            seen.push(kind);
+        }
+        assert_eq!(seen.len(), 4);
+    }
+
+    #[test]
+    fn only_an_agent_turn_reaches_a_model_and_the_rest_are_script_jobs() {
+        // Requirement line 20: a job may run notification-only with zero model
+        // call. Requirement line 51 of the contract: skipping the model does
+        // not buy weaker obligations, so every non-model action is a
+        // `JobKind::Script` and carries the same `JobObligations`.
+        for action in every_action() {
+            let expected = matches!(action.kind(), ActionKind::AgentTurn);
+            assert_eq!(action.reaches_model(), expected);
+            assert_eq!(
+                action.kind().job_kind(),
+                if expected {
+                    JobKind::Agent
+                } else {
+                    JobKind::Script
+                }
+            );
+        }
+        assert_eq!(
+            ActionKind::ALL
+                .iter()
+                .filter(|kind| kind.reaches_model())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_action_names_the_exact_effect_its_scope_must_contain() {
+        let expected = [
+            "agent_turn:prompt-nightly",
+            "script:workflow-backup",
+            "command:pause_intake",
+            "notify:slack:C1",
+        ];
+        let effects: Vec<String> = every_action()
+            .iter()
+            .map(AutomationAction::required_effect)
+            .collect();
+        assert_eq!(effects, expected);
+
+        // Deterministic: the same action yields the same effect every time.
+        for action in every_action() {
+            assert_eq!(action.required_effect(), action.required_effect());
+        }
+
+        // Distinct: two different actions never demand the same authority.
+        let mut sorted = effects.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), effects.len());
+    }
+
+    #[test]
+    fn an_action_inside_scope_binds_and_one_outside_it_can_only_be_asked_for() {
+        let trigger = TriggerSpec::schedule(CanonicalSchedule::every(60_000).expect("positive"));
+        for action in every_action() {
+            let effect = action.required_effect();
+            let declared = automation(&[effect.as_str()]);
+            // No wildcard arm: a third binding outcome would stop this
+            // compiling.
+            match declared
+                .bind(&trigger, action.clone())
+                .expect("an enabled automation")
+            {
+                ActionBinding::Bound(bound) => {
+                    assert_eq!(bound.automation_id(), "auto-1");
+                    assert_eq!(bound.action(), &action);
+                    assert_eq!(bound.trigger(), &trigger);
+                    assert_eq!(bound.job_kind(), action.kind().job_kind());
+                    // The binding is spendable exactly once, as the approval a
+                    // completed effect requires.
+                    let done = CompletedEffect::record(bound.into_approved(), "outbox:r-1")
+                        .expect("valid receipt");
+                    assert_eq!(done.effect(), effect);
+                    assert_eq!(done.automation_id(), "auto-1");
+                }
+                ActionBinding::RequiresApproval(request) => {
+                    panic!("{effect} was declared and still needed approval: {request:?}");
+                }
+            }
+
+            let undeclared = automation(&["notify:somewhere-else"]);
+            match undeclared
+                .bind(&trigger, action.clone())
+                .expect("an enabled automation")
+            {
+                ActionBinding::Bound(bound) => {
+                    panic!("{effect} was not declared and still bound: {bound:?}");
+                }
+                ActionBinding::RequiresApproval(request) => {
+                    assert_eq!(request.effect(), effect);
+                    assert_eq!(request.automation_id(), "auto-1");
+                    assert_eq!(
+                        request.refusal(),
+                        AutomationError::OutsideApprovedScope {
+                            effect: effect.clone(),
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_manual_trigger_is_not_a_way_around_declared_scope() {
+        // If run-now bypassed the scope check, "ask a person to press the
+        // button" would be a privilege escalation. Every trigger kind gets the
+        // same answer for the same action and the same declared scope.
+        let action = AutomationAction::command("submit_run").expect("valid command");
+        let undeclared = automation(&["command:status"]);
+        let triggers = [
+            TriggerSpec::manual("ada").expect("valid actor"),
+            TriggerSpec::schedule(CanonicalSchedule::every(60_000).expect("positive")),
+            TriggerSpec::inbound("route-1").expect("valid route"),
+            TriggerSpec::watch(WatchedSource::GitHub, "watcher-1").expect("valid watcher"),
+        ];
+        for trigger in &triggers {
+            let binding = undeclared
+                .bind(trigger, action.clone())
+                .expect("an enabled automation");
+            assert!(
+                matches!(binding, ActionBinding::RequiresApproval(_)),
+                "{} bypassed the declared scope",
+                trigger.kind().as_str()
+            );
+        }
+        // And the paired case: declaring it makes every trigger bind, so the
+        // test cannot be satisfied by refusing everything.
+        let declared = automation(&["command:submit_run"]);
+        for trigger in &triggers {
+            assert!(matches!(
+                declared
+                    .bind(trigger, action.clone())
+                    .expect("an enabled automation"),
+                ActionBinding::Bound(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_withdrawn_automation_binds_nothing_however_it_is_triggered() {
+        let cause = PauseCause::new("ada", "under investigation").expect("valid cause");
+        let declared = automation(&["command:status"]);
+        let action = AutomationAction::command("status").expect("valid command");
+        for withdrawn in [
+            declared
+                .paused(Revision::FIRST, cause.clone())
+                .expect("pauses"),
+            declared.archived(Revision::FIRST, cause).expect("archives"),
+        ] {
+            for trigger in [
+                TriggerSpec::manual("ada").expect("valid actor"),
+                TriggerSpec::schedule(CanonicalSchedule::every(60_000).expect("positive")),
+            ] {
+                let refusal = withdrawn
+                    .bind(&trigger, action.clone())
+                    .expect_err("a withdrawn automation binds nothing");
+                assert_eq!(refusal.category(), "not_enabled");
+            }
+        }
+        // Paired: the same automation, enabled, binds the same action.
+        assert!(matches!(
+            declared
+                .bind(&TriggerSpec::manual("ada").expect("valid actor"), action,)
+                .expect("an enabled automation"),
+            ActionBinding::Bound(_)
+        ));
+    }
+
+    #[test]
+    fn an_action_this_build_cannot_perform_is_refused_rather_than_dropped() {
+        for name in ["deploy", "agent-turn", "AgentTurn", "shell", ""] {
+            let refusal = ActionKind::from_name(name).expect_err("not a declared action");
+            assert_eq!(refusal.category(), "unknown_vocabulary");
+            assert_eq!(
+                refusal,
+                AutomationError::UnknownVocabulary {
+                    vocabulary: "action_kind",
+                    requested: name.to_owned(),
+                }
+            );
+        }
+        for kind in ActionKind::ALL {
+            assert_eq!(
+                ActionKind::from_name(kind.as_str()).expect("declared action"),
+                kind
+            );
+        }
+        // A command identifier outside the registry grammar is refused where it
+        // is written, not carried forward as text for something else to parse.
+        for spelling in ["Pause Intake", "pause intake", "", "pause..intake"] {
+            assert_eq!(
+                AutomationAction::command(spelling)
+                    .expect_err("not a command identifier")
+                    .category(),
+                "unknown_vocabulary"
+            );
+        }
+        assert!(AutomationAction::command("pause_intake").is_ok());
+    }
+
+    #[test]
+    fn an_action_reference_cannot_be_prose() {
+        for label in ["the nightly build", "prompt with spaces", ""] {
+            assert!(
+                AutomationAction::agent_turn(label).is_err(),
+                "{label} was accepted as a prompt reference"
+            );
+            assert!(
+                AutomationAction::script(label).is_err(),
+                "{label} was accepted as a workflow reference"
+            );
+        }
+        assert!(AutomationAction::agent_turn("prompt-nightly").is_ok());
+        assert!(AutomationAction::script("workflow-backup").is_ok());
+    }
+}
+
+/// § Inbound webhook subscriptions, line 43: declarative filters — `equals`,
+/// `contains`, existence, membership and bounded regex with all/any/not.
+mod condition_vocabulary {
+    use super::*;
+
+    fn eq(field: &str, value: &str) -> FilterExpression {
+        FilterExpression::field(field, FilterPredicate::equals(value).expect("valid value"))
+            .expect("valid field")
+    }
+
+    fn corpus() -> Vec<FilterExpression> {
+        let leaves = vec![
+            eq("repository", "acme/app"),
+            eq("repository", "acme/other"),
+            FilterExpression::field(
+                "event.name",
+                FilterPredicate::contains("completed").expect("valid substring"),
+            )
+            .expect("valid field"),
+            FilterExpression::field("payload.head_sha", FilterPredicate::Exists)
+                .expect("valid field"),
+            FilterExpression::field(
+                "branch",
+                FilterPredicate::member_of(&["main", "release", "hotfix"]).expect("valid set"),
+            )
+            .expect("valid field"),
+            FilterExpression::field(
+                "tag",
+                FilterPredicate::matches("v[0-9]{1,3}").expect("bounded pattern"),
+            )
+            .expect("valid field"),
+            // Separators inside a literal are structure-free because the
+            // rendering counts bytes rather than escaping them.
+            eq("note", "a,b)c(d:e"),
+            eq("note", "héllo — ünicode"),
+        ];
+        let mut all = leaves.clone();
+        all.push(FilterExpression::all(leaves.clone()).expect("bounded"));
+        all.push(FilterExpression::any(leaves.clone()).expect("bounded"));
+        all.push(FilterExpression::negating(leaves[0].clone()).expect("bounded"));
+        all.push(
+            FilterExpression::all(vec![
+                FilterExpression::negating(leaves[1].clone()).expect("bounded"),
+                FilterExpression::any(vec![leaves[2].clone(), leaves[3].clone()]).expect("bounded"),
+            ])
+            .expect("bounded"),
+        );
+        // Order is part of the value, so both orders belong in the corpus.
+        all.push(
+            FilterExpression::all(vec![leaves[0].clone(), leaves[1].clone()]).expect("bounded"),
+        );
+        all.push(
+            FilterExpression::all(vec![leaves[1].clone(), leaves[0].clone()]).expect("bounded"),
+        );
+        all
+    }
+
+    #[test]
+    fn the_predicate_set_is_exactly_the_five_the_requirement_names() {
+        let mut seen: Vec<PredicateKind> = Vec::new();
+        for kind in PredicateKind::ALL {
+            // No wildcard arm: a sixth predicate — an `Eval`, a `Script`, a
+            // `Jq` — would stop this compiling.
+            let predicate = match kind {
+                PredicateKind::Equals => FilterPredicate::equals("x").expect("valid"),
+                PredicateKind::Contains => FilterPredicate::contains("x").expect("valid"),
+                PredicateKind::Exists => FilterPredicate::Exists,
+                PredicateKind::MemberOf => FilterPredicate::member_of(&["x"]).expect("valid"),
+                PredicateKind::Matches => FilterPredicate::matches("x{1,2}").expect("valid"),
+            };
+            assert_eq!(predicate.kind(), kind);
+            seen.push(kind);
+        }
+        assert_eq!(seen.len(), 5);
+        assert_eq!(
+            PredicateKind::ALL.map(PredicateKind::as_str),
+            ["eq", "contains", "exists", "in", "matches"]
+        );
+    }
+
+    #[test]
+    fn an_unbounded_quantifier_is_refused() {
+        // This is the whole point of "bounded regex": a pattern whose matching
+        // cost is not bounded by its own text does not become a stored filter.
+        for pattern in [
+            "a*",
+            "a+",
+            "[a-z]*",
+            "(ab)+",
+            "a{2,}",
+            "build-.*",
+            "(a{1,4})+",
+        ] {
+            let refusal =
+                BoundedPattern::new(pattern).expect_err("an unbounded quantifier was accepted");
+            assert!(
+                matches!(refusal.category(), "not_canonical" | "too_large"),
+                "{pattern} was refused as {}",
+                refusal.category()
+            );
+        }
+        // The paired accepting cases, differing only in the ceiling.
+        for pattern in ["a{2,8}", "[a-z]{1,16}", "(ab){1,4}", "a?", "build-.{0,32}"] {
+            assert!(
+                BoundedPattern::new(pattern).is_ok(),
+                "{pattern} was refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_backreference_or_a_lookaround_is_refused() {
+        for pattern in ["(a){1,2}\\1", "(?=secret)", "(?!secret)", "(?:ab){1,2}"] {
+            assert_eq!(
+                BoundedPattern::new(pattern)
+                    .expect_err("an unbounded construct was accepted")
+                    .category(),
+                "not_canonical"
+            );
+        }
+        assert!(BoundedPattern::new("(a){1,2}b").is_ok());
+    }
+
+    #[test]
+    fn the_product_of_the_repetition_ceilings_is_bounded() {
+        // A pattern can name only bounded repetitions and still ask for
+        // unbounded work by nesting them, so the bound is on the product.
+        let refusal = BoundedPattern::new("a{1,64}b{1,64}").expect_err("4096 exceeds the ceiling");
+        assert_eq!(refusal.category(), "too_large");
+        assert_eq!(
+            refusal,
+            AutomationError::TooLarge {
+                field: "pattern_expansion",
+                max: MAX_PATTERN_EXPANSION as usize,
+                actual: 4_096,
+            }
+        );
+        assert!(
+            BoundedPattern::new("a{1,32}b{1,32}").is_ok(),
+            "1024 is exactly the ceiling"
+        );
+    }
+
+    #[test]
+    fn a_malformed_pattern_is_refused() {
+        for pattern in [
+            "(ab",    // unclosed group
+            "ab)",    // closes before it opens
+            "[a-z",   // unclosed class
+            "a]",     // class closes before it opens
+            "{1,2}",  // a repetition with nothing to repeat
+            "a{}",    // no bound at all
+            "a{2,1}", // ceiling below floor
+            "ab\\",   // trailing escape
+            "",       // empty
+        ] {
+            assert!(
+                BoundedPattern::new(pattern).is_err(),
+                "{pattern} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn membership_is_a_set_so_declaration_order_does_not_change_the_value() {
+        let one = FilterPredicate::member_of(&["main", "release", "hotfix"]).expect("valid");
+        let other = FilterPredicate::member_of(&["hotfix", "main", "release"]).expect("valid");
+        assert_eq!(one, other);
+        let duplicated =
+            FilterPredicate::member_of(&["main", "main", "release", "hotfix"]).expect("valid");
+        assert_eq!(one, duplicated);
+        assert_eq!(
+            FilterExpression::field("branch", one)
+                .expect("valid")
+                .render(),
+            FilterExpression::field("branch", other)
+                .expect("valid")
+                .render()
+        );
+
+        // An empty set admits nothing and is refused rather than read as
+        // "no constraint".
+        assert_eq!(
+            FilterPredicate::member_of(&[])
+                .expect_err("an empty set")
+                .category(),
+            "not_canonical"
+        );
+        let too_many: Vec<String> = (0..=MAX_MEMBERSHIP_VALUES).map(|n| n.to_string()).collect();
+        let borrowed: Vec<&str> = too_many.iter().map(String::as_str).collect();
+        assert_eq!(
+            FilterPredicate::member_of(&borrowed)
+                .expect_err("beyond the ceiling")
+                .category(),
+            "too_large"
+        );
+    }
+
+    #[test]
+    fn depth_and_node_count_are_bounded() {
+        let leaf = eq("a", "b");
+        // Nesting past the depth ceiling is refused at the constructor that
+        // crosses it, not tolerated and truncated later.
+        let mut nested = leaf.clone();
+        for _ in 1..MAX_FILTER_DEPTH {
+            nested = FilterExpression::negating(nested).expect("within the ceiling");
+        }
+        assert_eq!(nested.depth(), MAX_FILTER_DEPTH);
+        let refusal = FilterExpression::negating(nested).expect_err("one level past the ceiling");
+        assert_eq!(refusal.category(), "too_large");
+        assert_eq!(
+            refusal,
+            AutomationError::TooLarge {
+                field: "filter_depth",
+                max: MAX_FILTER_DEPTH,
+                actual: MAX_FILTER_DEPTH + 1,
+            }
+        );
+
+        let wide: Vec<FilterExpression> = (0..MAX_FILTER_NODES).map(|_| leaf.clone()).collect();
+        assert_eq!(
+            FilterExpression::all(wide)
+                .expect_err("the combinator is a node too")
+                .category(),
+            "too_large"
+        );
+        let fits: Vec<FilterExpression> = (0..MAX_FILTER_NODES - 1).map(|_| leaf.clone()).collect();
+        let accepted = FilterExpression::all(fits).expect("exactly the ceiling");
+        assert_eq!(accepted.nodes(), MAX_FILTER_NODES);
+
+        // A combinator with no operands admits everything or nothing depending
+        // on which one it is, so it is refused rather than guessed at.
+        for empty in [
+            FilterExpression::all(Vec::new()),
+            FilterExpression::any(Vec::new()),
+        ] {
+            assert_eq!(empty.expect_err("no operands").category(), "not_canonical");
+        }
+    }
+
+    #[test]
+    fn every_condition_round_trips_through_its_canonical_rendering() {
+        let corpus = corpus();
+        assert!(corpus.len() >= 14, "the corpus was shrunk");
+        for expression in &corpus {
+            let rendered = expression.render();
+            let read = FilterExpression::from_rendering(&rendered)
+                .unwrap_or_else(|error| panic!("{rendered} did not read back: {error}"));
+            assert_eq!(&read, expression);
+            assert_eq!(read.render(), rendered, "re-rendering was not identical");
+        }
+    }
+
+    #[test]
+    fn equal_conditions_render_identically_and_unequal_ones_do_not() {
+        let corpus = corpus();
+        for left in &corpus {
+            for right in &corpus {
+                assert_eq!(
+                    left == right,
+                    left.render() == right.render(),
+                    "{} and {} disagree",
+                    left.render(),
+                    right.render()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_rendering_is_the_one_the_reader_accepts() {
+        // Every constructible expression renders inside the bound the reader
+        // enforces, so `render` cannot produce a value `from_rendering` refuses.
+        for expression in corpus() {
+            assert!(expression.render().len() <= MAX_FILTER_RENDERING_BYTES);
+        }
+        let long = "v".repeat(200);
+        let wide: Vec<FilterExpression> = (0..MAX_FILTER_NODES - 1)
+            .map(|_| {
+                FilterExpression::field(
+                    "field",
+                    FilterPredicate::member_of(&[long.as_str()]).expect("valid"),
+                )
+                .expect("valid")
+            })
+            .collect();
+        match FilterExpression::all(wide) {
+            Ok(expression) => {
+                let rendered = expression.render();
+                assert!(rendered.len() <= MAX_FILTER_RENDERING_BYTES);
+                assert_eq!(
+                    FilterExpression::from_rendering(&rendered).expect("reads back"),
+                    expression
+                );
+            }
+            Err(error) => assert_eq!(error.category(), "too_large"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_rendering_is_refused_rather_than_normalized() {
+        for rendered in [
+            "eq(repository,7:acme/app)", // the count is not the text's
+            "eq(repository,3:acme/app)", // trailing input after the literal
+            "eq(repository,acme/app)",   // no count at all
+            "eq(repository,:acme)",      // empty count
+            "eq(repository,-1:acme)",    // not a count
+            "eq(repository)",            // no literal
+            "exists(repository,3:abc)",  // a literal where none belongs
+            "jq(repository,3:abc)",      // not a declared predicate
+            "eval(1:1)",                 // still not one
+            "all()",                     // no operands
+            "any()",                     // no operands
+            "not()",                     // no operand
+            "all(eq(a,1:b)",             // unclosed
+            "eq(a,1:b))",                // trailing input
+            "eq(a b,1:c)",               // a field outside the grammar
+            "eq(,1:c)",                  // no field
+            "repository",                // not a node at all
+            "",                          // empty
+        ] {
+            let refusal = FilterExpression::from_rendering(rendered)
+                .expect_err("a malformed rendering was accepted");
+            assert!(
+                matches!(
+                    refusal.category(),
+                    "not_canonical" | "unknown_vocabulary" | "field_invalid" | "too_large"
+                ),
+                "{rendered} was refused as {}",
+                refusal.category()
+            );
+        }
+        // The paired accepting cases, differing only in the rejected thing.
+        for rendered in [
+            "eq(repository,8:acme/app)",
+            "exists(repository)",
+            "all(eq(a,1:b))",
+            "any(eq(a,1:b),not(exists(c)))",
+            "in(branch,4:main,7:release)",
+            "matches(tag,11:v[0-9]{1,3})",
+        ] {
+            assert!(
+                FilterExpression::from_rendering(rendered).is_ok(),
+                "{rendered} was refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_route_filters_by_one_condition_however_it_was_declared() {
+        // The equality shorthand and the full condition are the same
+        // vocabulary, so a route declared either way filters identically.
+        let shorthand = EventFilters::requiring_all(vec![
+            EventFilter::requiring("repository", "acme/app").expect("valid"),
+            EventFilter::requiring("branch", "main").expect("valid"),
+        ]);
+        let spelled_out = EventFilters::matching(
+            FilterExpression::all(vec![eq("repository", "acme/app"), eq("branch", "main")])
+                .expect("bounded"),
+        );
+        let one = shorthand
+            .canonical_expression()
+            .expect("bounded")
+            .expect("a declared condition");
+        let other = spelled_out
+            .canonical_expression()
+            .expect("bounded")
+            .expect("a declared condition");
+        assert_eq!(one, other);
+        assert_eq!(one.render(), other.render());
+        assert_eq!(
+            one.render(),
+            "all(eq(repository,8:acme/app),eq(branch,4:main))"
+        );
+
+        // Accepting every allowed event type stays a named decision rather than
+        // becoming a condition that happens to admit everything.
+        assert_eq!(
+            EventFilters::accept_all_allowed_types()
+                .canonical_expression()
+                .expect("bounded"),
+            None
+        );
+        assert_eq!(EventFilters::accept_all_allowed_types().expression(), None);
+        assert!(spelled_out.expression().is_some());
+    }
+
+    #[test]
+    fn a_filter_list_too_large_to_lower_is_refused_rather_than_truncated() {
+        let filters: Vec<EventFilter> = (0..MAX_FILTER_NODES + 4)
+            .map(|n| EventFilter::requiring("branch", &n.to_string()).expect("valid"))
+            .collect();
+        let declared = EventFilters::requiring_all(filters);
+        let refusal = declared
+            .canonical_expression()
+            .expect_err("beyond the node ceiling");
+        assert_eq!(refusal.category(), "too_large");
+        // The declaration is still readable in full: nothing was dropped to
+        // make it fit.
+        assert_eq!(declared.as_slice().len(), MAX_FILTER_NODES + 4);
+    }
+
+    #[test]
+    fn a_filter_field_is_a_path_rather_than_prose() {
+        for label in [
+            "the repository name",
+            "repo/name",
+            "repo,name",
+            "repo(name)",
+            "repo..name",
+            ".repo",
+            "repo.",
+            "",
+        ] {
+            assert!(
+                FilterField::new(label).is_err(),
+                "{label} was accepted as a field path"
+            );
+        }
+        for path in ["repository", "payload.head_sha", "a.b.c.d", "x-request-id"] {
+            assert_eq!(FilterField::new(path).expect("valid path").as_str(), path);
+        }
+        let deep = ["a"; MAX_FILTER_FIELD_SEGMENTS + 1].join(".");
+        assert_eq!(
+            FilterField::new(&deep)
+                .expect_err("beyond the segment ceiling")
+                .category(),
+            "too_large"
         );
     }
 }

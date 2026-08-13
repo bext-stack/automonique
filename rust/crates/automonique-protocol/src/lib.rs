@@ -27,6 +27,7 @@ pub mod protocols;
 pub mod provider;
 pub mod provider_catalog;
 pub mod release;
+pub mod release_trust_root;
 pub mod sandbox;
 pub mod schema;
 pub mod tools;

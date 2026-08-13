@@ -206,11 +206,76 @@
 //! use automonique_protocol::automation::{AutomationJob, JobKind};
 //! let job = AutomationJob::declare(JobKind::Script);
 //! ```
+//!
+//! # A condition is a vocabulary, not an expression language
+//!
+//! A pattern predicate takes a [`BoundedPattern`], which refuses an unbounded
+//! quantifier before the value exists:
+//!
+//! ```
+//! use automonique_protocol::automation::{BoundedPattern, FilterExpression, FilterPredicate};
+//! let pattern = BoundedPattern::new("build-[a-z]{1,8}").unwrap();
+//! let condition =
+//!     FilterExpression::field("event.name", FilterPredicate::Matches { pattern }).unwrap();
+//! assert_eq!(condition.render(), "matches(event.name,16:build-[a-z]{1,8})");
+//! assert!(BoundedPattern::new("build-[a-z]+").is_err());
+//! ```
+//!
+//! and there is no way to hand it text instead, so a filter cannot be widened
+//! into something that has to be evaluated:
+//!
+//! ```compile_fail
+//! use automonique_protocol::automation::{FilterExpression, FilterPredicate};
+//! let condition = FilterExpression::field(
+//!     "event.name",
+//!     FilterPredicate::Matches { pattern: String::from("build-[a-z]+") },
+//! )
+//! .unwrap();
+//! ```
+//!
+//! # A trigger fires an action only inside declared scope
+//!
+//! ```
+//! use automonique_protocol::automation::{
+//!     ActionBinding, AutomationAction, AutomationRevision, CanonicalSchedule, CompletedEffect,
+//!     TriggerSpec,
+//! };
+//! use automonique_protocol::primitives::Revision;
+//! let automation = AutomationRevision::new(
+//!     "auto-1",
+//!     Revision::FIRST,
+//!     CanonicalSchedule::every(60_000).unwrap(),
+//!     &["command:pause_intake"],
+//! )
+//! .unwrap();
+//! let trigger = TriggerSpec::manual("ada").unwrap();
+//! let action = AutomationAction::command("pause_intake").unwrap();
+//! let ActionBinding::Bound(bound) = automation.bind(&trigger, action).unwrap() else {
+//!     panic!("declared effect");
+//! };
+//! let done = CompletedEffect::record(bound.into_approved(), "outbox:receipt-1").unwrap();
+//! assert_eq!(done.effect(), "command:pause_intake");
+//! ```
+//!
+//! [`BoundAction`]'s fields are private and it has no constructor, so the
+//! binding cannot be assembled beside the automation that refused it:
+//!
+//! ```compile_fail
+//! use automonique_protocol::automation::{
+//!     ActionBinding, AutomationAction, BoundAction, TriggerSpec,
+//! };
+//! let binding = ActionBinding::Bound(BoundAction {
+//!     automation_id: String::from("auto-1"),
+//!     trigger: TriggerSpec::manual("ada").unwrap(),
+//!     action: AutomationAction::command("deploy").unwrap(),
+//! });
+//! ```
 
 use core::fmt;
 use core::marker::PhantomData;
 use std::error::Error;
 
+use crate::command_registry::CommandId;
 use crate::primitives::{EpochMillis, Revision, ValueError};
 
 /// Maximum UTF-8 byte length of an automation field.
@@ -253,6 +318,37 @@ pub enum AutomationError {
         /// The evidence kind that was required.
         required: &'static str,
     },
+    /// A name was offered that a closed vocabulary does not contain.
+    ///
+    /// Refused rather than defaulted: a stored trigger, action or predicate
+    /// this build does not know is not silently read as a no-op.
+    UnknownVocabulary {
+        /// Which vocabulary was consulted.
+        vocabulary: &'static str,
+        /// The name that is not in it.
+        requested: String,
+    },
+    /// An operation required an automation that was enabled.
+    NotEnabled {
+        /// The state the automation was actually in.
+        state: &'static str,
+    },
+    /// A lifecycle transition the state machine does not permit.
+    InvalidTransition {
+        /// The state the automation was in.
+        from: &'static str,
+        /// The state the caller asked for.
+        to: &'static str,
+    },
+    /// A bounded collection, nesting depth or repetition ceiling was exceeded.
+    TooLarge {
+        /// The field that was too large.
+        field: &'static str,
+        /// The declared ceiling.
+        max: usize,
+        /// What was supplied.
+        actual: usize,
+    },
     /// A bounded field was rejected.
     Field {
         /// The rejected field.
@@ -273,6 +369,10 @@ impl AutomationError {
             Self::OutsideApprovedScope { .. } => "outside_approved_scope",
             Self::ApprovalMismatch { .. } => "approval_mismatch",
             Self::CompletionEvidenceMissing { .. } => "completion_evidence_missing",
+            Self::UnknownVocabulary { .. } => "unknown_vocabulary",
+            Self::NotEnabled { .. } => "not_enabled",
+            Self::InvalidTransition { .. } => "invalid_transition",
+            Self::TooLarge { .. } => "too_large",
             Self::Field { .. } => "field_invalid",
         }
     }
@@ -303,6 +403,24 @@ impl fmt::Display for AutomationError {
                 formatter,
                 "completion requires {required} evidence, which was not supplied"
             ),
+            Self::UnknownVocabulary {
+                vocabulary,
+                requested,
+            } => write!(
+                formatter,
+                "{requested} is not a declared {vocabulary}; this build knows no such value"
+            ),
+            Self::NotEnabled { state } => write!(
+                formatter,
+                "the automation is {state}, so it admits no occurrence and binds no action"
+            ),
+            Self::InvalidTransition { from, to } => {
+                write!(formatter, "an automation cannot go from {from} to {to}")
+            }
+            Self::TooLarge { field, max, actual } => write!(
+                formatter,
+                "field {field} admits at most {max}; {actual} were supplied"
+            ),
             Self::Field { field, error } => write!(formatter, "field {field}: {error}"),
         }
     }
@@ -312,6 +430,17 @@ impl Error for AutomationError {}
 
 const fn not_canonical(field: &'static str, reason: &'static str) -> AutomationError {
     AutomationError::NotCanonical { field, reason }
+}
+
+const fn too_large(field: &'static str, max: usize, actual: usize) -> AutomationError {
+    AutomationError::TooLarge { field, max, actual }
+}
+
+fn unknown_vocabulary(vocabulary: &'static str, requested: &str) -> AutomationError {
+    AutomationError::UnknownVocabulary {
+        vocabulary,
+        requested: requested.to_owned(),
+    }
 }
 
 /// The identity of something durable: a run, an event source, a monitor, a
@@ -814,6 +943,8 @@ pub struct AutomationRevision {
     revision: Revision,
     schedule: CanonicalSchedule,
     approved_effects: Vec<String>,
+    enablement: AutomationEnablement,
+    overlap: OverlapPolicy,
 }
 
 impl AutomationRevision {
@@ -837,6 +968,8 @@ impl AutomationRevision {
             revision,
             schedule,
             approved_effects: approved_effects.iter().map(|e| (*e).to_owned()).collect(),
+            enablement: AutomationEnablement::newly_declared(),
+            overlap: OverlapPolicy::Skip,
         })
     }
 
@@ -967,6 +1100,167 @@ impl AutomationRevision {
         match self.decide_unattended(effect) {
             UnattendedDecision::PreApproved(_) => Ok(()),
             UnattendedDecision::RequiresApproval(request) => Err(request.refusal()),
+        }
+    }
+
+    /// Whether the automation is in service, and what took it out.
+    #[must_use]
+    pub const fn enablement(&self) -> &AutomationEnablement {
+        &self.enablement
+    }
+
+    /// What happens when an occurrence fires while one is still running.
+    #[must_use]
+    pub const fn overlap(&self) -> OverlapPolicy {
+        self.overlap
+    }
+
+    /// Produce the next revision with a different overlap policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::RevisionConflict`] for a stale expectation.
+    pub fn with_overlap(
+        &self,
+        expected: Revision,
+        overlap: OverlapPolicy,
+    ) -> Result<Self, AutomationError> {
+        let mut next = self.successor(expected)?;
+        next.overlap = overlap;
+        Ok(next)
+    }
+
+    /// Produce the next revision, paused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::RevisionConflict`] for a stale expectation
+    /// and [`AutomationError::InvalidTransition`] from any state but
+    /// [`EnablementState::Enabled`]. Pausing an already-paused automation is
+    /// refused rather than accepted, because accepting it would overwrite the
+    /// cause of the pause an operator still has to resume from.
+    pub fn paused(&self, expected: Revision, cause: PauseCause) -> Result<Self, AutomationError> {
+        self.transition(expected, EnablementState::Paused, || {
+            AutomationEnablement::Paused { cause }
+        })
+    }
+
+    /// Produce the next revision, back in service and naming who reopened it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::RevisionConflict`] for a stale expectation,
+    /// [`AutomationError::InvalidTransition`] from any state but
+    /// [`EnablementState::Paused`], and [`AutomationError::Field`] for an
+    /// invalid actor.
+    pub fn resumed(&self, expected: Revision, actor: &str) -> Result<Self, AutomationError> {
+        let actor = AutomationActor::new(actor)?;
+        self.transition(expected, EnablementState::Enabled, || {
+            AutomationEnablement::Enabled {
+                resumed_by: Some(actor),
+            }
+        })
+    }
+
+    /// Produce the next revision, archived.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::RevisionConflict`] for a stale expectation
+    /// and [`AutomationError::InvalidTransition`] from
+    /// [`EnablementState::Archived`], which is terminal.
+    pub fn archived(&self, expected: Revision, cause: PauseCause) -> Result<Self, AutomationError> {
+        self.transition(expected, EnablementState::Archived, || {
+            AutomationEnablement::Archived { cause }
+        })
+    }
+
+    /// The closed lifecycle. Every other ordered pair is refused.
+    const fn permits(from: EnablementState, to: EnablementState) -> bool {
+        matches!(
+            (from, to),
+            (EnablementState::Enabled, EnablementState::Paused)
+                | (EnablementState::Paused, EnablementState::Enabled)
+                | (
+                    EnablementState::Enabled | EnablementState::Paused,
+                    EnablementState::Archived
+                )
+        )
+    }
+
+    fn transition(
+        &self,
+        expected: Revision,
+        to: EnablementState,
+        build: impl FnOnce() -> AutomationEnablement,
+    ) -> Result<Self, AutomationError> {
+        let from = self.enablement.state();
+        if !Self::permits(from, to) {
+            return Err(AutomationError::InvalidTransition {
+                from: from.as_str(),
+                to: to.as_str(),
+            });
+        }
+        let mut next = self.successor(expected)?;
+        next.enablement = build();
+        Ok(next)
+    }
+
+    /// Derive the occurrence key for a firing of this automation.
+    ///
+    /// The gate a pause exists for: a withdrawn automation produces no
+    /// occurrence key, so a scheduler that kept a stale tick has nothing to
+    /// enqueue it under. [`OccurrenceKey::derive`] remains available for
+    /// callers reconstructing a key for an occurrence that already happened.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::NotEnabled`] unless the automation is
+    /// enabled.
+    pub fn occurrence_at(&self, fire_at: EpochMillis) -> Result<OccurrenceKey, AutomationError> {
+        self.require_enabled()?;
+        OccurrenceKey::derive(&self.id, fire_at)
+    }
+
+    /// Bind a trigger to the action it fires.
+    ///
+    /// Total over the two outcomes that exist once the automation is in
+    /// service: the action's required effect is either inside the declared
+    /// scope, yielding a [`BoundAction`], or it is an approval request. The
+    /// trigger's kind does not change that decision — a manual run-now is not a
+    /// way around the scope an automation declared, because if it were, "ask a
+    /// person to press the button" would be a privilege escalation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::NotEnabled`] for a paused or archived
+    /// automation, which fires nothing whoever asks.
+    pub fn bind(
+        &self,
+        trigger: &TriggerSpec,
+        action: AutomationAction,
+    ) -> Result<ActionBinding, AutomationError> {
+        self.require_enabled()?;
+        Ok(match self.decide_unattended(&action.required_effect()) {
+            UnattendedDecision::PreApproved(approved) => ActionBinding::Bound(BoundAction {
+                automation_id: self.id.clone(),
+                trigger: trigger.clone(),
+                action,
+                approved,
+            }),
+            UnattendedDecision::RequiresApproval(request) => {
+                ActionBinding::RequiresApproval(request)
+            }
+        })
+    }
+
+    fn require_enabled(&self) -> Result<(), AutomationError> {
+        if self.enablement.admits_occurrence() {
+            Ok(())
+        } else {
+            Err(AutomationError::NotEnabled {
+                state: self.enablement.state().as_str(),
+            })
         }
     }
 }
@@ -2074,11 +2368,15 @@ impl VerificationMethod {
     }
 }
 
-/// One declarative filter on an inbound event.
+/// One declarative equality filter on an inbound event.
+///
+/// The shorthand for the common case. Its components are the same validated
+/// types [`FilterExpression`] uses, so it is the same vocabulary written
+/// shorter rather than a second one — see [`EventFilters::canonical_expression`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventFilter {
-    field: String,
-    equals: String,
+    field: FilterField,
+    equals: FilterValue,
 }
 
 impl EventFilter {
@@ -2086,26 +2384,35 @@ impl EventFilter {
     ///
     /// # Errors
     ///
-    /// Returns [`AutomationError::Field`] for an invalid component.
+    /// Returns [`AutomationError::Field`] for an invalid component and
+    /// [`AutomationError::NotCanonical`] for a field outside the dotted-path
+    /// grammar.
     pub fn requiring(field: &str, equals: &str) -> Result<Self, AutomationError> {
-        bounded(field, "filter_field")?;
-        bounded(equals, "filter_value")?;
         Ok(Self {
-            field: field.to_owned(),
-            equals: equals.to_owned(),
+            field: FilterField::new(field)?,
+            equals: FilterValue::new(equals)?,
         })
     }
 
     /// The filtered field.
     #[must_use]
     pub fn field(&self) -> &str {
-        &self.field
+        self.field.as_str()
     }
 
     /// The required value.
     #[must_use]
     pub fn equals(&self) -> &str {
-        &self.equals
+        self.equals.as_str()
+    }
+
+    fn to_expression(&self) -> FilterExpression {
+        FilterExpression::Field {
+            field: self.field.clone(),
+            predicate: FilterPredicate::Equals {
+                value: self.equals.clone(),
+            },
+        }
     }
 }
 
@@ -2113,26 +2420,83 @@ impl EventFilter {
 ///
 /// Accepting every allowed event type is a named decision rather than an
 /// omitted field, so a route never silently lacks filtering.
+///
+/// Two ways to write filtering, one meaning: the equality shorthand and a full
+/// [`FilterExpression`] both reduce to the same canonical expression through
+/// [`Self::canonical_expression`], so a route declared either way filters
+/// identically and renders identically. There is no third way, and neither way
+/// admits source text to evaluate.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EventFilters(Vec<EventFilter>);
+pub struct EventFilters {
+    filters: Vec<EventFilter>,
+    expression: Option<FilterExpression>,
+}
 
 impl EventFilters {
     /// Accept every event of an allowed type.
     #[must_use]
     pub const fn accept_all_allowed_types() -> Self {
-        Self(Vec::new())
+        Self {
+            filters: Vec::new(),
+            expression: None,
+        }
     }
 
-    /// Require every listed filter to match.
+    /// Require every listed equality filter to match.
     #[must_use]
     pub const fn requiring_all(filters: Vec<EventFilter>) -> Self {
-        Self(filters)
+        Self {
+            filters,
+            expression: None,
+        }
     }
 
-    /// The declared filters.
+    /// Require a full declarative condition to hold.
+    #[must_use]
+    pub const fn matching(expression: FilterExpression) -> Self {
+        Self {
+            filters: Vec::new(),
+            expression: Some(expression),
+        }
+    }
+
+    /// The declared equality filters, empty when a condition was declared
+    /// instead.
     #[must_use]
     pub fn as_slice(&self) -> &[EventFilter] {
-        &self.0
+        &self.filters
+    }
+
+    /// The declared condition, when one was declared rather than a shorthand.
+    #[must_use]
+    pub const fn expression(&self) -> Option<&FilterExpression> {
+        self.expression.as_ref()
+    }
+
+    /// The one condition this route filters by, whichever way it was declared.
+    ///
+    /// `Ok(None)` means "accept every allowed event type" — a named decision,
+    /// not a missing filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::TooLarge`] when lowering the shorthand would
+    /// exceed [`MAX_FILTER_NODES`] or [`MAX_FILTER_DEPTH`]. An over-long filter
+    /// list is refused here rather than silently truncated to the part that
+    /// fits, which would filter less than the operator asked for.
+    pub fn canonical_expression(&self) -> Result<Option<FilterExpression>, AutomationError> {
+        if let Some(expression) = &self.expression {
+            return Ok(Some(expression.clone()));
+        }
+        if self.filters.is_empty() {
+            return Ok(None);
+        }
+        let operands = self
+            .filters
+            .iter()
+            .map(EventFilter::to_expression)
+            .collect();
+        FilterExpression::all(operands).map(Some)
     }
 }
 
@@ -2413,12 +2777,1630 @@ impl TriggerRoute {
     }
 }
 
+/// Maximum number of nodes in one filter expression.
+pub const MAX_FILTER_NODES: usize = 32;
+
+/// Maximum nesting depth of one filter expression.
+pub const MAX_FILTER_DEPTH: usize = 4;
+
+/// Maximum number of values a membership predicate may list.
+pub const MAX_MEMBERSHIP_VALUES: usize = 16;
+
+/// Maximum number of dotted segments in a filter field path.
+pub const MAX_FILTER_FIELD_SEGMENTS: usize = 8;
+
+/// Maximum UTF-8 byte length of a bounded pattern.
+pub const MAX_PATTERN_BYTES: usize = 128;
+
+/// Maximum UTF-8 byte length of a filter expression's canonical rendering.
+///
+/// Checked at construction as well as when reading, so every constructible
+/// expression renders inside the bound the reader accepts: [`render`] cannot
+/// produce a value [`from_rendering`] would refuse.
+///
+/// [`render`]: FilterExpression::render
+/// [`from_rendering`]: FilterExpression::from_rendering
+pub const MAX_FILTER_RENDERING_BYTES: usize = 8_192;
+
+/// Maximum total repetition a bounded pattern may request.
+///
+/// The bound is on the *product* of every repetition ceiling in the pattern,
+/// which over-approximates the work a matcher can be made to do. A pattern
+/// whose product exceeds this is refused rather than truncated.
+pub const MAX_PATTERN_EXPANSION: u32 = 1_024;
+
+/// A person or runbook named on a lifecycle transition.
+///
+/// Not authenticated, and not a capability. It says who asked, which is worth
+/// recording for exactly that reason and no stronger one — the same discipline
+/// [`crate::admin::IntakePause`] applies to the daemon's intake switch.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AutomationActor(String);
+
+impl AutomationActor {
+    /// Validate and construct an actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::Field`] for an empty, over-long or control
+    /// value.
+    pub fn new(actor: &str) -> Result<Self, AutomationError> {
+        bounded(actor, "actor")?;
+        Ok(Self(actor.to_owned()))
+    }
+
+    /// The actor.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Who took an automation out of service, and why.
+///
+/// A reason is required. A pause with no stated cause is the one an operator
+/// cannot safely resume, so the type does not offer that shape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseCause {
+    actor: AutomationActor,
+    reason: String,
+}
+
+impl PauseCause {
+    /// Record who paused an automation and why.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::Field`] for an invalid actor or reason.
+    pub fn new(actor: &str, reason: &str) -> Result<Self, AutomationError> {
+        bounded(reason, "pause_reason")?;
+        Ok(Self {
+            actor: AutomationActor::new(actor)?,
+            reason: reason.to_owned(),
+        })
+    }
+
+    /// Who paused it.
+    #[must_use]
+    pub const fn actor(&self) -> &AutomationActor {
+        &self.actor
+    }
+
+    /// Why.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+/// Which of the three lifecycle states an automation is in.
+///
+/// Reported separately from [`AutomationEnablement`] so a caller can compare or
+/// render the state without inspecting its payload.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum EnablementState {
+    /// Firing.
+    Enabled,
+    /// Withdrawn from firing, resumable.
+    Paused,
+    /// Withdrawn permanently. Terminal.
+    Archived,
+}
+
+impl EnablementState {
+    /// Every state. The set is closed: there is no fourth.
+    pub const ALL: [Self; 3] = [Self::Enabled, Self::Paused, Self::Archived];
+
+    /// Stable spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Paused => "paused",
+            Self::Archived => "archived",
+        }
+    }
+
+    /// Whether an automation in this state fires.
+    #[must_use]
+    pub const fn admits_occurrence(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+/// Whether an automation is in service, and what took it out.
+///
+/// There is no state meaning "paused but still firing", and no way to reach
+/// [`Self::Paused`] or [`Self::Archived`] without a [`PauseCause`], so the
+/// record always says who withdrew it and why.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AutomationEnablement {
+    /// Firing. `resumed_by` names whoever last put it back, and is absent on an
+    /// automation that was never paused.
+    Enabled {
+        /// Who reopened it, when it had been paused.
+        resumed_by: Option<AutomationActor>,
+    },
+    /// Withdrawn from firing, resumable.
+    Paused {
+        /// Who withdrew it, and why.
+        cause: PauseCause,
+    },
+    /// Withdrawn permanently. Terminal: nothing transitions out of it.
+    Archived {
+        /// Who archived it, and why.
+        cause: PauseCause,
+    },
+}
+
+impl AutomationEnablement {
+    /// The state a freshly declared automation is in.
+    #[must_use]
+    pub const fn newly_declared() -> Self {
+        Self::Enabled { resumed_by: None }
+    }
+
+    /// Which state this is.
+    #[must_use]
+    pub const fn state(&self) -> EnablementState {
+        match self {
+            Self::Enabled { .. } => EnablementState::Enabled,
+            Self::Paused { .. } => EnablementState::Paused,
+            Self::Archived { .. } => EnablementState::Archived,
+        }
+    }
+
+    /// Whether an automation in this state fires.
+    #[must_use]
+    pub const fn admits_occurrence(&self) -> bool {
+        self.state().admits_occurrence()
+    }
+
+    /// Why it was withdrawn, when it was.
+    #[must_use]
+    pub const fn cause(&self) -> Option<&PauseCause> {
+        match self {
+            Self::Enabled { .. } => None,
+            Self::Paused { cause } | Self::Archived { cause } => Some(cause),
+        }
+    }
+}
+
+/// Which overlap policy an automation declares.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum OverlapKind {
+    /// Drop the new occurrence.
+    Skip,
+    /// Hold the new occurrence behind the running one.
+    Queue,
+    /// Cancel the running occurrence and start the new one.
+    CancelPrevious,
+    /// Run both, up to a declared ceiling.
+    Concurrent,
+}
+
+impl OverlapKind {
+    /// Every kind. The set is closed.
+    pub const ALL: [Self; 4] = [
+        Self::Skip,
+        Self::Queue,
+        Self::CancelPrevious,
+        Self::Concurrent,
+    ];
+
+    /// Stable spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::Queue => "queue",
+            Self::CancelPrevious => "cancel_previous",
+            Self::Concurrent => "concurrent",
+        }
+    }
+}
+
+/// What happens when an occurrence fires while the previous one still runs.
+///
+/// There is deliberately no variant meaning "unbounded": both variants that
+/// admit more than one live occurrence carry a declared ceiling, and a ceiling
+/// of zero is refused rather than read as "no limit".
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum OverlapPolicy {
+    /// The new occurrence is dropped while one is running.
+    Skip,
+    /// The new occurrence waits, up to a bounded queue.
+    Queue {
+        /// How many occurrences may wait.
+        max_queued: u32,
+    },
+    /// The running occurrence is cancelled and the new one starts.
+    CancelPrevious,
+    /// Occurrences run together, up to a bounded count.
+    Concurrent {
+        /// How many may run together.
+        max_concurrent: u32,
+    },
+}
+
+impl OverlapPolicy {
+    /// A bounded queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::NotCanonical`] for a zero ceiling, which
+    /// would be a queue that holds nothing rather than a queue without limit.
+    pub const fn queue(max_queued: u32) -> Result<Self, AutomationError> {
+        if max_queued == 0 {
+            return Err(not_canonical(
+                "max_queued",
+                "a queue ceiling admits at least one waiting occurrence",
+            ));
+        }
+        Ok(Self::Queue { max_queued })
+    }
+
+    /// A bounded concurrency.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::NotCanonical`] for a zero ceiling.
+    pub const fn concurrent(max_concurrent: u32) -> Result<Self, AutomationError> {
+        if max_concurrent == 0 {
+            return Err(not_canonical(
+                "max_concurrent",
+                "a concurrency ceiling admits at least one running occurrence",
+            ));
+        }
+        Ok(Self::Concurrent { max_concurrent })
+    }
+
+    /// Which kind this is.
+    #[must_use]
+    pub const fn kind(self) -> OverlapKind {
+        match self {
+            Self::Skip => OverlapKind::Skip,
+            Self::Queue { .. } => OverlapKind::Queue,
+            Self::CancelPrevious => OverlapKind::CancelPrevious,
+            Self::Concurrent { .. } => OverlapKind::Concurrent,
+        }
+    }
+
+    /// How many occurrences may be live at once under this policy.
+    ///
+    /// Always a number. No policy answers "as many as arrive".
+    #[must_use]
+    pub const fn live_ceiling(self) -> u32 {
+        match self {
+            Self::Skip | Self::CancelPrevious => 1,
+            Self::Queue { max_queued } => max_queued.saturating_add(1),
+            Self::Concurrent { max_concurrent } => max_concurrent,
+        }
+    }
+}
+
+/// The external sources a watcher may be registered against.
+///
+/// Exactly the sources the product requirement names. A source outside the list
+/// is refused by [`Self::from_str`] rather than admitted as an opaque string,
+/// so an unrecognized watcher cannot be stored and later read as something this
+/// build silently accepts.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum WatchedSource {
+    /// Repository events.
+    GitHub,
+    /// Continuous-integration events.
+    ContinuousIntegration,
+    /// Monitoring and alerting events.
+    Monitoring,
+    /// Filesystem events.
+    Filesystem,
+    /// Feed events.
+    Rss,
+    /// Calendar events.
+    Calendar,
+    /// Mailbox events.
+    Email,
+    /// Events raised by the product itself.
+    Platform,
+}
+
+impl WatchedSource {
+    /// Every source. The set is closed.
+    pub const ALL: [Self; 8] = [
+        Self::GitHub,
+        Self::ContinuousIntegration,
+        Self::Monitoring,
+        Self::Filesystem,
+        Self::Rss,
+        Self::Calendar,
+        Self::Email,
+        Self::Platform,
+    ];
+
+    /// Stable spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GitHub => "github",
+            Self::ContinuousIntegration => "ci",
+            Self::Monitoring => "monitoring",
+            Self::Filesystem => "filesystem",
+            Self::Rss => "rss",
+            Self::Calendar => "calendar",
+            Self::Email => "email",
+            Self::Platform => "platform",
+        }
+    }
+
+    /// Resolve a stored spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::UnknownVocabulary`] for anything else. There
+    /// is no fallback source and no case folding: the spelling is exact.
+    pub fn from_name(name: &str) -> Result<Self, AutomationError> {
+        Self::ALL
+            .into_iter()
+            .find(|source| source.as_str() == name)
+            .ok_or_else(|| unknown_vocabulary("watched_source", name))
+    }
+}
+
+/// Which of the four ways an automation can be started.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum TriggerKind {
+    /// A canonical schedule.
+    Schedule,
+    /// An inbound trigger route.
+    Inbound,
+    /// A registered watcher.
+    Watch,
+    /// A person asking for it now.
+    Manual,
+}
+
+impl TriggerKind {
+    /// Every kind. The set is closed.
+    pub const ALL: [Self; 4] = [Self::Schedule, Self::Inbound, Self::Watch, Self::Manual];
+
+    /// Stable spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Schedule => "schedule",
+            Self::Inbound => "inbound",
+            Self::Watch => "watch",
+            Self::Manual => "manual",
+        }
+    }
+
+    /// Whether a trigger of this kind starts work with nobody present.
+    #[must_use]
+    pub const fn is_unattended(self) -> bool {
+        !matches!(self, Self::Manual)
+    }
+
+    /// Resolve a stored spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::UnknownVocabulary`] for anything else.
+    pub fn from_name(name: &str) -> Result<Self, AutomationError> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == name)
+            .ok_or_else(|| unknown_vocabulary("trigger_kind", name))
+    }
+}
+
+/// What starts an automation.
+///
+/// Closed and total: a trigger is a canonical schedule, a declared inbound
+/// route, a registered watcher, or a person. Every payload is a validated type,
+/// so no variant carries prose and none carries an opaque escape hatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TriggerSpec {
+    /// A canonical schedule.
+    Schedule {
+        /// When it fires.
+        schedule: CanonicalSchedule,
+    },
+    /// A declared inbound trigger route.
+    Inbound {
+        /// The route identity, which must be a declared [`TriggerRoute`].
+        route: DurableId,
+    },
+    /// A registered watcher on an external source.
+    Watch {
+        /// Which source.
+        source: WatchedSource,
+        /// The watcher identity.
+        watcher: DurableId,
+    },
+    /// A person asking for a run now.
+    Manual {
+        /// Who asked.
+        actor: AutomationActor,
+    },
+}
+
+impl TriggerSpec {
+    /// A schedule trigger.
+    #[must_use]
+    pub const fn schedule(schedule: CanonicalSchedule) -> Self {
+        Self::Schedule { schedule }
+    }
+
+    /// An inbound route trigger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::Field`] or [`AutomationError::NotCanonical`]
+    /// for an invalid route identity.
+    pub fn inbound(route: &str) -> Result<Self, AutomationError> {
+        Ok(Self::Inbound {
+            route: DurableId::new(route)?,
+        })
+    }
+
+    /// A watcher trigger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::Field`] or [`AutomationError::NotCanonical`]
+    /// for an invalid watcher identity.
+    pub fn watch(source: WatchedSource, watcher: &str) -> Result<Self, AutomationError> {
+        Ok(Self::Watch {
+            source,
+            watcher: DurableId::new(watcher)?,
+        })
+    }
+
+    /// A run-now trigger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::Field`] for an invalid actor. A manual run
+    /// names the person who asked for it; there is no anonymous variant.
+    pub fn manual(actor: &str) -> Result<Self, AutomationError> {
+        Ok(Self::Manual {
+            actor: AutomationActor::new(actor)?,
+        })
+    }
+
+    /// Which kind this is.
+    #[must_use]
+    pub const fn kind(&self) -> TriggerKind {
+        match self {
+            Self::Schedule { .. } => TriggerKind::Schedule,
+            Self::Inbound { .. } => TriggerKind::Inbound,
+            Self::Watch { .. } => TriggerKind::Watch,
+            Self::Manual { .. } => TriggerKind::Manual,
+        }
+    }
+
+    /// Whether this trigger starts work with nobody present.
+    #[must_use]
+    pub const fn is_unattended(&self) -> bool {
+        self.kind().is_unattended()
+    }
+
+    /// Render the canonical form.
+    ///
+    /// Round-trips through [`Self::from_rendering`]. The kind is written first
+    /// and every variable-length component is written last, so the reading is
+    /// unambiguous without escaping.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let kind = self.kind().as_str();
+        match self {
+            Self::Schedule { schedule } => format!("{kind}:{}", schedule.render()),
+            Self::Inbound { route } => format!("{kind}:{route}"),
+            Self::Watch { source, watcher } => format!("{kind}:{}:{watcher}", source.as_str()),
+            Self::Manual { actor } => format!("{kind}:{}", actor.as_str()),
+        }
+    }
+
+    /// Read a canonical rendering back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::UnknownVocabulary`] for a kind or watched
+    /// source this build does not declare and
+    /// [`AutomationError::NotCanonical`] for a rendering that is not
+    /// `kind:payload`.
+    pub fn from_rendering(rendered: &str) -> Result<Self, AutomationError> {
+        bounded(rendered, "trigger")?;
+        let Some((kind, rest)) = rendered.split_once(':') else {
+            return Err(not_canonical(
+                "trigger",
+                "a canonical trigger rendering is kind:payload",
+            ));
+        };
+        match TriggerKind::from_name(kind)? {
+            TriggerKind::Schedule => Ok(Self::Schedule {
+                schedule: CanonicalSchedule::from_rendering(rest)?,
+            }),
+            TriggerKind::Inbound => Self::inbound(rest),
+            TriggerKind::Watch => {
+                let Some((source, watcher)) = rest.split_once(':') else {
+                    return Err(not_canonical(
+                        "trigger",
+                        "a canonical watch rendering is watch:source:watcher",
+                    ));
+                };
+                Self::watch(WatchedSource::from_name(source)?, watcher)
+            }
+            TriggerKind::Manual => Self::manual(rest),
+        }
+    }
+}
+
+/// Which of the four things an automation can do when it fires.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ActionKind {
+    /// Start a fresh agent turn.
+    AgentTurn,
+    /// Run a reviewed no-agent script or workflow.
+    Script,
+    /// Invoke a command from the command registry.
+    Command,
+    /// Deliver a notification with no model call.
+    Notify,
+}
+
+impl ActionKind {
+    /// Every kind. The set is closed.
+    pub const ALL: [Self; 4] = [Self::AgentTurn, Self::Script, Self::Command, Self::Notify];
+
+    /// Stable spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentTurn => "agent_turn",
+            Self::Script => "script",
+            Self::Command => "command",
+            Self::Notify => "notify",
+        }
+    }
+
+    /// Whether an action of this kind reaches a model.
+    #[must_use]
+    pub const fn reaches_model(self) -> bool {
+        matches!(self, Self::AgentTurn)
+    }
+
+    /// The job kind an action of this kind runs as.
+    ///
+    /// A notification-only action is a script job, so it carries the same
+    /// identity, sandbox and outbox obligations as one that drives a model —
+    /// skipping the model does not buy a weaker [`JobObligations`].
+    #[must_use]
+    pub const fn job_kind(self) -> JobKind {
+        if self.reaches_model() {
+            JobKind::Agent
+        } else {
+            JobKind::Script
+        }
+    }
+
+    /// Resolve a stored spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::UnknownVocabulary`] for anything else. An
+    /// action this build cannot perform is refused here rather than dropped:
+    /// there is no "unknown action" variant that reads as a no-op.
+    pub fn from_name(name: &str) -> Result<Self, AutomationError> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == name)
+            .ok_or_else(|| unknown_vocabulary("action_kind", name))
+    }
+}
+
+/// What an automation does when it fires.
+///
+/// Every variant names something durable — a prompt or workflow reference, a
+/// registry command identifier, an authorized destination — rather than prose
+/// to interpret. The set is closed, so an action the product cannot perform is
+/// not constructible and cannot be stored for a later build to guess at.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AutomationAction {
+    /// Start a fresh agent turn from a stored prompt.
+    AgentTurn {
+        /// The prompt reference.
+        prompt: DurableId,
+    },
+    /// Run a reviewed no-agent script or workflow.
+    Script {
+        /// The workflow reference.
+        workflow: DurableId,
+    },
+    /// Invoke a command from the command registry.
+    Command {
+        /// The command identifier, resolved against
+        /// [`crate::command_registry::CommandRegistry`].
+        command: CommandId,
+    },
+    /// Deliver a notification with zero model call.
+    Notify {
+        /// Where, and the grant that permits it.
+        destination: AuthorizedDestination,
+    },
+}
+
+impl AutomationAction {
+    /// An agent-turn action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::Field`] or [`AutomationError::NotCanonical`]
+    /// for an invalid prompt reference.
+    pub fn agent_turn(prompt: &str) -> Result<Self, AutomationError> {
+        Ok(Self::AgentTurn {
+            prompt: DurableId::new(prompt)?,
+        })
+    }
+
+    /// A no-agent script action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::Field`] or [`AutomationError::NotCanonical`]
+    /// for an invalid workflow reference.
+    pub fn script(workflow: &str) -> Result<Self, AutomationError> {
+        Ok(Self::Script {
+            workflow: DurableId::new(workflow)?,
+        })
+    }
+
+    /// A registry-command action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::UnknownVocabulary`] when the identifier is
+    /// not a command identifier the registry grammar admits. A command name
+    /// this build cannot spell is refused here, not carried forward as text.
+    pub fn command(command_id: &str) -> Result<Self, AutomationError> {
+        let command =
+            CommandId::new(command_id).map_err(|_| unknown_vocabulary("command_id", command_id))?;
+        Ok(Self::Command { command })
+    }
+
+    /// A notification-only action.
+    #[must_use]
+    pub const fn notify(destination: AuthorizedDestination) -> Self {
+        Self::Notify { destination }
+    }
+
+    /// Which kind this is.
+    #[must_use]
+    pub const fn kind(&self) -> ActionKind {
+        match self {
+            Self::AgentTurn { .. } => ActionKind::AgentTurn,
+            Self::Script { .. } => ActionKind::Script,
+            Self::Command { .. } => ActionKind::Command,
+            Self::Notify { .. } => ActionKind::Notify,
+        }
+    }
+
+    /// Whether this action reaches a model.
+    #[must_use]
+    pub const fn reaches_model(&self) -> bool {
+        self.kind().reaches_model()
+    }
+
+    /// The effect name this action requires in the automation's declared scope.
+    ///
+    /// Deterministic and exact: the string produced here is compared for
+    /// equality against [`AutomationRevision::approved_effects`], so declaring
+    /// `command:pause_intake` pre-approves exactly that command and no other,
+    /// and no prefix of it.
+    #[must_use]
+    pub fn required_effect(&self) -> String {
+        let kind = self.kind().as_str();
+        match self {
+            Self::AgentTurn { prompt } => format!("{kind}:{prompt}"),
+            Self::Script { workflow } => format!("{kind}:{workflow}"),
+            Self::Command { command } => format!("{kind}:{command}"),
+            Self::Notify { destination } => format!("{kind}:{}", destination.target()),
+        }
+    }
+}
+
+/// A trigger bound to the action it fires, with the authority to run it.
+///
+/// Every field is private and there is no public constructor: the only way to
+/// obtain one is [`AutomationRevision::bind`] on an enabled automation whose
+/// declared scope already contains the action's required effect. So a bound
+/// action is proof, not a request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundAction {
+    automation_id: String,
+    trigger: TriggerSpec,
+    action: AutomationAction,
+    approved: ApprovedEffect,
+}
+
+impl BoundAction {
+    /// The automation this binding belongs to.
+    #[must_use]
+    pub fn automation_id(&self) -> &str {
+        &self.automation_id
+    }
+
+    /// What fired.
+    #[must_use]
+    pub const fn trigger(&self) -> &TriggerSpec {
+        &self.trigger
+    }
+
+    /// What runs.
+    #[must_use]
+    pub const fn action(&self) -> &AutomationAction {
+        &self.action
+    }
+
+    /// The job kind this binding runs as.
+    #[must_use]
+    pub const fn job_kind(&self) -> JobKind {
+        self.action.kind().job_kind()
+    }
+
+    /// Spend the binding as the approval a [`CompletedEffect`] requires.
+    ///
+    /// This is the whole chain in one line: a trigger fires, an action is bound
+    /// only inside declared scope, and only a bound action yields the token
+    /// that records the effect as done.
+    #[must_use]
+    pub fn into_approved(self) -> ApprovedEffect {
+        self.approved
+    }
+}
+
+/// What may happen to a triggered action.
+///
+/// Two-valued for the same reason [`UnattendedDecision`] is: there is no third
+/// outcome that runs the action without the scope check.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActionBinding {
+    /// The action was inside the automation's declared scope.
+    Bound(BoundAction),
+    /// It was not, and can only be asked for.
+    RequiresApproval(ApprovalRequest),
+}
+
+/// A field path into an inbound event payload.
+///
+/// Dotted segments of ASCII alphanumerics, `_` and `-`. Deliberately narrower
+/// than a bounded string: a field path carries no separator the canonical
+/// rendering uses, so an expression renders and reads back without escaping.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FilterField(String);
+
+impl FilterField {
+    /// Validate and construct a field path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::Field`] for an empty, over-long or control
+    /// value, [`AutomationError::NotCanonical`] for a segment outside the
+    /// grammar, and [`AutomationError::TooLarge`] above
+    /// [`MAX_FILTER_FIELD_SEGMENTS`].
+    pub fn new(path: &str) -> Result<Self, AutomationError> {
+        bounded(path, "filter_field")?;
+        let mut segments = 0_usize;
+        for segment in path.split('.') {
+            segments += 1;
+            if segment.is_empty()
+                || !segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                return Err(not_canonical(
+                    "filter_field",
+                    "a field path is dotted segments of alphanumerics, underscore and hyphen",
+                ));
+            }
+        }
+        if segments > MAX_FILTER_FIELD_SEGMENTS {
+            return Err(too_large(
+                "filter_field",
+                MAX_FILTER_FIELD_SEGMENTS,
+                segments,
+            ));
+        }
+        Ok(Self(path.to_owned()))
+    }
+
+    /// The validated path.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for FilterField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// A literal a predicate compares against.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FilterValue(String);
+
+impl FilterValue {
+    /// Validate and construct a literal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::Field`] for an empty, over-long or control
+    /// value.
+    pub fn new(value: &str) -> Result<Self, AutomationError> {
+        bounded(value, "filter_value")?;
+        Ok(Self(value.to_owned()))
+    }
+
+    /// The literal.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A pattern whose total repetition is bounded by construction.
+///
+/// The product requirement asks for "bounded regex". What is bounded here is
+/// the pattern's own repetition: `*`, `+` and an open-ended `{m,}` are refused,
+/// every `{m,n}` must name a finite `n`, and the product of every ceiling in
+/// the pattern must not exceed [`MAX_PATTERN_EXPANSION`]. Backreferences and
+/// lookaround — the two constructs that make matching cost unbounded in the
+/// pattern's length — are refused outright.
+///
+/// This type compiles nothing and matches nothing. It establishes that a stored
+/// pattern is bounded, so the engine that eventually runs it is given a bounded
+/// input rather than trusted to survive an unbounded one.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BoundedPattern(String);
+
+impl BoundedPattern {
+    /// Validate and construct a bounded pattern.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::Field`] for an empty, over-long or control
+    /// value, [`AutomationError::NotCanonical`] for an unbounded quantifier,
+    /// an unbalanced group or class, a backreference or a lookaround, and
+    /// [`AutomationError::TooLarge`] when the product of the repetition
+    /// ceilings exceeds [`MAX_PATTERN_EXPANSION`].
+    pub fn new(pattern: &str) -> Result<Self, AutomationError> {
+        bounded(pattern, "pattern")?;
+        if pattern.len() > MAX_PATTERN_BYTES {
+            return Err(too_large("pattern", MAX_PATTERN_BYTES, pattern.len()));
+        }
+        validate_bounded_pattern(pattern)?;
+        Ok(Self(pattern.to_owned()))
+    }
+
+    /// The validated pattern.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Reject any pattern whose matching cost is not bounded by its own text.
+fn validate_bounded_pattern(pattern: &str) -> Result<(), AutomationError> {
+    let bytes = pattern.as_bytes();
+    let mut index = 0_usize;
+    let mut group_depth = 0_i32;
+    let mut expansion = 1_u32;
+    let mut quantifiable = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'*' | b'+' => {
+                return Err(not_canonical(
+                    "pattern",
+                    "a repetition is bounded: * and + name no ceiling",
+                ));
+            }
+            b'\\' => {
+                let Some(&escaped) = bytes.get(index + 1) else {
+                    return Err(not_canonical(
+                        "pattern",
+                        "a trailing backslash escapes nothing",
+                    ));
+                };
+                if escaped.is_ascii_digit() {
+                    return Err(not_canonical(
+                        "pattern",
+                        "a backreference makes matching cost unbounded",
+                    ));
+                }
+                index += 2;
+                quantifiable = true;
+                continue;
+            }
+            b'(' => {
+                if matches!(bytes.get(index + 1), Some(b'?')) {
+                    return Err(not_canonical(
+                        "pattern",
+                        "lookaround and inline flags are not part of the bounded grammar",
+                    ));
+                }
+                group_depth += 1;
+                quantifiable = false;
+            }
+            b')' => {
+                group_depth -= 1;
+                if group_depth < 0 {
+                    return Err(not_canonical("pattern", "a group closes before it opens"));
+                }
+                quantifiable = true;
+            }
+            b'[' => {
+                let Some(close) = find_class_end(bytes, index) else {
+                    return Err(not_canonical("pattern", "a character class never closes"));
+                };
+                index = close + 1;
+                quantifiable = true;
+                continue;
+            }
+            b']' => return Err(not_canonical("pattern", "a class closes before it opens")),
+            b'{' => {
+                if !quantifiable {
+                    return Err(not_canonical(
+                        "pattern",
+                        "a repetition follows something to repeat",
+                    ));
+                }
+                let (ceiling, next) = read_repetition(bytes, index)?;
+                expansion = expansion.saturating_mul(ceiling);
+                if expansion > MAX_PATTERN_EXPANSION {
+                    return Err(too_large(
+                        "pattern_expansion",
+                        MAX_PATTERN_EXPANSION as usize,
+                        expansion as usize,
+                    ));
+                }
+                index = next;
+                quantifiable = false;
+                continue;
+            }
+            b'?' => {
+                if !quantifiable {
+                    return Err(not_canonical(
+                        "pattern",
+                        "a repetition follows something to repeat",
+                    ));
+                }
+                quantifiable = false;
+            }
+            b'|' | b'^' | b'$' => quantifiable = false,
+            _ => quantifiable = true,
+        }
+        index += 1;
+    }
+    if group_depth != 0 {
+        return Err(not_canonical("pattern", "a group never closes"));
+    }
+    Ok(())
+}
+
+/// The index of the `]` closing the class opened at `open`, honouring escapes.
+fn find_class_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut index = open + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b']' if index > open + 1 => return Some(index),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Read `{m}` or `{m,n}` at `open`, returning the ceiling and the next index.
+fn read_repetition(bytes: &[u8], open: usize) -> Result<(u32, usize), AutomationError> {
+    let malformed = not_canonical(
+        "pattern",
+        "a repetition is {m} or {m,n} with a finite decimal ceiling",
+    );
+    let mut index = open + 1;
+    let low_start = index;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    if index == low_start {
+        return Err(malformed.clone());
+    }
+    let low = decimal_bound(&bytes[low_start..index]).ok_or_else(|| malformed.clone())?;
+    let high = if matches!(bytes.get(index), Some(b',')) {
+        index += 1;
+        let high_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if index == high_start {
+            return Err(not_canonical(
+                "pattern",
+                "an open-ended repetition {m,} names no ceiling",
+            ));
+        }
+        decimal_bound(&bytes[high_start..index]).ok_or_else(|| malformed.clone())?
+    } else {
+        low
+    };
+    if !matches!(bytes.get(index), Some(b'}')) {
+        return Err(malformed);
+    }
+    if high < low {
+        return Err(not_canonical(
+            "pattern",
+            "a repetition ceiling is at least its floor",
+        ));
+    }
+    Ok((high.max(1), index + 1))
+}
+
+/// Parse ASCII decimal digits, refusing anything that would not fit a `u32`.
+fn decimal_bound(digits: &[u8]) -> Option<u32> {
+    core::str::from_utf8(digits).ok()?.parse::<u32>().ok()
+}
+
+/// Which of the five comparisons a predicate makes.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum PredicateKind {
+    /// Exact equality.
+    Equals,
+    /// Substring containment.
+    Contains,
+    /// Presence of the field.
+    Exists,
+    /// Membership in a bounded set.
+    MemberOf,
+    /// A bounded pattern match.
+    Matches,
+}
+
+impl PredicateKind {
+    /// Every comparison. The set is closed: this is the whole condition
+    /// language, and there is no variant carrying source text to evaluate.
+    pub const ALL: [Self; 5] = [
+        Self::Equals,
+        Self::Contains,
+        Self::Exists,
+        Self::MemberOf,
+        Self::Matches,
+    ];
+
+    /// Stable spelling, used in the canonical rendering.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Equals => "eq",
+            Self::Contains => "contains",
+            Self::Exists => "exists",
+            Self::MemberOf => "in",
+            Self::Matches => "matches",
+        }
+    }
+
+    /// Resolve a stored spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::UnknownVocabulary`] for anything else.
+    pub fn from_name(name: &str) -> Result<Self, AutomationError> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == name)
+            .ok_or_else(|| unknown_vocabulary("predicate_kind", name))
+    }
+}
+
+/// One comparison against one field.
+///
+/// The whole condition vocabulary. There is no `Script`, no `Expression` and no
+/// variant holding source text, so a filter cannot become a program: what a
+/// route can ask about an inbound event is fixed by this enum at compile time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FilterPredicate {
+    /// The field equals the value exactly.
+    Equals {
+        /// The required value.
+        value: FilterValue,
+    },
+    /// The field contains the substring.
+    Contains {
+        /// The required substring.
+        substring: FilterValue,
+    },
+    /// The field is present, whatever it holds.
+    Exists,
+    /// The field is one of a bounded set of values.
+    MemberOf {
+        /// The permitted values, sorted and deduplicated.
+        values: Vec<FilterValue>,
+    },
+    /// The field matches a bounded pattern.
+    Matches {
+        /// The bounded pattern.
+        pattern: BoundedPattern,
+    },
+}
+
+impl FilterPredicate {
+    /// Require exact equality.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::Field`] for an invalid value.
+    pub fn equals(value: &str) -> Result<Self, AutomationError> {
+        Ok(Self::Equals {
+            value: FilterValue::new(value)?,
+        })
+    }
+
+    /// Require containment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::Field`] for an invalid substring.
+    pub fn contains(substring: &str) -> Result<Self, AutomationError> {
+        Ok(Self::Contains {
+            substring: FilterValue::new(substring)?,
+        })
+    }
+
+    /// Require membership in a bounded set.
+    ///
+    /// The values are sorted and deduplicated, so a set is a set: two
+    /// declarations listing the same values in different orders are equal and
+    /// render identically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::Field`] for an invalid value,
+    /// [`AutomationError::NotCanonical`] for an empty set — which would admit
+    /// nothing and is more likely a mistake than an intent — and
+    /// [`AutomationError::TooLarge`] above [`MAX_MEMBERSHIP_VALUES`].
+    pub fn member_of(values: &[&str]) -> Result<Self, AutomationError> {
+        if values.is_empty() {
+            return Err(not_canonical(
+                "membership_values",
+                "a membership set names at least one value",
+            ));
+        }
+        if values.len() > MAX_MEMBERSHIP_VALUES {
+            return Err(too_large(
+                "membership_values",
+                MAX_MEMBERSHIP_VALUES,
+                values.len(),
+            ));
+        }
+        let mut parsed = values
+            .iter()
+            .map(|value| FilterValue::new(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        parsed.sort();
+        parsed.dedup();
+        Ok(Self::MemberOf { values: parsed })
+    }
+
+    /// Require a bounded pattern match.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`BoundedPattern::new`] refuses the pattern with.
+    pub fn matches(pattern: &str) -> Result<Self, AutomationError> {
+        Ok(Self::Matches {
+            pattern: BoundedPattern::new(pattern)?,
+        })
+    }
+
+    /// Which comparison this is.
+    #[must_use]
+    pub const fn kind(&self) -> PredicateKind {
+        match self {
+            Self::Equals { .. } => PredicateKind::Equals,
+            Self::Contains { .. } => PredicateKind::Contains,
+            Self::Exists => PredicateKind::Exists,
+            Self::MemberOf { .. } => PredicateKind::MemberOf,
+            Self::Matches { .. } => PredicateKind::Matches,
+        }
+    }
+}
+
+/// A declarative condition over an inbound event.
+///
+/// A tree of the closed [`FilterPredicate`] vocabulary under `all`, `any` and
+/// `not`. Depth and node count are bounded at construction, so a condition
+/// cannot be grown into a denial-of-service against whatever evaluates it, and
+/// there is no variant carrying source text, so it cannot be grown into a
+/// program either.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FilterExpression {
+    /// One comparison against one field.
+    Field {
+        /// The field path.
+        field: FilterField,
+        /// The comparison.
+        predicate: FilterPredicate,
+    },
+    /// Every operand must hold.
+    All {
+        /// The operands, in declared order.
+        operands: Vec<FilterExpression>,
+    },
+    /// At least one operand must hold.
+    Any {
+        /// The operands, in declared order.
+        operands: Vec<FilterExpression>,
+    },
+    /// The operand must not hold.
+    Not {
+        /// The negated operand.
+        operand: Box<FilterExpression>,
+    },
+}
+
+impl FilterExpression {
+    /// One comparison against one field.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`FilterField::new`] refuses the path with, and
+    /// [`AutomationError::TooLarge`] when the node's canonical rendering would
+    /// exceed [`MAX_FILTER_RENDERING_BYTES`].
+    pub fn field(field: &str, predicate: FilterPredicate) -> Result<Self, AutomationError> {
+        Self::Field {
+            field: FilterField::new(field)?,
+            predicate,
+        }
+        .within_bounds()
+    }
+
+    /// Require every operand.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::NotCanonical`] for no operands and
+    /// [`AutomationError::TooLarge`] beyond [`MAX_FILTER_DEPTH`] or
+    /// [`MAX_FILTER_NODES`].
+    pub fn all(operands: Vec<Self>) -> Result<Self, AutomationError> {
+        Self::combined(operands, true)
+    }
+
+    /// Require at least one operand.
+    ///
+    /// # Errors
+    ///
+    /// The same refusals as [`Self::all`].
+    pub fn any(operands: Vec<Self>) -> Result<Self, AutomationError> {
+        Self::combined(operands, false)
+    }
+
+    fn combined(operands: Vec<Self>, conjunction: bool) -> Result<Self, AutomationError> {
+        if operands.is_empty() {
+            return Err(not_canonical(
+                "filter_operands",
+                "a combinator names at least one operand",
+            ));
+        }
+        let combined = if conjunction {
+            Self::All { operands }
+        } else {
+            Self::Any { operands }
+        };
+        combined.within_bounds()
+    }
+
+    /// Negate an expression.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::TooLarge`] beyond [`MAX_FILTER_DEPTH`] or
+    /// [`MAX_FILTER_NODES`].
+    pub fn negating(operand: Self) -> Result<Self, AutomationError> {
+        Self::Not {
+            operand: Box::new(operand),
+        }
+        .within_bounds()
+    }
+
+    fn within_bounds(self) -> Result<Self, AutomationError> {
+        let depth = self.depth();
+        if depth > MAX_FILTER_DEPTH {
+            return Err(too_large("filter_depth", MAX_FILTER_DEPTH, depth));
+        }
+        let nodes = self.nodes();
+        if nodes > MAX_FILTER_NODES {
+            return Err(too_large("filter_nodes", MAX_FILTER_NODES, nodes));
+        }
+        let rendered = self.render().len();
+        if rendered > MAX_FILTER_RENDERING_BYTES {
+            return Err(too_large(
+                "filter_rendering",
+                MAX_FILTER_RENDERING_BYTES,
+                rendered,
+            ));
+        }
+        Ok(self)
+    }
+
+    /// How deeply this expression nests. A single comparison is depth one.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        match self {
+            Self::Field { .. } => 1,
+            Self::All { operands } | Self::Any { operands } => {
+                1 + operands.iter().map(Self::depth).max().unwrap_or(0)
+            }
+            Self::Not { operand } => 1 + operand.depth(),
+        }
+    }
+
+    /// How many nodes this expression holds.
+    #[must_use]
+    pub fn nodes(&self) -> usize {
+        match self {
+            Self::Field { .. } => 1,
+            Self::All { operands } | Self::Any { operands } => {
+                1 + operands.iter().map(Self::nodes).sum::<usize>()
+            }
+            Self::Not { operand } => 1 + operand.nodes(),
+        }
+    }
+
+    /// Render the canonical form.
+    ///
+    /// Round-trips through [`Self::from_rendering`]. Every free-text leaf is
+    /// written length-prefixed as `<bytes>:<text>`, so a value holding a comma
+    /// or a bracket cannot be read as structure and no escaping is involved.
+    ///
+    /// Operand order is preserved and is part of the value: `all(a,b)` and
+    /// `all(b,a)` are distinct expressions that render distinctly. Membership
+    /// values are not, because [`FilterPredicate::member_of`] already sorted
+    /// them into a set.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        self.render_into(&mut out);
+        out
+    }
+
+    fn render_into(&self, out: &mut String) {
+        match self {
+            Self::Field { field, predicate } => {
+                out.push_str(predicate.kind().as_str());
+                out.push('(');
+                out.push_str(field.as_str());
+                match predicate {
+                    FilterPredicate::Exists => {}
+                    FilterPredicate::Equals { value }
+                    | FilterPredicate::Contains { substring: value } => {
+                        out.push(',');
+                        push_counted(out, value.as_str());
+                    }
+                    FilterPredicate::MemberOf { values } => {
+                        for value in values {
+                            out.push(',');
+                            push_counted(out, value.as_str());
+                        }
+                    }
+                    FilterPredicate::Matches { pattern } => {
+                        out.push(',');
+                        push_counted(out, pattern.as_str());
+                    }
+                }
+                out.push(')');
+            }
+            Self::All { operands } | Self::Any { operands } => {
+                out.push_str(if matches!(self, Self::All { .. }) {
+                    "all"
+                } else {
+                    "any"
+                });
+                out.push('(');
+                for (position, operand) in operands.iter().enumerate() {
+                    if position > 0 {
+                        out.push(',');
+                    }
+                    operand.render_into(out);
+                }
+                out.push(')');
+            }
+            Self::Not { operand } => {
+                out.push_str("not(");
+                operand.render_into(out);
+                out.push(')');
+            }
+        }
+    }
+
+    /// Read a canonical rendering back.
+    ///
+    /// This is the reader storage uses. It accepts exactly what
+    /// [`Self::render`] writes: a trailing byte, a wrong length prefix or an
+    /// unknown keyword is refused rather than tolerated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::UnknownVocabulary`] for a keyword outside the
+    /// closed vocabulary and [`AutomationError::NotCanonical`] for a rendering
+    /// that is malformed or has trailing input.
+    pub fn from_rendering(rendered: &str) -> Result<Self, AutomationError> {
+        bounded_within(rendered, "filter_expression", MAX_FILTER_RENDERING_BYTES)?;
+        let (expression, rest) = Self::read(rendered)?;
+        if !rest.is_empty() {
+            return Err(not_canonical(
+                "filter_expression",
+                "a canonical rendering ends where its outermost node does",
+            ));
+        }
+        expression.within_bounds()
+    }
+
+    fn read(input: &str) -> Result<(Self, &str), AutomationError> {
+        let Some(open) = input.find('(') else {
+            return Err(not_canonical(
+                "filter_expression",
+                "every node opens with a keyword and a parenthesis",
+            ));
+        };
+        let keyword = &input[..open];
+        let rest = &input[open + 1..];
+        match keyword {
+            "all" | "any" => {
+                let (operands, rest) = read_operands(rest)?;
+                let combined = if keyword == "all" {
+                    Self::All { operands }
+                } else {
+                    Self::Any { operands }
+                };
+                Ok((combined, rest))
+            }
+            "not" => {
+                let (operand, rest) = Self::read(rest)?;
+                let rest = expect(rest, b')')?;
+                Ok((
+                    Self::Not {
+                        operand: Box::new(operand),
+                    },
+                    rest,
+                ))
+            }
+            _ => {
+                let kind = PredicateKind::from_name(keyword)?;
+                read_field_node(kind, rest)
+            }
+        }
+    }
+}
+
+/// Read one or more comma-separated operands, then the closing parenthesis.
+fn read_operands(mut input: &str) -> Result<(Vec<FilterExpression>, &str), AutomationError> {
+    let mut operands = Vec::new();
+    loop {
+        let (operand, rest) = FilterExpression::read(input)?;
+        operands.push(operand);
+        match rest.as_bytes().first() {
+            Some(b',') => input = &rest[1..],
+            Some(b')') => return Ok((operands, &rest[1..])),
+            _ => {
+                return Err(not_canonical(
+                    "filter_expression",
+                    "operands are comma separated and the list closes",
+                ));
+            }
+        }
+    }
+}
+
+/// Read the field, the predicate payload and the closing parenthesis.
+fn read_field_node(
+    kind: PredicateKind,
+    input: &str,
+) -> Result<(FilterExpression, &str), AutomationError> {
+    let malformed = not_canonical(
+        "filter_expression",
+        "a comparison is keyword(field) or keyword(field,<bytes>:<text>)",
+    );
+    let terminator = input
+        .bytes()
+        .position(|byte| matches!(byte, b',' | b')'))
+        .ok_or_else(|| malformed.clone())?;
+    let field = &input[..terminator];
+    let mut rest = &input[terminator..];
+    let predicate = match kind {
+        PredicateKind::Exists => FilterPredicate::Exists,
+        PredicateKind::Equals | PredicateKind::Contains | PredicateKind::Matches => {
+            rest = expect(rest, b',')?;
+            let (value, tail) = read_counted(rest)?;
+            rest = tail;
+            match kind {
+                PredicateKind::Equals => FilterPredicate::equals(value)?,
+                PredicateKind::Contains => FilterPredicate::contains(value)?,
+                _ => FilterPredicate::matches(value)?,
+            }
+        }
+        PredicateKind::MemberOf => {
+            let mut values = Vec::new();
+            loop {
+                rest = expect(rest, b',')?;
+                let (value, tail) = read_counted(rest)?;
+                values.push(value);
+                rest = tail;
+                if !matches!(rest.as_bytes().first(), Some(b',')) {
+                    break;
+                }
+            }
+            FilterPredicate::member_of(&values)?
+        }
+    };
+    let rest = expect(rest, b')')?;
+    Ok((FilterExpression::field(field, predicate)?, rest))
+}
+
+/// Write `<bytes>:<text>`.
+fn push_counted(out: &mut String, text: &str) {
+    out.push_str(&text.len().to_string());
+    out.push(':');
+    out.push_str(text);
+}
+
+/// Read `<bytes>:<text>`, refusing a length that is not exactly the text's.
+fn read_counted(input: &str) -> Result<(&str, &str), AutomationError> {
+    let malformed = not_canonical(
+        "filter_expression",
+        "a literal is written <bytes>:<text> with an exact byte count",
+    );
+    let separator = input.find(':').ok_or_else(|| malformed.clone())?;
+    let digits = &input[..separator];
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(malformed.clone());
+    }
+    let Ok(length) = digits.parse::<usize>() else {
+        return Err(not_canonical(
+            "filter_expression",
+            "a literal is written <bytes>:<text> with an exact byte count",
+        ));
+    };
+    let body = &input[separator + 1..];
+    let value = body.get(..length).ok_or(malformed)?;
+    Ok((value, &body[length..]))
+}
+
+/// Consume one expected byte.
+fn expect(input: &str, byte: u8) -> Result<&str, AutomationError> {
+    if input.as_bytes().first() == Some(&byte) {
+        Ok(&input[1..])
+    } else {
+        Err(not_canonical(
+            "filter_expression",
+            "a canonical rendering places its separators exactly",
+        ))
+    }
+}
+
 fn bounded(value: &str, field: &'static str) -> Result<(), AutomationError> {
+    bounded_within(value, field, MAX_AUTOMATION_FIELD_BYTES)
+}
+
+fn bounded_within(
+    value: &str,
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<(), AutomationError> {
     let error = if value.is_empty() {
         Some(ValueError::Empty)
-    } else if value.len() > MAX_AUTOMATION_FIELD_BYTES {
+    } else if value.len() > max_bytes {
         Some(ValueError::TooLong {
-            max_bytes: MAX_AUTOMATION_FIELD_BYTES,
+            max_bytes,
             actual_bytes: value.len(),
         })
     } else if value.chars().any(char::is_control) {

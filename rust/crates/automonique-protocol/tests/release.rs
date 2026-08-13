@@ -1358,3 +1358,282 @@ mod secret_hygiene {
         }
     }
 }
+
+/// The canonical rendering a release attestation binds.
+///
+/// `automonique_protocol::release_trust_root` signs a manifest by its
+/// [`ReleaseManifest::canonical_digest`], so the rendering underneath it has to
+/// be total, deterministic and sensitive to every field. These rows check that
+/// directly rather than through the trust root, where a rendering bug would
+/// look like an attestation bug.
+mod canonical_rendering {
+    use super::*;
+
+    #[test]
+    fn a_parsed_manifest_renders_back_to_the_bytes_it_came_from() {
+        let bytes = complete_document();
+        let manifest = ReleaseManifest::from_canonical_bytes(&bytes).expect("valid manifest");
+        assert_eq!(manifest.to_canonical_bytes(), bytes);
+
+        // A retained unknown field survives the round trip verbatim.
+        let extended = document_with("future_knob", json_text("unreviewed"));
+        let manifest = ReleaseManifest::from_canonical_bytes(&extended).expect("valid manifest");
+        assert_eq!(manifest.to_canonical_bytes(), extended);
+    }
+
+    /// Rendering is total: every manifest the builder can assemble has a
+    /// document the strict reader accepts, and reading it back gives the same
+    /// canonical bytes.
+    #[test]
+    fn an_assembled_manifest_renders_a_document_the_strict_reader_accepts() {
+        for manifest in [
+            complete().build().expect("valid"),
+            complete_with_optional_sections().build().expect("valid"),
+            complete_with_optional_sections()
+                .digest(ArtifactKind::Companion, digest(SCHEMA_HEX))
+                .unknown_field("future_knob", "unreviewed")
+                .unknown_json_field(
+                    "future_table",
+                    JsonValue::Array(vec![JsonValue::Integer(7)]),
+                )
+                .build()
+                .expect("valid"),
+        ] {
+            let bytes = manifest.to_canonical_bytes();
+            let reread = ReleaseManifest::from_canonical_bytes(&bytes)
+                .expect("the rendering is a document this build reads");
+            assert_eq!(reread.to_canonical_bytes(), bytes);
+            assert_eq!(reread.canonical_digest(), manifest.canonical_digest());
+        }
+    }
+
+    #[test]
+    fn the_canonical_digest_is_a_function_of_the_manifest_not_its_assembly_order() {
+        let ordered = complete_with_optional_sections().build().expect("valid");
+        let shuffled = ReleaseManifestBuilder::new()
+            .digest(ArtifactKind::Binary, digest(OTHER_HEX))
+            .rollback(RollbackTarget::new("0.0.9", range(3, 5)).expect("valid"))
+            .sdk(sdk())
+            .database_schema(range(4, 6))
+            .events(range(1, 2))
+            .protocol(range(1, 3))
+            .build_target("x86_64-unknown-linux-gnu")
+            .source_revision(SOURCE_REVISION)
+            .version("0.1.0")
+            .schema_revision(MAX_SUPPORTED_MANIFEST_SCHEMA)
+            .capability(CapabilityRequirement::required("cgroup_v2").expect("valid"))
+            .capability(CapabilityRequirement::optional("systemd_adapter").expect("valid"))
+            .credential(CredentialDescriptor::new("database", 3).expect("valid"))
+            .build()
+            .expect("valid");
+        assert_eq!(ordered, shuffled);
+        assert_eq!(ordered.canonical_digest(), shuffled.canonical_digest());
+        assert_eq!(
+            ordered.canonical_digest().algorithm(),
+            DigestAlgorithm::Sha256
+        );
+        assert_eq!(ordered.canonical_digest().hex().len(), 64);
+    }
+
+    /// Every field a manifest carries reaches the digest.
+    ///
+    /// A field that did not would be a field an attestation does not cover,
+    /// which is the failure mode a signature over a partial rendering has.
+    #[test]
+    fn every_field_reaches_the_canonical_digest() {
+        let variants: Vec<(&str, ReleaseManifest)> = vec![
+            (
+                "baseline",
+                complete_with_optional_sections().build().expect("valid"),
+            ),
+            (
+                "version",
+                complete_with_optional_sections()
+                    .version("0.1.1")
+                    .build()
+                    .expect("valid"),
+            ),
+            (
+                "source_revision",
+                complete_with_optional_sections()
+                    .source_revision("0000000000000000000000000000000000000000")
+                    .build()
+                    .expect("valid"),
+            ),
+            (
+                "build_target",
+                complete_with_optional_sections()
+                    .build_target("aarch64-unknown-linux-gnu")
+                    .build()
+                    .expect("valid"),
+            ),
+            (
+                "protocol",
+                complete_with_optional_sections()
+                    .protocol(range(1, 4))
+                    .build()
+                    .expect("valid"),
+            ),
+            (
+                "events",
+                complete_with_optional_sections()
+                    .events(range(1, 3))
+                    .build()
+                    .expect("valid"),
+            ),
+            (
+                "database_schema",
+                complete_with_optional_sections()
+                    .database_schema(range(4, 5))
+                    .build()
+                    .expect("valid"),
+            ),
+            (
+                "sdk",
+                complete_with_optional_sections()
+                    .sdk(SdkCompatibility::new(range(1, 3), digest(SCHEMA_HEX)))
+                    .build()
+                    .expect("valid"),
+            ),
+            (
+                "sdk_schema_digest",
+                complete_with_optional_sections()
+                    .sdk(SdkCompatibility::new(range(1, 2), digest(OTHER_HEX)))
+                    .build()
+                    .expect("valid"),
+            ),
+            (
+                "binary_digest",
+                complete()
+                    .capability(CapabilityRequirement::required("cgroup_v2").expect("valid"))
+                    .capability(CapabilityRequirement::optional("systemd_adapter").expect("valid"))
+                    .credential(CredentialDescriptor::new("database", 3).expect("valid"))
+                    .rollback(RollbackTarget::new("0.0.9", range(3, 5)).expect("valid"))
+                    .digest(ArtifactKind::Policy, digest(SCHEMA_HEX))
+                    .build()
+                    .expect("valid"),
+            ),
+            (
+                "capability_added",
+                complete_with_optional_sections()
+                    .capability(CapabilityRequirement::required("landlock").expect("valid"))
+                    .build()
+                    .expect("valid"),
+            ),
+            (
+                "credential_version",
+                complete()
+                    .capability(CapabilityRequirement::required("cgroup_v2").expect("valid"))
+                    .capability(CapabilityRequirement::optional("systemd_adapter").expect("valid"))
+                    .credential(CredentialDescriptor::new("database", 4).expect("valid"))
+                    .rollback(RollbackTarget::new("0.0.9", range(3, 5)).expect("valid"))
+                    .build()
+                    .expect("valid"),
+            ),
+            (
+                "rollback_absent",
+                complete()
+                    .capability(CapabilityRequirement::required("cgroup_v2").expect("valid"))
+                    .capability(CapabilityRequirement::optional("systemd_adapter").expect("valid"))
+                    .credential(CredentialDescriptor::new("database", 3).expect("valid"))
+                    .build()
+                    .expect("valid"),
+            ),
+            (
+                "rollback_target",
+                complete()
+                    .capability(CapabilityRequirement::required("cgroup_v2").expect("valid"))
+                    .capability(CapabilityRequirement::optional("systemd_adapter").expect("valid"))
+                    .credential(CredentialDescriptor::new("database", 3).expect("valid"))
+                    .rollback(RollbackTarget::new("0.0.8", range(3, 5)).expect("valid"))
+                    .build()
+                    .expect("valid"),
+            ),
+            (
+                "unknown_field",
+                complete_with_optional_sections()
+                    .unknown_field("future_knob", "unreviewed")
+                    .build()
+                    .expect("valid"),
+            ),
+            (
+                "unknown_field_value",
+                complete_with_optional_sections()
+                    .unknown_field("future_knob", "reviewed")
+                    .build()
+                    .expect("valid"),
+            ),
+        ];
+
+        for (index, (name, manifest)) in variants.iter().enumerate() {
+            for (other_name, other) in &variants[index + 1..] {
+                assert_ne!(
+                    manifest.canonical_digest(),
+                    other.canonical_digest(),
+                    "{name} and {other_name} share a canonical digest"
+                );
+            }
+        }
+    }
+
+    /// A second digest for one artifact is refused rather than shadowed.
+    ///
+    /// `digest()` returns the first, so a shadowed second one would change the
+    /// manifest without changing anything a consumer can observe — exactly the
+    /// gap an attestation must not have.
+    #[test]
+    fn an_artifact_cannot_be_given_two_digests() {
+        assert_eq!(
+            complete()
+                .digest(ArtifactKind::Binary, digest(SCHEMA_HEX))
+                .build()
+                .expect_err("the second digest is refused"),
+            ManifestError::DuplicateArtifactDigest {
+                artifact: ArtifactKind::Binary
+            }
+        );
+        assert_eq!(
+            complete()
+                .digest(ArtifactKind::Policy, digest(SCHEMA_HEX))
+                .digest(ArtifactKind::Policy, digest(OTHER_HEX))
+                .build()
+                .expect_err("the second digest is refused")
+                .category(),
+            "duplicate_artifact_digest"
+        );
+        // A different artifact kind is still fine.
+        assert!(
+            complete()
+                .digest(ArtifactKind::Policy, digest(SCHEMA_HEX))
+                .build()
+                .is_ok()
+        );
+    }
+
+    /// A retained field cannot be named after an interpreted one.
+    ///
+    /// Such a manifest has no document form: rendering it would write the name
+    /// twice, and the canonical reader refuses duplicate keys. Every one of the
+    /// twelve interpreted names is checked, not one of them.
+    #[test]
+    fn a_retained_field_cannot_shadow_an_interpreted_one() {
+        for known in KNOWN_MANIFEST_FIELDS {
+            assert_eq!(
+                complete()
+                    .unknown_field(known, "unreviewed")
+                    .build()
+                    .expect_err("the shadowing field is refused"),
+                ManifestError::UnknownFieldShadowsKnownField { field: known },
+                "{known} was retained"
+            );
+        }
+        assert_eq!(
+            complete()
+                .unknown_field("version", "0.9.9")
+                .build()
+                .expect_err("refused")
+                .category(),
+            "unknown_field_shadows_known_field"
+        );
+    }
+}

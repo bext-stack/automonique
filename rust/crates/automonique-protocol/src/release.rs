@@ -20,11 +20,22 @@
 //! Version ranges reuse [`crate::codec::VersionRange`], so the protocol, event
 //! and database-schema ranges share one algebra with wire negotiation rather
 //! than growing a second, subtly different one.
+//!
+//! A manifest also renders back to its document form
+//! ([`ReleaseManifest::to_canonical_document`]) and hashes to a
+//! [`ReleaseManifest::canonical_digest`]. That digest is what
+//! [`crate::release_trust_root`] binds an attestation to. Rendering is *total*:
+//! every constructible manifest has exactly one canonical document, which is
+//! why [`ReleaseManifestBuilder::build`] refuses the two shapes only a
+//! programmatic assembly could reach — a second digest for an artifact kind, and
+//! a retained unknown field named after an interpreted one. Neither can arrive
+//! from a document, because the canonical reader already refuses duplicate keys.
 
 use core::fmt;
 use std::error::Error;
 
 use crate::codec::{CodecError, MajorVersion, VersionRange};
+use crate::digest::Sha256;
 use crate::primitives::ValueError;
 use crate::wire::{JsonValue, parse_canonical};
 
@@ -236,6 +247,27 @@ pub enum ManifestError {
         /// Maximum retained.
         max: usize,
     },
+    /// One artifact kind was given a digest twice.
+    ///
+    /// Only [`ReleaseManifestBuilder`] can reach this: a document cannot,
+    /// because the canonical reader refuses duplicate object keys. A second
+    /// declaration is refused rather than shadowed, so [`ReleaseManifest::digest`]
+    /// and [`ReleaseManifest::to_canonical_document`] cannot disagree about
+    /// which one counts.
+    DuplicateArtifactDigest {
+        /// Artifact declared twice. Contents never appear.
+        artifact: ArtifactKind,
+    },
+    /// A retained unknown field was named after a field this build interprets.
+    ///
+    /// Only [`ReleaseManifestBuilder`] can reach this, for the same reason. Such
+    /// a manifest has no document form — rendering it would emit the name twice
+    /// — so it is refused at assembly instead of producing bytes the canonical
+    /// reader would reject.
+    UnknownFieldShadowsKnownField {
+        /// The interpreted field whose name was reused.
+        field: &'static str,
+    },
 }
 
 impl ManifestError {
@@ -256,6 +288,8 @@ impl ManifestError {
             Self::RollbackIncompatible { .. } => "rollback_incompatible",
             Self::AbsolutePath { .. } => "absolute_path",
             Self::TooManyUnknownFields { .. } => "too_many_unknown_fields",
+            Self::DuplicateArtifactDigest { .. } => "duplicate_artifact_digest",
+            Self::UnknownFieldShadowsKnownField { .. } => "unknown_field_shadows_known_field",
         }
     }
 }
@@ -312,6 +346,15 @@ impl fmt::Display for ManifestError {
             Self::TooManyUnknownFields { max } => {
                 write!(formatter, "more than {max} unknown fields were supplied")
             }
+            Self::DuplicateArtifactDigest { artifact } => write!(
+                formatter,
+                "artifact {} was given a digest twice",
+                artifact.as_str()
+            ),
+            Self::UnknownFieldShadowsKnownField { field } => write!(
+                formatter,
+                "unknown field {field} reuses the name of an interpreted field"
+            ),
         }
     }
 }
@@ -947,6 +990,158 @@ impl ReleaseManifest {
         }
     }
 
+    /// Render this manifest back to its document form.
+    ///
+    /// Rendering is total: every value this type can hold has exactly one
+    /// canonical document, which is what makes [`Self::canonical_digest`] a
+    /// function of the manifest rather than of however it happened to arrive.
+    /// The two shapes that would have no document form — a repeated artifact
+    /// digest and a retained field named after an interpreted one — are refused
+    /// by [`ReleaseManifestBuilder::build`] instead of normalized here.
+    ///
+    /// A manifest read from a canonical document renders back to those exact
+    /// bytes, with one spelling caveat: `capabilities` and `credentials` are
+    /// always written, empty or not, because the manifest cannot record whether
+    /// an absent section was omitted or spelled empty. `rollback` is written
+    /// only when present, since omission is the only spelling the reader
+    /// accepts for an absent one.
+    ///
+    /// This is a value transform. It hashes nothing, opens nothing and grants
+    /// nothing.
+    #[must_use]
+    pub fn to_canonical_document(&self) -> JsonValue {
+        let mut fields = vec![
+            (
+                "build_target".to_owned(),
+                JsonValue::String(self.build_target.as_str().to_owned()),
+            ),
+            (
+                "capabilities".to_owned(),
+                JsonValue::Array(
+                    self.capabilities
+                        .iter()
+                        .map(|capability| {
+                            JsonValue::Object(vec![
+                                (
+                                    "id".to_owned(),
+                                    JsonValue::String(capability.id.as_str().to_owned()),
+                                ),
+                                ("required".to_owned(), JsonValue::Bool(capability.required)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "credentials".to_owned(),
+                JsonValue::Array(
+                    self.credentials
+                        .iter()
+                        .map(|credential| {
+                            JsonValue::Object(vec![
+                                (
+                                    "name".to_owned(),
+                                    JsonValue::String(credential.name.as_str().to_owned()),
+                                ),
+                                (
+                                    "version".to_owned(),
+                                    JsonValue::Integer(i64::from(credential.version)),
+                                ),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "database_schema".to_owned(),
+                render_range(self.database_schema),
+            ),
+            (
+                "digests".to_owned(),
+                JsonValue::Object(
+                    self.digests
+                        .iter()
+                        .map(|(kind, digest)| (kind.as_str().to_owned(), render_digest(digest)))
+                        .collect(),
+                ),
+            ),
+            ("events".to_owned(), render_range(self.events)),
+            ("protocol".to_owned(), render_range(self.protocol)),
+            (
+                "schema_revision".to_owned(),
+                JsonValue::Integer(i64::from(self.schema_revision)),
+            ),
+            (
+                "sdk".to_owned(),
+                JsonValue::Object(vec![
+                    ("protocol".to_owned(), render_range(self.sdk.protocol())),
+                    (
+                        "schema_digest".to_owned(),
+                        render_digest(self.sdk.schema_digest()),
+                    ),
+                ]),
+            ),
+            (
+                "source_revision".to_owned(),
+                JsonValue::String(self.source_revision.as_str().to_owned()),
+            ),
+            (
+                "version".to_owned(),
+                JsonValue::String(self.version.as_str().to_owned()),
+            ),
+        ];
+        if let Some(target) = &self.rollback {
+            fields.push((
+                "rollback".to_owned(),
+                JsonValue::Object(vec![
+                    (
+                        "database_schema".to_owned(),
+                        render_range(target.database_schema),
+                    ),
+                    (
+                        "version".to_owned(),
+                        JsonValue::String(target.version.as_str().to_owned()),
+                    ),
+                ]),
+            ));
+        }
+        for (key, value) in &self.unknown_fields {
+            fields.push((key.as_str().to_owned(), value.clone()));
+        }
+        JsonValue::Object(fields)
+    }
+
+    /// Canonical document bytes for this manifest.
+    ///
+    /// [`crate::wire::JsonValue::to_canonical_bytes`] sorts keys, so the order
+    /// [`Self::to_canonical_document`] assembled them in does not reach the
+    /// output.
+    #[must_use]
+    pub fn to_canonical_bytes(&self) -> Vec<u8> {
+        self.to_canonical_document().to_canonical_bytes()
+    }
+
+    /// SHA-256 over [`Self::to_canonical_bytes`].
+    ///
+    /// This is the digest [`crate::release_trust_root::ReleaseAttestation`]
+    /// binds, and the hash is [`crate::digest::Sha256`] — written in this crate
+    /// from FIPS 180-4 rather than imported, and therefore reviewable here.
+    ///
+    /// It covers the manifest *as this build interprets it*, not the bytes a
+    /// caller supplied. The two differ exactly where the reader is permissive:
+    /// a document that omits an empty `capabilities` and one that spells it
+    /// reach the same manifest and therefore the same digest. A consumer that
+    /// needs the received bytes pinned as well must hash those bytes itself —
+    /// `automonique-sandbox`'s release boundary already does, which is why the
+    /// two checks compose rather than duplicate.
+    #[must_use]
+    pub fn canonical_digest(&self) -> ArtifactDigest {
+        ArtifactDigest {
+            algorithm: DigestAlgorithm::Sha256,
+            hex: Sha256::digest(&self.to_canonical_bytes()).to_hex(),
+        }
+    }
+
     /// Whether this release's protocol range overlaps another's.
     ///
     /// # Errors
@@ -1129,6 +1324,20 @@ impl ReleaseManifestBuilder {
             });
         }
 
+        // A second digest for one artifact kind is refused rather than
+        // shadowed. `digest()` returns the first, so a shadowed second one is
+        // unobservable through every accessor while still changing the value;
+        // that is exactly the gap between "what a consumer decides on" and
+        // "what an attestation covers" that a trust root must not have.
+        for (position, (kind, _)) in self.digests.iter().enumerate() {
+            if self.digests[..position]
+                .iter()
+                .any(|(earlier, _)| earlier == kind)
+            {
+                return Err(ManifestError::DuplicateArtifactDigest { artifact: *kind });
+            }
+        }
+
         if let Some(target) = &self.rollback {
             // A release that cannot coexist with its selected rollback target
             // is refused here, before any handoff decision exists to make.
@@ -1150,6 +1359,13 @@ impl ReleaseManifestBuilder {
         let mut unknown_fields = Vec::with_capacity(self.unknown_fields.len());
         for (key, value) in self.unknown_fields {
             let key = ManifestText::new(&key, "unknown_field_key")?;
+            if let Some(known) = KNOWN_MANIFEST_FIELDS
+                .iter()
+                .copied()
+                .find(|field| *field == key.as_str())
+            {
+                return Err(ManifestError::UnknownFieldShadowsKnownField { field: known });
+            }
             validate_unknown_value(&value)?;
             unknown_fields.push((key, value));
         }
@@ -1174,6 +1390,31 @@ impl ReleaseManifestBuilder {
 
 fn required<T>(value: Option<T>, field: &'static str) -> Result<T, ManifestError> {
     value.ok_or(ManifestError::MissingField { field })
+}
+
+/// Render a version range in the shape [`decode_range`] reads.
+fn render_range(range: VersionRange) -> JsonValue {
+    JsonValue::Object(vec![
+        (
+            "max".to_owned(),
+            JsonValue::Integer(i64::from(range.max().get())),
+        ),
+        (
+            "min".to_owned(),
+            JsonValue::Integer(i64::from(range.min().get())),
+        ),
+    ])
+}
+
+/// Render a digest in the shape [`decode_digest`] reads.
+fn render_digest(digest: &ArtifactDigest) -> JsonValue {
+    JsonValue::Object(vec![
+        (
+            "algorithm".to_owned(),
+            JsonValue::String(digest.algorithm.as_str().to_owned()),
+        ),
+        ("hex".to_owned(), JsonValue::String(digest.hex.clone())),
+    ])
 }
 
 /// Whether a value spells an absolute host path.
