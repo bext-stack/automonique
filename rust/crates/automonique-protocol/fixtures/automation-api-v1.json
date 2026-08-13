@@ -1,0 +1,729 @@
+{
+  "decode_refusals": [
+    {
+      "category": "unknown_enum_value",
+      "id": "enablement-undefined-spelling",
+      "note": "an enablement this build does not define fails closed rather than decoding to a default a client would act on — and the safe-looking guess for an unnameable state is the wrong one",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a6e756c6c2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a2264697361626c6564222c22656e7472795f6964223a312c227265766973696f6e223a312c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "unknown_enum_value",
+      "id": "refusal-undefined-spelling",
+      "note": "a refusal word outside the eight this build carries; the vocabulary is closed on both sides of the wire",
+      "payload_hex": "7b22626f6479223a7b227265667573616c223a226e6f745f617574686f72697a6564227d2c226b696e64223a2272656675736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d72656769737465722d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_unwritten_row",
+      "id": "entry-id-zero",
+      "note": "a durable identity starts at one; zero names a row no writer produced",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a6e756c6c2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a302c227265766973696f6e223a312c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_invalid_body",
+      "id": "entry-id-negative",
+      "note": "a negative identity is a malformed body rather than an unwritten row: the decoder converts before it judges the domain, and the two categories differ",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a6e756c6c2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a2d312c227265766973696f6e223a312c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_unwritten_revision",
+      "id": "revision-zero",
+      "note": "registration writes revision one and every accepted transition writes one higher, so zero is a row no writer produced — a different statement from an unwritten row identity, under a different category",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a6e756c6c2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a312c227265766973696f6e223a302c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_unwritten_revision",
+      "id": "receipt-revision-zero",
+      "note": "the same rule on a receipt, which is the answer a write returns",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a312c227265766973696f6e223a302c22757064617465645f61745f6d73223a313730303030303030303030307d2c226b696e64223a226175746f6d6174696f6e5f6163636570746564222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d7365742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_time_before_epoch",
+      "id": "created-at-before-epoch",
+      "note": "a registration instant the store's own `created_at_ms >= 0` constraint cannot hold",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a6e756c6c2c22637265617465645f61745f6d73223a2d312c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a312c227265766973696f6e223a312c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_time_before_epoch",
+      "id": "receipt-updated-at-before-epoch",
+      "note": "the same constraint on the instant a write reports",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a312c227265766973696f6e223a312c22757064617465645f61745f6d73223a2d317d2c226b696e64223a226175746f6d6174696f6e5f6163636570746564222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d7365742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_invalid_field",
+      "id": "cause-empty-string",
+      "note": "an empty cause is refused rather than read as `no reason given`: a withdrawal an operator cannot safely resume from is the one this product does not offer a spelling for. The absence of a cause is null",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a22222c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a22706175736564222c22656e7472795f6964223a312c227265766973696f6e223a322c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_invalid_body",
+      "id": "cause-not-a-string",
+      "note": "the field is a string or a null and nothing else; a number is a malformed body rather than a cause",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a352c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a312c227265766973696f6e223a312c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_invalid_field",
+      "id": "automation-id-over-bound",
+      "note": "one byte over the identity bound, measured in UTF-8 bytes rather than in the UTF-16 code units a JavaScript `length` counts",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c226361757365223a6e756c6c2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a312c227265766973696f6e223a312c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_invalid_field",
+      "id": "actor-empty",
+      "note": "an empty actor names nobody, and this lane records who asked",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a22222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a6e756c6c2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a312c227265766973696f6e223a312c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_page_too_large",
+      "id": "page-over-bound",
+      "note": "one row past MAX_AUTOMATION_PAGE_ITEMS. The length is judged before any item is read, so what these items are does not matter and the refusal names the length",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b302c312c322c332c342c352c362c372c382c392c31302c31312c31322c31332c31342c31352c31362c31372c31382c31392c32302c32312c32322c32332c32342c32352c32362c32372c32382c32392c33302c33312c33325d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_invalid_body",
+      "id": "next-cursor-negative",
+      "note": "a cursor below the beginning of the listing",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b5d2c226d6f7265223a747275652c226e6578745f637572736f72223a2d317d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_invalid_body",
+      "id": "more-not-a-boolean",
+      "note": "the wire carries true or false for a continuation and nothing else",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b5d2c226d6f7265223a312c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_unwritten_revision",
+      "id": "conflict-expected-revision-zero",
+      "note": "a conflict about a revision no writer produced tells a caller to retry against nothing",
+      "payload_hex": "7b22626f6479223a7b2264757261626c655f7265766973696f6e223a352c2265787065637465645f7265766973696f6e223a307d2c226b696e64223a227265766973696f6e5f636f6e666c696374222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d7365742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_invalid_body",
+      "id": "page-extra-field",
+      "note": "an unexpected key is refused rather than ignored",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c2c22746f74616c223a317d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_invalid_body",
+      "id": "record-missing-field",
+      "note": "a missing key is refused rather than defaulted, inside a nested body as much as at the top level",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a6e756c6c2c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a312c227265766973696f6e223a312c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "automation_unknown_kind",
+      "id": "unknown-kind",
+      "note": "a kind this protocol version does not define, which is a different answer from a kind it defines and this surface does not decode",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f686973746f72795f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "unknown_protocol",
+      "id": "runs-protocol-message",
+      "note": "the Runs lane's name on this lane's decoder, refused on the name axis so each protocol's closed kind set stays closed",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e72756e73222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "unsupported_version",
+      "id": "unsupported-version",
+      "note": "this protocol at a major version neither side implements",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a327d"
+    },
+    {
+      "category": "non_canonical_json",
+      "id": "non-canonical-key-order",
+      "note": "a payload that parses but is not canonical is refused, not normalized",
+      "payload_hex": "7b226b696e64223a2272656675736564222c22626f6479223a7b227265667573616c223a2272656769737472795f66756c6c227d2c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d72656769737465722d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "malformed_json",
+      "id": "empty-payload",
+      "note": "zero bytes is not an empty message",
+      "payload_hex": ""
+    }
+  ],
+  "encode_refusals": [
+    {
+      "category": "automation_cause_required",
+      "id": "set-enablement-pause-without-cause",
+      "kind": "set_enablement",
+      "note": "the coupling, on the way out: a pause with no stated cause is refused before a frame is spent, because a withdrawal an operator cannot safely resume from is not a request this product has a shape for",
+      "params": {
+        "actor": "ops/oncall",
+        "automation_id": "auto-nightly",
+        "cause": null,
+        "expected_revision": "2",
+        "target": "paused"
+      },
+      "request_id": "req-set-1"
+    },
+    {
+      "category": "automation_cause_required",
+      "id": "set-enablement-archive-without-cause",
+      "kind": "set_enablement",
+      "note": "the terminal state owes a cause as much as the resumable one does",
+      "params": {
+        "actor": "ops/oncall",
+        "automation_id": "auto-nightly",
+        "cause": null,
+        "expected_revision": "2",
+        "target": "archived"
+      },
+      "request_id": "req-set-1"
+    },
+    {
+      "category": "automation_cause_forbidden",
+      "id": "set-enablement-resume-with-cause",
+      "kind": "set_enablement",
+      "note": "the other half of the coupling: a resume that states a cause is refused rather than silently dropping the cause, which would leave the caller believing it recorded something",
+      "params": {
+        "actor": "ops/oncall",
+        "automation_id": "auto-nightly",
+        "cause": "held for the migration",
+        "expected_revision": "2",
+        "target": "enabled"
+      },
+      "request_id": "req-set-1"
+    },
+    {
+      "category": "automation_unwritten_revision",
+      "id": "set-enablement-revision-zero",
+      "kind": "set_enablement",
+      "note": "zero names a row no writer produced, which is a different fault from a counter the wire cannot carry — and the two categories differ",
+      "params": {
+        "actor": "ops/oncall",
+        "automation_id": "auto-nightly",
+        "cause": null,
+        "expected_revision": "0",
+        "target": "enabled"
+      },
+      "refused_by": "DurableRowId",
+      "refused_param": "expected_revision",
+      "request_id": "req-set-1",
+      "violation": "out_of_range"
+    },
+    {
+      "category": "automation_counter_out_of_range",
+      "id": "set-enablement-revision-above-wire-ceiling",
+      "kind": "set_enablement",
+      "note": "one past the largest integer this wire carries: the same branded constructor refuses it, and the encoder reports the other end of the range",
+      "params": {
+        "actor": "ops/oncall",
+        "automation_id": "auto-nightly",
+        "cause": null,
+        "expected_revision": "9223372036854775808",
+        "target": "enabled"
+      },
+      "refused_by": "DurableRowId",
+      "refused_param": "expected_revision",
+      "request_id": "req-set-1",
+      "violation": "out_of_range"
+    },
+    {
+      "category": "unknown_enum_value",
+      "id": "set-enablement-undefined-target",
+      "kind": "set_enablement",
+      "note": "a brand exists only in the type checker, so the builder is where an untyped caller's undefined state is stopped. The coupling passes first — an unknown target requires no cause and none is given — so what refuses this is the vocabulary rather than the relation",
+      "params": {
+        "actor": "ops/oncall",
+        "automation_id": "auto-nightly",
+        "cause": null,
+        "expected_revision": "2",
+        "target": "disabled"
+      },
+      "request_id": "req-set-1"
+    },
+    {
+      "category": "automation_invalid_field",
+      "id": "set-enablement-cause-over-bound",
+      "kind": "set_enablement",
+      "note": "one byte over the cause bound, measured in UTF-8 bytes",
+      "params": {
+        "actor": "ops/oncall",
+        "automation_id": "auto-nightly",
+        "cause": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expected_revision": "2",
+        "target": "paused"
+      },
+      "refused_by": "PauseReason",
+      "refused_param": "cause",
+      "request_id": "req-set-1",
+      "violation": "too_long"
+    },
+    {
+      "category": "automation_invalid_field",
+      "id": "register-automation-id-over-bound",
+      "kind": "register_automation",
+      "note": "one byte over the identity bound",
+      "params": {
+        "actor": "ops/oncall",
+        "automation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "refused_by": "AutomationId",
+      "refused_param": "automation_id",
+      "request_id": "req-register-1",
+      "violation": "too_long"
+    },
+    {
+      "category": "automation_invalid_field",
+      "id": "register-actor-control-character",
+      "kind": "register_automation",
+      "note": "a control character in an actor, which the wire never carries raw",
+      "params": {
+        "actor": "ops\u0007oncall",
+        "automation_id": "auto-nightly"
+      },
+      "refused_by": "AutomationActor",
+      "refused_param": "actor",
+      "request_id": "req-register-1",
+      "violation": "invalid_character"
+    },
+    {
+      "category": "automation_invalid_field",
+      "id": "automation-detail-id-empty",
+      "kind": "automation_detail",
+      "note": "an empty identity names nothing",
+      "params": {
+        "automation_id": ""
+      },
+      "refused_by": "AutomationId",
+      "refused_param": "automation_id",
+      "request_id": "req-detail-1",
+      "violation": "empty"
+    },
+    {
+      "category": "automation_page_size_out_of_range",
+      "id": "list-automations-page-size-zero",
+      "kind": "list_automations",
+      "note": "a page that admits nothing cannot make progress, so zero is refused rather than treated as a default",
+      "params": {
+        "page_size": "0",
+        "since": "0",
+        "states": null
+      },
+      "refused_by": "AutomationPageSize",
+      "refused_param": "page_size",
+      "request_id": "req-list-1",
+      "violation": "out_of_range"
+    },
+    {
+      "category": "automation_page_size_out_of_range",
+      "id": "list-automations-page-size-above-bound",
+      "kind": "list_automations",
+      "note": "one past MAX_AUTOMATION_PAGE_ITEMS, which is thirty-two here and sixty-four on the Runs lane: a page bound follows the frame arithmetic of the rows it carries",
+      "params": {
+        "page_size": "33",
+        "since": "0",
+        "states": null
+      },
+      "refused_by": "AutomationPageSize",
+      "refused_param": "page_size",
+      "request_id": "req-list-1",
+      "violation": "out_of_range"
+    },
+    {
+      "category": "automation_counter_out_of_range",
+      "id": "list-automations-cursor-above-wire-ceiling",
+      "kind": "list_automations",
+      "note": "a cursor one past the largest integer this wire carries, which is a counter refusal rather than a malformed body",
+      "params": {
+        "page_size": "1",
+        "since": "9223372036854775808",
+        "states": null
+      },
+      "refused_by": "AutomationCursor",
+      "refused_param": "since",
+      "request_id": "req-list-1",
+      "violation": "out_of_range"
+    },
+    {
+      "category": "automation_state_filter_empty",
+      "id": "list-automations-empty-state-filter",
+      "kind": "list_automations",
+      "note": "an empty filter admits nothing, which no listing could ever answer; it is not the same request as no filter at all",
+      "params": {
+        "page_size": "1",
+        "since": "0",
+        "states": []
+      },
+      "request_id": "req-list-1"
+    },
+    {
+      "category": "automation_state_filter_repeats",
+      "id": "list-automations-repeated-state",
+      "kind": "list_automations",
+      "note": "a repeat means a caller believes it asked for something it did not",
+      "params": {
+        "page_size": "1",
+        "since": "0",
+        "states": [
+          "paused",
+          "paused"
+        ]
+      },
+      "request_id": "req-list-1"
+    },
+    {
+      "category": "unknown_enum_value",
+      "id": "list-automations-undefined-state",
+      "kind": "list_automations",
+      "note": "an undefined state in a filter, stopped where an untyped caller reaches the builder",
+      "params": {
+        "page_size": "1",
+        "since": "0",
+        "states": [
+          "disabled"
+        ]
+      },
+      "request_id": "req-list-1"
+    },
+    {
+      "category": "field_invalid",
+      "id": "request-id-too-long",
+      "kind": "automation_detail",
+      "note": "the envelope's fields are judged by the shared codec, whose refusal for a bound is not the one this protocol uses for a body",
+      "params": {
+        "automation_id": "auto-nightly"
+      },
+      "refused_by": "RequestId",
+      "refused_param": "request_id",
+      "request_id": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "violation": "too_long"
+    },
+    {
+      "category": "field_grammar",
+      "id": "request-id-outside-grammar",
+      "kind": "automation_detail",
+      "note": "a grammar refusal is not a bounds refusal, and the categories differ. A space is outside the correlation identifier's grammar and inside the automation identity's, which is the difference this lane's looser identifier makes",
+      "params": {
+        "automation_id": "auto nightly"
+      },
+      "refused_by": "RequestId",
+      "refused_param": "request_id",
+      "request_id": "req 1",
+      "violation": "invalid_character"
+    }
+  ],
+  "generator": "automonique-protocol tests/codegen.rs, module automation_surface",
+  "note": "Generated from the shipped Rust constructors: every canonical byte string here was produced by encoding a real message and re-read through from_canonical_bytes before it was written, and every refusal category was read back from the error Rust returned for that exact input. Counters travel as decimal strings because a JSON reader using a double would round the largest of them without saying so. Rust is the wire source of truth, so a disagreement is fixed in whichever implementation is wrong — never in this file.",
+  "protocol": "automonique.automation",
+  "requests": [
+    {
+      "canonical_bytes": 312,
+      "canonical_hex": "7b22626f6479223a7b22706167655f73697a65223a33322c2273696e6365223a393232333337323033363835343737353830372c22737461746573223a5b22656e61626c6564222c22706175736564222c226172636869766564225d7d2c226b696e64223a226c6973745f6175746f6d6174696f6e73222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c2276657273696f6e223a317d",
+      "id": "list-automations-maximal",
+      "kind": "list_automations",
+      "note": "every bound at once: all three states, a cursor at the wire's integer ceiling, the largest page this protocol serves, and a correlation identifier at MAX_REQUEST_ID_BYTES. The states are recorded shuffled — the wire order is the enum's declaration order, which is neither the caller's nor alphabetical",
+      "params": {
+        "page_size": "32",
+        "since": "9223372036854775807",
+        "states": [
+          "paused",
+          "archived",
+          "enabled"
+        ]
+      },
+      "request_id": "req-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "canonical_bytes": 148,
+      "canonical_hex": "7b22626f6479223a7b22706167655f73697a65223a312c2273696e6365223a302c22737461746573223a6e756c6c7d2c226b696e64223a226c6973745f6175746f6d6174696f6e73222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "id": "list-automations-unfiltered",
+      "kind": "list_automations",
+      "note": "no filter and the beginning of the listing: an explicit null, which is a different wire fact from a filter naming every state, and a cursor of zero, which is a position rather than the absence of one",
+      "params": {
+        "page_size": "1",
+        "since": "0",
+        "states": null
+      },
+      "request_id": "req-list-1"
+    },
+    {
+      "canonical_bytes": 165,
+      "canonical_hex": "7b22626f6479223a7b22706167655f73697a65223a342c2273696e6365223a372c22737461746573223a5b22706175736564222c226172636869766564225d7d2c226b696e64223a226c6973745f6175746f6d6174696f6e73222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d32222c2276657273696f6e223a317d",
+      "id": "list-automations-withdrawn-only",
+      "kind": "list_automations",
+      "note": "a two-state filter naming exactly the two states that carry a cause",
+      "params": {
+        "page_size": "4",
+        "since": "7",
+        "states": [
+          "archived",
+          "paused"
+        ]
+      },
+      "request_id": "req-list-2"
+    },
+    {
+      "canonical_bytes": 367,
+      "canonical_hex": "7b22626f6479223a7b226163746f72223a226f70732f5c226f6e63616c6c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c226175746f6d6174696f6e5f6964223a226175746f2f5c226e696768746c79206469676573745c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c226361757365223a2268656c643a205c226d61696e74656e616e63655c22205c5c2077697468647261776e206279206f70732f6f6e63616c6c20e28094206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c2265787065637465645f7265766973696f6e223a393232333337323033363835343737353830372c22746172676574223a22706175736564227d2c226b696e64223a227365745f656e61626c656d656e74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d7365742d31222c2276657273696f6e223a317d",
+      "id": "set-enablement-pause-escaping",
+      "kind": "set_enablement",
+      "note": "a withdrawal at the wire's ceiling revision, with an actor and a cause carrying every escape a bounded field can reach, a three-byte character and a surrogate pair; the automation identity carries a space, which this lane's grammar admits and DurableId's does not",
+      "params": {
+        "actor": "ops/\"oncall\" \\ naïve 日本語 🚀",
+        "automation_id": "auto/\"nightly digest\" \\ naïve 日本語 🚀",
+        "cause": "held: \"maintenance\" \\ withdrawn by ops/oncall — naïve 日本語 🚀",
+        "expected_revision": "9223372036854775807",
+        "target": "paused"
+      },
+      "request_id": "req-set-1"
+    },
+    {
+      "canonical_bytes": 213,
+      "canonical_hex": "7b22626f6479223a7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a6e756c6c2c2265787065637465645f7265766973696f6e223a322c22746172676574223a22656e61626c6564227d2c226b696e64223a227365745f656e61626c656d656e74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d7365742d32222c2276657273696f6e223a317d",
+      "id": "set-enablement-resume",
+      "kind": "set_enablement",
+      "note": "a resume states no cause, and the null is explicit: the absence of a reason is a fact this wire carries rather than a key it omits",
+      "params": {
+        "actor": "ops/oncall",
+        "automation_id": "auto-nightly",
+        "cause": null,
+        "expected_revision": "2",
+        "target": "enabled"
+      },
+      "request_id": "req-set-2"
+    },
+    {
+      "canonical_bytes": 241,
+      "canonical_hex": "7b22626f6479223a7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a2273757065727365646564206279206175746f2d6e696768746c792d7632222c2265787065637465645f7265766973696f6e223a332c22746172676574223a226172636869766564227d2c226b696e64223a227365745f656e61626c656d656e74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d7365742d33222c2276657273696f6e223a317d",
+      "id": "set-enablement-archive",
+      "kind": "set_enablement",
+      "note": "the terminal state, which also owes a cause; nothing transitions out of it",
+      "params": {
+        "actor": "ops/oncall",
+        "automation_id": "auto-nightly",
+        "cause": "superseded by auto-nightly-v2",
+        "expected_revision": "3",
+        "target": "archived"
+      },
+      "request_id": "req-set-3"
+    },
+    {
+      "canonical_bytes": 698,
+      "canonical_hex": "7b22626f6479223a7b226163746f72223a226f70732f5c226f6e63616c6c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c226175746f6d6174696f6e5f6964223a225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22227d2c226b696e64223a2272656769737465725f6175746f6d6174696f6e222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d72656769737465722d31222c2276657273696f6e223a317d",
+      "id": "register-automation-maximal",
+      "kind": "register_automation",
+      "note": "an identity at MAX_AUTOMATION_API_FIELD_BYTES whose every character escapes to two bytes, which is the worst case this protocol's frame arithmetic budgets for",
+      "params": {
+        "actor": "ops/\"oncall\" \\ naïve 日本語 🚀",
+        "automation_id": "\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\""
+      },
+      "request_id": "req-register-1"
+    },
+    {
+      "canonical_bytes": 180,
+      "canonical_hex": "7b22626f6479223a7b226175746f6d6174696f6e5f6964223a226175746f2f5c226e696768746c79206469676573745c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80227d2c226b696e64223a226175746f6d6174696f6e5f64657461696c222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d",
+      "id": "automation-detail-escaping",
+      "kind": "automation_detail",
+      "note": "one automation read by an identity carrying every reachable escape",
+      "params": {
+        "automation_id": "auto/\"nightly digest\" \\ naïve 日本語 🚀"
+      },
+      "request_id": "req-detail-1"
+    }
+  ],
+  "responses": [
+    {
+      "canonical_hex": "7b22626f6479223a7b226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a312c227265766973696f6e223a312c22757064617465645f61745f6d73223a313730303030303030303030307d2c226b696e64223a226175746f6d6174696f6e5f6163636570746564222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d72656769737465722d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "automation_id": "auto-nightly",
+        "enablement": "enabled",
+        "entry_id": "1",
+        "request_id": "req-register-1",
+        "revision": "1",
+        "updated_at_ms": "1700000000000"
+      },
+      "id": "accepted-registration",
+      "kind": "automation_accepted",
+      "note": "what a registration establishes: revision one, enabled, with no cause. `accepted` says the row is recorded, never that anything will run it",
+      "outcome": "accepted"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b226175746f6d6174696f6e5f6964223a226175746f2f5c226e696768746c79206469676573745c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c22656e61626c656d656e74223a22706175736564222c22656e7472795f6964223a393232333337323033363835343737353830362c227265766973696f6e223a393232333337323033363835343737353830372c22757064617465645f61745f6d73223a393232333337323033363835343737353830377d2c226b696e64223a226175746f6d6174696f6e5f6163636570746564222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d7365742d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "automation_id": "auto/\"nightly digest\" \\ naïve 日本語 🚀",
+        "enablement": "paused",
+        "entry_id": "9223372036854775806",
+        "request_id": "req-set-1",
+        "revision": "9223372036854775807",
+        "updated_at_ms": "9223372036854775807"
+      },
+      "id": "accepted-pause-at-ceiling",
+      "kind": "automation_accepted",
+      "note": "a withdrawal landing at the wire's ceiling revision and instant, both of which a decoder carrying counters in a double would round to an even neighbour",
+      "outcome": "accepted"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6669727374222c226361757365223a6e756c6c2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a312c227265766973696f6e223a332c22757064617465645f61745f6d73223a313730303030303030303530307d2c7b226163746f72223a226f70732f5c226f6e63616c6c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c226175746f6d6174696f6e5f6964223a226175746f2f5c226e696768746c79206469676573745c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c226361757365223a2268656c643a205c226d61696e74656e616e63655c22205c5c2077697468647261776e206279206f70732f6f6e63616c6c20e28094206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c22637265617465645f61745f6d73223a302c22656e61626c656d656e74223a226172636869766564222c22656e7472795f6964223a393232333337323033363835343737353830362c227265766973696f6e223a322c22757064617465645f61745f6d73223a393232333337323033363835343737353830377d5d2c226d6f7265223a747275652c226e6578745f637572736f72223a393232333337323033363835343737353830377d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a226175746f6d6174696f6e2d6c6973742d706167652d6d6f7265222c2276657273696f6e223a317d",
+      "decoded": {
+        "automations.0.actor": "ops/oncall",
+        "automations.0.automation_id": "auto-first",
+        "automations.0.cause": "null",
+        "automations.0.created_at_ms": "1700000000000",
+        "automations.0.enablement": "enabled",
+        "automations.0.entry_id": "1",
+        "automations.0.revision": "3",
+        "automations.0.updated_at_ms": "1700000000500",
+        "automations.1.actor": "ops/\"oncall\" \\ naïve 日本語 🚀",
+        "automations.1.automation_id": "auto/\"nightly digest\" \\ naïve 日本語 🚀",
+        "automations.1.cause": "held: \"maintenance\" \\ withdrawn by ops/oncall — naïve 日本語 🚀",
+        "automations.1.created_at_ms": "0",
+        "automations.1.enablement": "archived",
+        "automations.1.entry_id": "9223372036854775806",
+        "automations.1.revision": "2",
+        "automations.1.updated_at_ms": "9223372036854775807",
+        "automations.len": "2",
+        "more": "true",
+        "next_cursor": "9223372036854775807",
+        "request_id": "automation-list-page-more"
+      },
+      "id": "automation-list-page-more",
+      "kind": "automation_list_result",
+      "note": "a page whose last row and whose continuation cursor are both at the wire's ceiling, carrying a resumed automation beside a withdrawn one so that a null cause and a stated one travel in the same array",
+      "outcome": "completed"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b5d2c226d6f7265223a747275652c226e6578745f637572736f72223a34327d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a226175746f6d6174696f6e2d6c6973742d706167652d656d7074792d6d6f7265222c2276657273696f6e223a317d",
+      "decoded": {
+        "automations.len": "0",
+        "more": "true",
+        "next_cursor": "42",
+        "request_id": "automation-list-page-empty-more"
+      },
+      "id": "automation-list-page-empty-more",
+      "kind": "automation_list_result",
+      "note": "an empty page that still reports more: an enablement filter can exclude every row in one scanned window while rows remain behind it, so a client that inferred `done` from a short page would stop early",
+      "outcome": "completed"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6f6e6c79222c226361757365223a2268656c6420666f7220746865206d6967726174696f6e222c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a22706175736564222c22656e7472795f6964223a392c227265766973696f6e223a322c22757064617465645f61745f6d73223a313730303030303030393030307d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a226175746f6d6174696f6e2d6c6973742d706167652d636f6d706c657465222c2276657273696f6e223a317d",
+      "decoded": {
+        "automations.0.actor": "ops/oncall",
+        "automations.0.automation_id": "auto-only",
+        "automations.0.cause": "held for the migration",
+        "automations.0.created_at_ms": "1700000000000",
+        "automations.0.enablement": "paused",
+        "automations.0.entry_id": "9",
+        "automations.0.revision": "2",
+        "automations.0.updated_at_ms": "1700000009000",
+        "automations.len": "1",
+        "more": "false",
+        "next_cursor": "null",
+        "request_id": "automation-list-page-complete"
+      },
+      "id": "automation-list-page-complete",
+      "kind": "automation_list_result",
+      "note": "the end of the registry: `more` false and an explicit null cursor",
+      "outcome": "completed"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b226163746f72223a226f70732f5c226f6e63616c6c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c226175746f6d6174696f6e5f6964223a226175746f2f5c226e696768746c79206469676573745c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c226361757365223a2268656c643a205c226d61696e74656e616e63655c22205c5c2077697468647261776e206279206f70732f6f6e63616c6c20e28094206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a22706175736564222c22656e7472795f6964223a342c227265766973696f6e223a322c22757064617465645f61745f6d73223a313730303030303030313030307d2c226b696e64223a226175746f6d6174696f6e5f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "actor": "ops/\"oncall\" \\ naïve 日本語 🚀",
+        "automation_id": "auto/\"nightly digest\" \\ naïve 日本語 🚀",
+        "cause": "held: \"maintenance\" \\ withdrawn by ops/oncall — naïve 日本語 🚀",
+        "created_at_ms": "1700000000000",
+        "enablement": "paused",
+        "entry_id": "4",
+        "request_id": "req-detail-1",
+        "revision": "2",
+        "updated_at_ms": "1700000001000"
+      },
+      "id": "automation-detail-paused",
+      "kind": "automation_detail_result",
+      "note": "one automation in full, withdrawn: the actor is whoever withdrew it and the cause is why, which is the whole of the history this registry keeps",
+      "outcome": "completed"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6672657368222c226361757365223a6e756c6c2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a352c227265766973696f6e223a312c22757064617465645f61745f6d73223a313730303030303030303030307d2c226b696e64223a226175746f6d6174696f6e5f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d64657461696c2d32222c2276657273696f6e223a317d",
+      "decoded": {
+        "actor": "ops/oncall",
+        "automation_id": "auto-fresh",
+        "cause": "null",
+        "created_at_ms": "1700000000000",
+        "enablement": "enabled",
+        "entry_id": "5",
+        "request_id": "req-detail-2",
+        "revision": "1",
+        "updated_at_ms": "1700000000000"
+      },
+      "id": "automation-detail-never-paused",
+      "kind": "automation_detail_result",
+      "note": "a never-paused automation at revision one: the actor is the registrant rather than a resumer, and the cause is null",
+      "outcome": "completed"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b2264757261626c655f7265766973696f6e223a372c2265787065637465645f7265766973696f6e223a337d2c226b696e64223a227265766973696f6e5f636f6e666c696374222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d7365742d32222c2276657273696f6e223a317d",
+      "decoded": {
+        "durable_revision": "7",
+        "expected_revision": "3",
+        "request_id": "req-set-2"
+      },
+      "id": "revision-conflict",
+      "kind": "revision_conflict",
+      "note": "a stale fencing revision, which is not a rejection: the caller retries against the durable revision this carries",
+      "outcome": "conflict"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b227265667573616c223a22616c72656164795f72656769737465726564227d2c226b696e64223a2272656675736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d72656769737465722d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "refusal": "already_registered",
+        "request_id": "req-register-1"
+      },
+      "id": "refused-already-registered",
+      "kind": "refused",
+      "note": "the identity is already registered, whatever state its row is in",
+      "outcome": "rejected"
+    }
+  ],
+  "rust_only_refusals": [
+    {
+      "id": "record-cause-required",
+      "note": "a withdrawn row with no stated cause: the same coupling the builder applies on the way out, met on the way in, where this surface does not hold it",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a6e756c6c2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a22706175736564222c22656e7472795f6964223a312c227265766973696f6e223a322c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "rust_category": "automation_cause_required"
+    },
+    {
+      "id": "record-cause-forbidden",
+      "note": "an enabled row carrying a cause, which would say an automation in service was withdrawn",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a2268656c6420666f72206d61696e74656e616e6365222c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a312c227265766973696f6e223a312c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "rust_category": "automation_cause_forbidden"
+    },
+    {
+      "id": "record-withdrawn-at-first-revision",
+      "note": "registration is the only writer of revision one and it always writes enabled, so a withdrawn row below revision two is a row no writer produced",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a2273757065727365646564222c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a226172636869766564222c22656e7472795f6964223a312c227265766973696f6e223a312c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "rust_category": "automation_withdrawn_at_first_revision"
+    },
+    {
+      "id": "receipt-withdrawn-at-first-revision",
+      "note": "the same rule on a receipt",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c22656e61626c656d656e74223a22706175736564222c22656e7472795f6964223a312c227265766973696f6e223a312c22757064617465645f61745f6d73223a313730303030303030303030307d2c226b696e64223a226175746f6d6174696f6e5f6163636570746564222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d7365742d31222c2276657273696f6e223a317d",
+      "rust_category": "automation_withdrawn_at_first_revision"
+    },
+    {
+      "id": "page-out-of-order",
+      "note": "records that do not strictly increase by durable row identity, so the next page would re-serve or skip",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a6e756c6c2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a352c227265766973696f6e223a312c22757064617465645f61745f6d73223a313730303030303030303030307d2c7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a6e756c6c2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a322c227265766973696f6e223a312c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "rust_category": "automation_page_out_of_order"
+    },
+    {
+      "id": "continuation-incoherent",
+      "note": "rows follow, with no cursor to resume from",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b5d2c226d6f7265223a747275652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "rust_category": "automation_continuation_incoherent"
+    },
+    {
+      "id": "continuation-rewinds",
+      "note": "a continuation cursor below the last row on the page, which would re-serve it",
+      "payload_hex": "7b22626f6479223a7b226175746f6d6174696f6e73223a5b7b226163746f72223a226f70732f6f6e63616c6c222c226175746f6d6174696f6e5f6964223a226175746f2d6e696768746c79222c226361757365223a6e756c6c2c22637265617465645f61745f6d73223a313730303030303030303030302c22656e61626c656d656e74223a22656e61626c6564222c22656e7472795f6964223a392c227265766973696f6e223a312c22757064617465645f61745f6d73223a313730303030303030303030307d5d2c226d6f7265223a747275652c226e6578745f637572736f72223a347d2c226b696e64223a226175746f6d6174696f6e5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "rust_category": "automation_continuation_rewinds"
+    },
+    {
+      "id": "conflict-without-disagreement",
+      "note": "a conflict naming the revision the caller expected, which is agreement — and would tell a caller to retry with the revision it already used",
+      "payload_hex": "7b22626f6479223a7b2264757261626c655f7265766973696f6e223a342c2265787065637465645f7265766973696f6e223a347d2c226b696e64223a227265766973696f6e5f636f6e666c696374222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d7365742d31222c2276657273696f6e223a317d",
+      "rust_category": "automation_conflict_without_disagreement"
+    }
+  ],
+  "rust_only_refusals_note": "Payloads the Rust constructors refuse and the generated TypeScript accepts. Each breaks a rule relating two fields of a decoded message, which the generated surface does not hold. The request-side enablement/cause coupling is deliberately absent from this list: the generated builder does apply it, and encode_refusals is where that is proved. The runner asserts these decode, so the remaining gap is measured rather than described — teaching the generator one of these rules turns the suite red until the entry moves to decode_refusals.",
+  "version": 1
+}

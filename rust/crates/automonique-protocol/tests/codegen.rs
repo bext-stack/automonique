@@ -106,6 +106,102 @@ fn run_runtime_conformance() -> Option<RuntimeRun> {
     })
 }
 
+/// Every refusal category one command surface's fields actually refuse with.
+///
+/// The two `match`es are the coverage gate rather than a convenience: a value
+/// kind added to [`RequestValue`] or [`ResponseValue`] fails to compile here,
+/// so a new way to refuse cannot reach the generated surface without a test
+/// asking whether its category is declared. Both the Runs and the Automation
+/// suites read it, so one arm covers both.
+fn referenced_categories(surface: &automonique_protocol::codegen::CommandSurface) -> Vec<String> {
+    use automonique_protocol::codegen::{RequestValue, ResponseValue};
+
+    let mut referenced = Vec::new();
+    for field in surface.requests.iter().flat_map(|request| &request.fields) {
+        match &field.value {
+            RequestValue::Checked {
+                refusal_category, ..
+            }
+            | RequestValue::NullableChecked {
+                refusal_category, ..
+            }
+            | RequestValue::Integer {
+                refusal_category, ..
+            }
+            | RequestValue::NullableInteger {
+                refusal_category, ..
+            } => referenced.push(refusal_category.clone()),
+            RequestValue::RangedInteger {
+                below_category,
+                above_category,
+                ..
+            } => referenced.extend([below_category.clone(), above_category.clone()]),
+            RequestValue::Enum {
+                unknown_category, ..
+            } => referenced.push(unknown_category.clone()),
+            RequestValue::HexBytes {
+                oversize_category, ..
+            } => referenced.push(oversize_category.clone()),
+            RequestValue::NullableEnumSet {
+                empty_category,
+                repeat_category,
+                unknown_category,
+                ..
+            } => referenced.extend([
+                empty_category.clone(),
+                repeat_category.clone(),
+                unknown_category.clone(),
+            ]),
+        }
+    }
+    // A coupling refuses under two categories of its own, and neither is any
+    // one field's: they belong to the relation between two.
+    for coupling in surface
+        .requests
+        .iter()
+        .filter_map(|request| request.coupling.as_ref())
+    {
+        referenced.extend([
+            coupling.required_category.clone(),
+            coupling.forbidden_category.clone(),
+        ]);
+    }
+    for field in surface
+        .responses
+        .iter()
+        .flat_map(|response| &response.fields)
+        .chain(
+            surface
+                .body_objects
+                .iter()
+                .flat_map(|object| &object.fields),
+        )
+    {
+        match &field.value {
+            ResponseValue::Bool | ResponseValue::Object { .. } => {}
+            ResponseValue::Checked {
+                refusal_category, ..
+            }
+            | ResponseValue::NullableChecked {
+                refusal_category, ..
+            }
+            | ResponseValue::Integer {
+                refusal_category, ..
+            }
+            | ResponseValue::NullableInteger {
+                refusal_category, ..
+            } => referenced.push(refusal_category.clone()),
+            ResponseValue::Enum {
+                unknown_category, ..
+            } => referenced.push(unknown_category.clone()),
+            ResponseValue::ObjectArray {
+                oversize_category, ..
+            } => referenced.push(oversize_category.clone()),
+        }
+    }
+    referenced
+}
+
 mod source_direction {
     use super::*;
 
@@ -2699,8 +2795,8 @@ mod runs_surface {
 
     use automonique_protocol::codec::{MAX_REQUEST_ID_BYTES, MajorVersion};
     use automonique_protocol::codegen::{
-        CommandSurface, ConstantValue, REGENERATE_COMMAND, RUNS_MODULE, RequestValue,
-        ResponseValue, generated_files, maintained_modules, module_file_name,
+        CommandSurface, ConstantValue, REGENERATE_COMMAND, RUNS_MODULE, generated_files,
+        maintained_modules, module_file_name,
     };
     use automonique_protocol::digest::Sha256;
     use automonique_protocol::event::Authority;
@@ -4384,62 +4480,7 @@ mod runs_surface {
             surface.field_invalid_category.clone(),
             surface.field_grammar_category.clone(),
         ];
-        for field in surface.requests.iter().flat_map(|request| &request.fields) {
-            match &field.value {
-                RequestValue::Checked {
-                    refusal_category, ..
-                }
-                | RequestValue::Integer {
-                    refusal_category, ..
-                }
-                | RequestValue::NullableInteger {
-                    refusal_category, ..
-                } => referenced.push(refusal_category.clone()),
-                RequestValue::HexBytes {
-                    oversize_category, ..
-                } => referenced.push(oversize_category.clone()),
-                RequestValue::NullableEnumSet {
-                    empty_category,
-                    repeat_category,
-                    unknown_category,
-                    ..
-                } => referenced.extend([
-                    empty_category.clone(),
-                    repeat_category.clone(),
-                    unknown_category.clone(),
-                ]),
-            }
-        }
-        for field in surface
-            .responses
-            .iter()
-            .flat_map(|response| &response.fields)
-            .chain(
-                surface
-                    .body_objects
-                    .iter()
-                    .flat_map(|object| &object.fields),
-            )
-        {
-            match &field.value {
-                ResponseValue::Bool | ResponseValue::Object { .. } => {}
-                ResponseValue::Checked {
-                    refusal_category, ..
-                }
-                | ResponseValue::Integer {
-                    refusal_category, ..
-                }
-                | ResponseValue::NullableInteger {
-                    refusal_category, ..
-                } => referenced.push(refusal_category.clone()),
-                ResponseValue::Enum {
-                    unknown_category, ..
-                } => referenced.push(unknown_category.clone()),
-                ResponseValue::ObjectArray {
-                    oversize_category, ..
-                } => referenced.push(oversize_category.clone()),
-            }
-        }
+        referenced.extend(referenced_categories(&surface));
         for name in &referenced {
             assert!(
                 declared.contains_key(name),
@@ -4660,6 +4701,2306 @@ mod runs_surface {
         );
         println!(
             "runs api surface under {runtime}: {}",
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+    }
+}
+
+/// The `automonique.automation` control surface, measured across two languages.
+///
+/// The same shape as [`runs_surface`], and for the same reason: a generated
+/// encoder is worth what its bytes are worth beside the encoder that owns the
+/// wire. `fixtures/automation-api-v1.json` is generated from the shipped Rust
+/// constructors — every canonical byte string was produced by encoding a real
+/// message and re-read through `from_canonical_bytes` before it was written,
+/// every refusal category was read back from the error Rust returned for that
+/// exact input, and every decoded spelling came out of
+/// `AutomationResponse::from_canonical_bytes` rather than out of the value this
+/// file constructed.
+///
+/// # What this lane adds to what the Runs lane already measured
+///
+/// The **enablement/cause coupling**, which is the first cross-field rule the
+/// generator applies rather than records as a gap — and only on the way out.
+/// `conformance/automation-api.ts` proves the generated builder refuses a
+/// withdrawal with no cause and a resume with one, under the two categories
+/// `SetEnablement::new` answers; and `rust_only_refusals` proves the *decoder*
+/// still does not hold the same relation, so the gap that remains is measured
+/// rather than described.
+mod automation_surface {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use automonique_protocol::automation::{AutomationActor, EnablementState};
+    use automonique_protocol::automation_api::{
+        AUTOMATION_PROTOCOL, AutomationApiError, AutomationContinuation, AutomationCursor,
+        AutomationId, AutomationListPage, AutomationPageSize, AutomationReceiptView,
+        AutomationRecordParts, AutomationRecordView, AutomationRefusal, AutomationRequest,
+        AutomationResponse, AutomationStateFilter, ListAutomations, MAX_AUTOMATION_API_FIELD_BYTES,
+        MAX_AUTOMATION_PAGE_ITEMS, PauseReason, RegisterAutomation, SetEnablement,
+    };
+    use automonique_protocol::codec::{MAX_REQUEST_ID_BYTES, MajorVersion};
+    use automonique_protocol::codegen::{
+        AUTOMATION_MODULE, CommandSurface, ConstantValue, REGENERATE_COMMAND, generated_files,
+        maintained_modules, module_file_name,
+    };
+    use automonique_protocol::primitives::{EpochMillis, ValueError};
+
+    use super::command_surface::{count, hex, raw_message, request_id, text, unhex, write_pretty};
+    use super::*;
+
+    fn corpus_path() -> PathBuf {
+        crate_root().join("fixtures/automation-api-v1.json")
+    }
+
+    fn runner_path() -> PathBuf {
+        package_root().join("conformance/automation-api.ts")
+    }
+
+    fn regenerating() -> bool {
+        std::env::var(automonique_protocol::codegen::REGENERATE_ENV)
+            .is_ok_and(|value| !value.is_empty() && value != "0")
+    }
+
+    /// The command surface the generator describes for this protocol.
+    fn surface() -> CommandSurface {
+        maintained_modules()
+            .into_iter()
+            .find(|module| module.file_name == module_file_name(AUTOMATION_MODULE))
+            .and_then(|module| module.command_surface)
+            .expect("the automation module describes a command surface")
+    }
+
+    /// The generated TypeScript of the automation module.
+    fn generated_automation() -> String {
+        generated_files()
+            .into_iter()
+            .find(|(name, _)| *name == module_file_name(AUTOMATION_MODULE))
+            .map(|(_, contents)| contents)
+            .expect("the automation module is generated")
+    }
+
+    fn automation_id(value: &str) -> AutomationId {
+        AutomationId::new(value).expect("a valid automation identity")
+    }
+
+    fn actor(value: &str) -> AutomationActor {
+        AutomationActor::new(value).expect("a valid actor")
+    }
+
+    fn reason(value: &str) -> PauseReason {
+        PauseReason::new(value).expect("a valid cause")
+    }
+
+    fn page_size(items: usize) -> AutomationPageSize {
+        AutomationPageSize::new(items).expect("a page size within the bound")
+    }
+
+    /// A decimal string, because the wire carries 64-bit values and a JSON
+    /// reader that used a double would round the largest of them without saying
+    /// so. Every counter in this corpus travels as text for that reason.
+    fn number(value: u64) -> JsonValue {
+        JsonValue::String(value.to_string())
+    }
+
+    /// The wire ceiling, which a decoder carrying counters in a double rounds.
+    fn wire_ceiling() -> u64 {
+        u64::try_from(i64::MAX).expect("the wire ceiling is positive")
+    }
+
+    /// An automation identity carrying every escape a bounded identifier can
+    /// reach, a three-byte character, a surrogate pair — and a space.
+    ///
+    /// The space is the point of the last one: [`AutomationId`] deliberately
+    /// does *not* reuse `DurableId`, whose grammar additionally forbids
+    /// whitespace, because the durable registry stores any bounded control-free
+    /// identifier and a wire type stricter than the table would make a stored
+    /// row unreadable. A TypeScript brand that copied the wrong grammar would
+    /// refuse this fixture.
+    fn escaping_automation_id() -> String {
+        "auto/\"nightly digest\" \\ naïve 日本語 🚀".to_owned()
+    }
+
+    fn escaping_actor() -> String {
+        "ops/\"oncall\" \\ naïve 日本語 🚀".to_owned()
+    }
+
+    fn escaping_cause() -> String {
+        "held: \"maintenance\" \\ withdrawn by ops/oncall — naïve 日本語 🚀".to_owned()
+    }
+
+    /// One row's eight columns, in the shape the fixtures name them.
+    ///
+    /// A parameter object for the same reason [`AutomationRecordParts`] is one:
+    /// two `u64` revisions and two instants sit beside one another, and a
+    /// transposed pair would type-check into a fixture that measured the wrong
+    /// thing.
+    struct Row<'a> {
+        entry_id: u64,
+        automation_id: &'a str,
+        revision: u64,
+        enablement: EnablementState,
+        actor: &'a str,
+        cause: Option<&'a str>,
+        created_at_ms: i64,
+        updated_at_ms: i64,
+    }
+
+    fn record(row: Row<'_>) -> AutomationRecordView {
+        AutomationRecordView::new(AutomationRecordParts {
+            entry_id: row.entry_id,
+            automation_id: automation_id(row.automation_id),
+            revision: row.revision,
+            enablement: row.enablement,
+            actor: actor(row.actor),
+            cause: row.cause.map(reason),
+            created_at: EpochMillis::from_millis(row.created_at_ms),
+            updated_at: EpochMillis::from_millis(row.updated_at_ms),
+        })
+        .expect("a well-formed automation row")
+    }
+
+    // -----------------------------------------------------------------------
+    // Requests
+    // -----------------------------------------------------------------------
+
+    struct RequestCase {
+        id: &'static str,
+        note: &'static str,
+        request: AutomationRequest,
+        /// Builder parameters, in the shape the runner reads for this kind.
+        params: JsonValue,
+    }
+
+    fn request_cases() -> Vec<RequestCase> {
+        let maximal_request_id = format!("req-{}", "a".repeat(MAX_REQUEST_ID_BYTES - 4));
+        // Every character escapes to two bytes, which is the worst case the
+        // protocol's own frame arithmetic budgets for.
+        let maximal_automation_id = "\"".repeat(MAX_AUTOMATION_API_FIELD_BYTES);
+
+        vec![
+            RequestCase {
+                id: "list-automations-maximal",
+                note: "every bound at once: all three states, a cursor at the wire's integer \
+                       ceiling, the largest page this protocol serves, and a correlation \
+                       identifier at MAX_REQUEST_ID_BYTES. The states are recorded shuffled — \
+                       the wire order is the enum's declaration order, which is neither the \
+                       caller's nor alphabetical",
+                request: AutomationRequest::ListAutomations {
+                    request_id: request_id(&maximal_request_id),
+                    query: ListAutomations::new(
+                        AutomationStateFilter::only(EnablementState::ALL)
+                            .expect("every state is a valid set"),
+                        AutomationCursor::new(wire_ceiling()),
+                        page_size(MAX_AUTOMATION_PAGE_ITEMS),
+                    ),
+                },
+                params: JsonValue::Object(vec![
+                    (
+                        "page_size".to_owned(),
+                        number(MAX_AUTOMATION_PAGE_ITEMS as u64),
+                    ),
+                    ("since".to_owned(), number(wire_ceiling())),
+                    (
+                        "states".to_owned(),
+                        JsonValue::Array(
+                            ["paused", "archived", "enabled"]
+                                .into_iter()
+                                .map(text)
+                                .collect(),
+                        ),
+                    ),
+                ]),
+            },
+            RequestCase {
+                id: "list-automations-unfiltered",
+                note: "no filter and the beginning of the listing: an explicit null, which is a \
+                       different wire fact from a filter naming every state, and a cursor of \
+                       zero, which is a position rather than the absence of one",
+                request: AutomationRequest::ListAutomations {
+                    request_id: request_id("req-list-1"),
+                    query: ListAutomations::new(
+                        AutomationStateFilter::any(),
+                        AutomationCursor::START,
+                        page_size(1),
+                    ),
+                },
+                params: JsonValue::Object(vec![
+                    ("page_size".to_owned(), number(1)),
+                    ("since".to_owned(), number(0)),
+                    ("states".to_owned(), JsonValue::Null),
+                ]),
+            },
+            RequestCase {
+                id: "list-automations-withdrawn-only",
+                note: "a two-state filter naming exactly the two states that carry a cause",
+                request: AutomationRequest::ListAutomations {
+                    request_id: request_id("req-list-2"),
+                    query: ListAutomations::new(
+                        AutomationStateFilter::only([
+                            EnablementState::Archived,
+                            EnablementState::Paused,
+                        ])
+                        .expect("a two-state filter"),
+                        AutomationCursor::new(7),
+                        page_size(4),
+                    ),
+                },
+                params: JsonValue::Object(vec![
+                    ("page_size".to_owned(), number(4)),
+                    ("since".to_owned(), number(7)),
+                    (
+                        "states".to_owned(),
+                        JsonValue::Array(vec![text("archived"), text("paused")]),
+                    ),
+                ]),
+            },
+            RequestCase {
+                id: "set-enablement-pause-escaping",
+                note: "a withdrawal at the wire's ceiling revision, with an actor and a cause \
+                       carrying every escape a bounded field can reach, a three-byte character \
+                       and a surrogate pair; the automation identity carries a space, which this \
+                       lane's grammar admits and DurableId's does not",
+                request: AutomationRequest::SetEnablement {
+                    request_id: request_id("req-set-1"),
+                    transition: SetEnablement::new(
+                        automation_id(&escaping_automation_id()),
+                        wire_ceiling(),
+                        EnablementState::Paused,
+                        actor(&escaping_actor()),
+                        Some(reason(&escaping_cause())),
+                    )
+                    .expect("a withdrawal that states its cause"),
+                },
+                params: JsonValue::Object(vec![
+                    ("actor".to_owned(), text(&escaping_actor())),
+                    ("automation_id".to_owned(), text(&escaping_automation_id())),
+                    ("cause".to_owned(), text(&escaping_cause())),
+                    ("expected_revision".to_owned(), number(wire_ceiling())),
+                    ("target".to_owned(), text("paused")),
+                ]),
+            },
+            RequestCase {
+                id: "set-enablement-resume",
+                note: "a resume states no cause, and the null is explicit: the absence of a \
+                       reason is a fact this wire carries rather than a key it omits",
+                request: AutomationRequest::SetEnablement {
+                    request_id: request_id("req-set-2"),
+                    transition: SetEnablement::new(
+                        automation_id("auto-nightly"),
+                        2,
+                        EnablementState::Enabled,
+                        actor("ops/oncall"),
+                        None,
+                    )
+                    .expect("a resume admits no cause"),
+                },
+                params: JsonValue::Object(vec![
+                    ("actor".to_owned(), text("ops/oncall")),
+                    ("automation_id".to_owned(), text("auto-nightly")),
+                    ("cause".to_owned(), JsonValue::Null),
+                    ("expected_revision".to_owned(), number(2)),
+                    ("target".to_owned(), text("enabled")),
+                ]),
+            },
+            RequestCase {
+                id: "set-enablement-archive",
+                note: "the terminal state, which also owes a cause; nothing transitions out of it",
+                request: AutomationRequest::SetEnablement {
+                    request_id: request_id("req-set-3"),
+                    transition: SetEnablement::new(
+                        automation_id("auto-nightly"),
+                        3,
+                        EnablementState::Archived,
+                        actor("ops/oncall"),
+                        Some(reason("superseded by auto-nightly-v2")),
+                    )
+                    .expect("an archival that states its cause"),
+                },
+                params: JsonValue::Object(vec![
+                    ("actor".to_owned(), text("ops/oncall")),
+                    ("automation_id".to_owned(), text("auto-nightly")),
+                    ("cause".to_owned(), text("superseded by auto-nightly-v2")),
+                    ("expected_revision".to_owned(), number(3)),
+                    ("target".to_owned(), text("archived")),
+                ]),
+            },
+            RequestCase {
+                id: "register-automation-maximal",
+                note: "an identity at MAX_AUTOMATION_API_FIELD_BYTES whose every character \
+                       escapes to two bytes, which is the worst case this protocol's frame \
+                       arithmetic budgets for",
+                request: AutomationRequest::RegisterAutomation {
+                    request_id: request_id("req-register-1"),
+                    registration: RegisterAutomation::new(
+                        automation_id(&maximal_automation_id),
+                        actor(&escaping_actor()),
+                    ),
+                },
+                params: JsonValue::Object(vec![
+                    ("actor".to_owned(), text(&escaping_actor())),
+                    ("automation_id".to_owned(), text(&maximal_automation_id)),
+                ]),
+            },
+            RequestCase {
+                id: "automation-detail-escaping",
+                note: "one automation read by an identity carrying every reachable escape",
+                request: AutomationRequest::AutomationDetail {
+                    request_id: request_id("req-detail-1"),
+                    automation_id: automation_id(&escaping_automation_id()),
+                },
+                params: JsonValue::Object(vec![(
+                    "automation_id".to_owned(),
+                    text(&escaping_automation_id()),
+                )]),
+            },
+        ]
+    }
+
+    fn request_entry(case: &RequestCase) -> JsonValue {
+        let message = case.request.to_message().expect("the request encodes");
+        let canonical = message.to_canonical_bytes();
+        // What the corpus records is checked against the shipped decoder before
+        // it is written: a fixture Rust would not itself admit proves nothing.
+        assert_eq!(
+            AutomationRequest::from_canonical_bytes(&canonical)
+                .expect("Rust admits its own encoding"),
+            case.request,
+            "{}: the Rust decoder does not admit the Rust encoding",
+            case.id
+        );
+        assert!(
+            canonical.len() <= automonique_protocol::automation_api::MAX_AUTOMATION_CANONICAL_BYTES,
+            "{}: the encoding does not fit one automation frame",
+            case.id
+        );
+        JsonValue::Object(vec![
+            ("canonical_bytes".to_owned(), count(canonical.len())),
+            ("canonical_hex".to_owned(), text(&hex(&canonical))),
+            ("id".to_owned(), text(case.id)),
+            ("kind".to_owned(), text(message.envelope().kind().as_str())),
+            ("note".to_owned(), text(case.note)),
+            ("params".to_owned(), case.params.clone()),
+            (
+                "request_id".to_owned(),
+                text(message.envelope().request_id().as_str()),
+            ),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // Responses
+    // -----------------------------------------------------------------------
+
+    struct ResponseCase {
+        id: &'static str,
+        note: &'static str,
+        response: AutomationResponse,
+    }
+
+    /// A listing answer built through the enforcement path rather than around
+    /// it.
+    ///
+    /// `AutomationResponse::listing` is what refuses a page longer than the
+    /// query asked for or carrying a row its filter excludes, so a corpus entry
+    /// that constructed the variant directly would record bytes no daemon could
+    /// have produced.
+    fn listing(id: &str, query: &ListAutomations, page: AutomationListPage) -> AutomationResponse {
+        AutomationResponse::listing(request_id(id), query, page)
+            .expect("the page answers the query it was built for")
+    }
+
+    fn response_cases() -> Vec<ResponseCase> {
+        let unfiltered = ListAutomations::new(
+            AutomationStateFilter::any(),
+            AutomationCursor::START,
+            page_size(MAX_AUTOMATION_PAGE_ITEMS),
+        );
+
+        vec![
+            ResponseCase {
+                id: "accepted-registration",
+                note: "what a registration establishes: revision one, enabled, with no cause. \
+                       `accepted` says the row is recorded, never that anything will run it",
+                response: AutomationResponse::Accepted {
+                    request_id: request_id("req-register-1"),
+                    receipt: AutomationReceiptView::new(
+                        1,
+                        automation_id("auto-nightly"),
+                        EnablementState::Enabled,
+                        1,
+                        EpochMillis::from_millis(1_700_000_000_000),
+                    )
+                    .expect("a well-formed receipt"),
+                },
+            },
+            ResponseCase {
+                id: "accepted-pause-at-ceiling",
+                note: "a withdrawal landing at the wire's ceiling revision and instant, both of \
+                       which a decoder carrying counters in a double would round to an even \
+                       neighbour",
+                response: AutomationResponse::Accepted {
+                    request_id: request_id("req-set-1"),
+                    receipt: AutomationReceiptView::new(
+                        wire_ceiling() - 1,
+                        automation_id(&escaping_automation_id()),
+                        EnablementState::Paused,
+                        wire_ceiling(),
+                        EpochMillis::from_millis(i64::MAX),
+                    )
+                    .expect("a well-formed receipt"),
+                },
+            },
+            ResponseCase {
+                id: "automation-list-page-more",
+                note: "a page whose last row and whose continuation cursor are both at the \
+                       wire's ceiling, carrying a resumed automation beside a withdrawn one so \
+                       that a null cause and a stated one travel in the same array",
+                response: listing(
+                    "automation-list-page-more",
+                    &unfiltered,
+                    AutomationListPage::new(
+                        vec![
+                            record(Row {
+                                entry_id: 1,
+                                automation_id: "auto-first",
+                                revision: 3,
+                                enablement: EnablementState::Enabled,
+                                actor: "ops/oncall",
+                                cause: None,
+                                created_at_ms: 1_700_000_000_000,
+                                updated_at_ms: 1_700_000_000_500,
+                            }),
+                            record(Row {
+                                entry_id: wire_ceiling() - 1,
+                                automation_id: &escaping_automation_id(),
+                                revision: 2,
+                                enablement: EnablementState::Archived,
+                                actor: &escaping_actor(),
+                                cause: Some(&escaping_cause()),
+                                created_at_ms: 0,
+                                updated_at_ms: i64::MAX,
+                            }),
+                        ],
+                        AutomationContinuation::More(AutomationCursor::new(wire_ceiling())),
+                    )
+                    .expect("a well-formed page"),
+                ),
+            },
+            ResponseCase {
+                id: "automation-list-page-empty-more",
+                note: "an empty page that still reports more: an enablement filter can exclude \
+                       every row in one scanned window while rows remain behind it, so a client \
+                       that inferred `done` from a short page would stop early",
+                response: listing(
+                    "automation-list-page-empty-more",
+                    &unfiltered,
+                    AutomationListPage::new(
+                        Vec::new(),
+                        AutomationContinuation::More(AutomationCursor::new(42)),
+                    )
+                    .expect("an empty page may continue"),
+                ),
+            },
+            ResponseCase {
+                id: "automation-list-page-complete",
+                note: "the end of the registry: `more` false and an explicit null cursor",
+                response: listing(
+                    "automation-list-page-complete",
+                    &unfiltered,
+                    AutomationListPage::new(
+                        vec![record(Row {
+                            entry_id: 9,
+                            automation_id: "auto-only",
+                            revision: 2,
+                            enablement: EnablementState::Paused,
+                            actor: "ops/oncall",
+                            cause: Some("held for the migration"),
+                            created_at_ms: 1_700_000_000_000,
+                            updated_at_ms: 1_700_000_009_000,
+                        })],
+                        AutomationContinuation::Complete,
+                    )
+                    .expect("a well-formed page"),
+                ),
+            },
+            ResponseCase {
+                id: "automation-detail-paused",
+                note: "one automation in full, withdrawn: the actor is whoever withdrew it and \
+                       the cause is why, which is the whole of the history this registry keeps",
+                response: AutomationResponse::AutomationDetail {
+                    request_id: request_id("req-detail-1"),
+                    record: record(Row {
+                        entry_id: 4,
+                        automation_id: &escaping_automation_id(),
+                        revision: 2,
+                        enablement: EnablementState::Paused,
+                        actor: &escaping_actor(),
+                        cause: Some(&escaping_cause()),
+                        created_at_ms: 1_700_000_000_000,
+                        updated_at_ms: 1_700_000_001_000,
+                    }),
+                },
+            },
+            ResponseCase {
+                id: "automation-detail-never-paused",
+                note: "a never-paused automation at revision one: the actor is the registrant \
+                       rather than a resumer, and the cause is null",
+                response: AutomationResponse::AutomationDetail {
+                    request_id: request_id("req-detail-2"),
+                    record: record(Row {
+                        entry_id: 5,
+                        automation_id: "auto-fresh",
+                        revision: 1,
+                        enablement: EnablementState::Enabled,
+                        actor: "ops/oncall",
+                        cause: None,
+                        created_at_ms: 1_700_000_000_000,
+                        updated_at_ms: 1_700_000_000_000,
+                    }),
+                },
+            },
+            ResponseCase {
+                id: "revision-conflict",
+                note: "a stale fencing revision, which is not a rejection: the caller retries \
+                       against the durable revision this carries",
+                response: AutomationResponse::conflict(request_id("req-set-2"), 3, 7)
+                    .expect("two revisions that disagree"),
+            },
+            ResponseCase {
+                id: "refused-already-registered",
+                note: "the identity is already registered, whatever state its row is in",
+                response: AutomationResponse::Refused {
+                    request_id: request_id("req-register-1"),
+                    refusal: AutomationRefusal::AlreadyRegistered,
+                },
+            },
+        ]
+    }
+
+    /// How one decoded response is spelled in the corpus.
+    ///
+    /// Built from the value the *Rust decoder* recovered, and flattened with
+    /// dotted keys so a nested page compares field by field rather than as one
+    /// opaque blob.
+    fn decoded_spelling(response: &AutomationResponse) -> JsonValue {
+        let mut fields = vec![(
+            "request_id".to_owned(),
+            text(response.request_id().as_str()),
+        )];
+        let record_fields =
+            |prefix: &str, value: &AutomationRecordView| -> Vec<(String, JsonValue)> {
+                [
+                    ("actor", text(value.actor().as_str())),
+                    ("automation_id", text(value.automation_id().as_str())),
+                    (
+                        "cause",
+                        value
+                            .cause()
+                            .map_or_else(|| text("null"), |cause| text(cause.as_str())),
+                    ),
+                    (
+                        "created_at_ms",
+                        JsonValue::String(value.created_at().as_millis().to_string()),
+                    ),
+                    ("enablement", text(value.enablement().as_str())),
+                    ("entry_id", number(value.entry_id())),
+                    ("revision", number(value.revision())),
+                    (
+                        "updated_at_ms",
+                        JsonValue::String(value.updated_at().as_millis().to_string()),
+                    ),
+                ]
+                .into_iter()
+                .map(|(name, spelled)| (format!("{prefix}{name}"), spelled))
+                .collect()
+            };
+        match response {
+            AutomationResponse::Accepted { receipt, .. } => {
+                fields.push((
+                    "automation_id".to_owned(),
+                    text(receipt.automation_id().as_str()),
+                ));
+                fields.push(("enablement".to_owned(), text(receipt.enablement().as_str())));
+                fields.push(("entry_id".to_owned(), number(receipt.entry_id())));
+                fields.push(("revision".to_owned(), number(receipt.revision())));
+                fields.push((
+                    "updated_at_ms".to_owned(),
+                    JsonValue::String(receipt.updated_at().as_millis().to_string()),
+                ));
+            }
+            AutomationResponse::AutomationList { page, .. } => {
+                fields.push((
+                    "automations.len".to_owned(),
+                    number(page.entries().len() as u64),
+                ));
+                fields.push((
+                    "more".to_owned(),
+                    text(&page.continuation().has_more().to_string()),
+                ));
+                fields.push((
+                    "next_cursor".to_owned(),
+                    match page.continuation().cursor() {
+                        Some(cursor) => number(cursor.position()),
+                        None => text("null"),
+                    },
+                ));
+                for (index, carried) in page.entries().iter().enumerate() {
+                    fields.extend(record_fields(&format!("automations.{index}."), carried));
+                }
+            }
+            AutomationResponse::AutomationDetail { record, .. } => {
+                fields.extend(record_fields("", record));
+            }
+            AutomationResponse::Conflict {
+                expected_revision,
+                durable_revision,
+                ..
+            } => {
+                fields.push(("durable_revision".to_owned(), number(*durable_revision)));
+                fields.push(("expected_revision".to_owned(), number(*expected_revision)));
+            }
+            AutomationResponse::Refused { refusal, .. } => {
+                fields.push(("refusal".to_owned(), text(refusal.as_str())));
+            }
+        }
+        JsonValue::Object(fields)
+    }
+
+    fn response_entry(case: &ResponseCase) -> JsonValue {
+        let message = case.response.to_message().expect("the response encodes");
+        let canonical = message.to_canonical_bytes();
+        let decoded = AutomationResponse::from_canonical_bytes(&canonical)
+            .expect("Rust admits its own encoding");
+        assert_eq!(
+            decoded, case.response,
+            "{}: the Rust decoder does not recover what it encoded",
+            case.id
+        );
+        JsonValue::Object(vec![
+            ("canonical_hex".to_owned(), text(&hex(&canonical))),
+            ("decoded".to_owned(), decoded_spelling(&decoded)),
+            ("id".to_owned(), text(case.id)),
+            ("kind".to_owned(), text(message.envelope().kind().as_str())),
+            ("note".to_owned(), text(case.note)),
+            ("outcome".to_owned(), text(decoded.outcome().as_str())),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // Bodies, for the payloads no constructor would produce
+    // -----------------------------------------------------------------------
+
+    /// A well-formed record body, as a starting point for one that is not.
+    fn record_body(overrides: &[(&str, JsonValue)]) -> JsonValue {
+        let mut entries: Vec<(String, JsonValue)> = vec![
+            ("actor".to_owned(), text("ops/oncall")),
+            ("automation_id".to_owned(), text("auto-nightly")),
+            ("cause".to_owned(), JsonValue::Null),
+            (
+                "created_at_ms".to_owned(),
+                JsonValue::Integer(1_700_000_000_000),
+            ),
+            ("enablement".to_owned(), text("enabled")),
+            ("entry_id".to_owned(), JsonValue::Integer(1)),
+            ("revision".to_owned(), JsonValue::Integer(1)),
+            (
+                "updated_at_ms".to_owned(),
+                JsonValue::Integer(1_700_000_000_000),
+            ),
+        ];
+        for (name, value) in overrides {
+            let slot = entries
+                .iter_mut()
+                .find(|(existing, _)| existing == name)
+                .unwrap_or_else(|| panic!("{name} is not a record field"));
+            slot.1 = value.clone();
+        }
+        JsonValue::Object(entries)
+    }
+
+    /// A well-formed receipt body.
+    fn receipt_body(overrides: &[(&str, JsonValue)]) -> JsonValue {
+        let mut entries: Vec<(String, JsonValue)> = vec![
+            ("automation_id".to_owned(), text("auto-nightly")),
+            ("enablement".to_owned(), text("enabled")),
+            ("entry_id".to_owned(), JsonValue::Integer(1)),
+            ("revision".to_owned(), JsonValue::Integer(1)),
+            (
+                "updated_at_ms".to_owned(),
+                JsonValue::Integer(1_700_000_000_000),
+            ),
+        ];
+        for (name, value) in overrides {
+            let slot = entries
+                .iter_mut()
+                .find(|(existing, _)| existing == name)
+                .unwrap_or_else(|| panic!("{name} is not a receipt field"));
+            slot.1 = value.clone();
+        }
+        JsonValue::Object(entries)
+    }
+
+    /// A page body carrying the given records and continuation.
+    fn page_body(automations: Vec<JsonValue>, more: bool, next_cursor: JsonValue) -> JsonValue {
+        JsonValue::Object(vec![
+            ("automations".to_owned(), JsonValue::Array(automations)),
+            ("more".to_owned(), JsonValue::Bool(more)),
+            ("next_cursor".to_owned(), next_cursor),
+        ])
+    }
+
+    fn conflict_body(expected: i64, durable: i64) -> JsonValue {
+        JsonValue::Object(vec![
+            ("durable_revision".to_owned(), JsonValue::Integer(durable)),
+            ("expected_revision".to_owned(), JsonValue::Integer(expected)),
+        ])
+    }
+
+    fn automation_message(kind: &str, id: &str, body: JsonValue) -> Vec<u8> {
+        raw_message(AUTOMATION_PROTOCOL, 1, kind, id, body)
+    }
+
+    /// One record wrapped in the smallest page that can carry it.
+    fn one_record_page(record: JsonValue) -> Vec<u8> {
+        automation_message(
+            "automation_list_result",
+            "req-list-1",
+            page_body(vec![record], false, JsonValue::Null),
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Refusals both implementations make
+    // -----------------------------------------------------------------------
+
+    struct DecodeRefusal {
+        id: &'static str,
+        note: &'static str,
+        payload: Vec<u8>,
+    }
+
+    fn decode_refusals() -> Vec<DecodeRefusal> {
+        // The page bound is judged before any item is read, in Rust and in the
+        // generated TypeScript alike, so the over-bound payload carries integers
+        // rather than bodies: what is wrong with it is its length.
+        let filler: Vec<JsonValue> = (0..=MAX_AUTOMATION_PAGE_ITEMS)
+            .map(|index| JsonValue::Integer(index as i64))
+            .collect();
+        let long_identifier = "a".repeat(MAX_AUTOMATION_API_FIELD_BYTES + 1);
+
+        vec![
+            DecodeRefusal {
+                id: "enablement-undefined-spelling",
+                note: "an enablement this build does not define fails closed rather than \
+                       decoding to a default a client would act on — and the safe-looking guess \
+                       for an unnameable state is the wrong one",
+                payload: one_record_page(record_body(&[("enablement", text("disabled"))])),
+            },
+            DecodeRefusal {
+                id: "refusal-undefined-spelling",
+                note: "a refusal word outside the eight this build carries; the vocabulary is \
+                       closed on both sides of the wire",
+                payload: automation_message(
+                    "refused",
+                    "req-register-1",
+                    JsonValue::Object(vec![("refusal".to_owned(), text("not_authorized"))]),
+                ),
+            },
+            DecodeRefusal {
+                id: "entry-id-zero",
+                note: "a durable identity starts at one; zero names a row no writer produced",
+                payload: one_record_page(record_body(&[("entry_id", JsonValue::Integer(0))])),
+            },
+            DecodeRefusal {
+                id: "entry-id-negative",
+                note: "a negative identity is a malformed body rather than an unwritten row: the \
+                       decoder converts before it judges the domain, and the two categories differ",
+                payload: one_record_page(record_body(&[("entry_id", JsonValue::Integer(-1))])),
+            },
+            DecodeRefusal {
+                id: "revision-zero",
+                note: "registration writes revision one and every accepted transition writes one \
+                       higher, so zero is a row no writer produced — a different statement from \
+                       an unwritten row identity, under a different category",
+                payload: one_record_page(record_body(&[("revision", JsonValue::Integer(0))])),
+            },
+            DecodeRefusal {
+                id: "receipt-revision-zero",
+                note: "the same rule on a receipt, which is the answer a write returns",
+                payload: automation_message(
+                    "automation_accepted",
+                    "req-set-1",
+                    receipt_body(&[("revision", JsonValue::Integer(0))]),
+                ),
+            },
+            DecodeRefusal {
+                id: "created-at-before-epoch",
+                note: "a registration instant the store's own `created_at_ms >= 0` constraint \
+                       cannot hold",
+                payload: one_record_page(record_body(&[("created_at_ms", JsonValue::Integer(-1))])),
+            },
+            DecodeRefusal {
+                id: "receipt-updated-at-before-epoch",
+                note: "the same constraint on the instant a write reports",
+                payload: automation_message(
+                    "automation_accepted",
+                    "req-set-1",
+                    receipt_body(&[("updated_at_ms", JsonValue::Integer(-1))]),
+                ),
+            },
+            DecodeRefusal {
+                id: "cause-empty-string",
+                note: "an empty cause is refused rather than read as `no reason given`: a \
+                       withdrawal an operator cannot safely resume from is the one this product \
+                       does not offer a spelling for. The absence of a cause is null",
+                payload: one_record_page(record_body(&[
+                    ("enablement", text("paused")),
+                    ("revision", JsonValue::Integer(2)),
+                    ("cause", text("")),
+                ])),
+            },
+            DecodeRefusal {
+                id: "cause-not-a-string",
+                note: "the field is a string or a null and nothing else; a number is a malformed \
+                       body rather than a cause",
+                payload: one_record_page(record_body(&[("cause", JsonValue::Integer(5))])),
+            },
+            DecodeRefusal {
+                id: "automation-id-over-bound",
+                note: "one byte over the identity bound, measured in UTF-8 bytes rather than in \
+                       the UTF-16 code units a JavaScript `length` counts",
+                payload: one_record_page(record_body(&[("automation_id", text(&long_identifier))])),
+            },
+            DecodeRefusal {
+                id: "actor-empty",
+                note: "an empty actor names nobody, and this lane records who asked",
+                payload: one_record_page(record_body(&[("actor", text(""))])),
+            },
+            DecodeRefusal {
+                id: "page-over-bound",
+                note: "one row past MAX_AUTOMATION_PAGE_ITEMS. The length is judged before any \
+                       item is read, so what these items are does not matter and the refusal \
+                       names the length",
+                payload: automation_message(
+                    "automation_list_result",
+                    "req-list-1",
+                    page_body(filler, false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "next-cursor-negative",
+                note: "a cursor below the beginning of the listing",
+                payload: automation_message(
+                    "automation_list_result",
+                    "req-list-1",
+                    page_body(Vec::new(), true, JsonValue::Integer(-1)),
+                ),
+            },
+            DecodeRefusal {
+                id: "more-not-a-boolean",
+                note: "the wire carries true or false for a continuation and nothing else",
+                payload: automation_message(
+                    "automation_list_result",
+                    "req-list-1",
+                    JsonValue::Object(vec![
+                        ("automations".to_owned(), JsonValue::Array(Vec::new())),
+                        ("more".to_owned(), JsonValue::Integer(1)),
+                        ("next_cursor".to_owned(), JsonValue::Null),
+                    ]),
+                ),
+            },
+            DecodeRefusal {
+                id: "conflict-expected-revision-zero",
+                note: "a conflict about a revision no writer produced tells a caller to retry \
+                       against nothing",
+                payload: automation_message("revision_conflict", "req-set-1", conflict_body(0, 5)),
+            },
+            DecodeRefusal {
+                id: "page-extra-field",
+                note: "an unexpected key is refused rather than ignored",
+                payload: automation_message(
+                    "automation_list_result",
+                    "req-list-1",
+                    JsonValue::Object(vec![
+                        ("automations".to_owned(), JsonValue::Array(Vec::new())),
+                        ("more".to_owned(), JsonValue::Bool(false)),
+                        ("next_cursor".to_owned(), JsonValue::Null),
+                        ("total".to_owned(), JsonValue::Integer(1)),
+                    ]),
+                ),
+            },
+            DecodeRefusal {
+                id: "record-missing-field",
+                note: "a missing key is refused rather than defaulted, inside a nested body as \
+                       much as at the top level",
+                payload: one_record_page(JsonValue::Object(vec![
+                    ("actor".to_owned(), text("ops/oncall")),
+                    ("automation_id".to_owned(), text("auto-nightly")),
+                    ("cause".to_owned(), JsonValue::Null),
+                    ("enablement".to_owned(), text("enabled")),
+                    ("entry_id".to_owned(), JsonValue::Integer(1)),
+                    ("revision".to_owned(), JsonValue::Integer(1)),
+                    (
+                        "updated_at_ms".to_owned(),
+                        JsonValue::Integer(1_700_000_000_000),
+                    ),
+                ])),
+            },
+            DecodeRefusal {
+                id: "unknown-kind",
+                note: "a kind this protocol version does not define, which is a different answer \
+                       from a kind it defines and this surface does not decode",
+                payload: automation_message(
+                    "automation_history_result",
+                    "req-list-1",
+                    page_body(Vec::new(), false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "runs-protocol-message",
+                note: "the Runs lane's name on this lane's decoder, refused on the name axis so \
+                       each protocol's closed kind set stays closed",
+                payload: raw_message(
+                    "automonique.runs",
+                    1,
+                    "automation_list_result",
+                    "req-list-1",
+                    page_body(Vec::new(), false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "unsupported-version",
+                note: "this protocol at a major version neither side implements",
+                payload: raw_message(
+                    AUTOMATION_PROTOCOL,
+                    2,
+                    "automation_list_result",
+                    "req-list-1",
+                    page_body(Vec::new(), false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "non-canonical-key-order",
+                note: "a payload that parses but is not canonical is refused, not normalized",
+                payload: br#"{"kind":"refused","body":{"refusal":"registry_full"},"protocol":"automonique.automation","request_id":"req-register-1","version":1}"#.to_vec(),
+            },
+            DecodeRefusal {
+                id: "empty-payload",
+                note: "zero bytes is not an empty message",
+                payload: Vec::new(),
+            },
+        ]
+    }
+
+    fn decode_refusal_entry(refusal: &DecodeRefusal) -> JsonValue {
+        let category = AutomationResponse::from_canonical_bytes(&refusal.payload)
+            .err()
+            .unwrap_or_else(|| panic!("{}: Rust accepted a payload it must refuse", refusal.id))
+            .category()
+            .to_owned();
+        JsonValue::Object(vec![
+            ("category".to_owned(), text(&category)),
+            ("id".to_owned(), text(refusal.id)),
+            ("note".to_owned(), text(refusal.note)),
+            ("payload_hex".to_owned(), text(&hex(&refusal.payload))),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // The measured gap
+    // -----------------------------------------------------------------------
+
+    /// A payload the Rust constructors refuse and the generated TypeScript
+    /// accepts.
+    ///
+    /// Every one of these breaks a rule relating two fields of a *decoded*
+    /// message. The request-side cause coupling is deliberately not among them:
+    /// the generated builder does apply that one, and `encode_refusals` proves
+    /// it. What a client cannot check is whether a peer's answer is internally
+    /// coherent, and that is what stays here.
+    struct RustOnlyRefusal {
+        id: &'static str,
+        note: &'static str,
+        payload: Vec<u8>,
+    }
+
+    fn rust_only_refusals() -> Vec<RustOnlyRefusal> {
+        vec![
+            RustOnlyRefusal {
+                id: "record-cause-required",
+                note: "a withdrawn row with no stated cause: the same coupling the builder \
+                       applies on the way out, met on the way in, where this surface does not \
+                       hold it",
+                payload: one_record_page(record_body(&[
+                    ("enablement", text("paused")),
+                    ("revision", JsonValue::Integer(2)),
+                ])),
+            },
+            RustOnlyRefusal {
+                id: "record-cause-forbidden",
+                note: "an enabled row carrying a cause, which would say an automation in service \
+                       was withdrawn",
+                payload: one_record_page(record_body(&[("cause", text("held for maintenance"))])),
+            },
+            RustOnlyRefusal {
+                id: "record-withdrawn-at-first-revision",
+                note: "registration is the only writer of revision one and it always writes \
+                       enabled, so a withdrawn row below revision two is a row no writer produced",
+                payload: one_record_page(record_body(&[
+                    ("enablement", text("archived")),
+                    ("cause", text("superseded")),
+                ])),
+            },
+            RustOnlyRefusal {
+                id: "receipt-withdrawn-at-first-revision",
+                note: "the same rule on a receipt",
+                payload: automation_message(
+                    "automation_accepted",
+                    "req-set-1",
+                    receipt_body(&[("enablement", text("paused"))]),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "page-out-of-order",
+                note: "records that do not strictly increase by durable row identity, so the \
+                       next page would re-serve or skip",
+                payload: automation_message(
+                    "automation_list_result",
+                    "req-list-1",
+                    page_body(
+                        vec![
+                            record_body(&[("entry_id", JsonValue::Integer(5))]),
+                            record_body(&[("entry_id", JsonValue::Integer(2))]),
+                        ],
+                        false,
+                        JsonValue::Null,
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "continuation-incoherent",
+                note: "rows follow, with no cursor to resume from",
+                payload: automation_message(
+                    "automation_list_result",
+                    "req-list-1",
+                    page_body(Vec::new(), true, JsonValue::Null),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "continuation-rewinds",
+                note: "a continuation cursor below the last row on the page, which would re-serve \
+                       it",
+                payload: automation_message(
+                    "automation_list_result",
+                    "req-list-1",
+                    page_body(
+                        vec![record_body(&[("entry_id", JsonValue::Integer(9))])],
+                        true,
+                        JsonValue::Integer(4),
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "conflict-without-disagreement",
+                note: "a conflict naming the revision the caller expected, which is agreement — \
+                       and would tell a caller to retry with the revision it already used",
+                payload: automation_message("revision_conflict", "req-set-1", conflict_body(4, 4)),
+            },
+        ]
+    }
+
+    fn rust_only_entry(refusal: &RustOnlyRefusal) -> JsonValue {
+        let category = AutomationResponse::from_canonical_bytes(&refusal.payload)
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: Rust accepts this, so it is not a rule the generated surface is missing",
+                    refusal.id
+                )
+            })
+            .category()
+            .to_owned();
+        JsonValue::Object(vec![
+            ("id".to_owned(), text(refusal.id)),
+            ("note".to_owned(), text(refusal.note)),
+            ("payload_hex".to_owned(), text(&hex(&refusal.payload))),
+            ("rust_category".to_owned(), text(&category)),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // Encode refusals
+    // -----------------------------------------------------------------------
+
+    /// A request the other implementation must refuse while building it.
+    struct EncodeRefusal {
+        id: &'static str,
+        note: &'static str,
+        kind: &'static str,
+        request_id: String,
+        params: JsonValue,
+        category: String,
+        /// The generated constructor that refuses the value on its own, the
+        /// parameter it is applied to, and the violation it names.
+        constructor: Option<(&'static str, &'static str, &'static str)>,
+    }
+
+    /// The category Rust reports for a request body carrying this exact value.
+    ///
+    /// Read back from the shipped decoder rather than constructed here. The
+    /// bounded-field errors of `crate::automation` are translated into this
+    /// lane's on the way in, and a category retyped beside the translation
+    /// would be a claim about it rather than a reading of it.
+    fn wire_category(kind: &str, body: JsonValue) -> String {
+        AutomationRequest::from_canonical_bytes(&automation_message(kind, "req-1", body))
+            .err()
+            .unwrap_or_else(|| panic!("{kind}: Rust accepted a body it must refuse"))
+            .category()
+            .to_owned()
+    }
+
+    fn set_enablement_params(
+        actor: &str,
+        id: &str,
+        cause: JsonValue,
+        expected_revision: JsonValue,
+        target: &str,
+    ) -> JsonValue {
+        JsonValue::Object(vec![
+            ("actor".to_owned(), text(actor)),
+            ("automation_id".to_owned(), text(id)),
+            ("cause".to_owned(), cause),
+            ("expected_revision".to_owned(), expected_revision),
+            ("target".to_owned(), text(target)),
+        ])
+    }
+
+    fn list_params(size: JsonValue, since: JsonValue, states: JsonValue) -> JsonValue {
+        JsonValue::Object(vec![
+            ("page_size".to_owned(), size),
+            ("since".to_owned(), since),
+            ("states".to_owned(), states),
+        ])
+    }
+
+    fn encode_refusals() -> Vec<EncodeRefusal> {
+        let long_identifier = "a".repeat(MAX_AUTOMATION_API_FIELD_BYTES + 1);
+        let long_request_id = "r".repeat(MAX_REQUEST_ID_BYTES + 1);
+
+        let withdrawal_without_cause = |target: EnablementState| {
+            SetEnablement::new(
+                automation_id("auto-nightly"),
+                2,
+                target,
+                actor("ops/oncall"),
+                None,
+            )
+            .expect_err("a withdrawal with no stated cause is refused")
+            .category()
+            .to_owned()
+        };
+        let resume_with_cause = SetEnablement::new(
+            automation_id("auto-nightly"),
+            2,
+            EnablementState::Enabled,
+            actor("ops/oncall"),
+            Some(reason("held")),
+        )
+        .expect_err("a resume that states a cause is refused")
+        .category()
+        .to_owned();
+        let unwritten_revision = SetEnablement::new(
+            automation_id("auto-nightly"),
+            0,
+            EnablementState::Enabled,
+            actor("ops/oncall"),
+            None,
+        )
+        .expect_err("revision zero is refused")
+        .category()
+        .to_owned();
+        let revision_out_of_range = AutomationRequest::SetEnablement {
+            request_id: request_id("req-set-1"),
+            transition: SetEnablement::new(
+                automation_id("auto-nightly"),
+                wire_ceiling() + 1,
+                EnablementState::Enabled,
+                actor("ops/oncall"),
+                None,
+            )
+            .expect("the constructor admits any nonzero revision"),
+        }
+        .to_message()
+        .expect_err("a revision above the wire ceiling is refused")
+        .category()
+        .to_owned();
+        let cursor_out_of_range = AutomationRequest::ListAutomations {
+            request_id: request_id("req-list-1"),
+            query: ListAutomations::new(
+                AutomationStateFilter::any(),
+                AutomationCursor::new(wire_ceiling() + 1),
+                page_size(1),
+            ),
+        }
+        .to_message()
+        .expect_err("a cursor above the wire ceiling is refused")
+        .category()
+        .to_owned();
+        let page_size_out_of_range = AutomationPageSize::new(0)
+            .expect_err("a page that admits nothing is refused")
+            .category()
+            .to_owned();
+        let empty_filter = AutomationStateFilter::only([])
+            .expect_err("an empty filter is refused")
+            .category()
+            .to_owned();
+        let repeated_state =
+            AutomationStateFilter::only([EnablementState::Paused, EnablementState::Paused])
+                .expect_err("a repeated state is refused")
+                .category()
+                .to_owned();
+        let undefined_state =
+            AutomationApiError::Codec(automonique_protocol::codec::CodecError::UnknownEnumValue {
+                field: "target",
+            })
+            .category()
+            .to_owned();
+        let long_id_refusal = AutomationApiError::Codec(
+            RequestId::new(&long_request_id).expect_err("an overlong request id is refused"),
+        )
+        .category()
+        .to_owned();
+        let bad_id_refusal = AutomationApiError::Codec(
+            RequestId::new("req 1").expect_err("a space is outside the request id grammar"),
+        )
+        .category()
+        .to_owned();
+
+        vec![
+            EncodeRefusal {
+                id: "set-enablement-pause-without-cause",
+                note: "the coupling, on the way out: a pause with no stated cause is refused \
+                       before a frame is spent, because a withdrawal an operator cannot safely \
+                       resume from is not a request this product has a shape for",
+                kind: "set_enablement",
+                request_id: "req-set-1".to_owned(),
+                params: set_enablement_params(
+                    "ops/oncall",
+                    "auto-nightly",
+                    JsonValue::Null,
+                    number(2),
+                    "paused",
+                ),
+                category: withdrawal_without_cause(EnablementState::Paused),
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "set-enablement-archive-without-cause",
+                note: "the terminal state owes a cause as much as the resumable one does",
+                kind: "set_enablement",
+                request_id: "req-set-1".to_owned(),
+                params: set_enablement_params(
+                    "ops/oncall",
+                    "auto-nightly",
+                    JsonValue::Null,
+                    number(2),
+                    "archived",
+                ),
+                category: withdrawal_without_cause(EnablementState::Archived),
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "set-enablement-resume-with-cause",
+                note: "the other half of the coupling: a resume that states a cause is refused \
+                       rather than silently dropping the cause, which would leave the caller \
+                       believing it recorded something",
+                kind: "set_enablement",
+                request_id: "req-set-1".to_owned(),
+                params: set_enablement_params(
+                    "ops/oncall",
+                    "auto-nightly",
+                    text("held for the migration"),
+                    number(2),
+                    "enabled",
+                ),
+                category: resume_with_cause,
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "set-enablement-revision-zero",
+                note: "zero names a row no writer produced, which is a different fault from a \
+                       counter the wire cannot carry — and the two categories differ",
+                kind: "set_enablement",
+                request_id: "req-set-1".to_owned(),
+                params: set_enablement_params(
+                    "ops/oncall",
+                    "auto-nightly",
+                    JsonValue::Null,
+                    number(0),
+                    "enabled",
+                ),
+                category: unwritten_revision,
+                constructor: Some(("DurableRowId", "expected_revision", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "set-enablement-revision-above-wire-ceiling",
+                note: "one past the largest integer this wire carries: the same branded \
+                       constructor refuses it, and the encoder reports the other end of the range",
+                kind: "set_enablement",
+                request_id: "req-set-1".to_owned(),
+                params: set_enablement_params(
+                    "ops/oncall",
+                    "auto-nightly",
+                    JsonValue::Null,
+                    number(wire_ceiling() + 1),
+                    "enabled",
+                ),
+                category: revision_out_of_range,
+                constructor: Some(("DurableRowId", "expected_revision", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "set-enablement-undefined-target",
+                note: "a brand exists only in the type checker, so the builder is where an \
+                       untyped caller's undefined state is stopped. The coupling passes first — \
+                       an unknown target requires no cause and none is given — so what refuses \
+                       this is the vocabulary rather than the relation",
+                kind: "set_enablement",
+                request_id: "req-set-1".to_owned(),
+                params: set_enablement_params(
+                    "ops/oncall",
+                    "auto-nightly",
+                    JsonValue::Null,
+                    number(2),
+                    "disabled",
+                ),
+                category: undefined_state,
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "set-enablement-cause-over-bound",
+                note: "one byte over the cause bound, measured in UTF-8 bytes",
+                kind: "set_enablement",
+                request_id: "req-set-1".to_owned(),
+                params: set_enablement_params(
+                    "ops/oncall",
+                    "auto-nightly",
+                    text(&long_identifier),
+                    number(2),
+                    "paused",
+                ),
+                category: PauseReason::new(&long_identifier)
+                    .expect_err("an overlong cause is refused")
+                    .category()
+                    .to_owned(),
+                constructor: Some(("PauseReason", "cause", "too_long")),
+            },
+            EncodeRefusal {
+                id: "register-automation-id-over-bound",
+                note: "one byte over the identity bound",
+                kind: "register_automation",
+                request_id: "req-register-1".to_owned(),
+                params: JsonValue::Object(vec![
+                    ("actor".to_owned(), text("ops/oncall")),
+                    ("automation_id".to_owned(), text(&long_identifier)),
+                ]),
+                category: AutomationId::new(&long_identifier)
+                    .expect_err("an overlong identity is refused")
+                    .category()
+                    .to_owned(),
+                constructor: Some(("AutomationId", "automation_id", "too_long")),
+            },
+            EncodeRefusal {
+                id: "register-actor-control-character",
+                note: "a control character in an actor, which the wire never carries raw",
+                kind: "register_automation",
+                request_id: "req-register-1".to_owned(),
+                params: JsonValue::Object(vec![
+                    ("actor".to_owned(), text("ops\u{7}oncall")),
+                    ("automation_id".to_owned(), text("auto-nightly")),
+                ]),
+                category: wire_category(
+                    "register_automation",
+                    JsonValue::Object(vec![
+                        ("actor".to_owned(), text("ops\u{7}oncall")),
+                        ("automation_id".to_owned(), text("auto-nightly")),
+                    ]),
+                ),
+                constructor: Some(("AutomationActor", "actor", "invalid_character")),
+            },
+            EncodeRefusal {
+                id: "automation-detail-id-empty",
+                note: "an empty identity names nothing",
+                kind: "automation_detail",
+                request_id: "req-detail-1".to_owned(),
+                params: JsonValue::Object(vec![("automation_id".to_owned(), text(""))]),
+                category: AutomationId::new("")
+                    .expect_err("an empty identity is refused")
+                    .category()
+                    .to_owned(),
+                constructor: Some(("AutomationId", "automation_id", "empty")),
+            },
+            EncodeRefusal {
+                id: "list-automations-page-size-zero",
+                note: "a page that admits nothing cannot make progress, so zero is refused \
+                       rather than treated as a default",
+                kind: "list_automations",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(number(0), number(0), JsonValue::Null),
+                category: page_size_out_of_range.clone(),
+                constructor: Some(("AutomationPageSize", "page_size", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "list-automations-page-size-above-bound",
+                note: "one past MAX_AUTOMATION_PAGE_ITEMS, which is thirty-two here and \
+                       sixty-four on the Runs lane: a page bound follows the frame arithmetic of \
+                       the rows it carries",
+                kind: "list_automations",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(
+                    number(MAX_AUTOMATION_PAGE_ITEMS as u64 + 1),
+                    number(0),
+                    JsonValue::Null,
+                ),
+                category: page_size_out_of_range,
+                constructor: Some(("AutomationPageSize", "page_size", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "list-automations-cursor-above-wire-ceiling",
+                note: "a cursor one past the largest integer this wire carries, which is a \
+                       counter refusal rather than a malformed body",
+                kind: "list_automations",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(number(1), number(wire_ceiling() + 1), JsonValue::Null),
+                category: cursor_out_of_range,
+                constructor: Some(("AutomationCursor", "since", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "list-automations-empty-state-filter",
+                note: "an empty filter admits nothing, which no listing could ever answer; it is \
+                       not the same request as no filter at all",
+                kind: "list_automations",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(number(1), number(0), JsonValue::Array(Vec::new())),
+                category: empty_filter,
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "list-automations-repeated-state",
+                note: "a repeat means a caller believes it asked for something it did not",
+                kind: "list_automations",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(
+                    number(1),
+                    number(0),
+                    JsonValue::Array(vec![text("paused"), text("paused")]),
+                ),
+                category: repeated_state,
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "list-automations-undefined-state",
+                note: "an undefined state in a filter, stopped where an untyped caller reaches \
+                       the builder",
+                kind: "list_automations",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(
+                    number(1),
+                    number(0),
+                    JsonValue::Array(vec![text("disabled")]),
+                ),
+                category: AutomationApiError::Codec(
+                    automonique_protocol::codec::CodecError::UnknownEnumValue {
+                        field: "enablement",
+                    },
+                )
+                .category()
+                .to_owned(),
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "request-id-too-long",
+                note: "the envelope's fields are judged by the shared codec, whose refusal for a \
+                       bound is not the one this protocol uses for a body",
+                kind: "automation_detail",
+                request_id: long_request_id,
+                params: JsonValue::Object(vec![("automation_id".to_owned(), text("auto-nightly"))]),
+                category: long_id_refusal,
+                constructor: Some(("RequestId", "request_id", "too_long")),
+            },
+            EncodeRefusal {
+                id: "request-id-outside-grammar",
+                note: "a grammar refusal is not a bounds refusal, and the categories differ. A \
+                       space is outside the correlation identifier's grammar and inside the \
+                       automation identity's, which is the difference this lane's looser \
+                       identifier makes",
+                kind: "automation_detail",
+                request_id: "req 1".to_owned(),
+                params: JsonValue::Object(vec![("automation_id".to_owned(), text("auto nightly"))]),
+                category: bad_id_refusal,
+                constructor: Some(("RequestId", "request_id", "invalid_character")),
+            },
+        ]
+    }
+
+    fn encode_refusal_entry(refusal: &EncodeRefusal) -> JsonValue {
+        let mut entry = vec![
+            ("category".to_owned(), text(&refusal.category)),
+            ("id".to_owned(), text(refusal.id)),
+            ("kind".to_owned(), text(refusal.kind)),
+            ("note".to_owned(), text(refusal.note)),
+            ("params".to_owned(), refusal.params.clone()),
+            ("request_id".to_owned(), text(&refusal.request_id)),
+        ];
+        if let Some((constructor, parameter, violation)) = refusal.constructor {
+            // Named `refused_by` rather than `constructor`: a JSON object parsed
+            // by a JavaScript reader inherits `constructor` from its prototype.
+            entry.push(("refused_by".to_owned(), text(constructor)));
+            entry.push(("refused_param".to_owned(), text(parameter)));
+            entry.push(("violation".to_owned(), text(violation)));
+        }
+        JsonValue::Object(entry)
+    }
+
+    // -----------------------------------------------------------------------
+    // The corpus file
+    // -----------------------------------------------------------------------
+
+    fn corpus() -> String {
+        let document = JsonValue::Object(vec![
+            (
+                "decode_refusals".to_owned(),
+                JsonValue::Array(decode_refusals().iter().map(decode_refusal_entry).collect()),
+            ),
+            (
+                "encode_refusals".to_owned(),
+                JsonValue::Array(encode_refusals().iter().map(encode_refusal_entry).collect()),
+            ),
+            (
+                "generator".to_owned(),
+                text("automonique-protocol tests/codegen.rs, module automation_surface"),
+            ),
+            (
+                "note".to_owned(),
+                text(
+                    "Generated from the shipped Rust constructors: every canonical byte string \
+                     here was produced by encoding a real message and re-read through \
+                     from_canonical_bytes before it was written, and every refusal category was \
+                     read back from the error Rust returned for that exact input. Counters \
+                     travel as decimal strings because a JSON reader using a double would round \
+                     the largest of them without saying so. Rust is the wire source of truth, so \
+                     a disagreement is fixed in whichever implementation is wrong — never in \
+                     this file.",
+                ),
+            ),
+            ("protocol".to_owned(), text(AUTOMATION_PROTOCOL)),
+            (
+                "requests".to_owned(),
+                JsonValue::Array(request_cases().iter().map(request_entry).collect()),
+            ),
+            (
+                "responses".to_owned(),
+                JsonValue::Array(response_cases().iter().map(response_entry).collect()),
+            ),
+            (
+                "rust_only_refusals".to_owned(),
+                JsonValue::Array(rust_only_refusals().iter().map(rust_only_entry).collect()),
+            ),
+            (
+                "rust_only_refusals_note".to_owned(),
+                text(
+                    "Payloads the Rust constructors refuse and the generated TypeScript accepts. \
+                     Each breaks a rule relating two fields of a decoded message, which the \
+                     generated surface does not hold. The request-side enablement/cause coupling \
+                     is deliberately absent from this list: the generated builder does apply it, \
+                     and encode_refusals is where that is proved. The runner asserts these \
+                     decode, so the remaining gap is measured rather than described — teaching \
+                     the generator one of these rules turns the suite red until the entry moves \
+                     to decode_refusals.",
+                ),
+            ),
+            (
+                "version".to_owned(),
+                JsonValue::Integer(i64::from(MajorVersion::FIRST.get())),
+            ),
+        ]);
+        let mut out = String::new();
+        write_pretty(&document, 0, &mut out);
+        out.push('\n');
+        out
+    }
+
+    /// The drift gate over the corpus, and the regeneration that closes it.
+    #[test]
+    fn the_checked_in_corpus_matches_regeneration() {
+        let expected = corpus();
+        let path = corpus_path();
+        if regenerating() {
+            let staging = path.with_extension("json.staging");
+            std::fs::write(&staging, &expected).expect("stage the corpus");
+            std::fs::rename(&staging, &path).expect("publish the corpus");
+            return;
+        }
+        let actual = std::fs::read_to_string(&path)
+            .expect("the corpus is checked in — regenerate it to create it");
+        if actual != expected {
+            let difference = actual
+                .lines()
+                .zip(expected.lines())
+                .enumerate()
+                .find(|(_, (left, right))| left != right)
+                .map_or_else(
+                    || {
+                        format!(
+                            "{} lines on disk, {} lines generated",
+                            actual.lines().count(),
+                            expected.lines().count()
+                        )
+                    },
+                    |(index, (left, right))| {
+                        let shorten = |line: &str| line.chars().take(120).collect::<String>();
+                        format!(
+                            "line {}: on disk {:?}, generated {:?}",
+                            index + 1,
+                            shorten(left),
+                            shorten(right)
+                        )
+                    },
+                );
+            panic!(
+                "the checked-in automation corpus no longer matches the Rust encoders: \
+                 {difference}\n\nRegenerate with: {REGENERATE_COMMAND}"
+            );
+        }
+    }
+
+    /// Every request this protocol version defines is generated or named absent.
+    #[test]
+    fn every_request_kind_is_generated_or_named_as_absent() {
+        let id = request_id("req-coverage-1");
+        let requests = vec![
+            AutomationRequest::RegisterAutomation {
+                request_id: id.clone(),
+                registration: RegisterAutomation::new(automation_id("auto-1"), actor("ops/oncall")),
+            },
+            AutomationRequest::SetEnablement {
+                request_id: id.clone(),
+                transition: SetEnablement::new(
+                    automation_id("auto-1"),
+                    1,
+                    EnablementState::Enabled,
+                    actor("ops/oncall"),
+                    None,
+                )
+                .expect("a resume"),
+            },
+            AutomationRequest::ListAutomations {
+                request_id: id.clone(),
+                query: ListAutomations::new(
+                    AutomationStateFilter::any(),
+                    AutomationCursor::START,
+                    page_size(1),
+                ),
+            },
+            AutomationRequest::AutomationDetail {
+                request_id: id,
+                automation_id: automation_id("auto-1"),
+            },
+        ];
+        // The match is the point: a request added to `AutomationRequest` fails
+        // to compile here rather than quietly falling outside the generated
+        // surface.
+        for request in &requests {
+            match request {
+                AutomationRequest::RegisterAutomation { .. }
+                | AutomationRequest::SetEnablement { .. }
+                | AutomationRequest::ListAutomations { .. }
+                | AutomationRequest::AutomationDetail { .. } => {}
+            }
+        }
+        let encoded: BTreeSet<String> = requests
+            .iter()
+            .map(|request| {
+                request
+                    .to_message()
+                    .expect("each request encodes")
+                    .envelope()
+                    .kind()
+                    .as_str()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            encoded.len(),
+            requests.len(),
+            "one request per variant is required, each with its own kind"
+        );
+
+        let surface = surface();
+        let mut covered: BTreeSet<String> = surface
+            .requests
+            .iter()
+            .map(|request| request.kind.clone())
+            .collect();
+        for kind in &surface.request_kinds_not_generated {
+            assert!(
+                covered.insert(kind.clone()),
+                "{kind} is both generated and named as absent"
+            );
+        }
+        assert_eq!(
+            covered, encoded,
+            "the generated automation surface does not account for every request kind the Rust \
+             encoders produce; regenerate with: {REGENERATE_COMMAND}"
+        );
+    }
+
+    /// Every answer this protocol version defines is decoded or named undecoded.
+    #[test]
+    fn every_response_kind_is_decoded_or_named_as_undecoded() {
+        let id = request_id("req-coverage-1");
+        let responses = vec![
+            AutomationResponse::Accepted {
+                request_id: id.clone(),
+                receipt: AutomationReceiptView::new(
+                    1,
+                    automation_id("auto-1"),
+                    EnablementState::Enabled,
+                    1,
+                    EpochMillis::from_millis(0),
+                )
+                .expect("a receipt"),
+            },
+            AutomationResponse::AutomationList {
+                request_id: id.clone(),
+                page: AutomationListPage::new(Vec::new(), AutomationContinuation::Complete)
+                    .expect("a page"),
+            },
+            AutomationResponse::AutomationDetail {
+                request_id: id.clone(),
+                record: record(Row {
+                    entry_id: 1,
+                    automation_id: "auto-1",
+                    revision: 1,
+                    enablement: EnablementState::Enabled,
+                    actor: "ops/oncall",
+                    cause: None,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                }),
+            },
+            AutomationResponse::conflict(id.clone(), 1, 2).expect("a conflict"),
+            AutomationResponse::Refused {
+                request_id: id,
+                refusal: AutomationRefusal::UnknownAutomation,
+            },
+        ];
+        // The match is the point: a variant added to `AutomationResponse` fails
+        // to compile here rather than slipping past a surface that ignores it.
+        for response in &responses {
+            match response {
+                AutomationResponse::Accepted { .. }
+                | AutomationResponse::AutomationList { .. }
+                | AutomationResponse::AutomationDetail { .. }
+                | AutomationResponse::Conflict { .. }
+                | AutomationResponse::Refused { .. } => {}
+            }
+        }
+        let encoded: BTreeSet<String> = responses
+            .iter()
+            .map(|response| {
+                response
+                    .to_message()
+                    .expect("each response encodes")
+                    .envelope()
+                    .kind()
+                    .as_str()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            encoded.len(),
+            responses.len(),
+            "one response per variant is required, each with its own kind"
+        );
+
+        let surface = surface();
+        let mut covered: BTreeSet<String> = surface
+            .responses
+            .iter()
+            .map(|response| response.kind.clone())
+            .collect();
+        for kind in &surface.response_kinds_not_decoded {
+            assert!(
+                covered.insert(kind.clone()),
+                "{kind} is both decoded and named as undecoded"
+            );
+        }
+        assert_eq!(
+            covered, encoded,
+            "the generated automation surface does not account for every answer the daemon can \
+             produce; regenerate with: {REGENERATE_COMMAND}"
+        );
+    }
+
+    /// The closed vocabularies, restated here rather than read back from the
+    /// generator.
+    ///
+    /// A generator that dropped a variant would agree with itself perfectly.
+    /// This is the second opinion, and the third is the wire order, which is
+    /// checked against `EnablementState::ALL` rather than against a list: the
+    /// sorted `_VALUES` table is not the order a state filter encodes in, and a
+    /// generator that emitted the sorted one there would produce bytes Rust
+    /// refuses to match.
+    #[test]
+    fn every_closed_vocabulary_carries_all_of_its_variants() {
+        let generated = generated_automation();
+        let expected: [(&str, &[&str]); 2] = [
+            (
+                "AutomationRefusal",
+                &[
+                    "already_registered",
+                    "cause_forbidden",
+                    "cause_required",
+                    "cursor_out_of_range",
+                    "illegal_transition",
+                    "invalid_field",
+                    "registry_full",
+                    "unknown_automation",
+                ],
+            ),
+            ("EnablementState", &["archived", "enabled", "paused"]),
+        ];
+        for (name, values) in expected {
+            let literals: Vec<String> = values.iter().map(|value| format!("\"{value}\"")).collect();
+            let declaration = format!("export type {name} = {};", literals.join(" | "));
+            assert!(
+                generated.contains(&declaration),
+                "the automation surface lost a {name} variant.\nexpected: {declaration}"
+            );
+            assert!(
+                generated.contains(&format!(
+                    "export const {name}_VALUES: readonly {name}[] = [{}];",
+                    literals.join(", ")
+                )),
+                "the {name} table does not match its type"
+            );
+            assert!(
+                generated.contains(&format!(
+                    "export function decode{name}(value: string): {name} {{"
+                )),
+                "the automation surface does not refuse an undefined {name}"
+            );
+        }
+
+        let order: Vec<String> = EnablementState::ALL
+            .iter()
+            .map(|state| format!("\"{}\"", state.as_str()))
+            .collect();
+        assert!(
+            generated.contains(&format!(
+                "export const EnablementState_WIRE_ORDER: readonly EnablementState[] = [{}];",
+                order.join(", ")
+            )),
+            "the generated wire order is not EnablementState::ALL, so a state filter would \
+             encode bytes Rust does not produce"
+        );
+        assert_ne!(
+            {
+                let mut sorted = order.clone();
+                sorted.sort();
+                sorted
+            },
+            order,
+            "this check is only worth making while the two orders differ"
+        );
+    }
+
+    /// The states that owe a cause are the ones `requires_cause` names.
+    ///
+    /// Not a list retyped beside the generator's: the expectation is built by
+    /// asking the same function the daemon and the store agree with, and the
+    /// assertion below is that the *wire order* is preserved rather than sorted,
+    /// because a coupling that tested membership in a sorted list would still
+    /// pass while the array said something the enum does not.
+    #[test]
+    fn the_cause_coupling_names_exactly_the_withdrawn_states() {
+        let expected: Vec<&str> = EnablementState::ALL
+            .iter()
+            .filter(|state| automonique_protocol::automation_api::requires_cause(**state))
+            .map(|state| state.as_str())
+            .collect();
+        assert_eq!(
+            expected,
+            vec!["paused", "archived"],
+            "the withdrawn states are the two that carry a PauseCause"
+        );
+        let literals: Vec<String> = expected
+            .iter()
+            .map(|value| format!("\"{value}\""))
+            .collect();
+        let generated = generated_automation();
+        assert!(
+            generated.contains(&format!(
+                "export const ENABLEMENT_STATES_REQUIRING_CAUSE: readonly string[] = [{}];",
+                literals.join(", ")
+            )),
+            "the generated coupling does not name the states requires_cause names"
+        );
+        // Declaring the rule is not applying it.
+        for application in [
+            "const cause = coupledField(body.target, body.cause, {",
+            "requiring: ENABLEMENT_STATES_REQUIRING_CAUSE,",
+            "required: AUTOMATION_CAUSE_REQUIRED,",
+            "forbidden: AUTOMATION_CAUSE_FORBIDDEN,",
+        ] {
+            assert!(
+                generated.contains(application),
+                "the automation surface declares the coupling but does not apply it: {application}"
+            );
+        }
+        assert!(
+            !generated.contains("cause: PauseReason;"),
+            "a cause that cannot be null would make the coupling unreachable: a resume could not \
+             be spelled at all"
+        );
+    }
+
+    /// The bounds in the output are the Rust constants, and they are applied.
+    #[test]
+    fn the_generated_automation_bounds_are_the_rust_constants() {
+        let generated = generated_automation();
+        for declaration in [
+            format!("export const MAX_AUTOMATION_PAGE_ITEMS = {MAX_AUTOMATION_PAGE_ITEMS};"),
+            format!(
+                "export const MAX_AUTOMATION_CANONICAL_BYTES = {};",
+                automonique_protocol::automation_api::MAX_AUTOMATION_CANONICAL_BYTES
+            ),
+            format!("export const AutomationId_MAX_BYTES = {MAX_AUTOMATION_API_FIELD_BYTES};"),
+            format!("export const AutomationActor_MAX_BYTES = {MAX_AUTOMATION_API_FIELD_BYTES};"),
+            format!("export const PauseReason_MAX_BYTES = {MAX_AUTOMATION_API_FIELD_BYTES};"),
+            format!("export const AutomationPageSize_MAX = {MAX_AUTOMATION_PAGE_ITEMS}n;"),
+            "export const AutomationPageSize_MIN = 1n;".to_owned(),
+            "export const AutomationCursor_MIN = 0n;".to_owned(),
+            format!("export const AutomationCursor_MAX = {}n;", i64::MAX),
+            format!("export const AUTOMATION_PROTOCOL = \"{AUTOMATION_PROTOCOL}\";"),
+            format!(
+                "export const AUTOMATION_API_SCHEMA_V1 = \"{}\";",
+                automonique_protocol::automation_api::AUTOMATION_API_SCHEMA_V1
+            ),
+        ] {
+            assert!(
+                generated.contains(&declaration),
+                "the automation surface does not carry the Rust bound: {declaration}"
+            );
+        }
+        // Declaring a bound is not applying it.
+        for application in [
+            format!(
+                "  if (byteLength(value) > {MAX_AUTOMATION_API_FIELD_BYTES}) throw new \
+                 ValidationError(\"AutomationId\", \"too_long\");"
+            ),
+            format!(
+                "  if (byteLength(value) > {MAX_AUTOMATION_API_FIELD_BYTES}) throw new \
+                 ValidationError(\"PauseReason\", \"too_long\");"
+            ),
+            format!(
+                "  if (value < 1n || value > {MAX_AUTOMATION_PAGE_ITEMS}n) throw new \
+                 ValidationError(\"AutomationPageSize\", \"out_of_range\");"
+            ),
+            "bodyArray(fields, \"automations\", AUTOMATION_INVALID_BODY, \
+             MAX_AUTOMATION_PAGE_ITEMS, AUTOMATION_PAGE_TOO_LARGE)"
+                .to_owned(),
+        ] {
+            assert!(
+                generated.contains(&application),
+                "the automation surface declares a bound it does not apply: {application}"
+            );
+        }
+        // The identity's grammar is the store's looser one, not `DurableId`'s.
+        assert!(
+            generated.contains("export const AutomationId_PATTERN = /^[^\\p{Cc}]+$/u;"),
+            "the automation identity does not carry the control-free grammar the durable \
+             registry stores under"
+        );
+    }
+
+    /// Every category the generated code refuses with is declared, and every
+    /// declared category is a spelling Rust actually produces.
+    #[test]
+    fn every_refusal_category_is_declared_and_is_the_rust_spelling() {
+        let surface = surface();
+        let declared: BTreeMap<String, String> = surface
+            .categories
+            .iter()
+            .map(|constant| {
+                let ConstantValue::Text(value) = &constant.value else {
+                    panic!("{} is a refusal category, which is text", constant.name)
+                };
+                (constant.name.clone(), value.clone())
+            })
+            .collect();
+
+        let mut referenced = vec![
+            surface.invalid_body_category.clone(),
+            surface.unknown_kind_category.clone(),
+            surface.oversize_category.clone(),
+            surface.field_invalid_category.clone(),
+            surface.field_grammar_category.clone(),
+        ];
+        referenced.extend(referenced_categories(&surface));
+        for name in &referenced {
+            assert!(
+                declared.contains_key(name),
+                "the automation surface refuses with {name}, which it does not declare"
+            );
+        }
+
+        let generated = generated_automation();
+        for (name, expected) in [
+            (
+                "AUTOMATION_INVALID_BODY",
+                AutomationApiError::InvalidBody.category(),
+            ),
+            (
+                "AUTOMATION_UNKNOWN_KIND",
+                AutomationApiError::UnknownKind.category(),
+            ),
+            (
+                "AUTOMATION_CAUSE_REQUIRED",
+                AutomationApiError::CauseRequired {
+                    state: EnablementState::Paused,
+                }
+                .category(),
+            ),
+            (
+                "AUTOMATION_CAUSE_FORBIDDEN",
+                AutomationApiError::CauseForbidden {
+                    state: EnablementState::Enabled,
+                }
+                .category(),
+            ),
+            (
+                "AUTOMATION_UNWRITTEN_REVISION",
+                AutomationApiError::UnwrittenRevision.category(),
+            ),
+            (
+                "AUTOMATION_UNWRITTEN_ROW",
+                AutomationApiError::UnwrittenRow { field: "entry_id" }.category(),
+            ),
+            (
+                "AUTOMATION_PAGE_TOO_LARGE",
+                AutomationApiError::PageTooLarge {
+                    max_items: 0,
+                    actual_items: 0,
+                }
+                .category(),
+            ),
+            (
+                "AUTOMATION_TIME_BEFORE_EPOCH",
+                AutomationApiError::TimeBeforeEpoch {
+                    field: "updated_at_ms",
+                }
+                .category(),
+            ),
+            (
+                "AUTOMATION_UNKNOWN_ENUM_VALUE",
+                AutomationApiError::Codec(
+                    automonique_protocol::codec::CodecError::UnknownEnumValue {
+                        field: "enablement",
+                    },
+                )
+                .category(),
+            ),
+            (
+                "AUTOMATION_INVALID_FIELD",
+                AutomationApiError::Field {
+                    field: "automation_id",
+                    error: ValueError::Empty,
+                }
+                .category(),
+            ),
+        ] {
+            assert_eq!(
+                declared.get(name).map(String::as_str),
+                Some(expected),
+                "{name} is not the category Rust reports"
+            );
+            assert!(
+                generated.contains(&format!("export const {name} = \"{expected}\";")),
+                "the generated file does not carry {name} as {expected}"
+            );
+        }
+        // The two ends of the revision range are different faults, and the
+        // generated encoder reports each under the category Rust reports.
+        assert_ne!(
+            declared.get("AUTOMATION_UNWRITTEN_REVISION"),
+            declared.get("AUTOMATION_COUNTER_OUT_OF_RANGE"),
+            "a revision of zero and a revision above the wire ceiling are different faults"
+        );
+        assert_eq!(
+            declared.get(&surface.oversize_category).map(String::as_str),
+            Some("frame_size"),
+            "the oversize category is the spelling a transport would report; no shipped \
+             transport carries this protocol yet, so nothing pins it"
+        );
+    }
+
+    /// The SDK has no transport, and the generated file says so.
+    #[test]
+    fn the_generated_surface_says_the_framing_is_excluded() {
+        let generated = generated_automation();
+        for statement in [
+            "The length-delimited framing this protocol travels under is not applied",
+            "This package has no transport.",
+            "The payload is the framed transport's payload, without its length prefix.",
+        ] {
+            assert!(
+                generated.contains(statement),
+                "the generated automation surface does not state where framing lives: {statement}"
+            );
+        }
+    }
+
+    /// The package typecheck actually reads the new files.
+    #[test]
+    fn the_typecheck_reads_the_automation_surface_and_its_runner() {
+        let output = Command::new("npx")
+            .arg("--offline")
+            .arg("tsc")
+            .arg("-p")
+            .arg("./tsconfig.json")
+            .arg("--listFiles")
+            .current_dir(package_root())
+            .output();
+        let Ok(output) = output else {
+            eprintln!("GAP: tsc is unavailable; the automation surface is untypechecked");
+            return;
+        };
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "the protocol package does not typecheck with the automation surface:\n{combined}"
+        );
+        for expected in [
+            "generated/automation.ts",
+            "generated/runtime.ts",
+            "conformance/automation-api.ts",
+        ] {
+            assert!(
+                combined.lines().any(|line| line.trim().ends_with(expected)),
+                "tsc did not read {expected}; it is outside the tsconfig include globs, so \
+                 nothing typechecks it.\n{combined}"
+            );
+        }
+    }
+
+    /// The heart of the wave: the generated TypeScript encodes the same bytes
+    /// Rust does, decodes what Rust answers, refuses what Rust refuses, and
+    /// accepts exactly the cross-field payloads it is documented not to judge.
+    #[test]
+    fn the_generated_typescript_agrees_with_rust_byte_for_byte() {
+        let Some(runtime) = javascript_runtime() else {
+            eprintln!(
+                "GAP: no JavaScript runtime; the automation surface is unmeasured across languages"
+            );
+            return;
+        };
+        let directory =
+            std::env::temp_dir().join(format!("automonique-automation-api-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("scratch directory");
+        let produced_path = directory.join("typescript-encodings.txt");
+
+        let output = Command::new(runtime)
+            .arg(runner_path())
+            .arg(corpus_path())
+            .arg(&produced_path)
+            .current_dir(package_root())
+            .output()
+            .expect("the conformance runner starts");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "the generated automation surface disagrees with the Rust corpus under {runtime}:\n\
+             {combined}"
+        );
+
+        // The second direction: the runner reports the bytes it produced, and
+        // they are compared here against what Rust encodes and then fed to the
+        // shipped decoder.
+        let reported = std::fs::read_to_string(&produced_path)
+            .expect("the runner reports the payloads it produced");
+        let mut produced: BTreeMap<String, Vec<u8>> = reported
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let (id, payload) = line
+                    .split_once(' ')
+                    .unwrap_or_else(|| panic!("a reported line is `<id> <hex>`: {line:?}"));
+                (id.to_owned(), unhex(payload))
+            })
+            .collect();
+
+        for case in request_cases() {
+            let expected = case
+                .request
+                .to_message()
+                .expect("the request encodes")
+                .to_canonical_bytes();
+            let actual = produced
+                .remove(case.id)
+                .unwrap_or_else(|| panic!("the runner did not report {}", case.id));
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "{}: {runtime} produced {} canonical bytes, Rust produced {}",
+                case.id,
+                actual.len(),
+                expected.len()
+            );
+            if let Some(index) = actual
+                .iter()
+                .zip(expected.iter())
+                .position(|(left, right)| left != right)
+            {
+                let window = |bytes: &[u8]| {
+                    String::from_utf8_lossy(
+                        &bytes[index.saturating_sub(24)..(index + 24).min(bytes.len())],
+                    )
+                    .into_owned()
+                };
+                panic!(
+                    "{}: the two encodings first differ at byte {index}\n  {runtime}: {}\n  \
+                     rust: {}",
+                    case.id,
+                    window(&actual),
+                    window(&expected)
+                );
+            }
+            assert_eq!(
+                AutomationRequest::from_canonical_bytes(&actual).unwrap_or_else(|error| panic!(
+                    "{}: Rust refuses what {runtime} produced: {error}",
+                    case.id
+                )),
+                case.request,
+                "{}: Rust decodes what {runtime} produced as a different request",
+                case.id
+            );
+        }
+        assert!(
+            produced.is_empty(),
+            "the runner reported payloads the corpus has no cases for: {:?}",
+            produced.keys().collect::<Vec<_>>()
+        );
+        println!(
+            "automation api surface under {runtime}: {}",
             String::from_utf8_lossy(&output.stdout).trim()
         );
     }

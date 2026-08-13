@@ -127,6 +127,77 @@ export function refuseField<T>(
   }
 }
 
+/**
+ * Refuse a bounded integer, naming which end of the range it fell off.
+ *
+ * `refuse` reports one category for a value the constructor rejected, which is
+ * right where the Rust constructor reports one: a page size of zero and a page
+ * size above the bound are the same refusal there. Where the two ends are
+ * different faults — a revision of zero names a row no writer produced, a
+ * revision above the wire's ceiling is a counter the codec cannot carry — this
+ * reports the one the peer would.
+ */
+export function rangedInteger<T>(
+  value: bigint,
+  min: bigint,
+  belowCategory: string,
+  aboveCategory: string,
+  make: (value: bigint) => T,
+): T {
+  try {
+    return make(value);
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      throw new RefusalError(value < min ? belowCategory : aboveCategory, error.message);
+    }
+    throw error;
+  }
+}
+
+/** A rule relating one field's value to whether another may be present. */
+export interface CouplingRule {
+  /** Wire name of the field whose value decides. */
+  readonly deciding: string;
+  /** Wire name of the field it governs. */
+  readonly governed: string;
+  /** Deciding values that require the governed one. */
+  readonly requiring: readonly string[];
+  /** Category for a governed value that is required and absent. */
+  readonly required: string;
+  /** Category for one that is present and admitted by nothing. */
+  readonly forbidden: string;
+}
+
+/**
+ * Apply a coupling before a frame is spent on a request that cannot be right.
+ *
+ * The Rust constructor decides this too, and so does the durable store behind
+ * it, in its own API and in a database `CHECK`. Three checks that cannot
+ * disagree are worth more than one: this one refuses a malformed request
+ * without opening a socket, and the others refuse a malformed row without
+ * trusting this one.
+ */
+export function coupledField<T>(
+  decidingValue: string,
+  governedValue: T | null,
+  rule: CouplingRule,
+): T | null {
+  const requires = rule.requiring.includes(decidingValue);
+  if (requires && governedValue === null) {
+    throw new RefusalError(
+      rule.required,
+      `${rule.deciding} ${decidingValue} requires a stated ${rule.governed}`,
+    );
+  }
+  if (!requires && governedValue !== null) {
+    throw new RefusalError(
+      rule.forbidden,
+      `${rule.deciding} ${decidingValue} admits no ${rule.governed}`,
+    );
+  }
+  return governedValue;
+}
+
 /** Lowercase hexadecimal, two digits per byte. */
 export function hexEncode(bytes: Uint8Array): string {
   let hex = "";
@@ -243,6 +314,27 @@ export function bodyUnsigned(
     throw new RefusalError(category, `${name} is not an integer`);
   }
   if (value.value < 0n) throw new RefusalError(category, `${name} is negative`);
+  return value.value;
+}
+
+/**
+ * A string field that is always present and may be `null`.
+ *
+ * Absent and present-and-null are different wire facts, as they are for an
+ * integer. A row with no cause carries `null`, and a reader that read the key's
+ * absence as the same thing would accept a body Rust refuses.
+ */
+export function bodyStringOrNull(
+  fields: ReadonlyMap<string, JsonValue>,
+  name: string,
+  category: string,
+): string | null {
+  const value = fields.get(name);
+  if (value === undefined) throw new RefusalError(category, `${name} is absent`);
+  if (value.kind === "null") return null;
+  if (value.kind !== "string") {
+    throw new RefusalError(category, `${name} is neither a string nor null`);
+  }
   return value.value;
 }
 
