@@ -11,6 +11,7 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 mod admin_client;
+mod attempt;
 mod diagnostics;
 mod kernel;
 mod release;
@@ -37,7 +38,7 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
-const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique shutdown\n";
+const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique shutdown\n";
 
 #[derive(Clone)]
 enum Command {
@@ -73,6 +74,7 @@ enum Command {
         revision: OsString,
     },
     Shutdown,
+    Attempt(attempt::Operation),
 }
 
 /// Execute one closed product command. Arguments exclude the program name.
@@ -175,6 +177,39 @@ where
                 }
             }
         }
+        (Some(command), Some(operation), Some(socket_path), None)
+            if command == "attempt" && operation == "heartbeat" =>
+        {
+            Command::Attempt(attempt::Operation::Heartbeat { socket_path })
+        }
+        (Some(command), Some(operation), Some(socket_path), Some(attempt_id))
+            if command == "attempt" =>
+        {
+            let trailing = arguments.next();
+            let extra = arguments.next();
+            match (operation.to_str(), trailing, extra) {
+                (Some("inspect"), None, None) => Command::Attempt(attempt::Operation::Inspect {
+                    socket_path,
+                    attempt_id,
+                }),
+                (Some("events"), cursor, None) => Command::Attempt(attempt::Operation::Events {
+                    socket_path,
+                    attempt_id,
+                    cursor,
+                }),
+                (Some("cancel"), Some(request_ref), None) => {
+                    Command::Attempt(attempt::Operation::Cancel {
+                        socket_path,
+                        attempt_id,
+                        request_ref,
+                    })
+                }
+                _ => {
+                    let _ = stderr.write_all(USAGE.as_bytes());
+                    return 2;
+                }
+            }
+        }
         (Some(command), None, None, None) if command == "shutdown" => Command::Shutdown,
         _ => {
             let _ = stderr.write_all(USAGE.as_bytes());
@@ -249,6 +284,9 @@ where
         }
         Command::Shutdown => {
             return admin_shutdown(runtime.as_deref(), &mut stdout, &mut stderr);
+        }
+        Command::Attempt(operation) => {
+            return attempt::run(operation, &mut stdout, &mut stderr);
         }
         Command::Doctor { json } => json,
     };

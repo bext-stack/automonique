@@ -1023,10 +1023,23 @@ mod surface_coverage {
         assert_eq!(
             outside,
             [
+                // The six admission.* / sandbox.* / workspace.* entries are the
+                // runner admission bridge's UnmappableField spellings — the
+                // dotted names its typed refusals use to say which RunSpec
+                // field could not be mapped. They name fields, not protocols,
+                // and belong to this recorded class for the same reason
+                // `supervisor.adapter` does: a diagnostic identifier that a
+                // scanner cannot distinguish from a protocol name by shape.
+                "admission.origin",
                 "checkpoint.create",
                 "checkpoint.list",
                 "checkpoint.restore",
+                "sandbox.actor",
                 "supervisor.adapter",
+                "workspace.snapshot",
+                "workspace.source",
+                "workspace.tenant",
+                "workspace.token",
             ],
             "the recorded gap changed: {declared:?}"
         );

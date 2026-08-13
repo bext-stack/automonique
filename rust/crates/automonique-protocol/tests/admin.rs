@@ -4,12 +4,14 @@ use automonique_protocol::admin::{
     ADMIN_PROTOCOL, AdminCommand, AdminError, AdminInstanceId, AdminOutboxEvidence,
     AdminOutboxEvidenceParts, AdminReconciliationEvidence, AdminRefusalCategory, AdminRequest,
     AdminResponse, DaemonState, DaemonStatus, MAX_ADMIN_CANONICAL_BYTES, MAX_INSTANCE_ID_BYTES,
-    MAX_SYNTHETIC_KEY_BYTES, MAX_SYNTHETIC_SCOPE_BYTES, MAX_SYNTHETIC_TASK_BYTES,
-    OperationalMetric, OperationalStatus, OperationalStatusParts, OutboxReconciliation,
-    OutboxReconciliationDecision, OutboxReconciliationParts, ReconciliationFailure,
-    SyntheticSubmission,
+    MAX_RUN_SUBMISSION_KEY_BYTES, MAX_SUBMITTED_RUN_SPEC_BYTES, MAX_SYNTHETIC_KEY_BYTES,
+    MAX_SYNTHETIC_SCOPE_BYTES, MAX_SYNTHETIC_TASK_BYTES, OperationalMetric, OperationalStatus,
+    OperationalStatusParts, OutboxReconciliation, OutboxReconciliationDecision,
+    OutboxReconciliationParts, ReconciliationFailure, SubmittedRunSpec, SyntheticSubmission,
 };
 use automonique_protocol::codec::{CodecError, FrameDecode, RequestId, decode_frame, encode_frame};
+use automonique_protocol::digest::Sha256;
+use automonique_protocol::tools::RunId;
 
 fn request_id() -> RequestId {
     RequestId::new("req-admin-1").expect("valid request ID")
@@ -609,4 +611,230 @@ fn malformed_canonical_json_keeps_the_shared_codec_category() {
         error,
         AdminError::Codec(CodecError::MalformedJson)
     ));
+}
+
+#[test]
+fn run_spec_custody_requests_and_receipts_round_trip_exactly() {
+    let document = br#"{"schema":"automonique.run-spec/v1"}"#.to_vec();
+    let submission =
+        SubmittedRunSpec::sealed(document.clone(), "operator:run:7").expect("bounded document");
+    assert_eq!(submission.spec_digest(), &Sha256::digest(&document));
+
+    let request = AdminRequest::submit_run(request_id(), submission.clone());
+    let payload = request
+        .to_message()
+        .expect("encode submission")
+        .to_canonical_bytes();
+    let decoded = AdminRequest::from_canonical_bytes(&payload).expect("decode submission");
+    assert_eq!(decoded, request);
+    assert_eq!(decoded.command(), AdminCommand::SubmitRun);
+    assert_eq!(decoded.run_submission(), Some(&submission));
+    assert_eq!(
+        decoded.run_submission().expect("carried").document(),
+        document
+    );
+
+    let response = AdminResponse::RunAccepted {
+        request_id: request_id(),
+        run_id: RunId::new("run-1").expect("run identity"),
+        spec_digest: Sha256::digest(&document),
+        submission_id: 3,
+        replay: true,
+    };
+    let payload = response
+        .to_message()
+        .expect("encode receipt")
+        .to_canonical_bytes();
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(&payload).expect("decode receipt"),
+        response
+    );
+}
+
+#[test]
+fn a_maximal_run_submission_fits_one_admin_frame() {
+    // Worst case on every axis the bound was computed for: a maximal request
+    // identifier, a maximal idempotency key made entirely of bytes that
+    // JSON-escapes to two, and a maximal document.
+    let worst_case = AdminRequest::submit_run(
+        RequestId::new("r".repeat(128)).expect("maximal request identifier"),
+        SubmittedRunSpec::sealed(
+            vec![b'x'; MAX_SUBMITTED_RUN_SPEC_BYTES],
+            "\"".repeat(MAX_RUN_SUBMISSION_KEY_BYTES),
+        )
+        .expect("exact maximum document"),
+    )
+    .to_message()
+    .expect("maximal document encodes")
+    .to_canonical_bytes();
+    assert!(worst_case.len() > 2 * MAX_SUBMITTED_RUN_SPEC_BYTES);
+    assert!(worst_case.len() <= MAX_ADMIN_CANONICAL_BYTES);
+
+    let mut frame = Vec::new();
+    encode_frame(&worst_case, &mut frame).expect("maximal submission frames");
+    let FrameDecode::Frame { payload, .. } = decode_frame(&frame).expect("valid frame") else {
+        panic!("complete submission reported incomplete")
+    };
+    assert_eq!(
+        AdminRequest::from_canonical_bytes(payload)
+            .expect("admitted submission")
+            .run_submission()
+            .expect("carried document")
+            .document()
+            .len(),
+        MAX_SUBMITTED_RUN_SPEC_BYTES
+    );
+}
+
+#[test]
+fn oversized_run_spec_documents_are_refused_at_encode_and_decode() {
+    let oversized = MAX_SUBMITTED_RUN_SPEC_BYTES + 1;
+    assert_eq!(
+        SubmittedRunSpec::sealed(vec![b'x'; oversized], "key").expect_err("oversized document"),
+        AdminError::DocumentTooLarge {
+            max_bytes: MAX_SUBMITTED_RUN_SPEC_BYTES,
+            actual_bytes: oversized,
+        }
+    );
+    assert_eq!(
+        SubmittedRunSpec::sealed(Vec::new(), "key").expect_err("empty document"),
+        AdminError::InvalidBody
+    );
+
+    // The wire is refused on the same bound. The two payloads below pin the
+    // *order* of the decode checks, not only their outcome: the second is
+    // oversized and not hexadecimal and not even-length, and the bound still
+    // wins. That is what makes the ceiling a check on the encoded text rather
+    // than on a buffer already expanded from it.
+    let oversized_body = |document_hex: String| {
+        format!(
+            "{{\"body\":{{\"document_hex\":\"{document_hex}\",\"idempotency_key\":\"key\",\"spec_digest\":\"sha256:{}\"}},\"kind\":\"submit_run\",\"protocol\":\"{ADMIN_PROTOCOL}\",\"request_id\":\"r\",\"version\":1}}",
+            "0".repeat(64)
+        )
+    };
+    for payload in [
+        oversized_body("78".repeat(oversized)),
+        oversized_body(format!("{}z", "78".repeat(oversized))),
+    ] {
+        assert_eq!(
+            AdminRequest::from_canonical_bytes(payload.as_bytes())
+                .expect_err("oversized document")
+                .category(),
+            "admin_document_too_large"
+        );
+    }
+}
+
+#[test]
+fn malformed_document_hex_and_digests_are_refused() {
+    let body = |document_hex: &str, digest: &str| {
+        format!(
+            "{{\"body\":{{\"document_hex\":\"{document_hex}\",\"idempotency_key\":\"key\",\"spec_digest\":\"{digest}\"}},\"kind\":\"submit_run\",\"protocol\":\"{ADMIN_PROTOCOL}\",\"request_id\":\"r\",\"version\":1}}"
+        )
+    };
+    let digest = format!("sha256:{}", "0".repeat(64));
+    for payload in [
+        // Odd length is refused rather than padded.
+        body("7b7", &digest),
+        // Uppercase is refused rather than folded: one byte string, one spelling.
+        body("7B", &digest),
+        body("zz", &digest),
+        // A digest without its algorithm name is not a digest.
+        body("7b", &"0".repeat(64)),
+        body("7b", "sha256:0"),
+        body("7b", &format!("sha256:{}", "A".repeat(64))),
+    ] {
+        assert_eq!(
+            AdminRequest::from_canonical_bytes(payload.as_bytes()).expect_err("malformed field"),
+            AdminError::InvalidBody
+        );
+    }
+
+    for payload in [
+        br#"{"body":{"document_hex":"7b","spec_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"kind":"submit_run","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+        br#"{"body":{"document_hex":"7b","future":true,"idempotency_key":"key","spec_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"kind":"submit_run","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+        br#"{"body":{"document_hex":123,"idempotency_key":"key","spec_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"kind":"submit_run","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+    ] {
+        assert_eq!(
+            AdminRequest::from_canonical_bytes(payload).expect_err("inexact body"),
+            AdminError::InvalidBody
+        );
+    }
+}
+
+#[test]
+fn a_declared_digest_is_carried_without_being_verified_or_echoed() {
+    // The carrier does not compare the pair: an inconsistent submission is on
+    // the wire whether or not this constructor admits one, and the daemon is
+    // the layer that must answer it with a correlated refusal.
+    let document = b"secret-argv-and-environment".to_vec();
+    let lying = SubmittedRunSpec::declared(
+        document.clone(),
+        Sha256::digest(b"different bytes"),
+        "operator:run:8",
+    )
+    .expect("inconsistent pair is representable");
+    assert_ne!(lying.spec_digest(), &Sha256::digest(&document));
+    let payload = AdminRequest::submit_run(request_id(), lying.clone())
+        .to_message()
+        .expect("encode")
+        .to_canonical_bytes();
+    assert_eq!(
+        AdminRequest::from_canonical_bytes(&payload)
+            .expect("carried unverified")
+            .run_submission(),
+        Some(&lying)
+    );
+
+    // Neither the debug rendering nor a refusal grows the document.
+    let secret = "secret-argv-and-environment";
+    assert!(!format!("{lying:?}").contains(secret));
+    assert!(
+        !format!(
+            "{:?}",
+            AdminRequest::submit_run(request_id(), lying.clone())
+        )
+        .contains(secret)
+    );
+    let error = SubmittedRunSpec::sealed(
+        secret.repeat(MAX_SUBMITTED_RUN_SPEC_BYTES).into_bytes(),
+        "key",
+    )
+    .expect_err("oversized");
+    assert!(!error.to_string().contains(secret));
+}
+
+#[test]
+fn run_acceptance_receipts_are_exact_and_bounded() {
+    let response = |submission_id| AdminResponse::RunAccepted {
+        request_id: request_id(),
+        run_id: RunId::new("run-1").expect("run identity"),
+        spec_digest: Sha256::digest(b"document"),
+        submission_id,
+        replay: false,
+    };
+    // An unwritten row must not be reportable as accepted.
+    assert_eq!(
+        response(0).to_message().expect_err("zero row identity"),
+        AdminError::InvalidBody
+    );
+    let payload = String::from_utf8(
+        response(4)
+            .to_message()
+            .expect("encode")
+            .to_canonical_bytes(),
+    )
+    .expect("canonical UTF-8");
+    for broken in [
+        payload.replacen("\"submission_id\":4", "\"submission_id\":0", 1),
+        payload.replacen("\"submission_id\":4", "\"submission_id\":-1", 1),
+        payload.replacen("\"replay\":false", "\"replay\":\"no\"", 1),
+        payload.replacen("\"run_id\":\"run-1\"", "\"run_id\":\"\"", 1),
+        payload.replacen("\"spec_digest\":\"sha256:", "\"spec_digest\":\"sha512:", 1),
+    ] {
+        assert_eq!(
+            AdminResponse::from_canonical_bytes(broken.as_bytes()).expect_err("invalid receipt"),
+            AdminError::InvalidBody
+        );
+    }
 }

@@ -19,9 +19,13 @@ use automonique_transports::{
 use sha2::{Digest, Sha256};
 
 mod https_client;
+mod slack_sink;
 mod store_sink;
 
 pub use https_client::TelegramHttpsClient;
+pub use slack_sink::{
+    SlackDurableReceipt, SlackSinkFailure, StoreSlackDurableSink, slack_content_digest,
+};
 pub use store_sink::{Clock, ClockFailure, StoreTelegramDurableSink, SystemClock};
 
 const MAX_LEASE_ID_BYTES: usize = 256;

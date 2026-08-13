@@ -10,6 +10,8 @@
 
 pub mod cancel_ledger;
 pub mod provider_journal;
+pub mod run_submissions;
+pub mod slack_ingress;
 
 use std::error::Error;
 use std::fmt;

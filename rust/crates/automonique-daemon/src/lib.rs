@@ -5,6 +5,11 @@
 //! This first daemon slice owns a private runtime directory, a durable SQLite
 //! store, one fenced process generation, and a peer-authenticated Unix admin
 //! socket. It deliberately performs no external effects yet.
+//!
+//! That includes the run submission lane: a submitted RunSpec document is
+//! verified and durably held, and then nothing happens to it. The `SubmitRun`
+//! handler arm records what execution would still require and why none of it
+//! exists here.
 
 use std::error::Error;
 use std::fmt;
@@ -25,6 +30,9 @@ use automonique_protocol::admin::{
     OutboxReconciliationDecision,
 };
 use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, decode_frame, encode_frame};
+use automonique_protocol::digest::Sha256;
+use automonique_runner::{RunSpec, RunSpecDecodeError};
+use automonique_store::run_submissions::{RunSubmission, RunSubmissionError, RunSubmissionLog};
 use automonique_store::{
     InboxSubmission, LeaseRenewal, LeaseRequest,
     OutboxReconciliationDecision as StoreOutboxDecision, OutboxReconciliationRequest,
@@ -43,6 +51,13 @@ pub const ADMIN_SOCKET_NAME: &str = concat!("admin", ".sock");
 
 /// Database filename inside the private product state directory.
 pub const DATABASE_NAME: &str = concat!("automonique", ".sqlite3");
+
+/// Run submission custody database, a sibling of [`DATABASE_NAME`].
+///
+/// Separate, like every other sibling log in `automonique-store`: its schema
+/// versions independently of the scheduler's, and a submission is not scheduler
+/// state. What the separation costs is stated in that module's documentation.
+pub const RUN_SUBMISSIONS_NAME: &str = concat!("run-submissions", ".sqlite3");
 
 /// Maximum administration payload accepted by the daemon.
 pub const MAX_ADMIN_PAYLOAD_BYTES: usize = MAX_ADMIN_CANONICAL_BYTES;
@@ -109,6 +124,12 @@ impl DaemonConfig {
     pub fn database_path(&self) -> PathBuf {
         self.state_dir().join(DATABASE_NAME)
     }
+
+    /// Durable run submission custody path.
+    #[must_use]
+    pub fn run_submissions_path(&self) -> PathBuf {
+        self.state_dir().join(RUN_SUBMISSIONS_NAME)
+    }
 }
 
 /// A daemon lifecycle or local-control refusal.
@@ -135,6 +156,9 @@ pub enum DaemonError {
     /// The Telegram configuration or bot-lease lifecycle was refused. The
     /// payload is the stable category from the telegram module.
     TelegramRefused(&'static str),
+    /// The durable run submission log failed in a way no client caused. The
+    /// payload is the stable category from that module.
+    RunSubmissionFailed(&'static str),
 }
 
 impl DaemonError {
@@ -152,6 +176,7 @@ impl DaemonError {
             Self::ReconciliationRequired => "reconciliation_required",
             Self::Signal(_) => "signal",
             Self::TelegramRefused(category) => category,
+            Self::RunSubmissionFailed(category) => category,
         }
     }
 }
@@ -179,6 +204,9 @@ impl fmt::Display for DaemonError {
             Self::Signal(error) => write!(formatter, "daemon signal setup failed: {error}"),
             Self::TelegramRefused(category) => {
                 write!(formatter, "telegram host refused: {category}")
+            }
+            Self::RunSubmissionFailed(category) => {
+                write!(formatter, "run submission log failed: {category}")
             }
         }
     }
@@ -219,6 +247,7 @@ pub struct Daemon {
     controller: automonique_core::Controller,
     reconciliation_run_id: Option<i64>,
     telegram: telegram::TelegramHost,
+    run_submissions: RunSubmissionLog,
     execution_state: automonique_protocol::admin::ExecutionState,
 }
 
@@ -306,6 +335,12 @@ impl Daemon {
             TELEGRAM_LEASE_TTL_MS,
         )
         .map_err(|error| DaemonError::TelegramRefused(error.category()))?;
+
+        // Custody storage opens beneath the same fence and before the socket
+        // guard is disarmed: a daemon that cannot hold documents must not
+        // publish an endpoint that accepts them.
+        let run_submissions = RunSubmissionLog::open(config.run_submissions_path())
+            .map_err(|error| DaemonError::RunSubmissionFailed(error.category()))?;
         socket_cleanup.disarm();
 
         Ok(Self {
@@ -319,6 +354,7 @@ impl Daemon {
             controller: automonique_core::Controller::new(),
             reconciliation_run_id: None,
             telegram,
+            run_submissions,
             execution_state: Self::measure_execution_state(),
         })
     }
@@ -562,6 +598,132 @@ impl Daemon {
                     inbox_id: u64::try_from(receipt.inbox_id)
                         .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
                     duplicate: receipt.duplicate,
+                }
+            }
+            automonique_protocol::admin::AdminCommand::SubmitRun => {
+                // THIS LANE STOPS AT CUSTODY.
+                //
+                // What follows verifies a document and writes it down. It does
+                // not admit the run, build a launch plan, reserve a workspace,
+                // compose a sandbox, or start a supervisor — and it must not
+                // acquire the habit of doing so quietly. Executing a submitted
+                // document would require two things this build does not have:
+                // a release trust chain that establishes the provider binary
+                // and policy the document names are the ones on this host, and
+                // an operator-enabled execution lane that a host can be
+                // measured against and refused fail-closed. `execution_state`
+                // in the status snapshot reports the second as absent on every
+                // host, by construction. Accepting a document therefore
+                // establishes custody of it and no authority over anything.
+                let now_ms = unix_millis()?;
+                let snapshot = self.store.status_snapshot_at(GENERATION_ID, now_ms)?;
+                if self.reconciliation_run_id.is_some()
+                    || snapshot_requires_reconciliation(&snapshot)
+                {
+                    // A degraded generation is not accepting intake, and a
+                    // submission is intake even though it schedules nothing.
+                    // The reported `accepting_intake` must keep meaning what
+                    // the arms actually do.
+                    return self.write_refusal(
+                        stream,
+                        request.request_id(),
+                        DaemonError::ReconciliationRequired.category(),
+                    );
+                }
+                // The fence is checked here and the row lands in a different
+                // database, so this is a check-then-write across two files
+                // rather than one transaction. `automonique_store`'s
+                // run_submissions module states that race and the specific
+                // ground on which a custody row may accept it.
+                let generation = snapshot.generation().ok_or(StoreError::StaleEpoch)?;
+                if generation.holder_id() != self.instance_id.as_str()
+                    || generation.lease_epoch() != self.lease_epoch
+                    || generation.lease_expires_ms() != self.lease_expires_ms
+                    || generation.lease_expires_ms() <= now_ms
+                {
+                    return Err(DaemonError::Store(StoreError::StaleEpoch));
+                }
+                let submission = request
+                    .run_submission()
+                    .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
+
+                // 1. The declared digest must name the bytes as received. This
+                //    runs before anything parses them, so a document whose
+                //    name and contents disagree is refused without ever being
+                //    interpreted.
+                let spec_digest = Sha256::digest(submission.document());
+                if &spec_digest != submission.spec_digest() {
+                    return self.write_refusal(
+                        stream,
+                        request.request_id(),
+                        "run_spec_digest_mismatch",
+                    );
+                }
+                // 2. Strict decode by the runner's own decoder. The refusal
+                //    carries its class and never a byte of the document.
+                let spec = match RunSpec::from_canonical_bytes(submission.document()) {
+                    Ok(spec) => spec,
+                    Err(error) => {
+                        return self.write_refusal(
+                            stream,
+                            request.request_id(),
+                            run_spec_decode_category(error),
+                        );
+                    }
+                };
+                // 3. Re-encode what the decoder read and require the same
+                //    digest, so the digest about to be stored is bound to the
+                //    typed value the decoder actually produced.
+                //
+                //    Stated plainly: while the runner's decoder keeps its own
+                //    `NonCanonicalRoundTrip` guard, this cannot fail, and no
+                //    test here can distinguish a build with it from one
+                //    without. It is kept because that guard is another crate's
+                //    private decode step rather than a contract this lane can
+                //    hold anyone to, and because the cost is one hash of at
+                //    most a few tens of kilobytes. The `not_encodable` arm is
+                //    unreachable for the same reason: a document that decoded
+                //    from an admin frame cannot re-encode past the runner's
+                //    8 MiB ceiling. Both are fail-closed, and neither is
+                //    presented here as evidence of anything.
+                let reencoded = match spec.to_canonical_bytes() {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return self.write_refusal(
+                            stream,
+                            request.request_id(),
+                            "run_spec_not_encodable",
+                        );
+                    }
+                };
+                if Sha256::digest(&reencoded) != spec_digest {
+                    return self.write_refusal(
+                        stream,
+                        request.request_id(),
+                        "run_spec_not_canonical",
+                    );
+                }
+                let digest_hex = spec_digest.to_hex();
+                let receipt = match self.run_submissions.record(RunSubmission {
+                    idempotency_key: submission.idempotency_key(),
+                    run_id: spec.run_id().as_str(),
+                    spec_digest: &digest_hex,
+                    document: submission.document(),
+                    accepted_at_ms: now_ms,
+                }) {
+                    Ok(receipt) => receipt,
+                    Err(error) if run_submission_refusal(&error) => {
+                        return self.write_refusal(stream, request.request_id(), error.category());
+                    }
+                    Err(error) => return Err(DaemonError::RunSubmissionFailed(error.category())),
+                };
+                AdminResponse::RunAccepted {
+                    request_id: request.request_id().clone(),
+                    run_id: spec.run_id().clone(),
+                    spec_digest,
+                    submission_id: u64::try_from(receipt.submission_id)
+                        .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
+                    replay: receipt.disposition.is_replay(),
                 }
             }
             automonique_protocol::admin::AdminCommand::InspectReconciliation => {
@@ -985,6 +1147,38 @@ fn fatal_store_error(error: &StoreError) -> bool {
             | StoreError::AlreadyTerminal
             | StoreError::OutboxConflict
             | StoreError::NotFound(_)
+    )
+}
+
+/// Stable, document-free class of one strict RunSpec decode refusal.
+///
+/// The decoder's own variants name a field or an object, which is our own
+/// static vocabulary rather than submitter data. They are collapsed to a fixed
+/// set here anyway: a refusal category is a metric label, and one that can take
+/// a few dozen values is a worse label than one that takes six.
+const fn run_spec_decode_category(error: RunSpecDecodeError) -> &'static str {
+    match error {
+        RunSpecDecodeError::DocumentTooLarge => "run_spec_document_too_large",
+        RunSpecDecodeError::InvalidCanonicalJson => "run_spec_invalid_canonical_json",
+        RunSpecDecodeError::ObjectShape(_) => "run_spec_object_shape",
+        RunSpecDecodeError::Field(_) => "run_spec_field_invalid",
+        RunSpecDecodeError::Domain(_) => "run_spec_domain_invariant",
+        RunSpecDecodeError::NonCanonicalRoundTrip => "run_spec_non_canonical_round_trip",
+    }
+}
+
+/// Whether a submission-log failure is the submitter's to fix.
+///
+/// A malformed field, a reused key and a full log are answered to the client.
+/// Corruption, a schema mismatch and storage failure are not: they say the
+/// daemon's own custody is unsound, and a correlated refusal would present that
+/// as a client error.
+const fn run_submission_refusal(error: &RunSubmissionError) -> bool {
+    matches!(
+        error,
+        RunSubmissionError::InvalidField(_)
+            | RunSubmissionError::Conflict { .. }
+            | RunSubmissionError::LogFull { .. }
     )
 }
 

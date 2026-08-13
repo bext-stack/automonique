@@ -6,8 +6,17 @@
 //! server authenticates the Unix peer before it decodes a frame; putting a
 //! bearer secret in the payload would make that boundary weaker and easier to
 //! leak. Version one exposes only a read-only status query and an orderly
-//! shutdown request, a local no-effect synthetic intake, and explicit fenced
-//! reconciliation paths for ambiguous synthetic runs and expired outbox effects.
+//! shutdown request, a local no-effect synthetic intake, explicit fenced
+//! reconciliation paths for ambiguous synthetic runs and expired outbox
+//! effects, and a durable-custody submission of one canonical RunSpec document.
+//!
+//! # The RunSpec document is opaque here
+//!
+//! This crate does not depend on `automonique-runner` and therefore cannot
+//! decode, validate or interpret a RunSpec. [`SubmittedRunSpec`] carries the
+//! document as bounded bytes and the digest a submitter declares for them.
+//! Carrying is all it does: see that type's documentation for what a carried
+//! pair does *not* establish.
 
 use std::error::Error;
 use std::fmt;
@@ -16,6 +25,8 @@ use crate::codec::{
     CodecError, Envelope, MajorVersion, MessageKind, ProtocolName, RequestId, SupportedProtocol,
     VersionRange,
 };
+use crate::digest::{Sha256, Sha256Digest};
+use crate::tools::RunId;
 use crate::wire::{JsonValue, Message};
 
 /// Stable protocol name for local daemon administration.
@@ -45,6 +56,50 @@ pub const MAX_RECONCILIATION_FIELD_BYTES: usize = 256;
 /// Maximum stable refusal-category bytes returned to an authenticated client.
 pub const MAX_ADMIN_REFUSAL_CATEGORY_BYTES: usize = 64;
 
+/// Maximum UTF-8 byte length of a run submission's idempotency key.
+pub const MAX_RUN_SUBMISSION_KEY_BYTES: usize = 128;
+
+/// Maximum canonical RunSpec document bytes this lane will carry.
+///
+/// # Arithmetic, and the ceiling this does not reach
+///
+/// A canonical RunSpec document is arbitrary bytes, so it travels hex-encoded
+/// and occupies exactly `2 * N` bytes inside the canonical body. One
+/// `submit_run` message therefore costs
+///
+/// ```text
+/// 2 * N + SUBMIT_RUN_OVERHEAD_BYTES <= MAX_ADMIN_CANONICAL_BYTES
+/// 2 * 24576 + 600 = 49752 <= 65536
+/// ```
+///
+/// which leaves deliberate headroom rather than sitting on the boundary. The
+/// runner's own `MAX_RUN_SPEC_BYTES` is the 8 MiB protocol frame ceiling —
+/// about 341 times this value — so **a document this lane refuses can still be
+/// a valid RunSpec.** The two limits are not reconciled and must not be: an
+/// 8 MiB document cannot be hex-encoded into a 64 KiB admin frame, and no
+/// widening of this constant would change that. A document above this bound is
+/// [`AdminError::DocumentTooLarge`] at encode and at decode, never a truncation
+/// and never a silently smaller message.
+pub const MAX_SUBMITTED_RUN_SPEC_BYTES: usize = 24 * 1024;
+
+/// Worst-case canonical bytes of one `submit_run` message, excluding the hex
+/// document.
+///
+/// - 216 for the envelope: `{"body":`, the `kind`, `protocol` and `version`
+///   members, and a maximal 128-byte `request_id`.
+/// - 256 for the body scaffold: both key names, the quoted 71-byte
+///   `sha256:`-spelled digest, a maximal idempotency key, and the punctuation.
+/// - One further [`MAX_RUN_SUBMISSION_KEY_BYTES`] because an idempotency key
+///   may be entirely quotes or backslashes, each of which JSON-escapes to two
+///   bytes. Budgeting the escaped worst case is why the bound holds for keys
+///   this protocol actually admits, not merely for well-behaved ones.
+const SUBMIT_RUN_OVERHEAD_BYTES: usize = 216 + 256 + MAX_RUN_SUBMISSION_KEY_BYTES;
+
+const _: () = assert!(
+    2 * MAX_SUBMITTED_RUN_SPEC_BYTES + SUBMIT_RUN_OVERHEAD_BYTES <= MAX_ADMIN_CANONICAL_BYTES,
+    "a maximal submit_run message must fit one admin frame"
+);
+
 /// A refusal while constructing or decoding an administration message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdminError {
@@ -63,6 +118,16 @@ pub enum AdminError {
     InvalidInstanceId,
     /// A security-relevant daemon state spelling was not defined by this build.
     UnknownState,
+    /// A carried RunSpec document is larger than one admin frame can hold.
+    ///
+    /// Only lengths are reported. A document that violates this bound is never
+    /// echoed, in whole or in part, by this refusal.
+    DocumentTooLarge {
+        /// Maximum accepted document length.
+        max_bytes: usize,
+        /// Length the submitter presented.
+        actual_bytes: usize,
+    },
 }
 
 impl AdminError {
@@ -76,6 +141,7 @@ impl AdminError {
             Self::CounterOutOfRange { .. } => "admin_counter_out_of_range",
             Self::InvalidInstanceId => "admin_invalid_instance_id",
             Self::UnknownState => "admin_unknown_state",
+            Self::DocumentTooLarge { .. } => "admin_document_too_large",
         }
     }
 }
@@ -96,6 +162,13 @@ impl fmt::Display for AdminError {
             }
             Self::InvalidInstanceId => formatter.write_str("daemon instance identifier is invalid"),
             Self::UnknownState => formatter.write_str("daemon state is not defined"),
+            Self::DocumentTooLarge {
+                max_bytes,
+                actual_bytes,
+            } => write!(
+                formatter,
+                "run specification document is {actual_bytes} bytes; maximum is {max_bytes}"
+            ),
         }
     }
 }
@@ -248,6 +321,11 @@ pub enum AdminCommand {
     Status,
     /// Durably enqueue a no-effect synthetic work item.
     SubmitSynthetic,
+    /// Take durable custody of one canonical RunSpec document.
+    ///
+    /// Acceptance is custody, not execution: no variant of this protocol
+    /// launches, schedules or admits a run.
+    SubmitRun,
     /// Inspect the durable evidence for one ambiguously claimed run.
     InspectReconciliation,
     /// Explicitly fail one exact old run observation under the daemon's fence.
@@ -265,6 +343,7 @@ impl AdminCommand {
         match self {
             Self::Status => "status",
             Self::SubmitSynthetic => "submit_synthetic",
+            Self::SubmitRun => "submit_run",
             Self::InspectReconciliation => "inspect_reconciliation",
             Self::FailReconciliation => "fail_reconciliation",
             Self::InspectOutbox => "inspect_outbox",
@@ -671,6 +750,155 @@ impl SyntheticSubmission {
     }
 }
 
+/// One bounded canonical RunSpec document, the digest its submitter declares
+/// for it, and a stable retry key.
+///
+/// # What this crate does with the document
+///
+/// It bounds it, hex-encodes it and hands it on. Nothing here parses a RunSpec:
+/// this crate has no dependency on `automonique-runner` and could not
+/// interpret one if it wanted to.
+///
+/// # What a carried pair does not establish
+///
+/// - **Not that the digest names the document.** [`Self::declared`] accepts any
+///   well-formed digest for any bounded document, so an inconsistent pair is
+///   representable — as it must be, because a hostile or buggy peer can put one
+///   on the wire regardless of what this constructor allows. The verification
+///   belongs to the daemon, which owns the durable custody and can answer a
+///   correlated [`AdminResponse::Refused`] the submitter can act on; a codec
+///   that refused here would instead drop the frame. [`Self::sealed`] is the
+///   constructor for callers that have the bytes and want the digest to be
+///   right by construction.
+/// - **Not that the document is a RunSpec.** Bounded, non-empty bytes are the
+///   whole of what is checked. Only a strict decoder establishes more.
+/// - **Not that anything will be executed.** This message asks for durable
+///   custody of a document and nothing else.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SubmittedRunSpec {
+    document: Vec<u8>,
+    spec_digest: Sha256Digest,
+    idempotency_key: String,
+}
+
+impl fmt::Debug for SubmittedRunSpec {
+    /// The document is redacted: a RunSpec carries process arguments and
+    /// environment values, which are exactly what a log must not grow.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SubmittedRunSpec")
+            .field(
+                "document",
+                &format_args!("<canonical run-spec: {} bytes>", self.document.len()),
+            )
+            .field("spec_digest", &self.spec_digest)
+            .field("idempotency_key", &self.idempotency_key)
+            .finish()
+    }
+}
+
+impl SubmittedRunSpec {
+    /// Carry a document under the digest this crate computes for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::DocumentTooLarge`] above
+    /// [`MAX_SUBMITTED_RUN_SPEC_BYTES`] and [`AdminError::InvalidBody`] for an
+    /// empty document or an invalid idempotency key.
+    pub fn sealed(
+        document: Vec<u8>,
+        idempotency_key: impl Into<String>,
+    ) -> Result<Self, AdminError> {
+        let spec_digest = Sha256::digest(&document);
+        Self::declared(document, spec_digest, idempotency_key)
+    }
+
+    /// Carry a document under a digest the submitter declares for it.
+    ///
+    /// The two are not compared here; see the type documentation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::DocumentTooLarge`] above
+    /// [`MAX_SUBMITTED_RUN_SPEC_BYTES`] and [`AdminError::InvalidBody`] for an
+    /// empty document or an invalid idempotency key.
+    pub fn declared(
+        document: Vec<u8>,
+        spec_digest: Sha256Digest,
+        idempotency_key: impl Into<String>,
+    ) -> Result<Self, AdminError> {
+        let idempotency_key = idempotency_key.into();
+        if document.len() > MAX_SUBMITTED_RUN_SPEC_BYTES {
+            return Err(AdminError::DocumentTooLarge {
+                max_bytes: MAX_SUBMITTED_RUN_SPEC_BYTES,
+                actual_bytes: document.len(),
+            });
+        }
+        if document.is_empty() || !valid_coordinate(&idempotency_key, MAX_RUN_SUBMISSION_KEY_BYTES)
+        {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self {
+            document,
+            spec_digest,
+            idempotency_key,
+        })
+    }
+
+    /// Canonical RunSpec document bytes, uninterpreted.
+    #[must_use]
+    pub fn document(&self) -> &[u8] {
+        &self.document
+    }
+
+    /// The digest the submitter declared for those bytes.
+    #[must_use]
+    pub const fn spec_digest(&self) -> &Sha256Digest {
+        &self.spec_digest
+    }
+
+    /// Stable caller-controlled retry key.
+    #[must_use]
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    fn to_body(&self) -> JsonValue {
+        JsonValue::Object(vec![
+            (
+                "document_hex".to_owned(),
+                JsonValue::String(encode_hex(&self.document)),
+            ),
+            (
+                "idempotency_key".to_owned(),
+                JsonValue::String(self.idempotency_key.clone()),
+            ),
+            (
+                "spec_digest".to_owned(),
+                JsonValue::String(self.spec_digest.to_string()),
+            ),
+        ])
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        exact_fields(body, &["document_hex", "idempotency_key", "spec_digest"])?;
+        let hex = required_body_string(body, "document_hex")?;
+        // The length bound is checked on the *encoded* text, before any buffer
+        // is sized from it: a hostile submitter never drives an allocation.
+        if hex.len() > 2 * MAX_SUBMITTED_RUN_SPEC_BYTES {
+            return Err(AdminError::DocumentTooLarge {
+                max_bytes: MAX_SUBMITTED_RUN_SPEC_BYTES,
+                actual_bytes: hex.len() / 2,
+            });
+        }
+        Self::declared(
+            decode_hex(&hex).ok_or(AdminError::InvalidBody)?,
+            parse_digest(body, "spec_digest")?,
+            required_body_string(body, "idempotency_key")?,
+        )
+    }
+}
+
 /// A correlated local administration request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminRequest {
@@ -681,6 +909,7 @@ pub struct AdminRequest {
     reconciliation_failure: Option<ReconciliationFailure>,
     outbox_id: Option<u64>,
     outbox_reconciliation: Option<OutboxReconciliation>,
+    run_submission: Option<SubmittedRunSpec>,
 }
 
 impl AdminRequest {
@@ -695,6 +924,7 @@ impl AdminRequest {
             reconciliation_failure: None,
             outbox_id: None,
             outbox_reconciliation: None,
+            run_submission: None,
         }
     }
 
@@ -709,6 +939,25 @@ impl AdminRequest {
             reconciliation_failure: None,
             outbox_id: None,
             outbox_reconciliation: None,
+            run_submission: None,
+        }
+    }
+
+    /// Construct a durable RunSpec custody request.
+    ///
+    /// The request asks the daemon to verify and durably retain one document.
+    /// It is not a launch request and this protocol has no launch request.
+    #[must_use]
+    pub const fn submit_run(request_id: RequestId, run_submission: SubmittedRunSpec) -> Self {
+        Self {
+            request_id,
+            command: AdminCommand::SubmitRun,
+            submission: None,
+            reconciliation_run_id: None,
+            reconciliation_failure: None,
+            outbox_id: None,
+            outbox_reconciliation: None,
+            run_submission: Some(run_submission),
         }
     }
 
@@ -725,6 +974,7 @@ impl AdminRequest {
             reconciliation_failure: None,
             outbox_id: None,
             outbox_reconciliation: None,
+            run_submission: None,
         })
     }
 
@@ -742,6 +992,7 @@ impl AdminRequest {
             reconciliation_failure: Some(failure),
             outbox_id: None,
             outbox_reconciliation: None,
+            run_submission: None,
         }
     }
 
@@ -757,6 +1008,7 @@ impl AdminRequest {
             reconciliation_failure: None,
             outbox_id: Some(outbox_id),
             outbox_reconciliation: None,
+            run_submission: None,
         })
     }
 
@@ -773,6 +1025,7 @@ impl AdminRequest {
             reconciliation_failure: None,
             outbox_id: None,
             outbox_reconciliation: Some(reconciliation),
+            run_submission: None,
         }
     }
 
@@ -792,6 +1045,12 @@ impl AdminRequest {
     #[must_use]
     pub const fn submission(&self) -> Option<&SyntheticSubmission> {
         self.submission.as_ref()
+    }
+
+    /// Carried RunSpec document, present only for [`AdminCommand::SubmitRun`].
+    #[must_use]
+    pub const fn run_submission(&self) -> Option<&SubmittedRunSpec> {
+        self.run_submission.as_ref()
     }
 
     #[must_use]
@@ -828,26 +1087,30 @@ impl AdminRequest {
             &self.reconciliation_failure,
             self.outbox_id,
             &self.outbox_reconciliation,
+            &self.run_submission,
         ) {
-            (AdminCommand::SubmitSynthetic, Some(submission), None, None, None, None) => {
+            (AdminCommand::SubmitSynthetic, Some(submission), None, None, None, None, None) => {
                 submission.to_body()
             }
-            (AdminCommand::InspectReconciliation, None, Some(run_id), None, None, None) => {
+            (AdminCommand::SubmitRun, None, None, None, None, None, Some(run_submission)) => {
+                run_submission.to_body()
+            }
+            (AdminCommand::InspectReconciliation, None, Some(run_id), None, None, None, None) => {
                 JsonValue::Object(vec![("run_id".to_owned(), integer("run_id", run_id)?)])
             }
-            (AdminCommand::FailReconciliation, None, None, Some(failure), None, None) => {
+            (AdminCommand::FailReconciliation, None, None, Some(failure), None, None, None) => {
                 failure.to_body()?
             }
-            (AdminCommand::InspectOutbox, None, None, None, Some(outbox_id), None) => {
+            (AdminCommand::InspectOutbox, None, None, None, Some(outbox_id), None, None) => {
                 JsonValue::Object(vec![(
                     "outbox_id".to_owned(),
                     integer("outbox_id", outbox_id)?,
                 )])
             }
-            (AdminCommand::ReconcileOutbox, None, None, None, None, Some(reconciliation)) => {
+            (AdminCommand::ReconcileOutbox, None, None, None, None, Some(reconciliation), None) => {
                 reconciliation.to_body()?
             }
-            (AdminCommand::Status | AdminCommand::Shutdown, None, None, None, None, None) => {
+            (AdminCommand::Status | AdminCommand::Shutdown, None, None, None, None, None, None) => {
                 JsonValue::Object(Vec::new())
             }
             _ => return Err(AdminError::InvalidBody),
@@ -870,6 +1133,10 @@ impl AdminRequest {
             "submit_synthetic" => Ok(Self::submit(
                 message.envelope().request_id().clone(),
                 SyntheticSubmission::from_body(message.body())?,
+            )),
+            "submit_run" => Ok(Self::submit_run(
+                message.envelope().request_id().clone(),
+                SubmittedRunSpec::from_body(message.body())?,
             )),
             "inspect_reconciliation" => {
                 exact_fields(message.body(), &["run_id"])?;
@@ -1950,6 +2217,22 @@ pub enum AdminResponse {
         /// Whether an identical stable-key submission already existed.
         duplicate: bool,
     },
+    /// One RunSpec document is durably held, or the exact retry was replayed.
+    ///
+    /// Custody is all this reports. It is not an admission decision, not a
+    /// launch, and not a promise that the run named here will ever execute.
+    RunAccepted {
+        /// Correlation identifier from the request.
+        request_id: RequestId,
+        /// Run identity read out of the accepted document.
+        run_id: RunId,
+        /// SHA-256 the daemon verified over the accepted document bytes.
+        spec_digest: Sha256Digest,
+        /// Durable identity of the submission row.
+        submission_id: u64,
+        /// Whether an identical stable-key submission already existed.
+        replay: bool,
+    },
     /// Durable reconciliation evidence for one run.
     ReconciliationInspected {
         request_id: RequestId,
@@ -1995,6 +2278,7 @@ impl AdminResponse {
         match self {
             Self::Status { request_id, .. }
             | Self::SyntheticAccepted { request_id, .. }
+            | Self::RunAccepted { request_id, .. }
             | Self::ReconciliationInspected { request_id, .. }
             | Self::ReconciliationFailed { request_id, .. }
             | Self::OutboxInspected { request_id, .. }
@@ -2027,6 +2311,37 @@ impl AdminResponse {
                     ("inbox_id".to_owned(), integer("inbox_id", *inbox_id)?),
                 ]),
             )),
+            Self::RunAccepted {
+                request_id,
+                run_id,
+                spec_digest,
+                submission_id,
+                replay,
+            } => {
+                // A durable row identity starts at one. Zero would be an
+                // unwritten row reported as accepted.
+                if *submission_id == 0 {
+                    return Err(AdminError::InvalidBody);
+                }
+                Ok(Message::new(
+                    envelope(request_id.clone(), "run_accepted")?,
+                    JsonValue::Object(vec![
+                        ("replay".to_owned(), JsonValue::Bool(*replay)),
+                        (
+                            "run_id".to_owned(),
+                            JsonValue::String(run_id.as_str().to_owned()),
+                        ),
+                        (
+                            "spec_digest".to_owned(),
+                            JsonValue::String(spec_digest.to_string()),
+                        ),
+                        (
+                            "submission_id".to_owned(),
+                            integer("submission_id", *submission_id)?,
+                        ),
+                    ]),
+                ))
+            }
             Self::ReconciliationInspected {
                 request_id,
                 evidence,
@@ -2125,6 +2440,28 @@ impl AdminResponse {
                     request_id,
                     inbox_id: unsigned(message.body(), "inbox_id")?,
                     duplicate,
+                })
+            }
+            "run_accepted" => {
+                exact_fields(
+                    message.body(),
+                    &["replay", "run_id", "spec_digest", "submission_id"],
+                )?;
+                let replay = match message.body().get("replay") {
+                    Some(JsonValue::Bool(value)) => *value,
+                    _ => return Err(AdminError::InvalidBody),
+                };
+                let submission_id = unsigned(message.body(), "submission_id")?;
+                if submission_id == 0 {
+                    return Err(AdminError::InvalidBody);
+                }
+                Ok(Self::RunAccepted {
+                    request_id,
+                    run_id: RunId::new(required_body_string(message.body(), "run_id")?)
+                        .map_err(|_| AdminError::InvalidBody)?,
+                    spec_digest: parse_digest(message.body(), "spec_digest")?,
+                    submission_id,
+                    replay,
                 })
             }
             "reconciliation_inspected" => Ok(Self::ReconciliationInspected {
@@ -2258,6 +2595,50 @@ fn optional_body_string(
         Some(JsonValue::String(value)) => Ok(Some(value.clone())),
         _ => Err(AdminError::InvalidBody),
     }
+}
+
+/// Parse the canonical `sha256:<64 lowercase hex>` spelling of a body field.
+fn parse_digest(body: &JsonValue, field: &'static str) -> Result<Sha256Digest, AdminError> {
+    required_body_string(body, field)?
+        .parse()
+        .map_err(|_| AdminError::InvalidBody)
+}
+
+/// Lowercase hexadecimal, two digits per byte.
+fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+/// Decode lowercase hexadecimal, or refuse.
+///
+/// Uppercase digits are refused rather than folded, and an odd length is
+/// refused rather than padded, so one byte string has exactly one accepted
+/// spelling — the same rule the canonical JSON codec applies to everything
+/// else on this wire.
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let mut byte = 0_u8;
+        for digit in pair {
+            byte = (byte << 4)
+                | match digit {
+                    b'0'..=b'9' => digit - b'0',
+                    b'a'..=b'f' => digit - b'a' + 10,
+                    _ => return None,
+                };
+        }
+        bytes.push(byte);
+    }
+    Some(bytes)
 }
 
 fn valid_coordinate(value: &str, max_bytes: usize) -> bool {

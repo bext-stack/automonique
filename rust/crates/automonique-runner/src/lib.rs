@@ -7,6 +7,7 @@
 //! A separately named in-process simulation API records deterministic events
 //! without presenting itself as provider execution or sandbox enforcement.
 
+pub mod admission;
 pub mod backend;
 mod boundary;
 pub mod capability;
