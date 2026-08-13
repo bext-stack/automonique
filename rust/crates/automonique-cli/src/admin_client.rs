@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use automonique_protocol::admin::{
     AdminCommand, AdminRequest, AdminResponse, MAX_ADMIN_CANONICAL_BYTES, OutboxReconciliation,
-    ReconciliationFailure, SyntheticSubmission,
+    ReconciliationFailure, SubmittedRunSpec, SyntheticSubmission,
 };
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use nix::sys::socket::{getsockopt, sockopt};
@@ -26,6 +26,7 @@ static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub(crate) enum Operation {
     Status,
     Submit(SyntheticSubmission),
+    SubmitRun(SubmittedRunSpec),
     InspectReconciliation(u64),
     FailReconciliation(ReconciliationFailure),
     InspectOutbox(u64),
@@ -61,6 +62,7 @@ pub(crate) fn request(
     let operation_name = match &operation {
         Operation::Status => "status",
         Operation::Submit(_) => "submit",
+        Operation::SubmitRun(_) => "run-submit",
         Operation::InspectReconciliation(_) => "reconcile-inspect",
         Operation::FailReconciliation(_) => "reconcile-fail",
         Operation::InspectOutbox(_) => "outbox-inspect",
@@ -76,6 +78,9 @@ pub(crate) fn request(
         RequestId::new(&request_id).map_err(|error| ClientError::Protocol(error.category()))?;
     let request = match operation {
         Operation::Submit(submission) => AdminRequest::submit(request_id, submission),
+        Operation::SubmitRun(run_submission) => {
+            AdminRequest::submit_run(request_id, run_submission)
+        }
         Operation::InspectReconciliation(run_id) => {
             AdminRequest::inspect_reconciliation(request_id, run_id)
                 .map_err(|error| ClientError::Protocol(error.category()))?

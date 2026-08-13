@@ -15,6 +15,7 @@ mod attempt;
 mod diagnostics;
 mod kernel;
 mod release;
+mod run_submit;
 mod supervisor;
 
 pub use diagnostics::{
@@ -38,7 +39,7 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
-const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique shutdown\n";
+const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique shutdown\n";
 
 #[derive(Clone)]
 enum Command {
@@ -73,6 +74,9 @@ enum Command {
         attempt: OsString,
         revision: OsString,
     },
+    RunSubmit {
+        idempotency_key: OsString,
+    },
     Shutdown,
     Attempt(attempt::Operation),
 }
@@ -90,9 +94,10 @@ where
 
 /// Execute one closed product command with an explicit input stream.
 ///
-/// Only `submit` consumes input. Keeping the task out of argv prevents it from
-/// appearing in process listings and makes the protocol size limit enforceable
-/// before any request is sent.
+/// `submit`, `outbox reconcile`, and `run submit` consume input. Keeping task
+/// content, receipts, and documents out of argv prevents them from appearing
+/// in process listings and makes each protocol size limit enforceable before
+/// any request is sent.
 pub fn run_with_input<I, S, R, W, E>(arguments: I, mut input: R, mut stdout: W, mut stderr: E) -> u8
 where
     I: IntoIterator<Item = S>,
@@ -176,6 +181,11 @@ where
                     return 2;
                 }
             }
+        }
+        (Some(command), Some(action), Some(idempotency_key), None)
+            if command == "run" && action == "submit" =>
+        {
+            Command::RunSubmit { idempotency_key }
         }
         (Some(command), Some(operation), Some(socket_path), None)
             if command == "attempt" && operation == "heartbeat" =>
@@ -277,6 +287,15 @@ where
                     attempt,
                     revision,
                 },
+                &mut input,
+                &mut stdout,
+                &mut stderr,
+            );
+        }
+        Command::RunSubmit { idempotency_key } => {
+            return run_submit::run(
+                runtime.as_deref(),
+                idempotency_key,
                 &mut input,
                 &mut stdout,
                 &mut stderr,

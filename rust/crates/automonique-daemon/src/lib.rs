@@ -43,6 +43,7 @@ use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::sys::socket::{getsockopt, sockopt};
 use nix::unistd::geteuid;
 
+pub mod cancel_custody;
 mod synthetic;
 mod telegram;
 

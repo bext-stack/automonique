@@ -30,18 +30,20 @@
 //! fails loudly at `bind` rather than silently admitting root peers.
 
 use automonique_runner::control::{
-    CONTROL_GREETING, CancelSink, CancelUnavailable, ControlError, ControlServer, MAX_BINDINGS,
+    CONTROL_GREETING, CancelClaim, CancelCustody, CancelSink, CancelUnavailable, ControlError,
+    ControlServer, CustodyFailure, CustodyVerdict, InMemoryCancelCustody, MAX_BINDINGS,
     MAX_CANCEL_LEDGER_ENTRIES, MAX_REQUEST_LINE_BYTES, MAX_SUBSCRIBE_PAGE_EVENTS, PeerIdentity,
     PeerRefusal, Refusal, Served, admit_peer,
 };
 use automonique_runner::{Authority, CancellationToken, EventKind, Spool};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -128,6 +130,88 @@ impl SinkProbe {
 
     fn delivered_refs(&self) -> Vec<String> {
         self.refs.lock().unwrap().clone()
+    }
+}
+
+/// Which half of the [`CancelCustody`] pair the server called.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CustodyCall {
+    Classify,
+    Record,
+}
+
+/// One custody call as the seam saw it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SeenClaim {
+    call: CustodyCall,
+    attempt_id: String,
+    request_ref: String,
+    observed_sequence: u64,
+}
+
+type CustodyAnswer = Result<CustodyVerdict, CustodyFailure>;
+
+#[derive(Default)]
+struct CustodyScript {
+    classify: VecDeque<CustodyAnswer>,
+    record: VecDeque<CustodyAnswer>,
+    seen: Vec<SeenClaim>,
+}
+
+/// Custody whose every answer the test dictates.
+///
+/// It holds no idempotency state at all, which is exactly the point: whatever
+/// the client is told has to come from the scripted verdict, so a server that
+/// second-guessed custody — kept a cache, re-derived a conflict, treated a
+/// failure as a refusal category of its own — would disagree with the script.
+#[derive(Clone, Default)]
+struct ScriptedCustody(Arc<Mutex<CustodyScript>>);
+
+impl ScriptedCustody {
+    /// Queue the answers for exactly one `cancel` request.
+    fn queue(&self, classify: CustodyAnswer, record: Option<CustodyAnswer>) {
+        let mut script = self.0.lock().unwrap();
+        script.classify.push_back(classify);
+        if let Some(record) = record {
+            script.record.push_back(record);
+        }
+    }
+
+    fn seen(&self) -> Vec<SeenClaim> {
+        self.0.lock().unwrap().seen.clone()
+    }
+
+    fn note(&self, call: CustodyCall, claim: CancelClaim<'_>) {
+        self.0.lock().unwrap().seen.push(SeenClaim {
+            call,
+            attempt_id: claim.attempt_id.to_owned(),
+            request_ref: claim.request_ref.to_owned(),
+            observed_sequence: claim.observed_sequence,
+        });
+    }
+}
+
+impl CancelCustody for ScriptedCustody {
+    fn classify(&self, claim: CancelClaim<'_>) -> CustodyAnswer {
+        self.note(CustodyCall::Classify, claim);
+        // An unscripted call is a failure the test can see rather than a
+        // silently plausible verdict.
+        self.0
+            .lock()
+            .unwrap()
+            .classify
+            .pop_front()
+            .unwrap_or(Err(CustodyFailure::Unavailable))
+    }
+
+    fn record(&mut self, claim: CancelClaim<'_>) -> CustodyAnswer {
+        self.note(CustodyCall::Record, claim);
+        self.0
+            .lock()
+            .unwrap()
+            .record
+            .pop_front()
+            .unwrap_or(Err(CustodyFailure::Unavailable))
     }
 }
 
@@ -648,6 +732,377 @@ fn the_cancel_ledger_refuses_beyond_its_bound() {
         "cancel_result already_delivered\n"
     );
 
+    harness.stop();
+}
+
+// --- cancel: observed sequence --------------------------------------------
+
+#[test]
+fn the_observed_sequence_is_optional_and_defaults_to_zero() {
+    let dir = TempDir::new("seq-default");
+    let spools = TempDir::new("seq-default-spools");
+    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let (sink, probe) = SinkProbe::new(true);
+    server
+        .register("attempt-1", empty_spool(spools.path(), "run-alpha"), sink)
+        .unwrap();
+    let mut harness = Harness::spawn(server);
+
+    // The three-token line is the earlier grammar and must keep working
+    // byte for byte, which is what the shipped attempt client sends.
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-legacy\n"),
+        "cancel_result delivered\n"
+    );
+    // Its default is exactly zero, not "unset": presenting the same reference
+    // with an explicit `0` is the same binding and replays.
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-legacy 0\n"),
+        "cancel_result already_delivered\n"
+    );
+    // And the reverse direction: a four-token delivery at zero replays for a
+    // three-token retry, so the two spellings are interchangeable.
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-new 0\n"),
+        "cancel_result delivered\n"
+    );
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-new\n"),
+        "cancel_result already_delivered\n"
+    );
+    assert_eq!(probe.deliveries(), 2);
+
+    harness.stop();
+}
+
+#[test]
+fn the_observed_sequence_binds_the_reference_and_conflicts_when_it_differs() {
+    let dir = TempDir::new("seq-bind");
+    let spools = TempDir::new("seq-bind-spools");
+    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let (sink, probe) = SinkProbe::new(true);
+    server
+        .register("attempt-1", empty_spool(spools.path(), "run-alpha"), sink)
+        .unwrap();
+    let mut harness = Harness::spawn(server);
+
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-a 7\n"),
+        "cancel_result delivered\n"
+    );
+    assert_eq!(probe.deliveries(), 1);
+    // Same attempt, same reference, same sequence: an exact replay.
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-a 7\n"),
+        "cancel_result already_delivered\n"
+    );
+    // Same attempt and reference at a *different* observed sequence is a reuse
+    // of the reference, not a second delivery, and must not reach the sink.
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-a 8\n"),
+        "refused cancel_conflict\n"
+    );
+    // The implicit zero of a three-token line is a real sequence value, so it
+    // conflicts with a recorded seven exactly as an explicit zero would.
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-a\n"),
+        "refused cancel_conflict\n"
+    );
+    assert_eq!(probe.deliveries(), 1);
+    assert_eq!(probe.delivered_refs(), vec!["ref-a".to_owned()]);
+
+    harness.stop();
+}
+
+#[test]
+fn the_observed_sequence_obeys_the_canonical_unsigned_grammar() {
+    let dir = TempDir::new("seq-grammar");
+    let spools = TempDir::new("seq-grammar-spools");
+    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let (sink, probe) = SinkProbe::new(true);
+    server
+        .register("attempt-1", empty_spool(spools.path(), "run-alpha"), sink)
+        .unwrap();
+    let mut harness = Harness::spawn(server);
+
+    for spelling in [
+        "01",                    // leading zero
+        "-1",                    // signed
+        "+1",                    // signed
+        "1_000",                 // separator
+        "0x1",                   // radix prefix
+        "1.0",                   // not an integer
+        "",                      // empty field
+        "18446744073709551616",  // one past u64::MAX
+        "184467440737095516150", // past the digit ceiling
+    ] {
+        assert_eq!(
+            body(
+                harness.path(),
+                &format!("cancel attempt-1 ref-bad {spelling}\n")
+            ),
+            "refused field_invalid\n",
+            "sequence {spelling:?} was not refused"
+        );
+    }
+    // None of that reached the sink, and none of it was recorded: the same
+    // reference is still deliverable, so a refusal never minted a binding.
+    assert_eq!(probe.deliveries(), 0);
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-bad 1\n"),
+        "cancel_result delivered\n"
+    );
+
+    // Both ends of the range are ordinary values.
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-zero 0\n"),
+        "cancel_result delivered\n"
+    );
+    assert_eq!(
+        body(
+            harness.path(),
+            &format!("cancel attempt-1 ref-max {}\n", u64::MAX)
+        ),
+        "cancel_result delivered\n"
+    );
+    assert_eq!(probe.deliveries(), 3);
+
+    // A fifth token is not a wider cancel: arity stays closed.
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-a 1 extra\n"),
+        "refused unknown_operation\n"
+    );
+    // An out-of-grammar reference is still refused before the sequence is even
+    // looked at, so field ordering did not drift.
+    assert_eq!(
+        body(
+            harness.path(),
+            &format!("cancel attempt-1 {} 1\n", "r".repeat(65))
+        ),
+        "refused field_invalid\n"
+    );
+
+    harness.stop();
+}
+
+// --- cancel: the custody seam ---------------------------------------------
+
+#[test]
+fn the_cancel_answer_follows_the_custody_verdict_and_nothing_else() {
+    let dir = TempDir::new("custody");
+    let spools = TempDir::new("custody-spools");
+    let custody = ScriptedCustody::default();
+    let mut server = ControlServer::bind_with_custody(
+        dir.path().join("run/control.sock"),
+        Box::new(custody.clone()),
+    )
+    .unwrap();
+    // One always-available sink for every case, so the sink is a constant and
+    // the custody verdict is the only variable.
+    let (sink, probe) = SinkProbe::new(true);
+    server
+        .register("attempt-1", empty_spool(spools.path(), "run-alpha"), sink)
+        .unwrap();
+    let mut harness = Harness::spawn(server);
+
+    // (classify, record, answer, whether the sink was reached)
+    let cases: [(CustodyAnswer, Option<CustodyAnswer>, &str, bool); 9] = [
+        (
+            Ok(CustodyVerdict::Replay),
+            None,
+            "cancel_result already_delivered\n",
+            false,
+        ),
+        (
+            Ok(CustodyVerdict::Conflict),
+            None,
+            "refused cancel_conflict\n",
+            false,
+        ),
+        (
+            Err(CustodyFailure::Full),
+            None,
+            "refused ledger_full\n",
+            false,
+        ),
+        (
+            Err(CustodyFailure::Unavailable),
+            None,
+            "refused internal\n",
+            false,
+        ),
+        (
+            Ok(CustodyVerdict::Fresh),
+            Some(Ok(CustodyVerdict::Fresh)),
+            "cancel_result delivered\n",
+            true,
+        ),
+        // Another writer bound the same claim between the two calls. This
+        // server's sink did fire, so the answer stays delivery evidence.
+        (
+            Ok(CustodyVerdict::Fresh),
+            Some(Ok(CustodyVerdict::Replay)),
+            "cancel_result delivered\n",
+            true,
+        ),
+        (
+            Ok(CustodyVerdict::Fresh),
+            Some(Ok(CustodyVerdict::Conflict)),
+            "refused cancel_conflict\n",
+            true,
+        ),
+        (
+            Ok(CustodyVerdict::Fresh),
+            Some(Err(CustodyFailure::Unavailable)),
+            "refused internal\n",
+            true,
+        ),
+        (
+            Ok(CustodyVerdict::Fresh),
+            Some(Err(CustodyFailure::Full)),
+            "refused ledger_full\n",
+            true,
+        ),
+    ];
+
+    let mut expected_seen = Vec::new();
+    let mut expected_deliveries = 0_usize;
+    for (index, (classify, record, answer, reaches_sink)) in cases.into_iter().enumerate() {
+        let request_ref = format!("ref-{index}");
+        // A distinct sequence per case: whatever custody saw has to be the
+        // exact number on the wire, not a placeholder the server invented.
+        let observed_sequence = (index as u64) * 100 + 7;
+        let scripted_record = record.is_some();
+        custody.queue(classify, record);
+
+        assert_eq!(
+            body(
+                harness.path(),
+                &format!("cancel attempt-1 {request_ref} {observed_sequence}\n")
+            ),
+            answer,
+            "case {index} answered against its custody verdict"
+        );
+        if reaches_sink {
+            expected_deliveries += 1;
+        }
+        assert_eq!(
+            probe.deliveries(),
+            expected_deliveries,
+            "case {index} reached the sink the wrong number of times"
+        );
+
+        expected_seen.push(SeenClaim {
+            call: CustodyCall::Classify,
+            attempt_id: "attempt-1".to_owned(),
+            request_ref: request_ref.clone(),
+            observed_sequence,
+        });
+        if scripted_record {
+            expected_seen.push(SeenClaim {
+                call: CustodyCall::Record,
+                attempt_id: "attempt-1".to_owned(),
+                request_ref,
+                observed_sequence,
+            });
+        }
+    }
+
+    // Every claim custody saw, in order, with the wire's own coordinates: a
+    // server that dropped the sequence, reordered the pair, recorded before
+    // delivering or called custody twice would not match this list.
+    assert_eq!(custody.seen(), expected_seen);
+
+    // An unbound attempt never reaches custody at all, so it cannot mint an
+    // entry: the seen list is unchanged after a target refusal.
+    assert_eq!(
+        body(harness.path(), "cancel attempt-missing ref-x 1\n"),
+        "refused target_unknown\n"
+    );
+    assert_eq!(custody.seen(), expected_seen);
+
+    harness.stop();
+}
+
+#[test]
+fn custody_supplied_at_bind_carries_its_own_bound() {
+    let dir = TempDir::new("custody-bound");
+    let spools = TempDir::new("custody-bound-spools");
+    // Two references fit; the third has nowhere to be recorded.
+    let mut server = ControlServer::bind_with_custody(
+        dir.path().join("run/control.sock"),
+        Box::new(InMemoryCancelCustody::with_capacity(2)),
+    )
+    .unwrap();
+    let (sink, probe) = SinkProbe::new(true);
+    server
+        .register("attempt-1", empty_spool(spools.path(), "run-alpha"), sink)
+        .unwrap();
+    let mut harness = Harness::spawn(server);
+
+    for index in 0..2 {
+        assert_eq!(
+            body(harness.path(), &format!("cancel attempt-1 ref-{index} 1\n")),
+            "cancel_result delivered\n"
+        );
+    }
+    // The bound is custody's, not the module constant's.
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-overflow 1\n"),
+        "refused ledger_full\n"
+    );
+    assert_eq!(probe.deliveries(), 2);
+    // A full custody still replays what it holds.
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-0 1\n"),
+        "cancel_result already_delivered\n"
+    );
+    // And a conflicting reuse is still a conflict rather than a capacity
+    // refusal: the reuse is a client bug however full custody is.
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-0 2\n"),
+        "refused cancel_conflict\n"
+    );
+
+    harness.stop();
+}
+
+#[test]
+fn the_default_custody_is_in_memory_and_dies_with_its_server() {
+    let dir = TempDir::new("custody-default");
+    let spools = TempDir::new("custody-default-spools");
+    let socket_path = dir.path().join("run/control.sock");
+
+    let mut server = ControlServer::bind(&socket_path).unwrap();
+    let (sink, _probe) = SinkProbe::new(true);
+    server
+        .register("attempt-1", empty_spool(spools.path(), "run-alpha"), sink)
+        .unwrap();
+    let mut harness = Harness::spawn(server);
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-a 3\n"),
+        "cancel_result delivered\n"
+    );
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-a 3\n"),
+        "cancel_result already_delivered\n"
+    );
+    harness.stop();
+
+    // The default custody is process-local and server-scoped. This is the
+    // limitation the durable seam exists to remove, asserted rather than
+    // described: a fresh server has forgotten the reference and delivers again.
+    let mut server = ControlServer::bind(&socket_path).unwrap();
+    let (sink, probe) = SinkProbe::new(true);
+    server
+        .register("attempt-1", empty_spool(spools.path(), "run-beta"), sink)
+        .unwrap();
+    let mut harness = Harness::spawn(server);
+    assert_eq!(
+        body(harness.path(), "cancel attempt-1 ref-a 3\n"),
+        "cancel_result delivered\n"
+    );
+    assert_eq!(probe.deliveries(), 1);
     harness.stop();
 }
 

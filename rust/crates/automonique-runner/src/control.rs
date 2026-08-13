@@ -44,7 +44,8 @@
 //! subscribe <attempt-id> <cursor>         -> event <sequence> <kind> <authority> <payload-hex>  (0..=8 lines)
 //!                                            end <next-cursor> <more>
 //! heartbeat                               -> heartbeat <uptime-millis> <binding-count>
-//! cancel    <attempt-id> <request-ref>    -> cancel_result delivered | cancel_result already_delivered
+//! cancel    <attempt-id> <request-ref> [<observed-sequence>]
+//!                                         -> cancel_result delivered | cancel_result already_delivered
 //! <anything else>                         -> refused <category>
 //! ```
 //!
@@ -54,6 +55,15 @@
 //! Refusal categories are the closed set in [`Refusal`]. A peer that fails
 //! credential admission receives nothing at all — not even the greeting — and
 //! the connection closes with zero request bytes read.
+//!
+//! `cancel` is the one request with an optional field. `<observed-sequence>` is
+//! the spool sequence the requester had seen when it asked, and it participates
+//! in idempotency: a reference presented twice against the same attempt but a
+//! different observed sequence is a conflict, not a replay. A three-token
+//! `cancel` line is accepted and reads as observed sequence `0`, so a client
+//! written against the earlier grammar keeps working byte for byte. The field
+//! obeys the same canonical-decimal rule as `<cursor>`; a non-canonical
+//! spelling is `field_invalid` and never reaches custody.
 //!
 //! # Divergence from the R2-04 contract
 //!
@@ -75,19 +85,43 @@
 //!   `Admission` do not exist. [`PeerIdentity`] and [`admit_peer`] carry the
 //!   same rule — exactly the server's own non-root effective UID, with GID and
 //!   PID diagnostic only, and no caller-selectable policy.
-//! - **Cancellation service.** R2-06 (the host cancellation dispatcher with a
-//!   durable host-wide `RequestRef` ledger, and R1-25 `RequestRef` itself) does
-//!   not exist. Each binding instead carries a [`CancelSink`], and the ledger
-//!   is in-memory and server-scoped, bounded at
-//!   [`MAX_CANCEL_LEDGER_ENTRIES`]. Consequences that a reviewer must not
-//!   overlook: idempotency does not survive a server restart, and it is not
-//!   host-wide. Composing a [`CancelSink`] onto a real
-//!   [`RunContainment::kill`](crate::RunContainment::kill) is the backend's
-//!   decision, not this module's; this module holds no containment handle.
-//! - **`observed_sequence`.** The contract's cancel and heartbeat bodies carry
-//!   an observed sequence that participates in conflict detection. Without the
-//!   R2-06 request type there is nowhere to record it, so it is absent from
-//!   the wire rather than accepted and ignored.
+//! - **Cancellation service.** R2-06's host cancellation dispatcher still does
+//!   not exist, and neither does R1-25 `RequestRef`. What *does* now exist is
+//!   the durable half of it: idempotency is expressed as the [`CancelCustody`]
+//!   seam, and `automonique-store`'s `cancel_ledger` implements it host-wide
+//!   and restart-surviving. The runner cannot depend on that crate — the
+//!   dependency runs the other way and a SQLite handle has no business inside a
+//!   runner — so the trait lives here and the implementation lives daemon-side.
+//!   What remains diverged:
+//!   - **The default is still in-memory.** [`ControlServer::bind`] installs
+//!     [`InMemoryCancelCustody`], bounded at [`MAX_CANCEL_LEDGER_ENTRIES`],
+//!     because a runner that opened a database on `bind` would put durable
+//!     state in the wrong process. A caller that wants durability passes it in
+//!     through [`ControlServer::bind_with_custody`], and only then does
+//!     idempotency survive a restart or reach across servers.
+//!   - **Delivery still precedes recording.** The server classifies against
+//!     custody, delivers, and records only what the sink accepted, so an
+//!     unavailable sink records nothing and a retry is a real second attempt.
+//!     The cost is stated rather than hidden: a crash between delivery and
+//!     recording loses the record, and a replay then delivers twice.
+//!   - **Custody is not a dispatcher.** Each binding still carries its own
+//!     [`CancelSink`]; custody decides *whether* to call it and never calls it.
+//!     Composing a sink onto a real
+//!     [`RunContainment::kill`](crate::RunContainment::kill) is the backend's
+//!     decision, not this module's; this module holds no containment handle.
+//! - **`observed_sequence`.** The contract's cancel body carries an observed
+//!   sequence that participates in conflict detection, and custody now records
+//!   one, so the wire carries it as an optional fourth `cancel` token
+//!   defaulting to `0`. The contract's *heartbeat* observed sequence is still
+//!   absent: heartbeat here claims nothing about any attempt. `requested_at_ms`
+//!   is deliberately **not** on the wire — it is stamped by the custody
+//!   implementation's own clock, so a client cannot backdate a ledger row.
+//! - **Custody races.** Two servers sharing one durable custody can interleave
+//!   between classify and record. The window is stated rather than locked:
+//!   if the record then replays, the answer is still `delivered` because this
+//!   server's sink did fire; if it conflicts, the answer is `cancel_conflict`
+//!   even though delivery already happened. Closing that needs a dispatcher
+//!   that owns both halves, which is R2-06's job, not this endpoint's.
 //! - **Subscribe pages.** The contract returns exactly one record per request
 //!   with digest, byte count and hex fragments. This module returns up to
 //!   [`MAX_SUBSCRIBE_PAGE_EVENTS`] whole events per request and omits the
@@ -140,7 +174,11 @@ pub const MAX_REQUEST_LINE_BYTES: usize = 4 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Most attempt bindings one server may hold at once.
 pub const MAX_BINDINGS: usize = 128;
-/// Most distinct cancel request references one server retains.
+/// Most distinct cancel request references [`InMemoryCancelCustody`] retains.
+///
+/// This is the default custody's bound, not a wire bound. Custody supplied
+/// through [`ControlServer::bind_with_custody`] carries whatever capacity it
+/// was opened with and answers [`CustodyFailure::Full`] at its own ceiling.
 pub const MAX_CANCEL_LEDGER_ENTRIES: usize = 1024;
 /// Most events returned by one `subscribe` request.
 pub const MAX_SUBSCRIBE_PAGE_EVENTS: usize = 8;
@@ -160,6 +198,10 @@ const MAX_DRAIN_BYTES: usize = 64 * 1024;
 const MAX_EVENT_LINE_BYTES: usize = 64 + 2 * 64 * 1024;
 /// Ceiling on the `end` line that closes a subscription page.
 const MAX_END_LINE_BYTES: usize = 64;
+/// Answer for a cancellation this server handed to a sink.
+const DELIVERED_LINE: &str = "cancel_result delivered\n";
+/// Answer for a cancellation custody had already recorded.
+const ALREADY_DELIVERED_LINE: &str = "cancel_result already_delivered\n";
 
 // A full page can never reach the response ceiling. The runtime preflight in
 // `subscribe` is defence in depth for a future change to either bound.
@@ -304,6 +346,197 @@ pub trait CancelSink: Send {
     fn deliver(&self, attempt_id: &str, request_ref: &str) -> Result<(), CancelUnavailable>;
 }
 
+/// One cancellation request as custody sees it.
+///
+/// Everything custody needs and nothing it does not: there is no spool handle,
+/// no sink and no timestamp. `requested_at_ms` is absent on purpose — a
+/// [`CancelCustody`] implementation stamps its own clock, so a client cannot
+/// backdate a durable row by lying on the wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CancelClaim<'a> {
+    /// Attempt this reference cancels.
+    pub attempt_id: &'a str,
+    /// The requester's idempotency reference. The unique key.
+    pub request_ref: &'a str,
+    /// Spool sequence the requester had observed when it asked.
+    ///
+    /// Part of the binding: the same reference presented against the same
+    /// attempt at a different observed sequence is a
+    /// [`CustodyVerdict::Conflict`], not a replay.
+    pub observed_sequence: u64,
+}
+
+/// What custody holds for one claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CustodyVerdict {
+    /// Custody holds no binding for this reference and has room to record one.
+    /// From [`CancelCustody::record`] it means the binding is now held.
+    Fresh,
+    /// Custody already holds this exact binding. The sink must not be called
+    /// again, and [`CancelCustody::record`] wrote nothing.
+    Replay,
+    /// Custody holds this reference against a different attempt or a different
+    /// observed sequence. Nothing was written.
+    Conflict,
+}
+
+/// Why custody could not answer at all.
+///
+/// Distinct from [`CustodyVerdict::Conflict`], which is an answer: a conflict
+/// is a client bug custody detected, whereas these two say custody itself could
+/// not reach a decision. Collapsing them would report a broken ledger as a
+/// misbehaving client.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CustodyFailure {
+    /// Custody holds its full capacity, so a delivery could not be recorded.
+    /// Reported to the client as `ledger_full`.
+    Full,
+    /// Custody is unreachable, corrupt, or otherwise unsound. Reported to the
+    /// client as `internal`, because nothing the client sent caused it.
+    Unavailable,
+}
+
+impl fmt::Display for CustodyFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Full => "cancel custody holds its full capacity",
+            Self::Unavailable => "cancel custody is unavailable",
+        })
+    }
+}
+
+impl std::error::Error for CustodyFailure {}
+
+/// Idempotency custody for cancellation requests.
+///
+/// This is the seam between an endpoint that must answer a retry the same way
+/// it answered the original, and whatever actually remembers that. The server
+/// holds one implementation for its whole lifetime and consults it around every
+/// `cancel`; it keeps no idempotency state of its own.
+///
+/// The two methods exist because the server delivers between them:
+///
+/// 1. [`classify`](CancelCustody::classify) decides one claim and writes
+///    nothing. A [`CustodyVerdict::Replay`] answers the client without the sink
+///    ever being called, which is what makes idempotency observable rather than
+///    merely claimed.
+/// 2. [`record`](CancelCustody::record) is called only after a sink accepted
+///    delivery, so a delivery that never happened is never remembered as one.
+///
+/// The ordering costs exactly one thing, and it is stated rather than hidden: a
+/// crash between the two loses the record, and a later replay delivers a second
+/// time. The alternative — record first — turns every crash into a
+/// cancellation that was recorded but never delivered, which is worse for a
+/// caller that reads the ledger to decide whether to act.
+///
+/// An implementation must be consistent across the pair: a claim that
+/// `classify` called [`CustodyVerdict::Fresh`] must not become a
+/// [`CustodyVerdict::Conflict`] on `record` unless something outside this
+/// server wrote in between.
+pub trait CancelCustody: Send {
+    /// Decide one claim without recording anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CustodyFailure::Full`] when custody has no room for a new
+    /// binding — refused *before* delivery, because a delivery custody cannot
+    /// record would lose idempotency for every later replay — and
+    /// [`CustodyFailure::Unavailable`] when custody could not be consulted.
+    fn classify(&self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure>;
+
+    /// Record one claim whose delivery a sink accepted.
+    ///
+    /// # Errors
+    ///
+    /// Same categories as [`classify`](CancelCustody::classify).
+    fn record(&mut self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure>;
+}
+
+/// Process-local, server-scoped custody. The default.
+///
+/// Bounded at [`MAX_CANCEL_LEDGER_ENTRIES`] distinct references. It is honest
+/// about what it is not: idempotency held here dies with the process and is
+/// never host-wide, which is the whole reason [`CancelCustody`] is a trait.
+#[derive(Debug)]
+pub struct InMemoryCancelCustody {
+    entries: HashMap<String, (String, u64)>,
+    capacity: usize,
+}
+
+impl InMemoryCancelCustody {
+    /// Custody bounded at [`MAX_CANCEL_LEDGER_ENTRIES`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_capacity(MAX_CANCEL_LEDGER_ENTRIES)
+    }
+
+    /// Custody bounded at `capacity` distinct references.
+    ///
+    /// A capacity above [`MAX_CANCEL_LEDGER_ENTRIES`] is clamped down to it, so
+    /// no caller can widen this process's memory footprint past the module's
+    /// own stated bound.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            capacity: capacity.min(MAX_CANCEL_LEDGER_ENTRIES),
+        }
+    }
+
+    /// References currently retained.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether any reference is retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Shared decision for both trait methods, so the pair cannot drift.
+    fn verdict(&self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
+        match self.entries.get(claim.request_ref) {
+            Some((attempt_id, observed_sequence)) => {
+                if attempt_id == claim.attempt_id && *observed_sequence == claim.observed_sequence {
+                    Ok(CustodyVerdict::Replay)
+                } else {
+                    Ok(CustodyVerdict::Conflict)
+                }
+            }
+            // Lookup precedes the capacity check so a replay is still a replay
+            // in a full ledger: it writes nothing and must never degrade into a
+            // refusal.
+            None if self.entries.len() >= self.capacity => Err(CustodyFailure::Full),
+            None => Ok(CustodyVerdict::Fresh),
+        }
+    }
+}
+
+impl Default for InMemoryCancelCustody {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancelCustody for InMemoryCancelCustody {
+    fn classify(&self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
+        self.verdict(claim)
+    }
+
+    fn record(&mut self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
+        let verdict = self.verdict(claim)?;
+        if verdict == CustodyVerdict::Fresh {
+            self.entries.insert(
+                claim.request_ref.to_owned(),
+                (claim.attempt_id.to_owned(), claim.observed_sequence),
+            );
+        }
+        Ok(verdict)
+    }
+}
+
 /// Closed set of refusal categories that reach the wire.
 ///
 /// A refusal carries only its category. It never echoes the request, a payload,
@@ -322,11 +555,12 @@ pub enum Refusal {
     TargetUnknown,
     /// The cursor is ahead of the last sequence the spool holds.
     CursorAhead,
-    /// This request reference was already delivered to a different attempt.
+    /// Custody binds this request reference to a different attempt or to a
+    /// different observed sequence.
     CancelConflict,
     /// The bound cancellation sink accepted no signal.
     CancelUnavailable,
-    /// The idempotency ledger is full, so delivery cannot be recorded.
+    /// Cancel custody is full, so a delivery could not be recorded.
     LedgerFull,
     /// A server invariant failed. No partial response was written.
     Internal,
@@ -479,13 +713,18 @@ pub struct ControlServer {
     socket_identity: (u64, u64),
     admitted_uid: u32,
     bindings: HashMap<String, Binding>,
-    ledger: HashMap<String, String>,
+    custody: Box<dyn CancelCustody>,
     started: Instant,
 }
 
 impl ControlServer {
     /// Create the private directory if needed, validate it, and bind the
     /// socket at `socket_path` with mode `0600`.
+    ///
+    /// Cancel idempotency is [`InMemoryCancelCustody`]: server-scoped, lost on
+    /// restart, never host-wide. A caller that needs durable custody uses
+    /// [`ControlServer::bind_with_custody`] instead — binding a socket must not
+    /// be the moment a runner decides to open a database.
     ///
     /// Only the final directory component is created, mirroring
     /// [`Spool::open`]. The parent chain must already exist.
@@ -499,6 +738,30 @@ impl ControlServer {
     /// the path is not private and owned, and [`ControlError::SocketInUse`]
     /// when a live listener already answers there.
     pub fn bind(socket_path: impl Into<PathBuf>) -> Result<Self, ControlError> {
+        Self::bind_with_custody(socket_path, Box::new(InMemoryCancelCustody::new()))
+    }
+
+    /// Bind exactly as [`ControlServer::bind`] does, under caller-supplied
+    /// cancel idempotency custody.
+    ///
+    /// This is how durable, host-wide idempotency reaches this endpoint: the
+    /// caller opens the ledger, wraps it in a [`CancelCustody`] implementation
+    /// and hands it over. Two servers over one durable custody deduplicate
+    /// against each other, and a server that restarts over the same custody
+    /// answers `already_delivered` for references its predecessor delivered.
+    ///
+    /// Custody is not consulted here. A custody that is already unreachable
+    /// surfaces on the first `cancel` as `refused internal`, not as a bind
+    /// failure, because a broken ledger must not take down `inspect`,
+    /// `subscribe` and `heartbeat` with it.
+    ///
+    /// # Errors
+    ///
+    /// Exactly the categories [`ControlServer::bind`] documents.
+    pub fn bind_with_custody(
+        socket_path: impl Into<PathBuf>,
+        custody: Box<dyn CancelCustody>,
+    ) -> Result<Self, ControlError> {
         let socket_path = socket_path.into();
         validate_socket_path(&socket_path)?;
         let admitted_uid = geteuid().as_raw();
@@ -532,7 +795,7 @@ impl ControlServer {
             socket_identity: (metadata.dev(), metadata.ino()),
             admitted_uid,
             bindings: HashMap::new(),
-            ledger: HashMap::new(),
+            custody,
             started: Instant::now(),
         })
     }
@@ -594,9 +857,9 @@ impl ControlServer {
 
     /// Release one binding and hand its spool observer back to the caller.
     ///
-    /// The ledger is not touched: a reference already delivered stays
-    /// delivered, so re-registering the same attempt cannot turn a replay into
-    /// a second delivery.
+    /// Custody is not touched: a reference already delivered stays delivered,
+    /// so re-registering the same attempt cannot turn a replay into a second
+    /// delivery.
     ///
     /// # Errors
     ///
@@ -695,7 +958,13 @@ impl ControlServer {
             ["inspect", attempt_id] => self.inspect(attempt_id),
             ["subscribe", attempt_id, cursor] => self.subscribe(attempt_id, cursor),
             ["heartbeat"] => self.heartbeat(),
-            ["cancel", attempt_id, request_ref] => self.cancel(attempt_id, request_ref),
+            // The observed sequence is the one optional field on this wire. A
+            // three-token line is the earlier grammar and reads as sequence
+            // zero, so a client that predates this field keeps working.
+            ["cancel", attempt_id, request_ref] => self.cancel(attempt_id, request_ref, "0"),
+            ["cancel", attempt_id, request_ref, observed_sequence] => {
+                self.cancel(attempt_id, request_ref, observed_sequence)
+            }
             _ => Err(Refusal::UnknownOperation),
         }
     }
@@ -791,33 +1060,51 @@ impl ControlServer {
     /// The answer is delivery evidence only. `delivered` does not mean the
     /// process exited, that descendants were reaped, or that the spool reached
     /// a terminal state.
-    fn cancel(&mut self, attempt_id: &str, request_ref: &str) -> Result<String, Refusal> {
+    ///
+    /// Every idempotency decision here is [`CancelCustody`]'s. This method
+    /// holds no reference state of its own, so what the client is told follows
+    /// from the custody verdict and nothing else: a replay verdict answers
+    /// without touching the sink, a conflict verdict refuses without touching
+    /// the sink, and only a fresh verdict reaches the sink at all.
+    fn cancel(
+        &mut self,
+        attempt_id: &str,
+        request_ref: &str,
+        observed_sequence: &str,
+    ) -> Result<String, Refusal> {
         if !is_identifier(request_ref) {
             return Err(Refusal::FieldInvalid);
         }
-        // Existence of the target is checked before the ledger so that an
-        // unbound attempt cannot mint a ledger entry.
+        let observed_sequence = parse_unsigned(observed_sequence)?;
+        // Existence of the target is checked before custody so that an unbound
+        // attempt cannot mint a custody entry.
         self.binding(attempt_id)?;
-        if let Some(recorded) = self.ledger.get(request_ref) {
-            if recorded == attempt_id {
-                return Ok("cancel_result already_delivered\n".to_owned());
-            }
-            // Reusing a reference against another attempt is a client bug, not
-            // a second delivery. Refuse rather than deliver.
-            return Err(Refusal::CancelConflict);
-        }
-        if self.ledger.len() >= MAX_CANCEL_LEDGER_ENTRIES {
-            // Refuse before delivering: a delivery this server cannot record
-            // would lose idempotency for every later replay.
-            return Err(Refusal::LedgerFull);
+        let claim = CancelClaim {
+            attempt_id,
+            request_ref,
+            observed_sequence,
+        };
+        match self.custody.classify(claim).map_err(custody_refusal)? {
+            CustodyVerdict::Replay => return Ok(ALREADY_DELIVERED_LINE.to_owned()),
+            // Reusing a reference against another attempt, or against another
+            // observed sequence, is a client bug rather than a second delivery.
+            // Refuse rather than deliver.
+            CustodyVerdict::Conflict => return Err(Refusal::CancelConflict),
+            CustodyVerdict::Fresh => {}
         }
         self.binding(attempt_id)?
             .cancel
             .deliver(attempt_id, request_ref)
             .map_err(|CancelUnavailable| Refusal::CancelUnavailable)?;
-        self.ledger
-            .insert(request_ref.to_owned(), attempt_id.to_owned());
-        Ok("cancel_result delivered\n".to_owned())
+        // Recorded only now: an unavailable delivery leaves custody untouched,
+        // so a retry is a real second attempt rather than a false replay.
+        match self.custody.record(claim).map_err(custody_refusal)? {
+            // A record that replays means another writer bound the same claim
+            // between the two calls. This server's sink did fire, so the answer
+            // stays delivery evidence.
+            CustodyVerdict::Fresh | CustodyVerdict::Replay => Ok(DELIVERED_LINE.to_owned()),
+            CustodyVerdict::Conflict => Err(Refusal::CancelConflict),
+        }
     }
 
     /// Unlink the socket only while it is still the exact inode created here.
@@ -847,12 +1134,15 @@ impl Drop for ControlServer {
 
 impl fmt::Debug for ControlServer {
     /// Deliberately narrow: no spool contents, no attempt identifiers and no
-    /// ledger references reach a debug rendering.
+    /// custody references reach a debug rendering.
+    ///
+    /// The custody entry count is gone rather than proxied through the trait:
+    /// counting a durable ledger is a fallible query, and a `Debug` rendering
+    /// is not a place to perform one.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ControlServer")
             .field("bindings", &self.bindings.len())
-            .field("ledger_entries", &self.ledger.len())
             .finish_non_exhaustive()
     }
 }
@@ -1020,6 +1310,19 @@ fn is_identifier(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.'
         })
+}
+
+/// Wire category for a custody failure.
+///
+/// The split is the point: a full custody is a bound the client can see and
+/// retry against, while an unavailable one is this host's own custody being
+/// unsound. Reporting the second as `cancel_conflict` — or as any other
+/// client-shaped category — would blame the caller for our storage.
+const fn custody_refusal(failure: CustodyFailure) -> Refusal {
+    match failure {
+        CustodyFailure::Full => Refusal::LedgerFull,
+        CustodyFailure::Unavailable => Refusal::Internal,
+    }
 }
 
 /// Canonical unsigned decimal: no sign, no leading zero, no separator.
