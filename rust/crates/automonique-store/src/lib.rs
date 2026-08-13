@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod approval_ledger;
 pub mod automation_store;
 pub mod cancel_ledger;
 pub mod generation_audit;
