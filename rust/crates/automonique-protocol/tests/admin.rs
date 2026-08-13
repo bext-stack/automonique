@@ -1099,19 +1099,25 @@ fn a_reported_pause_cannot_claim_intake_is_still_open() {
 }
 
 // ---------------------------------------------------------------------------
-// One socket, three protocols.
+// One socket, four protocols.
 //
-// A local endpoint serves administration, the native Runs API read surface
-// *and* the native Automation control surface. `LocalRequest` is the only thing
-// that decides which, and it decides by the protocol name the frame itself
-// declares. These pin that the decision is made once, before any lane reads a
-// body, and that no lane can be reached through another's decoder.
+// A local endpoint serves administration, the native Runs API read surface, the
+// native Automation control surface *and* the native Approval decision surface.
+// `LocalRequest` is the only thing that decides which, and it decides by the
+// protocol name the frame itself declares. These pin that the decision is made
+// once, before any lane reads a body, and that no lane can be reached through
+// another's decoder.
 // ---------------------------------------------------------------------------
 
 mod local_dispatch {
     use super::*;
 
     use automonique_protocol::admin::{LocalRequest, LocalRequestError};
+    use automonique_protocol::approval_api::{
+        APPROVAL_PROTOCOL, ApprovalApiError, ApprovalCursor, ApprovalDecision, ApprovalKey,
+        ApprovalPageSize, ApprovalRequest, ApprovalSubject, ApprovalsBySubject, Decider,
+        ListApprovals, MAX_APPROVAL_CANONICAL_BYTES, RecordApproval,
+    };
     use automonique_protocol::automation::{AutomationActor, EnablementState};
     use automonique_protocol::automation_api::{
         AUTOMATION_PROTOCOL, AutomationApiError, AutomationCursor, AutomationId,
@@ -1163,6 +1169,20 @@ mod local_dispatch {
         request
             .to_message()
             .expect("encode automation request")
+            .to_canonical_bytes()
+    }
+
+    fn approval_listing() -> ApprovalRequest {
+        ApprovalRequest::ListApprovals {
+            request_id: request_id(),
+            query: ListApprovals::new(ApprovalCursor::START, ApprovalPageSize::MAX),
+        }
+    }
+
+    fn approval_payload(request: &ApprovalRequest) -> Vec<u8> {
+        request
+            .to_message()
+            .expect("encode approval request")
             .to_canonical_bytes()
     }
 
@@ -1218,6 +1238,36 @@ mod local_dispatch {
                 .expect("an automation frame is placed");
             assert_eq!(placed.protocol(), AUTOMATION_PROTOCOL);
             assert_eq!(placed, LocalRequest::Automation(Box::new(request)));
+        }
+
+        for request in [
+            approval_listing(),
+            ApprovalRequest::RecordApproval {
+                request_id: request_id(),
+                decision: RecordApproval::new(
+                    ApprovalKey::new("deploy-1").expect("approval key"),
+                    ApprovalSubject::new("command:shutdown").expect("subject"),
+                    ApprovalDecision::Granted,
+                    Decider::new("ben").expect("decider"),
+                ),
+            },
+            ApprovalRequest::ApprovalDetail {
+                request_id: request_id(),
+                approval_key: ApprovalKey::new("deploy-1").expect("approval key"),
+            },
+            ApprovalRequest::ApprovalsBySubject {
+                request_id: request_id(),
+                query: ApprovalsBySubject::new(
+                    ApprovalSubject::new("command:shutdown").expect("subject"),
+                    ApprovalCursor::new(3),
+                    ApprovalPageSize::MAX,
+                ),
+            },
+        ] {
+            let placed = LocalRequest::from_canonical_bytes(&approval_payload(&request))
+                .expect("an approval frame is placed");
+            assert_eq!(placed.protocol(), APPROVAL_PROTOCOL);
+            assert_eq!(placed, LocalRequest::Approval(Box::new(request)));
         }
     }
 
@@ -1316,6 +1366,64 @@ mod local_dispatch {
             LocalRequest::from_canonical_bytes(crossed).expect_err("smuggled automation kind"),
             LocalRequestError::Runs(RunsApiError::UnknownKind)
         );
+
+        // The fourth lane refuses in its own vocabulary too. A recording body
+        // missing its declared `subject` is the Approval lane's
+        // `approval_invalid_body`, which no other lane can produce.
+        let short = br#"{"body":{"approval_key":"deploy-1","decider":"ben","decision":"granted"},"kind":"record_approval","protocol":"automonique.approval","request_id":"r","version":1}"#;
+        let error = LocalRequest::from_canonical_bytes(short).expect_err("short recording body");
+        assert_eq!(
+            error,
+            LocalRequestError::Approval(ApprovalApiError::InvalidBody)
+        );
+        assert_eq!(error.category(), "approval_invalid_body");
+
+        // An approval kind inside each of the other three envelopes stays that
+        // lane's refusal, and each of their kinds inside an approval envelope
+        // stays the approval lane's. Four lanes, and none falls through to
+        // another.
+        let approval_body =
+            br#"{"approval_key":"deploy-1","decider":"ben","decision":"granted","subject":"s"}"#;
+        for (protocol, expected) in [
+            (
+                "automonique.admin",
+                LocalRequestError::Admin(AdminError::UnknownKind),
+            ),
+            (
+                "automonique.runs",
+                LocalRequestError::Runs(RunsApiError::UnknownKind),
+            ),
+            (
+                "automonique.automation",
+                LocalRequestError::Automation(AutomationApiError::UnknownKind),
+            ),
+        ] {
+            let smuggled = [
+                br#"{"body":"#.as_slice(),
+                approval_body.as_slice(),
+                format!(
+                    r#","kind":"record_approval","protocol":"{protocol}","request_id":"r","version":1}}"#
+                )
+                .as_bytes(),
+            ]
+            .concat();
+            assert_eq!(
+                LocalRequest::from_canonical_bytes(&smuggled).expect_err("smuggled approval kind"),
+                expected,
+                "an approval kind inside a {protocol} envelope",
+            );
+        }
+        for kind in ["shutdown", "list_runs", "register_automation"] {
+            let inverted = format!(
+                r#"{{"body":{{}},"kind":"{kind}","protocol":"automonique.approval","request_id":"r","version":1}}"#
+            );
+            assert_eq!(
+                LocalRequest::from_canonical_bytes(inverted.as_bytes())
+                    .expect_err("smuggled foreign kind"),
+                LocalRequestError::Approval(ApprovalApiError::UnknownKind),
+                "a {kind} inside an approval envelope",
+            );
+        }
     }
 
     #[test]
@@ -1324,11 +1432,48 @@ mod local_dispatch {
         // own decoder refuses the others' bytes outright, so a caller that
         // bypassed `LocalRequest` could not mix them either.
         let automation = automation_payload(&automation_listing());
+        let approval = approval_payload(&approval_listing());
         for (label, category) in [
             (
                 "a runs frame is not an admin request",
                 AdminRequest::from_canonical_bytes(&runs_payload(&listing()))
                     .expect_err("runs into admin")
+                    .category(),
+            ),
+            (
+                "an approval frame is not an admin request",
+                AdminRequest::from_canonical_bytes(&approval)
+                    .expect_err("approval into admin")
+                    .category(),
+            ),
+            (
+                "an approval frame is not a runs request",
+                RunsRequest::from_canonical_bytes(&approval)
+                    .expect_err("approval into runs")
+                    .category(),
+            ),
+            (
+                "an approval frame is not an automation request",
+                AutomationRequest::from_canonical_bytes(&approval)
+                    .expect_err("approval into automation")
+                    .category(),
+            ),
+            (
+                "an admin frame is not an approval request",
+                ApprovalRequest::from_canonical_bytes(&admin_payload())
+                    .expect_err("admin into approval")
+                    .category(),
+            ),
+            (
+                "a runs frame is not an approval request",
+                ApprovalRequest::from_canonical_bytes(&runs_payload(&listing()))
+                    .expect_err("runs into approval")
+                    .category(),
+            ),
+            (
+                "an automation frame is not an approval request",
+                ApprovalRequest::from_canonical_bytes(&automation)
+                    .expect_err("automation into approval")
                     .category(),
             ),
             (
@@ -1390,6 +1535,33 @@ mod local_dispatch {
         assert!(
             frame.len() < MAX_AUTOMATION_CANONICAL_BYTES && frame.len() < LOCAL_READ_BOUND,
             "a maximal transition framed to {} bytes",
+            frame.len(),
+        );
+    }
+
+    #[test]
+    fn a_maximal_approval_frame_fits_the_local_administration_read_bound() {
+        // The relation between the ceilings is a compile-time assertion in
+        // `admin.rs`, so this build could not have linked if it stopped
+        // holding. What is measured here is the consequence: a real Approval
+        // message, framed the way this socket frames it, fits the bound the
+        // local endpoint reads under.
+        const LOCAL_READ_BOUND: usize = MAX_ADMIN_CANONICAL_BYTES;
+        let worst = "\"".repeat(ApprovalKey::MAX_BYTES);
+        let payload = approval_payload(&ApprovalRequest::RecordApproval {
+            request_id: request_id(),
+            decision: RecordApproval::new(
+                ApprovalKey::new(&worst).expect("approval key"),
+                ApprovalSubject::new(&worst).expect("subject"),
+                ApprovalDecision::Granted,
+                Decider::new(&worst).expect("decider"),
+            ),
+        });
+        let mut frame = Vec::new();
+        encode_frame(&payload, &mut frame).expect("a maximal recording fits one frame");
+        assert!(
+            frame.len() < MAX_APPROVAL_CANONICAL_BYTES && frame.len() < LOCAL_READ_BOUND,
+            "a maximal recording framed to {} bytes",
             frame.len(),
         );
     }

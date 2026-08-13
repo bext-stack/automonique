@@ -18,27 +18,31 @@
 //! Carrying is all it does: see that type's documentation for what a carried
 //! pair does *not* establish.
 //!
-//! # One socket, three protocols
+//! # One socket, four protocols
 //!
 //! [`LocalRequest`] is what a local endpoint decodes a frame into. The local
-//! socket serves this protocol, [`crate::runs_api`]'s read surface *and*
-//! [`crate::automation_api`]'s control surface, and the envelope's declared
+//! socket serves this protocol, [`crate::runs_api`]'s read surface,
+//! [`crate::automation_api`]'s control surface *and*
+//! [`crate::approval_api`]'s decision surface, and the envelope's declared
 //! protocol name is what separates them — not a heuristic, not a fallback
 //! chain, and not a widening of [`AdminCommand`]. That is the arrangement
 //! `runs_api` asks for in as many words: its values travel "on the same
 //! canonical-JSON envelope [`crate::admin`] uses, under a separate protocol
-//! name so the admin lane's closed kind set stays closed." A run listing or an
-//! automation pause is therefore not an admin command, does not appear in
-//! [`crate::command_registry`]'s admin surface, and cannot reach
-//! [`DaemonStatus`].
+//! name so the admin lane's closed kind set stays closed." A run listing, an
+//! automation pause or a recorded approval is therefore not an admin command,
+//! does not appear in [`crate::command_registry`]'s admin surface, and cannot
+//! reach [`DaemonStatus`].
 //!
 //! Adding the third lane cost this module one enum arm, one match arm and one
 //! frame-fit assertion, and cost the admin lane nothing at all — which is the
-//! property the arrangement was chosen for.
+//! property the arrangement was chosen for. The fourth cost exactly the same
+//! three lines, which is the evidence that the property holds rather than
+//! merely having held once.
 
 use std::error::Error;
 use std::fmt;
 
+use crate::approval_api::{APPROVAL_PROTOCOL, ApprovalApiError, ApprovalRequest};
 use crate::automation_api::{AUTOMATION_PROTOCOL, AutomationApiError, AutomationRequest};
 use crate::codec::{
     CodecError, Envelope, MajorVersion, MessageKind, ProtocolName, RequestId, SupportedProtocol,
@@ -1486,13 +1490,25 @@ const _: () = assert!(
     "a maximal automation frame must fit the local administration read bound"
 );
 
+/// A maximal Approval frame must fit the bound a local transport reads under.
+///
+/// The same dependency the Runs and Automation ceilings have, stated for the
+/// same reason: a widened `approval_api` ceiling that outgrew this one would
+/// turn a legal Approval message into a `frame_size` refusal at the socket,
+/// which is a size failure discovered by a peer rather than by this build.
+const _: () = assert!(
+    crate::approval_api::MAX_APPROVAL_CANONICAL_BYTES <= MAX_ADMIN_CANONICAL_BYTES,
+    "a maximal approval frame must fit the local administration read bound"
+);
+
 /// A refusal while deciding which protocol one local frame belongs to.
 ///
-/// The four variants say *who* refused, which is the distinction a metric
+/// The five variants say *who* refused, which is the distinction a metric
 /// label needs: an envelope this socket could not place at all, a well-placed
 /// administration message the admin lane refused, a well-placed Runs message
-/// the Runs lane refused, or a well-placed Automation message the Automation
-/// lane refused. Every category spelling is the refusing lane's own.
+/// the Runs lane refused, a well-placed Automation message the Automation lane
+/// refused, or a well-placed Approval message the Approval lane refused. Every
+/// category spelling is the refusing lane's own.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalRequestError {
     /// The payload is not a well-formed envelope, or names a protocol this
@@ -1504,6 +1520,8 @@ pub enum LocalRequestError {
     Runs(RunsApiError),
     /// The Automation control lane refused the message it was handed.
     Automation(AutomationApiError),
+    /// The Approval decision lane refused the message it was handed.
+    Approval(ApprovalApiError),
 }
 
 impl LocalRequestError {
@@ -1515,6 +1533,7 @@ impl LocalRequestError {
             Self::Admin(error) => error.category(),
             Self::Runs(error) => error.category(),
             Self::Automation(error) => error.category(),
+            Self::Approval(error) => error.category(),
         }
     }
 }
@@ -1526,13 +1545,14 @@ impl fmt::Display for LocalRequestError {
             Self::Admin(error) => write!(formatter, "{error}"),
             Self::Runs(error) => write!(formatter, "{error}"),
             Self::Automation(error) => write!(formatter, "{error}"),
+            Self::Approval(error) => write!(formatter, "{error}"),
         }
     }
 }
 
 impl Error for LocalRequestError {}
 
-/// One decoded request on a local endpoint that serves both local protocols.
+/// One decoded request on a local endpoint that serves every local protocol.
 ///
 /// # Why this is a dispatch and not a tenth admin command
 ///
@@ -1543,10 +1563,10 @@ impl Error for LocalRequestError {}
 /// refusal vocabulary; re-spelling any of that here would create a second
 /// authority for one wire format, and the two would drift.
 ///
-/// So the frame's own `protocol` member decides. Both lanes then admit their
-/// own message independently — including its major version, which each lane
-/// owns — so nothing is guessed, downgraded, or tried in sequence until
-/// something parses.
+/// So the frame's own `protocol` member decides. Each lane then admits its own
+/// message independently — including its major version, which each lane owns —
+/// so nothing is guessed, downgraded, or tried in sequence until something
+/// parses.
 ///
 /// The payload is parsed twice: once here to read the declared name, and once
 /// by the lane that owns it. That is the cost of leaving each lane's decoder
@@ -1570,6 +1590,11 @@ pub enum LocalRequest {
     /// [`AutomationRequest`] carries three maximal bounded identifiers inline,
     /// so an unboxed arm would set this enum's size for every lane.
     Automation(Box<AutomationRequest>),
+    /// A decision operation on the native Approval API.
+    ///
+    /// Boxed for the same reason: an [`ApprovalRequest`] carries three maximal
+    /// bounded identifiers inline.
+    Approval(Box<ApprovalRequest>),
 }
 
 impl LocalRequest {
@@ -1597,6 +1622,9 @@ impl LocalRequest {
             AUTOMATION_PROTOCOL => AutomationRequest::from_canonical_bytes(payload)
                 .map(|request| Self::Automation(Box::new(request)))
                 .map_err(LocalRequestError::Automation),
+            APPROVAL_PROTOCOL => ApprovalRequest::from_canonical_bytes(payload)
+                .map(|request| Self::Approval(Box::new(request)))
+                .map_err(LocalRequestError::Approval),
             _ => Err(LocalRequestError::Envelope(CodecError::UnknownProtocol)),
         }
     }
@@ -1608,6 +1636,7 @@ impl LocalRequest {
             Self::Admin(_) => ADMIN_PROTOCOL,
             Self::Runs(_) => RUNS_PROTOCOL,
             Self::Automation(_) => AUTOMATION_PROTOCOL,
+            Self::Approval(_) => APPROVAL_PROTOCOL,
         }
     }
 }

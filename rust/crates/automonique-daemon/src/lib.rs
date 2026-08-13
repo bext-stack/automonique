@@ -29,6 +29,12 @@ use automonique_protocol::admin::{
     MAX_ADMIN_CANONICAL_BYTES, OperationalMetric, OperationalStatus, OperationalStatusParts,
     OutboxReconciliationDecision,
 };
+use automonique_protocol::approval_api::{
+    ApprovalContinuation, ApprovalCursor, ApprovalDecision, ApprovalDisposition, ApprovalKey,
+    ApprovalListPage, ApprovalReceiptView, ApprovalRecordParts, ApprovalRecordView,
+    ApprovalRefusal, ApprovalRequest, ApprovalResponse, ApprovalSubject, ApprovalsBySubject,
+    Decider, ListApprovals, RecordApproval, RecordedApproval,
+};
 use automonique_protocol::automation::{AutomationActor, EnablementState};
 use automonique_protocol::automation_api::{
     AutomationContinuation, AutomationCursor, AutomationId, AutomationListPage,
@@ -45,6 +51,11 @@ use automonique_protocol::runs_api::{
 };
 use automonique_protocol::tools::RunId;
 use automonique_runner::{RunSpec, RunSpecDecodeError};
+use automonique_store::approval_ledger::{
+    ApprovalDecision as StoreApprovalDecision, ApprovalDecisionRecord,
+    ApprovalDisposition as StoreApprovalDisposition, ApprovalEntry, ApprovalLedger,
+    ApprovalLedgerError,
+};
 use automonique_store::automation_store::{
     AutomationRecord, AutomationRegistration, AutomationStore, AutomationStoreError,
     EnablementState as StoreEnablementState, EnablementTransition,
@@ -112,6 +123,23 @@ pub const RUN_INDEX_NAME: &str = concat!("run-index", ".sqlite3");
 /// today. It is written now so that the scheduler, when it lands, reads its
 /// enablement out of a durable record rather than inventing one.
 pub const AUTOMATION_REGISTRY_NAME: &str = concat!("automations", ".sqlite3");
+
+/// Durable write-once approval decision ledger, a sibling of [`DATABASE_NAME`].
+///
+/// One row per decision, recording what was approved or refused, by whom, and
+/// when. Separate for the reason every sibling log is separate — its schema
+/// versions independently — and because a decision record is not scheduler
+/// state.
+///
+/// WHAT THIS FILE DOES NOT DO. It gates nothing. **A `granted` row in this file
+/// allows no action in this build, because nothing consults it**: there is no
+/// scheduler, no executor and no provider turn that reads a decision before
+/// acting, and a `denied` row stops nothing for the same reason. It is written
+/// now so that a gate, when one lands, reads a durable decision rather than
+/// inventing one. It is also not the per-session binding —
+/// `automonique_store::provider_journal`'s `provider_approvals` table is that,
+/// keyed on `(session_id, approval_key)` — and no transaction spans the two.
+pub const APPROVAL_LEDGER_NAME: &str = concat!("approvals", ".sqlite3");
 
 /// Durable host-wide cancellation ledger, a sibling of [`DATABASE_NAME`].
 ///
@@ -235,6 +263,12 @@ impl DaemonConfig {
         self.state_dir().join(AUTOMATION_REGISTRY_NAME)
     }
 
+    /// Durable approval decision ledger path.
+    #[must_use]
+    pub fn approval_ledger_path(&self) -> PathBuf {
+        self.state_dir().join(APPROVAL_LEDGER_NAME)
+    }
+
     /// Durable generation hand-off audit path.
     #[must_use]
     pub fn generation_audit_path(&self) -> PathBuf {
@@ -290,6 +324,17 @@ pub enum DaemonError {
     /// daemon's own durable state is unsound and must not be presented as an
     /// operator error. [`automation_refusal`] is where the line is drawn.
     AutomationStoreFailed(&'static str),
+    /// The durable approval ledger failed in a way no client caused. The
+    /// payload is the stable category from that module.
+    ///
+    /// The same line [`AutomationStoreFailed`](Self::AutomationStoreFailed)
+    /// draws: a malformed field, a lost cursor and a full ledger are the
+    /// operator's to fix and are answered to the client in one closed word,
+    /// while corruption, a schema mismatch, an unsafe path and storage failure
+    /// say the daemon's own durable state is unsound and must not be presented
+    /// as an operator error. [`refuse_approval`] is where the line is drawn. No
+    /// variant of this error echoes any part of the payload that met it.
+    ApprovalLedgerFailed(&'static str),
     /// The durable generation hand-off audit could not be opened, could not
     /// record this daemon's tenure, or could not close it. The payload is the
     /// stable category from that module.
@@ -318,6 +363,7 @@ impl DaemonError {
             Self::RunIndexFailed(category) => category,
             Self::AttemptHostFailed(category) => category,
             Self::AutomationStoreFailed(category) => category,
+            Self::ApprovalLedgerFailed(category) => category,
             Self::GenerationAuditFailed(category) => category,
         }
     }
@@ -358,6 +404,9 @@ impl fmt::Display for DaemonError {
             }
             Self::AutomationStoreFailed(category) => {
                 write!(formatter, "automation registry failed: {category}")
+            }
+            Self::ApprovalLedgerFailed(category) => {
+                write!(formatter, "approval ledger failed: {category}")
             }
             Self::GenerationAuditFailed(category) => {
                 write!(formatter, "generation audit failed: {category}")
@@ -419,6 +468,14 @@ pub struct Daemon {
     /// scheduler — so its whole role in this build is to answer the automation
     /// control lane truthfully across restarts.
     automations: AutomationStore,
+    /// The durable record of which approval decisions were made, and by whom.
+    ///
+    /// A plain field for the reason [`Daemon::run_index`] is: it owns no
+    /// dispatcher and needs no ordered disposal. Nothing in this daemon *reads*
+    /// it to decide anything — no handler consults a decision before acting,
+    /// because no handler in this build acts on anybody's behalf — so its whole
+    /// role here is to answer the approval lane truthfully across restarts.
+    approvals: ApprovalLedger,
     /// This host's one cancellation dispatcher over its one durable ledger.
     ///
     /// `Option` only so [`Daemon::serve`] can dispose of it explicitly while
@@ -590,6 +647,18 @@ impl Daemon {
         let automations = AutomationStore::open(config.automation_registry_path())
             .map_err(|error| DaemonError::AutomationStoreFailed(error.category()))?;
 
+        // The approval ledger opens beside the registry, under the same fence
+        // and before the socket guard is disarmed, for the same reason: a
+        // daemon that cannot durably record that somebody approved something
+        // must not publish an endpoint that accepts the recording. An approval
+        // held in memory and forgotten by a restart is exactly the failure this
+        // ledger exists to remove — `command_registry` says plainly that its
+        // operator-confirmation policy leaves no durable trace — and serving
+        // the lane from a ledger that failed to open would reintroduce it
+        // silently.
+        let approvals = ApprovalLedger::open(config.approval_ledger_path())
+            .map_err(|error| DaemonError::ApprovalLedgerFailed(error.category()))?;
+
         // The host's one cancellation dispatcher and its durable custody open
         // beneath the same fence and before the socket guard is disarmed, for
         // the same reason custody storage does: a daemon that cannot remember
@@ -615,6 +684,7 @@ impl Daemon {
             run_submissions,
             run_index,
             automations,
+            approvals,
             attempt_host: Some(attempt_host),
             generation_audit,
             tenure_revision: tenure.revision,
@@ -846,11 +916,12 @@ impl Daemon {
     /// Authenticate the peer, read one bounded frame, and hand it to the lane
     /// its envelope names.
     ///
-    /// The socket serves three protocols. Which one a frame belongs to is read
+    /// The socket serves four protocols. Which one a frame belongs to is read
     /// off its declared protocol name by
     /// [`LocalRequest::from_canonical_bytes`], never guessed and never tried in
-    /// sequence, so an administration client, a Runs client and an Automation
-    /// client receive their own lane's refusals rather than each other's.
+    /// sequence, so an administration client, a Runs client, an Automation
+    /// client and an Approval client receive their own lane's refusals rather
+    /// than each other's.
     fn handle_stream(
         &mut self,
         stream: &mut UnixStream,
@@ -866,6 +937,7 @@ impl Daemon {
             LocalRequest::Admin(request) => self.handle_admin(stream, &request, stop),
             LocalRequest::Runs(request) => self.handle_runs(stream, &request),
             LocalRequest::Automation(request) => self.handle_automation(stream, &request),
+            LocalRequest::Approval(request) => self.handle_approval(stream, &request),
         }
     }
 
@@ -1884,6 +1956,220 @@ impl Daemon {
         })
     }
 
+    /// Answer one operation on the native Approval decision API.
+    ///
+    /// # What an accepted write here does, and what it does not
+    ///
+    /// It commits one write-once row saying that somebody identifying
+    /// themselves as `decider` answered `decision` about `subject`. **Nothing
+    /// else happens.** In particular:
+    ///
+    /// - **A recorded approval allows nothing.** No handler in this daemon
+    ///   consults this ledger before doing anything, because no handler here
+    ///   acts on anybody's behalf: there is no scheduler, no executor and no
+    ///   provider turn. A `granted` row permits nothing that was not already
+    ///   permitted.
+    /// - **A recorded denial blocks nothing**, for the same reason and with the
+    ///   same force. The row is written beside the action, never in front of it.
+    /// - **The decider is not authenticated.** [`authenticate_peer`] established
+    ///   that the peer is this user; that string says which person or runbook
+    ///   behind that user answered, and the daemon records it verbatim.
+    /// - **The decision is bound to no provider session.** That binding is
+    ///   `provider_journal`'s, in a different database, under a different key.
+    ///
+    /// That is why a landed write answers `accepted` rather than `completed`:
+    /// the row is committed, and the decision the row records has not taken
+    /// effect anywhere, because there is nowhere for it to take effect yet.
+    ///
+    /// # Fencing
+    ///
+    /// Fenced exactly as [`Daemon::handle_automation`] is, and for the same
+    /// reason: this lane writes. A daemon that has lost its generation must not
+    /// record a decision into a database another generation now owns, and must
+    /// not serve one out of it either.
+    ///
+    /// Like the automation lane and unlike the intake arms, this is *not* closed
+    /// by an operator pause or by a degraded generation. An intake pause stops
+    /// the daemon taking custody of new work; writing down that somebody refused
+    /// something is the opposite of taking on work, and an operator repairing a
+    /// degraded generation is precisely the person whose decisions most need
+    /// recording.
+    fn handle_approval(
+        &mut self,
+        stream: &mut UnixStream,
+        request: &ApprovalRequest,
+    ) -> Result<(), DaemonError> {
+        let now_ms = unix_millis()?;
+        let snapshot = self.store.status_snapshot_at(GENERATION_ID, now_ms)?;
+        let generation = snapshot.generation().ok_or(StoreError::StaleEpoch)?;
+        if generation.holder_id() != self.instance_id.as_str()
+            || generation.lease_epoch() != self.lease_epoch
+            || generation.lease_expires_ms() != self.lease_expires_ms
+            || generation.lease_expires_ms() <= now_ms
+        {
+            return Err(DaemonError::Store(StoreError::StaleEpoch));
+        }
+        let response = match request {
+            ApprovalRequest::RecordApproval {
+                request_id,
+                decision,
+            } => self.record_approval(request_id, decision, now_ms)?,
+            ApprovalRequest::ListApprovals { request_id, query } => {
+                self.list_approvals(request_id, *query)?
+            }
+            ApprovalRequest::ApprovalDetail {
+                request_id,
+                approval_key,
+            } => self.approval_detail(request_id, approval_key)?,
+            ApprovalRequest::ApprovalsBySubject { request_id, query } => {
+                self.approvals_by_subject(request_id, query)?
+            }
+        };
+        let response = response
+            .to_message()
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
+            .to_canonical_bytes();
+        let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + response.len());
+        encode_frame(&response, &mut frame)
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
+        stream.write_all(&frame)?;
+        stream.flush()?;
+        Ok(())
+    }
+
+    /// Record one decision, write-once.
+    ///
+    /// The instant is the daemon's, not the caller's: the wire carries no
+    /// timestamp, so a client cannot date a decision to whenever it likes.
+    ///
+    /// The three answers the ledger gives are the three this lane gives. An
+    /// exact replay is a *success* carrying
+    /// [`ApprovalDisposition::AlreadyRecorded`] and the first recording's
+    /// instant — never a refusal, because a caller that lost the answer to its
+    /// first attempt must get the first answer back. A key presented with a
+    /// different subject, decision or decider is the conflict, which the
+    /// protocol derives from both sides rather than trusting this function's
+    /// claim about which field differed.
+    fn record_approval(
+        &mut self,
+        request_id: &RequestId,
+        decision: &RecordApproval,
+        now_ms: i64,
+    ) -> Result<ApprovalResponse, DaemonError> {
+        let receipt = match self.approvals.record(ApprovalDecisionRecord {
+            approval_key: decision.approval_key().as_str(),
+            subject: decision.subject().as_str(),
+            decision: store_approval_decision(decision.decision()),
+            decider: decision.decider().as_str(),
+            decided_at_ms: now_ms,
+        }) {
+            Ok(receipt) => receipt,
+            Err(ApprovalLedgerError::Conflict {
+                entry_id,
+                recorded_subject,
+                recorded_decision,
+                recorded_decider,
+                ..
+            }) => {
+                // The ledger's own `field` is deliberately dropped: the
+                // protocol re-derives it from the two decisions in hand, so
+                // this daemon cannot report a field the sides agree on.
+                return ApprovalResponse::conflict(
+                    request_id.clone(),
+                    decision,
+                    RecordedApproval {
+                        entry_id: checked_row_id(entry_id)?,
+                        subject: ApprovalSubject::new(&recorded_subject).map_err(|_| {
+                            DaemonError::ApprovalLedgerFailed("subject_ungrammatical")
+                        })?,
+                        decision: approval_decision(recorded_decision),
+                        decider: Decider::new(&recorded_decider).map_err(|_| {
+                            DaemonError::ApprovalLedgerFailed("decider_ungrammatical")
+                        })?,
+                    },
+                )
+                .map_err(approval_refused);
+            }
+            Err(error) => return refuse_approval(request_id, &error),
+        };
+        Ok(ApprovalResponse::Recorded {
+            request_id: request_id.clone(),
+            receipt: ApprovalReceiptView::new(
+                checked_row_id(receipt.entry_id)?,
+                decision.approval_key().clone(),
+                decision.decision(),
+                approval_disposition(receipt.disposition),
+                automonique_protocol::primitives::EpochMillis::from_millis(receipt.decided_at_ms),
+            )
+            .map_err(approval_refused)?,
+        })
+    }
+
+    /// One bounded page of every recorded decision.
+    ///
+    /// The wire cursor is the ledger's own exclusive `entry_id` position, so
+    /// nothing is translated between two coordinate spaces and there is no
+    /// off-by-one to re-derive.
+    fn list_approvals(
+        &self,
+        request_id: &RequestId,
+        query: ListApprovals,
+    ) -> Result<ApprovalResponse, DaemonError> {
+        let page = match self
+            .approvals
+            .page(query.since().position(), query.page_size().get())
+        {
+            Ok(page) => page,
+            Err(error) => return refuse_approval(request_id, &error),
+        };
+        let page = approval_page(&page)?;
+        ApprovalResponse::listing(request_id.clone(), query, page).map_err(approval_refused)
+    }
+
+    /// One bounded page of one subject's decisions, oldest first.
+    fn approvals_by_subject(
+        &self,
+        request_id: &RequestId,
+        query: &ApprovalsBySubject,
+    ) -> Result<ApprovalResponse, DaemonError> {
+        let page = match self.approvals.by_subject(
+            query.subject().as_str(),
+            query.since().position(),
+            query.page_size().get(),
+        ) {
+            Ok(page) => page,
+            Err(error) => return refuse_approval(request_id, &error),
+        };
+        let page = approval_page(&page)?;
+        ApprovalResponse::subject_listing(request_id.clone(), query, page).map_err(approval_refused)
+    }
+
+    /// One decision in full, or [`ApprovalRefusal::UnknownApproval`].
+    ///
+    /// An absent row is "nothing was recorded under this key" and never "the
+    /// subject behind it was refused"; those are different answers and this one
+    /// makes the true one.
+    fn approval_detail(
+        &self,
+        request_id: &RequestId,
+        approval_key: &ApprovalKey,
+    ) -> Result<ApprovalResponse, DaemonError> {
+        let entry = match self.approvals.entry(approval_key.as_str()) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => {
+                return Ok(ApprovalResponse::Refused {
+                    request_id: request_id.clone(),
+                    refusal: ApprovalRefusal::UnknownApproval,
+                });
+            }
+            Err(error) => return refuse_approval(request_id, &error),
+        };
+        Ok(ApprovalResponse::ApprovalDetail {
+            request_id: request_id.clone(),
+            record: approval_record(&entry)?,
+        })
+    }
+
     fn write_refusal(
         &self,
         stream: &mut UnixStream,
@@ -2062,6 +2348,118 @@ fn refuse_automation(
         }
     };
     Ok(AutomationResponse::Refused {
+        request_id: request_id.clone(),
+        refusal,
+    })
+}
+
+fn approval_refused(error: automonique_protocol::approval_api::ApprovalApiError) -> DaemonError {
+    DaemonError::ProtocolRefused(error.category())
+}
+
+/// Translate the wire's decision vocabulary into the ledger's.
+///
+/// Two closed two-word enums that mirror one another and one exhaustive match
+/// between them. Deliberately not a spelling comparison, and deliberately not a
+/// shared type: this crate can see both, but neither crate depends on the other,
+/// so the match is where a rename on either side becomes a compile failure
+/// rather than a row nobody can read.
+const fn store_approval_decision(decision: ApprovalDecision) -> StoreApprovalDecision {
+    match decision {
+        ApprovalDecision::Granted => StoreApprovalDecision::Granted,
+        ApprovalDecision::Denied => StoreApprovalDecision::Denied,
+    }
+}
+
+/// Translate the ledger's decision vocabulary into the wire's.
+const fn approval_decision(decision: StoreApprovalDecision) -> ApprovalDecision {
+    match decision {
+        StoreApprovalDecision::Granted => ApprovalDecision::Granted,
+        StoreApprovalDecision::Denied => ApprovalDecision::Denied,
+    }
+}
+
+/// Translate the ledger's disposition vocabulary into the wire's.
+const fn approval_disposition(disposition: StoreApprovalDisposition) -> ApprovalDisposition {
+    match disposition {
+        StoreApprovalDisposition::Recorded => ApprovalDisposition::Recorded,
+        StoreApprovalDisposition::AlreadyRecorded => ApprovalDisposition::AlreadyRecorded,
+    }
+}
+
+/// Project one validated ledger row onto the wire.
+///
+/// Every field is re-validated by the protocol's own constructor rather than
+/// trusted through: the ledger validated it against its grammar, and this
+/// validates it against the wire's, which is the one a client will decode under.
+/// A row the wire cannot carry is a typed daemon failure rather than a row
+/// silently omitted from a page.
+fn approval_record(entry: &ApprovalEntry) -> Result<ApprovalRecordView, DaemonError> {
+    use automonique_protocol::primitives::EpochMillis;
+
+    ApprovalRecordView::new(ApprovalRecordParts {
+        entry_id: checked_row_id(entry.entry_id)?,
+        approval_key: ApprovalKey::new(&entry.approval_key)
+            .map_err(|_| DaemonError::ApprovalLedgerFailed("approval_key_ungrammatical"))?,
+        subject: ApprovalSubject::new(&entry.subject)
+            .map_err(|_| DaemonError::ApprovalLedgerFailed("subject_ungrammatical"))?,
+        decision: approval_decision(entry.decision),
+        decider: Decider::new(&entry.decider)
+            .map_err(|_| DaemonError::ApprovalLedgerFailed("decider_ungrammatical"))?,
+        decided_at: EpochMillis::from_millis(entry.decided_at_ms),
+        revision: entry.revision,
+    })
+    .map_err(approval_refused)
+}
+
+/// Project one bounded ledger page onto the wire.
+///
+/// `next_cursor` is set only when the ledger saw a further *matching* row, so a
+/// page shortened by a subject filter still reports itself complete only when
+/// nothing matching remains.
+fn approval_page(
+    page: &automonique_store::approval_ledger::ApprovalPage,
+) -> Result<ApprovalListPage, DaemonError> {
+    let mut entries = Vec::with_capacity(page.entries.len());
+    for entry in &page.entries {
+        entries.push(approval_record(entry)?);
+    }
+    let continuation = match page.next_cursor {
+        Some(next) => ApprovalContinuation::More(ApprovalCursor::new(next)),
+        None => ApprovalContinuation::Complete,
+    };
+    ApprovalListPage::new(entries, continuation).map_err(approval_refused)
+}
+
+/// Answer one approval-ledger failure to the client, or report it as ours.
+///
+/// The same split the automation registry gets: a malformed field, a lost cursor
+/// and a full ledger are the operator's to fix and are answered with one closed
+/// word carrying no echo of what they sent. Corruption, a schema mismatch, an
+/// unsafe path and storage failure are *ours* — they say the daemon's own
+/// durable state is unsound — and presenting them as a refusal would blame an
+/// operator for our broken database.
+///
+/// [`ApprovalLedgerError::Conflict`] never reaches here: it is the `conflict`
+/// answer, handled at the call site before this function is asked.
+fn refuse_approval(
+    request_id: &RequestId,
+    error: &ApprovalLedgerError,
+) -> Result<ApprovalResponse, DaemonError> {
+    let refusal = match error {
+        ApprovalLedgerError::InvalidField(_) => ApprovalRefusal::InvalidField,
+        ApprovalLedgerError::CursorOutOfRange { .. } => ApprovalRefusal::CursorOutOfRange,
+        ApprovalLedgerError::LedgerFull { .. } => ApprovalRefusal::LedgerFull,
+        ApprovalLedgerError::Conflict { .. }
+        | ApprovalLedgerError::InsecurePath(_)
+        | ApprovalLedgerError::SchemaVersion { .. }
+        | ApprovalLedgerError::Corrupt(_)
+        | ApprovalLedgerError::Io(_)
+        | ApprovalLedgerError::Sqlite(_) => {
+            return Err(DaemonError::ApprovalLedgerFailed(error.category()));
+        }
+    };
+    Ok(ApprovalResponse::Refused {
         request_id: request_id.clone(),
         refusal,
     })

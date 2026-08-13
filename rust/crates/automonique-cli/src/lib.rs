@@ -11,6 +11,7 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 mod admin_client;
+mod approval;
 mod attempt;
 mod automation;
 mod diagnostics;
@@ -41,7 +42,7 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
-const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique automation register <automation-id> <actor>\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique shutdown\n";
+const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique automation register <automation-id> <actor>\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique shutdown\n";
 
 #[derive(Clone)]
 enum Command {
@@ -83,6 +84,7 @@ enum Command {
     Attempt(attempt::Operation),
     Runs(runs::Operation),
     Automation(automation::Operation),
+    Approval(approval::Operation),
 }
 
 /// Execute one closed product command. Arguments exclude the program name.
@@ -268,6 +270,45 @@ where
                 }
             }
         }
+        // `approval` is variadic for the reason `runs` and `automation` are:
+        // both listings take optional paging flags while `record` and `detail`
+        // are positional with different arities. The remaining words are
+        // collected here and matched by the verb they belong to, so a wrong
+        // arity is a usage refusal rather than a positional match that happened
+        // to bind.
+        (Some(command), Some(action), second, third) if command == "approval" => {
+            let words: Vec<OsString> = second
+                .into_iter()
+                .chain(third)
+                .chain(arguments.by_ref())
+                .collect();
+            match (action.to_str(), words.as_slice()) {
+                (Some("list"), _) => Command::Approval(approval::Operation::List { flags: words }),
+                (Some("detail"), [approval_key]) => {
+                    Command::Approval(approval::Operation::Detail {
+                        approval_key: approval_key.clone(),
+                    })
+                }
+                (Some("by-subject"), [subject, flags @ ..]) => {
+                    Command::Approval(approval::Operation::BySubject {
+                        subject: subject.clone(),
+                        flags: flags.to_vec(),
+                    })
+                }
+                (Some("record"), [approval_key, subject, decision, decider]) => {
+                    Command::Approval(approval::Operation::Record {
+                        approval_key: approval_key.clone(),
+                        subject: subject.clone(),
+                        decision: decision.clone(),
+                        decider: decider.clone(),
+                    })
+                }
+                _ => {
+                    let _ = stderr.write_all(USAGE.as_bytes());
+                    return 2;
+                }
+            }
+        }
         (Some(command), Some(operation), Some(socket_path), None)
             if command == "attempt" && operation == "heartbeat" =>
         {
@@ -387,6 +428,9 @@ where
         }
         Command::Automation(operation) => {
             return automation::run(&operation, runtime.as_deref(), &mut stdout, &mut stderr);
+        }
+        Command::Approval(operation) => {
+            return approval::run(&operation, runtime.as_deref(), &mut stdout, &mut stderr);
         }
         Command::Shutdown => {
             return admin_shutdown(runtime.as_deref(), &mut stdout, &mut stderr);

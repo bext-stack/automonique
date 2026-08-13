@@ -6,6 +6,7 @@
 //! credential, or provider operations.
 
 pub mod admin;
+pub mod approval_api;
 pub mod automation;
 pub mod automation_api;
 pub mod codec;
