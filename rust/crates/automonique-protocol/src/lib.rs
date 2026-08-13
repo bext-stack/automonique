@@ -9,6 +9,7 @@ pub mod admin;
 pub mod automation;
 pub mod codec;
 pub mod codegen;
+pub mod command_registry;
 pub mod compat;
 pub mod connector;
 pub mod context;

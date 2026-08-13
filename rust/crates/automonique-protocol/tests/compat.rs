@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! R1-17 verification contract.
+//! R1-17 verification contract, and the version-compatibility matrix.
 //!
-//! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-17.md`.
+//! Each module up to `identifier_classes` corresponds to one row of the check
+//! table in `plan/contracts/R1-17.md`. The modules after it cover the
+//! compatibility ranges: the range invariants, the verdict bands, the
+//! cross-checks against the constants this crate can see, and the manifest a
+//! crate this one cannot depend on would pin.
 
 use std::path::PathBuf;
 
@@ -504,6 +507,564 @@ mod identifier_classes {
         for class in IdentifierClass::ALL {
             let declared = NameEntry::new("NAME", class, "owner", "durable:x").expect("valid");
             assert_eq!(declared.class(), class);
+        }
+    }
+}
+
+/// The version half of the module: ranges, verdicts and the shipped matrix.
+mod versions {
+    use automonique_protocol::codec::MajorVersion;
+    use automonique_protocol::compat::{
+        COMPATIBILITY_MATRIX_SCHEMA_V1, CompatError, CompatVerdict, CompatibilityMatrix,
+        CompatibilityRange, Component, ComponentVersion, RefusalReason, VersionAuthority,
+        matrix_manifest, shipped_matrix,
+    };
+
+    fn version(value: u32) -> MajorVersion {
+        MajorVersion::new(value).expect("a nonzero version")
+    }
+
+    /// The components whose live constant lives in a crate this one cannot
+    /// depend on. Restated here rather than derived, so adding a foreign
+    /// component without acknowledging the gap fails this file.
+    const KNOWN_FOREIGN: [Component; 7] = [
+        Component::StoreSchema,
+        Component::CancelLedgerSchema,
+        Component::GenerationAuditSchema,
+        Component::ProviderJournalSchema,
+        Component::RunSubmissionsSchema,
+        Component::SlackIngressSchema,
+        Component::RunSpecDocument,
+    ];
+
+    mod range_invariants {
+        use super::*;
+
+        #[test]
+        fn a_minimum_above_the_current_version_is_refused() {
+            assert_eq!(
+                CompatibilityRange::new(Component::StoreSchema, 7, 6).expect_err("inverted"),
+                CompatError::InvertedRange {
+                    component: Component::StoreSchema,
+                    min_supported: 7,
+                    current: 6,
+                }
+            );
+            // The message names both bounds, because an operator has to see
+            // which of the two is wrong.
+            let rendered = CompatibilityRange::new(Component::StoreSchema, 7, 6)
+                .expect_err("inverted")
+                .to_string();
+            assert!(rendered.contains('7'), "{rendered}");
+            assert!(rendered.contains('6'), "{rendered}");
+        }
+
+        #[test]
+        fn a_zero_bound_is_refused_naming_which_bound() {
+            assert_eq!(
+                CompatibilityRange::new(Component::AdminProtocol, 0, 1).expect_err("zero min"),
+                CompatError::ZeroVersion {
+                    component: Component::AdminProtocol,
+                    bound: "min_supported",
+                }
+            );
+            assert_eq!(
+                CompatibilityRange::new(Component::AdminProtocol, 1, 0).expect_err("zero current"),
+                CompatError::ZeroVersion {
+                    component: Component::AdminProtocol,
+                    bound: "current",
+                }
+            );
+            assert_eq!(
+                ComponentVersion::offered(Component::AdminProtocol, 0)
+                    .expect_err("zero offered")
+                    .category(),
+                "zero_version"
+            );
+        }
+
+        #[test]
+        fn every_component_in_the_vocabulary_starts_at_one() {
+            // Zero is refused because no component has ever had a version zero.
+            // If one ever did, this assertion is what would have to change
+            // first.
+            let matrix = shipped_matrix();
+            for component in Component::ALL {
+                assert_eq!(
+                    matrix.range(component).min_supported().get(),
+                    1,
+                    "{component} claims a minimum other than 1"
+                );
+            }
+        }
+
+        #[test]
+        fn a_single_version_range_is_representable_and_an_empty_one_is_not() {
+            let exact = CompatibilityRange::new(Component::AdminProtocol, 1, 1).expect("valid");
+            assert_eq!(exact.min_supported(), exact.current());
+            // Both bounds are inclusive and at least one, so there is no
+            // construction producing a range that admits nothing.
+            assert!(exact.assess(version(1)).may_mutate());
+        }
+    }
+
+    mod verdict_bands {
+        use super::*;
+
+        #[test]
+        fn a_version_inside_the_range_is_compatible_and_may_mutate() {
+            let range = CompatibilityRange::new(Component::StoreSchema, 1, 6).expect("valid");
+            for offered in 1..=6 {
+                let verdict = range.assess(version(offered));
+                assert_eq!(
+                    verdict.category(),
+                    "compatible",
+                    "version {offered} inside 1..=6 was not compatible"
+                );
+                assert!(verdict.may_read());
+                assert!(verdict.may_mutate());
+                assert_eq!(verdict.offered().version().get(), offered);
+                assert_eq!(verdict.offered().component(), Component::StoreSchema);
+            }
+        }
+
+        /// The adjacent band is exactly one release above `current`: a peer
+        /// produced by an N -> N+1 rolling upgrade. The requirement tolerates
+        /// "adjacent releases" and nothing wider.
+        #[test]
+        fn one_release_above_the_current_version_is_read_only_with_an_upgrade_note() {
+            let range = CompatibilityRange::new(Component::StoreSchema, 1, 6).expect("valid");
+            let CompatVerdict::ReadOnlyCompatible { upgrade_required } = range.assess(version(7))
+            else {
+                panic!("version 7 against current 6 is the adjacent band");
+            };
+            assert_eq!(upgrade_required.upgrade_to().get(), 7);
+            assert_eq!(upgrade_required.supported().min().get(), 1);
+            assert_eq!(upgrade_required.supported().max().get(), 6);
+
+            // The note names both versions, so a peer is told what it offered
+            // and what this build has.
+            let note = upgrade_required.note();
+            assert!(note.contains("store_schema"), "{note}");
+            assert!(note.contains('7'), "{note}");
+            assert!(note.contains("1..=6"), "{note}");
+
+            let verdict = range.assess(version(7));
+            assert!(verdict.may_read(), "an adjacent peer is still readable");
+            assert!(
+                !verdict.may_mutate(),
+                "an adjacent peer must not mutate under a dialect this build does not define"
+            );
+        }
+
+        #[test]
+        fn a_version_below_the_minimum_is_incompatible_naming_both_versions() {
+            let range = CompatibilityRange::new(Component::StoreSchema, 3, 6).expect("valid");
+            let CompatVerdict::Incompatible { refusal } = range.assess(version(2)) else {
+                panic!("version 2 is below the minimum of 3");
+            };
+            assert_eq!(refusal.reason(), RefusalReason::BelowMinimumSupported);
+            assert_eq!(refusal.category(), "below_minimum_supported");
+
+            let note = refusal.note();
+            assert!(note.contains("store_schema"), "{note}");
+            assert!(note.contains('2'), "{note}");
+            assert!(note.contains("3..=6"), "{note}");
+            // The peer is the side that has to move here, not this build.
+            assert!(note.contains("Upgrade the peer"), "{note}");
+
+            assert!(
+                !range.assess(version(2)).may_read(),
+                "the decoders for a retired dialect are gone; offering reads would be a \
+                 claim this build cannot honour"
+            );
+            assert!(!range.assess(version(2)).may_mutate());
+        }
+
+        /// Two releases ahead is not adjacent, and nothing in the requirement
+        /// claims decode tolerance across it.
+        #[test]
+        fn two_releases_above_the_current_version_is_incompatible() {
+            let range = CompatibilityRange::new(Component::StoreSchema, 1, 6).expect("valid");
+            let CompatVerdict::Incompatible { refusal } = range.assess(version(8)) else {
+                panic!("version 8 against current 6 is two releases away");
+            };
+            assert_eq!(refusal.reason(), RefusalReason::BeyondAdjacentRelease);
+            let note = refusal.note();
+            assert!(note.contains('8'), "{note}");
+            assert!(note.contains("1..=6"), "{note}");
+            // Here it is this build that has to move.
+            assert!(note.contains("upgrade this build"), "{note}");
+            assert!(!range.assess(version(8)).may_read());
+        }
+
+        /// The whole band structure in one sweep, so a swapped or widened band
+        /// cannot hide in the gap between the cases above.
+        #[test]
+        fn the_bands_partition_every_version_around_the_range() {
+            let range = CompatibilityRange::new(Component::StoreSchema, 3, 6).expect("valid");
+            let observed: Vec<(u32, &str)> = (1..=10)
+                .map(|offered| (offered, range.assess(version(offered)).category()))
+                .collect();
+            assert_eq!(
+                observed,
+                vec![
+                    (1, "incompatible"),
+                    (2, "incompatible"),
+                    (3, "compatible"),
+                    (4, "compatible"),
+                    (5, "compatible"),
+                    (6, "compatible"),
+                    (7, "read_only_compatible"),
+                    (8, "incompatible"),
+                    (9, "incompatible"),
+                    (10, "incompatible"),
+                ]
+            );
+        }
+
+        /// No verdict admits a write outside the supported range, for any
+        /// component and any offered version near it.
+        #[test]
+        fn mutation_is_reachable_only_from_inside_the_range() {
+            let matrix = shipped_matrix();
+            for component in Component::ALL {
+                let range = matrix.range(component);
+                let ceiling = range.current().get() + 4;
+                for offered in 1..=ceiling {
+                    let verdict = matrix.assess(component, version(offered));
+                    let inside =
+                        offered >= range.min_supported().get() && offered <= range.current().get();
+                    assert_eq!(
+                        verdict.may_mutate(),
+                        inside,
+                        "{component} at version {offered} disagreed about mutation"
+                    );
+                    assert!(
+                        !verdict.may_mutate() || verdict.may_read(),
+                        "{component} at version {offered} may mutate but not read"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn every_refusal_reason_has_a_distinct_spelling() {
+            let mut spellings: Vec<&str> = RefusalReason::ALL
+                .iter()
+                .map(|reason| reason.as_str())
+                .collect();
+            let total = spellings.len();
+            spellings.sort_unstable();
+            spellings.dedup();
+            assert_eq!(spellings.len(), total);
+        }
+    }
+
+    mod matrix_shape {
+        use super::*;
+
+        #[test]
+        fn every_component_has_exactly_one_row_at_its_own_index() {
+            let matrix = shipped_matrix();
+            assert_eq!(matrix.rows().len(), Component::COUNT);
+            for component in Component::ALL {
+                assert_eq!(
+                    Component::ALL[component.index()],
+                    component,
+                    "{component} does not sit at its own index"
+                );
+                assert_eq!(matrix.rows()[component.index()].component(), component);
+                assert_eq!(matrix.range(component).component(), component);
+            }
+        }
+
+        #[test]
+        fn every_component_spelling_is_distinct() {
+            let mut spellings: Vec<&str> = Component::ALL
+                .iter()
+                .map(|component| component.as_str())
+                .collect();
+            let total = spellings.len();
+            assert_eq!(total, Component::COUNT);
+            spellings.sort_unstable();
+            spellings.dedup();
+            assert_eq!(spellings.len(), total, "two components share a spelling");
+        }
+
+        #[test]
+        fn every_component_names_the_symbol_its_version_comes_from() {
+            for component in Component::ALL {
+                let authority = component.authority();
+                assert!(
+                    !authority.symbol().is_empty(),
+                    "{component} names no authoritative symbol"
+                );
+                assert!(
+                    authority.symbol().contains("::"),
+                    "{component} names {} , which is not a symbol path",
+                    authority.symbol()
+                );
+            }
+        }
+    }
+
+    /// The claims this crate can check against the live constant.
+    mod local_cross_checks {
+        use automonique_protocol::admin::{AdminError, AdminRequest};
+        use automonique_protocol::codec::{
+            CodecError, Envelope, MessageKind, ProtocolName, RequestId,
+        };
+        use automonique_protocol::codegen::maintained_modules;
+        use automonique_protocol::release::{
+            MANIFEST_SCHEMA_REVISION, MAX_SUPPORTED_MANIFEST_SCHEMA,
+        };
+        use automonique_protocol::wire::{JsonValue, Message};
+
+        use super::*;
+
+        /// A canonical admin status payload at an arbitrary major version.
+        fn admin_payload(major: u32) -> Vec<u8> {
+            Message::new(
+                Envelope::new(
+                    ProtocolName::new(automonique_protocol::admin::ADMIN_PROTOCOL)
+                        .expect("the shipped protocol name"),
+                    version(major),
+                    RequestId::new("compat-matrix").expect("a valid request id"),
+                    MessageKind::new("status").expect("a defined kind"),
+                ),
+                JsonValue::Object(Vec::new()),
+            )
+            .to_canonical_bytes()
+        }
+
+        /// The admin range is not a public constant, so it is checked through
+        /// the behaviour it produces: the refusal carries the live minimum and
+        /// maximum, and those are what the matrix has to agree with.
+        #[test]
+        fn the_admin_protocol_row_matches_the_range_the_socket_actually_admits() {
+            let declared = shipped_matrix().range(Component::AdminProtocol);
+            let beyond = declared.current().get() + 1;
+            let error = AdminRequest::from_canonical_bytes(&admin_payload(beyond))
+                .expect_err("a version above the admitted range");
+            assert_eq!(
+                error,
+                AdminError::Codec(CodecError::UnsupportedVersion {
+                    supported_min: declared.min_supported().get(),
+                    supported_max: declared.current().get(),
+                    offered: beyond,
+                }),
+                "the matrix row for admin_protocol drifted from admin::supported_protocol"
+            );
+
+            // And the version the matrix calls current is not refused on the
+            // version axis, so the row cannot be right by naming a range the
+            // socket does not admit at all.
+            let accepted =
+                AdminRequest::from_canonical_bytes(&admin_payload(declared.current().get()));
+            assert!(
+                !matches!(
+                    accepted,
+                    Err(AdminError::Codec(CodecError::UnsupportedVersion { .. }))
+                ),
+                "the socket refused the version the matrix calls current"
+            );
+        }
+
+        #[test]
+        fn the_release_manifest_row_matches_the_shipped_constants() {
+            let declared = shipped_matrix().range(Component::ReleaseManifestSchema);
+            assert_eq!(
+                declared.current().get(),
+                MANIFEST_SCHEMA_REVISION,
+                "the matrix row for release_manifest_schema drifted from \
+                 MANIFEST_SCHEMA_REVISION"
+            );
+            assert_eq!(
+                declared.current().get(),
+                MAX_SUPPORTED_MANIFEST_SCHEMA,
+                "the matrix names a current revision the build cannot interpret"
+            );
+        }
+
+        #[test]
+        fn the_typescript_sdk_row_matches_the_generated_command_surface() {
+            let declared = shipped_matrix().range(Component::TypeScriptSdkSurface);
+            let surfaces: Vec<u32> = maintained_modules()
+                .into_iter()
+                .filter_map(|module| module.command_surface)
+                .map(|surface| surface.version)
+                .collect();
+            assert!(
+                !surfaces.is_empty(),
+                "no generated command surface to check the row against"
+            );
+            for offered in surfaces {
+                assert_eq!(
+                    offered,
+                    declared.current().get(),
+                    "the matrix row for typescript_sdk_surface drifted from the version a \
+                     generated command surface speaks"
+                );
+            }
+        }
+
+        /// Every row the matrix calls locally checkable is checked by one of
+        /// the tests above, and every row it calls foreign is not. The lists
+        /// are restated rather than derived, so a new component has to declare
+        /// which side it falls on.
+        #[test]
+        fn the_checkable_and_foreign_rows_are_exactly_what_is_declared() {
+            let checked_above = [
+                Component::AdminProtocol,
+                Component::ReleaseManifestSchema,
+                Component::TypeScriptSdkSurface,
+            ];
+            let (local, foreign): (Vec<Component>, Vec<Component>) = Component::ALL
+                .into_iter()
+                .partition(|component| component.authority().is_checkable_here());
+            assert_eq!(local, checked_above.to_vec());
+            assert_eq!(foreign, KNOWN_FOREIGN.to_vec());
+            assert_eq!(local.len() + foreign.len(), Component::COUNT);
+
+            for component in foreign {
+                assert!(
+                    matches!(component.authority(), VersionAuthority::Foreign { .. }),
+                    "{component} is not marked foreign"
+                );
+                assert_eq!(component.authority().as_str(), "foreign");
+            }
+        }
+    }
+
+    mod manifest {
+        use super::*;
+
+        #[test]
+        fn the_manifest_is_byte_identical_across_runs() {
+            let first = matrix_manifest();
+            for _ in 0..8 {
+                assert_eq!(matrix_manifest(), first);
+            }
+            // And a separately built matrix renders the same bytes, so the
+            // rendering does not depend on which instance produced it.
+            assert_eq!(shipped_matrix().manifest(), first);
+        }
+
+        #[test]
+        fn the_manifest_names_its_schema_and_every_component_once() {
+            let rendered = matrix_manifest();
+            let mut lines = rendered.lines();
+            assert_eq!(lines.next(), Some(COMPATIBILITY_MATRIX_SCHEMA_V1));
+            let rows: Vec<&str> = lines.collect();
+            assert_eq!(rows.len(), Component::COUNT);
+
+            let matrix = shipped_matrix();
+            for component in Component::ALL {
+                let range = matrix.range(component);
+                let authority = component.authority();
+                let expected = format!(
+                    "{} {}..={} {} {}",
+                    component,
+                    range.min_supported(),
+                    range.current(),
+                    authority.as_str(),
+                    authority.symbol()
+                );
+                assert_eq!(
+                    rows.iter().filter(|row| **row == expected).count(),
+                    1,
+                    "{component} has no line reading {expected:?} in:\n{rendered}"
+                );
+            }
+        }
+
+        /// Sorted by component spelling rather than declaration order, so
+        /// reordering the enum cannot move a pinned line.
+        #[test]
+        fn the_manifest_rows_are_sorted() {
+            let rendered = matrix_manifest();
+            let rows: Vec<&str> = rendered.lines().skip(1).collect();
+            let mut sorted = rows.clone();
+            sorted.sort_unstable();
+            assert_eq!(rows, sorted);
+        }
+
+        /// The whole point of the manifest: a crate that owns a foreign
+        /// constant can read its expected value out of this text without
+        /// depending on the protocol crate's types. This is the shape of the
+        /// check that does not exist yet.
+        #[test]
+        fn a_foreign_row_can_be_read_back_out_of_the_manifest_text() {
+            let rendered = matrix_manifest();
+            for component in KNOWN_FOREIGN {
+                let prefix = format!("{component} ");
+                let row = rendered
+                    .lines()
+                    .find(|line| line.starts_with(&prefix))
+                    .unwrap_or_else(|| panic!("{component} has no manifest row"));
+                let mut fields = row.split(' ');
+                assert_eq!(fields.next(), Some(component.as_str()));
+                let bounds = fields.next().expect("a bounds field");
+                let (min, current) = bounds.split_once("..=").expect("an inclusive range");
+                let declared = shipped_matrix().range(component);
+                assert_eq!(
+                    min.parse::<u32>().expect("a numeric minimum"),
+                    declared.min_supported().get()
+                );
+                assert_eq!(
+                    current.parse::<u32>().expect("a numeric current"),
+                    declared.current().get()
+                );
+                assert_eq!(fields.next(), Some("foreign"));
+                assert_eq!(fields.next(), Some(component.authority().symbol()));
+                assert_eq!(fields.next(), None, "the row carries an unexplained field");
+            }
+        }
+
+        /// The values the manifest asserts for the foreign crates, restated so
+        /// that changing one in `declared_bounds` without changing the constant
+        /// it names is a visible edit rather than a silent one.
+        #[test]
+        fn the_asserted_foreign_versions_are_the_ones_this_wave_recorded() {
+            let matrix = shipped_matrix();
+            let recorded = [
+                (Component::StoreSchema, 1, 6),
+                (Component::CancelLedgerSchema, 1, 1),
+                (Component::GenerationAuditSchema, 1, 1),
+                (Component::ProviderJournalSchema, 1, 1),
+                (Component::RunSubmissionsSchema, 1, 1),
+                (Component::SlackIngressSchema, 1, 1),
+                (Component::RunSpecDocument, 1, 1),
+            ];
+            assert_eq!(recorded.len(), KNOWN_FOREIGN.len());
+            for (component, min, current) in recorded {
+                let declared = matrix.range(component);
+                assert_eq!(
+                    (declared.min_supported().get(), declared.current().get()),
+                    (min, current),
+                    "{component} drifted from the value recorded against {}",
+                    component.authority().symbol()
+                );
+            }
+        }
+    }
+
+    /// The matrix is a description; nothing enforces it yet.
+    mod honesty {
+        use super::*;
+
+        #[test]
+        fn the_matrix_is_a_value_and_carries_no_enforcement_hook() {
+            // `assess` answers a question. It returns a verdict and takes
+            // nothing it could act on: no connection, no store, no boundary.
+            // The only way this becomes enforcement is a later slice calling
+            // it, which is what makes the claim checkable rather than a
+            // promise.
+            let matrix: CompatibilityMatrix = shipped_matrix();
+            let verdict = matrix.assess(Component::AdminProtocol, version(1));
+            assert!(verdict.may_mutate());
+            assert_eq!(verdict.offered().component(), Component::AdminProtocol);
         }
     }
 }

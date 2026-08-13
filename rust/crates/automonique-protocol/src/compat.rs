@@ -11,10 +11,18 @@
 //! identity is fixed at construction and survives a canonical rename, which is
 //! what makes a compatibility alias a forwarding boundary rather than a
 //! migration.
+//!
+//! The module answers a second compatibility question, about versions rather
+//! than spellings: which version of each versioned surface this tree admits.
+//! [`shipped_matrix`] declares one [`CompatibilityRange`] per [`Component`],
+//! and [`CompatibilityMatrix::assess`] turns an offered version into a typed
+//! [`CompatVerdict`]. See that type for what the three verdicts mean and
+//! [`shipped_matrix`] for what the matrix does and does not prove.
 
 use core::fmt;
 use std::error::Error;
 
+use crate::codec::{MajorVersion, VersionRange};
 use crate::primitives::ValueError;
 
 mod generated;
@@ -117,6 +125,27 @@ pub enum CompatError {
         /// Violation class.
         error: ValueError,
     },
+    /// A component's declared range ended before it began.
+    InvertedRange {
+        /// The component whose declaration is wrong.
+        component: Component,
+        /// The declared lowest admitted version.
+        min_supported: u32,
+        /// The declared live version.
+        current: u32,
+    },
+    /// A version was zero.
+    ///
+    /// Every component in the vocabulary starts at one, so zero is not a lower
+    /// bound this build could ever have supported. On the store's sibling
+    /// databases a `user_version` of zero means the file has no schema yet,
+    /// which is a different thing from a version and is not representable here.
+    ZeroVersion {
+        /// The component whose version was zero.
+        component: Component,
+        /// Which bound was zero.
+        bound: &'static str,
+    },
 }
 
 impl CompatError {
@@ -129,6 +158,8 @@ impl CompatError {
             Self::DuplicateSpelling { .. } => "duplicate_spelling",
             Self::CanonicalAndAliasBothSet { .. } => "canonical_and_alias_both_set",
             Self::Field { .. } => "field_invalid",
+            Self::InvertedRange { .. } => "inverted_range",
+            Self::ZeroVersion { .. } => "zero_version",
         }
     }
 }
@@ -162,6 +193,19 @@ impl fmt::Display for CompatError {
                  {alias_value}; unset one rather than relying on precedence"
             ),
             Self::Field { field, error } => write!(formatter, "field {field}: {error}"),
+            Self::InvertedRange {
+                component,
+                min_supported,
+                current,
+            } => write!(
+                formatter,
+                "{component} declares min_supported {min_supported} above its current \
+                 version {current}"
+            ),
+            Self::ZeroVersion { component, bound } => write!(
+                formatter,
+                "{component} declares a zero {bound}; the component starts at version 1"
+            ),
         }
     }
 }
@@ -986,4 +1030,741 @@ fn bounded(value: &str, field: &'static str) -> Result<(), CompatError> {
         Some(error) => Err(CompatError::Field { field, error }),
         None => Ok(()),
     }
+}
+
+/// Stable schema identifier for the rendered compatibility matrix.
+pub const COMPATIBILITY_MATRIX_SCHEMA_V1: &str = "automonique.compat/v1";
+
+/// One versioned surface this product admits a version of.
+///
+/// The vocabulary is closed and names only surfaces that carry a real version
+/// number today. It is deliberately not a list of everything that might one day
+/// be versioned: a component with no live constant behind it would make the
+/// matrix a wish rather than a description.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Component {
+    /// The `automonique.admin` control socket wire protocol.
+    AdminProtocol,
+    /// The release manifest document schema.
+    ReleaseManifestSchema,
+    /// The generated TypeScript SDK command surface.
+    TypeScriptSdkSurface,
+    /// The primary store's SQLite schema.
+    StoreSchema,
+    /// The cancel ledger sibling database schema.
+    CancelLedgerSchema,
+    /// The generation audit sibling database schema.
+    GenerationAuditSchema,
+    /// The provider journal sibling database schema.
+    ProviderJournalSchema,
+    /// The run submissions sibling database schema.
+    RunSubmissionsSchema,
+    /// The Slack ingress sibling database schema.
+    SlackIngressSchema,
+    /// The runner's `RunSpec` document.
+    RunSpecDocument,
+}
+
+impl Component {
+    /// Every component, for coverage checks.
+    pub const ALL: [Self; 10] = [
+        Self::AdminProtocol,
+        Self::ReleaseManifestSchema,
+        Self::TypeScriptSdkSurface,
+        Self::StoreSchema,
+        Self::CancelLedgerSchema,
+        Self::GenerationAuditSchema,
+        Self::ProviderJournalSchema,
+        Self::RunSubmissionsSchema,
+        Self::SlackIngressSchema,
+        Self::RunSpecDocument,
+    ];
+
+    /// How many components the vocabulary names.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Stable lowercase wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AdminProtocol => "admin_protocol",
+            Self::ReleaseManifestSchema => "release_manifest_schema",
+            Self::TypeScriptSdkSurface => "typescript_sdk_surface",
+            Self::StoreSchema => "store_schema",
+            Self::CancelLedgerSchema => "cancel_ledger_schema",
+            Self::GenerationAuditSchema => "generation_audit_schema",
+            Self::ProviderJournalSchema => "provider_journal_schema",
+            Self::RunSubmissionsSchema => "run_submissions_schema",
+            Self::SlackIngressSchema => "slack_ingress_schema",
+            Self::RunSpecDocument => "run_spec_document",
+        }
+    }
+
+    /// Position in [`Component::ALL`], which is how a matrix indexes its rows.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::AdminProtocol => 0,
+            Self::ReleaseManifestSchema => 1,
+            Self::TypeScriptSdkSurface => 2,
+            Self::StoreSchema => 3,
+            Self::CancelLedgerSchema => 4,
+            Self::GenerationAuditSchema => 5,
+            Self::ProviderJournalSchema => 6,
+            Self::RunSubmissionsSchema => 7,
+            Self::SlackIngressSchema => 8,
+            Self::RunSpecDocument => 9,
+        }
+    }
+
+    /// Where the version this component's range claims actually lives.
+    #[must_use]
+    pub const fn authority(self) -> VersionAuthority {
+        match self {
+            // Private, but its range is observable: an admin payload offering
+            // an unsupported version is refused with `CodecError::
+            // UnsupportedVersion`, which carries the live minimum and maximum.
+            Self::AdminProtocol => VersionAuthority::Local {
+                symbol: "automonique_protocol::admin::supported_protocol",
+            },
+            Self::ReleaseManifestSchema => VersionAuthority::Local {
+                symbol: "automonique_protocol::release::MANIFEST_SCHEMA_REVISION",
+            },
+            Self::TypeScriptSdkSurface => VersionAuthority::Local {
+                symbol: "automonique_protocol::codegen::maintained_modules",
+            },
+            Self::StoreSchema => VersionAuthority::Foreign {
+                symbol: "automonique_store::SCHEMA_VERSION",
+            },
+            Self::CancelLedgerSchema => VersionAuthority::Foreign {
+                symbol: "automonique_store::cancel_ledger::CANCEL_LEDGER_SCHEMA_VERSION",
+            },
+            Self::GenerationAuditSchema => VersionAuthority::Foreign {
+                symbol: "automonique_store::generation_audit::GENERATION_AUDIT_SCHEMA_VERSION",
+            },
+            Self::ProviderJournalSchema => VersionAuthority::Foreign {
+                symbol: "automonique_store::provider_journal::PROVIDER_JOURNAL_SCHEMA_VERSION",
+            },
+            Self::RunSubmissionsSchema => VersionAuthority::Foreign {
+                symbol: "automonique_store::run_submissions::RUN_SUBMISSIONS_SCHEMA_VERSION",
+            },
+            Self::SlackIngressSchema => VersionAuthority::Foreign {
+                symbol: "automonique_store::slack_ingress::SLACK_INGRESS_SCHEMA_VERSION",
+            },
+            Self::RunSpecDocument => VersionAuthority::Foreign {
+                symbol: "automonique_runner::spec::RunSpec::protocol_version",
+            },
+        }
+    }
+
+    /// The range this tree declares for the component.
+    ///
+    /// An exhaustive match, so adding a component is a compile error until its
+    /// bounds are declared rather than a row that quietly defaults to `1..=1`.
+    const fn declared_bounds(self) -> (u32, u32) {
+        match self {
+            // Exactly the first version: `supported_protocol` declares
+            // `VersionRange::new(MajorVersion::FIRST, MajorVersion::FIRST)`.
+            Self::AdminProtocol => (1, 1),
+            // `MAX_SUPPORTED_MANIFEST_SCHEMA == MANIFEST_SCHEMA_REVISION == 1`.
+            Self::ReleaseManifestSchema => (1, 1),
+            // The generated admin command surface speaks `MajorVersion::FIRST`
+            // and admits no other.
+            Self::TypeScriptSdkSurface => (1, 1),
+            // `SCHEMA_VERSION` is 6, and the numbered migrations run an
+            // unbroken v1 -> v2 -> ... -> v6 chain, so a v1 file still opens.
+            Self::StoreSchema => (1, 6),
+            // Each sibling database is at its first schema and has no migration
+            // chain yet, so its only supported version is the one it creates.
+            Self::CancelLedgerSchema
+            | Self::GenerationAuditSchema
+            | Self::ProviderJournalSchema
+            | Self::RunSubmissionsSchema
+            | Self::SlackIngressSchema => (1, 1),
+            // `RunSpec` admission refuses any `protocol_version` but 1.
+            Self::RunSpecDocument => (1, 1),
+        }
+    }
+}
+
+impl fmt::Display for Component {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Where a component's live version constant lives, relative to this crate.
+///
+/// The distinction is the honest part of the matrix. A local claim is checkable
+/// here; a foreign one is an assertion this crate cannot verify, because
+/// `automonique-protocol` is dependency-free by design and cannot import the
+/// store or the runner to look.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum VersionAuthority {
+    /// The authority is visible from this crate, so a test here compares
+    /// against it directly.
+    Local {
+        /// Path of the authoritative symbol.
+        symbol: &'static str,
+    },
+    /// The authority lives in a crate this one cannot depend on.
+    ///
+    /// The matrix carries the expected value and names the symbol; a test in
+    /// the owning crate pinning [`matrix_manifest`] is what would close the
+    /// loop, and none exists yet.
+    Foreign {
+        /// Path of the authoritative symbol.
+        symbol: &'static str,
+    },
+}
+
+impl VersionAuthority {
+    /// Stable lowercase wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local { .. } => "local",
+            Self::Foreign { .. } => "foreign",
+        }
+    }
+
+    /// The authoritative symbol's path.
+    #[must_use]
+    pub const fn symbol(self) -> &'static str {
+        match self {
+            Self::Local { symbol } | Self::Foreign { symbol } => symbol,
+        }
+    }
+
+    /// Whether a test in this crate can compare the claim against the source.
+    #[must_use]
+    pub const fn is_checkable_here(self) -> bool {
+        matches!(self, Self::Local { .. })
+    }
+}
+
+/// One component at one version.
+///
+/// A version bound to the component it is a version of, so an admin protocol
+/// version cannot be passed where a store schema version belongs.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ComponentVersion {
+    component: Component,
+    version: MajorVersion,
+}
+
+impl ComponentVersion {
+    /// Name a component at a version.
+    #[must_use]
+    pub const fn new(component: Component, version: MajorVersion) -> Self {
+        Self { component, version }
+    }
+
+    /// Name a component at a version read off a wire.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompatError::ZeroVersion`] for zero, which is the only value
+    /// [`MajorVersion::new`] refuses.
+    pub fn offered(component: Component, version: u32) -> Result<Self, CompatError> {
+        Ok(Self::new(
+            component,
+            checked_version(component, version, "offered")?,
+        ))
+    }
+
+    /// The component.
+    #[must_use]
+    pub const fn component(self) -> Component {
+        self.component
+    }
+
+    /// The version.
+    #[must_use]
+    pub const fn version(self) -> MajorVersion {
+        self.version
+    }
+}
+
+impl fmt::Display for ComponentVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}@{}", self.component, self.version)
+    }
+}
+
+/// The versions of one component this tree admits.
+///
+/// The range is `[min_supported, current]`, where `current` is the live version
+/// this tree runs and is also the highest version it admits without reservation.
+/// The bounds are inclusive and both are at least one, so an empty range is
+/// unrepresentable.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CompatibilityRange {
+    component: Component,
+    supported: VersionRange,
+}
+
+impl CompatibilityRange {
+    /// Declare the range for one component.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompatError::ZeroVersion`] when either bound is zero and
+    /// [`CompatError::InvertedRange`] when `min_supported` is above `current`.
+    /// A build cannot claim to support versions below a floor it has already
+    /// passed, and there is no bound-swapping repair: an inverted declaration
+    /// is a mistake about what shipped, not a typo to fix silently.
+    pub fn new(
+        component: Component,
+        min_supported: u32,
+        current: u32,
+    ) -> Result<Self, CompatError> {
+        let min = checked_version(component, min_supported, "min_supported")?;
+        let max = checked_version(component, current, "current")?;
+        let supported = VersionRange::new(min, max).map_err(|_| CompatError::InvertedRange {
+            component,
+            min_supported,
+            current,
+        })?;
+        Ok(Self {
+            component,
+            supported,
+        })
+    }
+
+    /// The component this range describes.
+    #[must_use]
+    pub const fn component(self) -> Component {
+        self.component
+    }
+
+    /// The lowest version this tree still admits.
+    #[must_use]
+    pub const fn min_supported(self) -> MajorVersion {
+        self.supported.min()
+    }
+
+    /// The live version this tree runs.
+    #[must_use]
+    pub const fn current(self) -> MajorVersion {
+        self.supported.max()
+    }
+
+    /// The range as the crate's shared version-range value.
+    #[must_use]
+    pub const fn supported(self) -> VersionRange {
+        self.supported
+    }
+
+    /// Decide what an offered version is entitled to.
+    ///
+    /// The bands are documented on [`CompatVerdict`].
+    #[must_use]
+    pub const fn assess(self, offered: MajorVersion) -> CompatVerdict {
+        let at = ComponentVersion::new(self.component, offered);
+        if self.supported.accepts(offered) {
+            return CompatVerdict::Compatible { offered: at };
+        }
+        if offered.get() < self.supported.min().get() {
+            return CompatVerdict::Incompatible {
+                refusal: CompatRefusal {
+                    offered: at,
+                    supported: self.supported,
+                    reason: RefusalReason::BelowMinimumSupported,
+                },
+            };
+        }
+        // Above the range, so the subtraction cannot wrap. One release of
+        // distance is the whole tolerated band; see `CompatVerdict`.
+        if offered.get() - self.supported.max().get() == 1 {
+            return CompatVerdict::ReadOnlyCompatible {
+                upgrade_required: UpgradeRequirement {
+                    offered: at,
+                    supported: self.supported,
+                },
+            };
+        }
+        CompatVerdict::Incompatible {
+            refusal: CompatRefusal {
+                offered: at,
+                supported: self.supported,
+                reason: RefusalReason::BeyondAdjacentRelease,
+            },
+        }
+    }
+}
+
+impl fmt::Display for CompatibilityRange {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} {}..={}",
+            self.component,
+            self.supported.min(),
+            self.supported.max()
+        )
+    }
+}
+
+/// What an offered version is entitled to.
+///
+/// The three bands come from one sentence in
+/// `docs/product-plan/requirements/state-and-protocols.md`: "Additive fields
+/// and unknown read-only events are tolerated across adjacent releases;
+/// incompatible clients are read-only and receive an explicit upgrade
+/// requirement."
+///
+/// - Inside `[min_supported, current]`: [`CompatVerdict::Compatible`]. Nothing
+///   to reconcile.
+/// - Exactly `current + 1`: [`CompatVerdict::ReadOnlyCompatible`]. This is a
+///   peer one release ahead of this build, which is what an N -> N+1 rolling
+///   upgrade produces and the only distance the requirement calls adjacent.
+///   Reads are served, mutation is not, and the verdict carries the explicit
+///   upgrade requirement the sentence demands.
+/// - Below `min_supported`, or above `current + 1`:
+///   [`CompatVerdict::Incompatible`], carrying a refusal that names both
+///   versions and which side has to move.
+///
+/// Read-only is offered only where this build can genuinely still decode. Below
+/// `min_supported` the decoders for that dialect are gone, so offering reads
+/// would be a claim the build cannot honour; above `current + 1` nothing in the
+/// requirement claims tolerance across two generations, and inventing it is the
+/// silent downgrade the house forbids.
+///
+/// Tolerance of *additive fields* is not modelled here, because it is not a
+/// property of a range. It is a property of the decoders: `codec::ReadOnly`
+/// preserves an unknown read-only enum spelling without giving it meaning,
+/// while `codec::SecuritySensitiveEnum` refuses one. A flag on this matrix
+/// claiming "additive fields tolerated" would assert something the matrix has
+/// no way to know.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompatVerdict {
+    /// Inside the supported range.
+    Compatible {
+        /// The version that was assessed.
+        offered: ComponentVersion,
+    },
+    /// One release ahead: readable, not mutable, and told to upgrade.
+    ReadOnlyCompatible {
+        /// What has to change, naming both versions.
+        upgrade_required: UpgradeRequirement,
+    },
+    /// Outside every tolerated band.
+    Incompatible {
+        /// Why, naming both versions.
+        refusal: CompatRefusal,
+    },
+}
+
+impl CompatVerdict {
+    /// The version that was assessed.
+    #[must_use]
+    pub const fn offered(&self) -> ComponentVersion {
+        match self {
+            Self::Compatible { offered } => *offered,
+            Self::ReadOnlyCompatible { upgrade_required } => upgrade_required.offered,
+            Self::Incompatible { refusal } => refusal.offered,
+        }
+    }
+
+    /// Stable machine-readable outcome.
+    #[must_use]
+    pub const fn category(&self) -> &'static str {
+        match self {
+            Self::Compatible { .. } => "compatible",
+            Self::ReadOnlyCompatible { .. } => "read_only_compatible",
+            Self::Incompatible { .. } => "incompatible",
+        }
+    }
+
+    /// Whether reads may be served.
+    #[must_use]
+    pub const fn may_read(&self) -> bool {
+        matches!(
+            self,
+            Self::Compatible { .. } | Self::ReadOnlyCompatible { .. }
+        )
+    }
+
+    /// Whether mutations may be accepted.
+    ///
+    /// Only full compatibility grants this, so no verdict admits a write under
+    /// a dialect this build does not entirely define.
+    #[must_use]
+    pub const fn may_mutate(&self) -> bool {
+        matches!(self, Self::Compatible { .. })
+    }
+}
+
+/// The explicit upgrade requirement a read-only peer receives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UpgradeRequirement {
+    offered: ComponentVersion,
+    supported: VersionRange,
+}
+
+impl UpgradeRequirement {
+    /// The version that was assessed.
+    #[must_use]
+    pub const fn offered(self) -> ComponentVersion {
+        self.offered
+    }
+
+    /// The range this build supports.
+    #[must_use]
+    pub const fn supported(self) -> VersionRange {
+        self.supported
+    }
+
+    /// The version this build has to reach to serve the peer fully.
+    #[must_use]
+    pub const fn upgrade_to(self) -> MajorVersion {
+        self.offered.version()
+    }
+
+    /// The requirement in words, naming both versions.
+    #[must_use]
+    pub fn note(&self) -> String {
+        format!(
+            "{} offered version {}; this build supports {}..={}. Reads are served and \
+             mutations are refused until this build reaches version {}.",
+            self.offered.component(),
+            self.offered.version(),
+            self.supported.min(),
+            self.supported.max(),
+            self.upgrade_to()
+        )
+    }
+}
+
+impl fmt::Display for UpgradeRequirement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.note())
+    }
+}
+
+/// Why an offered version was refused outright.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompatRefusal {
+    offered: ComponentVersion,
+    supported: VersionRange,
+    reason: RefusalReason,
+}
+
+impl CompatRefusal {
+    /// The version that was assessed.
+    #[must_use]
+    pub const fn offered(self) -> ComponentVersion {
+        self.offered
+    }
+
+    /// The range this build supports.
+    #[must_use]
+    pub const fn supported(self) -> VersionRange {
+        self.supported
+    }
+
+    /// Which band the version fell outside.
+    #[must_use]
+    pub const fn reason(self) -> RefusalReason {
+        self.reason
+    }
+
+    /// Stable machine-readable category.
+    #[must_use]
+    pub const fn category(self) -> &'static str {
+        self.reason.as_str()
+    }
+
+    /// The refusal in words, naming both versions and which side has to move.
+    #[must_use]
+    pub fn note(&self) -> String {
+        let component = self.offered.component();
+        let offered = self.offered.version();
+        let min = self.supported.min();
+        let max = self.supported.max();
+        match self.reason {
+            RefusalReason::BelowMinimumSupported => format!(
+                "{component} offered version {offered}; this build supports {min}..={max} \
+                 and no longer decodes {offered}. Upgrade the peer to at least version \
+                 {min}."
+            ),
+            RefusalReason::BeyondAdjacentRelease => format!(
+                "{component} offered version {offered}; this build supports {min}..={max}. \
+                 Only version {} is tolerated read-only, so upgrade this build to version \
+                 {offered}.",
+                max.get().saturating_add(1)
+            ),
+        }
+    }
+}
+
+impl fmt::Display for CompatRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.note())
+    }
+}
+
+/// Which side of the supported range a refused version fell on.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RefusalReason {
+    /// Older than the oldest version this build still decodes.
+    BelowMinimumSupported,
+    /// Newer than the one adjacent release this build tolerates.
+    BeyondAdjacentRelease,
+}
+
+impl RefusalReason {
+    /// Every reason, for coverage checks.
+    pub const ALL: [Self; 2] = [Self::BelowMinimumSupported, Self::BeyondAdjacentRelease];
+
+    /// Stable lowercase wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BelowMinimumSupported => "below_minimum_supported",
+            Self::BeyondAdjacentRelease => "beyond_adjacent_release",
+        }
+    }
+}
+
+/// Every component's supported range, one row each.
+///
+/// Indexed by [`Component::index`], so every component has a row and a lookup
+/// cannot miss.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompatibilityMatrix {
+    rows: [CompatibilityRange; Component::COUNT],
+}
+
+impl CompatibilityMatrix {
+    /// The range declared for one component.
+    #[must_use]
+    pub const fn range(&self, component: Component) -> CompatibilityRange {
+        self.rows[component.index()]
+    }
+
+    /// Every range, in [`Component::ALL`] order.
+    #[must_use]
+    pub const fn rows(&self) -> &[CompatibilityRange] {
+        &self.rows
+    }
+
+    /// Decide what an offered version of a component is entitled to.
+    #[must_use]
+    pub const fn assess(&self, component: Component, offered: MajorVersion) -> CompatVerdict {
+        self.range(component).assess(offered)
+    }
+
+    /// Render the matrix as stable text.
+    ///
+    /// One header line naming [`COMPATIBILITY_MATRIX_SCHEMA_V1`], then one line
+    /// per component sorted by wire spelling:
+    /// `<component> <min>..=<current> <local|foreign> <symbol>`.
+    ///
+    /// Sorted by spelling rather than emitted in [`Component::ALL`] order, so
+    /// reordering the enum — which changes nothing about what is supported —
+    /// cannot change the rendering a downstream test has pinned.
+    #[must_use]
+    pub fn manifest(&self) -> String {
+        let mut lines: Vec<String> = self
+            .rows
+            .iter()
+            .map(|row| {
+                let authority = row.component().authority();
+                format!(
+                    "{} {}..={} {} {}",
+                    row.component(),
+                    row.min_supported(),
+                    row.current(),
+                    authority.as_str(),
+                    authority.symbol()
+                )
+            })
+            .collect();
+        lines.sort();
+        let mut out = String::from(COMPATIBILITY_MATRIX_SCHEMA_V1);
+        for line in lines {
+            out.push('\n');
+            out.push_str(&line);
+        }
+        out.push('\n');
+        out
+    }
+}
+
+/// The matrix this tree ships.
+///
+/// # What this proves, and what it does not
+///
+/// The matrix *describes* the ranges this tree supports. Nothing enforces it at
+/// any daemon boundary today: the admin socket still admits versions through
+/// `admin::supported_protocol`, the store through its own numbered migrations,
+/// and the runner through `RunSpec` admission. A later slice adopts
+/// [`CompatVerdict`] at those boundaries; until then a disagreement between the
+/// matrix and a boundary shows up as a failing cross-check here, not as a
+/// changed refusal in production.
+///
+/// Rows whose authority is [`VersionAuthority::Local`] are checked against the
+/// live constant by `tests/compat.rs`. Rows whose authority is
+/// [`VersionAuthority::Foreign`] are assertions: `automonique-protocol` is
+/// dependency-free by design and cannot import `automonique-store` or
+/// `automonique-runner` to look. They are kept true by discipline and by
+/// [`matrix_manifest`], which a test in the owning crate can pin against its
+/// own constants. No such test exists yet, and that is the open gap.
+///
+/// # Panics
+///
+/// Panics if a declared range in [`Component::declared_bounds`] is inconsistent
+/// — a zero bound, or a minimum above the current version. That is a mistake in
+/// this file rather than a caller error, and it fails every test that touches
+/// the matrix.
+///
+/// # Examples
+///
+/// A version inside the range mutates; the one release above it reads only:
+///
+/// ```
+/// use automonique_protocol::codec::MajorVersion;
+/// use automonique_protocol::compat::{Component, shipped_matrix};
+///
+/// let matrix = shipped_matrix();
+/// let current = matrix.range(Component::StoreSchema).current();
+/// assert!(matrix.assess(Component::StoreSchema, current).may_mutate());
+///
+/// let next = MajorVersion::new(current.get() + 1).expect("nonzero");
+/// let verdict = matrix.assess(Component::StoreSchema, next);
+/// assert!(verdict.may_read());
+/// assert!(!verdict.may_mutate());
+/// ```
+#[must_use]
+pub fn shipped_matrix() -> CompatibilityMatrix {
+    CompatibilityMatrix {
+        rows: Component::ALL.map(|component| {
+            let (min_supported, current) = component.declared_bounds();
+            CompatibilityRange::new(component, min_supported, current)
+                .expect("the declared matrix is consistent")
+        }),
+    }
+}
+
+/// The shipped matrix rendered as stable text.
+///
+/// See [`CompatibilityMatrix::manifest`] for the format and
+/// [`shipped_matrix`] for what pinning it does and does not prove.
+#[must_use]
+pub fn matrix_manifest() -> String {
+    shipped_matrix().manifest()
+}
+
+/// Build a version, refusing zero.
+///
+/// `MajorVersion::new` refuses zero and nothing else, so the discarded error
+/// carries no information this one does not.
+fn checked_version(
+    component: Component,
+    value: u32,
+    bound: &'static str,
+) -> Result<MajorVersion, CompatError> {
+    MajorVersion::new(value).map_err(|_| CompatError::ZeroVersion { component, bound })
 }
