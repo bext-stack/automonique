@@ -83,6 +83,7 @@ export interface DaemonStatus {
   readonly generation: WireCounter;
   readonly inbox_pending: WireCounter;
   readonly instance_id: AdminInstanceId;
+  readonly intake_paused: boolean;
   readonly operational: OperationalStatus;
   readonly outbox_pending: WireCounter;
   readonly running: WireCounter;
@@ -97,6 +98,7 @@ export const DaemonStatus_FIELDS: readonly string[] = [
   "generation",
   "inbox_pending",
   "instance_id",
+  "intake_paused",
   "operational",
   "outbox_pending",
   "running",

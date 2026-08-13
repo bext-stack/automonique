@@ -958,6 +958,7 @@ fn admin_status_module() -> GeneratedModule {
                     counter("generation"),
                     counter("inbox_pending"),
                     required("instance_id", "AdminInstanceId"),
+                    required("intake_paused", "boolean"),
                     required("operational", "OperationalStatus"),
                     counter("outbox_pending"),
                     counter("running"),

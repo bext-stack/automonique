@@ -56,6 +56,16 @@ pub const MAX_RECONCILIATION_FIELD_BYTES: usize = 256;
 /// Maximum stable refusal-category bytes returned to an authenticated client.
 pub const MAX_ADMIN_REFUSAL_CATEGORY_BYTES: usize = 64;
 
+/// Maximum UTF-8 byte length of the actor named on an intake pause or resume.
+///
+/// The transport authenticates the Unix peer; this string is the operator's own
+/// account of who decided, which the daemon records verbatim and never treats
+/// as an authentication claim.
+pub const MAX_INTAKE_ACTOR_BYTES: usize = 128;
+
+/// Maximum UTF-8 byte length of an intake pause reason.
+pub const MAX_INTAKE_REASON_BYTES: usize = 256;
+
 /// Maximum UTF-8 byte length of a run submission's idempotency key.
 pub const MAX_RUN_SUBMISSION_KEY_BYTES: usize = 128;
 
@@ -334,6 +344,13 @@ pub enum AdminCommand {
     InspectOutbox,
     /// Close one exact expired outbox observation as delivered or dead-lettered.
     ReconcileOutbox,
+    /// Durably close intake for this generation, naming the deciding operator.
+    ///
+    /// Unlike [`Self::Shutdown`], this outlives the process: a paused daemon
+    /// that is restarted comes back paused.
+    PauseIntake,
+    /// Reopen intake, naming the operator who decided to.
+    ResumeIntake,
     /// Stop intake and request an orderly shutdown.
     Shutdown,
 }
@@ -348,6 +365,8 @@ impl AdminCommand {
             Self::FailReconciliation => "fail_reconciliation",
             Self::InspectOutbox => "inspect_outbox",
             Self::ReconcileOutbox => "reconcile_outbox",
+            Self::PauseIntake => "pause_intake",
+            Self::ResumeIntake => "resume_intake",
             Self::Shutdown => "shutdown",
         }
     }
@@ -672,6 +691,105 @@ impl ReconciliationFailure {
     }
 }
 
+/// An operator's bounded account of who is closing intake, and why.
+///
+/// Neither field is authenticated. The local transport establishes that the
+/// peer is this user; these strings say which person or runbook behind that
+/// user made the call, and are worth recording for exactly that reason and no
+/// stronger one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IntakePause {
+    actor: String,
+    reason: String,
+}
+
+impl IntakePause {
+    /// Validate a pause request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::InvalidBody`] for an empty, overlong, or
+    /// control-character-bearing actor or reason. A reason is required: a pause
+    /// with no stated cause is the one an operator cannot safely resume.
+    pub fn new(actor: impl Into<String>, reason: impl Into<String>) -> Result<Self, AdminError> {
+        let actor = actor.into();
+        let reason = reason.into();
+        if !valid_coordinate(&actor, MAX_INTAKE_ACTOR_BYTES)
+            || !valid_coordinate(&reason, MAX_INTAKE_REASON_BYTES)
+        {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self { actor, reason })
+    }
+
+    #[must_use]
+    pub fn actor(&self) -> &str {
+        &self.actor
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    fn to_body(&self) -> JsonValue {
+        JsonValue::Object(vec![
+            ("actor".to_owned(), JsonValue::String(self.actor.clone())),
+            ("reason".to_owned(), JsonValue::String(self.reason.clone())),
+        ])
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        exact_fields(body, &["actor", "reason"])?;
+        Self::new(
+            required_body_string(body, "actor")?,
+            required_body_string(body, "reason")?,
+        )
+    }
+}
+
+/// An operator's bounded account of who is reopening intake.
+///
+/// There is no resume reason: the durable pause already carries the cause, and
+/// a second free-text field would invite restating it inconsistently.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IntakeResume {
+    actor: String,
+}
+
+impl IntakeResume {
+    /// Validate a resume request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::InvalidBody`] for an empty, overlong, or
+    /// control-character-bearing actor.
+    pub fn new(actor: impl Into<String>) -> Result<Self, AdminError> {
+        let actor = actor.into();
+        if !valid_coordinate(&actor, MAX_INTAKE_ACTOR_BYTES) {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self { actor })
+    }
+
+    #[must_use]
+    pub fn actor(&self) -> &str {
+        &self.actor
+    }
+
+    fn to_body(&self) -> JsonValue {
+        JsonValue::Object(vec![(
+            "actor".to_owned(),
+            JsonValue::String(self.actor.clone()),
+        )])
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        exact_fields(body, &["actor"])?;
+        Self::new(required_body_string(body, "actor")?)
+    }
+}
+
 /// Bounded local work used to exercise the durable scheduler without a provider
 /// or transport.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -910,6 +1028,8 @@ pub struct AdminRequest {
     outbox_id: Option<u64>,
     outbox_reconciliation: Option<OutboxReconciliation>,
     run_submission: Option<SubmittedRunSpec>,
+    intake_pause: Option<IntakePause>,
+    intake_resume: Option<IntakeResume>,
 }
 
 impl AdminRequest {
@@ -925,6 +1045,8 @@ impl AdminRequest {
             outbox_id: None,
             outbox_reconciliation: None,
             run_submission: None,
+            intake_pause: None,
+            intake_resume: None,
         }
     }
 
@@ -940,6 +1062,8 @@ impl AdminRequest {
             outbox_id: None,
             outbox_reconciliation: None,
             run_submission: None,
+            intake_pause: None,
+            intake_resume: None,
         }
     }
 
@@ -958,6 +1082,8 @@ impl AdminRequest {
             outbox_id: None,
             outbox_reconciliation: None,
             run_submission: Some(run_submission),
+            intake_pause: None,
+            intake_resume: None,
         }
     }
 
@@ -975,6 +1101,8 @@ impl AdminRequest {
             outbox_id: None,
             outbox_reconciliation: None,
             run_submission: None,
+            intake_pause: None,
+            intake_resume: None,
         })
     }
 
@@ -993,6 +1121,8 @@ impl AdminRequest {
             outbox_id: None,
             outbox_reconciliation: None,
             run_submission: None,
+            intake_pause: None,
+            intake_resume: None,
         }
     }
 
@@ -1009,6 +1139,8 @@ impl AdminRequest {
             outbox_id: Some(outbox_id),
             outbox_reconciliation: None,
             run_submission: None,
+            intake_pause: None,
+            intake_resume: None,
         })
     }
 
@@ -1026,6 +1158,42 @@ impl AdminRequest {
             outbox_id: None,
             outbox_reconciliation: Some(reconciliation),
             run_submission: None,
+            intake_pause: None,
+            intake_resume: None,
+        }
+    }
+
+    /// Construct a durable intake-pause request.
+    #[must_use]
+    pub const fn pause_intake(request_id: RequestId, intake_pause: IntakePause) -> Self {
+        Self {
+            request_id,
+            command: AdminCommand::PauseIntake,
+            submission: None,
+            reconciliation_run_id: None,
+            reconciliation_failure: None,
+            outbox_id: None,
+            outbox_reconciliation: None,
+            run_submission: None,
+            intake_pause: Some(intake_pause),
+            intake_resume: None,
+        }
+    }
+
+    /// Construct a durable intake-resume request.
+    #[must_use]
+    pub const fn resume_intake(request_id: RequestId, intake_resume: IntakeResume) -> Self {
+        Self {
+            request_id,
+            command: AdminCommand::ResumeIntake,
+            submission: None,
+            reconciliation_run_id: None,
+            reconciliation_failure: None,
+            outbox_id: None,
+            outbox_reconciliation: None,
+            run_submission: None,
+            intake_pause: None,
+            intake_resume: Some(intake_resume),
         }
     }
 
@@ -1073,6 +1241,18 @@ impl AdminRequest {
         self.outbox_reconciliation.as_ref()
     }
 
+    /// Pause body, present only for [`AdminCommand::PauseIntake`].
+    #[must_use]
+    pub const fn intake_pause(&self) -> Option<&IntakePause> {
+        self.intake_pause.as_ref()
+    }
+
+    /// Resume body, present only for [`AdminCommand::ResumeIntake`].
+    #[must_use]
+    pub const fn intake_resume(&self) -> Option<&IntakeResume> {
+        self.intake_resume.as_ref()
+    }
+
     /// Encode this request as a canonical local-protocol message.
     ///
     /// # Errors
@@ -1088,31 +1268,111 @@ impl AdminRequest {
             self.outbox_id,
             &self.outbox_reconciliation,
             &self.run_submission,
+            &self.intake_pause,
+            &self.intake_resume,
         ) {
-            (AdminCommand::SubmitSynthetic, Some(submission), None, None, None, None, None) => {
-                submission.to_body()
-            }
-            (AdminCommand::SubmitRun, None, None, None, None, None, Some(run_submission)) => {
-                run_submission.to_body()
-            }
-            (AdminCommand::InspectReconciliation, None, Some(run_id), None, None, None, None) => {
-                JsonValue::Object(vec![("run_id".to_owned(), integer("run_id", run_id)?)])
-            }
-            (AdminCommand::FailReconciliation, None, None, Some(failure), None, None, None) => {
-                failure.to_body()?
-            }
-            (AdminCommand::InspectOutbox, None, None, None, Some(outbox_id), None, None) => {
-                JsonValue::Object(vec![(
-                    "outbox_id".to_owned(),
-                    integer("outbox_id", outbox_id)?,
-                )])
-            }
-            (AdminCommand::ReconcileOutbox, None, None, None, None, Some(reconciliation), None) => {
-                reconciliation.to_body()?
-            }
-            (AdminCommand::Status | AdminCommand::Shutdown, None, None, None, None, None, None) => {
-                JsonValue::Object(Vec::new())
-            }
+            (
+                AdminCommand::SubmitSynthetic,
+                Some(submission),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) => submission.to_body(),
+            (
+                AdminCommand::SubmitRun,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(run_submission),
+                None,
+                None,
+            ) => run_submission.to_body(),
+            (
+                AdminCommand::InspectReconciliation,
+                None,
+                Some(run_id),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) => JsonValue::Object(vec![("run_id".to_owned(), integer("run_id", run_id)?)]),
+            (
+                AdminCommand::FailReconciliation,
+                None,
+                None,
+                Some(failure),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) => failure.to_body()?,
+            (
+                AdminCommand::InspectOutbox,
+                None,
+                None,
+                None,
+                Some(outbox_id),
+                None,
+                None,
+                None,
+                None,
+            ) => JsonValue::Object(vec![(
+                "outbox_id".to_owned(),
+                integer("outbox_id", outbox_id)?,
+            )]),
+            (
+                AdminCommand::ReconcileOutbox,
+                None,
+                None,
+                None,
+                None,
+                Some(reconciliation),
+                None,
+                None,
+                None,
+            ) => reconciliation.to_body()?,
+            (
+                AdminCommand::PauseIntake,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(intake_pause),
+                None,
+            ) => intake_pause.to_body(),
+            (
+                AdminCommand::ResumeIntake,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(intake_resume),
+            ) => intake_resume.to_body(),
+            (
+                AdminCommand::Status | AdminCommand::Shutdown,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) => JsonValue::Object(Vec::new()),
             _ => return Err(AdminError::InvalidBody),
         };
         Ok(Message::new(
@@ -1160,6 +1420,14 @@ impl AdminRequest {
                 message.envelope().request_id().clone(),
                 OutboxReconciliation::from_body(message.body())?,
             )),
+            "pause_intake" => Ok(Self::pause_intake(
+                message.envelope().request_id().clone(),
+                IntakePause::from_body(message.body())?,
+            )),
+            "resume_intake" => Ok(Self::resume_intake(
+                message.envelope().request_id().clone(),
+                IntakeResume::from_body(message.body())?,
+            )),
             "status" | "shutdown" => {
                 if !matches!(message.body(), JsonValue::Object(entries) if entries.is_empty()) {
                     return Err(AdminError::InvalidBody);
@@ -1187,6 +1455,7 @@ pub struct DaemonStatus {
     outbox_pending: u64,
     running: u64,
     accepting_intake: bool,
+    intake_paused: bool,
     telegram_state: TelegramState,
     telegram_poller_epoch: Option<u64>,
     execution_state: ExecutionState,
@@ -1545,6 +1814,7 @@ impl DaemonStatus {
             outbox_pending,
             running,
             accepting_intake,
+            intake_paused: false,
             telegram_state: TelegramState::DisabledNoClient,
             telegram_poller_epoch: None,
             execution_state: ExecutionState::SandboxUnavailableNoLane,
@@ -1574,6 +1844,30 @@ impl DaemonStatus {
         }
         self.telegram_state = telegram_state;
         self.telegram_poller_epoch = telegram_poller_epoch;
+        Ok(self)
+    }
+
+    /// Report the durable operator pause, refusing an incoherent pair.
+    ///
+    /// A pause is only meaningful if it is doing something, so `true` requires
+    /// `accepting_intake` to already be false. Encoding the implication here
+    /// rather than trusting each caller keeps `intake_paused` from becoming a
+    /// decorative flag beside a status that still says intake is open — the
+    /// same reason [`Self::with_telegram`] refuses its own incoherent pairs.
+    ///
+    /// The converse is deliberately not required: intake also closes for a
+    /// degraded generation, so `accepting_intake == false` with no pause is an
+    /// ordinary state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::InvalidBody`] for a pause reported alongside open
+    /// intake.
+    pub fn with_intake_pause(mut self, intake_paused: bool) -> Result<Self, AdminError> {
+        if intake_paused && self.accepting_intake {
+            return Err(AdminError::InvalidBody);
+        }
+        self.intake_paused = intake_paused;
         Ok(self)
     }
 
@@ -1648,6 +1942,16 @@ impl DaemonStatus {
         self.accepting_intake
     }
 
+    /// Whether a durable operator pause is closing intake.
+    ///
+    /// False does not mean intake is open: read [`Self::accepting_intake`] for
+    /// that. This distinguishes an operator decision from a degraded
+    /// generation, which are the two different reasons intake can be closed.
+    #[must_use]
+    pub const fn intake_paused(&self) -> bool {
+        self.intake_paused
+    }
+
     #[must_use]
     pub const fn telegram_state(&self) -> TelegramState {
         self.telegram_state
@@ -1692,6 +1996,10 @@ impl DaemonStatus {
                 JsonValue::String(self.instance_id.as_str().to_owned()),
             ),
             (
+                "intake_paused".to_owned(),
+                JsonValue::Bool(self.intake_paused),
+            ),
+            (
                 "outbox_pending".to_owned(),
                 integer("outbox_pending", self.outbox_pending)?,
             ),
@@ -1723,13 +2031,14 @@ impl DaemonStatus {
     }
 
     fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
-        const FIELDS: [&str; 12] = [
+        const FIELDS: [&str; 13] = [
             "accepting_intake",
             "event_cursor",
             "execution_state",
             "generation",
             "inbox_pending",
             "instance_id",
+            "intake_paused",
             "outbox_pending",
             "operational",
             "running",
@@ -1751,6 +2060,10 @@ impl DaemonStatus {
             Some(JsonValue::Bool(value)) => *value,
             _ => return Err(AdminError::InvalidBody),
         };
+        let intake_paused = match body.get("intake_paused") {
+            Some(JsonValue::Bool(value)) => *value,
+            _ => return Err(AdminError::InvalidBody),
+        };
         let instance_id = body
             .get("instance_id")
             .and_then(JsonValue::as_str)
@@ -1769,6 +2082,7 @@ impl DaemonStatus {
             unsigned(body, "running")?,
             accepting_intake,
         )
+        .and_then(|status| status.with_intake_pause(intake_paused))
         .and_then(|status| {
             status.with_telegram(
                 TelegramState::parse(required_body_string(body, "telegram_state")?.as_str())?,
@@ -2259,6 +2573,25 @@ pub enum AdminResponse {
         revision: u64,
         duplicate: bool,
     },
+    /// Intake is durably closed for this generation.
+    ///
+    /// The decision outlives this process. A daemon restarted after this
+    /// response comes back with intake still closed.
+    IntakePaused {
+        request_id: RequestId,
+        /// Durable identity of the pause row.
+        pause_id: u64,
+        /// Fencing revision an exact resume must present.
+        revision: u64,
+    },
+    /// A durable pause was closed and intake reopened.
+    IntakeResumed {
+        request_id: RequestId,
+        /// Durable identity of the pause row, which is retained, not deleted.
+        pause_id: u64,
+        /// Revision the closed pause now carries.
+        revision: u64,
+    },
     /// The request was definitely refused before a successful mutation.
     Refused {
         request_id: RequestId,
@@ -2283,6 +2616,8 @@ impl AdminResponse {
             | Self::ReconciliationFailed { request_id, .. }
             | Self::OutboxInspected { request_id, .. }
             | Self::OutboxReconciled { request_id, .. }
+            | Self::IntakePaused { request_id, .. }
+            | Self::IntakeResumed { request_id, .. }
             | Self::Refused { request_id, .. }
             | Self::ShutdownAccepted { request_id } => request_id,
         }
@@ -2400,6 +2735,35 @@ impl AdminResponse {
                     ]),
                 ))
             }
+            Self::IntakePaused {
+                request_id,
+                pause_id,
+                revision,
+            }
+            | Self::IntakeResumed {
+                request_id,
+                pause_id,
+                revision,
+            } => {
+                // A durable row identity starts at one and a written row has a
+                // revision. Zero for either would be an unwritten decision
+                // reported as committed.
+                if *pause_id == 0 || *revision == 0 {
+                    return Err(AdminError::InvalidBody);
+                }
+                let kind = if matches!(self, Self::IntakePaused { .. }) {
+                    "intake_paused"
+                } else {
+                    "intake_resumed"
+                };
+                Ok(Message::new(
+                    envelope(request_id.clone(), kind)?,
+                    JsonValue::Object(vec![
+                        ("pause_id".to_owned(), integer("pause_id", *pause_id)?),
+                        ("revision".to_owned(), integer("revision", *revision)?),
+                    ]),
+                ))
+            }
             Self::Refused {
                 request_id,
                 category,
@@ -2513,6 +2877,27 @@ impl AdminResponse {
                     state,
                     revision,
                     duplicate,
+                })
+            }
+            kind @ ("intake_paused" | "intake_resumed") => {
+                exact_fields(message.body(), &["pause_id", "revision"])?;
+                let pause_id = unsigned(message.body(), "pause_id")?;
+                let revision = unsigned(message.body(), "revision")?;
+                if pause_id == 0 || revision == 0 {
+                    return Err(AdminError::InvalidBody);
+                }
+                Ok(if kind == "intake_paused" {
+                    Self::IntakePaused {
+                        request_id,
+                        pause_id,
+                        revision,
+                    }
+                } else {
+                    Self::IntakeResumed {
+                        request_id,
+                        pause_id,
+                        revision,
+                    }
                 })
             }
             "refused" => {

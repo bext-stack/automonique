@@ -3,7 +3,8 @@
 use automonique_protocol::admin::{
     ADMIN_PROTOCOL, AdminCommand, AdminError, AdminInstanceId, AdminOutboxEvidence,
     AdminOutboxEvidenceParts, AdminReconciliationEvidence, AdminRefusalCategory, AdminRequest,
-    AdminResponse, DaemonState, DaemonStatus, MAX_ADMIN_CANONICAL_BYTES, MAX_INSTANCE_ID_BYTES,
+    AdminResponse, DaemonState, DaemonStatus, IntakePause, IntakeResume, MAX_ADMIN_CANONICAL_BYTES,
+    MAX_INSTANCE_ID_BYTES, MAX_INTAKE_ACTOR_BYTES, MAX_INTAKE_REASON_BYTES,
     MAX_RUN_SUBMISSION_KEY_BYTES, MAX_SUBMITTED_RUN_SPEC_BYTES, MAX_SYNTHETIC_KEY_BYTES,
     MAX_SYNTHETIC_SCOPE_BYTES, MAX_SYNTHETIC_TASK_BYTES, OperationalMetric, OperationalStatus,
     OperationalStatusParts, OutboxReconciliation, OutboxReconciliationDecision,
@@ -837,4 +838,262 @@ fn run_acceptance_receipts_are_exact_and_bounded() {
             AdminError::InvalidBody
         );
     }
+}
+
+/// A status snapshot with intake closed by an operator rather than by damage.
+fn paused_status() -> DaemonStatus {
+    DaemonStatus::new(
+        AdminInstanceId::new("daemon-7").expect("valid instance"),
+        DaemonState::Ready,
+        7,
+        41,
+        2,
+        3,
+        1,
+        false,
+    )
+    .and_then(|status| status.with_intake_pause(true))
+    .and_then(|status| {
+        status.with_operational(
+            OperationalStatus::new(OperationalStatusParts {
+                observed_ms: 100,
+                reconciliation_pending: 0,
+                outbox_pending_ready: 2,
+                outbox_pending_delayed: 1,
+                outbox_in_flight_live: 4,
+                outbox_in_flight_ambiguous: 0,
+                outbox_delivered: 5,
+                outbox_dead_lettered: 6,
+                outbox_oldest_ready_age_ms: 7,
+                telegram_pollers_live: 0,
+                telegram_pollers_expired: 0,
+                telegram_offset_lag: OperationalMetric::Unavailable,
+                provider_available: OperationalMetric::Unavailable,
+                sandbox_launch_refusals: OperationalMetric::Unavailable,
+            })
+            .expect("operational status"),
+        )
+    })
+    .expect("wire-representable paused status")
+}
+
+#[test]
+fn intake_pause_and_resume_commands_are_exact_bounded_and_round_trip() {
+    let pause = IntakePause::new("operator:ada", "provider incident 4417").expect("pause body");
+    let request = AdminRequest::pause_intake(request_id(), pause.clone());
+    let decoded = AdminRequest::from_canonical_bytes(
+        &request.to_message().expect("encode").to_canonical_bytes(),
+    )
+    .expect("decode pause");
+    assert_eq!(decoded.command(), AdminCommand::PauseIntake);
+    assert_eq!(decoded.intake_pause(), Some(&pause));
+    assert_eq!(decoded.intake_resume(), None);
+    assert_eq!(decoded, request);
+
+    let resume = IntakeResume::new("operator:bo").expect("resume body");
+    let request = AdminRequest::resume_intake(request_id(), resume.clone());
+    let decoded = AdminRequest::from_canonical_bytes(
+        &request.to_message().expect("encode").to_canonical_bytes(),
+    )
+    .expect("decode resume");
+    assert_eq!(decoded.command(), AdminCommand::ResumeIntake);
+    assert_eq!(decoded.intake_resume(), Some(&resume));
+    assert_eq!(decoded.intake_pause(), None);
+    assert_eq!(decoded, request);
+
+    // Exact bodies: no missing field, no extra field, no borrowed field from
+    // the sibling command.
+    for payload in [
+        br#"{"body":{"actor":"operator:ada"},"kind":"pause_intake","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+        br#"{"body":{"actor":"operator:ada","future":true,"reason":"x"},"kind":"pause_intake","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+        br#"{"body":{"reason":"x"},"kind":"pause_intake","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+        br#"{"body":{"actor":1,"reason":"x"},"kind":"pause_intake","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+        br#"{"body":{},"kind":"pause_intake","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+        br#"{"body":{"actor":"operator:bo","reason":"x"},"kind":"resume_intake","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+        br#"{"body":{},"kind":"resume_intake","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+    ] {
+        assert_eq!(
+            AdminRequest::from_canonical_bytes(payload).expect_err("inexact intake body"),
+            AdminError::InvalidBody,
+            "{}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+
+    // Bounds are checked on the constructor and therefore on decode too.
+    let actor = "a".repeat(MAX_INTAKE_ACTOR_BYTES);
+    let reason = "r".repeat(MAX_INTAKE_REASON_BYTES);
+    IntakePause::new(actor.clone(), reason.clone()).expect("maximal pause");
+    IntakeResume::new(actor.clone()).expect("maximal resume");
+    for (actor, reason) in [
+        (format!("{actor}a"), reason.clone()),
+        (actor.clone(), format!("{reason}r")),
+        (String::new(), reason.clone()),
+        (actor.clone(), String::new()),
+        ("operator:\u{7}ada".to_owned(), reason),
+    ] {
+        assert_eq!(
+            IntakePause::new(actor, reason).expect_err("unbounded pause"),
+            AdminError::InvalidBody
+        );
+    }
+    assert_eq!(
+        IntakeResume::new(format!("{actor}a")).expect_err("overlong actor"),
+        AdminError::InvalidBody
+    );
+    assert_eq!(
+        IntakeResume::new("").expect_err("empty actor"),
+        AdminError::InvalidBody
+    );
+}
+
+#[test]
+fn intake_pause_receipts_are_correlated_and_refuse_unwritten_rows() {
+    for response in [
+        AdminResponse::IntakePaused {
+            request_id: request_id(),
+            pause_id: 4,
+            revision: 1,
+        },
+        AdminResponse::IntakeResumed {
+            request_id: request_id(),
+            pause_id: 4,
+            revision: 2,
+        },
+    ] {
+        let bytes = response.to_message().expect("encode").to_canonical_bytes();
+        assert_eq!(
+            AdminResponse::from_canonical_bytes(&bytes).expect("decode"),
+            response
+        );
+        assert_eq!(response.request_id(), &request_id());
+    }
+
+    // The two receipts are distinct messages, not one message with a flag: a
+    // pause must never decode as the resume that undoes it.
+    let paused = AdminResponse::IntakePaused {
+        request_id: request_id(),
+        pause_id: 4,
+        revision: 1,
+    };
+    let resumed = AdminResponse::IntakeResumed {
+        request_id: request_id(),
+        pause_id: 4,
+        revision: 1,
+    };
+    assert_ne!(
+        paused.to_message().expect("encode").to_canonical_bytes(),
+        resumed.to_message().expect("encode").to_canonical_bytes()
+    );
+
+    for response in [
+        AdminResponse::IntakePaused {
+            request_id: request_id(),
+            pause_id: 0,
+            revision: 1,
+        },
+        AdminResponse::IntakeResumed {
+            request_id: request_id(),
+            pause_id: 4,
+            revision: 0,
+        },
+    ] {
+        assert_eq!(
+            response.to_message().expect_err("unwritten row"),
+            AdminError::InvalidBody
+        );
+    }
+    for payload in [
+        br#"{"body":{"pause_id":0,"revision":1},"kind":"intake_paused","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+        br#"{"body":{"pause_id":4,"revision":0},"kind":"intake_resumed","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+        br#"{"body":{"pause_id":4},"kind":"intake_paused","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+        br#"{"body":{"future":1,"pause_id":4,"revision":1},"kind":"intake_paused","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+    ] {
+        assert_eq!(
+            AdminResponse::from_canonical_bytes(payload).expect_err("unwritten receipt"),
+            AdminError::InvalidBody
+        );
+    }
+}
+
+#[test]
+fn a_reported_pause_cannot_claim_intake_is_still_open() {
+    // The coherence rule: paused implies intake is closed.
+    let open = DaemonStatus::new(
+        AdminInstanceId::new("daemon-7").expect("instance"),
+        DaemonState::Ready,
+        7,
+        41,
+        2,
+        3,
+        1,
+        true,
+    )
+    .expect("base status");
+    assert!(!open.intake_paused(), "a fresh status reports no pause");
+    assert_eq!(
+        open.clone()
+            .with_intake_pause(true)
+            .expect_err("paused while accepting intake"),
+        AdminError::InvalidBody
+    );
+    // The builder is not a one-way door, and the converse is not required:
+    // intake closes for a degraded generation with no pause at all.
+    assert!(
+        !open
+            .with_intake_pause(false)
+            .expect("no pause")
+            .intake_paused()
+    );
+
+    let closed = paused_status();
+    assert!(closed.intake_paused());
+    assert!(!closed.accepting_intake());
+    assert_eq!(closed.state(), DaemonState::Ready, "a pause is not damage");
+
+    let payload = AdminResponse::Status {
+        request_id: request_id(),
+        status: closed.clone(),
+    }
+    .to_message()
+    .expect("encode")
+    .to_canonical_bytes();
+    let AdminResponse::Status {
+        status: decoded, ..
+    } = AdminResponse::from_canonical_bytes(&payload).expect("decode")
+    else {
+        panic!("wrong response variant")
+    };
+    assert_eq!(decoded, closed);
+    assert!(decoded.intake_paused());
+    assert!(!decoded.accepting_intake());
+
+    // The rule is enforced on the wire, not only in the constructor: a peer
+    // that hand-writes the incoherent pair is refused rather than believed.
+    let incoherent = String::from_utf8(payload)
+        .expect("utf-8 body")
+        .replace("\"accepting_intake\":false", "\"accepting_intake\":true");
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(incoherent.as_bytes())
+            .expect_err("paused status claiming open intake"),
+        AdminError::InvalidBody
+    );
+
+    // A status body that predates the field is not silently defaulted.
+    let missing = String::from_utf8(
+        AdminResponse::Status {
+            request_id: request_id(),
+            status: status(),
+        }
+        .to_message()
+        .expect("encode")
+        .to_canonical_bytes(),
+    )
+    .expect("utf-8 body")
+    .replace("\"intake_paused\":false,", "");
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(missing.as_bytes())
+            .expect_err("status body without the pause field"),
+        AdminError::InvalidBody
+    );
 }

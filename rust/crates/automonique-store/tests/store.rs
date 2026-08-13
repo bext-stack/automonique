@@ -5,13 +5,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use automonique_store::{
-    InboxSubmission, LeaseRenewal, LeaseRequest, OutboxClaimRequest, OutboxDelivery, OutboxFailure,
-    OutboxFailureDecision, OutboxPayloadRequest, OutboxReconciliationDecision,
-    OutboxReconciliationRequest, ReconciliationDecision, ReconciliationInboxState,
-    ReconciliationRequest, ReconciliationRunState, SCHEMA_VERSION, SchedulerClaim, Store,
-    TelegramBatchIngestion, TelegramPollerCommit, TelegramPollerLeaseIdentity,
-    TelegramPollerLeaseRenewal, TelegramPollerLeaseRequest, TelegramStoreDisposition,
-    TelegramStoreUpdate, TerminalRun, TerminalState, WorkClaim,
+    InboxSubmission, IntakePauseRequest, IntakeResumeRequest, LeaseRenewal, LeaseRequest,
+    OutboxClaimRequest, OutboxDelivery, OutboxFailure, OutboxFailureDecision, OutboxPayloadRequest,
+    OutboxReconciliationDecision, OutboxReconciliationRequest, ReconciliationDecision,
+    ReconciliationInboxState, ReconciliationRequest, ReconciliationRunState, SCHEMA_VERSION,
+    SchedulerClaim, Store, TelegramBatchIngestion, TelegramPollerCommit,
+    TelegramPollerLeaseIdentity, TelegramPollerLeaseRenewal, TelegramPollerLeaseRequest,
+    TelegramStoreDisposition, TelegramStoreUpdate, TerminalRun, TerminalState, WorkClaim,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -2558,4 +2558,267 @@ fn telegram_fenced_commit_preserves_u64_max_cursor_across_reopen() {
             .source_key,
         source_key
     );
+}
+
+fn pause(
+    store: &mut Store,
+    holder: &str,
+    epoch: u64,
+    actor: &str,
+    reason: &str,
+    now_ms: i64,
+) -> Result<automonique_store::IntakePauseReceipt, automonique_store::StoreError> {
+    store.pause_intake(IntakePauseRequest {
+        generation_id: "generation-a",
+        holder_id: holder,
+        authority_lease_epoch: epoch,
+        actor,
+        reason,
+        now_ms,
+    })
+}
+
+fn resume(
+    store: &mut Store,
+    holder: &str,
+    epoch: u64,
+    actor: &str,
+    expected_revision: u64,
+    now_ms: i64,
+) -> Result<automonique_store::IntakePauseReceipt, automonique_store::StoreError> {
+    store.resume_intake(IntakeResumeRequest {
+        generation_id: "generation-a",
+        holder_id: holder,
+        authority_lease_epoch: epoch,
+        actor,
+        expected_revision,
+        now_ms,
+    })
+}
+
+#[test]
+fn intake_pause_is_durable_attributed_and_answers_repeats_by_type() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let epoch = lease(&mut store, "holder-a", 0);
+    assert_eq!(
+        store.intake_paused("generation-a", 1).expect("read"),
+        None,
+        "a fresh generation is not paused"
+    );
+
+    let receipt =
+        pause(&mut store, "holder-a", epoch, "operator:ada", "hotfix", 5).expect("first pause");
+    assert!(receipt.pause_id > 0);
+    assert_eq!(receipt.revision, 1);
+
+    let live = store
+        .intake_paused("generation-a", 9)
+        .expect("read")
+        .expect("paused");
+    assert_eq!(live.pause_id, receipt.pause_id);
+    assert_eq!(live.revision, 1);
+    assert_eq!(live.paused_at_ms, 5);
+    assert_eq!(live.actor, "operator:ada");
+    assert_eq!(live.reason, "hotfix");
+    assert_eq!(live.observed_ms, 9, "the record is stamped with the read");
+
+    // Pausing a paused generation is not an accident to swallow: the second
+    // operator is told who already holds intake closed and why.
+    let error =
+        pause(&mut store, "holder-a", epoch, "operator:bo", "again", 6).expect_err("double pause");
+    assert_eq!(error.category(), "intake_already_paused");
+    let automonique_store::StoreError::AlreadyPaused(carried) = error else {
+        panic!("AlreadyPaused must carry the live decision")
+    };
+    assert_eq!(carried.actor, "operator:ada");
+    assert_eq!(carried.reason, "hotfix");
+    assert_eq!(carried.pause_id, receipt.pause_id);
+    assert_eq!(
+        store
+            .intake_paused("generation-a", 7)
+            .expect("read")
+            .expect("still paused")
+            .revision,
+        1,
+        "a refused second pause must not move the live row"
+    );
+
+    // A resume the caller did not observe is refused rather than applied to
+    // whatever the row happens to say now.
+    let stale =
+        resume(&mut store, "holder-a", epoch, "operator:bo", 7, 8).expect_err("wrong revision");
+    assert_eq!(stale.category(), "idempotency_conflict");
+
+    let resumed = resume(&mut store, "holder-a", epoch, "operator:bo", 1, 10).expect("resume");
+    assert_eq!(resumed.pause_id, receipt.pause_id);
+    assert_eq!(resumed.revision, 2);
+    assert_eq!(store.intake_paused("generation-a", 11).expect("read"), None);
+
+    let again =
+        resume(&mut store, "holder-a", epoch, "operator:bo", 2, 12).expect_err("double resume");
+    assert_eq!(again.category(), "intake_not_paused");
+
+    // Both attributions survive the resume and a reopen: the pause row is
+    // history, not a flag that gets cleared.
+    drop(store);
+    let reopened = Connection::open(database.path()).expect("raw reopen");
+    let row: (String, String, i64, Option<String>, Option<i64>, i64) = reopened
+        .query_row(
+            "SELECT actor, reason, paused_at_ms, resume_actor, resumed_at_ms, revision
+             FROM intake_pauses WHERE pause_id = ?1",
+            [receipt.pause_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .expect("durable pause row");
+    assert_eq!(
+        row,
+        (
+            "operator:ada".to_owned(),
+            "hotfix".to_owned(),
+            5,
+            Some("operator:bo".to_owned()),
+            Some(10),
+            2
+        )
+    );
+}
+
+#[test]
+fn intake_pause_is_fenced_by_generation_authority_and_scoped_to_its_generation() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let first = lease(&mut store, "holder-a", 0);
+
+    // Wrong holder, wrong epoch, and an expired lease are all stale epochs.
+    assert_eq!(
+        pause(&mut store, "holder-b", first, "operator:ada", "hotfix", 5)
+            .expect_err("foreign holder")
+            .category(),
+        "stale_epoch"
+    );
+    assert_eq!(
+        pause(
+            &mut store,
+            "holder-a",
+            first + 1,
+            "operator:ada",
+            "hotfix",
+            5
+        )
+        .expect_err("future epoch")
+        .category(),
+        "stale_epoch"
+    );
+    assert_eq!(
+        pause(&mut store, "holder-a", first, "operator:ada", "hotfix", 500)
+            .expect_err("expired lease")
+            .category(),
+        "stale_epoch"
+    );
+    assert_eq!(
+        store.intake_paused("generation-a", 5).expect("read"),
+        None,
+        "no refused pause may leave a durable row"
+    );
+
+    let receipt =
+        pause(&mut store, "holder-a", first, "operator:ada", "hotfix", 5).expect("live authority");
+
+    // A successor takes the lease at a new epoch. The pause is scoped to the
+    // generation identifier, not the epoch that wrote it, so the successor
+    // inherits it and resumes under its own epoch.
+    let second = store
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "generation-a",
+            holder_id: "holder-b",
+            now_ms: 200,
+            ttl_ms: 100,
+        })
+        .expect("successor lease");
+    assert!(second.epoch > first);
+    assert_eq!(
+        store
+            .intake_paused("generation-a", 201)
+            .expect("read")
+            .expect("inherited")
+            .pause_id,
+        receipt.pause_id
+    );
+    assert_eq!(
+        pause(&mut store, "holder-a", first, "operator:ada", "hotfix", 201)
+            .expect_err("dead epoch")
+            .category(),
+        "stale_epoch"
+    );
+    assert_eq!(
+        resume(&mut store, "holder-b", second.epoch, "operator:bo", 1, 202)
+            .expect("successor resume")
+            .revision,
+        2
+    );
+
+    // A different generation has its own answer and is unaffected throughout.
+    store
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "generation-b",
+            holder_id: "holder-c",
+            now_ms: 200,
+            ttl_ms: 100,
+        })
+        .expect("other generation");
+    pause(&mut store, "holder-a", first, "operator:ada", "hotfix", 203).ok();
+    assert_eq!(
+        store.intake_paused("generation-b", 204).expect("read"),
+        None
+    );
+}
+
+#[test]
+fn intake_pause_refuses_unbounded_fields_and_survives_reopen() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let epoch = lease(&mut store, "holder-a", 0);
+    let overlong = "a".repeat(257);
+    for (actor, reason) in [
+        ("", "hotfix"),
+        ("operator:ada", ""),
+        (overlong.as_str(), "hotfix"),
+        ("operator:ada", overlong.as_str()),
+        ("operator:\u{7}ada", "hotfix"),
+    ] {
+        assert_eq!(
+            pause(&mut store, "holder-a", epoch, actor, reason, 5)
+                .expect_err("unbounded field")
+                .category(),
+            "invalid_field"
+        );
+    }
+    pause(&mut store, "holder-a", epoch, "operator:ada", "hotfix", 5).expect("bounded pause");
+    drop(store);
+
+    let mut reopened = Store::open(database.path()).expect("reopen");
+    let version: u32 = Connection::open(database.path())
+        .expect("raw reopen")
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("version");
+    assert_eq!(
+        version, SCHEMA_VERSION,
+        "reopening a paused database must not migrate it again"
+    );
+    let live = reopened
+        .intake_paused("generation-a", 6)
+        .expect("read")
+        .expect("pause survived the reopen");
+    assert_eq!(live.actor, "operator:ada");
+    assert_eq!(live.reason, "hotfix");
 }

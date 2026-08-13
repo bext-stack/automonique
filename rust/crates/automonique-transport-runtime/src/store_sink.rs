@@ -257,7 +257,9 @@ fn map_read_error(error: StoreError) -> SinkFailure {
         | StoreError::OutboxReconciliationRequired { .. }
         | StoreError::NotFound(_)
         | StoreError::AlreadyTerminal
-        | StoreError::OutboxConflict => SinkFailure::Conflict,
+        | StoreError::OutboxConflict
+        | StoreError::AlreadyPaused(_)
+        | StoreError::NotPaused => SinkFailure::Conflict,
         StoreError::InsecurePath(_)
         | StoreError::SchemaVersion { .. }
         | StoreError::MigrationInvariant(_)
@@ -278,7 +280,9 @@ fn map_lifecycle_error(error: StoreError) -> SinkFailure {
         | StoreError::OutboxReconciliationRequired { .. }
         | StoreError::NotFound(_)
         | StoreError::AlreadyTerminal
-        | StoreError::OutboxConflict => SinkFailure::Conflict,
+        | StoreError::OutboxConflict
+        | StoreError::AlreadyPaused(_)
+        | StoreError::NotPaused => SinkFailure::Conflict,
         StoreError::InsecurePath(_)
         | StoreError::SchemaVersion { .. }
         | StoreError::MigrationInvariant(_)
@@ -299,7 +303,9 @@ fn map_commit_error(error: StoreError) -> SinkFailure {
         | StoreError::OutboxReconciliationRequired { .. }
         | StoreError::NotFound(_)
         | StoreError::AlreadyTerminal
-        | StoreError::OutboxConflict => SinkFailure::Conflict,
+        | StoreError::OutboxConflict
+        | StoreError::AlreadyPaused(_)
+        | StoreError::NotPaused => SinkFailure::Conflict,
         StoreError::Io(_) | StoreError::Sqlite(_) => SinkFailure::AmbiguousCommit,
         StoreError::InsecurePath(_)
         | StoreError::SchemaVersion { .. }

@@ -34,7 +34,7 @@ use automonique_protocol::digest::Sha256;
 use automonique_runner::{RunSpec, RunSpecDecodeError};
 use automonique_store::run_submissions::{RunSubmission, RunSubmissionError, RunSubmissionLog};
 use automonique_store::{
-    InboxSubmission, LeaseRenewal, LeaseRequest,
+    InboxSubmission, IntakePauseRequest, IntakeResumeRequest, LeaseRenewal, LeaseRequest,
     OutboxReconciliationDecision as StoreOutboxDecision, OutboxReconciliationRequest,
     ReconciliationDecision, ReconciliationRequest, StatusSnapshot, Store, StoreError,
 };
@@ -72,6 +72,14 @@ const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 const TELEGRAM_LEASE_TTL_MS: i64 = 20_000;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const ACCEPT_POLL: Duration = Duration::from_millis(25);
+
+/// Refusal category both intake lanes answer with while an operator pause is
+/// live.
+///
+/// Distinct from `reconciliation_required` on purpose: a submitter that retries
+/// on a degraded generation is waiting for a repair, while one that retries
+/// through a pause is waiting for a person.
+const INTAKE_PAUSED_CATEGORY: &str = "intake_paused";
 
 /// Configuration for one foreground daemon instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -544,6 +552,11 @@ impl Daemon {
                 }
                 let degraded = self.reconciliation_run_id.is_some()
                     || snapshot_requires_reconciliation(&snapshot);
+                // Read at the snapshot's own instant. A pause and a degraded
+                // generation are different reasons for the same closed intake,
+                // and the status reports both so an operator can tell which
+                // one they are looking at.
+                let paused = self.store.intake_paused(GENERATION_ID, now_ms)?.is_some();
                 let projection = StoreProjection::from_status(&snapshot)
                     .map_err(|_| DaemonError::ProtocolRefused("operational_projection"))?;
                 let operational = operational_status(&projection)?;
@@ -560,8 +573,9 @@ impl Daemon {
                     snapshot.inbox_pending(),
                     snapshot.outbox_pending(),
                     snapshot.runs_running(),
-                    !degraded,
+                    !degraded && !paused,
                 )
+                .and_then(|status| status.with_intake_pause(paused))
                 .and_then(|status| status.with_telegram(telegram_state, telegram_poller_epoch))
                 .map(|status| status.with_execution(self.execution_state))
                 .and_then(|status| status.with_operational(operational))
@@ -572,9 +586,8 @@ impl Daemon {
                 }
             }
             automonique_protocol::admin::AdminCommand::SubmitSynthetic => {
-                let snapshot = self
-                    .store
-                    .status_snapshot_at(GENERATION_ID, unix_millis()?)?;
+                let now_ms = unix_millis()?;
+                let snapshot = self.store.status_snapshot_at(GENERATION_ID, now_ms)?;
                 if self.reconciliation_run_id.is_some()
                     || snapshot_requires_reconciliation(&snapshot)
                 {
@@ -582,6 +595,16 @@ impl Daemon {
                         stream,
                         request.request_id(),
                         DaemonError::ReconciliationRequired.category(),
+                    );
+                }
+                // An operator pause closes this lane with its own category, so
+                // a client can tell "an operator stopped intake" from "this
+                // generation is damaged" without reading the status.
+                if self.store.intake_paused(GENERATION_ID, now_ms)?.is_some() {
+                    return self.write_refusal(
+                        stream,
+                        request.request_id(),
+                        INTAKE_PAUSED_CATEGORY,
                     );
                 }
                 let submission = request
@@ -629,6 +652,18 @@ impl Daemon {
                         stream,
                         request.request_id(),
                         DaemonError::ReconciliationRequired.category(),
+                    );
+                }
+                // A pause closes intake, and custody of a document is intake
+                // even though it schedules nothing — the same reasoning that
+                // makes a degraded generation refuse here. Gating both lanes is
+                // what keeps `accepting_intake == false` a true statement
+                // rather than a description of one of the two arms.
+                if self.store.intake_paused(GENERATION_ID, now_ms)?.is_some() {
+                    return self.write_refusal(
+                        stream,
+                        request.request_id(),
+                        INTAKE_PAUSED_CATEGORY,
                     );
                 }
                 // The fence is checked here and the row lands in a different
@@ -871,6 +906,92 @@ impl Daemon {
                     state: receipt.state,
                     revision: receipt.revision,
                     duplicate: receipt.duplicate,
+                }
+            }
+            automonique_protocol::admin::AdminCommand::PauseIntake => {
+                // WHAT A PAUSE IS SCOPED TO, AND WHAT THAT COSTS.
+                //
+                // The durable row names `GENERATION_ID` — the identifier, not
+                // the lease epoch that wrote it. Two consequences follow, and
+                // only one of them is obvious:
+                //
+                // - A restart keeps the pause. This daemon always takes the
+                //   same named generation, so a successor process reads the
+                //   same row and comes back with intake closed. That is the
+                //   point: an operator who paused before a crash should not
+                //   have their decision quietly undone by the recovery.
+                // - A *different* generation does not see it. Its intake is
+                //   open on the first tick, and its operator must pause it
+                //   themselves. Nothing here warns them.
+                //
+                // A global pause — one row gating every generation — is the
+                // other reasonable policy, and it is a policy choice rather
+                // than a correctness fix. It is deliberately not implemented:
+                // it would let one operator close intake for a control plane
+                // they may not own, which is a decision for whoever owns this
+                // product to make, not for this handler to assume.
+                let pause = request
+                    .intake_pause()
+                    .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
+                let receipt = match self.store.pause_intake(IntakePauseRequest {
+                    generation_id: GENERATION_ID,
+                    holder_id: self.instance_id.as_str(),
+                    authority_lease_epoch: self.lease_epoch,
+                    actor: pause.actor(),
+                    reason: pause.reason(),
+                    now_ms: unix_millis()?,
+                }) {
+                    Ok(receipt) => receipt,
+                    Err(error) if intake_pause_refusal(&error) => {
+                        return self.write_refusal(stream, request.request_id(), error.category());
+                    }
+                    Err(error) => return Err(DaemonError::Store(error)),
+                };
+                AdminResponse::IntakePaused {
+                    request_id: request.request_id().clone(),
+                    pause_id: u64::try_from(receipt.pause_id)
+                        .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
+                    revision: receipt.revision,
+                }
+            }
+            automonique_protocol::admin::AdminCommand::ResumeIntake => {
+                let resume = request
+                    .intake_resume()
+                    .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
+                let now_ms = unix_millis()?;
+                // The revision the resume presents is read here rather than
+                // supplied by the client: a resume closes whichever pause is
+                // live, and asking an operator to quote a revision they cannot
+                // see would make the command unusable. The store still
+                // compare-and-sets on it inside its own transaction, so a
+                // concurrent writer between this read and that write is
+                // refused rather than overwritten.
+                let Some(live) = self.store.intake_paused(GENERATION_ID, now_ms)? else {
+                    return self.write_refusal(
+                        stream,
+                        request.request_id(),
+                        StoreError::NotPaused.category(),
+                    );
+                };
+                let receipt = match self.store.resume_intake(IntakeResumeRequest {
+                    generation_id: GENERATION_ID,
+                    holder_id: self.instance_id.as_str(),
+                    authority_lease_epoch: self.lease_epoch,
+                    actor: resume.actor(),
+                    expected_revision: live.revision,
+                    now_ms,
+                }) {
+                    Ok(receipt) => receipt,
+                    Err(error) if intake_pause_refusal(&error) => {
+                        return self.write_refusal(stream, request.request_id(), error.category());
+                    }
+                    Err(error) => return Err(DaemonError::Store(error)),
+                };
+                AdminResponse::IntakeResumed {
+                    request_id: request.request_id().clone(),
+                    pause_id: u64::try_from(receipt.pause_id)
+                        .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
+                    revision: receipt.revision,
                 }
             }
             automonique_protocol::admin::AdminCommand::Shutdown => {
@@ -1180,6 +1301,22 @@ const fn run_submission_refusal(error: &RunSubmissionError) -> bool {
         RunSubmissionError::InvalidField(_)
             | RunSubmissionError::Conflict { .. }
             | RunSubmissionError::LogFull { .. }
+    )
+}
+
+/// Whether an intake pause or resume failure is the operator's to act on.
+///
+/// A lost fence, an idempotent repeat and a malformed field are answered to the
+/// client. Storage failure is not: it says the daemon's own durable state is
+/// unsound, and a correlated refusal would present that as an operator error.
+fn intake_pause_refusal(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::InvalidField(_)
+            | StoreError::IdempotencyConflict(_)
+            | StoreError::StaleEpoch
+            | StoreError::AlreadyPaused(_)
+            | StoreError::NotPaused
     )
 }
 

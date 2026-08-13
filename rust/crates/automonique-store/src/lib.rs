@@ -27,7 +27,7 @@ use rusqlite::{
 };
 
 /// The only database schema this build can read and write.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 /// SQLite lock contention is bounded rather than waiting indefinitely.
 pub const BUSY_TIMEOUT: Duration = Duration::from_millis(2_000);
 
@@ -352,6 +352,39 @@ CREATE INDEX telegram_poller_owner
     ON telegram_poller_leases(generation_id, holder_id, poller_epoch);
 "#;
 
+/// Operator intake pauses, in the main database beside the generation they scope.
+///
+/// A pause is scheduler state: it decides whether the very next intake write in
+/// this database is admitted. Putting it in a sibling log the way run
+/// submissions are stored would make the gate and the thing it gates commit
+/// separately, so the row lives here and is fenced by the same generation lease
+/// as every other mutation.
+///
+/// Rows are never deleted. A resumed pause keeps its actor, reason and both
+/// timestamps, which is the whole point of writing it down: the history of who
+/// closed intake and why survives the resume that reopened it. The partial
+/// unique index is what makes "paused" a question with one answer — at most one
+/// unresumed row per generation — while still admitting an unbounded sequence
+/// of closed pause episodes for the same generation over time.
+const MIGRATE_V5_TO_V6: &str = r#"
+CREATE TABLE intake_pauses (
+    pause_id INTEGER PRIMARY KEY,
+    generation_id TEXT NOT NULL REFERENCES generations(generation_id),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    paused_at_ms INTEGER NOT NULL CHECK (paused_at_ms >= 0),
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    resumed_at_ms INTEGER CHECK (resumed_at_ms IS NULL OR resumed_at_ms >= 0),
+    resume_actor TEXT,
+    CHECK (
+        (resumed_at_ms IS NULL AND resume_actor IS NULL)
+        OR (resumed_at_ms IS NOT NULL AND resume_actor IS NOT NULL)
+    )
+) STRICT;
+CREATE UNIQUE INDEX intake_pauses_one_live_per_generation
+    ON intake_pauses(generation_id) WHERE resumed_at_ms IS NULL;
+"#;
+
 /// A durable store error with stable refusal categories.
 #[derive(Debug)]
 pub enum StoreError {
@@ -383,6 +416,13 @@ pub enum StoreError {
     AlreadyTerminal,
     /// The outbox key already belongs to another intent.
     OutboxConflict,
+    /// Intake is already paused for this generation.
+    ///
+    /// The live decision travels with the refusal so a second operator learns
+    /// who closed intake and why, rather than only that their own request lost.
+    AlreadyPaused(Box<PauseRecord>),
+    /// Intake is not paused for this generation, so there is nothing to resume.
+    NotPaused,
     /// Filesystem failure while establishing the private database.
     Io(std::io::Error),
     /// SQLite rejected an operation.
@@ -408,6 +448,8 @@ impl StoreError {
             Self::NotFound(_) => "not_found",
             Self::AlreadyTerminal => "already_terminal",
             Self::OutboxConflict => "outbox_conflict",
+            Self::AlreadyPaused(_) => "intake_already_paused",
+            Self::NotPaused => "intake_not_paused",
             Self::Io(_) => "io",
             Self::Sqlite(_) => "sqlite",
         }
@@ -455,6 +497,12 @@ impl fmt::Display for StoreError {
                 formatter.write_str("run is already terminal with different content")
             }
             Self::OutboxConflict => formatter.write_str("outbox intent key is already in use"),
+            Self::AlreadyPaused(record) => write!(
+                formatter,
+                "intake is already paused for generation {} since {}",
+                record.generation_id, record.paused_at_ms
+            ),
+            Self::NotPaused => formatter.write_str("intake is not paused"),
             Self::Io(error) => write!(formatter, "database filesystem error: {error}"),
             Self::Sqlite(error) => write!(formatter, "sqlite error: {error}"),
         }
@@ -507,6 +555,53 @@ pub struct LeaseRenewal<'a> {
     pub epoch: u64,
     pub now_ms: i64,
     pub ttl_ms: i64,
+}
+
+/// One live operator decision to close intake for a generation.
+///
+/// `observed_ms` is the instant the record was read, not a property of the
+/// pause: a pause has no expiry and does not lapse. It is carried so a caller
+/// that reports "intake is paused" can say when it established that, the same
+/// way [`StatusSnapshot`] carries its own observation instant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseRecord {
+    pub pause_id: i64,
+    pub generation_id: String,
+    pub revision: u64,
+    pub paused_at_ms: i64,
+    pub actor: String,
+    pub reason: String,
+    pub observed_ms: i64,
+}
+
+/// Close intake for one generation under its live authority lease.
+pub struct IntakePauseRequest<'a> {
+    pub generation_id: &'a str,
+    pub holder_id: &'a str,
+    pub authority_lease_epoch: u64,
+    /// Who decided. Recorded verbatim; the store does not authenticate it.
+    pub actor: &'a str,
+    pub reason: &'a str,
+    pub now_ms: i64,
+}
+
+/// Reopen intake by closing the exact live pause a caller has already read.
+pub struct IntakeResumeRequest<'a> {
+    pub generation_id: &'a str,
+    pub holder_id: &'a str,
+    pub authority_lease_epoch: u64,
+    /// Who reopened it. Recorded beside, never over, the pausing actor.
+    pub actor: &'a str,
+    /// Revision the caller observed on the live pause row.
+    pub expected_revision: u64,
+    pub now_ms: i64,
+}
+
+/// Durable identity and fencing revision of one pause decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IntakePauseReceipt {
+    pub pause_id: i64,
+    pub revision: u64,
 }
 
 /// One stable transport delivery.
@@ -1346,6 +1441,161 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Durably close intake for one generation, naming the deciding actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::StaleEpoch`] unless the caller holds the named
+    /// generation's live lease at `now_ms`, and
+    /// [`StoreError::AlreadyPaused`] — carrying the live decision — when this
+    /// generation already has an unresumed pause.
+    pub fn pause_intake(
+        &mut self,
+        request: IntakePauseRequest<'_>,
+    ) -> Result<IntakePauseReceipt, StoreError> {
+        validate_id(request.generation_id, "generation_id")?;
+        validate_id(request.holder_id, "holder_id")?;
+        validate_id(request.actor, "intake_pause_actor")?;
+        validate_id(request.reason, "intake_pause_reason")?;
+        validate_time(request.now_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A pause takes effect at an instant rather than holding a window
+        // open, so the lease need only be live now — unlike a bot lease, which
+        // must outlive the TTL it is about to be granted.
+        require_generation_authority_through(
+            &transaction,
+            request.generation_id,
+            request.holder_id,
+            request.authority_lease_epoch,
+            request.now_ms,
+            request.now_ms,
+        )?;
+        if let Some(live) = live_intake_pause(&transaction, request.generation_id, request.now_ms)?
+        {
+            return Err(StoreError::AlreadyPaused(Box::new(live)));
+        }
+        transaction.execute(
+            "INSERT INTO intake_pauses
+             (generation_id, revision, paused_at_ms, actor, reason, resumed_at_ms, resume_actor)
+             VALUES (?1, 1, ?2, ?3, ?4, NULL, NULL)",
+            params![
+                request.generation_id,
+                request.now_ms,
+                request.actor,
+                request.reason
+            ],
+        )?;
+        let pause_id = transaction.last_insert_rowid();
+        append_event(
+            &transaction,
+            "intake_pause",
+            &pause_id.to_string(),
+            1,
+            request.now_ms,
+            "intake.paused",
+            request.actor.as_bytes(),
+        )?;
+        transaction.commit()?;
+        Ok(IntakePauseReceipt {
+            pause_id,
+            revision: 1,
+        })
+    }
+
+    /// Reopen intake by closing the exact live pause the caller observed.
+    ///
+    /// The pause row is updated, never removed: `actor`/`reason` keep naming
+    /// who closed intake, and `resume_actor` records who reopened it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::StaleEpoch`] without live generation authority,
+    /// [`StoreError::NotPaused`] when no unresumed pause exists, and
+    /// [`StoreError::IdempotencyConflict`] when the live pause has moved past
+    /// the revision the caller read.
+    pub fn resume_intake(
+        &mut self,
+        request: IntakeResumeRequest<'_>,
+    ) -> Result<IntakePauseReceipt, StoreError> {
+        validate_id(request.generation_id, "generation_id")?;
+        validate_id(request.holder_id, "holder_id")?;
+        validate_id(request.actor, "intake_resume_actor")?;
+        validate_time(request.now_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_generation_authority_through(
+            &transaction,
+            request.generation_id,
+            request.holder_id,
+            request.authority_lease_epoch,
+            request.now_ms,
+            request.now_ms,
+        )?;
+        let Some(live) = live_intake_pause(&transaction, request.generation_id, request.now_ms)?
+        else {
+            return Err(StoreError::NotPaused);
+        };
+        if live.revision != request.expected_revision {
+            return Err(StoreError::IdempotencyConflict("intake_pause_revision"));
+        }
+        let next_revision = live
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::InvalidField("intake_pause_revision"))?;
+        let changed = transaction.execute(
+            "UPDATE intake_pauses
+             SET revision = ?3, resumed_at_ms = ?4, resume_actor = ?5
+             WHERE pause_id = ?1 AND revision = ?2 AND resumed_at_ms IS NULL",
+            params![
+                live.pause_id,
+                to_db_u64(live.revision, "intake_pause_revision")?,
+                to_db_u64(next_revision, "intake_pause_revision")?,
+                request.now_ms,
+                request.actor
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::StaleEpoch);
+        }
+        append_event(
+            &transaction,
+            "intake_pause",
+            &live.pause_id.to_string(),
+            next_revision,
+            request.now_ms,
+            "intake.resumed",
+            request.actor.as_bytes(),
+        )?;
+        transaction.commit()?;
+        Ok(IntakePauseReceipt {
+            pause_id: live.pause_id,
+            revision: next_revision,
+        })
+    }
+
+    /// Read the live pause for one generation, if intake is closed.
+    ///
+    /// This is scoped to `generation_id` and nothing else: a pause outlives the
+    /// lease epoch that wrote it, which is what makes it survive a restart of
+    /// the same named generation. A different generation has its own answer.
+    pub fn intake_paused(
+        &mut self,
+        generation_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<PauseRecord>, StoreError> {
+        validate_id(generation_id, "generation_id")?;
+        validate_time(now_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let record = live_intake_pause(&transaction, generation_id, now_ms)?;
+        transaction.commit()?;
+        Ok(record)
     }
 
     /// Durably accept one transport delivery, replaying the same stable key.
@@ -3455,19 +3705,26 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
         }
         migrate_v2_to_v3(connection)?;
         migrate_v3_to_v4(connection)?;
-        return migrate_v4_to_v5(connection);
+        migrate_v4_to_v5(connection)?;
+        return migrate_v5_to_v6(connection);
     }
     if version == 2 {
         migrate_v2_to_v3(connection)?;
         migrate_v3_to_v4(connection)?;
-        return migrate_v4_to_v5(connection);
+        migrate_v4_to_v5(connection)?;
+        return migrate_v5_to_v6(connection);
     }
     if version == 3 {
         migrate_v3_to_v4(connection)?;
-        return migrate_v4_to_v5(connection);
+        migrate_v4_to_v5(connection)?;
+        return migrate_v5_to_v6(connection);
     }
     if version == 4 {
-        return migrate_v4_to_v5(connection);
+        migrate_v4_to_v5(connection)?;
+        return migrate_v5_to_v6(connection);
+    }
+    if version == 5 {
+        return migrate_v5_to_v6(connection);
     }
     if version != 0 {
         return Err(StoreError::SchemaVersion {
@@ -3491,6 +3748,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
     transaction.execute_batch(MIGRATE_V2_TO_V3)?;
     transaction.execute_batch(MIGRATE_V3_TO_V4)?;
     transaction.execute_batch(MIGRATE_V4_TO_V5)?;
+    transaction.execute_batch(MIGRATE_V5_TO_V6)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -3515,6 +3773,14 @@ fn migrate_v3_to_v4(connection: &mut Connection) -> Result<(), StoreError> {
 fn migrate_v4_to_v5(connection: &mut Connection) -> Result<(), StoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(MIGRATE_V4_TO_V5)?;
+    transaction.pragma_update(None, "user_version", 5)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v5_to_v6(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(MIGRATE_V5_TO_V6)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -3577,6 +3843,47 @@ fn require_generation_authority_through(
     } else {
         Err(StoreError::StaleEpoch)
     }
+}
+
+/// The one unresumed pause for a generation, read inside a caller's transaction.
+///
+/// The partial unique index is what makes `query_row` the right shape here:
+/// two live pauses for one generation are unrepresentable, so this cannot be
+/// silently reading the first of several.
+fn live_intake_pause(
+    transaction: &Transaction<'_>,
+    generation_id: &str,
+    observed_ms: i64,
+) -> Result<Option<PauseRecord>, StoreError> {
+    transaction
+        .query_row(
+            "SELECT pause_id, revision, paused_at_ms, actor, reason
+             FROM intake_pauses
+             WHERE generation_id = ?1 AND resumed_at_ms IS NULL",
+            [generation_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(|(pause_id, raw_revision, paused_at_ms, actor, reason)| {
+            Ok(PauseRecord {
+                pause_id,
+                generation_id: generation_id.to_owned(),
+                revision: from_db_u64(raw_revision, "intake_pause_revision")?,
+                paused_at_ms,
+                actor,
+                reason,
+                observed_ms,
+            })
+        })
+        .transpose()
 }
 
 fn require_exact_telegram_poller(
@@ -4307,6 +4614,167 @@ mod migration_tests {
         generation_id: Option<String>,
         holder_id: Option<String>,
         poller_epoch: Option<i64>,
+    }
+
+    /// Build the exact canonical v5 shape through the migration path that
+    /// produces it, rather than restating the schema as a literal here.
+    fn canonical_v5(connection: &mut Connection) {
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        connection.execute_batch(SCHEMA_V2).expect("v2 base");
+        connection
+            .execute_batch(MIGRATE_V2_TO_V3)
+            .expect("v3 schema");
+        connection
+            .execute_batch(MIGRATE_V3_TO_V4)
+            .expect("v4 schema");
+        connection
+            .execute_batch(MIGRATE_V4_TO_V5)
+            .expect("canonical v5 schema");
+        connection
+            .pragma_update(None, "user_version", 5)
+            .expect("v5 marker");
+    }
+
+    #[test]
+    fn fresh_database_initializes_at_the_pause_bearing_version() {
+        let mut connection = Connection::open_in_memory().expect("memory database");
+        initialize_or_validate_schema(&mut connection).expect("fresh initialization");
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, 6);
+        let pauses: i64 = connection
+            .query_row("SELECT count(*) FROM intake_pauses", [], |row| row.get(0))
+            .expect("pause table exists");
+        assert_eq!(pauses, 0);
+        // The partial index is the invariant, not decoration: without it two
+        // live pauses for one generation would be representable and
+        // `live_intake_pause` would be reading the first of several.
+        let index: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE name = 'intake_pauses_one_live_per_generation'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("partial unique index");
+        assert!(index.contains("UNIQUE"), "{index}");
+        assert!(index.contains("WHERE resumed_at_ms IS NULL"), "{index}");
+    }
+
+    #[test]
+    fn populated_canonical_v5_migrates_to_empty_pause_state_preserving_every_row() {
+        let mut connection = Connection::open_in_memory().expect("memory database");
+        canonical_v5(&mut connection);
+        connection
+            .execute(
+                "INSERT INTO generations
+                 VALUES ('foreground', 3, 'active', 'holder-v5', 4, 900)",
+                [],
+            )
+            .expect("v5 generation");
+        connection
+            .execute(
+                "INSERT INTO inbox
+                 (transport, transport_key, scope, payload, received_ms, state, revision)
+                 VALUES ('local.synthetic', 'preserved-v5', 'scope:v5', X'01', 7, 'pending', 1)",
+                [],
+            )
+            .expect("v5 inbox");
+        connection
+            .execute(
+                "INSERT INTO domain_events
+                 (aggregate_kind, aggregate_id, revision, schema_version,
+                  occurred_ms, kind, payload)
+                 VALUES ('generation', 'foreground', 3, 1, 7,
+                         'generation.lease_acquired', X'02')",
+                [],
+            )
+            .expect("v5 event");
+        connection
+            .execute(
+                "INSERT INTO telegram_poller_leases
+                 (bot_id, revision, generation_id, holder_id, authority_lease_epoch,
+                  poller_epoch, expires_ms)
+                 VALUES (7, 2, 'foreground', 'holder-v5', 4, 3, 800)",
+                [],
+            )
+            .expect("v5 poller lease");
+
+        initialize_or_validate_schema(&mut connection).expect("v6 migration");
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // Every table the v5 database carried keeps its rows: this migration
+        // adds state and rewrites none.
+        for (table, expected) in [
+            ("generations", 1),
+            ("inbox", 1),
+            ("domain_events", 1),
+            ("telegram_poller_leases", 1),
+            ("intake_pauses", 0),
+        ] {
+            let rows: i64 = connection
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap_or_else(|error| panic!("count {table}: {error}"));
+            assert_eq!(rows, expected, "{table} row count changed across v5 -> v6");
+        }
+        let inbox: (String, String, i64) = connection
+            .query_row(
+                "SELECT transport_key, scope, revision FROM inbox",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("preserved inbox row");
+        assert_eq!(inbox, ("preserved-v5".to_owned(), "scope:v5".to_owned(), 1));
+        let generation: (i64, String, i64, i64) = connection
+            .query_row(
+                "SELECT revision, lease_holder, lease_epoch, lease_expires_ms
+                 FROM generations WHERE generation_id = 'foreground'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("preserved generation");
+        assert_eq!(generation, (3, "holder-v5".to_owned(), 4, 900));
+        let poller: (i64, String, i64) = connection
+            .query_row(
+                "SELECT revision, holder_id, poller_epoch FROM telegram_poller_leases
+                 WHERE bot_id = 7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("preserved poller lease");
+        assert_eq!(poller, (2, "holder-v5".to_owned(), 3));
+
+        // The migrated database is writable as v6, and the new table's
+        // foreign key resolves against the generation that survived.
+        connection
+            .execute(
+                "INSERT INTO intake_pauses
+                 (generation_id, revision, paused_at_ms, actor, reason,
+                  resumed_at_ms, resume_actor)
+                 VALUES ('foreground', 1, 10, 'operator:a', 'draining', NULL, NULL)",
+                [],
+            )
+            .expect("pause writable after migration");
+        let orphan = connection.execute(
+            "INSERT INTO intake_pauses
+             (generation_id, revision, paused_at_ms, actor, reason,
+              resumed_at_ms, resume_actor)
+             VALUES ('absent', 1, 10, 'operator:a', 'draining', NULL, NULL)",
+            [],
+        );
+        assert!(
+            orphan.is_err(),
+            "a pause must not name a generation that does not exist"
+        );
     }
 
     #[test]

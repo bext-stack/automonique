@@ -694,9 +694,11 @@ fn admin_status<W: Write, E: Write>(
         serde_json::json!({
             "accepting_intake": status.accepting_intake(),
             "event_cursor": status.event_cursor(),
+            "execution_state": status.execution_state().as_str(),
             "generation": status.generation(),
             "inbox_pending": status.inbox_pending(),
             "instance_id": status.instance_id().as_str(),
+            "intake_paused": status.intake_paused(),
             "outbox_pending": status.outbox_pending(),
             "operational": {
                 "observed_ms": operational.observed_ms(),
@@ -723,7 +725,7 @@ fn admin_status<W: Write, E: Write>(
             + "\n"
     } else {
         format!(
-            "Automonique daemon: {}\ninstance: {}\ngeneration: {}\nevent cursor: {}\ninbox pending: {}\noutbox pending: {}\nrunning: {}\naccepting intake: {}\ntelegram: {}\ntelegram poller epoch: {}\nobserved ms: {}\nreconciliation pending: {}\noutbox ready: {}\noutbox delayed: {}\noutbox live: {}\noutbox ambiguous: {}\noutbox delivered: {}\noutbox dead-lettered: {}\noutbox oldest ready age ms: {}\ntelegram pollers live: {}\ntelegram pollers expired: {}\ntelegram offset lag: {}\nprovider available: {}\nsandbox launch refusals: {}\n",
+            "Automonique daemon: {}\ninstance: {}\ngeneration: {}\nevent cursor: {}\ninbox pending: {}\noutbox pending: {}\nrunning: {}\naccepting intake: {}\nintake paused: {}\nexecution: {}\ntelegram: {}\ntelegram poller epoch: {}\nobserved ms: {}\nreconciliation pending: {}\noutbox ready: {}\noutbox delayed: {}\noutbox live: {}\noutbox ambiguous: {}\noutbox delivered: {}\noutbox dead-lettered: {}\noutbox oldest ready age ms: {}\ntelegram pollers live: {}\ntelegram pollers expired: {}\ntelegram offset lag: {}\nprovider available: {}\nsandbox launch refusals: {}\n",
             status.state().as_str(),
             status.instance_id().as_str(),
             status.generation(),
@@ -732,6 +734,8 @@ fn admin_status<W: Write, E: Write>(
             status.outbox_pending(),
             status.running(),
             status.accepting_intake(),
+            status.intake_paused(),
+            status.execution_state().as_str(),
             status.telegram_state().as_str(),
             status
                 .telegram_poller_epoch()
