@@ -13,6 +13,7 @@ pub mod command_registry;
 pub mod compat;
 pub mod composer;
 pub mod connector;
+pub mod connector_conformance;
 pub mod context;
 pub mod digest;
 pub mod event;
