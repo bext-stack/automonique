@@ -21,6 +21,7 @@ pub mod connector_conformance;
 pub mod context;
 pub mod digest;
 pub mod event;
+pub mod execute_api;
 pub mod host;
 pub mod identity;
 pub mod interaction;

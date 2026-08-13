@@ -52,13 +52,15 @@ use automonique_protocol::batch_runner::{
 };
 use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, RequestId, decode_frame, encode_frame};
 use automonique_protocol::digest::{ALGORITHM, Sha256, Sha256Digest};
+use automonique_protocol::execute_api::{ExecuteRefusal, ExecuteRequest, ExecuteResponse};
 use automonique_protocol::journal::{CursorResume, RetainedRange};
 use automonique_protocol::runs_api::{
-    Continuation, LifecycleCoverage, ListRuns, RunCursor, RunDetailView, RunListPage, RunState,
-    RunSummary, RunsRefusal, RunsRequest, RunsResponse, SubmissionState,
+    Continuation, LifecycleCoverage, ListRuns, MAX_LIFECYCLE_EVENTS, RunCursor, RunDetailView,
+    RunLifecycleEvent, RunListPage, RunState, RunSummary, RunsRefusal, RunsRequest, RunsResponse,
+    SpoolEventKind, SubmissionState,
 };
 use automonique_protocol::tools::RunId;
-use automonique_runner::{RunSpec, RunSpecDecodeError};
+use automonique_runner::{RunSpec, RunSpecDecodeError, Spool};
 use automonique_store::approval_ledger::{
     ApprovalDecision as StoreApprovalDecision, ApprovalDecisionRecord,
     ApprovalDisposition as StoreApprovalDisposition, ApprovalEntry, ApprovalLedger,
@@ -95,6 +97,7 @@ use nix::unistd::geteuid;
 
 pub mod attempt_host;
 pub mod cancel_custody;
+pub mod execute;
 mod synthetic;
 mod telegram;
 
@@ -198,6 +201,17 @@ pub const GENERATION_AUDIT_NAME: &str = concat!("generation-audit", ".sqlite3");
 
 /// Maximum administration payload accepted by the daemon.
 pub const MAX_ADMIN_PAYLOAD_BYTES: usize = MAX_ADMIN_CANONICAL_BYTES;
+
+/// Ceiling this daemon re-opens a finished run's spool under, to read its
+/// lifecycle.
+///
+/// Deliberately above any single document's own spool budget rather than equal
+/// to it. [`Spool::open`] refuses a file larger than the ceiling it is given, so
+/// a reader that re-used the writer's budget would be unable to read exactly the
+/// spool that had filled it — the one a reader most wants to see. Reading more
+/// than a document budgeted for costs this process memory it has already
+/// bounded; refusing to read it would cost the record.
+const MAX_READ_SPOOL_BYTES: u64 = 64 * 1024 * 1024;
 
 const GENERATION_ID: &str = "foreground";
 const LEASE_TTL_MS: i64 = 30_000;
@@ -544,7 +558,16 @@ pub struct Daemon {
     /// the generation fence is still held — this type has a `Drop` impl, so a
     /// field cannot otherwise be moved out. It is `Some` for the whole life of
     /// a daemon a caller can observe.
-    attempt_host: Option<DaemonAttemptHost>,
+    ///
+    /// Held behind an [`Arc`] because [`execute`] lends it to every worker
+    /// thread that has an attempt registered on it. That is the *only* sharing
+    /// of this value, and it does not weaken the composition
+    /// [`attempt_host`](crate::attempt_host) establishes: an `Arc` is one
+    /// dispatcher over one ledger reached from several threads, not two
+    /// dispatchers. [`Daemon::serve`] joins every worker before it unwraps the
+    /// `Arc` to dispose of it, so disposal still happens exactly once and only
+    /// when nothing can still register.
+    attempt_host: Option<Arc<DaemonAttemptHost>>,
     /// The durable history of who has held this generation.
     ///
     /// A plain field, like [`Daemon::run_index`]: it owns no dispatcher, and
@@ -560,6 +583,20 @@ pub struct Daemon {
     /// crate asserting a fact about another crate's schema.
     tenure_revision: u64,
     execution_state: automonique_protocol::admin::ExecutionState,
+    /// The lane that starts contained attempts for custodied documents.
+    ///
+    /// Opened on every host, including one that can never execute anything:
+    /// what a host cannot do is answered as a typed refusal on the wire, not by
+    /// a daemon that declines to start. See [`execute::ExecutionLane`].
+    ///
+    /// `Option` for the reason [`Daemon::attempt_host`] is, and it is the same
+    /// reason twice over: this type has a `Drop` impl, so a field cannot be
+    /// moved out of it, and [`Daemon::serve`] must *consume* the lane while the
+    /// generation fence is still held — joining its workers and releasing its
+    /// reference to the attempt host are both ordered operations, not disposal
+    /// a drop could perform. It is `Some` for the whole life of a daemon a
+    /// caller can observe.
+    execution: Option<execute::ExecutionLane>,
 }
 
 struct SocketCleanup {
@@ -740,8 +777,27 @@ impl Daemon {
         // This is also the moment the dispatcher's single-instance requirement
         // is satisfied — one bound endpoint and one generation lease per state
         // directory means one dispatcher per ledger file, with no new lock.
-        let attempt_host = DaemonAttemptHost::open(config.run_cancel_ledger_path())
-            .map_err(|error| DaemonError::AttemptHostFailed(error.category()))?;
+        let attempt_host = Arc::new(
+            DaemonAttemptHost::open(config.run_cancel_ledger_path())
+                .map_err(|error| DaemonError::AttemptHostFailed(error.category()))?,
+        );
+
+        // The execution lane opens last, beneath the same fence, and probes
+        // nothing: it reads one environment variable and remembers the
+        // measurement above. Discovering and preparing a cgroup domain is
+        // deferred to the first request, because preparing one moves this
+        // process into a supervisor leaf, and a daemon nobody asks to execute
+        // anything must not have its own placement changed.
+        let execution_state = Self::measure_execution_state();
+        let execution = execute::ExecutionLane::open(
+            Arc::clone(&attempt_host),
+            state_dir.clone(),
+            config.run_index_path(),
+            matches!(
+                execution_state,
+                automonique_protocol::admin::ExecutionState::SandboxEnforceableNoLane
+            ),
+        );
         socket_cleanup.disarm();
 
         Ok(Self {
@@ -763,7 +819,8 @@ impl Daemon {
             attempt_host: Some(attempt_host),
             generation_audit,
             tenure_revision: tenure.revision,
-            execution_state: Self::measure_execution_state(),
+            execution_state,
+            execution: Some(execution),
         })
     }
 
@@ -781,11 +838,14 @@ impl Daemon {
     /// after [`Daemon::serve`] disposed of it, which no caller can observe
     /// because `serve` consumes the daemon.
     ///
-    /// Nothing in this build registers an attempt against it: no administration
-    /// command routes a cancel, so a running daemon's registry stays empty.
+    /// [`execute::ExecutionLane`] registers every attempt it starts against
+    /// this host, so a daemon with a live attempt has a non-empty registry and
+    /// a cancellation delivered here reaches that attempt's process tree. No
+    /// administration command routes a cancel, so the registry is still empty
+    /// on a daemon that has been asked to run nothing.
     #[must_use]
     pub fn attempt_host(&self) -> Option<&DaemonAttemptHost> {
-        self.attempt_host.as_ref()
+        self.attempt_host.as_deref()
     }
 
     /// Serve until the supplied stop flag is set or an authenticated shutdown
@@ -843,18 +903,38 @@ impl Daemon {
                 Err(error) => break Err(DaemonError::Io(error)),
             }
         };
-        // Cancellation dispatch ends first, beneath the still-held generation
+        // LIVE ATTEMPTS END FIRST, AND THEY END BY FINISHING.
+        //
+        // Every worker holds a registration on the attempt host and writes to
+        // the read model this generation owns, so both have to outlive it.
+        // Joining also means this daemon never returns while a contained
+        // process tree is still running under a supervisor that has stopped
+        // answering for it. The lane is moved out and consumed rather than
+        // borrowed, because ending it also releases its own reference to the
+        // attempt host, which is what makes the unwrap below possible.
+        if let Some(execution) = self.execution.take() {
+            execution.shutdown();
+        }
+        // Cancellation dispatch ends next, beneath the still-held generation
         // fence. The lease is what makes "one daemon is one dispatcher" true,
         // so this process stops owning the ledger before it stops owning the
         // generation: no successor can hold the generation while our dispatcher
         // is still live over the same file. Disposal reports exactly one state
         // — a host a panicking sink poisoned, whose last delivery is unknown —
         // and reporting it is why shutdown does not simply drop the field.
-        let attempt_host_disposal = self
-            .attempt_host
-            .take()
-            .map_or(Ok(()), DaemonAttemptHost::dispose)
-            .map_err(|error| DaemonError::AttemptHostFailed(error.category()));
+        //
+        // Unwrapping the `Arc` is the proof that the join above did its job: a
+        // surviving clone means a worker is still live, which is a state this
+        // daemon cannot dispose from and will not pretend it did.
+        let attempt_host_disposal = self.attempt_host.take().map_or(Ok(()), |host| {
+            Arc::try_unwrap(host).map_or(
+                Err(DaemonError::AttemptHostFailed("attempt_host_still_shared")),
+                |host| {
+                    host.dispose()
+                        .map_err(|error| DaemonError::AttemptHostFailed(error.category()))
+                },
+            )
+        });
         // The bot lease releases before the generation lease so its release
         // still runs under a live generation authority; both results defer to
         // any primary serve failure.
@@ -928,14 +1008,13 @@ impl Daemon {
     /// refusal is the expected truthful state on an undelegated host.
     fn measure_execution_state() -> automonique_protocol::admin::ExecutionState {
         use automonique_protocol::admin::ExecutionState;
-        use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
+        use automonique_runner::capability::HostCapabilities;
 
-        let selection = HostCapabilities::probe().select_mode(&[
-            BoundaryProperty::DescendantContainment,
-            BoundaryProperty::FilesystemRestriction,
-            BoundaryProperty::TcpDenial,
-            BoundaryProperty::SyscallRestriction,
-        ]);
+        // The property set is [`execute::ENFORCED_PROPERTIES`] rather than a
+        // list written here, so the measurement this status reports and the
+        // host features the execution lane offers cannot disagree about which
+        // properties this build enforces.
+        let selection = HostCapabilities::probe().select_mode(&execute::ENFORCED_PROPERTIES);
         match selection {
             Ok(_) => ExecutionState::SandboxEnforceableNoLane,
             Err(_) => ExecutionState::SandboxUnavailableNoLane,
@@ -991,12 +1070,12 @@ impl Daemon {
     /// Authenticate the peer, read one bounded frame, and hand it to the lane
     /// its envelope names.
     ///
-    /// The socket serves five protocols. Which one a frame belongs to is read
+    /// The socket serves six protocols. Which one a frame belongs to is read
     /// off its declared protocol name by
     /// [`LocalRequest::from_canonical_bytes`], never guessed and never tried in
     /// sequence, so an administration client, a Runs client, an Automation
-    /// client, an Approval client and a Batch client receive their own lane's
-    /// refusals rather than each other's.
+    /// client, an Approval client, a Batch client and an Execute client receive
+    /// their own lane's refusals rather than each other's.
     fn handle_stream(
         &mut self,
         stream: &mut UnixStream,
@@ -1014,6 +1093,7 @@ impl Daemon {
             LocalRequest::Automation(request) => self.handle_automation(stream, &request),
             LocalRequest::Approval(request) => self.handle_approval(stream, &request),
             LocalRequest::Batch(request) => self.handle_batch(stream, &request),
+            LocalRequest::Execute(request) => self.handle_execute(stream, &request),
         }
     }
 
@@ -1739,36 +1819,110 @@ impl Daemon {
                 refusal: RunsRefusal::UnknownRun,
             });
         };
-        // THE LIFECYCLE IS THE SUBSCRIBE LANE'S, NOT THIS HANDLER'S.
+        // THE LIFECYCLE COMES FROM THE RUN'S OWN DURABLE SPOOL.
         //
-        // The index holds a state and a last sequence. It does not hold the
-        // events themselves — those live in the runner's durable spool, one
-        // directory per run, served by that endpoint's `subscribe`. So a view
-        // built here carries no lifecycle at all, and `LifecycleCoverage`
-        // makes that a statement rather than an omission: `complete` with an
-        // empty lifecycle is only coherent for a `ready` run at sequence zero,
-        // which is exactly what a run whose events do not exist is.
+        // The index holds a state and a last sequence; it does not hold the
+        // events. Those live in the runner's hash-chained spool, one directory
+        // per run, written by the execution lane's worker.
         //
-        // A row that has moved cannot be served from here at all. `truncated`
-        // requires at least one carried event, so this handler would have to
-        // invent one or misdeclare coverage, and it will do neither. Nothing
-        // in this build advances an index row — no execution lane writes a
-        // spool — so this is unreachable today; when that lane lands, this
-        // arm reads the spool rather than growing a synthetic event.
-        if record.spool_state != RunSpoolState::Ready || record.last_sequence != 0 {
-            return Err(DaemonError::ProtocolRefused("run_lifecycle_unavailable"));
+        // A row still at `ready` and sequence zero has no spool to read, and
+        // `LifecycleCoverage` makes that a statement rather than an omission:
+        // `complete` with an empty lifecycle is only coherent for exactly that
+        // row, which is what a run whose events do not exist is.
+        if record.spool_state == RunSpoolState::Ready && record.last_sequence == 0 {
+            let view = RunDetailView::new(
+                self.summary(record)?,
+                record.last_sequence,
+                Vec::new(),
+                LifecycleCoverage::Complete,
+            )
+            .map_err(runs_refused)?;
+            return Ok(RunsResponse::RunDetail {
+                request_id: request_id.clone(),
+                view,
+            });
         }
+        // THE SPOOL IS THE AUTHORITY FOR A ROW THAT HAS MOVED.
+        //
+        // The index row is a *writer's last report*; the spool is what the run
+        // wrote. They can disagree in exactly one direction — a worker that
+        // reached a terminal event and then failed to advance the row — and a
+        // view that carried the spool's events beside the row's state would be
+        // refused by `RunDetailView` for contradicting itself. So the state,
+        // the last sequence and the events all come from the one place, and the
+        // summary is rebuilt on it.
+        let (lifecycle, state) = self.lifecycle(&record.run_id)?;
+        let last_sequence = lifecycle.last().map_or(0, |event| event.sequence());
+        let (carried, coverage) = if lifecycle.len() > MAX_LIFECYCLE_EVENTS {
+            // A truncated view carries a *prefix*, not a tail: `resume_cursor`
+            // is exclusive and a subscriber resumes from it, so the events this
+            // view omits must be the ones after the last carried sequence.
+            (
+                lifecycle[..MAX_LIFECYCLE_EVENTS].to_vec(),
+                LifecycleCoverage::Truncated,
+            )
+        } else {
+            (lifecycle, LifecycleCoverage::Complete)
+        };
         let view = RunDetailView::new(
-            self.summary(record)?,
-            record.last_sequence,
-            Vec::new(),
-            LifecycleCoverage::Complete,
+            self.summary_in_state(record, state)?,
+            last_sequence,
+            carried,
+            coverage,
         )
         .map_err(runs_refused)?;
         Ok(RunsResponse::RunDetail {
             request_id: request_id.clone(),
             view,
         })
+    }
+
+    /// Read one run's durable lifecycle skeleton out of its spool.
+    ///
+    /// # Why this can refuse a live run
+    ///
+    /// [`Spool::open`] takes an **exclusive** `flock` for as long as the handle
+    /// exists, and the execution lane's backend holds exactly that lock for the
+    /// whole of an attempt. So a detail read of a run that is running right now
+    /// cannot open its spool, and this refuses rather than answering.
+    ///
+    /// That is a real gap and it is named rather than papered over. The two
+    /// alternatives were both worse: parsing the event file behind the lock
+    /// would be a second reader of a record whose writer is mid-append, and
+    /// synthesising a placeholder event would put a lifecycle in the answer
+    /// that no run ever wrote. Closing it properly needs a read-only spool
+    /// opener in the runner, which this lane may not add. Until then a live
+    /// run is listed by [`Daemon::list_runs`] — which never touches a spool —
+    /// and read in full once it has ended.
+    /// Re-opening also re-verifies the spool's hash chain, so an answer built
+    /// here is an answer built from a record that was intact when it was read.
+    fn lifecycle(&self, run_id: &str) -> Result<(Vec<RunLifecycleEvent>, RunState), DaemonError> {
+        let unavailable = || DaemonError::ProtocolRefused("run_lifecycle_unavailable");
+        // The lane owns the directory layout, so the read asks it rather than
+        // rebuilding the path. A daemon whose lane has been consumed is one
+        // that is shutting down, and it answers no reads.
+        let root = self
+            .execution
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .spool_root(run_id);
+        let spool = Spool::open(&root, run_id, MAX_READ_SPOOL_BYTES).map_err(|_| unavailable())?;
+        let events = spool.events_after(0).map_err(|_| unavailable())?;
+        let mut lifecycle = Vec::with_capacity(events.len());
+        for event in &events {
+            let at = i64::try_from(event.at_millis())
+                .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?;
+            lifecycle.push(
+                RunLifecycleEvent::new(
+                    event.sequence(),
+                    automonique_protocol::primitives::EpochMillis::from_millis(at),
+                    lifecycle_kind(event.kind()),
+                    lifecycle_authority(event.authority()),
+                )
+                .map_err(runs_refused)?,
+            );
+        }
+        Ok((lifecycle, spool_run_state(spool.status().state())))
     }
 
     /// Join one index row against the custody it derives from.
@@ -1782,6 +1936,21 @@ impl Daemon {
     /// drop the whole retention rule exists to prevent; refusing makes a
     /// broken read model visible on the first read instead of on none.
     fn summary(&self, record: &RunIndexRecord) -> Result<RunSummary, DaemonError> {
+        self.summary_in_state(record, run_state(record.spool_state))
+    }
+
+    /// [`Daemon::summary`], with the run state supplied rather than read off the
+    /// index row.
+    ///
+    /// The one caller that supplies it is [`Daemon::run_detail`], which has just
+    /// read the run's own spool and must not present a view whose summary
+    /// contradicts the events beside it. Every other field still comes from the
+    /// row and the custody it derives from.
+    fn summary_in_state(
+        &self,
+        record: &RunIndexRecord,
+        state: RunState,
+    ) -> Result<RunSummary, DaemonError> {
         let entry = self
             .run_submissions
             .run_submissions(&record.run_id)
@@ -1802,7 +1971,7 @@ impl Daemon {
                 .map_err(|_| DaemonError::RunIndexFailed("run_index_run_id_ungrammatical"))?,
             checked_row_id(record.submission_id)?,
             spec_digest,
-            run_state(record.spool_state),
+            state,
             submission_state(entry.state),
             automonique_protocol::primitives::EpochMillis::from_millis(entry.accepted_at_ms),
         )
@@ -1877,6 +2046,128 @@ impl Daemon {
             }
         }
         Ok(low)
+    }
+
+    /// Start one run already in custody.
+    ///
+    /// # This is the lane that acts
+    ///
+    /// Every other handler on this socket ends at a durable row and says so.
+    /// This one starts a contained process, so it is gated by everything the
+    /// intake arms are gated by *and* by everything
+    /// [`execute::ExecutionLane`] refuses on:
+    ///
+    /// - **Fenced**, like every arm: a daemon that has lost its generation must
+    ///   not start work on state another generation now owns.
+    /// - **Closed by a degraded generation and by an operator pause.** Unlike
+    ///   the Runs read lane, and unlike the Automation and Approval control
+    ///   lanes, this one takes the intake gates. Those lanes were left open
+    ///   because reading what is held, and withdrawing something from service,
+    ///   are what an operator repairing a generation needs to do. Starting a
+    ///   process is the opposite: an operator who closed intake wants no new
+    ///   work beginning, and a submission already in custody is still new work
+    ///   the moment somebody asks for it to run.
+    ///
+    /// # What an accepted answer means
+    ///
+    /// One attempt was started. It is running when the answer is written, so
+    /// the answer carries no outcome — [`Daemon::handle_runs`] is where one is
+    /// observed, once the worker has advanced the read model. A refusal means
+    /// nothing was started and nothing was written.
+    fn handle_execute(
+        &mut self,
+        stream: &mut UnixStream,
+        request: &ExecuteRequest,
+    ) -> Result<(), DaemonError> {
+        let now_ms = unix_millis()?;
+        let snapshot = self.store.status_snapshot_at(GENERATION_ID, now_ms)?;
+        let generation = snapshot.generation().ok_or(StoreError::StaleEpoch)?;
+        if generation.holder_id() != self.instance_id.as_str()
+            || generation.lease_epoch() != self.lease_epoch
+            || generation.lease_expires_ms() != self.lease_expires_ms
+            || generation.lease_expires_ms() <= now_ms
+        {
+            return Err(DaemonError::Store(StoreError::StaleEpoch));
+        }
+        let degraded =
+            self.reconciliation_run_id.is_some() || snapshot_requires_reconciliation(&snapshot);
+        let paused = self.store.intake_paused(GENERATION_ID, now_ms)?.is_some();
+
+        let ExecuteRequest::ExecuteRun { request_id, run_id } = request;
+        let response = match self.start_run(run_id, degraded, paused) {
+            Ok(submission_id) => {
+                ExecuteResponse::accepted(request_id.clone(), run_id.clone(), submission_id)
+                    .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
+            }
+            Err(refusal) => ExecuteResponse::Refused {
+                request_id: request_id.clone(),
+                refusal,
+            },
+        };
+        let response = response
+            .to_message()
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
+            .to_canonical_bytes();
+        let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + response.len());
+        encode_frame(&response, &mut frame)
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
+        stream.write_all(&frame)?;
+        stream.flush()?;
+        Ok(())
+    }
+
+    /// Resolve one run identity to the exact document and read-model row an
+    /// attempt would run, and hand both to the lane.
+    ///
+    /// The join is the same one [`Daemon::summary`] performs, and it is
+    /// performed for the same reason: the index says which submission is the
+    /// run's most recent, and custody holds that submission's bytes. A lane
+    /// handed a document from one row and a revision from another would advance
+    /// the wrong row on terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ExecuteRefusal`] the caller is owed. A store failure is
+    /// [`ExecuteRefusal::ExecutionUnavailable`] rather than a daemon error: the
+    /// caller asked whether their run could start, and "this daemon's own state
+    /// would not answer" is a truthful no rather than a dropped connection.
+    fn start_run(
+        &mut self,
+        run_id: &RunId,
+        degraded: bool,
+        paused: bool,
+    ) -> Result<u64, ExecuteRefusal> {
+        if degraded {
+            return Err(ExecuteRefusal::GenerationDegraded);
+        }
+        if paused {
+            return Err(ExecuteRefusal::IntakePaused);
+        }
+        let records = self
+            .run_index
+            .by_run_id(run_id.as_str())
+            .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
+        let record = records.last().ok_or(ExecuteRefusal::UnknownRun)?;
+        // A row that has already moved is not startable, and saying so is what
+        // makes "one attempt per submission" enforceable across restarts rather
+        // than only within one process's live set.
+        if record.spool_state != RunSpoolState::Ready || record.last_sequence != 0 {
+            return Err(ExecuteRefusal::RunNotReady);
+        }
+        let entry = self
+            .run_submissions
+            .run_submissions(&record.run_id)
+            .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?
+            .into_iter()
+            .find(|entry| entry.submission_id == record.submission_id)
+            .ok_or(ExecuteRefusal::ExecutionUnavailable)?;
+        let submission_id =
+            u64::try_from(entry.submission_id).map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
+        self.execution
+            .as_mut()
+            .ok_or(ExecuteRefusal::ExecutionUnavailable)?
+            .start(&entry.document, record.submission_id, record.revision)?;
+        Ok(submission_id)
     }
 
     /// Answer one operation on the native Automation control API.
@@ -2616,6 +2907,53 @@ const fn spool_state(state: RunState) -> RunSpoolState {
         RunState::Failed => RunSpoolState::Failed,
         RunState::Cancelled => RunSpoolState::Cancelled,
         RunState::TimedOut => RunSpoolState::TimedOut,
+    }
+}
+
+/// Translate the runner spool's own state vocabulary into the wire's.
+///
+/// A third translation beside [`run_state`] and [`spool_state`], and
+/// deliberately not routed through either: this one crosses from the runner to
+/// the wire without the store's vocabulary in the middle, so a read of a spool
+/// never depends on a row agreeing with it. All three are exhaustive matches,
+/// so a variant added anywhere fails to compile rather than silently mapping.
+const fn spool_run_state(state: automonique_runner::RunState) -> RunState {
+    match state {
+        automonique_runner::RunState::Ready => RunState::Ready,
+        automonique_runner::RunState::Running => RunState::Running,
+        automonique_runner::RunState::Completed => RunState::Completed,
+        automonique_runner::RunState::Failed => RunState::Failed,
+        automonique_runner::RunState::Cancelled => RunState::Cancelled,
+        automonique_runner::RunState::TimedOut => RunState::TimedOut,
+    }
+}
+
+/// Translate one durable spool event kind onto the wire's.
+///
+/// `runs_api` carries [`SpoolEventKind`] precisely because
+/// `automonique-protocol` cannot import the runner; this is the crossing that
+/// pin exists for, made once, in an exhaustive match.
+const fn lifecycle_kind(kind: automonique_runner::EventKind) -> SpoolEventKind {
+    match kind {
+        automonique_runner::EventKind::Started => SpoolEventKind::Started,
+        automonique_runner::EventKind::AdapterEvent => SpoolEventKind::AdapterEvent,
+        automonique_runner::EventKind::SimulationEvent => SpoolEventKind::SimulationEvent,
+        automonique_runner::EventKind::CancelRequested => SpoolEventKind::CancelRequested,
+        automonique_runner::EventKind::Terminal => SpoolEventKind::Terminal,
+    }
+}
+
+/// Translate one durable spool authority onto the wire's.
+const fn lifecycle_authority(
+    authority: automonique_runner::Authority,
+) -> automonique_protocol::event::Authority {
+    match authority {
+        automonique_runner::Authority::Synthetic => {
+            automonique_protocol::event::Authority::Synthetic
+        }
+        automonique_runner::Authority::Authoritative => {
+            automonique_protocol::event::Authority::Authoritative
+        }
     }
 }
 

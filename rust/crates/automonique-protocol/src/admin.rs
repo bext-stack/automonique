@@ -18,26 +18,30 @@
 //! Carrying is all it does: see that type's documentation for what a carried
 //! pair does *not* establish.
 //!
-//! # One socket, five protocols
+//! # One socket, six protocols
 //!
 //! [`LocalRequest`] is what a local endpoint decodes a frame into. The local
 //! socket serves this protocol, [`crate::runs_api`]'s read surface,
 //! [`crate::automation_api`]'s control surface, [`crate::approval_api`]'s
-//! decision surface *and* [`crate::batch_api`]'s batch control surface, and the
+//! decision surface, [`crate::batch_api`]'s batch control surface *and*
+//! [`crate::execute_api`]'s execution verb, and the
 //! envelope's declared protocol name is what separates them — not a heuristic,
 //! not a fallback chain, and not a widening of [`AdminCommand`]. That is the
 //! arrangement `runs_api` asks for in as many words: its values travel "on the
 //! same canonical-JSON envelope [`crate::admin`] uses, under a separate protocol
 //! name so the admin lane's closed kind set stays closed." A run listing, an
-//! automation pause, a recorded approval or a registered batch is therefore not
-//! an admin command, does not appear in [`crate::command_registry`]'s admin
-//! surface, and cannot reach [`DaemonStatus`].
+//! automation pause, a recorded approval, a registered batch or a started run
+//! is therefore not an admin command, does not appear in
+//! [`crate::command_registry`]'s admin surface, and cannot reach
+//! [`DaemonStatus`].
 //!
 //! Adding the third lane cost this module one enum arm, one match arm and one
 //! frame-fit assertion, and cost the admin lane nothing at all — which is the
 //! property the arrangement was chosen for. The fourth cost exactly the same
-//! three lines, and so did the fifth, which is the evidence that the property
-//! holds rather than merely having held once.
+//! three lines, and so did the fifth and the sixth
+//! ([`crate::execute_api`], the one lane on this socket that *starts* something),
+//! which is the evidence that the property holds rather than merely having held
+//! once.
 
 use std::error::Error;
 use std::fmt;
@@ -50,6 +54,7 @@ use crate::codec::{
     VersionRange,
 };
 use crate::digest::{Sha256, Sha256Digest};
+use crate::execute_api::{EXECUTE_PROTOCOL, ExecuteApiError, ExecuteRequest};
 use crate::runs_api::{RUNS_PROTOCOL, RunsApiError, RunsRequest};
 use crate::tools::RunId;
 use crate::wire::{JsonValue, Message};
@@ -1517,6 +1522,17 @@ const _: () = assert!(
     "a maximal batch control frame must fit the local administration read bound"
 );
 
+/// A maximal Execute frame must fit the bound a local transport reads under.
+///
+/// The same dependency the other four ceilings have, stated for the same
+/// reason: a widened `execute_api` ceiling that outgrew this one would turn a
+/// legal Execute message into a `frame_size` refusal at the socket, which is a
+/// size failure discovered by a peer rather than by this build.
+const _: () = assert!(
+    crate::execute_api::MAX_EXECUTE_CANONICAL_BYTES <= MAX_ADMIN_CANONICAL_BYTES,
+    "a maximal execute frame must fit the local administration read bound"
+);
+
 /// A refusal while deciding which protocol one local frame belongs to.
 ///
 /// The six variants say *who* refused, which is the distinction a metric
@@ -1541,6 +1557,8 @@ pub enum LocalRequestError {
     Approval(ApprovalApiError),
     /// The Batch control lane refused the message it was handed.
     Batch(BatchApiError),
+    /// The Execute lane refused the message it was handed.
+    Execute(ExecuteApiError),
 }
 
 impl LocalRequestError {
@@ -1554,6 +1572,7 @@ impl LocalRequestError {
             Self::Automation(error) => error.category(),
             Self::Approval(error) => error.category(),
             Self::Batch(error) => error.category(),
+            Self::Execute(error) => error.category(),
         }
     }
 }
@@ -1567,6 +1586,7 @@ impl fmt::Display for LocalRequestError {
             Self::Automation(error) => write!(formatter, "{error}"),
             Self::Approval(error) => write!(formatter, "{error}"),
             Self::Batch(error) => write!(formatter, "{error}"),
+            Self::Execute(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -1622,6 +1642,12 @@ pub enum LocalRequest {
     /// membership inline, which is the largest body any lane on this socket
     /// sends, and an unboxed arm would set this enum's size for every lane.
     Batch(Box<BatchRequest>),
+    /// A request to start one run already in custody.
+    ///
+    /// Deliberately *not* boxed: an [`ExecuteRequest`] carries one bounded run
+    /// identifier beside its correlation identifier, so it is the smallest body
+    /// on this socket, and boxing it would add an allocation to buy nothing.
+    Execute(ExecuteRequest),
 }
 
 impl LocalRequest {
@@ -1655,6 +1681,9 @@ impl LocalRequest {
             BATCH_CONTROL_PROTOCOL => BatchRequest::from_canonical_bytes(payload)
                 .map(|request| Self::Batch(Box::new(request)))
                 .map_err(LocalRequestError::Batch),
+            EXECUTE_PROTOCOL => ExecuteRequest::from_canonical_bytes(payload)
+                .map(Self::Execute)
+                .map_err(LocalRequestError::Execute),
             _ => Err(LocalRequestError::Envelope(CodecError::UnknownProtocol)),
         }
     }
@@ -1668,6 +1697,7 @@ impl LocalRequest {
             Self::Automation(_) => AUTOMATION_PROTOCOL,
             Self::Approval(_) => APPROVAL_PROTOCOL,
             Self::Batch(_) => BATCH_CONTROL_PROTOCOL,
+            Self::Execute(_) => EXECUTE_PROTOCOL,
         }
     }
 }

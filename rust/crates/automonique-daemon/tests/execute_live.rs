@@ -1,0 +1,836 @@
+// SPDX-License-Identifier: Elastic-2.0
+
+//! The execution lane, live over the real local socket.
+//!
+//! Nothing here is a unit test of the lane's types. What is proved is the whole
+//! path a run takes through a *running daemon*: a real `RunSpec` submitted
+//! through the administration lane, started through the Execute lane, and the
+//! outcome read back through the Runs lane — every message encoded and decoded
+//! by the protocol's own codecs, over the socket the daemon bound.
+//!
+//! # The two proofs, and why both are gated
+//!
+//! [`an_executed_run_reaches_a_terminal_state_the_runs_lane_reports`] needs a
+//! host that can actually enforce the composed sandbox: a delegated cgroup v2
+//! domain that can distribute the `pids` and `memory` controllers, the Landlock
+//! and seccomp mechanisms the capability probe requires, and the built entry
+//! helper. Outside such a host it reports what is missing and returns, and
+//! `AUTOMONIQUE_REQUIRE_ENFORCED_CONTAINMENT=1` turns that into a failure so a
+//! verifying host cannot quietly skip it:
+//!
+//! ```sh
+//! cd rust
+//! cargo build -p automonique-runner --bin automonique-launch-enter
+//! cargo test -p automonique-daemon --test execute_live --no-run
+//! systemd-run --user --scope -p Delegate=yes \
+//!   --setenv=AUTOMONIQUE_REQUIRE_ENFORCED_CONTAINMENT=1 \
+//!   "$(ls -t target/debug/deps/execute_live-* | grep -v '\.d$' | head -1)" \
+//!   --test-threads=1 --nocapture
+//! ```
+//!
+//! Two things about that command are not incidental, and both were established
+//! by running it:
+//!
+//! - **The helper is built separately.** Cargo builds a dependency's *library*
+//!   for this crate's tests and never its binaries, so
+//!   `automonique-launch-enter` — the process that installs the sandbox and
+//!   becomes the workload — must be asked for by name. Without it the lane has
+//!   no helper and refuses `launch_helper_unavailable`.
+//! - **The scope wraps the test binary, not `cargo test`.** Wrapping cargo
+//!   leaves cargo itself a direct member of the delegated scope, and cgroup v2
+//!   forbids enabling `subtree_control` on a cgroup that holds member
+//!   processes. The daemon's domain preparation then fails and every request
+//!   answers `containment_unavailable`, so the proof would silently degrade to
+//!   the fail-closed one. (The same limitation is why
+//!   `automonique-runner`'s own `admission` proof reports "the domain cannot
+//!   distribute pids and memory" when it is run through cargo under a scope.)
+//!
+//! `--test-threads=1` is required for a third reason: preparing a delegated
+//! domain moves *this process* into a supervisor leaf, and two daemons doing
+//! that concurrently would race over one cgroup tree.
+//!
+//! [`a_host_that_cannot_contain_refuses_and_executes_nothing`] is the mirror
+//! image and is gated the *other* way: it proves the fail-closed refusal, so it
+//! is meaningful exactly on a host that cannot execute, and it skips loudly on
+//! one that can. Between them the two tests cover every host — and neither can
+//! pass by accident on the other's, because each asserts a different answer to
+//! the same request.
+//!
+//! # Anti-vacuity
+//!
+//! Both tests submit the same document and send the same request. The enforced
+//! proof asserts a `completed` run whose workload left a witness file
+//! containing the exact prompt bytes; the fail-closed proof asserts a typed
+//! refusal, a read-model row still at `ready`, and **no spool directory at
+//! all**. A lane that answered the same way in both cases would fail one of
+//! them.
+
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
+
+use automonique_daemon::execute::{
+    DAEMON_WORKSPACE_REGISTRY, locate_launch_helper, offered_host_features,
+};
+use automonique_daemon::{Daemon, DaemonConfig};
+use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse, SubmittedRunSpec};
+use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
+use automonique_protocol::context::{ContextManifest, TokenBudget};
+use automonique_protocol::digest::Sha256;
+use automonique_protocol::execute_api::{ExecuteRefusal, ExecuteRequest, ExecuteResponse};
+use automonique_protocol::host::{AttemptId, HostId, HostLifetime, WorkId};
+use automonique_protocol::identity::Actor;
+use automonique_protocol::models::{ExecutorClass, ProviderAccountId};
+use automonique_protocol::primitives::Revision;
+use automonique_protocol::provider::BinaryProvenance;
+use automonique_protocol::runs_api::{
+    LifecycleCoverage, ListRuns, PageSize, RunState, RunStateFilter, RunsRequest, RunsResponse,
+    SpoolEventKind,
+};
+use automonique_protocol::sandbox::{
+    BudgetQuantities, Budgets, CredentialDescriptors, ExecutionAllowlists, ExecutionBackendId,
+    FilesystemAccess, ImplementationDigest, IsolationRequirement, NestedIsolation, PathGrants,
+    PolicyDigest, ProhibitedCapabilities, ProviderControlEgress, RequiredFeature, RequiredFeatures,
+    SandboxProfile, SandboxSpec, SandboxSpecParts, ToolWorkloadEgress, WorkspaceContextHash,
+};
+use automonique_protocol::tools::RunId;
+use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
+use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
+use automonique_runner::{
+    AdmissionFields, AdmissionFieldsParts, ArtifactGrantBindings, Authority, ContainmentDomain,
+    CwdToken, EventKind, ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility,
+    IntegrationMode, IoReservation, ModelRoutingDigest, PersonaDigest, PortabilityPolicy,
+    ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference, RemoteAttestationPolicy,
+    RequiredCapabilities, RunCoordinates, RunOrigin, RunSpec, RunSpecParts, RunnerEventDialect,
+    SchedulerDecisionDigest, SchedulerReservationBinding, SchedulerReservationId, SkillsetDigest,
+    Spool, ToolsetDigest, WorkspaceRegistryId, WorkspaceReservation,
+};
+
+const BUSYBOX: &str = "/usr/bin/busybox";
+const REQUIRE_ENFORCED_ENV: &str = "AUTOMONIQUE_REQUIRE_ENFORCED_CONTAINMENT";
+const PROMPT_SLOT: &str = "execute-prompt-slot";
+const PROMPT: &[u8] = b"the prompt the workload copies\n";
+const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
+const PROCESSES: u64 = 64;
+const TIMEOUT_MILLIS: u64 = 30_000;
+const SPOOL_BYTES: u64 = 1024 * 1024;
+/// Ceiling the test re-opens a finished spool under; well above `SPOOL_BYTES`.
+const READ_SPOOL_BYTES: u64 = 8 * 1024 * 1024;
+/// Bound on waiting for a run to reach a terminal state, comfortably above the
+/// document's own 30-second timeout, which the backend enforces.
+const TERMINAL_DEADLINE: Duration = Duration::from_secs(90);
+
+// --- host gating ----------------------------------------------------------
+
+/// Whether the capability probe says this host can enforce the composed
+/// sandbox.
+///
+/// Exactly the four properties `Daemon::measure_execution_state` asks for, so
+/// this test agrees with the daemon by asking the same question rather than by
+/// assuming the answer.
+fn sandbox_enforceable() -> bool {
+    HostCapabilities::probe()
+        .select_mode(&[
+            BoundaryProperty::DescendantContainment,
+            BoundaryProperty::FilesystemRestriction,
+            BoundaryProperty::TcpDenial,
+            BoundaryProperty::SyscallRestriction,
+        ])
+        .is_ok()
+}
+
+/// The first gate this host fails, or `None` when it fails none.
+///
+/// Derived from the same public surfaces the lane consults, in the same order,
+/// so the fail-closed proof asserts the *exact* refusal rather than any refusal.
+fn first_failing_gate() -> Option<ExecuteRefusal> {
+    if !sandbox_enforceable() {
+        return Some(ExecuteRefusal::SandboxUnenforceable);
+    }
+    if locate_launch_helper().is_none() {
+        return Some(ExecuteRefusal::LaunchHelperUnavailable);
+    }
+    if ContainmentDomain::discover().is_err() {
+        return Some(ExecuteRefusal::ContainmentUnavailable);
+    }
+    None
+}
+
+/// Report a proof that could not run, and fail when the host promised it could.
+fn not_proven(test: &str, reason: &str) {
+    assert!(
+        std::env::var_os(REQUIRE_ENFORCED_ENV).is_none(),
+        "{test}: {REQUIRE_ENFORCED_ENV} is set but this host cannot prove it: {reason}"
+    );
+    eprintln!("[execute_live] NOT PROVEN: {test}: {reason}");
+}
+
+// --- daemon harness -------------------------------------------------------
+
+/// A private root, with the daemon's state directory and its prompt slot
+/// already in place.
+///
+/// The slot is written before the daemon opens because there is no lane that
+/// writes one: prompt slots are the daemon's own protected input, and this test
+/// stands in for whatever fills them.
+fn fixture() -> (tempfile::TempDir, DaemonConfig) {
+    let root = tempfile::tempdir().expect("temporary root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private root");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    for directory in [&runtime, &state] {
+        std::fs::create_dir(directory).expect("root");
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+            .expect("private root");
+    }
+    let state_dir = state.join("automonique");
+    let prompts = state_dir.join("prompts");
+    std::fs::create_dir(&state_dir).expect("state directory");
+    std::fs::create_dir(&prompts).expect("prompt directory");
+    for directory in [&state_dir, &prompts] {
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+            .expect("private directory");
+    }
+    std::fs::write(prompts.join(PROMPT_SLOT), PROMPT).expect("prompt slot");
+    std::fs::set_permissions(
+        prompts.join(PROMPT_SLOT),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("private slot");
+    (
+        root,
+        DaemonConfig {
+            runtime_root: runtime,
+            state_root: state,
+        },
+    )
+}
+
+fn exchange(config: &DaemonConfig, payload: &[u8]) -> Option<Vec<u8>> {
+    let mut stream = UnixStream::connect(config.admin_socket()).expect("connect to daemon");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("read deadline");
+    let mut frame = Vec::new();
+    encode_frame(payload, &mut frame).expect("frame request");
+    stream.write_all(&frame).expect("write request");
+    let mut prefix = [0_u8; 4];
+    if stream.read_exact(&mut prefix).is_err() {
+        return None;
+    }
+    let length = u32::from_be_bytes(prefix) as usize;
+    let mut response = vec![0_u8; length + 4];
+    response[..4].copy_from_slice(&prefix);
+    stream
+        .read_exact(&mut response[4..])
+        .expect("response body");
+    let FrameDecode::Frame { payload, .. } = decode_frame(&response).expect("response frame")
+    else {
+        panic!("complete response was incomplete")
+    };
+    Some(payload.to_vec())
+}
+
+fn admin(config: &DaemonConfig, request: AdminRequest) -> AdminResponse {
+    let payload = request
+        .to_message()
+        .expect("encode request")
+        .to_canonical_bytes();
+    let response = exchange(config, &payload).expect("the admin lane answered");
+    AdminResponse::from_canonical_bytes(&response).expect("admitted response")
+}
+
+/// Ask the Execute lane to start one run, over the same socket.
+///
+/// The answer is required to carry the request's own correlation identifier: an
+/// answer to somebody else's question would otherwise pass every assertion.
+fn execute(config: &DaemonConfig, label: &str, run: &str) -> ExecuteResponse {
+    let request = ExecuteRequest::ExecuteRun {
+        request_id: RequestId::new(label).expect("request ID"),
+        run_id: RunId::new(run).expect("run identity"),
+    };
+    let payload = request
+        .to_message()
+        .expect("encode execute request")
+        .to_canonical_bytes();
+    let response = exchange(config, &payload).expect("the execute lane answered");
+    let response =
+        ExecuteResponse::from_canonical_bytes(&response).expect("admitted execute response");
+    assert_eq!(
+        response.request_id().as_str(),
+        request.request_id().as_str(),
+        "the answer was not correlated to the question",
+    );
+    response
+}
+
+fn runs(config: &DaemonConfig, request: &RunsRequest) -> RunsResponse {
+    let payload = request
+        .to_message()
+        .expect("encode runs request")
+        .to_canonical_bytes();
+    let response = exchange(config, &payload).expect("the runs lane answered");
+    RunsResponse::from_canonical_bytes(&response).expect("admitted runs response")
+}
+
+/// The state the Runs listing reports for one run right now.
+fn listed_state(config: &DaemonConfig, label: &str, run: &str) -> RunState {
+    let response = runs(
+        config,
+        &RunsRequest::ListRuns {
+            request_id: RequestId::new(label).expect("request ID"),
+            query: ListRuns::new(RunStateFilter::any(), None, PageSize::MAX),
+        },
+    );
+    let RunsResponse::RunList { page, .. } = response else {
+        panic!("expected a page, got {response:?}")
+    };
+    page.runs()
+        .iter()
+        .find(|summary| summary.run_id().as_str() == run)
+        .unwrap_or_else(|| panic!("{run} is not listed"))
+        .state()
+}
+
+/// Poll the Runs lane until the run has ended, or fail on the deadline.
+///
+/// The listing is the poll target on purpose: it never opens a spool, so it
+/// answers while the attempt still holds the spool's exclusive lock.
+fn await_terminal(config: &DaemonConfig, run: &str) -> RunState {
+    let deadline = Instant::now() + TERMINAL_DEADLINE;
+    loop {
+        let state = listed_state(config, "await-terminal", run);
+        if state.is_terminal() {
+            return state;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{run} did not reach a terminal state; last seen {state}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_socket(config: &DaemonConfig) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !config.admin_socket().exists() {
+        assert!(Instant::now() < deadline, "daemon did not bind");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+struct Serving {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<Result<(), automonique_daemon::DaemonError>>>,
+}
+
+fn serve(config: &DaemonConfig) -> Serving {
+    let daemon = Daemon::open(config).expect("daemon opens");
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let thread = std::thread::spawn(move || daemon.serve(&thread_stop));
+    wait_for_socket(config);
+    Serving {
+        stop,
+        thread: Some(thread),
+    }
+}
+
+impl Serving {
+    fn shutdown(mut self, config: &DaemonConfig) {
+        assert!(matches!(
+            admin(
+                config,
+                AdminRequest::new(
+                    RequestId::new("shutdown").expect("request ID"),
+                    AdminCommand::Shutdown,
+                ),
+            ),
+            AdminResponse::ShutdownAccepted { .. }
+        ));
+        self.thread
+            .take()
+            .expect("running")
+            .join()
+            .expect("daemon thread")
+            .expect("clean stop");
+    }
+}
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            let _ = thread.join();
+        }
+    }
+}
+
+// --- a document this daemon's admission accepts ---------------------------
+
+fn digest_text(digit: char) -> String {
+    format!("sha256:{}", digit.to_string().repeat(64))
+}
+
+/// The pin the document carries for the program it runs.
+///
+/// Hashed from the file on disk, because the lane hashes the same file and
+/// compares. A hard-coded digest would make the document unrunnable on any host
+/// whose busybox differs, and — worse — would make the comparison untestable.
+fn provider_binary() -> BinaryProvenance {
+    let bytes = std::fs::read(BUSYBOX).expect("busybox is readable");
+    BinaryProvenance::new(
+        "busybox",
+        &format!("sha256:{}", Sha256::digest(&bytes).to_hex()),
+        // No schema digest: this daemon speaks no provider protocol, so it can
+        // observe none, and a document that pinned one would be refused.
+        None,
+    )
+    .expect("observed provenance")
+}
+
+/// What the document requires of the host's enforcement.
+///
+/// Pinned from what this daemon actually offers, which is what a reviewing
+/// client does: it records the composition it reviewed. A hard-coded digest
+/// would be a different test — of this file's copy of the derivation rather
+/// than of the negotiation — and
+/// [`a_document_pinning_another_composition_is_refused`] is where the negative
+/// is proved.
+///
+/// On a host that offers nothing, one placeholder is required instead: the
+/// document must still declare a feature (`RequiredFeatures` refuses an empty
+/// set), and on such a host the request never reaches the negotiation because
+/// a host-wide gate refuses first.
+fn required_features() -> RequiredFeatures {
+    let offered = offered_host_features();
+    if offered.is_empty() {
+        return RequiredFeatures::declare(&[RequiredFeature::new(
+            "descendant_containment",
+            &[ImplementationDigest::parse(&digest_text('3')).expect("digest")],
+        )
+        .expect("feature")])
+        .expect("features");
+    }
+    let required: Vec<RequiredFeature> = offered
+        .iter()
+        .map(|feature| {
+            RequiredFeature::new(
+                feature.name(),
+                std::slice::from_ref(feature.implementation()),
+            )
+            .expect("feature")
+        })
+        .collect();
+    RequiredFeatures::declare(&required).expect("features")
+}
+
+fn sandbox() -> SandboxSpec {
+    sandbox_requiring(required_features())
+}
+
+fn sandbox_requiring(required_features: RequiredFeatures) -> SandboxSpec {
+    SandboxSpec::compile(SandboxSpecParts {
+        profile: SandboxProfile::new(
+            "execute-profile",
+            1,
+            FilesystemAccess::IsolatedWritable,
+            ToolWorkloadEgress::denied(),
+        )
+        .expect("profile"),
+        policy_digest: PolicyDigest::parse(&digest_text('4')).expect("policy digest"),
+        actor: Actor::new("acme", "actor-1").expect("actor"),
+        provider_account: ProviderAccountId::new("provider-account-1").expect("account"),
+        workspace_context: WorkspaceContextHash::parse(&digest_text('5')).expect("context"),
+        base_revision: Revision::new(7).expect("revision"),
+        path_grants: PathGrants::declare(&[]).expect("grants"),
+        allowlists: ExecutionAllowlists::declare(&[]).expect("allowlists"),
+        // Both egress axes denied: admission refuses anything else, because the
+        // broker that would carry brokered egress does not exist.
+        provider_control_egress: ProviderControlEgress::denied(),
+        tool_workload_egress: ToolWorkloadEgress::denied(),
+        credentials: CredentialDescriptors::declare(&[]).expect("credentials"),
+        budgets: Budgets::declare(BudgetQuantities {
+            cgroup_memory_bytes: MEMORY_BYTES,
+            cgroup_cpu_millicores: 1_000,
+            rlimit_processes: PROCESSES,
+            rlimit_descriptors: 256,
+            timeout_millis: TIMEOUT_MILLIS,
+            temporary_storage_bytes: 1024 * 1024,
+            spool_bytes: SPOOL_BYTES,
+            artifact_bytes: 1024 * 1024,
+        })
+        .expect("budgets"),
+        required_features,
+        nested_isolation: NestedIsolation::new(
+            IsolationRequirement::HostBoundary,
+            IsolationRequirement::HostBoundary,
+        ),
+        approval_revision: Revision::FIRST,
+        prohibited_capabilities: ProhibitedCapabilities::declare(&[]).expect("prohibited"),
+    })
+    .expect("compiled sandbox")
+}
+
+fn admission() -> AdmissionFields {
+    let mode = IntegrationMode::new("native").expect("mode");
+    AdmissionFields::new(AdmissionFieldsParts {
+        io_reservation: IoReservation::new(1024, 1024).expect("io"),
+        workspace_reservation: WorkspaceReservation::new(8_192).expect("workspace bytes"),
+        session_binding: None,
+        fallback_eligibility: FallbackEligibility::declare(&mode, Vec::new()).expect("fallback"),
+        integration_mode: mode,
+        required_capabilities: RequiredCapabilities::declare(Vec::new()).expect("capabilities"),
+        context_manifest: ContextManifest::new(
+            Revision::FIRST,
+            TokenBudget::new(0),
+            Vec::new(),
+            Vec::new(),
+        ),
+        profile_digest: ProfileDigest::parse(&digest_text('6')).expect("profile digest"),
+        model_routing_digest: ModelRoutingDigest::parse(&digest_text('7')).expect("routing"),
+        toolset_digest: ToolsetDigest::parse(&digest_text('8')).expect("toolset"),
+        skillset_digest: SkillsetDigest::parse(&digest_text('9')).expect("skillset"),
+        extension_set_digest: ExtensionSetDigest::parse(&digest_text('a')).expect("extensions"),
+        origin: RunOrigin::Interactive,
+        executor_class: ExecutorClass::Local,
+        portability_policy: PortabilityPolicy::Pinned,
+        remote_attestation_policy: RemoteAttestationPolicy::NotRequired,
+        persona_digest: PersonaDigest::parse(&digest_text('b')).expect("persona"),
+        execution_plan_digest: ExecutionPlanDigest::parse(&digest_text('c')).expect("plan"),
+        scheduler_reservation: SchedulerReservationBinding::new(
+            SchedulerReservationId::new("reservation-1").expect("reservation"),
+            Revision::FIRST,
+            SchedulerDecisionDigest::parse(&digest_text('d')).expect("decision"),
+        ),
+        artifact_grants: ArtifactGrantBindings::declare(Vec::new()).expect("grants"),
+        credential_bindings: Vec::new(),
+        event_dialect: RunnerEventDialect::AutomoniqueRunnerV1,
+    })
+}
+
+/// One document naming `run`, whose workload runs `script`.
+fn run_spec(run: &str, script: &str) -> RunSpec {
+    run_spec_with_sandbox(run, script, sandbox())
+}
+
+fn run_spec_with_sandbox(run: &str, script: &str, sandbox: SandboxSpec) -> RunSpec {
+    RunSpec::new(RunSpecParts {
+        protocol_version: 1,
+        coordinates: RunCoordinates::new(
+            WorkId::new("work-1").expect("work"),
+            RunId::new(run).expect("run"),
+            AttemptId::new(format!("{run}-attempt-1")).expect("attempt"),
+            HostId::new("host-1").expect("host"),
+            HostLifetime::Attempt,
+            ExecutionBackendId::new("local-direct").expect("backend"),
+        ),
+        executable: PathBuf::from(BUSYBOX),
+        arguments: vec!["sh".into(), "-c".into(), script.into()],
+        cwd_token: CwdToken::new("cwd-1").expect("cwd"),
+        environment: Vec::new(),
+        prompt: PromptDeliveryPlan::ProtectedReference(
+            ProtectedPromptReference::new(PROMPT_SLOT).expect("slot"),
+        ),
+        // The one registry identity this daemon resolves. Any other is refused.
+        workspace_registry_id: WorkspaceRegistryId::new(DAEMON_WORKSPACE_REGISTRY)
+            .expect("registry"),
+        workspace: WorkspaceRegistration::new(
+            "acme",
+            "source-1",
+            Revision::new(7).expect("revision"),
+            "snapshot-1",
+            IsolationKind::AttemptCopy,
+            WorkspaceToken::new("workspace-token-1").expect("token"),
+        )
+        .expect("registered workspace"),
+        provider_binary: provider_binary(),
+        sandbox,
+        admission: admission(),
+    })
+    .expect("valid run specification")
+}
+
+/// Submit one document and return the durable identity custody assigned.
+fn submit(config: &DaemonConfig, spec: &RunSpec, key: &str) -> u64 {
+    let document = spec.to_canonical_bytes().expect("canonical encoding");
+    let submission = SubmittedRunSpec::sealed(document, key).expect("bounded submission");
+    let response = admin(
+        config,
+        AdminRequest::submit_run(RequestId::new(key).expect("request ID"), submission),
+    );
+    let AdminResponse::RunAccepted {
+        submission_id,
+        replay,
+        ..
+    } = response
+    else {
+        panic!("expected acceptance, got {response:?}")
+    };
+    assert!(!replay, "{key} was already held");
+    submission_id
+}
+
+/// Where the daemon keeps one run's authoritative spool.
+fn spool_root(config: &DaemonConfig, run: &str) -> PathBuf {
+    config.state_dir().join("runs").join(run).join("spool")
+}
+
+/// Where the daemon resolves one run's workspace.
+fn workspace_root(config: &DaemonConfig, run: &str) -> PathBuf {
+    config.state_dir().join("runs").join(run).join("workspace")
+}
+
+// --- the proofs -----------------------------------------------------------
+
+/// A submitted document, started over the wire, runs contained and ends.
+#[test]
+fn an_executed_run_reaches_a_terminal_state_the_runs_lane_reports() {
+    let test = "an_executed_run_reaches_a_terminal_state_the_runs_lane_reports";
+    if !Path::new(BUSYBOX).exists() {
+        not_proven(test, "no static busybox at /usr/bin/busybox");
+        return;
+    }
+    if let Some(gate) = first_failing_gate() {
+        not_proven(test, &format!("this host refuses at {gate}"));
+        return;
+    }
+
+    let (_root, config) = fixture();
+    let run = "execlive1";
+    // The workload copies its own stdin — which is the admitted prompt — into
+    // the workspace the daemon resolved for it. Every command is the granted
+    // busybox by absolute path: the admitted plan grants execute on exactly the
+    // program the document named and on nothing else.
+    let witness = workspace_root(&config, run).join("witness.txt");
+    let script = format!("{BUSYBOX} cat > {}", witness.display());
+    let spec = run_spec(run, &script);
+
+    let serving = serve(&config);
+    let submission_id = submit(&config, &spec, "execute-submit-1");
+    assert_eq!(
+        listed_state(&config, "before", run),
+        RunState::Ready,
+        "custody alone must not move the read model"
+    );
+
+    let response = execute(&config, "execute-1", run);
+    let ExecuteResponse::Accepted {
+        run_id,
+        submission_id: accepted_submission,
+        ..
+    } = &response
+    else {
+        panic!("expected the run to start, got {response:?}")
+    };
+    assert_eq!(run_id.as_str(), run);
+    assert_eq!(
+        *accepted_submission, submission_id,
+        "the answer must name the custody row the attempt was started from"
+    );
+
+    let terminal = await_terminal(&config, run);
+    assert_eq!(
+        terminal,
+        RunState::Completed,
+        "the workload exited zero, so the run completed"
+    );
+
+    // THE WORKLOAD REALLY RAN, AND THE PROMPT REALLY REACHED IT.
+    //
+    // The witness is written by the contained process itself, inside the
+    // workspace grant, and its content is the prompt the daemon resolved from
+    // its slot and admission delivered on stdin.
+    assert_eq!(
+        std::fs::read(&witness).expect("the workload wrote its witness"),
+        PROMPT,
+        "the admitted prompt must reach the workload unaltered"
+    );
+
+    // THE DURABLE RECORD IS THE RUNNER'S, RE-VERIFIED FROM DISK.
+    //
+    // Re-opening re-parses and re-checks the hash chain, so these assertions
+    // are made against a record that was intact after the run rather than
+    // against the daemon's belief about it.
+    let spool = Spool::open(spool_root(&config, run), run, READ_SPOOL_BYTES)
+        .expect("the run's spool re-opens");
+    let events = spool.events_after(0).expect("the spool replays");
+    assert_eq!(events.len(), 2, "one Started and one Terminal: {events:?}");
+    assert_eq!(events[0].kind(), EventKind::Started);
+    assert_eq!(events[0].authority(), Authority::Authoritative);
+    assert_eq!(events[1].kind(), EventKind::Terminal);
+    assert_eq!(events[1].authority(), Authority::Authoritative);
+    assert_eq!(events[1].payload(), b"completed");
+    drop(spool);
+
+    // The Runs detail lane serves that same lifecycle back over the socket.
+    let detail = runs(
+        &config,
+        &RunsRequest::RunDetail {
+            request_id: RequestId::new("detail-1").expect("request ID"),
+            run_id: RunId::new(run).expect("run identity"),
+        },
+    );
+    let RunsResponse::RunDetail { view, .. } = detail else {
+        panic!("expected a detail view, got {detail:?}")
+    };
+    assert_eq!(view.summary().state(), RunState::Completed);
+    assert_eq!(view.summary().submission_id(), submission_id);
+    assert_eq!(view.last_sequence(), 2);
+    assert_eq!(view.coverage(), LifecycleCoverage::Complete);
+    assert_eq!(
+        view.lifecycle()
+            .iter()
+            .map(|event| event.kind())
+            .collect::<Vec<_>>(),
+        vec![SpoolEventKind::Started, SpoolEventKind::Terminal],
+    );
+
+    // ONE ATTEMPT PER SUBMISSION, AND THE ROW IS WHAT ENFORCES IT.
+    //
+    // The read model has moved off `ready`, so a second request for the same
+    // run is refused rather than starting a second attempt over the same spool.
+    let repeat = execute(&config, "execute-2", run);
+    assert!(
+        matches!(
+            repeat,
+            ExecuteResponse::Refused {
+                refusal: ExecuteRefusal::RunNotReady,
+                ..
+            }
+        ),
+        "expected run_not_ready, got {repeat:?}"
+    );
+
+    serving.shutdown(&config);
+}
+
+/// A document that pins an enforcement composition this host does not provide
+/// is refused, on the very host that would otherwise have run it.
+///
+/// The negative control for [`required_features`]: without it, the enforced
+/// proof would pass just as well against a daemon that ignored the document's
+/// enforcement negotiation entirely.
+#[test]
+fn a_document_pinning_another_composition_is_refused() {
+    let test = "a_document_pinning_another_composition_is_refused";
+    if !Path::new(BUSYBOX).exists() {
+        not_proven(test, "no static busybox at /usr/bin/busybox");
+        return;
+    }
+    if let Some(gate) = first_failing_gate() {
+        not_proven(test, &format!("this host refuses at {gate}"));
+        return;
+    }
+
+    let (_root, config) = fixture();
+    let run = "execpinned1";
+    let witness = workspace_root(&config, run).join("witness.txt");
+    let script = format!("{BUSYBOX} cat > {}", witness.display());
+    // The same feature *name* this host offers, pinned to an implementation
+    // digest it does not publish. Everything else about the document is the one
+    // the enforced proof runs.
+    let stranger = RequiredFeatures::declare(&[RequiredFeature::new(
+        "descendant_containment",
+        &[ImplementationDigest::parse(&digest_text('e')).expect("digest")],
+    )
+    .expect("feature")])
+    .expect("features");
+    let spec = run_spec_with_sandbox(run, &script, sandbox_requiring(stranger));
+
+    let serving = serve(&config);
+    submit(&config, &spec, "execute-pinned-1");
+    let response = execute(&config, "execute-pinned-1", run);
+    assert!(
+        matches!(
+            &response,
+            ExecuteResponse::Refused {
+                refusal: ExecuteRefusal::AdmissionRefused,
+                ..
+            }
+        ),
+        "expected admission_refused, got {response:?}"
+    );
+    assert!(
+        !spool_root(&config, run).exists(),
+        "a refused admission must leave no spool"
+    );
+    assert!(
+        !witness.exists(),
+        "a refused admission must run no workload"
+    );
+    assert_eq!(
+        listed_state(&config, "after-pin-refusal", run),
+        RunState::Ready
+    );
+
+    serving.shutdown(&config);
+}
+
+/// A host that cannot contain refuses, and starts nothing at all.
+#[test]
+fn a_host_that_cannot_contain_refuses_and_executes_nothing() {
+    let test = "a_host_that_cannot_contain_refuses_and_executes_nothing";
+    if !Path::new(BUSYBOX).exists() {
+        not_proven(test, "no static busybox at /usr/bin/busybox");
+        return;
+    }
+    let Some(expected) = first_failing_gate() else {
+        // Gated the other way round from the enforced proof: this one is
+        // meaningful exactly where execution is impossible. A host that can
+        // execute proves it in the other test, and there is nothing to assert
+        // here — so this reports and returns, and it does so even under
+        // `AUTOMONIQUE_REQUIRE_ENFORCED_CONTAINMENT`, which asks for the
+        // *enforced* proof rather than this one.
+        eprintln!(
+            "[execute_live] NOT PROVEN: {test}: this host can execute, so no fail-closed \
+             refusal is reachable"
+        );
+        return;
+    };
+    assert!(
+        expected.is_host_wide(),
+        "a gate that stops every run must be a host-wide refusal, not {expected}"
+    );
+
+    let (_root, config) = fixture();
+    let run = "execclosed1";
+    let witness = workspace_root(&config, run).join("witness.txt");
+    let script = format!("{BUSYBOX} cat > {}", witness.display());
+    let spec = run_spec(run, &script);
+
+    let serving = serve(&config);
+    submit(&config, &spec, "execute-closed-1");
+
+    let response = execute(&config, "execute-closed-1", run);
+    assert!(
+        matches!(
+            &response,
+            ExecuteResponse::Refused { refusal, .. } if *refusal == expected
+        ),
+        "expected {expected}, got {response:?}"
+    );
+
+    // NOTHING RAN, AND NOTHING WAS WRITTEN.
+    //
+    // Three independent witnesses, because a refusal that had still created
+    // kernel or filesystem state would be a partial execution wearing a
+    // refusal's answer.
+    assert_eq!(
+        listed_state(&config, "after-refusal", run),
+        RunState::Ready,
+        "a refused request must not move the read model"
+    );
+    assert!(
+        !spool_root(&config, run).exists(),
+        "a refused request must leave no spool"
+    );
+    assert!(!witness.exists(), "a refused request must run no workload");
+
+    serving.shutdown(&config);
+}
