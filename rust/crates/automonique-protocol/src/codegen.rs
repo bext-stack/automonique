@@ -62,6 +62,19 @@
 //!   [`crate::automation_api::AutomationResponse::Refused`]), with the record
 //!   body they nest and the two closed vocabularies they carry.
 //!
+//! - The whole decision surface of `automonique.approval` from
+//!   [`crate::approval_api`]: all four requests
+//!   ([`crate::approval_api::ApprovalRequest::RecordApproval`],
+//!   [`crate::approval_api::ApprovalRequest::ListApprovals`],
+//!   [`crate::approval_api::ApprovalRequest::ApprovalDetail`] and
+//!   [`crate::approval_api::ApprovalRequest::ApprovalsBySubject`]) and all five
+//!   answers ([`crate::approval_api::ApprovalResponse::Recorded`],
+//!   [`crate::approval_api::ApprovalResponse::ApprovalList`],
+//!   [`crate::approval_api::ApprovalResponse::ApprovalDetail`],
+//!   [`crate::approval_api::ApprovalResponse::Conflict`] and
+//!   [`crate::approval_api::ApprovalResponse::Refused`]), with the record body
+//!   they nest and the four closed vocabularies they carry.
+//!
 //! # What it does not cover
 //!
 //! Everything else in the crate, including: `RunSpec` and the run surface,
@@ -151,6 +164,43 @@
 //! - a conflict naming two revisions that disagree
 //!   ([`ConflictWithoutDisagreement`]).
 //!
+//! `automonique.approval` brings a shorter list than either, and one rule that
+//! crosses for a reason worth stating. The **write-once revision** *is*
+//! generated: `approval_decisions.revision` is pinned to `1` by a database
+//! `CHECK` and the ledger has no update path, so "revision is one" is a bound on
+//! one field's own value rather than a relation between two, and a generated
+//! reader can hold it exactly as it holds a byte length. It is emitted as a
+//! bounded integer whose minimum and maximum are both one, refused under
+//! [`RowAmended`](crate::approval_api::ApprovalApiError::RowAmended) — the same
+//! category
+//! [`ApprovalRecordView::new`](crate::approval_api::ApprovalRecordView::new)
+//! answers. A client can therefore see for itself that the row it decoded was
+//! never amended, which is the whole point of storing the column.
+//!
+//! What stays outside is what stays outside everywhere: relations between two
+//! fields of a decoded message, measured in `rust_only_refusals` —
+//!
+//! - page records strictly increasing by durable row identity
+//!   ([`PageOutOfOrder`](crate::approval_api::ApprovalApiError::PageOutOfOrder));
+//!   and
+//! - `more` agreeing with `next_cursor`
+//!   ([`ContinuationIncoherent`](crate::approval_api::ApprovalApiError::ContinuationIncoherent))
+//!   and a continuation cursor reaching the last row it served
+//!   ([`ContinuationRewinds`](crate::approval_api::ApprovalApiError::ContinuationRewinds)).
+//!
+//! Three of that lane's refusals are deliberately *not* on the list, because
+//! they are not decoder rules on the Rust side either and a gap list that
+//! claimed them would be describing a gap that does not exist:
+//! [`PageAboveRequestedSize`](crate::approval_api::ApprovalApiError::PageAboveRequestedSize)
+//! and
+//! [`PageOutsideSubject`](crate::approval_api::ApprovalApiError::PageOutsideSubject)
+//! relate an answer to the *query* it answers, which no decoder holds; and
+//! [`ConflictWithoutDisagreement`](crate::approval_api::ApprovalApiError::ConflictWithoutDisagreement)
+//! is derived by
+//! [`ApprovalResponse::conflict`](crate::approval_api::ApprovalResponse::conflict)
+//! at the answering end, where both sides are in hand, and cannot be re-derived
+//! from a conflict frame that carries only the recorded side.
+//!
 //! [`WithdrawnAtFirstRevision`]: crate::automation_api::AutomationApiError::WithdrawnAtFirstRevision
 //! [`ContinuationIncoherent`]: crate::automation_api::AutomationApiError::ContinuationIncoherent
 //! [`ConflictWithoutDisagreement`]: crate::automation_api::AutomationApiError::ConflictWithoutDisagreement
@@ -175,6 +225,9 @@
 use core::fmt::Write as _;
 
 use crate::admin::{AdminError, DaemonState, ExecutionState, OperationalMetric, TelegramState};
+use crate::approval_api::{
+    ApprovalApiError, ApprovalDecision, ApprovalDisposition, ApprovalRefusal, ConflictField,
+};
 use crate::automation::EnablementState;
 use crate::automation_api::{
     AutomationApiError, AutomationRefusal, ENABLEMENT_STATES, requires_cause,
@@ -672,6 +725,9 @@ pub const RUNS_MODULE: &str = "runs";
 
 /// The `automonique.automation` control surface.
 pub const AUTOMATION_MODULE: &str = "automation";
+
+/// The `automonique.approval` decision surface.
+pub const APPROVAL_MODULE: &str = "approval";
 
 /// The file one module is written to.
 #[must_use]
@@ -3534,6 +3590,656 @@ fn automation_module() -> GeneratedModule {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The `automonique.approval` decision surface
+//
+// Four closed vocabularies, every one of them fail-closed on both sides of the
+// wire. The exhaustive `match` in each function below is what makes a third
+// decision word, a third disposition or a fourth conflict field a compile error
+// here rather than a spelling that quietly falls out of the generated union —
+// which on this lane matters more than on most, because the words being dropped
+// would be the ones that say whether somebody approved something.
+// ---------------------------------------------------------------------------
+
+/// The declared [`ApprovalDecision`] spellings, pinned to the Rust wire strings.
+///
+/// `granted` and `denied`, and the set is closed: there is no `pending` and no
+/// `expired`, because a decision nobody made has no row. The `match` is written
+/// out rather than mapped so a third answer cannot appear on the wire without
+/// this file being asked about it.
+fn approval_decision_values() -> Vec<String> {
+    ApprovalDecision::ALL
+        .into_iter()
+        .map(|decision| match decision {
+            ApprovalDecision::Granted | ApprovalDecision::Denied => decision.as_str().to_owned(),
+        })
+        .collect()
+}
+
+/// The declared [`ApprovalDisposition`] spellings, pinned to the Rust wire
+/// strings.
+fn approval_disposition_values() -> Vec<String> {
+    ApprovalDisposition::ALL
+        .into_iter()
+        .map(|disposition| match disposition {
+            ApprovalDisposition::Recorded | ApprovalDisposition::AlreadyRecorded => {
+                disposition.as_str().to_owned()
+            }
+        })
+        .collect()
+}
+
+/// The declared [`ConflictField`] spellings, pinned to the Rust wire strings.
+fn conflict_field_values() -> Vec<String> {
+    ConflictField::ALL
+        .into_iter()
+        .map(|field| match field {
+            ConflictField::Subject | ConflictField::Decision | ConflictField::Decider => {
+                field.as_str().to_owned()
+            }
+        })
+        .collect()
+}
+
+/// The declared [`ApprovalRefusal`] spellings, pinned to the Rust wire strings.
+fn approval_refusal_values() -> Vec<String> {
+    ApprovalRefusal::ALL
+        .into_iter()
+        .map(|refusal| match refusal {
+            ApprovalRefusal::UnknownApproval
+            | ApprovalRefusal::CursorOutOfRange
+            | ApprovalRefusal::LedgerFull
+            | ApprovalRefusal::InvalidField => refusal.as_str().to_owned(),
+        })
+        .collect()
+}
+
+/// A refusal category, pinned to the spelling the Approval API reports.
+fn approval_category(name: &str, doc: &str, error: &ApprovalApiError) -> Constant {
+    Constant {
+        name: name.to_owned(),
+        doc: doc.to_owned(),
+        value: ConstantValue::Text(error.category().to_owned()),
+    }
+}
+
+/// A security-sensitive enumeration of the Approval API.
+///
+/// All four are [`SecuritySensitiveEnum`](crate::codec::SecuritySensitiveEnum)
+/// in Rust and all four fail closed here. A reader that retained an undefined
+/// decision would have to decide what an unnameable answer to an approval
+/// question means, and every available guess is wrong: treating it as a grant
+/// invents permission, and treating it as a denial invents a refusal nobody
+/// made.
+fn approval_enum(name: &str, values: Vec<String>) -> GeneratedEnum {
+    GeneratedEnum {
+        name: name.to_owned(),
+        sensitivity: EnumSensitivity::SecuritySensitive,
+        values,
+        // No set of these reaches the wire, so no declaration order has to
+        // travel with them: this lane's listings filter by subject rather than
+        // by vocabulary.
+        wire_order: None,
+    }
+}
+
+/// A response or nested-body field carrying one of this lane's vocabularies.
+fn approval_enum_field(name: &str, type_name: &str) -> ResponseField {
+    ResponseField {
+        name: name.to_owned(),
+        value: ResponseValue::Enum {
+            type_name: type_name.to_owned(),
+            unknown_category: "APPROVAL_UNKNOWN_ENUM_VALUE".to_owned(),
+        },
+    }
+}
+
+/// A response or nested-body field carrying one of this lane's bounded strings.
+fn approval_checked_field(name: &str, type_name: &str) -> ResponseField {
+    ResponseField {
+        name: name.to_owned(),
+        value: ResponseValue::Checked {
+            type_name: type_name.to_owned(),
+            refusal_category: "APPROVAL_INVALID_FIELD".to_owned(),
+        },
+    }
+}
+
+/// A response or nested-body field carrying a bounded integer.
+///
+/// `unsigned` mirrors which Rust reader the field goes through, exactly as it
+/// does on the Runs and Automation lanes: a row identity and a revision are read
+/// through `unsigned()`, which refuses a negative as a malformed body before the
+/// domain is consulted, while the decision instant is read signed and refused by
+/// the domain itself for being before the epoch.
+fn approval_integer_field(
+    name: &str,
+    type_name: &str,
+    refusal_category: &str,
+    unsigned: bool,
+) -> ResponseField {
+    ResponseField {
+        name: name.to_owned(),
+        value: ResponseValue::Integer {
+            type_name: type_name.to_owned(),
+            refusal_category: refusal_category.to_owned(),
+            unsigned,
+        },
+    }
+}
+
+/// TypeScript name of the branded decision identity.
+const APPROVAL_KEY: &str = "ApprovalKey";
+
+/// TypeScript name of the bounded name for what was decided.
+const APPROVAL_SUBJECT: &str = "ApprovalSubject";
+
+/// TypeScript name of the bounded name for who answered.
+const DECIDER: &str = "Decider";
+
+/// TypeScript name of the branded listing position.
+const APPROVAL_CURSOR: &str = "ApprovalCursor";
+
+/// TypeScript name of the write-once revision, whose domain is `1..=1`.
+const APPROVAL_REVISION: &str = "ApprovalRevision";
+
+/// The seven columns one `approval_decisions` row carries, as a reader decodes
+/// them.
+///
+/// One list, used twice: a record travels inside a listing page and *as* a
+/// detail answer's whole body, and the two readings cannot be allowed to drift
+/// into disagreeing about a column. The Rust side has the same shape for the
+/// same reason — [`ApprovalRecordView::from_body`] is what both go through.
+///
+/// [`ApprovalRecordView::from_body`]: crate::approval_api::ApprovalRecordView
+fn approval_record_fields() -> Vec<ResponseField> {
+    vec![
+        approval_checked_field("approval_key", APPROVAL_KEY),
+        approval_integer_field(
+            "decided_at_ms",
+            EPOCH_MILLIS,
+            "APPROVAL_TIME_BEFORE_EPOCH",
+            false,
+        ),
+        approval_checked_field("decider", DECIDER),
+        approval_enum_field("decision", "ApprovalDecision"),
+        approval_integer_field("entry_id", DURABLE_ROW_ID, "APPROVAL_UNWRITTEN_ROW", true),
+        // The write-once pin, and the one cross-language rule this lane hands a
+        // client that the Automation lane could not: `1..=1` is a bound on one
+        // field's own value, so a decoder can see for itself that the row was
+        // never amended.
+        approval_integer_field("revision", APPROVAL_REVISION, "APPROVAL_ROW_AMENDED", true),
+        approval_checked_field("subject", APPROVAL_SUBJECT),
+    ]
+}
+
+/// The `automonique.approval` decision surface: what an operator records, and
+/// what it reads back.
+fn approval_module() -> GeneratedModule {
+    GeneratedModule {
+        file_name: module_file_name(APPROVAL_MODULE),
+        doc: "The native Approval decision surface: record that somebody answered an approval \
+              question, durably, and read the answers back. Nothing here enforces a decision, \
+              verifies who made it, or binds it to a session."
+            .to_owned(),
+        source: "automonique_protocol::approval_api".to_owned(),
+        // A name is declared in exactly one module. A correlation identifier, a
+        // durable row identity and a durable instant are wire vocabularies
+        // rather than one lane's, so this module reads them from where they are
+        // already declared rather than emitting a fourth copy.
+        imports: vec![
+            ModuleImport {
+                module: ADMIN_COMMAND_MODULE.to_owned(),
+                values: vec![DURABLE_ROW_ID.to_owned(), "RequestId".to_owned()],
+                types: Vec::new(),
+            },
+            ModuleImport {
+                module: RUNS_MODULE.to_owned(),
+                values: vec![EPOCH_MILLIS.to_owned()],
+                types: Vec::new(),
+            },
+        ],
+        constants: vec![
+            Constant {
+                name: "APPROVAL_API_SCHEMA_V1".to_owned(),
+                doc: "Stable schema identifier for the version-one decision surface.".to_owned(),
+                value: ConstantValue::Text(crate::approval_api::APPROVAL_API_SCHEMA_V1.to_owned()),
+            },
+            Constant {
+                name: "APPROVAL_PROTOCOL".to_owned(),
+                doc: "Stable protocol name for the native Approval decision API.".to_owned(),
+                value: ConstantValue::Text(crate::approval_api::APPROVAL_PROTOCOL.to_owned()),
+            },
+            Constant {
+                name: "MAX_APPROVAL_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical message bytes this protocol will assemble or admit."
+                    .to_owned(),
+                value: ConstantValue::Count(crate::approval_api::MAX_APPROVAL_CANONICAL_BYTES),
+            },
+            Constant {
+                name: "MAX_APPROVAL_PAGE_ITEMS".to_owned(),
+                doc:
+                    "Maximum decisions one listing page may carry. Thirty-two, because a decision \
+                      row carries three maximal identifiers where a run summary carries one; the \
+                      number is derived from this protocol's frame arithmetic rather than chosen. \
+                      Well below the durable ledger's own read ceiling, which bounds a database \
+                      read rather than a wire frame — the smaller of the two is the one a client \
+                      sees, and they are not reconciled. A longer page is refused rather than \
+                      truncated: a truncated page that still answered `complete` is a silent drop."
+                        .to_owned(),
+                value: ConstantValue::Count(crate::approval_api::MAX_APPROVAL_PAGE_ITEMS),
+            },
+        ],
+        branded_ids: vec![BrandedId {
+            // The ledger's own grammar: non-empty, bounded, control-free, and
+            // nothing more. This protocol never parses a key, derives nothing
+            // from it and gives it no structure, so a wire type stricter than
+            // the table would make a stored row unreadable through the only
+            // surface that serves it.
+            name: APPROVAL_KEY.to_owned(),
+            max_bytes: crate::approval_api::MAX_APPROVAL_API_FIELD_BYTES,
+            pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+        }],
+        bounded_strings: vec![
+            BoundedString {
+                // A name for what was decided — a command identifier, an effect
+                // name, a digest — never the thing itself.
+                name: APPROVAL_SUBJECT.to_owned(),
+                max_bytes: crate::approval_api::MAX_APPROVAL_API_FIELD_BYTES,
+                pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+            },
+            BoundedString {
+                // Recorded, never verified: the local transport establishes that
+                // the peer is this user, and this string says which person or
+                // runbook behind that user made the call. Empty is refused
+                // rather than read as "nobody", because an unattributed decision
+                // is the one this product does not offer a spelling for.
+                name: DECIDER.to_owned(),
+                max_bytes: crate::approval_api::MAX_APPROVAL_API_FIELD_BYTES,
+                pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+            },
+        ],
+        bounded_integers: vec![
+            BoundedInteger {
+                // Zero is the beginning of the listing rather than the absence
+                // of a cursor: this lane carries the ledger's own exclusive
+                // cursor, so there is no coordinate to convert and no
+                // off-by-one to re-derive.
+                name: APPROVAL_CURSOR.to_owned(),
+                min: 0,
+                max: i64::MAX,
+            },
+            BoundedInteger {
+                name: "ApprovalPageSize".to_owned(),
+                min: 1,
+                max: i64::try_from(crate::approval_api::MAX_APPROVAL_PAGE_ITEMS)
+                    .expect("the page bound is within the wire range"),
+            },
+            BoundedInteger {
+                // A domain of exactly one value, which is what write-once means
+                // on the wire. The ledger pins the column with a database
+                // `CHECK` and has no update path at all, so any other value
+                // names a row this product could not have written — and a client
+                // that decodes a record can therefore see for itself that the
+                // row it is reading was never amended.
+                name: APPROVAL_REVISION.to_owned(),
+                min: 1,
+                max: 1,
+            },
+        ],
+        enums: vec![
+            // `generated/spike.ts` declares an `ApprovalDecision` of its own,
+            // spelled `allow`/`deny`. It is the R1-11 spike's invented
+            // vocabulary rather than this product's, and the two never meet: the
+            // barrel deliberately does not re-export the spike, so no consumer
+            // can reach both names, and nothing imports the spike except its own
+            // runtime check.
+            approval_enum("ApprovalDecision", approval_decision_values()),
+            approval_enum("ApprovalDisposition", approval_disposition_values()),
+            // Named for its lane rather than `ConflictField`: the barrel
+            // re-exports every module flat, and a name that generic would claim
+            // a word four other protocols could want.
+            approval_enum("ApprovalConflictField", conflict_field_values()),
+            approval_enum("ApprovalRefusal", approval_refusal_values()),
+        ],
+        command_surface: Some(CommandSurface {
+            name: "Approval".to_owned(),
+            protocol_constant: "APPROVAL_PROTOCOL".to_owned(),
+            protocol: crate::approval_api::APPROVAL_PROTOCOL.to_owned(),
+            version: crate::codec::MajorVersion::FIRST.get(),
+            max_message_bytes_constant: "MAX_APPROVAL_CANONICAL_BYTES".to_owned(),
+            request_id_type: "RequestId".to_owned(),
+            categories: vec![
+                approval_category(
+                    "APPROVAL_COUNTER_OUT_OF_RANGE",
+                    "A counter is outside the range the integer-only wire codec carries.",
+                    &ApprovalApiError::CounterOutOfRange { field: "since" },
+                ),
+                approval_category(
+                    "APPROVAL_INVALID_BODY",
+                    "A body was not the exact shape defined for its kind.",
+                    &ApprovalApiError::InvalidBody,
+                ),
+                approval_category(
+                    "APPROVAL_INVALID_FIELD",
+                    "A bounded key, subject or decider was empty, over-long or control-bearing.",
+                    &ApprovalApiError::Field {
+                        field: "approval_key",
+                        error: ValueError::Empty,
+                    },
+                ),
+                approval_category(
+                    "APPROVAL_PAGE_SIZE_OUT_OF_RANGE",
+                    "A requested page size was zero — a page that admits nothing cannot make \
+                     progress — or above the largest page this protocol serves.",
+                    &ApprovalApiError::PageSizeOutOfRange {
+                        max_items: 0,
+                        requested: 0,
+                    },
+                ),
+                approval_category(
+                    "APPROVAL_PAGE_TOO_LARGE",
+                    "A page carried more decisions than one page holds.",
+                    &ApprovalApiError::PageTooLarge {
+                        max_items: 0,
+                        actual_items: 0,
+                    },
+                ),
+                approval_category(
+                    "APPROVAL_ROW_AMENDED",
+                    "A write-once row claimed a revision other than one. The ledger pins the \
+                     column with a database CHECK and has no update path, so any other value \
+                     names a row this product could not have written.",
+                    &ApprovalApiError::RowAmended { revision: 2 },
+                ),
+                approval_category(
+                    "APPROVAL_TIME_BEFORE_EPOCH",
+                    "A durable instant was before the epoch, which the ledger cannot hold.",
+                    &ApprovalApiError::TimeBeforeEpoch {
+                        field: "decided_at_ms",
+                    },
+                ),
+                approval_category(
+                    "APPROVAL_UNKNOWN_KIND",
+                    "The message kind is not part of this closed protocol version.",
+                    &ApprovalApiError::UnknownKind,
+                ),
+                approval_category(
+                    "APPROVAL_UNWRITTEN_ROW",
+                    "A durable row identity was zero, which names a row no writer produced.",
+                    &ApprovalApiError::UnwrittenRow { field: "entry_id" },
+                ),
+                // The three below are the shared codec's own categories, which
+                // this protocol reports unchanged. They carry this lane's prefix
+                // because one name has one declaring module.
+                approval_category(
+                    "APPROVAL_FIELD_GRAMMAR",
+                    "An envelope field cleared the bounded-value rules and broke its own grammar.",
+                    &ApprovalApiError::Codec(CodecError::Grammar {
+                        field: "request_id",
+                    }),
+                ),
+                approval_category(
+                    "APPROVAL_FIELD_INVALID",
+                    "An envelope field was empty, too long, or carried a control character.",
+                    &ApprovalApiError::Codec(CodecError::Field {
+                        field: "request_id",
+                        error: ValueError::Empty,
+                    }),
+                ),
+                approval_category(
+                    "APPROVAL_UNKNOWN_ENUM_VALUE",
+                    "A decision, disposition, conflict field or refusal this build does not \
+                     define. All four vocabularies on this lane fail closed: every guess at an \
+                     unnameable answer to an approval question is wrong.",
+                    &ApprovalApiError::Codec(CodecError::UnknownEnumValue { field: "decision" }),
+                ),
+                Constant {
+                    // As on the Runs and Automation lanes, nothing pins this
+                    // one: no shipped transport carries `automonique.approval`
+                    // yet, so no peer reports a spelling for a payload above the
+                    // ceiling.
+                    name: "APPROVAL_FRAME_SIZE".to_owned(),
+                    doc: "A canonical payload above this protocol's ceiling. No shipped transport \
+                          carries this protocol yet, so nothing pins this spelling; it is the one \
+                          the local admin transport reports for the same fault."
+                        .to_owned(),
+                    value: ConstantValue::Text("frame_size".to_owned()),
+                },
+            ],
+            invalid_body_category: "APPROVAL_INVALID_BODY".to_owned(),
+            unknown_kind_category: "APPROVAL_UNKNOWN_KIND".to_owned(),
+            oversize_category: "APPROVAL_FRAME_SIZE".to_owned(),
+            field_invalid_category: "APPROVAL_FIELD_INVALID".to_owned(),
+            field_grammar_category: "APPROVAL_FIELD_GRAMMAR".to_owned(),
+            body_objects: vec![BodyObject {
+                name: "ApprovalRecord".to_owned(),
+                doc: "One validated `approval_decisions` row. `revision` is always one and this \
+                      type refuses anything else: the row is write-once, so there is no update \
+                      and no delete, and reversing a decision is a new key naming the same \
+                      subject with both rows surviving."
+                    .to_owned(),
+                fields: approval_record_fields(),
+            }],
+            requests: vec![
+                RequestCommand {
+                    kind: "approval_detail".to_owned(),
+                    name: "ApprovalDetail".to_owned(),
+                    doc: "Read one decision in full, by the key it was recorded under.".to_owned(),
+                    fields: vec![checked_field(
+                        "approval_key",
+                        APPROVAL_KEY,
+                        "APPROVAL_INVALID_FIELD",
+                    )],
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "approvals_by_subject".to_owned(),
+                    name: "ApprovalsBySubject".to_owned(),
+                    doc: "Ask for one bounded page of the decisions recorded against one subject, \
+                          in the order they were recorded. A grant and the later denial that \
+                          reconsidered it are two records here; which of them governs is not this \
+                          protocol's answer. The cursor is a position in the whole listing rather \
+                          than in the matching subset, exactly as the ledger judges it."
+                        .to_owned(),
+                    fields: vec![
+                        RequestField {
+                            name: "page_size".to_owned(),
+                            input_name: "page_size".to_owned(),
+                            value: RequestValue::Integer {
+                                type_name: "ApprovalPageSize".to_owned(),
+                                refusal_category: "APPROVAL_PAGE_SIZE_OUT_OF_RANGE".to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "since".to_owned(),
+                            input_name: "since".to_owned(),
+                            value: RequestValue::Integer {
+                                type_name: APPROVAL_CURSOR.to_owned(),
+                                refusal_category: "APPROVAL_COUNTER_OUT_OF_RANGE".to_owned(),
+                            },
+                        },
+                        checked_field("subject", APPROVAL_SUBJECT, "APPROVAL_INVALID_FIELD"),
+                    ],
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "list_approvals".to_owned(),
+                    name: "ListApprovals".to_owned(),
+                    doc: "Ask for one bounded page of every recorded decision. `since` is the \
+                          entry this listing resumes *after*, and zero is the beginning rather \
+                          than the absence of a cursor."
+                        .to_owned(),
+                    fields: vec![
+                        RequestField {
+                            name: "page_size".to_owned(),
+                            input_name: "page_size".to_owned(),
+                            value: RequestValue::Integer {
+                                type_name: "ApprovalPageSize".to_owned(),
+                                refusal_category: "APPROVAL_PAGE_SIZE_OUT_OF_RANGE".to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "since".to_owned(),
+                            input_name: "since".to_owned(),
+                            value: RequestValue::Integer {
+                                type_name: APPROVAL_CURSOR.to_owned(),
+                                refusal_category: "APPROVAL_COUNTER_OUT_OF_RANGE".to_owned(),
+                            },
+                        },
+                    ],
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "record_approval".to_owned(),
+                    name: "RecordApproval".to_owned(),
+                    doc: "Record one decision, write-once. The only mutation this protocol has: \
+                          there is no update and no delete, because the ledger has neither. The \
+                          instant is not a field either — the daemon stamps it from its own \
+                          clock, because a caller-supplied one would let a client date a decision \
+                          to whenever it liked and the durable row is the evidence."
+                        .to_owned(),
+                    fields: vec![
+                        checked_field("approval_key", APPROVAL_KEY, "APPROVAL_INVALID_FIELD"),
+                        checked_field("decider", DECIDER, "APPROVAL_INVALID_FIELD"),
+                        RequestField {
+                            name: "decision".to_owned(),
+                            input_name: "decision".to_owned(),
+                            value: RequestValue::Enum {
+                                type_name: "ApprovalDecision".to_owned(),
+                                unknown_category: "APPROVAL_UNKNOWN_ENUM_VALUE".to_owned(),
+                            },
+                        },
+                        checked_field("subject", APPROVAL_SUBJECT, "APPROVAL_INVALID_FIELD"),
+                    ],
+                    coupling: None,
+                },
+            ],
+            // This protocol version defines exactly the four requests above.
+            // `tests/codegen.rs` proves the list against the Rust encoders
+            // themselves rather than against this claim.
+            request_kinds_not_generated: Vec::new(),
+            responses: vec![
+                ResponseDecoder {
+                    kind: "approval_conflict".to_owned(),
+                    name: "ApprovalConflict".to_owned(),
+                    doc: "The key is recorded with a different decision. Nothing was written, and \
+                          nothing ever will be for this key: the ledger has no update path, and a \
+                          genuinely changed decision is a new key. The recorded coordinates \
+                          travel with the answer so a caller learns what it collided with without \
+                          a second read; the key is deliberately absent, because the caller \
+                          supplied it and already holds it."
+                        .to_owned(),
+                    fields: vec![
+                        approval_integer_field(
+                            "entry_id",
+                            DURABLE_ROW_ID,
+                            "APPROVAL_UNWRITTEN_ROW",
+                            true,
+                        ),
+                        // Which of the three the two decisions differ on. The
+                        // answering end derives it by comparing them in the
+                        // order the ledger compares them; a decoder cannot
+                        // re-derive it, because a conflict carries only the
+                        // recorded side. What a decoder can hold is that the
+                        // spelling is one of the three, and it does.
+                        approval_enum_field("field", "ApprovalConflictField"),
+                        approval_checked_field("recorded_decider", DECIDER),
+                        approval_enum_field("recorded_decision", "ApprovalDecision"),
+                        approval_checked_field("recorded_subject", APPROVAL_SUBJECT),
+                    ],
+                },
+                ResponseDecoder {
+                    kind: "approval_detail_result".to_owned(),
+                    name: "ApprovalDetailView".to_owned(),
+                    // The body *is* a record: no wrapper key, nothing nested
+                    // beside it. The fields come from the same list the nested
+                    // body object is built from, so the two readings cannot
+                    // drift apart.
+                    doc: "One decision in full. The body is a record with no wrapper: what a \
+                          listing carries in an array is what a detail read answers on its own."
+                        .to_owned(),
+                    fields: approval_record_fields(),
+                },
+                ResponseDecoder {
+                    kind: "approval_list_result".to_owned(),
+                    name: "ApprovalListPage".to_owned(),
+                    doc: "One bounded page of decision records. `more` is carried explicitly \
+                          rather than inferred from a short page: a subject filter can exclude \
+                          every row in a scanned window and still leave rows behind it, so a \
+                          client that inferred `done` from a short page would stop early."
+                        .to_owned(),
+                    fields: vec![
+                        ResponseField {
+                            name: "approvals".to_owned(),
+                            value: ResponseValue::ObjectArray {
+                                type_name: "ApprovalRecord".to_owned(),
+                                max_items_constant: "MAX_APPROVAL_PAGE_ITEMS".to_owned(),
+                                oversize_category: "APPROVAL_PAGE_TOO_LARGE".to_owned(),
+                            },
+                        },
+                        ResponseField {
+                            name: "more".to_owned(),
+                            value: ResponseValue::Bool,
+                        },
+                        ResponseField {
+                            name: "next_cursor".to_owned(),
+                            value: ResponseValue::NullableInteger {
+                                type_name: APPROVAL_CURSOR.to_owned(),
+                                refusal_category: "APPROVAL_INVALID_BODY".to_owned(),
+                            },
+                        },
+                    ],
+                },
+                ResponseDecoder {
+                    kind: "approval_recorded".to_owned(),
+                    name: "ApprovalReceipt".to_owned(),
+                    doc: "One decision is durable, and the disposition says whether this call is \
+                          what made it so. `accepted` rather than `completed`, on a fresh \
+                          recording and on an exact replay alike: the row is committed, but what \
+                          it records has not taken effect and cannot, because no executor in this \
+                          build consults the ledger before acting. On an `already_recorded` \
+                          answer the instant is the *first* recording's — a replay writes \
+                          nothing, including the clock. There is no revision here, because a \
+                          caller has nothing to fence against: no second write to this row exists."
+                        .to_owned(),
+                    fields: vec![
+                        approval_checked_field("approval_key", APPROVAL_KEY),
+                        approval_integer_field(
+                            "decided_at_ms",
+                            EPOCH_MILLIS,
+                            "APPROVAL_TIME_BEFORE_EPOCH",
+                            false,
+                        ),
+                        approval_enum_field("decision", "ApprovalDecision"),
+                        approval_enum_field("disposition", "ApprovalDisposition"),
+                        approval_integer_field(
+                            "entry_id",
+                            DURABLE_ROW_ID,
+                            "APPROVAL_UNWRITTEN_ROW",
+                            true,
+                        ),
+                    ],
+                },
+                ResponseDecoder {
+                    kind: "refused".to_owned(),
+                    name: "ApprovalRefused".to_owned(),
+                    doc: "The operation was refused. Nothing was written and nothing was read. A \
+                          key recorded with a different answer is deliberately not among these \
+                          words: that is a conflict, which a caller retries differently — and an \
+                          exact replay is not among them either, because a replay is a success \
+                          carrying `already_recorded`."
+                        .to_owned(),
+                    fields: vec![approval_enum_field("refusal", "ApprovalRefusal")],
+                },
+            ],
+            // Every kind this protocol version answers with is decoded above.
+            response_kinds_not_decoded: Vec::new(),
+        }),
+        ..GeneratedModule::default()
+    }
+}
+
 /// Every maintained module, in file-name order.
 #[must_use]
 pub fn maintained_modules() -> Vec<GeneratedModule> {
@@ -3544,6 +4250,7 @@ pub fn maintained_modules() -> Vec<GeneratedModule> {
         admin_command_module(),
         runs_module(),
         automation_module(),
+        approval_module(),
     ];
     modules.sort_by(|left, right| left.file_name.cmp(&right.file_name));
     modules

@@ -1,0 +1,666 @@
+{
+  "decode_refusals": [
+    {
+      "category": "unknown_enum_value",
+      "id": "decision-undefined-spelling",
+      "note": "a decision this build does not define fails closed rather than decoding to a default a client would act on. There is no safe guess here: reading it as a grant invents permission, and reading it as a denial invents a refusal nobody made",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b7b22617070726f76616c5f6b6579223a22617070726f76616c2f6465706c6f792d70726f64222c22646563696465645f61745f6d73223a313730303030303030303030302c2264656369646572223a226f70732f6f6e63616c6c222c226465636973696f6e223a226162737461696e6564222c22656e7472795f6964223a312c227265766973696f6e223a312c227375626a656374223a226566666563743a7075626c6973682d6172746966616374227d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "unknown_enum_value",
+      "id": "disposition-undefined-spelling",
+      "note": "a disposition outside the two this build carries, on the answer a write returns; the vocabulary is closed on both sides of the wire",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c5f6b6579223a22617070726f76616c2f6465706c6f792d70726f64222c22646563696465645f61745f6d73223a313730303030303030303030302c226465636973696f6e223a226772616e746564222c22646973706f736974696f6e223a2273757065727365646564222c22656e7472795f6964223a317d2c226b696e64223a22617070726f76616c5f7265636f72646564222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7265636f72642d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "unknown_enum_value",
+      "id": "conflict-field-undefined-spelling",
+      "note": "a conflict naming a field outside the three the ledger compares. A decoder cannot re-derive which field disagrees — a conflict carries only the recorded side — so holding the spelling closed is exactly what it can hold",
+      "payload_hex": "7b22626f6479223a7b22656e7472795f6964223a31322c226669656c64223a22646563696465645f6174222c227265636f726465645f64656369646572223a226f70732f6f6e63616c6c222c227265636f726465645f6465636973696f6e223a2264656e696564222c227265636f726465645f7375626a656374223a226566666563743a7075626c6973682d6172746966616374227d2c226b696e64223a22617070726f76616c5f636f6e666c696374222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7265636f72642d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "unknown_enum_value",
+      "id": "refusal-undefined-spelling",
+      "note": "a refusal word outside the four this build carries",
+      "payload_hex": "7b22626f6479223a7b227265667573616c223a226e6f745f617574686f72697a6564227d2c226b696e64223a2272656675736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7265636f72642d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_unwritten_row",
+      "id": "entry-id-zero",
+      "note": "a durable identity starts at one; zero names a row no writer produced",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b7b22617070726f76616c5f6b6579223a22617070726f76616c2f6465706c6f792d70726f64222c22646563696465645f61745f6d73223a313730303030303030303030302c2264656369646572223a226f70732f6f6e63616c6c222c226465636973696f6e223a226772616e746564222c22656e7472795f6964223a302c227265766973696f6e223a312c227375626a656374223a226566666563743a7075626c6973682d6172746966616374227d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_invalid_body",
+      "id": "entry-id-negative",
+      "note": "a negative identity is a malformed body rather than an unwritten row: the decoder converts before it judges the domain, and the two categories differ",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b7b22617070726f76616c5f6b6579223a22617070726f76616c2f6465706c6f792d70726f64222c22646563696465645f61745f6d73223a313730303030303030303030302c2264656369646572223a226f70732f6f6e63616c6c222c226465636973696f6e223a226772616e746564222c22656e7472795f6964223a2d312c227265766973696f6e223a312c227375626a656374223a226566666563743a7075626c6973682d6172746966616374227d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_row_amended",
+      "id": "revision-two",
+      "note": "the write-once pin, met from above: the ledger has no update path at all, so a second revision names a row a second writer produced. This is the durable-row rule the generated surface *does* hold, because `revision == 1` is a bound on one field's own value rather than a relation between two",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b7b22617070726f76616c5f6b6579223a22617070726f76616c2f6465706c6f792d70726f64222c22646563696465645f61745f6d73223a313730303030303030303030302c2264656369646572223a226f70732f6f6e63616c6c222c226465636973696f6e223a226772616e746564222c22656e7472795f6964223a312c227265766973696f6e223a322c227375626a656374223a226566666563743a7075626c6973682d6172746966616374227d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_row_amended",
+      "id": "revision-zero",
+      "note": "the same pin met from below, and under the same category: a write-once row that claims revision zero is as impossible as one that claims two",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b7b22617070726f76616c5f6b6579223a22617070726f76616c2f6465706c6f792d70726f64222c22646563696465645f61745f6d73223a313730303030303030303030302c2264656369646572223a226f70732f6f6e63616c6c222c226465636973696f6e223a226772616e746564222c22656e7472795f6964223a312c227265766973696f6e223a302c227375626a656374223a226566666563743a7075626c6973682d6172746966616374227d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_time_before_epoch",
+      "id": "decided-at-before-epoch",
+      "note": "an instant the ledger's own `decided_at_ms >= 0` constraint cannot hold",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b7b22617070726f76616c5f6b6579223a22617070726f76616c2f6465706c6f792d70726f64222c22646563696465645f61745f6d73223a2d312c2264656369646572223a226f70732f6f6e63616c6c222c226465636973696f6e223a226772616e746564222c22656e7472795f6964223a312c227265766973696f6e223a312c227375626a656374223a226566666563743a7075626c6973682d6172746966616374227d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_time_before_epoch",
+      "id": "receipt-decided-at-before-epoch",
+      "note": "the same constraint on the instant a write reports",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c5f6b6579223a22617070726f76616c2f6465706c6f792d70726f64222c22646563696465645f61745f6d73223a2d312c226465636973696f6e223a226772616e746564222c22646973706f736974696f6e223a227265636f72646564222c22656e7472795f6964223a317d2c226b696e64223a22617070726f76616c5f7265636f72646564222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7265636f72642d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_invalid_field",
+      "id": "subject-empty",
+      "note": "an empty subject would answer `was this decided` and never `what was decided`, which is the whole reason the ledger stores a subject beside the key",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b7b22617070726f76616c5f6b6579223a22617070726f76616c2f6465706c6f792d70726f64222c22646563696465645f61745f6d73223a313730303030303030303030302c2264656369646572223a226f70732f6f6e63616c6c222c226465636973696f6e223a226772616e746564222c22656e7472795f6964223a312c227265766973696f6e223a312c227375626a656374223a22227d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_invalid_field",
+      "id": "decider-empty",
+      "note": "an empty decider names nobody. This lane records who answered, and an unattributed decision is the one it does not offer a spelling for",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b7b22617070726f76616c5f6b6579223a22617070726f76616c2f6465706c6f792d70726f64222c22646563696465645f61745f6d73223a313730303030303030303030302c2264656369646572223a22222c226465636973696f6e223a226772616e746564222c22656e7472795f6964223a312c227265766973696f6e223a312c227375626a656374223a226566666563743a7075626c6973682d6172746966616374227d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_invalid_field",
+      "id": "approval-key-over-bound-in-bytes-only",
+      "note": "129 two-byte characters: 129 UTF-16 code units, which a JavaScript `length` check would wave through, and 258 UTF-8 bytes, which is over the bound Rust and the ledger both measure",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b7b22617070726f76616c5f6b6579223a22c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9222c22646563696465645f61745f6d73223a313730303030303030303030302c2264656369646572223a226f70732f6f6e63616c6c222c226465636973696f6e223a226772616e746564222c22656e7472795f6964223a312c227265766973696f6e223a312c227375626a656374223a226566666563743a7075626c6973682d6172746966616374227d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_invalid_field",
+      "id": "decider-control-character",
+      "note": "a control character in a decider, which the wire never carries raw",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b7b22617070726f76616c5f6b6579223a22617070726f76616c2f6465706c6f792d70726f64222c22646563696465645f61745f6d73223a313730303030303030303030302c2264656369646572223a226f70735c75303030376f6e63616c6c222c226465636973696f6e223a226772616e746564222c22656e7472795f6964223a312c227265766973696f6e223a312c227375626a656374223a226566666563743a7075626c6973682d6172746966616374227d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_page_too_large",
+      "id": "page-over-bound",
+      "note": "one row past MAX_APPROVAL_PAGE_ITEMS. The length is judged before any item is read, so what these items are does not matter and the refusal names the length",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b302c312c322c332c342c352c362c372c382c392c31302c31312c31322c31332c31342c31352c31362c31372c31382c31392c32302c32312c32322c32332c32342c32352c32362c32372c32382c32392c33302c33312c33325d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_invalid_body",
+      "id": "next-cursor-negative",
+      "note": "a cursor below the beginning of the listing",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b5d2c226d6f7265223a747275652c226e6578745f637572736f72223a2d317d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_invalid_body",
+      "id": "more-not-a-boolean",
+      "note": "the wire carries true or false for a continuation and nothing else",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b5d2c226d6f7265223a312c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_unwritten_row",
+      "id": "conflict-entry-id-zero",
+      "note": "a conflict pointing at a row no writer produced tells a caller it collided with nothing",
+      "payload_hex": "7b22626f6479223a7b22656e7472795f6964223a302c226669656c64223a226465636973696f6e222c227265636f726465645f64656369646572223a226f70732f6f6e63616c6c222c227265636f726465645f6465636973696f6e223a2264656e696564222c227265636f726465645f7375626a656374223a226566666563743a7075626c6973682d6172746966616374227d2c226b696e64223a22617070726f76616c5f636f6e666c696374222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7265636f72642d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_invalid_field",
+      "id": "conflict-recorded-subject-empty",
+      "note": "the recorded coordinates are held to the same grammar as the ones a record carries; a conflict is evidence and not an error string",
+      "payload_hex": "7b22626f6479223a7b22656e7472795f6964223a31322c226669656c64223a226465636973696f6e222c227265636f726465645f64656369646572223a226f70732f6f6e63616c6c222c227265636f726465645f6465636973696f6e223a2264656e696564222c227265636f726465645f7375626a656374223a22227d2c226b696e64223a22617070726f76616c5f636f6e666c696374222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7265636f72642d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_invalid_body",
+      "id": "page-extra-field",
+      "note": "an unexpected key is refused rather than ignored",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c2c22746f74616c223a317d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_invalid_body",
+      "id": "record-missing-revision",
+      "note": "a missing key is refused rather than defaulted, inside a nested body as much as at the top level — and defaulting this one to `1` is exactly the shortcut that would make the write-once claim unfalsifiable",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b7b22617070726f76616c5f6b6579223a22617070726f76616c2f6465706c6f792d70726f64222c22646563696465645f61745f6d73223a313730303030303030303030302c2264656369646572223a226f70732f6f6e63616c6c222c226465636973696f6e223a226772616e746564222c22656e7472795f6964223a312c227375626a656374223a226566666563743a7075626c6973682d6172746966616374227d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "approval_unknown_kind",
+      "id": "unknown-kind",
+      "note": "a kind this protocol version does not define, which is a different answer from a kind it defines and this surface does not decode",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f686973746f72795f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "unknown_protocol",
+      "id": "automation-protocol-message",
+      "note": "the Automation lane's name on this lane's decoder, refused on the name axis so each protocol's closed kind set stays closed",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e6175746f6d6174696f6e222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "unsupported_version",
+      "id": "unsupported-version",
+      "note": "this protocol at a major version neither side implements",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a327d"
+    },
+    {
+      "category": "non_canonical_json",
+      "id": "non-canonical-key-order",
+      "note": "a payload that parses but is not canonical is refused, not normalized",
+      "payload_hex": "7b226b696e64223a2272656675736564222c22626f6479223a7b227265667573616c223a226c65646765725f66756c6c227d2c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7265636f72642d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "malformed_json",
+      "id": "empty-payload",
+      "note": "zero bytes is not an empty message",
+      "payload_hex": ""
+    }
+  ],
+  "encode_refusals": [
+    {
+      "category": "unknown_enum_value",
+      "id": "record-approval-undefined-decision",
+      "kind": "record_approval",
+      "note": "a brand exists only in the type checker, so the builder is where an untyped caller's undefined decision is stopped rather than put on the wire. `abstained` is not a word this ledger can store",
+      "params": {
+        "approval_key": "approval/deploy-prod",
+        "decider": "ops/oncall",
+        "decision": "abstained",
+        "subject": "effect:publish-artifact"
+      },
+      "request_id": "req-record-1"
+    },
+    {
+      "category": "unknown_enum_value",
+      "id": "record-approval-decision-title-case",
+      "kind": "record_approval",
+      "note": "the spelling is exact and lowercase: `Granted` is not `granted`, and a vocabulary that case-folded would admit words the ledger's CHECK refuses",
+      "params": {
+        "approval_key": "approval/deploy-prod",
+        "decider": "ops/oncall",
+        "decision": "Granted",
+        "subject": "effect:publish-artifact"
+      },
+      "request_id": "req-record-1"
+    },
+    {
+      "category": "approval_invalid_field",
+      "id": "record-approval-subject-over-bound",
+      "kind": "record_approval",
+      "note": "129 two-byte characters: inside the UTF-16 code-unit bound and outside the UTF-8 one the ledger stores under",
+      "params": {
+        "approval_key": "approval/deploy-prod",
+        "decider": "ops/oncall",
+        "decision": "granted",
+        "subject": "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+      },
+      "refused_by": "ApprovalSubject",
+      "refused_param": "subject",
+      "request_id": "req-record-1",
+      "violation": "too_long"
+    },
+    {
+      "category": "approval_invalid_field",
+      "id": "record-approval-decider-empty",
+      "kind": "record_approval",
+      "note": "empty is refused rather than read as `nobody`: an unattributed decision is the one this product does not offer a spelling for",
+      "params": {
+        "approval_key": "approval/deploy-prod",
+        "decider": "",
+        "decision": "granted",
+        "subject": "effect:publish-artifact"
+      },
+      "refused_by": "Decider",
+      "refused_param": "decider",
+      "request_id": "req-record-1",
+      "violation": "empty"
+    },
+    {
+      "category": "approval_invalid_field",
+      "id": "record-approval-key-control-character",
+      "kind": "record_approval",
+      "note": "a control character in a key, which the wire never carries raw. A space *is* admitted here, which is the difference between this lane's grammar and the correlation identifier's",
+      "params": {
+        "approval_key": "approval\u0007deploy",
+        "decider": "ops/oncall",
+        "decision": "granted",
+        "subject": "effect:publish-artifact"
+      },
+      "refused_by": "ApprovalKey",
+      "refused_param": "approval_key",
+      "request_id": "req-record-1",
+      "violation": "invalid_character"
+    },
+    {
+      "category": "approval_page_size_out_of_range",
+      "id": "list-approvals-page-size-zero",
+      "kind": "list_approvals",
+      "note": "a page that admits nothing cannot make progress, so zero is refused rather than treated as a default",
+      "params": {
+        "page_size": "0",
+        "since": "0"
+      },
+      "refused_by": "ApprovalPageSize",
+      "refused_param": "page_size",
+      "request_id": "req-list-1",
+      "violation": "out_of_range"
+    },
+    {
+      "category": "approval_page_size_out_of_range",
+      "id": "list-approvals-page-size-above-bound",
+      "kind": "list_approvals",
+      "note": "one past MAX_APPROVAL_PAGE_ITEMS, which is thirty-two here and sixty-four on the Runs lane: a page bound follows the frame arithmetic of the rows it carries, and a decision row carries three maximal identifiers where a run summary carries one",
+      "params": {
+        "page_size": "33",
+        "since": "0"
+      },
+      "refused_by": "ApprovalPageSize",
+      "refused_param": "page_size",
+      "request_id": "req-list-1",
+      "violation": "out_of_range"
+    },
+    {
+      "category": "approval_counter_out_of_range",
+      "id": "list-approvals-cursor-above-wire-ceiling",
+      "kind": "list_approvals",
+      "note": "a cursor one past the largest integer this wire carries, which is a counter refusal rather than a malformed body",
+      "params": {
+        "page_size": "1",
+        "since": "9223372036854775808"
+      },
+      "refused_by": "ApprovalCursor",
+      "refused_param": "since",
+      "request_id": "req-list-1",
+      "violation": "out_of_range"
+    },
+    {
+      "category": "approval_page_size_out_of_range",
+      "id": "approvals-by-subject-page-size-above-bound",
+      "kind": "approvals_by_subject",
+      "note": "the second listing obeys the same page bound as the first; they share one decoder in Rust and one branded type here, so they cannot disagree",
+      "params": {
+        "page_size": "33",
+        "since": "0",
+        "subject": "effect:publish-artifact"
+      },
+      "refused_by": "ApprovalPageSize",
+      "refused_param": "page_size",
+      "request_id": "req-subject-1",
+      "violation": "out_of_range"
+    },
+    {
+      "category": "approval_invalid_field",
+      "id": "approvals-by-subject-subject-empty",
+      "kind": "approvals_by_subject",
+      "note": "an empty subject names nothing to read the history of",
+      "params": {
+        "page_size": "1",
+        "since": "0",
+        "subject": ""
+      },
+      "refused_by": "ApprovalSubject",
+      "refused_param": "subject",
+      "request_id": "req-subject-1",
+      "violation": "empty"
+    },
+    {
+      "category": "approval_invalid_field",
+      "id": "approval-detail-key-empty",
+      "kind": "approval_detail",
+      "note": "an empty key names no decision",
+      "params": {
+        "approval_key": ""
+      },
+      "refused_by": "ApprovalKey",
+      "refused_param": "approval_key",
+      "request_id": "req-detail-1",
+      "violation": "empty"
+    },
+    {
+      "category": "field_invalid",
+      "id": "request-id-too-long",
+      "kind": "approval_detail",
+      "note": "the envelope's fields are judged by the shared codec, whose refusal for a bound is not the one this protocol uses for a body",
+      "params": {
+        "approval_key": "approval/deploy-prod"
+      },
+      "refused_by": "RequestId",
+      "refused_param": "request_id",
+      "request_id": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "violation": "too_long"
+    },
+    {
+      "category": "field_grammar",
+      "id": "request-id-outside-grammar",
+      "kind": "approval_detail",
+      "note": "a grammar refusal is not a bounds refusal, and the categories differ. A space is outside the correlation identifier's grammar and inside the approval key's, which is the difference this lane's looser identifier makes",
+      "params": {
+        "approval_key": "approval/deploy prod"
+      },
+      "refused_by": "RequestId",
+      "refused_param": "request_id",
+      "request_id": "req 1",
+      "violation": "invalid_character"
+    }
+  ],
+  "generator": "automonique-protocol tests/codegen.rs, module approval_surface",
+  "note": "Generated from the shipped Rust constructors: every canonical byte string here was produced by encoding a real message and re-read through from_canonical_bytes before it was written, and every refusal category was read back from the error Rust returned for that exact input. Counters travel as decimal strings because a JSON reader using a double would round the largest of them without saying so. Rust is the wire source of truth, so a disagreement is fixed in whichever implementation is wrong — never in this file.",
+  "protocol": "automonique.approval",
+  "requests": [
+    {
+      "canonical_bytes": 267,
+      "canonical_hex": "7b22626f6479223a7b22706167655f73697a65223a33322c2273696e6365223a393232333337323033363835343737353830377d2c226b696e64223a226c6973745f617070726f76616c73222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c2276657273696f6e223a317d",
+      "id": "list-approvals-maximal",
+      "kind": "list_approvals",
+      "note": "every bound at once: a cursor at the wire's integer ceiling, the largest page this protocol serves, and a correlation identifier at MAX_REQUEST_ID_BYTES. A reader carrying the cursor in a double would encode 9223372036854775808 here without a word of complaint",
+      "params": {
+        "page_size": "32",
+        "since": "9223372036854775807"
+      },
+      "request_id": "req-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "canonical_bytes": 130,
+      "canonical_hex": "7b22626f6479223a7b22706167655f73697a65223a312c2273696e6365223a307d2c226b696e64223a226c6973745f617070726f76616c73222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "id": "list-approvals-start",
+      "kind": "list_approvals",
+      "note": "the beginning of the ledger: a cursor of zero, which is a position rather than the absence of one, and the smallest page that can make progress",
+      "params": {
+        "page_size": "1",
+        "since": "0"
+      },
+      "request_id": "req-list-1"
+    },
+    {
+      "canonical_bytes": 321,
+      "canonical_hex": "7b22626f6479223a7b22617070726f76616c5f6b6579223a22617070726f76616c2f5c226465706c6f792070726f645c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c2264656369646572223a226f70732f5c226f6e63616c6c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c226465636973696f6e223a226772616e746564222c227375626a656374223a226566666563743a5c227075626c6973682061727469666163745c22205c5c207368613235363a6e61c3af766520e697a5e69cace8aa9e20f09f9a80227d2c226b696e64223a227265636f72645f617070726f76616c222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7265636f72642d31222c2276657273696f6e223a317d",
+      "id": "record-approval-granted-escaping",
+      "kind": "record_approval",
+      "note": "a grant whose key, subject and decider each carry every escape a bounded field can reach, a three-byte character and a surrogate pair; the key carries a space, which this lane's grammar admits because the ledger stores any bounded control-free identifier",
+      "params": {
+        "approval_key": "approval/\"deploy prod\" \\ naïve 日本語 🚀",
+        "decider": "ops/\"oncall\" \\ naïve 日本語 🚀",
+        "decision": "granted",
+        "subject": "effect:\"publish artifact\" \\ sha256:naïve 日本語 🚀"
+      },
+      "request_id": "req-record-1"
+    },
+    {
+      "canonical_bytes": 767,
+      "canonical_hex": "7b22626f6479223a7b22617070726f76616c5f6b6579223a225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c225c22222c2264656369646572223a2272756e626f6f6b2f6e696768746c792d72656c65617365222c226465636973696f6e223a2264656e696564222c227375626a656374223a226566666563743a5c227075626c6973682061727469666163745c22205c5c207368613235363a6e61c3af766520e697a5e69cace8aa9e20f09f9a80227d2c226b696e64223a227265636f72645f617070726f76616c222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7265636f72642d32222c2276657273696f6e223a317d",
+      "id": "record-approval-denied-maximal",
+      "kind": "record_approval",
+      "note": "a denial under a key at MAX_APPROVAL_API_FIELD_BYTES whose every character escapes to two bytes, which is the worst case this protocol's frame arithmetic budgets for. `denied` is a recorded answer and not a refusal: an unrecorded decision and a denied one are different facts",
+      "params": {
+        "approval_key": "\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"",
+        "decider": "runbook/nightly-release",
+        "decision": "denied",
+        "subject": "effect:\"publish artifact\" \\ sha256:naïve 日本語 🚀"
+      },
+      "request_id": "req-record-2"
+    },
+    {
+      "canonical_bytes": 176,
+      "canonical_hex": "7b22626f6479223a7b22617070726f76616c5f6b6579223a22617070726f76616c2f5c226465706c6f792070726f645c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80227d2c226b696e64223a22617070726f76616c5f64657461696c222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d",
+      "id": "approval-detail-escaping",
+      "kind": "approval_detail",
+      "note": "one decision read by a key carrying every reachable escape",
+      "params": {
+        "approval_key": "approval/\"deploy prod\" \\ naïve 日本語 🚀"
+      },
+      "request_id": "req-detail-1"
+    },
+    {
+      "canonical_bytes": 230,
+      "canonical_hex": "7b22626f6479223a7b22706167655f73697a65223a33322c2273696e6365223a393232333337323033363835343737353830372c227375626a656374223a226566666563743a5c227075626c6973682061727469666163745c22205c5c207368613235363a6e61c3af766520e697a5e69cace8aa9e20f09f9a80227d2c226b696e64223a22617070726f76616c735f62795f7375626a656374222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7375626a6563742d31222c2276657273696f6e223a317d",
+      "id": "approvals-by-subject-maximal",
+      "kind": "approvals_by_subject",
+      "note": "one subject's whole decision history at the wire's ceiling cursor and the largest page: the cursor is a position in the whole listing rather than in the matching subset, exactly as the ledger judges it",
+      "params": {
+        "page_size": "32",
+        "since": "9223372036854775807",
+        "subject": "effect:\"publish artifact\" \\ sha256:naïve 日本語 🚀"
+      },
+      "request_id": "req-subject-1"
+    },
+    {
+      "canonical_bytes": 175,
+      "canonical_hex": "7b22626f6479223a7b22706167655f73697a65223a322c2273696e6365223a302c227375626a656374223a226566666563743a7075626c6973682d6172746966616374227d2c226b696e64223a22617070726f76616c735f62795f7375626a656374222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7375626a6563742d32222c2276657273696f6e223a317d",
+      "id": "approvals-by-subject-start",
+      "kind": "approvals_by_subject",
+      "note": "the same read from the beginning, with the smallest page",
+      "params": {
+        "page_size": "2",
+        "since": "0",
+        "subject": "effect:publish-artifact"
+      },
+      "request_id": "req-subject-2"
+    }
+  ],
+  "responses": [
+    {
+      "canonical_hex": "7b22626f6479223a7b22617070726f76616c5f6b6579223a22617070726f76616c2f5c226465706c6f792070726f645c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c22646563696465645f61745f6d73223a313730303030303030303030302c226465636973696f6e223a226772616e746564222c22646973706f736974696f6e223a227265636f72646564222c22656e7472795f6964223a317d2c226b696e64223a22617070726f76616c5f7265636f72646564222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7265636f72642d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "approval_key": "approval/\"deploy prod\" \\ naïve 日本語 🚀",
+        "decided_at_ms": "1700000000000",
+        "decision": "granted",
+        "disposition": "recorded",
+        "entry_id": "1",
+        "request_id": "req-record-1"
+      },
+      "id": "recorded-new",
+      "kind": "approval_recorded",
+      "note": "the key was new, so this call is what made the decision durable. `accepted` rather than `completed`: the row is committed, but what it records has not taken effect and cannot, because no executor in this build consults the ledger before acting",
+      "outcome": "accepted"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b22617070726f76616c5f6b6579223a22617070726f76616c2f6465706c6f792d70726f642d323032362d30382d3133222c22646563696465645f61745f6d73223a393232333337323033363835343737353830372c226465636973696f6e223a2264656e696564222c22646973706f736974696f6e223a22616c72656164795f7265636f72646564222c22656e7472795f6964223a393232333337323033363835343737353830377d2c226b696e64223a22617070726f76616c5f7265636f72646564222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7265636f72642d32222c2276657273696f6e223a317d",
+      "decoded": {
+        "approval_key": "approval/deploy-prod-2026-08-13",
+        "decided_at_ms": "9223372036854775807",
+        "decision": "denied",
+        "disposition": "already_recorded",
+        "entry_id": "9223372036854775807",
+        "request_id": "req-record-2"
+      },
+      "id": "recorded-already-at-ceiling",
+      "kind": "approval_recorded",
+      "note": "an exact replay writes nothing and must never degrade into a refusal: the disposition says `already_recorded` and the instant is the *first* recording's, not this call's. Both counters sit at the wire's ceiling, which a decoder carrying them in a double would round to an even neighbour",
+      "outcome": "accepted"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b22617070726f76616c73223a5b7b22617070726f76616c5f6b6579223a22617070726f76616c2f6669727374222c22646563696465645f61745f6d73223a313730303030303030303030302c2264656369646572223a226f70732f6f6e63616c6c222c226465636973696f6e223a226772616e746564222c22656e7472795f6964223a312c227265766973696f6e223a312c227375626a656374223a226566666563743a7075626c6973682d6172746966616374227d2c7b22617070726f76616c5f6b6579223a22617070726f76616c2f5c226465706c6f792070726f645c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c22646563696465645f61745f6d73223a393232333337323033363835343737353830372c2264656369646572223a226f70732f5c226f6e63616c6c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c226465636973696f6e223a2264656e696564222c22656e7472795f6964223a393232333337323033363835343737353830362c227265766973696f6e223a312c227375626a656374223a226566666563743a5c227075626c6973682061727469666163745c22205c5c207368613235363a6e61c3af766520e697a5e69cace8aa9e20f09f9a80227d5d2c226d6f7265223a747275652c226e6578745f637572736f72223a393232333337323033363835343737353830377d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a22617070726f76616c2d6c6973742d706167652d6d6f7265222c2276657273696f6e223a317d",
+      "decoded": {
+        "approvals.0.approval_key": "approval/first",
+        "approvals.0.decided_at_ms": "1700000000000",
+        "approvals.0.decider": "ops/oncall",
+        "approvals.0.decision": "granted",
+        "approvals.0.entry_id": "1",
+        "approvals.0.revision": "1",
+        "approvals.0.subject": "effect:publish-artifact",
+        "approvals.1.approval_key": "approval/\"deploy prod\" \\ naïve 日本語 🚀",
+        "approvals.1.decided_at_ms": "9223372036854775807",
+        "approvals.1.decider": "ops/\"oncall\" \\ naïve 日本語 🚀",
+        "approvals.1.decision": "denied",
+        "approvals.1.entry_id": "9223372036854775806",
+        "approvals.1.revision": "1",
+        "approvals.1.subject": "effect:\"publish artifact\" \\ sha256:naïve 日本語 🚀",
+        "approvals.len": "2",
+        "more": "true",
+        "next_cursor": "9223372036854775807",
+        "request_id": "approval-list-page-more"
+      },
+      "id": "approval-list-page-more",
+      "kind": "approval_list_result",
+      "note": "a page whose last row and whose continuation cursor are both at the wire's ceiling, carrying a grant beside a denial so both decision spellings travel in the same array",
+      "outcome": "completed"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b22617070726f76616c73223a5b7b22617070726f76616c5f6b6579223a22617070726f76616c2f6f6e6c79222c22646563696465645f61745f6d73223a302c2264656369646572223a226f70732f6f6e63616c6c222c226465636973696f6e223a2264656e696564222c22656e7472795f6964223a392c227265766973696f6e223a312c227375626a656374223a22636f6d6d616e643a6175746f6d6f6e697175652e72756e2e7375626d6974227d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a22617070726f76616c2d6c6973742d706167652d636f6d706c657465222c2276657273696f6e223a317d",
+      "decoded": {
+        "approvals.0.approval_key": "approval/only",
+        "approvals.0.decided_at_ms": "0",
+        "approvals.0.decider": "ops/oncall",
+        "approvals.0.decision": "denied",
+        "approvals.0.entry_id": "9",
+        "approvals.0.revision": "1",
+        "approvals.0.subject": "command:automonique.run.submit",
+        "approvals.len": "1",
+        "more": "false",
+        "next_cursor": "null",
+        "request_id": "approval-list-page-complete"
+      },
+      "id": "approval-list-page-complete",
+      "kind": "approval_list_result",
+      "note": "the end of the ledger: `more` false and an explicit null cursor. A decision recorded at the epoch, which the ledger's own `decided_at_ms >= 0` constraint admits and one millisecond earlier does not",
+      "outcome": "completed"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b22617070726f76616c73223a5b5d2c226d6f7265223a747275652c226e6578745f637572736f72223a34327d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a22617070726f76616c2d6c6973742d706167652d656d7074792d6d6f7265222c2276657273696f6e223a317d",
+      "decoded": {
+        "approvals.len": "0",
+        "more": "true",
+        "next_cursor": "42",
+        "request_id": "approval-list-page-empty-more"
+      },
+      "id": "approval-list-page-empty-more",
+      "kind": "approval_list_result",
+      "note": "an empty page that still reports more: a subject filter can exclude every row in one scanned window while rows remain behind it, so a client that inferred `done` from a short page would stop early",
+      "outcome": "completed"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b22617070726f76616c73223a5b7b22617070726f76616c5f6b6579223a22617070726f76616c2f7075626c6973682d323032362d30382d3132222c22646563696465645f61745f6d73223a313730303030303030303030302c2264656369646572223a226f70732f6f6e63616c6c222c226465636973696f6e223a226772616e746564222c22656e7472795f6964223a342c227265766973696f6e223a312c227375626a656374223a226566666563743a5c227075626c6973682061727469666163745c22205c5c207368613235363a6e61c3af766520e697a5e69cace8aa9e20f09f9a80227d2c7b22617070726f76616c5f6b6579223a22617070726f76616c2f5c226465706c6f792070726f645c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c22646563696465645f61745f6d73223a313730303030303030393030302c2264656369646572223a226f70732f5c226f6e63616c6c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c226465636973696f6e223a2264656e696564222c22656e7472795f6964223a31312c227265766973696f6e223a312c227375626a656374223a226566666563743a5c227075626c6973682061727469666163745c22205c5c207368613235363a6e61c3af766520e697a5e69cace8aa9e20f09f9a80227d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a22617070726f76616c732d62792d7375626a6563742d70616765222c2276657273696f6e223a317d",
+      "decoded": {
+        "approvals.0.approval_key": "approval/publish-2026-08-12",
+        "approvals.0.decided_at_ms": "1700000000000",
+        "approvals.0.decider": "ops/oncall",
+        "approvals.0.decision": "granted",
+        "approvals.0.entry_id": "4",
+        "approvals.0.revision": "1",
+        "approvals.0.subject": "effect:\"publish artifact\" \\ sha256:naïve 日本語 🚀",
+        "approvals.1.approval_key": "approval/\"deploy prod\" \\ naïve 日本語 🚀",
+        "approvals.1.decided_at_ms": "1700000009000",
+        "approvals.1.decider": "ops/\"oncall\" \\ naïve 日本語 🚀",
+        "approvals.1.decision": "denied",
+        "approvals.1.entry_id": "11",
+        "approvals.1.revision": "1",
+        "approvals.1.subject": "effect:\"publish artifact\" \\ sha256:naïve 日本語 🚀",
+        "approvals.len": "2",
+        "more": "false",
+        "next_cursor": "null",
+        "request_id": "approvals-by-subject-page"
+      },
+      "id": "approvals-by-subject-page",
+      "kind": "approval_list_result",
+      "note": "one subject's history: a grant and the later denial that reconsidered it, in the order they were recorded, under two different keys. Which of them governs is not this protocol's answer, and it does not pretend to give one",
+      "outcome": "completed"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b22617070726f76616c5f6b6579223a22617070726f76616c2f5c226465706c6f792070726f645c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c22646563696465645f61745f6d73223a313730303030303030313030302c2264656369646572223a226f70732f5c226f6e63616c6c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c226465636973696f6e223a226772616e746564222c22656e7472795f6964223a342c227265766973696f6e223a312c227375626a656374223a226566666563743a5c227075626c6973682061727469666163745c22205c5c207368613235363a6e61c3af766520e697a5e69cace8aa9e20f09f9a80227d2c226b696e64223a22617070726f76616c5f64657461696c5f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "approval_key": "approval/\"deploy prod\" \\ naïve 日本語 🚀",
+        "decided_at_ms": "1700000001000",
+        "decider": "ops/\"oncall\" \\ naïve 日本語 🚀",
+        "decision": "granted",
+        "entry_id": "4",
+        "request_id": "req-detail-1",
+        "revision": "1",
+        "subject": "effect:\"publish artifact\" \\ sha256:naïve 日本語 🚀"
+      },
+      "id": "approval-detail-granted",
+      "kind": "approval_detail_result",
+      "note": "one decision in full, including the revision a reader checks for itself: one, and this build has no way to write anything else",
+      "outcome": "completed"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b22656e7472795f6964223a31322c226669656c64223a226465636973696f6e222c227265636f726465645f64656369646572223a226f70732f6f6e63616c6c222c227265636f726465645f6465636973696f6e223a2264656e696564222c227265636f726465645f7375626a656374223a226566666563743a7075626c6973682d6172746966616374227d2c226b696e64223a22617070726f76616c5f636f6e666c696374222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7265636f72642d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "entry_id": "12",
+        "field": "decision",
+        "recorded_decider": "ops/oncall",
+        "recorded_decision": "denied",
+        "recorded_subject": "effect:publish-artifact",
+        "request_id": "req-record-1"
+      },
+      "id": "conflict-decision",
+      "kind": "approval_conflict",
+      "note": "the key is recorded with the other answer. Not a rejection and not a replay: nothing was written, and nothing ever will be for this key, because the ledger has no update path and a genuinely changed decision is a new key",
+      "outcome": "conflict"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b22656e7472795f6964223a393232333337323033363835343737353830372c226669656c64223a227375626a656374222c227265636f726465645f64656369646572223a226f70732f5c226f6e63616c6c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c227265636f726465645f6465636973696f6e223a2264656e696564222c227265636f726465645f7375626a656374223a226566666563743a5c227075626c6973682061727469666163745c22205c5c207368613235363a6e61c3af766520e697a5e69cace8aa9e20f09f9a80227d2c226b696e64223a22617070726f76616c5f636f6e666c696374222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7265636f72642d32222c2276657273696f6e223a317d",
+      "decoded": {
+        "entry_id": "9223372036854775807",
+        "field": "subject",
+        "recorded_decider": "ops/\"oncall\" \\ naïve 日本語 🚀",
+        "recorded_decision": "denied",
+        "recorded_subject": "effect:\"publish artifact\" \\ sha256:naïve 日本語 🚀",
+        "request_id": "req-record-2"
+      },
+      "id": "conflict-subject-escaping",
+      "kind": "approval_conflict",
+      "note": "the key was recorded describing something else, which the ledger compares first and this therefore reports; the recorded coordinates travel at the wire's ceiling row and carry every reachable escape, so a caller learns what it collided with without a second read",
+      "outcome": "conflict"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b22656e7472795f6964223a31332c226669656c64223a2264656369646572222c227265636f726465645f64656369646572223a226f70732f5c226f6e63616c6c5c22205c5c206e61c3af766520e697a5e69cace8aa9e20f09f9a80222c227265636f726465645f6465636973696f6e223a226772616e746564222c227265636f726465645f7375626a656374223a226566666563743a7075626c6973682d6172746966616374227d2c226b696e64223a22617070726f76616c5f636f6e666c696374222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7265636f72642d33222c2276657273696f6e223a317d",
+      "decoded": {
+        "entry_id": "13",
+        "field": "decider",
+        "recorded_decider": "ops/\"oncall\" \\ naïve 日本語 🚀",
+        "recorded_decision": "granted",
+        "recorded_subject": "effect:publish-artifact",
+        "request_id": "req-record-3"
+      },
+      "id": "conflict-decider",
+      "kind": "approval_conflict",
+      "note": "the subject and the answer agree and the person does not, which is the third and last field the ledger compares. All three spellings of the conflict vocabulary reach this corpus",
+      "outcome": "conflict"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b227265667573616c223a22756e6b6e6f776e5f617070726f76616c227d2c226b696e64223a2272656675736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d64657461696c2d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "refusal": "unknown_approval",
+        "request_id": "req-detail-1"
+      },
+      "id": "refused-unknown-approval",
+      "kind": "refused",
+      "note": "no decision is recorded under that key. This is not `the subject behind the key was refused`: an unrecorded decision and a denied one are different answers, and this protocol only ever makes the true one",
+      "outcome": "rejected"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b227265667573616c223a226c65646765725f66756c6c227d2c226b696e64223a2272656675736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d7265636f72642d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "refusal": "ledger_full",
+        "request_id": "req-record-1"
+      },
+      "id": "refused-ledger-full",
+      "kind": "refused",
+      "note": "capacity is a refusal and never an eviction: forgetting a denied row would let the denied thing be presented again as a fresh, undecided request",
+      "outcome": "rejected"
+    }
+  ],
+  "rust_only_refusals": [
+    {
+      "id": "page-out-of-order",
+      "note": "records that do not strictly increase by durable row identity, so the next page would re-serve or skip",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b7b22617070726f76616c5f6b6579223a22617070726f76616c2f6465706c6f792d70726f64222c22646563696465645f61745f6d73223a313730303030303030303030302c2264656369646572223a226f70732f6f6e63616c6c222c226465636973696f6e223a226772616e746564222c22656e7472795f6964223a352c227265766973696f6e223a312c227375626a656374223a226566666563743a7075626c6973682d6172746966616374227d2c7b22617070726f76616c5f6b6579223a22617070726f76616c2f6465706c6f792d70726f64222c22646563696465645f61745f6d73223a313730303030303030303030302c2264656369646572223a226f70732f6f6e63616c6c222c226465636973696f6e223a226772616e746564222c22656e7472795f6964223a322c227265766973696f6e223a312c227375626a656374223a226566666563743a7075626c6973682d6172746966616374227d5d2c226d6f7265223a66616c73652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "rust_category": "approval_page_out_of_order"
+    },
+    {
+      "id": "continuation-incoherent",
+      "note": "rows follow, with no cursor to resume from",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b5d2c226d6f7265223a747275652c226e6578745f637572736f72223a6e756c6c7d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "rust_category": "approval_continuation_incoherent"
+    },
+    {
+      "id": "continuation-rewinds",
+      "note": "a continuation cursor below the last row on the page, which would re-serve it",
+      "payload_hex": "7b22626f6479223a7b22617070726f76616c73223a5b7b22617070726f76616c5f6b6579223a22617070726f76616c2f6465706c6f792d70726f64222c22646563696465645f61745f6d73223a313730303030303030303030302c2264656369646572223a226f70732f6f6e63616c6c222c226465636973696f6e223a226772616e746564222c22656e7472795f6964223a392c227265766973696f6e223a312c227375626a656374223a226566666563743a7075626c6973682d6172746966616374227d5d2c226d6f7265223a747275652c226e6578745f637572736f72223a347d2c226b696e64223a22617070726f76616c5f6c6973745f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e617070726f76616c222c22726571756573745f6964223a227265712d6c6973742d31222c2276657273696f6e223a317d",
+      "rust_category": "approval_continuation_rewinds"
+    }
+  ],
+  "rust_only_refusals_note": "Payloads the Rust decoder refuses and the generated TypeScript accepts. Each breaks a rule relating two fields of a decoded message, which the generated surface does not hold. The write-once revision is deliberately absent from this list: `revision == 1` is a bound on one field's own value, the generated decoder does hold it, and decode_refusals is where that is proved from both ends. The runner asserts these decode, so the remaining gap is measured rather than described — teaching the generator one of these rules turns the suite red until the entry moves to decode_refusals.",
+  "version": 1
+}

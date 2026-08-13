@@ -7005,3 +7005,2316 @@ mod automation_surface {
         );
     }
 }
+
+/// The `automonique.approval` decision surface, measured across two languages.
+///
+/// The mechanism is the one [`command_surface`] established and
+/// [`automation_surface`] last applied: `fixtures/approval-api-v1.json` is
+/// generated from the shipped Rust constructors — every canonical byte string
+/// was produced by encoding a real message and re-read through
+/// `from_canonical_bytes` before it was written, every refusal category was read
+/// back from the error Rust returned for that exact input, and every decoded
+/// spelling came out of `ApprovalResponse::from_canonical_bytes` rather than out
+/// of the value this file constructed.
+///
+/// # What this lane adds to what the other three already measured
+///
+/// **The write-once revision**, which is the first *durable-row* invariant to
+/// cross into the generated surface rather than be recorded as a gap. The
+/// automation lane could not hand a client its revision rule, because "withdrawn
+/// implies revision two or above" relates two fields; this lane's rule is
+/// `revision == 1` and nothing else, which is a bound on one field's own value.
+/// It is generated as a bounded integer of domain `1..=1` and refused under the
+/// category `ApprovalRecordView::new` answers, so a client can see for itself
+/// that the row it decoded was never amended — and `decode_refusals` carries
+/// both a `0` and a `2` to prove it.
+///
+/// **Four fail-closed vocabularies at once**, where the automation lane carried
+/// two: a decision, a disposition, a conflict field and a refusal. Every one of
+/// them has an undefined-spelling entry in `decode_refusals`, because a reader
+/// that retained an unnameable answer to an approval question has no safe guess
+/// available — treating it as a grant invents permission, and treating it as a
+/// denial invents a refusal nobody made.
+///
+/// `rust_only_refusals` is correspondingly shorter than either of the two lanes
+/// before it, and the three refusals that are *not* on it are named in
+/// [`the_rust_only_list_is_the_whole_of_the_gap`] rather than left to be assumed
+/// absent by accident.
+mod approval_surface {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use automonique_protocol::approval_api::{
+        APPROVAL_PROTOCOL, ApprovalApiError, ApprovalContinuation, ApprovalCursor,
+        ApprovalDecision, ApprovalDisposition, ApprovalKey, ApprovalListPage, ApprovalPageSize,
+        ApprovalReceiptView, ApprovalRecordParts, ApprovalRecordView, ApprovalRefusal,
+        ApprovalRequest, ApprovalResponse, ApprovalSubject, ApprovalsBySubject, ConflictField,
+        Decider, ListApprovals, MAX_APPROVAL_API_FIELD_BYTES, MAX_APPROVAL_PAGE_ITEMS,
+        RecordApproval, RecordedApproval,
+    };
+    use automonique_protocol::codec::{MAX_REQUEST_ID_BYTES, MajorVersion};
+    use automonique_protocol::codegen::{
+        APPROVAL_MODULE, CommandSurface, ConstantValue, REGENERATE_COMMAND, generated_files,
+        maintained_modules, module_file_name,
+    };
+    use automonique_protocol::primitives::{EpochMillis, ValueError};
+
+    use super::command_surface::{count, hex, raw_message, request_id, text, unhex, write_pretty};
+    use super::*;
+
+    fn corpus_path() -> PathBuf {
+        crate_root().join("fixtures/approval-api-v1.json")
+    }
+
+    fn runner_path() -> PathBuf {
+        package_root().join("conformance/approval-api.ts")
+    }
+
+    fn regenerating() -> bool {
+        std::env::var(automonique_protocol::codegen::REGENERATE_ENV)
+            .is_ok_and(|value| !value.is_empty() && value != "0")
+    }
+
+    /// The command surface the generator describes for this protocol.
+    fn surface() -> CommandSurface {
+        maintained_modules()
+            .into_iter()
+            .find(|module| module.file_name == module_file_name(APPROVAL_MODULE))
+            .and_then(|module| module.command_surface)
+            .expect("the approval module describes a command surface")
+    }
+
+    /// The generated TypeScript of the approval module.
+    fn generated_approval() -> String {
+        generated_files()
+            .into_iter()
+            .find(|(name, _)| *name == module_file_name(APPROVAL_MODULE))
+            .map(|(_, contents)| contents)
+            .expect("the approval module is generated")
+    }
+
+    fn key(value: &str) -> ApprovalKey {
+        ApprovalKey::new(value).expect("a valid approval key")
+    }
+
+    fn subject(value: &str) -> ApprovalSubject {
+        ApprovalSubject::new(value).expect("a valid subject")
+    }
+
+    fn decider(value: &str) -> Decider {
+        Decider::new(value).expect("a valid decider")
+    }
+
+    fn page_size(items: usize) -> ApprovalPageSize {
+        ApprovalPageSize::new(items).expect("a page size within the bound")
+    }
+
+    /// A decimal string, because the wire carries 64-bit values and a JSON
+    /// reader that used a double would round the largest of them without saying
+    /// so. Every counter in this corpus travels as text for that reason.
+    fn number(value: u64) -> JsonValue {
+        JsonValue::String(value.to_string())
+    }
+
+    /// The wire ceiling, which a decoder carrying counters in a double rounds.
+    fn wire_ceiling() -> u64 {
+        u64::try_from(i64::MAX).expect("the wire ceiling is positive")
+    }
+
+    /// An approval key carrying every escape a bounded identifier can reach, a
+    /// three-byte character, a surrogate pair — and a space.
+    ///
+    /// The key is opaque to this protocol: it parses nothing, derives nothing
+    /// and gives it no structure, so its grammar is the ledger's own and admits
+    /// whitespace. A TypeScript brand that copied `DurableId`'s stricter grammar
+    /// would refuse this fixture.
+    fn escaping_key() -> String {
+        "approval/\"deploy prod\" \\ naïve 日本語 🚀".to_owned()
+    }
+
+    fn escaping_subject() -> String {
+        "effect:\"publish artifact\" \\ sha256:naïve 日本語 🚀".to_owned()
+    }
+
+    fn escaping_decider() -> String {
+        "ops/\"oncall\" \\ naïve 日本語 🚀".to_owned()
+    }
+
+    /// A value inside the UTF-16 code-unit bound and outside the UTF-8 one.
+    ///
+    /// One hundred and twenty-nine two-byte characters: `value.length` in
+    /// JavaScript counts 129, well under the bound, while the UTF-8 length Rust
+    /// measures is 258 and over it. A generated constructor that measured code
+    /// units would accept a value the daemon refuses, which is the one direction
+    /// that matters.
+    fn over_bound_by_bytes_only() -> String {
+        "é".repeat(MAX_APPROVAL_API_FIELD_BYTES / 2 + 1)
+    }
+
+    /// One row's seven columns, in the shape the fixtures name them.
+    ///
+    /// A parameter object for the same reason [`ApprovalRecordParts`] is one:
+    /// three bounded strings sit beside one another, and a transposed pair would
+    /// type-check into a fixture that measured the wrong thing.
+    struct Row<'a> {
+        entry_id: u64,
+        approval_key: &'a str,
+        subject: &'a str,
+        decision: ApprovalDecision,
+        decider: &'a str,
+        decided_at_ms: i64,
+    }
+
+    fn record(row: Row<'_>) -> ApprovalRecordView {
+        ApprovalRecordView::new(ApprovalRecordParts {
+            entry_id: row.entry_id,
+            approval_key: key(row.approval_key),
+            subject: subject(row.subject),
+            decision: row.decision,
+            decider: decider(row.decider),
+            decided_at: EpochMillis::from_millis(row.decided_at_ms),
+            // The only revision a write-once row can carry. The constructor
+            // refuses anything else, so this is not a choice the fixtures make.
+            revision: 1,
+        })
+        .expect("a well-formed decision row")
+    }
+
+    // -----------------------------------------------------------------------
+    // Requests
+    // -----------------------------------------------------------------------
+
+    struct RequestCase {
+        id: &'static str,
+        note: &'static str,
+        request: ApprovalRequest,
+        /// Builder parameters, in the shape the runner reads for this kind.
+        params: JsonValue,
+    }
+
+    fn request_cases() -> Vec<RequestCase> {
+        let maximal_request_id = format!("req-{}", "a".repeat(MAX_REQUEST_ID_BYTES - 4));
+        // Every character escapes to two bytes, which is the worst case this
+        // protocol's own frame arithmetic budgets for.
+        let maximal_key = "\"".repeat(MAX_APPROVAL_API_FIELD_BYTES);
+
+        vec![
+            RequestCase {
+                id: "list-approvals-maximal",
+                note: "every bound at once: a cursor at the wire's integer ceiling, the largest \
+                       page this protocol serves, and a correlation identifier at \
+                       MAX_REQUEST_ID_BYTES. A reader carrying the cursor in a double would \
+                       encode 9223372036854775808 here without a word of complaint",
+                request: ApprovalRequest::ListApprovals {
+                    request_id: request_id(&maximal_request_id),
+                    query: ListApprovals::new(
+                        ApprovalCursor::new(wire_ceiling()),
+                        page_size(MAX_APPROVAL_PAGE_ITEMS),
+                    ),
+                },
+                params: JsonValue::Object(vec![
+                    (
+                        "page_size".to_owned(),
+                        number(MAX_APPROVAL_PAGE_ITEMS as u64),
+                    ),
+                    ("since".to_owned(), number(wire_ceiling())),
+                ]),
+            },
+            RequestCase {
+                id: "list-approvals-start",
+                note: "the beginning of the ledger: a cursor of zero, which is a position rather \
+                       than the absence of one, and the smallest page that can make progress",
+                request: ApprovalRequest::ListApprovals {
+                    request_id: request_id("req-list-1"),
+                    query: ListApprovals::new(ApprovalCursor::START, page_size(1)),
+                },
+                params: JsonValue::Object(vec![
+                    ("page_size".to_owned(), number(1)),
+                    ("since".to_owned(), number(0)),
+                ]),
+            },
+            RequestCase {
+                id: "record-approval-granted-escaping",
+                note: "a grant whose key, subject and decider each carry every escape a bounded \
+                       field can reach, a three-byte character and a surrogate pair; the key \
+                       carries a space, which this lane's grammar admits because the ledger \
+                       stores any bounded control-free identifier",
+                request: ApprovalRequest::RecordApproval {
+                    request_id: request_id("req-record-1"),
+                    decision: RecordApproval::new(
+                        key(&escaping_key()),
+                        subject(&escaping_subject()),
+                        ApprovalDecision::Granted,
+                        decider(&escaping_decider()),
+                    ),
+                },
+                params: JsonValue::Object(vec![
+                    ("approval_key".to_owned(), text(&escaping_key())),
+                    ("decider".to_owned(), text(&escaping_decider())),
+                    ("decision".to_owned(), text("granted")),
+                    ("subject".to_owned(), text(&escaping_subject())),
+                ]),
+            },
+            RequestCase {
+                id: "record-approval-denied-maximal",
+                note: "a denial under a key at MAX_APPROVAL_API_FIELD_BYTES whose every \
+                       character escapes to two bytes, which is the worst case this protocol's \
+                       frame arithmetic budgets for. `denied` is a recorded answer and not a \
+                       refusal: an unrecorded decision and a denied one are different facts",
+                request: ApprovalRequest::RecordApproval {
+                    request_id: request_id("req-record-2"),
+                    decision: RecordApproval::new(
+                        key(&maximal_key),
+                        subject(&escaping_subject()),
+                        ApprovalDecision::Denied,
+                        decider("runbook/nightly-release"),
+                    ),
+                },
+                params: JsonValue::Object(vec![
+                    ("approval_key".to_owned(), text(&maximal_key)),
+                    ("decider".to_owned(), text("runbook/nightly-release")),
+                    ("decision".to_owned(), text("denied")),
+                    ("subject".to_owned(), text(&escaping_subject())),
+                ]),
+            },
+            RequestCase {
+                id: "approval-detail-escaping",
+                note: "one decision read by a key carrying every reachable escape",
+                request: ApprovalRequest::ApprovalDetail {
+                    request_id: request_id("req-detail-1"),
+                    approval_key: key(&escaping_key()),
+                },
+                params: JsonValue::Object(vec![("approval_key".to_owned(), text(&escaping_key()))]),
+            },
+            RequestCase {
+                id: "approvals-by-subject-maximal",
+                note: "one subject's whole decision history at the wire's ceiling cursor and the \
+                       largest page: the cursor is a position in the whole listing rather than \
+                       in the matching subset, exactly as the ledger judges it",
+                request: ApprovalRequest::ApprovalsBySubject {
+                    request_id: request_id("req-subject-1"),
+                    query: ApprovalsBySubject::new(
+                        subject(&escaping_subject()),
+                        ApprovalCursor::new(wire_ceiling()),
+                        page_size(MAX_APPROVAL_PAGE_ITEMS),
+                    ),
+                },
+                params: JsonValue::Object(vec![
+                    (
+                        "page_size".to_owned(),
+                        number(MAX_APPROVAL_PAGE_ITEMS as u64),
+                    ),
+                    ("since".to_owned(), number(wire_ceiling())),
+                    ("subject".to_owned(), text(&escaping_subject())),
+                ]),
+            },
+            RequestCase {
+                id: "approvals-by-subject-start",
+                note: "the same read from the beginning, with the smallest page",
+                request: ApprovalRequest::ApprovalsBySubject {
+                    request_id: request_id("req-subject-2"),
+                    query: ApprovalsBySubject::new(
+                        subject("effect:publish-artifact"),
+                        ApprovalCursor::START,
+                        page_size(2),
+                    ),
+                },
+                params: JsonValue::Object(vec![
+                    ("page_size".to_owned(), number(2)),
+                    ("since".to_owned(), number(0)),
+                    ("subject".to_owned(), text("effect:publish-artifact")),
+                ]),
+            },
+        ]
+    }
+
+    fn request_entry(case: &RequestCase) -> JsonValue {
+        let message = case.request.to_message().expect("the request encodes");
+        let canonical = message.to_canonical_bytes();
+        // What the corpus records is checked against the shipped decoder before
+        // it is written: a fixture Rust would not itself admit proves nothing.
+        assert_eq!(
+            ApprovalRequest::from_canonical_bytes(&canonical)
+                .expect("Rust admits its own encoding"),
+            case.request,
+            "{}: the Rust decoder does not admit the Rust encoding",
+            case.id
+        );
+        assert!(
+            canonical.len() <= automonique_protocol::approval_api::MAX_APPROVAL_CANONICAL_BYTES,
+            "{}: the encoding does not fit one approval frame",
+            case.id
+        );
+        JsonValue::Object(vec![
+            ("canonical_bytes".to_owned(), count(canonical.len())),
+            ("canonical_hex".to_owned(), text(&hex(&canonical))),
+            ("id".to_owned(), text(case.id)),
+            ("kind".to_owned(), text(message.envelope().kind().as_str())),
+            ("note".to_owned(), text(case.note)),
+            ("params".to_owned(), case.params.clone()),
+            (
+                "request_id".to_owned(),
+                text(message.envelope().request_id().as_str()),
+            ),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // Responses
+    // -----------------------------------------------------------------------
+
+    struct ResponseCase {
+        id: &'static str,
+        note: &'static str,
+        response: ApprovalResponse,
+    }
+
+    /// A whole-ledger listing answer built through the enforcement path rather
+    /// than around it.
+    ///
+    /// `ApprovalResponse::listing` is what refuses a page longer than the query
+    /// asked for, so a corpus entry that constructed the variant directly would
+    /// record bytes no daemon could have produced.
+    fn listing(id: &str, query: ListApprovals, page: ApprovalListPage) -> ApprovalResponse {
+        ApprovalResponse::listing(request_id(id), query, page)
+            .expect("the page answers the query it was built for")
+    }
+
+    /// A subject listing built through the stricter of the two paths.
+    ///
+    /// `subject_listing` additionally refuses a page carrying a decision
+    /// recorded against another subject, which is the enforcement that module
+    /// exists for.
+    fn subject_listing(
+        id: &str,
+        query: &ApprovalsBySubject,
+        page: ApprovalListPage,
+    ) -> ApprovalResponse {
+        ApprovalResponse::subject_listing(request_id(id), query, page)
+            .expect("the page answers the subject it was built for")
+    }
+
+    /// A conflict built through the deriving constructor.
+    ///
+    /// `ApprovalResponse::conflict` compares the presented and recorded
+    /// decisions in the order the ledger compares them and reports the first
+    /// difference, so a fixture cannot name a field the two agree on.
+    fn conflict(
+        id: &str,
+        presented: &RecordApproval,
+        recorded: RecordedApproval,
+    ) -> ApprovalResponse {
+        ApprovalResponse::conflict(request_id(id), presented, recorded)
+            .expect("two decisions that disagree")
+    }
+
+    fn presented_grant() -> RecordApproval {
+        RecordApproval::new(
+            key("approval/deploy-prod-2026-08-13"),
+            subject("effect:publish-artifact"),
+            ApprovalDecision::Granted,
+            decider("ops/oncall"),
+        )
+    }
+
+    fn response_cases() -> Vec<ResponseCase> {
+        let whole_ledger =
+            ListApprovals::new(ApprovalCursor::START, page_size(MAX_APPROVAL_PAGE_ITEMS));
+        let by_subject = ApprovalsBySubject::new(
+            subject(&escaping_subject()),
+            ApprovalCursor::START,
+            page_size(MAX_APPROVAL_PAGE_ITEMS),
+        );
+
+        vec![
+            ResponseCase {
+                id: "recorded-new",
+                note: "the key was new, so this call is what made the decision durable. \
+                       `accepted` rather than `completed`: the row is committed, but what it \
+                       records has not taken effect and cannot, because no executor in this \
+                       build consults the ledger before acting",
+                response: ApprovalResponse::Recorded {
+                    request_id: request_id("req-record-1"),
+                    receipt: ApprovalReceiptView::new(
+                        1,
+                        key(&escaping_key()),
+                        ApprovalDecision::Granted,
+                        ApprovalDisposition::Recorded,
+                        EpochMillis::from_millis(1_700_000_000_000),
+                    )
+                    .expect("a well-formed receipt"),
+                },
+            },
+            ResponseCase {
+                id: "recorded-already-at-ceiling",
+                note: "an exact replay writes nothing and must never degrade into a refusal: the \
+                       disposition says `already_recorded` and the instant is the *first* \
+                       recording's, not this call's. Both counters sit at the wire's ceiling, \
+                       which a decoder carrying them in a double would round to an even neighbour",
+                response: ApprovalResponse::Recorded {
+                    request_id: request_id("req-record-2"),
+                    receipt: ApprovalReceiptView::new(
+                        wire_ceiling(),
+                        key("approval/deploy-prod-2026-08-13"),
+                        ApprovalDecision::Denied,
+                        ApprovalDisposition::AlreadyRecorded,
+                        EpochMillis::from_millis(i64::MAX),
+                    )
+                    .expect("a well-formed receipt"),
+                },
+            },
+            ResponseCase {
+                id: "approval-list-page-more",
+                note: "a page whose last row and whose continuation cursor are both at the \
+                       wire's ceiling, carrying a grant beside a denial so both decision \
+                       spellings travel in the same array",
+                response: listing(
+                    "approval-list-page-more",
+                    whole_ledger,
+                    ApprovalListPage::new(
+                        vec![
+                            record(Row {
+                                entry_id: 1,
+                                approval_key: "approval/first",
+                                subject: "effect:publish-artifact",
+                                decision: ApprovalDecision::Granted,
+                                decider: "ops/oncall",
+                                decided_at_ms: 1_700_000_000_000,
+                            }),
+                            record(Row {
+                                entry_id: wire_ceiling() - 1,
+                                approval_key: &escaping_key(),
+                                subject: &escaping_subject(),
+                                decision: ApprovalDecision::Denied,
+                                decider: &escaping_decider(),
+                                decided_at_ms: i64::MAX,
+                            }),
+                        ],
+                        ApprovalContinuation::More(ApprovalCursor::new(wire_ceiling())),
+                    )
+                    .expect("a well-formed page"),
+                ),
+            },
+            ResponseCase {
+                id: "approval-list-page-complete",
+                note: "the end of the ledger: `more` false and an explicit null cursor. A \
+                       decision recorded at the epoch, which the ledger's own \
+                       `decided_at_ms >= 0` constraint admits and one millisecond earlier does not",
+                response: listing(
+                    "approval-list-page-complete",
+                    whole_ledger,
+                    ApprovalListPage::new(
+                        vec![record(Row {
+                            entry_id: 9,
+                            approval_key: "approval/only",
+                            subject: "command:automonique.run.submit",
+                            decision: ApprovalDecision::Denied,
+                            decider: "ops/oncall",
+                            decided_at_ms: 0,
+                        })],
+                        ApprovalContinuation::Complete,
+                    )
+                    .expect("a well-formed page"),
+                ),
+            },
+            ResponseCase {
+                id: "approval-list-page-empty-more",
+                note: "an empty page that still reports more: a subject filter can exclude every \
+                       row in one scanned window while rows remain behind it, so a client that \
+                       inferred `done` from a short page would stop early",
+                response: listing(
+                    "approval-list-page-empty-more",
+                    whole_ledger,
+                    ApprovalListPage::new(
+                        Vec::new(),
+                        ApprovalContinuation::More(ApprovalCursor::new(42)),
+                    )
+                    .expect("an empty page may continue"),
+                ),
+            },
+            ResponseCase {
+                id: "approvals-by-subject-page",
+                note: "one subject's history: a grant and the later denial that reconsidered it, \
+                       in the order they were recorded, under two different keys. Which of them \
+                       governs is not this protocol's answer, and it does not pretend to give one",
+                response: subject_listing(
+                    "approvals-by-subject-page",
+                    &by_subject,
+                    ApprovalListPage::new(
+                        vec![
+                            record(Row {
+                                entry_id: 4,
+                                approval_key: "approval/publish-2026-08-12",
+                                subject: &escaping_subject(),
+                                decision: ApprovalDecision::Granted,
+                                decider: "ops/oncall",
+                                decided_at_ms: 1_700_000_000_000,
+                            }),
+                            record(Row {
+                                entry_id: 11,
+                                approval_key: &escaping_key(),
+                                subject: &escaping_subject(),
+                                decision: ApprovalDecision::Denied,
+                                decider: &escaping_decider(),
+                                decided_at_ms: 1_700_000_009_000,
+                            }),
+                        ],
+                        ApprovalContinuation::Complete,
+                    )
+                    .expect("a well-formed page"),
+                ),
+            },
+            ResponseCase {
+                id: "approval-detail-granted",
+                note: "one decision in full, including the revision a reader checks for itself: \
+                       one, and this build has no way to write anything else",
+                response: ApprovalResponse::ApprovalDetail {
+                    request_id: request_id("req-detail-1"),
+                    record: record(Row {
+                        entry_id: 4,
+                        approval_key: &escaping_key(),
+                        subject: &escaping_subject(),
+                        decision: ApprovalDecision::Granted,
+                        decider: &escaping_decider(),
+                        decided_at_ms: 1_700_000_001_000,
+                    }),
+                },
+            },
+            ResponseCase {
+                id: "conflict-decision",
+                note: "the key is recorded with the other answer. Not a rejection and not a \
+                       replay: nothing was written, and nothing ever will be for this key, \
+                       because the ledger has no update path and a genuinely changed decision is \
+                       a new key",
+                response: conflict(
+                    "req-record-1",
+                    &presented_grant(),
+                    RecordedApproval {
+                        entry_id: 12,
+                        subject: subject("effect:publish-artifact"),
+                        decision: ApprovalDecision::Denied,
+                        decider: decider("ops/oncall"),
+                    },
+                ),
+            },
+            ResponseCase {
+                id: "conflict-subject-escaping",
+                note: "the key was recorded describing something else, which the ledger compares \
+                       first and this therefore reports; the recorded coordinates travel at the \
+                       wire's ceiling row and carry every reachable escape, so a caller learns \
+                       what it collided with without a second read",
+                response: conflict(
+                    "req-record-2",
+                    &presented_grant(),
+                    RecordedApproval {
+                        entry_id: wire_ceiling(),
+                        subject: subject(&escaping_subject()),
+                        decision: ApprovalDecision::Denied,
+                        decider: decider(&escaping_decider()),
+                    },
+                ),
+            },
+            ResponseCase {
+                id: "conflict-decider",
+                note: "the subject and the answer agree and the person does not, which is the \
+                       third and last field the ledger compares. All three spellings of the \
+                       conflict vocabulary reach this corpus",
+                response: conflict(
+                    "req-record-3",
+                    &presented_grant(),
+                    RecordedApproval {
+                        entry_id: 13,
+                        subject: subject("effect:publish-artifact"),
+                        decision: ApprovalDecision::Granted,
+                        decider: decider(&escaping_decider()),
+                    },
+                ),
+            },
+            ResponseCase {
+                id: "refused-unknown-approval",
+                note: "no decision is recorded under that key. This is not `the subject behind \
+                       the key was refused`: an unrecorded decision and a denied one are \
+                       different answers, and this protocol only ever makes the true one",
+                response: ApprovalResponse::Refused {
+                    request_id: request_id("req-detail-1"),
+                    refusal: ApprovalRefusal::UnknownApproval,
+                },
+            },
+            ResponseCase {
+                id: "refused-ledger-full",
+                note: "capacity is a refusal and never an eviction: forgetting a denied row \
+                       would let the denied thing be presented again as a fresh, undecided \
+                       request",
+                response: ApprovalResponse::Refused {
+                    request_id: request_id("req-record-1"),
+                    refusal: ApprovalRefusal::LedgerFull,
+                },
+            },
+        ]
+    }
+
+    /// How one decoded response is spelled in the corpus.
+    ///
+    /// Built from the value the *Rust decoder* recovered, and flattened with
+    /// dotted keys so a nested page compares field by field rather than as one
+    /// opaque blob.
+    fn decoded_spelling(response: &ApprovalResponse) -> JsonValue {
+        let mut fields = vec![(
+            "request_id".to_owned(),
+            text(response.request_id().as_str()),
+        )];
+        let record_fields =
+            |prefix: &str, value: &ApprovalRecordView| -> Vec<(String, JsonValue)> {
+                [
+                    ("approval_key", text(value.approval_key().as_str())),
+                    (
+                        "decided_at_ms",
+                        JsonValue::String(value.decided_at().as_millis().to_string()),
+                    ),
+                    ("decider", text(value.decider().as_str())),
+                    ("decision", text(value.decision().as_str())),
+                    ("entry_id", number(value.entry_id())),
+                    ("revision", number(value.revision())),
+                    ("subject", text(value.subject().as_str())),
+                ]
+                .into_iter()
+                .map(|(name, spelled)| (format!("{prefix}{name}"), spelled))
+                .collect()
+            };
+        match response {
+            ApprovalResponse::Recorded { receipt, .. } => {
+                fields.push((
+                    "approval_key".to_owned(),
+                    text(receipt.approval_key().as_str()),
+                ));
+                fields.push((
+                    "decided_at_ms".to_owned(),
+                    JsonValue::String(receipt.decided_at().as_millis().to_string()),
+                ));
+                fields.push(("decision".to_owned(), text(receipt.decision().as_str())));
+                fields.push((
+                    "disposition".to_owned(),
+                    text(receipt.disposition().as_str()),
+                ));
+                fields.push(("entry_id".to_owned(), number(receipt.entry_id())));
+            }
+            ApprovalResponse::ApprovalList { page, .. } => {
+                fields.push((
+                    "approvals.len".to_owned(),
+                    number(page.entries().len() as u64),
+                ));
+                fields.push((
+                    "more".to_owned(),
+                    text(&page.continuation().has_more().to_string()),
+                ));
+                fields.push((
+                    "next_cursor".to_owned(),
+                    match page.continuation().cursor() {
+                        Some(cursor) => number(cursor.position()),
+                        None => text("null"),
+                    },
+                ));
+                for (index, carried) in page.entries().iter().enumerate() {
+                    fields.extend(record_fields(&format!("approvals.{index}."), carried));
+                }
+            }
+            ApprovalResponse::ApprovalDetail { record, .. } => {
+                fields.extend(record_fields("", record));
+            }
+            ApprovalResponse::Conflict {
+                field, recorded, ..
+            } => {
+                fields.push(("entry_id".to_owned(), number(recorded.entry_id)));
+                fields.push(("field".to_owned(), text(field.as_str())));
+                fields.push((
+                    "recorded_decider".to_owned(),
+                    text(recorded.decider.as_str()),
+                ));
+                fields.push((
+                    "recorded_decision".to_owned(),
+                    text(recorded.decision.as_str()),
+                ));
+                fields.push((
+                    "recorded_subject".to_owned(),
+                    text(recorded.subject.as_str()),
+                ));
+            }
+            ApprovalResponse::Refused { refusal, .. } => {
+                fields.push(("refusal".to_owned(), text(refusal.as_str())));
+            }
+        }
+        JsonValue::Object(fields)
+    }
+
+    fn response_entry(case: &ResponseCase) -> JsonValue {
+        let message = case.response.to_message().expect("the response encodes");
+        let canonical = message.to_canonical_bytes();
+        let decoded = ApprovalResponse::from_canonical_bytes(&canonical)
+            .expect("Rust admits its own encoding");
+        assert_eq!(
+            decoded, case.response,
+            "{}: the Rust decoder does not recover what it encoded",
+            case.id
+        );
+        JsonValue::Object(vec![
+            ("canonical_hex".to_owned(), text(&hex(&canonical))),
+            ("decoded".to_owned(), decoded_spelling(&decoded)),
+            ("id".to_owned(), text(case.id)),
+            ("kind".to_owned(), text(message.envelope().kind().as_str())),
+            ("note".to_owned(), text(case.note)),
+            ("outcome".to_owned(), text(decoded.outcome().as_str())),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // Bodies, for the payloads no constructor would produce
+    // -----------------------------------------------------------------------
+
+    /// A well-formed record body, as a starting point for one that is not.
+    fn record_body(overrides: &[(&str, JsonValue)]) -> JsonValue {
+        let mut entries: Vec<(String, JsonValue)> = vec![
+            ("approval_key".to_owned(), text("approval/deploy-prod")),
+            (
+                "decided_at_ms".to_owned(),
+                JsonValue::Integer(1_700_000_000_000),
+            ),
+            ("decider".to_owned(), text("ops/oncall")),
+            ("decision".to_owned(), text("granted")),
+            ("entry_id".to_owned(), JsonValue::Integer(1)),
+            ("revision".to_owned(), JsonValue::Integer(1)),
+            ("subject".to_owned(), text("effect:publish-artifact")),
+        ];
+        for (name, value) in overrides {
+            let slot = entries
+                .iter_mut()
+                .find(|(existing, _)| existing == name)
+                .unwrap_or_else(|| panic!("{name} is not a record field"));
+            slot.1 = value.clone();
+        }
+        JsonValue::Object(entries)
+    }
+
+    /// A well-formed receipt body.
+    fn receipt_body(overrides: &[(&str, JsonValue)]) -> JsonValue {
+        let mut entries: Vec<(String, JsonValue)> = vec![
+            ("approval_key".to_owned(), text("approval/deploy-prod")),
+            (
+                "decided_at_ms".to_owned(),
+                JsonValue::Integer(1_700_000_000_000),
+            ),
+            ("decision".to_owned(), text("granted")),
+            ("disposition".to_owned(), text("recorded")),
+            ("entry_id".to_owned(), JsonValue::Integer(1)),
+        ];
+        for (name, value) in overrides {
+            let slot = entries
+                .iter_mut()
+                .find(|(existing, _)| existing == name)
+                .unwrap_or_else(|| panic!("{name} is not a receipt field"));
+            slot.1 = value.clone();
+        }
+        JsonValue::Object(entries)
+    }
+
+    /// A well-formed conflict body.
+    fn conflict_body(overrides: &[(&str, JsonValue)]) -> JsonValue {
+        let mut entries: Vec<(String, JsonValue)> = vec![
+            ("entry_id".to_owned(), JsonValue::Integer(12)),
+            ("field".to_owned(), text("decision")),
+            ("recorded_decider".to_owned(), text("ops/oncall")),
+            ("recorded_decision".to_owned(), text("denied")),
+            (
+                "recorded_subject".to_owned(),
+                text("effect:publish-artifact"),
+            ),
+        ];
+        for (name, value) in overrides {
+            let slot = entries
+                .iter_mut()
+                .find(|(existing, _)| existing == name)
+                .unwrap_or_else(|| panic!("{name} is not a conflict field"));
+            slot.1 = value.clone();
+        }
+        JsonValue::Object(entries)
+    }
+
+    /// A page body carrying the given records and continuation.
+    fn page_body(approvals: Vec<JsonValue>, more: bool, next_cursor: JsonValue) -> JsonValue {
+        JsonValue::Object(vec![
+            ("approvals".to_owned(), JsonValue::Array(approvals)),
+            ("more".to_owned(), JsonValue::Bool(more)),
+            ("next_cursor".to_owned(), next_cursor),
+        ])
+    }
+
+    fn approval_message(kind: &str, id: &str, body: JsonValue) -> Vec<u8> {
+        raw_message(APPROVAL_PROTOCOL, 1, kind, id, body)
+    }
+
+    /// One record wrapped in the smallest page that can carry it.
+    fn one_record_page(record: JsonValue) -> Vec<u8> {
+        approval_message(
+            "approval_list_result",
+            "req-list-1",
+            page_body(vec![record], false, JsonValue::Null),
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Refusals both implementations make
+    // -----------------------------------------------------------------------
+
+    struct DecodeRefusal {
+        id: &'static str,
+        note: &'static str,
+        payload: Vec<u8>,
+    }
+
+    fn decode_refusals() -> Vec<DecodeRefusal> {
+        // The page bound is judged before any item is read, in Rust and in the
+        // generated TypeScript alike, so the over-bound payload carries integers
+        // rather than bodies: what is wrong with it is its length.
+        let filler: Vec<JsonValue> = (0..=MAX_APPROVAL_PAGE_ITEMS)
+            .map(|index| JsonValue::Integer(index as i64))
+            .collect();
+
+        vec![
+            DecodeRefusal {
+                id: "decision-undefined-spelling",
+                note: "a decision this build does not define fails closed rather than decoding \
+                       to a default a client would act on. There is no safe guess here: reading \
+                       it as a grant invents permission, and reading it as a denial invents a \
+                       refusal nobody made",
+                payload: one_record_page(record_body(&[("decision", text("abstained"))])),
+            },
+            DecodeRefusal {
+                id: "disposition-undefined-spelling",
+                note: "a disposition outside the two this build carries, on the answer a write \
+                       returns; the vocabulary is closed on both sides of the wire",
+                payload: approval_message(
+                    "approval_recorded",
+                    "req-record-1",
+                    receipt_body(&[("disposition", text("superseded"))]),
+                ),
+            },
+            DecodeRefusal {
+                id: "conflict-field-undefined-spelling",
+                note: "a conflict naming a field outside the three the ledger compares. A \
+                       decoder cannot re-derive which field disagrees — a conflict carries only \
+                       the recorded side — so holding the spelling closed is exactly what it can \
+                       hold",
+                payload: approval_message(
+                    "approval_conflict",
+                    "req-record-1",
+                    conflict_body(&[("field", text("decided_at"))]),
+                ),
+            },
+            DecodeRefusal {
+                id: "refusal-undefined-spelling",
+                note: "a refusal word outside the four this build carries",
+                payload: approval_message(
+                    "refused",
+                    "req-record-1",
+                    JsonValue::Object(vec![("refusal".to_owned(), text("not_authorized"))]),
+                ),
+            },
+            DecodeRefusal {
+                id: "entry-id-zero",
+                note: "a durable identity starts at one; zero names a row no writer produced",
+                payload: one_record_page(record_body(&[("entry_id", JsonValue::Integer(0))])),
+            },
+            DecodeRefusal {
+                id: "entry-id-negative",
+                note: "a negative identity is a malformed body rather than an unwritten row: the \
+                       decoder converts before it judges the domain, and the two categories differ",
+                payload: one_record_page(record_body(&[("entry_id", JsonValue::Integer(-1))])),
+            },
+            DecodeRefusal {
+                id: "revision-two",
+                note: "the write-once pin, met from above: the ledger has no update path at all, \
+                       so a second revision names a row a second writer produced. This is the \
+                       durable-row rule the generated surface *does* hold, because `revision == \
+                       1` is a bound on one field's own value rather than a relation between two",
+                payload: one_record_page(record_body(&[("revision", JsonValue::Integer(2))])),
+            },
+            DecodeRefusal {
+                id: "revision-zero",
+                note: "the same pin met from below, and under the same category: a write-once \
+                       row that claims revision zero is as impossible as one that claims two",
+                payload: one_record_page(record_body(&[("revision", JsonValue::Integer(0))])),
+            },
+            DecodeRefusal {
+                id: "decided-at-before-epoch",
+                note: "an instant the ledger's own `decided_at_ms >= 0` constraint cannot hold",
+                payload: one_record_page(record_body(&[("decided_at_ms", JsonValue::Integer(-1))])),
+            },
+            DecodeRefusal {
+                id: "receipt-decided-at-before-epoch",
+                note: "the same constraint on the instant a write reports",
+                payload: approval_message(
+                    "approval_recorded",
+                    "req-record-1",
+                    receipt_body(&[("decided_at_ms", JsonValue::Integer(-1))]),
+                ),
+            },
+            DecodeRefusal {
+                id: "subject-empty",
+                note: "an empty subject would answer `was this decided` and never `what was \
+                       decided`, which is the whole reason the ledger stores a subject beside \
+                       the key",
+                payload: one_record_page(record_body(&[("subject", text(""))])),
+            },
+            DecodeRefusal {
+                id: "decider-empty",
+                note: "an empty decider names nobody. This lane records who answered, and an \
+                       unattributed decision is the one it does not offer a spelling for",
+                payload: one_record_page(record_body(&[("decider", text(""))])),
+            },
+            DecodeRefusal {
+                id: "approval-key-over-bound-in-bytes-only",
+                note: "129 two-byte characters: 129 UTF-16 code units, which a JavaScript \
+                       `length` check would wave through, and 258 UTF-8 bytes, which is over the \
+                       bound Rust and the ledger both measure",
+                payload: one_record_page(record_body(&[(
+                    "approval_key",
+                    text(&over_bound_by_bytes_only()),
+                )])),
+            },
+            DecodeRefusal {
+                id: "decider-control-character",
+                note: "a control character in a decider, which the wire never carries raw",
+                payload: one_record_page(record_body(&[("decider", text("ops\u{7}oncall"))])),
+            },
+            DecodeRefusal {
+                id: "page-over-bound",
+                note: "one row past MAX_APPROVAL_PAGE_ITEMS. The length is judged before any \
+                       item is read, so what these items are does not matter and the refusal \
+                       names the length",
+                payload: approval_message(
+                    "approval_list_result",
+                    "req-list-1",
+                    page_body(filler, false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "next-cursor-negative",
+                note: "a cursor below the beginning of the listing",
+                payload: approval_message(
+                    "approval_list_result",
+                    "req-list-1",
+                    page_body(Vec::new(), true, JsonValue::Integer(-1)),
+                ),
+            },
+            DecodeRefusal {
+                id: "more-not-a-boolean",
+                note: "the wire carries true or false for a continuation and nothing else",
+                payload: approval_message(
+                    "approval_list_result",
+                    "req-list-1",
+                    JsonValue::Object(vec![
+                        ("approvals".to_owned(), JsonValue::Array(Vec::new())),
+                        ("more".to_owned(), JsonValue::Integer(1)),
+                        ("next_cursor".to_owned(), JsonValue::Null),
+                    ]),
+                ),
+            },
+            DecodeRefusal {
+                id: "conflict-entry-id-zero",
+                note: "a conflict pointing at a row no writer produced tells a caller it \
+                       collided with nothing",
+                payload: approval_message(
+                    "approval_conflict",
+                    "req-record-1",
+                    conflict_body(&[("entry_id", JsonValue::Integer(0))]),
+                ),
+            },
+            DecodeRefusal {
+                id: "conflict-recorded-subject-empty",
+                note: "the recorded coordinates are held to the same grammar as the ones a \
+                       record carries; a conflict is evidence and not an error string",
+                payload: approval_message(
+                    "approval_conflict",
+                    "req-record-1",
+                    conflict_body(&[("recorded_subject", text(""))]),
+                ),
+            },
+            DecodeRefusal {
+                id: "page-extra-field",
+                note: "an unexpected key is refused rather than ignored",
+                payload: approval_message(
+                    "approval_list_result",
+                    "req-list-1",
+                    JsonValue::Object(vec![
+                        ("approvals".to_owned(), JsonValue::Array(Vec::new())),
+                        ("more".to_owned(), JsonValue::Bool(false)),
+                        ("next_cursor".to_owned(), JsonValue::Null),
+                        ("total".to_owned(), JsonValue::Integer(1)),
+                    ]),
+                ),
+            },
+            DecodeRefusal {
+                id: "record-missing-revision",
+                note: "a missing key is refused rather than defaulted, inside a nested body as \
+                       much as at the top level — and defaulting this one to `1` is exactly the \
+                       shortcut that would make the write-once claim unfalsifiable",
+                payload: one_record_page(JsonValue::Object(vec![
+                    ("approval_key".to_owned(), text("approval/deploy-prod")),
+                    (
+                        "decided_at_ms".to_owned(),
+                        JsonValue::Integer(1_700_000_000_000),
+                    ),
+                    ("decider".to_owned(), text("ops/oncall")),
+                    ("decision".to_owned(), text("granted")),
+                    ("entry_id".to_owned(), JsonValue::Integer(1)),
+                    ("subject".to_owned(), text("effect:publish-artifact")),
+                ])),
+            },
+            DecodeRefusal {
+                id: "unknown-kind",
+                note: "a kind this protocol version does not define, which is a different answer \
+                       from a kind it defines and this surface does not decode",
+                payload: approval_message(
+                    "approval_history_result",
+                    "req-list-1",
+                    page_body(Vec::new(), false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "automation-protocol-message",
+                note: "the Automation lane's name on this lane's decoder, refused on the name \
+                       axis so each protocol's closed kind set stays closed",
+                payload: raw_message(
+                    "automonique.automation",
+                    1,
+                    "approval_list_result",
+                    "req-list-1",
+                    page_body(Vec::new(), false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "unsupported-version",
+                note: "this protocol at a major version neither side implements",
+                payload: raw_message(
+                    APPROVAL_PROTOCOL,
+                    2,
+                    "approval_list_result",
+                    "req-list-1",
+                    page_body(Vec::new(), false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "non-canonical-key-order",
+                note: "a payload that parses but is not canonical is refused, not normalized",
+                payload: br#"{"kind":"refused","body":{"refusal":"ledger_full"},"protocol":"automonique.approval","request_id":"req-record-1","version":1}"#.to_vec(),
+            },
+            DecodeRefusal {
+                id: "empty-payload",
+                note: "zero bytes is not an empty message",
+                payload: Vec::new(),
+            },
+        ]
+    }
+
+    fn decode_refusal_entry(refusal: &DecodeRefusal) -> JsonValue {
+        let category = ApprovalResponse::from_canonical_bytes(&refusal.payload)
+            .err()
+            .unwrap_or_else(|| panic!("{}: Rust accepted a payload it must refuse", refusal.id))
+            .category()
+            .to_owned();
+        JsonValue::Object(vec![
+            ("category".to_owned(), text(&category)),
+            ("id".to_owned(), text(refusal.id)),
+            ("note".to_owned(), text(refusal.note)),
+            ("payload_hex".to_owned(), text(&hex(&refusal.payload))),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // The measured gap
+    // -----------------------------------------------------------------------
+
+    /// A payload the Rust decoder refuses and the generated TypeScript accepts.
+    ///
+    /// Every one of these breaks a rule relating two fields of a *decoded*
+    /// message. The list is shorter than either lane before it, and
+    /// [`the_rust_only_list_is_the_whole_of_the_gap`] names the three refusals
+    /// that are deliberately absent from it — because they are not decoder rules
+    /// on the Rust side either, and a gap list that claimed them would describe
+    /// a gap that does not exist.
+    struct RustOnlyRefusal {
+        id: &'static str,
+        note: &'static str,
+        payload: Vec<u8>,
+    }
+
+    fn rust_only_refusals() -> Vec<RustOnlyRefusal> {
+        vec![
+            RustOnlyRefusal {
+                id: "page-out-of-order",
+                note: "records that do not strictly increase by durable row identity, so the \
+                       next page would re-serve or skip",
+                payload: approval_message(
+                    "approval_list_result",
+                    "req-list-1",
+                    page_body(
+                        vec![
+                            record_body(&[("entry_id", JsonValue::Integer(5))]),
+                            record_body(&[("entry_id", JsonValue::Integer(2))]),
+                        ],
+                        false,
+                        JsonValue::Null,
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "continuation-incoherent",
+                note: "rows follow, with no cursor to resume from",
+                payload: approval_message(
+                    "approval_list_result",
+                    "req-list-1",
+                    page_body(Vec::new(), true, JsonValue::Null),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "continuation-rewinds",
+                note: "a continuation cursor below the last row on the page, which would \
+                       re-serve it",
+                payload: approval_message(
+                    "approval_list_result",
+                    "req-list-1",
+                    page_body(
+                        vec![record_body(&[("entry_id", JsonValue::Integer(9))])],
+                        true,
+                        JsonValue::Integer(4),
+                    ),
+                ),
+            },
+        ]
+    }
+
+    fn rust_only_entry(refusal: &RustOnlyRefusal) -> JsonValue {
+        let category = ApprovalResponse::from_canonical_bytes(&refusal.payload)
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: Rust accepts this, so it is not a rule the generated surface is missing",
+                    refusal.id
+                )
+            })
+            .category()
+            .to_owned();
+        JsonValue::Object(vec![
+            ("id".to_owned(), text(refusal.id)),
+            ("note".to_owned(), text(refusal.note)),
+            ("payload_hex".to_owned(), text(&hex(&refusal.payload))),
+            ("rust_category".to_owned(), text(&category)),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // Encode refusals
+    // -----------------------------------------------------------------------
+
+    /// A request the other implementation must refuse while building it.
+    struct EncodeRefusal {
+        id: &'static str,
+        note: &'static str,
+        kind: &'static str,
+        request_id: String,
+        params: JsonValue,
+        category: String,
+        /// The generated constructor that refuses the value on its own, the
+        /// parameter it is applied to, and the violation it names.
+        constructor: Option<(&'static str, &'static str, &'static str)>,
+    }
+
+    /// The category Rust reports for a request body carrying this exact value.
+    ///
+    /// Read back from the shipped decoder rather than constructed here.
+    fn wire_category(kind: &str, body: JsonValue) -> String {
+        ApprovalRequest::from_canonical_bytes(&approval_message(kind, "req-1", body))
+            .err()
+            .unwrap_or_else(|| panic!("{kind}: Rust accepted a body it must refuse"))
+            .category()
+            .to_owned()
+    }
+
+    fn record_params(
+        approval_key: &str,
+        decider_name: &str,
+        decision: &str,
+        subject_name: &str,
+    ) -> JsonValue {
+        JsonValue::Object(vec![
+            ("approval_key".to_owned(), text(approval_key)),
+            ("decider".to_owned(), text(decider_name)),
+            ("decision".to_owned(), text(decision)),
+            ("subject".to_owned(), text(subject_name)),
+        ])
+    }
+
+    fn list_params(size: JsonValue, since: JsonValue) -> JsonValue {
+        JsonValue::Object(vec![
+            ("page_size".to_owned(), size),
+            ("since".to_owned(), since),
+        ])
+    }
+
+    fn subject_params(size: JsonValue, since: JsonValue, subject_name: &str) -> JsonValue {
+        JsonValue::Object(vec![
+            ("page_size".to_owned(), size),
+            ("since".to_owned(), since),
+            ("subject".to_owned(), text(subject_name)),
+        ])
+    }
+
+    fn encode_refusals() -> Vec<EncodeRefusal> {
+        let over_bound = over_bound_by_bytes_only();
+        let long_request_id = "r".repeat(MAX_REQUEST_ID_BYTES + 1);
+
+        let page_size_out_of_range = ApprovalPageSize::new(0)
+            .expect_err("a page that admits nothing is refused")
+            .category()
+            .to_owned();
+        let cursor_out_of_range = ApprovalRequest::ListApprovals {
+            request_id: request_id("req-list-1"),
+            query: ListApprovals::new(ApprovalCursor::new(wire_ceiling() + 1), page_size(1)),
+        }
+        .to_message()
+        .expect_err("a cursor above the wire ceiling is refused")
+        .category()
+        .to_owned();
+        let long_id_refusal = ApprovalApiError::Codec(
+            RequestId::new(&long_request_id).expect_err("an overlong request id is refused"),
+        )
+        .category()
+        .to_owned();
+        let bad_id_refusal = ApprovalApiError::Codec(
+            RequestId::new("req 1").expect_err("a space is outside the request id grammar"),
+        )
+        .category()
+        .to_owned();
+
+        vec![
+            EncodeRefusal {
+                id: "record-approval-undefined-decision",
+                note: "a brand exists only in the type checker, so the builder is where an \
+                       untyped caller's undefined decision is stopped rather than put on the \
+                       wire. `abstained` is not a word this ledger can store",
+                kind: "record_approval",
+                request_id: "req-record-1".to_owned(),
+                params: record_params(
+                    "approval/deploy-prod",
+                    "ops/oncall",
+                    "abstained",
+                    "effect:publish-artifact",
+                ),
+                category: wire_category(
+                    "record_approval",
+                    record_params(
+                        "approval/deploy-prod",
+                        "ops/oncall",
+                        "abstained",
+                        "effect:publish-artifact",
+                    ),
+                ),
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "record-approval-decision-title-case",
+                note: "the spelling is exact and lowercase: `Granted` is not `granted`, and a \
+                       vocabulary that case-folded would admit words the ledger's CHECK refuses",
+                kind: "record_approval",
+                request_id: "req-record-1".to_owned(),
+                params: record_params(
+                    "approval/deploy-prod",
+                    "ops/oncall",
+                    "Granted",
+                    "effect:publish-artifact",
+                ),
+                category: wire_category(
+                    "record_approval",
+                    record_params(
+                        "approval/deploy-prod",
+                        "ops/oncall",
+                        "Granted",
+                        "effect:publish-artifact",
+                    ),
+                ),
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "record-approval-subject-over-bound",
+                note: "129 two-byte characters: inside the UTF-16 code-unit bound and outside \
+                       the UTF-8 one the ledger stores under",
+                kind: "record_approval",
+                request_id: "req-record-1".to_owned(),
+                params: record_params("approval/deploy-prod", "ops/oncall", "granted", &over_bound),
+                category: ApprovalSubject::new(&over_bound)
+                    .expect_err("an overlong subject is refused")
+                    .category()
+                    .to_owned(),
+                constructor: Some(("ApprovalSubject", "subject", "too_long")),
+            },
+            EncodeRefusal {
+                id: "record-approval-decider-empty",
+                note: "empty is refused rather than read as `nobody`: an unattributed decision \
+                       is the one this product does not offer a spelling for",
+                kind: "record_approval",
+                request_id: "req-record-1".to_owned(),
+                params: record_params(
+                    "approval/deploy-prod",
+                    "",
+                    "granted",
+                    "effect:publish-artifact",
+                ),
+                category: Decider::new("")
+                    .expect_err("an empty decider is refused")
+                    .category()
+                    .to_owned(),
+                constructor: Some(("Decider", "decider", "empty")),
+            },
+            EncodeRefusal {
+                id: "record-approval-key-control-character",
+                note: "a control character in a key, which the wire never carries raw. A space \
+                       *is* admitted here, which is the difference between this lane's grammar \
+                       and the correlation identifier's",
+                kind: "record_approval",
+                request_id: "req-record-1".to_owned(),
+                params: record_params(
+                    "approval\u{7}deploy",
+                    "ops/oncall",
+                    "granted",
+                    "effect:publish-artifact",
+                ),
+                category: wire_category(
+                    "record_approval",
+                    record_params(
+                        "approval\u{7}deploy",
+                        "ops/oncall",
+                        "granted",
+                        "effect:publish-artifact",
+                    ),
+                ),
+                constructor: Some(("ApprovalKey", "approval_key", "invalid_character")),
+            },
+            EncodeRefusal {
+                id: "list-approvals-page-size-zero",
+                note: "a page that admits nothing cannot make progress, so zero is refused \
+                       rather than treated as a default",
+                kind: "list_approvals",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(number(0), number(0)),
+                category: page_size_out_of_range.clone(),
+                constructor: Some(("ApprovalPageSize", "page_size", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "list-approvals-page-size-above-bound",
+                note: "one past MAX_APPROVAL_PAGE_ITEMS, which is thirty-two here and \
+                       sixty-four on the Runs lane: a page bound follows the frame arithmetic of \
+                       the rows it carries, and a decision row carries three maximal identifiers \
+                       where a run summary carries one",
+                kind: "list_approvals",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(number(MAX_APPROVAL_PAGE_ITEMS as u64 + 1), number(0)),
+                category: page_size_out_of_range.clone(),
+                constructor: Some(("ApprovalPageSize", "page_size", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "list-approvals-cursor-above-wire-ceiling",
+                note: "a cursor one past the largest integer this wire carries, which is a \
+                       counter refusal rather than a malformed body",
+                kind: "list_approvals",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(number(1), number(wire_ceiling() + 1)),
+                category: cursor_out_of_range,
+                constructor: Some(("ApprovalCursor", "since", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "approvals-by-subject-page-size-above-bound",
+                note: "the second listing obeys the same page bound as the first; they share one \
+                       decoder in Rust and one branded type here, so they cannot disagree",
+                kind: "approvals_by_subject",
+                request_id: "req-subject-1".to_owned(),
+                params: subject_params(
+                    number(MAX_APPROVAL_PAGE_ITEMS as u64 + 1),
+                    number(0),
+                    "effect:publish-artifact",
+                ),
+                category: page_size_out_of_range,
+                constructor: Some(("ApprovalPageSize", "page_size", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "approvals-by-subject-subject-empty",
+                note: "an empty subject names nothing to read the history of",
+                kind: "approvals_by_subject",
+                request_id: "req-subject-1".to_owned(),
+                params: subject_params(number(1), number(0), ""),
+                category: ApprovalSubject::new("")
+                    .expect_err("an empty subject is refused")
+                    .category()
+                    .to_owned(),
+                constructor: Some(("ApprovalSubject", "subject", "empty")),
+            },
+            EncodeRefusal {
+                id: "approval-detail-key-empty",
+                note: "an empty key names no decision",
+                kind: "approval_detail",
+                request_id: "req-detail-1".to_owned(),
+                params: JsonValue::Object(vec![("approval_key".to_owned(), text(""))]),
+                category: ApprovalKey::new("")
+                    .expect_err("an empty key is refused")
+                    .category()
+                    .to_owned(),
+                constructor: Some(("ApprovalKey", "approval_key", "empty")),
+            },
+            EncodeRefusal {
+                id: "request-id-too-long",
+                note: "the envelope's fields are judged by the shared codec, whose refusal for a \
+                       bound is not the one this protocol uses for a body",
+                kind: "approval_detail",
+                request_id: long_request_id,
+                params: JsonValue::Object(vec![(
+                    "approval_key".to_owned(),
+                    text("approval/deploy-prod"),
+                )]),
+                category: long_id_refusal,
+                constructor: Some(("RequestId", "request_id", "too_long")),
+            },
+            EncodeRefusal {
+                id: "request-id-outside-grammar",
+                note: "a grammar refusal is not a bounds refusal, and the categories differ. A \
+                       space is outside the correlation identifier's grammar and inside the \
+                       approval key's, which is the difference this lane's looser identifier makes",
+                kind: "approval_detail",
+                request_id: "req 1".to_owned(),
+                params: JsonValue::Object(vec![(
+                    "approval_key".to_owned(),
+                    text("approval/deploy prod"),
+                )]),
+                category: bad_id_refusal,
+                constructor: Some(("RequestId", "request_id", "invalid_character")),
+            },
+        ]
+    }
+
+    fn encode_refusal_entry(refusal: &EncodeRefusal) -> JsonValue {
+        let mut entry = vec![
+            ("category".to_owned(), text(&refusal.category)),
+            ("id".to_owned(), text(refusal.id)),
+            ("kind".to_owned(), text(refusal.kind)),
+            ("note".to_owned(), text(refusal.note)),
+            ("params".to_owned(), refusal.params.clone()),
+            ("request_id".to_owned(), text(&refusal.request_id)),
+        ];
+        if let Some((constructor, parameter, violation)) = refusal.constructor {
+            // Named `refused_by` rather than `constructor`: a JSON object parsed
+            // by a JavaScript reader inherits `constructor` from its prototype.
+            entry.push(("refused_by".to_owned(), text(constructor)));
+            entry.push(("refused_param".to_owned(), text(parameter)));
+            entry.push(("violation".to_owned(), text(violation)));
+        }
+        JsonValue::Object(entry)
+    }
+
+    // -----------------------------------------------------------------------
+    // The corpus file
+    // -----------------------------------------------------------------------
+
+    fn corpus() -> String {
+        let document = JsonValue::Object(vec![
+            (
+                "decode_refusals".to_owned(),
+                JsonValue::Array(decode_refusals().iter().map(decode_refusal_entry).collect()),
+            ),
+            (
+                "encode_refusals".to_owned(),
+                JsonValue::Array(encode_refusals().iter().map(encode_refusal_entry).collect()),
+            ),
+            (
+                "generator".to_owned(),
+                text("automonique-protocol tests/codegen.rs, module approval_surface"),
+            ),
+            (
+                "note".to_owned(),
+                text(
+                    "Generated from the shipped Rust constructors: every canonical byte string \
+                     here was produced by encoding a real message and re-read through \
+                     from_canonical_bytes before it was written, and every refusal category was \
+                     read back from the error Rust returned for that exact input. Counters \
+                     travel as decimal strings because a JSON reader using a double would round \
+                     the largest of them without saying so. Rust is the wire source of truth, so \
+                     a disagreement is fixed in whichever implementation is wrong — never in \
+                     this file.",
+                ),
+            ),
+            ("protocol".to_owned(), text(APPROVAL_PROTOCOL)),
+            (
+                "requests".to_owned(),
+                JsonValue::Array(request_cases().iter().map(request_entry).collect()),
+            ),
+            (
+                "responses".to_owned(),
+                JsonValue::Array(response_cases().iter().map(response_entry).collect()),
+            ),
+            (
+                "rust_only_refusals".to_owned(),
+                JsonValue::Array(rust_only_refusals().iter().map(rust_only_entry).collect()),
+            ),
+            (
+                "rust_only_refusals_note".to_owned(),
+                text(
+                    "Payloads the Rust decoder refuses and the generated TypeScript accepts. \
+                     Each breaks a rule relating two fields of a decoded message, which the \
+                     generated surface does not hold. The write-once revision is deliberately \
+                     absent from this list: `revision == 1` is a bound on one field's own value, \
+                     the generated decoder does hold it, and decode_refusals is where that is \
+                     proved from both ends. The runner asserts these decode, so the remaining \
+                     gap is measured rather than described — teaching the generator one of these \
+                     rules turns the suite red until the entry moves to decode_refusals.",
+                ),
+            ),
+            (
+                "version".to_owned(),
+                JsonValue::Integer(i64::from(MajorVersion::FIRST.get())),
+            ),
+        ]);
+        let mut out = String::new();
+        write_pretty(&document, 0, &mut out);
+        out.push('\n');
+        out
+    }
+
+    /// The drift gate over the corpus, and the regeneration that closes it.
+    #[test]
+    fn the_checked_in_corpus_matches_regeneration() {
+        let expected = corpus();
+        let path = corpus_path();
+        if regenerating() {
+            let staging = path.with_extension("json.staging");
+            std::fs::write(&staging, &expected).expect("stage the corpus");
+            std::fs::rename(&staging, &path).expect("publish the corpus");
+            return;
+        }
+        let actual = std::fs::read_to_string(&path)
+            .expect("the corpus is checked in — regenerate it to create it");
+        if actual != expected {
+            let difference = actual
+                .lines()
+                .zip(expected.lines())
+                .enumerate()
+                .find(|(_, (left, right))| left != right)
+                .map_or_else(
+                    || {
+                        format!(
+                            "{} lines on disk, {} lines generated",
+                            actual.lines().count(),
+                            expected.lines().count()
+                        )
+                    },
+                    |(index, (left, right))| {
+                        let shorten = |line: &str| line.chars().take(120).collect::<String>();
+                        format!(
+                            "line {}: on disk {:?}, generated {:?}",
+                            index + 1,
+                            shorten(left),
+                            shorten(right)
+                        )
+                    },
+                );
+            panic!(
+                "the checked-in approval corpus no longer matches the Rust encoders: \
+                 {difference}\n\nRegenerate with: {REGENERATE_COMMAND}"
+            );
+        }
+    }
+
+    /// Every request this protocol version defines is generated or named absent.
+    #[test]
+    fn every_request_kind_is_generated_or_named_as_absent() {
+        let id = request_id("req-coverage-1");
+        let requests = vec![
+            ApprovalRequest::RecordApproval {
+                request_id: id.clone(),
+                decision: RecordApproval::new(
+                    key("approval/1"),
+                    subject("effect:one"),
+                    ApprovalDecision::Granted,
+                    decider("ops/oncall"),
+                ),
+            },
+            ApprovalRequest::ListApprovals {
+                request_id: id.clone(),
+                query: ListApprovals::new(ApprovalCursor::START, page_size(1)),
+            },
+            ApprovalRequest::ApprovalDetail {
+                request_id: id.clone(),
+                approval_key: key("approval/1"),
+            },
+            ApprovalRequest::ApprovalsBySubject {
+                request_id: id,
+                query: ApprovalsBySubject::new(
+                    subject("effect:one"),
+                    ApprovalCursor::START,
+                    page_size(1),
+                ),
+            },
+        ];
+        // The match is the point: a request added to `ApprovalRequest` fails to
+        // compile here rather than quietly falling outside the generated
+        // surface.
+        for request in &requests {
+            match request {
+                ApprovalRequest::RecordApproval { .. }
+                | ApprovalRequest::ListApprovals { .. }
+                | ApprovalRequest::ApprovalDetail { .. }
+                | ApprovalRequest::ApprovalsBySubject { .. } => {}
+            }
+        }
+        let encoded: BTreeSet<String> = requests
+            .iter()
+            .map(|request| {
+                request
+                    .to_message()
+                    .expect("each request encodes")
+                    .envelope()
+                    .kind()
+                    .as_str()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            encoded.len(),
+            requests.len(),
+            "one request per variant is required, each with its own kind"
+        );
+
+        let surface = surface();
+        let mut covered: BTreeSet<String> = surface
+            .requests
+            .iter()
+            .map(|request| request.kind.clone())
+            .collect();
+        for kind in &surface.request_kinds_not_generated {
+            assert!(
+                covered.insert(kind.clone()),
+                "{kind} is both generated and named as absent"
+            );
+        }
+        assert_eq!(
+            covered, encoded,
+            "the generated approval surface does not account for every request kind the Rust \
+             encoders produce; regenerate with: {REGENERATE_COMMAND}"
+        );
+    }
+
+    /// Every answer this protocol version defines is decoded or named undecoded.
+    #[test]
+    fn every_response_kind_is_decoded_or_named_as_undecoded() {
+        let id = request_id("req-coverage-1");
+        let responses = vec![
+            ApprovalResponse::Recorded {
+                request_id: id.clone(),
+                receipt: ApprovalReceiptView::new(
+                    1,
+                    key("approval/1"),
+                    ApprovalDecision::Granted,
+                    ApprovalDisposition::Recorded,
+                    EpochMillis::from_millis(0),
+                )
+                .expect("a receipt"),
+            },
+            ApprovalResponse::ApprovalList {
+                request_id: id.clone(),
+                page: ApprovalListPage::new(Vec::new(), ApprovalContinuation::Complete)
+                    .expect("a page"),
+            },
+            ApprovalResponse::ApprovalDetail {
+                request_id: id.clone(),
+                record: record(Row {
+                    entry_id: 1,
+                    approval_key: "approval/1",
+                    subject: "effect:one",
+                    decision: ApprovalDecision::Granted,
+                    decider: "ops/oncall",
+                    decided_at_ms: 0,
+                }),
+            },
+            ApprovalResponse::conflict(
+                id.clone(),
+                &presented_grant(),
+                RecordedApproval {
+                    entry_id: 2,
+                    subject: subject("effect:publish-artifact"),
+                    decision: ApprovalDecision::Denied,
+                    decider: decider("ops/oncall"),
+                },
+            )
+            .expect("a conflict"),
+            ApprovalResponse::Refused {
+                request_id: id,
+                refusal: ApprovalRefusal::UnknownApproval,
+            },
+        ];
+        // The match is the point: a variant added to `ApprovalResponse` fails to
+        // compile here rather than slipping past a surface that ignores it.
+        for response in &responses {
+            match response {
+                ApprovalResponse::Recorded { .. }
+                | ApprovalResponse::ApprovalList { .. }
+                | ApprovalResponse::ApprovalDetail { .. }
+                | ApprovalResponse::Conflict { .. }
+                | ApprovalResponse::Refused { .. } => {}
+            }
+        }
+        let encoded: BTreeSet<String> = responses
+            .iter()
+            .map(|response| {
+                response
+                    .to_message()
+                    .expect("each response encodes")
+                    .envelope()
+                    .kind()
+                    .as_str()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            encoded.len(),
+            responses.len(),
+            "one response per variant is required, each with its own kind"
+        );
+
+        let surface = surface();
+        let mut covered: BTreeSet<String> = surface
+            .responses
+            .iter()
+            .map(|response| response.kind.clone())
+            .collect();
+        for kind in &surface.response_kinds_not_decoded {
+            assert!(
+                covered.insert(kind.clone()),
+                "{kind} is both decoded and named as undecoded"
+            );
+        }
+        assert_eq!(
+            covered, encoded,
+            "the generated approval surface does not account for every answer the daemon can \
+             produce; regenerate with: {REGENERATE_COMMAND}"
+        );
+    }
+
+    /// The four closed vocabularies, restated here rather than read back from
+    /// the generator.
+    ///
+    /// A generator that dropped a variant would agree with itself perfectly.
+    /// This is the second opinion, and it is spelled out literally: these are
+    /// the words the durable ledger's `CHECK` constraints hold, and this crate
+    /// does not depend on that one, so the agreement is asserted rather than
+    /// derived.
+    #[test]
+    fn every_closed_vocabulary_carries_all_of_its_variants() {
+        let generated = generated_approval();
+        let expected: [(&str, &[&str]); 4] = [
+            ("ApprovalConflictField", &["decider", "decision", "subject"]),
+            ("ApprovalDecision", &["denied", "granted"]),
+            ("ApprovalDisposition", &["already_recorded", "recorded"]),
+            (
+                "ApprovalRefusal",
+                &[
+                    "cursor_out_of_range",
+                    "invalid_field",
+                    "ledger_full",
+                    "unknown_approval",
+                ],
+            ),
+        ];
+        for (name, values) in expected {
+            let literals: Vec<String> = values.iter().map(|value| format!("\"{value}\"")).collect();
+            let declaration = format!("export type {name} = {};", literals.join(" | "));
+            assert!(
+                generated.contains(&declaration),
+                "the approval surface lost a {name} variant.\nexpected: {declaration}"
+            );
+            assert!(
+                generated.contains(&format!(
+                    "export const {name}_VALUES: readonly {name}[] = [{}];",
+                    literals.join(", ")
+                )),
+                "the {name} table does not match its type"
+            );
+            assert!(
+                generated.contains(&format!(
+                    "export function decode{name}(value: string): {name} {{"
+                )),
+                "the approval surface does not refuse an undefined {name}"
+            );
+        }
+        // The spellings themselves, read from the Rust enums rather than from
+        // the literals above, so the two can never drift into agreeing with
+        // each other while disagreeing with the wire.
+        assert_eq!(
+            ApprovalDecision::ALL.map(ApprovalDecision::as_str),
+            ["granted", "denied"],
+            "the decision vocabulary is the pair the ledger's CHECK stores"
+        );
+        assert_eq!(
+            ApprovalDisposition::ALL.map(ApprovalDisposition::as_str),
+            ["recorded", "already_recorded"],
+            "an exact replay is a disposition and never a refusal"
+        );
+        assert_eq!(
+            ConflictField::ALL.map(ConflictField::as_str),
+            ["subject", "decision", "decider"],
+            "the conflict fields are the three the ledger compares, in that order"
+        );
+        // A `pending` or an `expired` decision would be a decision nobody made,
+        // which has no row. The generated union must not carry one.
+        for absent in ["pending", "expired", "revoked", "allow", "deny"] {
+            assert!(
+                !generated.contains(&format!("\"{absent}\"")),
+                "the approval surface carries a decision spelling this product does not \
+                 define: {absent}"
+            );
+        }
+    }
+
+    /// The bounds in the output are the Rust constants, and they are applied.
+    #[test]
+    fn the_generated_approval_bounds_are_the_rust_constants() {
+        let generated = generated_approval();
+        for declaration in [
+            format!("export const MAX_APPROVAL_PAGE_ITEMS = {MAX_APPROVAL_PAGE_ITEMS};"),
+            format!(
+                "export const MAX_APPROVAL_CANONICAL_BYTES = {};",
+                automonique_protocol::approval_api::MAX_APPROVAL_CANONICAL_BYTES
+            ),
+            format!("export const ApprovalKey_MAX_BYTES = {MAX_APPROVAL_API_FIELD_BYTES};"),
+            format!("export const ApprovalSubject_MAX_BYTES = {MAX_APPROVAL_API_FIELD_BYTES};"),
+            format!("export const Decider_MAX_BYTES = {MAX_APPROVAL_API_FIELD_BYTES};"),
+            format!("export const ApprovalPageSize_MAX = {MAX_APPROVAL_PAGE_ITEMS}n;"),
+            "export const ApprovalPageSize_MIN = 1n;".to_owned(),
+            "export const ApprovalCursor_MIN = 0n;".to_owned(),
+            format!("export const ApprovalCursor_MAX = {}n;", i64::MAX),
+            // The write-once pin: a domain of exactly one value.
+            "export const ApprovalRevision_MIN = 1n;".to_owned(),
+            "export const ApprovalRevision_MAX = 1n;".to_owned(),
+            format!("export const APPROVAL_PROTOCOL = \"{APPROVAL_PROTOCOL}\";"),
+            format!(
+                "export const APPROVAL_API_SCHEMA_V1 = \"{}\";",
+                automonique_protocol::approval_api::APPROVAL_API_SCHEMA_V1
+            ),
+        ] {
+            assert!(
+                generated.contains(&declaration),
+                "the approval surface does not carry the Rust bound: {declaration}"
+            );
+        }
+        // Declaring a bound is not applying it.
+        for application in [
+            format!(
+                "  if (byteLength(value) > {MAX_APPROVAL_API_FIELD_BYTES}) throw new \
+                 ValidationError(\"ApprovalKey\", \"too_long\");"
+            ),
+            format!(
+                "  if (byteLength(value) > {MAX_APPROVAL_API_FIELD_BYTES}) throw new \
+                 ValidationError(\"Decider\", \"too_long\");"
+            ),
+            format!(
+                "  if (value < 1n || value > {MAX_APPROVAL_PAGE_ITEMS}n) throw new \
+                 ValidationError(\"ApprovalPageSize\", \"out_of_range\");"
+            ),
+            "  if (value < 1n || value > 1n) throw new ValidationError(\"ApprovalRevision\", \
+             \"out_of_range\");"
+                .to_owned(),
+            "bodyArray(fields, \"approvals\", APPROVAL_INVALID_BODY, MAX_APPROVAL_PAGE_ITEMS, \
+             APPROVAL_PAGE_TOO_LARGE)"
+                .to_owned(),
+            "revision: refuse(APPROVAL_ROW_AMENDED, () => ApprovalRevision(bodyUnsigned(fields, \
+             \"revision\", APPROVAL_INVALID_BODY)))"
+                .to_owned(),
+        ] {
+            assert!(
+                generated.contains(&application),
+                "the approval surface declares a bound it does not apply: {application}"
+            );
+        }
+        // The key's grammar is the ledger's own looser one, not `DurableId`'s:
+        // the registry stores any bounded control-free identifier, and a wire
+        // type stricter than the table would make a stored row unreadable.
+        assert!(
+            generated.contains("export const ApprovalKey_PATTERN = /^[^\\p{Cc}]+$/u;"),
+            "the approval key does not carry the control-free grammar the durable ledger stores \
+             under"
+        );
+        // The page bound is this lane's own, not the Runs lane's.
+        assert_ne!(
+            MAX_APPROVAL_PAGE_ITEMS,
+            automonique_protocol::runs_api::MAX_RUN_PAGE_ITEMS,
+            "this check is only worth making while the two page bounds differ"
+        );
+    }
+
+    /// Every category the generated code refuses with is declared, and every
+    /// declared category is a spelling Rust actually produces.
+    #[test]
+    fn every_refusal_category_is_declared_and_is_the_rust_spelling() {
+        let surface = surface();
+        let declared: BTreeMap<String, String> = surface
+            .categories
+            .iter()
+            .map(|constant| {
+                let ConstantValue::Text(value) = &constant.value else {
+                    panic!("{} is a refusal category, which is text", constant.name)
+                };
+                (constant.name.clone(), value.clone())
+            })
+            .collect();
+
+        let mut referenced = vec![
+            surface.invalid_body_category.clone(),
+            surface.unknown_kind_category.clone(),
+            surface.oversize_category.clone(),
+            surface.field_invalid_category.clone(),
+            surface.field_grammar_category.clone(),
+        ];
+        referenced.extend(referenced_categories(&surface));
+        for name in &referenced {
+            assert!(
+                declared.contains_key(name),
+                "the approval surface refuses with {name}, which it does not declare"
+            );
+        }
+
+        let generated = generated_approval();
+        for (name, expected) in [
+            (
+                "APPROVAL_INVALID_BODY",
+                ApprovalApiError::InvalidBody.category(),
+            ),
+            (
+                "APPROVAL_UNKNOWN_KIND",
+                ApprovalApiError::UnknownKind.category(),
+            ),
+            (
+                "APPROVAL_ROW_AMENDED",
+                ApprovalApiError::RowAmended { revision: 2 }.category(),
+            ),
+            (
+                "APPROVAL_UNWRITTEN_ROW",
+                ApprovalApiError::UnwrittenRow { field: "entry_id" }.category(),
+            ),
+            (
+                "APPROVAL_PAGE_TOO_LARGE",
+                ApprovalApiError::PageTooLarge {
+                    max_items: 0,
+                    actual_items: 0,
+                }
+                .category(),
+            ),
+            (
+                "APPROVAL_PAGE_SIZE_OUT_OF_RANGE",
+                ApprovalApiError::PageSizeOutOfRange {
+                    max_items: 0,
+                    requested: 0,
+                }
+                .category(),
+            ),
+            (
+                "APPROVAL_TIME_BEFORE_EPOCH",
+                ApprovalApiError::TimeBeforeEpoch {
+                    field: "decided_at_ms",
+                }
+                .category(),
+            ),
+            (
+                "APPROVAL_COUNTER_OUT_OF_RANGE",
+                ApprovalApiError::CounterOutOfRange { field: "since" }.category(),
+            ),
+            (
+                "APPROVAL_UNKNOWN_ENUM_VALUE",
+                ApprovalApiError::Codec(
+                    automonique_protocol::codec::CodecError::UnknownEnumValue { field: "decision" },
+                )
+                .category(),
+            ),
+            (
+                "APPROVAL_INVALID_FIELD",
+                ApprovalApiError::Field {
+                    field: "approval_key",
+                    error: ValueError::Empty,
+                }
+                .category(),
+            ),
+        ] {
+            assert_eq!(
+                declared.get(name).map(String::as_str),
+                Some(expected),
+                "{name} is not the category Rust reports"
+            );
+            assert!(
+                generated.contains(&format!("export const {name} = \"{expected}\";")),
+                "the generated file does not carry {name} as {expected}"
+            );
+        }
+        // An amended write-once row and an unwritten one are different faults,
+        // and a caller told the wrong one cannot act on what it was told.
+        assert_ne!(
+            declared.get("APPROVAL_ROW_AMENDED"),
+            declared.get("APPROVAL_UNWRITTEN_ROW"),
+            "a revision other than one and a row identity of zero are different faults"
+        );
+        assert_eq!(
+            declared.get(&surface.oversize_category).map(String::as_str),
+            Some("frame_size"),
+            "the oversize category is the spelling a transport would report; no shipped \
+             transport carries this protocol yet, so nothing pins it"
+        );
+    }
+
+    /// The gap list is the whole of the gap, and the refusals absent from it are
+    /// absent for a stated reason.
+    ///
+    /// Three of this lane's refusals never reach a decoder on *either* side:
+    /// two relate an answer to the query it answers, and one is derived at the
+    /// answering end from both sides of a comparison a conflict frame only
+    /// carries one half of. Listing them as gaps would claim the generated
+    /// surface is missing something Rust has; this asserts the opposite, so a
+    /// later change that moved one of them into `ApprovalResponse::from_canonical_bytes`
+    /// turns the suite red until the corpus grows an entry for it.
+    #[test]
+    fn the_rust_only_list_is_the_whole_of_the_gap() {
+        let recorded: BTreeSet<&str> = rust_only_refusals()
+            .iter()
+            .map(|refusal| refusal.id)
+            .collect();
+        assert_eq!(
+            recorded,
+            BTreeSet::from([
+                "continuation-incoherent",
+                "continuation-rewinds",
+                "page-out-of-order",
+            ]),
+            "the measured gap changed without the reason for it changing"
+        );
+
+        // A page longer than the query asked for: refused by the *constructor*
+        // that answers a listing, not by any decoder, because a decoded frame
+        // does not carry the query it answers.
+        let query = ListApprovals::new(ApprovalCursor::START, page_size(1));
+        let page = ApprovalListPage::new(
+            vec![
+                record(Row {
+                    entry_id: 1,
+                    approval_key: "approval/1",
+                    subject: "effect:one",
+                    decision: ApprovalDecision::Granted,
+                    decider: "ops/oncall",
+                    decided_at_ms: 0,
+                }),
+                record(Row {
+                    entry_id: 2,
+                    approval_key: "approval/2",
+                    subject: "effect:one",
+                    decision: ApprovalDecision::Denied,
+                    decider: "ops/oncall",
+                    decided_at_ms: 1,
+                }),
+            ],
+            ApprovalContinuation::Complete,
+        )
+        .expect("a well-formed page");
+        let refused = ApprovalResponse::listing(request_id("req-list-1"), query, page.clone())
+            .expect_err("a page longer than the query asked for is refused");
+        assert_eq!(refused.category(), "approval_page_above_requested_size");
+        // And the same bytes decode, on both sides: the encoded form of that
+        // very page carries nothing a decoder could judge it by.
+        let served = ApprovalResponse::ApprovalList {
+            request_id: request_id("req-list-1"),
+            page,
+        };
+        let canonical = served
+            .to_message()
+            .expect("the page encodes")
+            .to_canonical_bytes();
+        assert!(
+            ApprovalResponse::from_canonical_bytes(&canonical).is_ok(),
+            "the Rust decoder judges a page against a query it cannot see"
+        );
+
+        // A conflict that names a field the two decisions agree on: refused by
+        // the deriving constructor, which holds both sides. A decoder holds one.
+        let presented = presented_grant();
+        let replay = ApprovalResponse::conflict(
+            request_id("req-record-1"),
+            &presented,
+            RecordedApproval {
+                entry_id: 12,
+                subject: subject("effect:publish-artifact"),
+                decision: ApprovalDecision::Granted,
+                decider: decider("ops/oncall"),
+            },
+        )
+        .expect_err("a conflict with nothing to disagree about is refused");
+        assert_eq!(replay.category(), "approval_conflict_without_disagreement");
+    }
+
+    /// The SDK has no transport, and the generated file says so.
+    #[test]
+    fn the_generated_surface_says_the_framing_is_excluded() {
+        let generated = generated_approval();
+        for statement in [
+            "The length-delimited framing this protocol travels under is not applied",
+            "This package has no transport.",
+            "The payload is the framed transport's payload, without its length prefix.",
+        ] {
+            assert!(
+                generated.contains(statement),
+                "the generated approval surface does not state where framing lives: {statement}"
+            );
+        }
+    }
+
+    /// The package typecheck actually reads the new files.
+    #[test]
+    fn the_typecheck_reads_the_approval_surface_and_its_runner() {
+        let output = Command::new("npx")
+            .arg("--offline")
+            .arg("tsc")
+            .arg("-p")
+            .arg("./tsconfig.json")
+            .arg("--listFiles")
+            .current_dir(package_root())
+            .output();
+        let Ok(output) = output else {
+            eprintln!("GAP: tsc is unavailable; the approval surface is untypechecked");
+            return;
+        };
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "the protocol package does not typecheck with the approval surface:\n{combined}"
+        );
+        for expected in [
+            "generated/approval.ts",
+            "generated/runtime.ts",
+            "conformance/approval-api.ts",
+        ] {
+            assert!(
+                combined.lines().any(|line| line.trim().ends_with(expected)),
+                "tsc did not read {expected}; it is outside the tsconfig include globs, so \
+                 nothing typechecks it.\n{combined}"
+            );
+        }
+    }
+
+    /// The heart of the lane: the generated TypeScript encodes the same bytes
+    /// Rust does, decodes what Rust answers, refuses what Rust refuses, and
+    /// accepts exactly the cross-field payloads it is documented not to judge.
+    #[test]
+    fn the_generated_typescript_agrees_with_rust_byte_for_byte() {
+        let Some(runtime) = javascript_runtime() else {
+            eprintln!(
+                "GAP: no JavaScript runtime; the approval surface is unmeasured across languages"
+            );
+            return;
+        };
+        let directory =
+            std::env::temp_dir().join(format!("automonique-approval-api-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("scratch directory");
+        let produced_path = directory.join("typescript-encodings.txt");
+
+        let output = Command::new(runtime)
+            .arg(runner_path())
+            .arg(corpus_path())
+            .arg(&produced_path)
+            .current_dir(package_root())
+            .output()
+            .expect("the conformance runner starts");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "the generated approval surface disagrees with the Rust corpus under {runtime}:\n\
+             {combined}"
+        );
+
+        // The second direction: the runner reports the bytes it produced, and
+        // they are compared here against what Rust encodes and then fed to the
+        // shipped decoder.
+        let reported = std::fs::read_to_string(&produced_path)
+            .expect("the runner reports the payloads it produced");
+        let mut produced: BTreeMap<String, Vec<u8>> = reported
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let (id, payload) = line
+                    .split_once(' ')
+                    .unwrap_or_else(|| panic!("a reported line is `<id> <hex>`: {line:?}"));
+                (id.to_owned(), unhex(payload))
+            })
+            .collect();
+
+        for case in request_cases() {
+            let expected = case
+                .request
+                .to_message()
+                .expect("the request encodes")
+                .to_canonical_bytes();
+            let actual = produced
+                .remove(case.id)
+                .unwrap_or_else(|| panic!("the runner did not report {}", case.id));
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "{}: {runtime} produced {} canonical bytes, Rust produced {}",
+                case.id,
+                actual.len(),
+                expected.len()
+            );
+            if let Some(index) = actual
+                .iter()
+                .zip(expected.iter())
+                .position(|(left, right)| left != right)
+            {
+                let window = |bytes: &[u8]| {
+                    String::from_utf8_lossy(
+                        &bytes[index.saturating_sub(24)..(index + 24).min(bytes.len())],
+                    )
+                    .into_owned()
+                };
+                panic!(
+                    "{}: the two encodings first differ at byte {index}\n  {runtime}: {}\n  \
+                     rust: {}",
+                    case.id,
+                    window(&actual),
+                    window(&expected)
+                );
+            }
+            assert_eq!(
+                ApprovalRequest::from_canonical_bytes(&actual).unwrap_or_else(|error| panic!(
+                    "{}: Rust refuses what {runtime} produced: {error}",
+                    case.id
+                )),
+                case.request,
+                "{}: Rust decodes what {runtime} produced as a different request",
+                case.id
+            );
+        }
+        assert!(
+            produced.is_empty(),
+            "the runner reported payloads the corpus has no cases for: {:?}",
+            produced.keys().collect::<Vec<_>>()
+        );
+        println!(
+            "approval api surface under {runtime}: {}",
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+    }
+}
