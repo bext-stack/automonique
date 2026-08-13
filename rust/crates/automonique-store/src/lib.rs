@@ -34,6 +34,25 @@ pub const SCHEMA_VERSION: u32 = 6;
 /// SQLite lock contention is bounded rather than waiting indefinitely.
 pub const BUSY_TIMEOUT: Duration = Duration::from_millis(2_000);
 
+/// Longest accepted inbox `transport_key`, in bytes.
+///
+/// Deliberately wider than the 256-byte bound every other identifier in this
+/// store carries. That bound is the default for names the store itself mints,
+/// parses or matches against a vocabulary; the inbox key is none of those. It
+/// is an opaque coordinate the transport supplies, stored whole, compared whole
+/// by `UNIQUE (transport, transport_key)` and never split — so its length is a
+/// storage question, not a correctness one, and a wider bound admits no shape
+/// the narrower one was protecting against.
+///
+/// It has to be wider. `automonique-transports` builds a Slack key as
+/// `slack:{app}:{team}:{channel}:{ts}` from four coordinates of at most 128
+/// bytes each, reaching `9 + 4 * 128 = 521` bytes, so a 256-byte inbox would
+/// refuse legitimate deliveries from long-coordinate workspaces outright. This
+/// matches [`slack_ingress::MAX_SOURCE_KEY_BYTES`](crate::slack_ingress::MAX_SOURCE_KEY_BYTES)
+/// exactly: the inbox admits precisely the keys the ingress log can already
+/// record, and nothing beyond them.
+pub const MAX_TRANSPORT_KEY_BYTES: usize = 640;
+
 const MAX_ID_BYTES: usize = 256;
 const MAX_KIND_BYTES: usize = 128;
 const MAX_PAYLOAD_BYTES: usize = 1_048_576;
@@ -610,6 +629,8 @@ pub struct IntakePauseReceipt {
 /// One stable transport delivery.
 pub struct InboxSubmission<'a> {
     pub transport: &'a str,
+    /// The transport's own delivery coordinate, opaque here and bounded by
+    /// [`MAX_TRANSPORT_KEY_BYTES`] so a maximal Slack key fits.
     pub transport_key: &'a str,
     pub scope: &'a str,
     pub payload: &'a [u8],
@@ -1602,12 +1623,22 @@ impl Store {
     }
 
     /// Durably accept one transport delivery, replaying the same stable key.
+    ///
+    /// The key is bounded by [`MAX_TRANSPORT_KEY_BYTES`] rather than by the
+    /// store's ordinary identifier width, because it is the transport's
+    /// coordinate and not this store's name for anything; a maximal Slack key
+    /// exceeds the ordinary width. The transport and scope beside it are the
+    /// store's own vocabulary and keep the ordinary bound.
     pub fn submit_inbox(
         &mut self,
         submission: InboxSubmission<'_>,
     ) -> Result<InboxReceipt, StoreError> {
         validate_id(submission.transport, "transport")?;
-        validate_id(submission.transport_key, "transport_key")?;
+        validate_bounded_id(
+            submission.transport_key,
+            MAX_TRANSPORT_KEY_BYTES,
+            "transport_key",
+        )?;
         validate_id(submission.scope, "scope")?;
         validate_payload(submission.payload, "inbox_payload")?;
         validate_time(submission.received_ms)?;
@@ -4232,7 +4263,19 @@ fn telegram_offset_from_bytes(bytes: &[u8]) -> Result<u64, StoreError> {
 }
 
 fn validate_id(value: &str, field: &'static str) -> Result<(), StoreError> {
-    if value.is_empty() || value.len() > MAX_ID_BYTES || value.chars().any(char::is_control) {
+    validate_bounded_id(value, MAX_ID_BYTES, field)
+}
+
+/// The identifier grammar at a caller-chosen width.
+///
+/// Only the length ceiling varies. Empty and control-bearing values stay
+/// refused at every width, so a wider bound buys length and nothing else.
+fn validate_bounded_id(
+    value: &str,
+    max_bytes: usize,
+    field: &'static str,
+) -> Result<(), StoreError> {
+    if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
         return Err(StoreError::InvalidField(field));
     }
     Ok(())
@@ -4666,6 +4709,77 @@ mod migration_tests {
             .expect("partial unique index");
         assert!(index.contains("UNIQUE"), "{index}");
         assert!(index.contains("WHERE resumed_at_ms IS NULL"), "{index}");
+    }
+
+    /// Widening the `transport_key` bound needed no migration, and this is the
+    /// evidence rather than the assertion. Every inbox table this build can
+    /// reach — created fresh, or arrived at from v1, v2 or v5 — stores a
+    /// maximal key, refuses a second row carrying it, and still separates two
+    /// keys that differ only in their final byte. The column is TEXT with no
+    /// length constraint on any of those paths and the unique index compares
+    /// the key whole, so the bound lives in `validate_bounded_id` alone and an
+    /// existing database accepts Slack-length keys without being rewritten.
+    #[test]
+    fn every_inbox_schema_path_stores_and_dedupes_a_maximal_transport_key() {
+        const INSERT: &str = "INSERT INTO inbox
+             (transport, transport_key, scope, payload, received_ms, state, revision)
+             VALUES ('slack', ?1, 'scope:maximal', X'01', 1, 'pending', 1)";
+        let maximal = "k".repeat(MAX_TRANSPORT_KEY_BYTES);
+        let mut sibling = maximal.clone();
+        sibling.pop();
+        sibling.push('z');
+
+        let mut fresh = Connection::open_in_memory().expect("memory database");
+        initialize_or_validate_schema(&mut fresh).expect("fresh initialization");
+        let mut from_v1 = Connection::open_in_memory().expect("memory database");
+        from_v1
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        from_v1.execute_batch(SCHEMA_V1).expect("v1 base");
+        from_v1
+            .pragma_update(None, "user_version", 1)
+            .expect("v1 marker");
+        initialize_or_validate_schema(&mut from_v1).expect("v1 migration");
+        let mut from_v2 = Connection::open_in_memory().expect("memory database");
+        from_v2
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        from_v2.execute_batch(SCHEMA_V2).expect("v2 base");
+        from_v2
+            .pragma_update(None, "user_version", 2)
+            .expect("v2 marker");
+        initialize_or_validate_schema(&mut from_v2).expect("v2 migration");
+        let mut from_v5 = Connection::open_in_memory().expect("memory database");
+        canonical_v5(&mut from_v5);
+        initialize_or_validate_schema(&mut from_v5).expect("v5 migration");
+
+        for (label, connection) in [
+            ("fresh", &fresh),
+            ("from_v1", &from_v1),
+            ("from_v2", &from_v2),
+            ("from_v5", &from_v5),
+        ] {
+            connection
+                .execute(INSERT, params![maximal])
+                .unwrap_or_else(|error| panic!("{label} stores a maximal key: {error}"));
+            let stored: String = connection
+                .query_row(
+                    "SELECT transport_key FROM inbox WHERE transport = 'slack'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|error| panic!("{label} reads the maximal key back: {error}"));
+            assert_eq!(stored, maximal, "{label} truncated a maximal key");
+            assert!(
+                connection.execute(INSERT, params![maximal]).is_err(),
+                "{label} admitted a duplicate maximal key"
+            );
+            connection
+                .execute(INSERT, params![sibling])
+                .unwrap_or_else(|error| {
+                    panic!("{label} treats a key differing in its last byte as taken: {error}")
+                });
+        }
     }
 
     #[test]

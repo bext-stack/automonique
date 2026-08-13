@@ -6,12 +6,13 @@ use std::path::{Path, PathBuf};
 
 use automonique_store::{
     InboxSubmission, IntakePauseRequest, IntakeResumeRequest, LeaseRenewal, LeaseRequest,
-    OutboxClaimRequest, OutboxDelivery, OutboxFailure, OutboxFailureDecision, OutboxPayloadRequest,
-    OutboxReconciliationDecision, OutboxReconciliationRequest, ReconciliationDecision,
-    ReconciliationInboxState, ReconciliationRequest, ReconciliationRunState, SCHEMA_VERSION,
-    SchedulerClaim, Store, TelegramBatchIngestion, TelegramPollerCommit,
-    TelegramPollerLeaseIdentity, TelegramPollerLeaseRenewal, TelegramPollerLeaseRequest,
-    TelegramStoreDisposition, TelegramStoreUpdate, TerminalRun, TerminalState, WorkClaim,
+    MAX_TRANSPORT_KEY_BYTES, OutboxClaimRequest, OutboxDelivery, OutboxFailure,
+    OutboxFailureDecision, OutboxPayloadRequest, OutboxReconciliationDecision,
+    OutboxReconciliationRequest, ReconciliationDecision, ReconciliationInboxState,
+    ReconciliationRequest, ReconciliationRunState, SCHEMA_VERSION, SchedulerClaim, Store,
+    TelegramBatchIngestion, TelegramPollerCommit, TelegramPollerLeaseIdentity,
+    TelegramPollerLeaseRenewal, TelegramPollerLeaseRequest, TelegramStoreDisposition,
+    TelegramStoreUpdate, TerminalRun, TerminalState, WorkClaim,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -2821,4 +2822,205 @@ fn intake_pause_refuses_unbounded_fields_and_survives_reopen() {
         .expect("pause survived the reopen");
     assert_eq!(live.actor, "operator:ada");
     assert_eq!(live.reason, "hotfix");
+}
+
+/// A maximal Slack coordinate is a legitimate delivery, not an abusive one.
+///
+/// `automonique-transports` builds `slack:{app}:{team}:{channel}:{ts}` from four
+/// coordinates of at most 128 bytes, so a long-coordinate workspace produces a
+/// 521-byte key. The whole key has to survive submission, deduplication and the
+/// claim, because the transport is the only thing that can map it back to the
+/// message it came from.
+#[test]
+fn a_maximal_slack_transport_key_round_trips_through_submit_and_claim() {
+    let coordinate = "9".repeat(128);
+    let key = format!("slack:{coordinate}:{coordinate}:{coordinate}:{coordinate}");
+    assert_eq!(key.len(), 521, "the derivable maximal Slack key");
+    assert!(
+        key.len() <= MAX_TRANSPORT_KEY_BYTES,
+        "the inbox bound must admit the transport's maximal key"
+    );
+    assert_eq!(
+        MAX_TRANSPORT_KEY_BYTES,
+        automonique_store::slack_ingress::MAX_SOURCE_KEY_BYTES,
+        "the inbox must admit exactly the keys the ingress log records"
+    );
+
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let epoch = lease(&mut store, "holder-a", 0);
+    let accepted = store
+        .submit_inbox(InboxSubmission {
+            transport: "slack",
+            transport_key: &key,
+            scope: "scope:slack",
+            payload: b"slack-payload",
+            received_ms: 1,
+        })
+        .expect("a maximal Slack key is a legitimate delivery");
+    assert!(!accepted.duplicate);
+    let accepted_events = store.event_count().expect("events");
+
+    // The same delivery arriving twice is still one row, at this width.
+    let retry = store
+        .submit_inbox(InboxSubmission {
+            transport: "slack",
+            transport_key: &key,
+            scope: "scope:slack",
+            payload: b"slack-payload",
+            received_ms: 2,
+        })
+        .expect("stable retry");
+    assert_eq!(retry.inbox_id, accepted.inbox_id);
+    assert!(retry.duplicate);
+    assert_eq!(
+        store.event_count().expect("events"),
+        accepted_events,
+        "a replayed maximal key must append nothing"
+    );
+
+    // Two Slack messages differing only in the last byte of their timestamp are
+    // two deliveries, so the key is compared whole and not by a prefix.
+    let mut neighbour = key.clone();
+    neighbour.pop();
+    neighbour.push('8');
+    let separate = store
+        .submit_inbox(InboxSubmission {
+            transport: "slack",
+            transport_key: &neighbour,
+            scope: "scope:slack",
+            payload: b"slack-payload",
+            received_ms: 3,
+        })
+        .expect("a neighbouring timestamp is a different delivery");
+    assert_ne!(separate.inbox_id, accepted.inbox_id);
+    assert!(!separate.duplicate);
+
+    // A replay carrying different content is still refused by stable key.
+    let conflict = store
+        .submit_inbox(InboxSubmission {
+            transport: "slack",
+            transport_key: &key,
+            scope: "scope:slack",
+            payload: b"rewritten",
+            received_ms: 4,
+        })
+        .expect_err("changed delivery refused");
+    assert_eq!(conflict.category(), "idempotency_conflict");
+
+    // The claim hands the whole key back untruncated.
+    let claim = store
+        .claim_next(SchedulerClaim {
+            transport: "slack",
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            now_ms: 5,
+        })
+        .expect("scheduler claim")
+        .expect("pending Slack row");
+    assert_eq!(claim.inbox_id, accepted.inbox_id);
+    let owned = store
+        .claimed_inbox(claim.run_id, "generation-a", "holder-a", epoch, 6)
+        .expect("claimed Slack input");
+    assert_eq!(owned.transport_key, key);
+    assert_eq!(owned.transport_key.len(), 521);
+    assert_eq!(owned.payload, b"slack-payload");
+
+    // And it survives a reopen: the width is durable, not connection state.
+    drop(store);
+    let mut reopened = Store::open(database.path()).expect("reopen");
+    let same = reopened
+        .submit_inbox(InboxSubmission {
+            transport: "slack",
+            transport_key: &key,
+            scope: "scope:slack",
+            payload: b"slack-payload",
+            received_ms: 7,
+        })
+        .expect("stable retry after reopen");
+    assert_eq!(same.inbox_id, accepted.inbox_id);
+    assert!(same.duplicate);
+}
+
+/// The inbox key is wider; nothing else is.
+///
+/// The widened bound is a bound, not an opening: it still ends somewhere, still
+/// refuses empty and control-bearing keys, and the transport and scope beside it
+/// keep the store's ordinary 256-byte identifier width.
+#[test]
+fn only_the_inbox_transport_key_widened_and_it_still_ends() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let widest = format!("slack:{}", "k".repeat(MAX_TRANSPORT_KEY_BYTES - 6));
+    assert_eq!(widest.len(), MAX_TRANSPORT_KEY_BYTES);
+    let widest_receipt = store
+        .submit_inbox(InboxSubmission {
+            transport: "slack",
+            transport_key: &widest,
+            scope: "scope:widest",
+            payload: b"payload",
+            received_ms: 1,
+        })
+        .expect("the exact maximum is accepted");
+    assert!(!widest_receipt.duplicate);
+
+    let over = format!("{widest}x");
+    let mut control_bearing = widest.clone();
+    control_bearing.pop();
+    control_bearing.push('\u{7}');
+    for (label, key) in [
+        ("one byte over the maximum", over.as_str()),
+        ("empty", ""),
+        ("control-bearing at the maximum", control_bearing.as_str()),
+    ] {
+        let error = store
+            .submit_inbox(InboxSubmission {
+                transport: "slack",
+                transport_key: key,
+                scope: "scope:refused",
+                payload: b"payload",
+                received_ms: 2,
+            })
+            .expect_err(label);
+        assert_eq!(error.category(), "invalid_field", "{label}");
+        assert_eq!(error.to_string(), "invalid field: transport_key", "{label}");
+    }
+
+    // The identifiers beside the key did not move with it.
+    let ordinary = "t".repeat(256);
+    let overlong = "t".repeat(257);
+    store
+        .submit_inbox(InboxSubmission {
+            transport: &ordinary,
+            transport_key: "ordinary-width-neighbours",
+            scope: &ordinary,
+            payload: b"payload",
+            received_ms: 3,
+        })
+        .expect("256-byte transport and scope are still accepted");
+    for (field, transport, scope) in [
+        ("transport", overlong.as_str(), ordinary.as_str()),
+        ("scope", ordinary.as_str(), overlong.as_str()),
+    ] {
+        let error = store
+            .submit_inbox(InboxSubmission {
+                transport,
+                transport_key: "unrelated-bound",
+                scope,
+                payload: b"payload",
+                received_ms: 4,
+            })
+            .expect_err(field);
+        assert_eq!(error.category(), "invalid_field", "{field}");
+        assert_eq!(
+            error.to_string(),
+            format!("invalid field: {field}"),
+            "{field}"
+        );
+    }
+
+    // The short Telegram-shaped key that worked before still works, unchanged.
+    let short = submit(&mut store, "telegram:7:42", "scope:short");
+    assert_eq!(submit(&mut store, "telegram:7:42", "scope:short"), short);
 }
