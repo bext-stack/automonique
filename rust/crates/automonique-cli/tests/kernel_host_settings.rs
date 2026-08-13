@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-use automonique_cli::{inspect_cgroup_v2_controllers, inspect_max_user_namespaces};
+use automonique_cli::{
+    inspect_cgroup_v2_controllers, inspect_cgroup_v2_delegation, inspect_landlock_support,
+    inspect_max_user_namespaces,
+};
 use automonique_protocol::CheckStatus;
+use automonique_runner::ContainmentDomain;
+use automonique_runner::capability::{LANDLOCK_ABI_TCP, LandlockFinding};
 use std::fs::FileTimes;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
@@ -262,4 +267,145 @@ fn symlinked_parent_is_unavailable_without_target_mutation() {
         CheckStatus::Unavailable
     );
     assert_unchanged(&target, &target_before);
+}
+
+/// The securityfs entry the runner's boundary probe used to consult. Read here
+/// only to prove the doctor line does not depend on it.
+const LANDLOCK_SECURITYFS_ENTRY: &str = "/sys/kernel/security/landlock";
+
+/// The Landlock line must report what the kernel answers, not what securityfs
+/// publishes.
+///
+/// Written as an agreement with an independent probe rather than as a host
+/// constant, so it is equally correct on a kernel with no Landlock at all. The
+/// clause with teeth is the securityfs one: on a host where that entry is
+/// absent and the kernel nevertheless supports Landlock — this crate's
+/// development host is exactly that — a securityfs-derived line reports absence
+/// and fails here.
+#[test]
+fn the_landlock_line_follows_the_kernel_not_the_securityfs_entry() {
+    let check = inspect_landlock_support();
+    assert_eq!(check.code().as_str(), "kernel.landlock-support");
+
+    let securityfs_entry = Path::new(LANDLOCK_SECURITYFS_ENTRY).exists();
+    match LandlockFinding::probe().abi() {
+        Some(measured) if measured.denies_tcp() => {
+            assert_eq!(
+                check.status(),
+                CheckStatus::Healthy,
+                "the kernel reports {measured} but the doctor line is not healthy; securityfs entry present: {securityfs_entry}"
+            );
+            assert!(measured.level() >= LANDLOCK_ABI_TCP);
+        }
+        Some(measured) => {
+            assert_eq!(check.status(), CheckStatus::Finding);
+            assert_eq!(
+                check.reason().expect("reason").code().as_str(),
+                "kernel.landlock-support-below-tcp-abi",
+                "a kernel at {measured} restricts filesystems but cannot deny TCP"
+            );
+        }
+        None => {
+            assert_eq!(check.status(), CheckStatus::Finding);
+            assert_eq!(
+                check.reason().expect("reason").code().as_str(),
+                "kernel.landlock-support-absent",
+                "securityfs entry present: {securityfs_entry}"
+            );
+        }
+    }
+}
+
+/// The delegation line must agree with the call the runner itself makes before
+/// creating a run cgroup, so the doctor cannot promise a domain the runner
+/// would refuse, nor refuse one the runner would accept.
+#[test]
+fn the_delegation_line_matches_the_discovery_the_runner_uses() {
+    let check = inspect_cgroup_v2_delegation();
+    assert_eq!(check.code().as_str(), "kernel.cgroup-v2.delegation");
+    assert_eq!(
+        check.status() == CheckStatus::Healthy,
+        ContainmentDomain::discover().is_ok(),
+        "the doctor and ContainmentDomain::discover disagree about delegation"
+    );
+    if check.status() != CheckStatus::Healthy {
+        let code = check
+            .reason()
+            .expect("a non-healthy delegation line must say why")
+            .code()
+            .as_str()
+            .to_owned();
+        assert!(
+            code.starts_with("kernel.cgroup-v2.delegation-"),
+            "an unusable domain must name its own reason: {code}"
+        );
+    }
+}
+
+/// Delegation is a separate fact from controller visibility. A host whose
+/// controller list is complete may still be unable to place a single child, so
+/// neither line may be inferred from the other.
+#[test]
+fn controller_visibility_and_delegation_are_reported_separately() {
+    let controllers = inspect_cgroup_v2_controllers(Path::new("/sys/fs/cgroup/cgroup.controllers"));
+    let delegation = inspect_cgroup_v2_delegation();
+    assert_ne!(controllers.code().as_str(), delegation.code().as_str());
+    if controllers.status() == CheckStatus::Healthy && ContainmentDomain::discover().is_err() {
+        assert_ne!(
+            delegation.status(),
+            CheckStatus::Healthy,
+            "a complete controller list was allowed to stand in for delegation"
+        );
+    }
+}
+
+/// Asking these questions must not answer them. A probe that created a cgroup,
+/// applied a ruleset, or set no_new_privs would restrict the doctor itself, and
+/// nothing could undo it.
+///
+/// Read through `/proc/thread-self`, never `/proc/self`: `no_new_privs`, the
+/// seccomp fields, and the mount namespace are per-thread while `/proc/self`
+/// reports the thread-group leader, so a check that restricted the worker
+/// thread this test runs on would leave no trace there.
+#[test]
+fn the_new_kernel_checks_do_not_restrict_or_mutate_the_calling_process() {
+    let field = |name: &str| {
+        std::fs::read_to_string("/proc/thread-self/status")
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix(name).map(|value| value.trim().to_owned()))
+    };
+    let observe = || {
+        (
+            field("NoNewPrivs:"),
+            field("Seccomp:"),
+            field("Seccomp_filters:"),
+            std::fs::read_link("/proc/thread-self/ns/user").ok(),
+            std::fs::read_link("/proc/thread-self/ns/mnt").ok(),
+            std::fs::read_link("/proc/thread-self/ns/net").ok(),
+            std::fs::read_to_string("/proc/thread-self/cgroup").ok(),
+        )
+    };
+
+    let before = observe();
+    let first = (
+        inspect_landlock_support().status(),
+        inspect_cgroup_v2_delegation().status(),
+    );
+    let after = observe();
+    assert_eq!(
+        before, after,
+        "a kernel check changed this process's no_new_privs, seccomp, namespace, or cgroup state"
+    );
+    assert!(
+        std::fs::read_dir("/").is_ok(),
+        "a kernel check restricted this process's filesystem view"
+    );
+
+    // A check with side effects would not answer the same way twice.
+    let second = (
+        inspect_landlock_support().status(),
+        inspect_cgroup_v2_delegation().status(),
+    );
+    assert_eq!(first, second);
 }

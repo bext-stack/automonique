@@ -7,6 +7,27 @@
 //! boundary. No type in this module grants permission to launch a provider.
 //! Every assessment produces a [`LaunchRefusal`] until a later implementation
 //! can install and attest all requirements on the exact descendant tree.
+//!
+//! # Two kinds of observation, and why Landlock is the second kind
+//!
+//! Most observations here are fixed-path reads: an interface counts as present
+//! when this process can open it. Landlock cannot be measured that way. The
+//! securityfs entry `/sys/kernel/security/landlock` records whether securityfs
+//! publishes a Landlock directory, not whether the kernel accepts Landlock
+//! access rights, and the two disagree: on the development host for this crate
+//! the entry is absent while the kernel answers the Landlock version query with
+//! ABI 4. Reading that path would therefore report "no Landlock" on a host that
+//! fully supports it. The Landlock observation is taken instead from
+//! [`crate::capability::LandlockFinding`], which asks the kernel directly; see
+//! that module's "Why the securityfs entry is not consulted" section for the
+//! measurement itself. That query allocates no ruleset descriptor and restricts
+//! nothing, so this module remains read-only and side-effect free.
+//!
+//! Correcting the measurement changes nothing about what this module claims. A
+//! measured ABI floor says a launcher *could* install a ruleset; it never says
+//! one is installed. [`BoundaryStatus::is_enforced`] stays `false` for every
+//! status produced here, including one built from a kernel that supports
+//! Landlock at every level this build can name.
 
 use sha2::{Digest as _, Sha256};
 use std::error::Error;
@@ -16,6 +37,8 @@ use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+use crate::capability::LandlockFinding;
 #[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
 #[cfg(target_os = "linux")]
@@ -135,8 +158,13 @@ pub enum LinuxPrimitive {
     NetworkNamespace,
     /// The kernel exposes the process descriptor directory.
     ProcessDescriptorView,
-    /// The kernel publishes a Landlock security filesystem entry.
-    LandlockInterface,
+    /// The running kernel accepts Landlock access rights.
+    ///
+    /// Measured by the Landlock version query, never by the presence of the
+    /// securityfs entry: that entry is a visibility fact and this is a support
+    /// fact. Accepting access rights is still not a ruleset; see the module
+    /// documentation.
+    LandlockSupport,
 }
 
 impl LinuxPrimitive {
@@ -146,7 +174,7 @@ impl LinuxPrimitive {
         Self::MountNamespace,
         Self::NetworkNamespace,
         Self::ProcessDescriptorView,
-        Self::LandlockInterface,
+        Self::LandlockSupport,
     ];
 
     const fn as_str(self) -> &'static str {
@@ -156,7 +184,7 @@ impl LinuxPrimitive {
             Self::MountNamespace => "mount_namespace",
             Self::NetworkNamespace => "network_namespace",
             Self::ProcessDescriptorView => "process_descriptor_view",
-            Self::LandlockInterface => "landlock_interface",
+            Self::LandlockSupport => "landlock_support",
         }
     }
 }
@@ -249,8 +277,10 @@ pub struct ExecutionBoundaryAssessment {
 }
 
 impl ExecutionBoundaryAssessment {
-    /// Observe fixed Linux kernel paths without installing or changing a
-    /// boundary. Caller-supplied filesystem paths are not accepted.
+    /// Observe fixed Linux kernel paths, and ask the kernel its Landlock
+    /// version, without installing or changing a boundary. Caller-supplied
+    /// filesystem paths are not accepted, and no observation here allocates a
+    /// ruleset descriptor, creates a cgroup, or unshares a namespace.
     pub fn observe(subject: BoundarySubject) -> Result<Self, BoundaryProbeError> {
         let primitives = observe_linux_primitives()?;
         Ok(Self::from_primitives(subject, &primitives))
@@ -634,7 +664,7 @@ fn supporting_primitives(requirement: BoundaryRequirement) -> &'static [LinuxPri
         BoundaryRequirement::DescriptorClosure => &[LinuxPrimitive::ProcessDescriptorView],
         BoundaryRequirement::FilesystemIsolation => &[
             LinuxPrimitive::MountNamespace,
-            LinuxPrimitive::LandlockInterface,
+            LinuxPrimitive::LandlockSupport,
         ],
         BoundaryRequirement::NetworkDenial => &[LinuxPrimitive::NetworkNamespace],
         BoundaryRequirement::CompleteCleanup => &[LinuxPrimitive::CgroupKill],
@@ -672,13 +702,31 @@ fn observe_linux_primitives() -> Result<Vec<PrimitiveObservation>, BoundaryProbe
                 .map(|_| b"present".as_slice()),
             b"descriptor view unavailable",
         ),
-        observation(
-            LinuxPrimitive::LandlockInterface,
-            read_optional_fixed_file("/sys/kernel/security/landlock")?.as_deref(),
-            b"landlock securityfs entry unavailable",
-        ),
+        landlock_observation(LandlockFinding::probe()),
     ];
     Ok(observations.into_iter().collect())
+}
+
+/// Record what the running kernel answered to the Landlock version query.
+///
+/// The measured ABI floor is bound into the fact digest, so two hosts that both
+/// support Landlock at different floors do not mint the same evidence, and a
+/// kernel upgrade that raises the floor is visible in the digest rather than
+/// silently absorbed.
+///
+/// This function is the whole Landlock observation. It reads no securityfs
+/// path, and it deliberately cannot: a host where the entry is absent and the
+/// kernel supports Landlock must be recorded as supporting Landlock.
+#[cfg(target_os = "linux")]
+fn landlock_observation(finding: LandlockFinding) -> PrimitiveObservation {
+    let supported = finding
+        .abi()
+        .map(|abi| format!("landlock enforceable abi {}", abi.level()));
+    observation(
+        LinuxPrimitive::LandlockSupport,
+        supported.as_deref().map(str::as_bytes),
+        b"landlock unsupported by the running kernel",
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -937,6 +985,120 @@ mod tests {
                 &changed_facts,
             )
             .evidence_sha256
+        );
+    }
+
+    /// The mapping from a kernel answer to a recorded observation is the point
+    /// of the fix, so it is pinned in both directions. A kernel that refuses
+    /// every Landlock access right must never be recorded as supporting
+    /// Landlock, and a kernel that accepts them must be, whatever securityfs
+    /// does or does not publish.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_availability_follows_the_kernel_answer_in_both_directions() {
+        let unsupported = landlock_observation(LandlockFinding::Unsupported);
+        assert_eq!(unsupported.primitive, LinuxPrimitive::LandlockSupport);
+        assert!(
+            !unsupported.available,
+            "a kernel that accepts no Landlock access right must not be recorded as supporting it"
+        );
+
+        for level in [
+            crate::capability::LANDLOCK_ABI_FILESYSTEM,
+            crate::capability::LANDLOCK_ABI_TCP,
+            crate::capability::LANDLOCK_ABI_HIGHEST_KNOWN,
+        ] {
+            let abi = crate::capability::LandlockAbi::from_level(level).expect("known ABI level");
+            let supported = landlock_observation(LandlockFinding::Enforceable(abi));
+            assert!(
+                supported.available,
+                "ABI {level} was measured but not recorded as support"
+            );
+            assert_ne!(
+                supported.fact_sha256, unsupported.fact_sha256,
+                "support and non-support must not share a fact digest"
+            );
+        }
+    }
+
+    /// A measured ABI floor is evidence, so a host at a different floor must
+    /// not mint the same digest. Collapsing the levels would let a kernel
+    /// downgrade pass unnoticed through the evidence chain.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn each_measured_landlock_floor_produces_distinct_evidence() {
+        let mut digests = Vec::new();
+        for level in crate::capability::LANDLOCK_ABI_FILESYSTEM
+            ..=crate::capability::LANDLOCK_ABI_HIGHEST_KNOWN
+        {
+            let abi = crate::capability::LandlockAbi::from_level(level).expect("known ABI level");
+            let mut observations = LinuxPrimitive::ALL
+                .into_iter()
+                .map(|primitive| observation(primitive, true))
+                .collect::<Vec<_>>();
+            let landlock = landlock_observation(LandlockFinding::Enforceable(abi));
+            for entry in &mut observations {
+                if entry.primitive == LinuxPrimitive::LandlockSupport {
+                    entry.clone_from(&landlock);
+                }
+            }
+            let assessment = ExecutionBoundaryAssessment::from_primitives(
+                subject("run-a", 'a', 'b'),
+                &observations,
+            );
+            assert!(
+                !digests.contains(&assessment.evidence_sha256),
+                "ABI {level} reused an evidence digest from a different floor"
+            );
+            digests.push(assessment.evidence_sha256);
+        }
+    }
+
+    /// Landlock is a supporting interface for filesystem isolation only. A
+    /// corrected Landlock observation must not leak into any other requirement,
+    /// and must never turn detection into enforcement.
+    #[test]
+    fn landlock_support_backs_filesystem_isolation_and_nothing_else() {
+        for requirement in BoundaryRequirement::ALL {
+            let backs_landlock =
+                supporting_primitives(requirement).contains(&LinuxPrimitive::LandlockSupport);
+            assert_eq!(
+                backs_landlock,
+                requirement == BoundaryRequirement::FilesystemIsolation,
+                "{requirement:?} disagrees with the documented Landlock mapping"
+            );
+        }
+
+        let mut observations = LinuxPrimitive::ALL
+            .into_iter()
+            .map(|primitive| observation(primitive, false))
+            .collect::<Vec<_>>();
+        for entry in &mut observations {
+            if entry.primitive == LinuxPrimitive::LandlockSupport {
+                entry.available = true;
+            }
+        }
+        let assessment =
+            ExecutionBoundaryAssessment::from_primitives(subject("run-a", 'a', 'b'), &observations);
+        assert_eq!(
+            assessment.status(BoundaryRequirement::FilesystemIsolation),
+            &BoundaryStatus::PrimitiveObserved(vec![LinuxPrimitive::LandlockSupport])
+        );
+        assert!(
+            !assessment
+                .status(BoundaryRequirement::FilesystemIsolation)
+                .is_enforced(),
+            "observed Landlock support is not an installed filesystem boundary"
+        );
+        for requirement in BoundaryRequirement::ALL {
+            if requirement != BoundaryRequirement::FilesystemIsolation {
+                assert_eq!(assessment.status(requirement), &BoundaryStatus::Unavailable);
+            }
+        }
+        assert_eq!(
+            assessment.launch_refusal().unenforced_requirements(),
+            BoundaryRequirement::ALL,
+            "Landlock support must not reduce the unenforced requirement set"
         );
     }
 

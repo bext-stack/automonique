@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const MAX_COORDINATE_BYTES: usize = 160;
+/// Longest offending event kind an error may name back to the caller.
+pub const MAX_EVENT_KIND_BYTES: usize = 64;
 pub const MAX_PROMPT_BYTES: usize = 64 * 1024;
 pub const MAX_ENV_VALUE_BYTES: usize = 4 * 1024;
 pub const MAX_EVENT_TEXT_BYTES: usize = 64 * 1024;
@@ -348,7 +350,63 @@ impl NormalizedTranscript {
     }
 }
 
-#[derive(Debug)]
+/// The offending vocabulary token of a refused event, safe to log.
+///
+/// A refusal must be actionable — "some event was unknown" tells an operator
+/// nothing — but the line that carried it is provider output, and provider
+/// output may contain prompt or workspace content. This type therefore carries
+/// **only** the event's kind token, and only when that token is short and
+/// drawn from the harmless character set a schema keyword uses. Anything else
+/// collapses to a fixed placeholder, so no payload byte can ever reach a log
+/// through an error message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnknownEventKind(String);
+
+impl UnknownEventKind {
+    /// Name a refused top-level event kind, e.g. `turn.interrupted`.
+    pub(crate) fn event(raw: &str) -> Self {
+        Self(sanitize_kind(raw))
+    }
+
+    /// Name a refused item kind, kept distinct from the top-level vocabulary
+    /// because `item.started` itself is known while its item type is not.
+    pub(crate) fn item(raw: &str) -> Self {
+        Self(format!("item:{}", sanitize_kind(raw)))
+    }
+
+    /// Exact token, already sanitized.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for UnknownEventKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Reduce an untrusted token to something safe to name, or to a placeholder.
+fn sanitize_kind(raw: &str) -> String {
+    if raw.is_empty() {
+        return "<empty>".to_owned();
+    }
+    if raw.len() > MAX_EVENT_KIND_BYTES {
+        // Truncating would still emit payload bytes chosen by the provider.
+        return "<oversized>".to_owned();
+    }
+    if raw
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        raw.to_owned()
+    } else {
+        "<unprintable>".to_owned()
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum AdapterError {
     Coordinate(CoordinateError),
     ExecutionUnavailable,
@@ -356,10 +414,18 @@ pub enum AdapterError {
     OutputTooLarge,
     InvalidUtf8,
     InvalidJson,
-    UnknownEvent,
+    /// An event kind outside the accepted vocabulary. Never a skip: a stream
+    /// containing one is refused, because an adapter that ignored the events
+    /// it does not understand would report a transcript it cannot vouch for.
+    UnknownEvent(UnknownEventKind),
     UnknownSchema,
     EventOrder,
     SessionMismatch,
+    /// The stream carried more accepted events than
+    /// [`crate::MAX_STREAM_EVENTS`].
+    TooManyEvents,
+    /// The stream ended mid-line, so the last event cannot be proven complete.
+    IncompleteFinalLine,
 }
 
 impl AdapterError {
@@ -371,17 +437,34 @@ impl AdapterError {
             Self::OutputTooLarge => "output_too_large",
             Self::InvalidUtf8 => "invalid_utf8",
             Self::InvalidJson => "invalid_json",
-            Self::UnknownEvent => "unknown_event",
+            Self::UnknownEvent(_) => "unknown_event",
             Self::UnknownSchema => "unknown_schema",
             Self::EventOrder => "event_order",
             Self::SessionMismatch => "session_mismatch",
+            Self::TooManyEvents => "too_many_events",
+            Self::IncompleteFinalLine => "incomplete_final_line",
+        }
+    }
+
+    /// The offending kind, when the refusal names one.
+    #[must_use]
+    pub const fn unknown_kind(&self) -> Option<&UnknownEventKind> {
+        match self {
+            Self::UnknownEvent(kind) => Some(kind),
+            _ => None,
         }
     }
 }
 
 impl fmt::Display for AdapterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "Codex adapter refused: {}", self.category())
+        match self {
+            // The kind token is named; the line that carried it never is.
+            Self::UnknownEvent(kind) => {
+                write!(formatter, "Codex adapter refused: unknown_event: {kind}")
+            }
+            _ => write!(formatter, "Codex adapter refused: {}", self.category()),
+        }
     }
 }
 

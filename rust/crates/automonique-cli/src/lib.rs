@@ -20,7 +20,10 @@ pub use diagnostics::{
     inspect_admin_socket, inspect_database_health, inspect_foreground_generation,
     inspect_process_control,
 };
-pub use kernel::{inspect_cgroup_v2_controllers, inspect_max_user_namespaces};
+pub use kernel::{
+    inspect_cgroup_v2_controllers, inspect_cgroup_v2_delegation, inspect_landlock_support,
+    inspect_max_user_namespaces,
+};
 pub use release::{
     InspectedRelease, InspectedVersionRange, MAX_RELEASE_MANIFEST_BYTES, ReleaseInspection,
     ReleaseInspectionStatus, ReleaseIssue, inspect_release_manifest_structure,
@@ -734,6 +737,11 @@ fn inspect_doctor(runtime: Option<&OsStr>) -> Result<DoctorReportV1, DoctorRepor
         inspect_database_health(&admin_socket),
         inspect_foreground_generation(&admin_socket),
         inspect_cgroup_v2_controllers(Path::new("/sys/fs/cgroup/cgroup.controllers")),
+        // The controller list above is the hierarchy's, not this process's.
+        // Delegation is asked separately so a host with a complete controller
+        // list and an undelegated cgroup cannot read as able to bound a run.
+        inspect_cgroup_v2_delegation(),
+        inspect_landlock_support(),
         inspect_max_user_namespaces(Path::new("/proc/sys/user/max_user_namespaces")),
         inspect_local_release(),
         inspect_supervisor_adapter(),

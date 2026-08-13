@@ -25,6 +25,7 @@ mod spec_decode;
 mod spec_encode;
 mod spec_fields;
 mod spool;
+pub mod supervise;
 
 pub use boundary::{
     BoundaryProbeError, BoundaryRequirement, BoundaryStatus, BoundarySubject,

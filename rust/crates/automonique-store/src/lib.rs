@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cancel_ledger;
 pub mod provider_journal;
 
 use std::error::Error;

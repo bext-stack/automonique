@@ -48,7 +48,16 @@ fn doctor_human_mode_reports_unavailable_rpcs_for_a_private_runtime() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
-    assert!(stdout.contains("degraded"), "{stdout}");
+    // The overall status follows the protocol's aggregation contract rather
+    // than a host-specific constant: any finding fails the report, while
+    // unavailable checks alone only degrade it. The kernel delegation check
+    // legitimately differs between a delegated service and an interactive
+    // session, so pinning one word here would pin the test to one host shape.
+    if stdout.contains(": finding (") {
+        assert!(stdout.contains("failed"), "{stdout}");
+    } else {
+        assert!(stdout.contains("degraded"), "{stdout}");
+    }
     assert!(
         stdout.contains("database.health-rpc-unavailable"),
         "{stdout}"
@@ -60,6 +69,10 @@ fn doctor_human_mode_reports_unavailable_rpcs_for_a_private_runtime() {
         "{stdout}"
     );
     assert!(stdout.contains("runtime"), "{stdout}");
+    // The kernel checks landed with the truthful Landlock/delegation work and
+    // must not silently vanish from the assembled report.
+    assert!(stdout.contains("kernel.landlock-support"), "{stdout}");
+    assert!(stdout.contains("kernel.cgroup-v2.delegation"), "{stdout}");
 }
 
 #[test]
@@ -74,7 +87,13 @@ fn doctor_json_mode_uses_the_versioned_schema() {
         stdout.contains("\"schema\":\"automonique.doctor/v1\""),
         "{stdout}"
     );
-    assert!(stdout.contains("\"status\":\"degraded\""), "{stdout}");
+    // Same aggregation contract as the human-mode test: findings fail the
+    // report, unavailable checks alone degrade it.
+    if stdout.contains("\"status\":\"finding\"") {
+        assert!(stdout.contains("\"status\":\"failed\""), "{stdout}");
+    } else {
+        assert!(stdout.contains("\"status\":\"degraded\""), "{stdout}");
+    }
     assert!(
         stdout.contains("\"code\":\"database.health-rpc-unavailable\""),
         "{stdout}"

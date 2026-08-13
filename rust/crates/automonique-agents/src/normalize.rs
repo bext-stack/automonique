@@ -2,8 +2,8 @@
 
 use crate::types::{
     AdapterError, ExecutionMode, MAX_EVENT_TEXT_BYTES, NormalizedEvent, ProviderDisposition,
-    RecordedEvent, RecordedKind, ResumeBinding, RunCoordinates, validate_coordinate,
-    validate_provider_session,
+    RecordedEvent, RecordedKind, ResumeBinding, RunCoordinates, UnknownEventKind,
+    validate_coordinate, validate_provider_session,
 };
 use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
@@ -55,8 +55,13 @@ impl<'a> Normalizer<'a> {
             "item.completed" => self.item_completed(object),
             "turn.completed" => self.turn_completed(object),
             "turn.failed" => self.turn_failed(object),
-            _ => Err(AdapterError::UnknownEvent),
+            other => Err(AdapterError::UnknownEvent(UnknownEventKind::event(other))),
         }
+    }
+
+    /// Events accepted so far, in acceptance order.
+    pub fn events(&self) -> &[NormalizedEvent] {
+        &self.events
     }
 
     pub fn finish(&self) -> Result<NormalizedRun, AdapterError> {
@@ -109,9 +114,7 @@ impl<'a> Normalizer<'a> {
         exact(item, &["id", "type"])?;
         let item_id = string(item, "id")?;
         validate_coordinate(item_id, "provider_item_id")?;
-        if string(item, "type")? != "agent_message" {
-            return Err(AdapterError::UnknownEvent);
-        }
+        require_agent_message(item)?;
         self.active_item = Some(item_id.to_owned());
         Ok(())
     }
@@ -126,9 +129,7 @@ impl<'a> Normalizer<'a> {
         if self.active_item.as_deref() != Some(item_id) || self.final_seen {
             return Err(AdapterError::EventOrder);
         }
-        if string(item, "type")? != "agent_message" {
-            return Err(AdapterError::UnknownEvent);
-        }
+        require_agent_message(item)?;
         let text = bounded_text(item, "text")?.to_owned();
         let session = self.session.clone().ok_or(AdapterError::EventOrder)?;
         let sequence = self.next_sequence()?;
@@ -155,9 +156,7 @@ impl<'a> Normalizer<'a> {
         if self.active_item.as_deref() != Some(item_id) {
             return Err(AdapterError::EventOrder);
         }
-        if string(item, "type")? != "agent_message" {
-            return Err(AdapterError::UnknownEvent);
-        }
+        require_agent_message(item)?;
         let text = bounded_text(item, "text")?.to_owned();
         self.active_item = None;
         self.final_seen = true;
@@ -232,6 +231,24 @@ impl<'a> Normalizer<'a> {
             .ok()
             .and_then(|value| value.checked_add(1))
             .ok_or(AdapterError::OutputTooLarge)
+    }
+}
+
+/// The only item type this vocabulary accepts.
+///
+/// Every other item type — a tool call, a reasoning summary, a patch — is a
+/// refusal naming that type, not a silently dropped item. Accepting a
+/// transcript while discarding the items it does not model would produce a
+/// normalized event list that is a strict, unannounced subset of what the
+/// provider actually did.
+fn require_agent_message(item: &Map<String, Value>) -> Result<(), AdapterError> {
+    let item_type = string(item, "type")?;
+    if item_type == "agent_message" {
+        Ok(())
+    } else {
+        Err(AdapterError::UnknownEvent(UnknownEventKind::item(
+            item_type,
+        )))
     }
 }
 

@@ -112,7 +112,12 @@ fn full_host() -> HostCapabilities {
 // ---------------------------------------------------------------------------
 
 fn status_field(field: &str) -> Option<String> {
-    std::fs::read_to_string("/proc/self/status")
+    // /proc/thread-self, not /proc/self: no_new_privs, the seccomp fields,
+    // and the mount namespace are per-thread, while /proc/self reports the
+    // thread-group leader. libtest runs this test on a worker thread, so a
+    // probe that restricted the thread it ran on would be invisible through
+    // /proc/self and this whole assertion would be vacuous.
+    std::fs::read_to_string("/proc/thread-self/status")
         .ok()?
         .lines()
         .find_map(|line| {
@@ -131,10 +136,10 @@ fn probing_does_not_restrict_the_calling_process() {
         status_field("NoNewPrivs:"),
         status_field("Seccomp:"),
         status_field("Seccomp_filters:"),
-        std::fs::read_link("/proc/self/ns/user").ok(),
-        std::fs::read_link("/proc/self/ns/mnt").ok(),
-        std::fs::read_link("/proc/self/ns/net").ok(),
-        std::fs::read_to_string("/proc/self/cgroup").ok(),
+        std::fs::read_link("/proc/thread-self/ns/user").ok(),
+        std::fs::read_link("/proc/thread-self/ns/mnt").ok(),
+        std::fs::read_link("/proc/thread-self/ns/net").ok(),
+        std::fs::read_to_string("/proc/thread-self/cgroup").ok(),
     );
 
     let host = HostCapabilities::probe();
@@ -143,10 +148,10 @@ fn probing_does_not_restrict_the_calling_process() {
         status_field("NoNewPrivs:"),
         status_field("Seccomp:"),
         status_field("Seccomp_filters:"),
-        std::fs::read_link("/proc/self/ns/user").ok(),
-        std::fs::read_link("/proc/self/ns/mnt").ok(),
-        std::fs::read_link("/proc/self/ns/net").ok(),
-        std::fs::read_to_string("/proc/self/cgroup").ok(),
+        std::fs::read_link("/proc/thread-self/ns/user").ok(),
+        std::fs::read_link("/proc/thread-self/ns/mnt").ok(),
+        std::fs::read_link("/proc/thread-self/ns/net").ok(),
+        std::fs::read_to_string("/proc/thread-self/cgroup").ok(),
     );
     assert_eq!(
         before, after,
