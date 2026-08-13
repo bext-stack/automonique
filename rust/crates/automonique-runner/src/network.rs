@@ -210,7 +210,8 @@ impl LandlockAbi {
                 effective_abi,
                 kernel_abi,
             } => Ok(Self {
-                effective: abi_ordinal(effective_abi).ok_or(TcpPolicyError::UnnamedAbi)?,
+                effective: crate::landlock_abi::ordinal(effective_abi)
+                    .ok_or(TcpPolicyError::UnnamedAbi)?,
                 kernel_newer_than_known: kernel_abi,
             }),
         }
@@ -227,27 +228,6 @@ impl fmt::Display for LandlockAbi {
             )?;
         }
         Ok(())
-    }
-}
-
-/// Number of a Landlock ABI this build can name.
-///
-/// `landlock::ABI` is `#[non_exhaustive]`, so a version this build does not
-/// name is representable. Returning `None` rather than guessing a number keeps
-/// the reported ABI honest; the caller turns it into a refusal.
-fn abi_ordinal(abi: ABI) -> Option<u8> {
-    match abi {
-        ABI::Unsupported => Some(0),
-        ABI::V1 => Some(1),
-        ABI::V2 => Some(2),
-        ABI::V3 => Some(3),
-        ABI::V4 => Some(4),
-        ABI::V5 => Some(5),
-        ABI::V6 => Some(6),
-        ABI::V7 => Some(7),
-        ABI::V8 => Some(8),
-        ABI::V9 => Some(9),
-        _ => None,
     }
 }
 
@@ -403,6 +383,13 @@ impl TcpBindConnectPolicy {
 
         // Past this point the thread is restricted. Every remaining check can
         // only turn a real restriction into a refusal, never the reverse.
+        //
+        // These two checks and the `HardRequirement` compat level above are
+        // independent guards against the same silent downgrade. On an ABI-4
+        // kernel with hard requirement in force they cannot fire, so no test
+        // on such a host can distinguish keeping them from dropping them;
+        // they exist for kernels where the builder-side guard is not enough,
+        // and removing them would be a deliberate policy change, not cleanup.
         if status.ruleset != RulesetStatus::FullyEnforced {
             return Err(TcpPolicyError::NotFullyEnforced);
         }

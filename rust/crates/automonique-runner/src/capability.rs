@@ -37,6 +37,7 @@
 //! crate's compatibility engine, and ignores securityfs entirely.
 
 use crate::containment::{ContainmentDomain, ContainmentError};
+use crate::landlock_abi::KNOWN as KNOWN_LANDLOCK_ABI;
 use landlock::{
     ABI, Access as _, AccessFs, AccessNet, CompatLevel, Compatible as _, Ruleset, RulesetAttr as _,
     Scope,
@@ -80,19 +81,6 @@ const MAX_STATUS_BYTES: usize = 64 * 1024;
 /// Seccomp actions that can actually refuse a syscall. A filter built only from
 /// `log` and `allow` denies nothing, so its availability is not a restriction.
 const DENYING_SECCOMP_ACTIONS: [&str; 5] = ["kill_process", "kill_thread", "kill", "errno", "trap"];
-
-/// Landlock ABI levels this build can hard-require, ascending.
-const KNOWN_LANDLOCK_ABI: [(u8, ABI); 9] = [
-    (1, ABI::V1),
-    (2, ABI::V2),
-    (3, ABI::V3),
-    (4, ABI::V4),
-    (5, ABI::V5),
-    (6, ABI::V6),
-    (7, ABI::V7),
-    (8, ABI::V8),
-    (9, ABI::V9),
-];
 
 /// A measured Landlock ABI level.
 ///
