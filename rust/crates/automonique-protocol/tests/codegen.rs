@@ -1251,7 +1251,7 @@ mod command_surface {
             .expect("the command module is generated")
     }
 
-    fn request_id(value: &str) -> RequestId {
+    pub(crate) fn request_id(value: &str) -> RequestId {
         RequestId::new(value).expect("a valid correlation identifier")
     }
 
@@ -1277,15 +1277,15 @@ mod command_surface {
             .collect()
     }
 
-    fn text(value: &str) -> JsonValue {
+    pub(crate) fn text(value: &str) -> JsonValue {
         JsonValue::String(value.to_owned())
     }
 
-    fn count(value: usize) -> JsonValue {
+    pub(crate) fn count(value: usize) -> JsonValue {
         JsonValue::Integer(i64::try_from(value).expect("a corpus count is within the wire range"))
     }
 
-    fn hex(bytes: &[u8]) -> String {
+    pub(crate) fn hex(bytes: &[u8]) -> String {
         let mut encoded = String::with_capacity(bytes.len() * 2);
         for byte in bytes {
             let _ = write!(encoded, "{byte:02x}");
@@ -1293,7 +1293,7 @@ mod command_surface {
         encoded
     }
 
-    fn unhex(value: &str) -> Vec<u8> {
+    pub(crate) fn unhex(value: &str) -> Vec<u8> {
         assert!(value.len().is_multiple_of(2), "hex has two digits per byte");
         value
             .as_bytes()
@@ -1667,7 +1667,13 @@ mod command_surface {
 
     /// Build one message with full control over the envelope, including the
     /// parts a valid request could not carry.
-    fn raw_message(protocol: &str, version: u32, kind: &str, id: &str, body: JsonValue) -> Vec<u8> {
+    pub(crate) fn raw_message(
+        protocol: &str,
+        version: u32,
+        kind: &str,
+        id: &str,
+        body: JsonValue,
+    ) -> Vec<u8> {
         Message::new(
             Envelope::new(
                 ProtocolName::new(protocol).expect("a protocol name"),
@@ -1971,7 +1977,7 @@ mod command_surface {
 
     /// Write one JSON value as reviewable text: two-space indentation, keys in
     /// the wire's own order, scalars in the wire's own escaping.
-    fn write_pretty(value: &JsonValue, indent: usize, out: &mut String) {
+    pub(crate) fn write_pretty(value: &JsonValue, indent: usize, out: &mut String) {
         let pad = |depth: usize| "  ".repeat(depth);
         match value {
             JsonValue::Object(entries) if !entries.is_empty() => {
@@ -2661,6 +2667,1999 @@ mod command_surface {
         );
         println!(
             "admin command surface under {runtime}: {}",
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+    }
+}
+
+/// The `automonique.runs` read surface, measured across two languages.
+///
+/// The mechanism is the one [`command_surface`] established, applied to a
+/// protocol with a richer shape: nested bodies, bounded arrays, a nullable
+/// cursor, and a state filter whose canonical order is the Rust enum's
+/// declaration order rather than anything a sort would produce.
+///
+/// `fixtures/runs-api-v1.json` is generated from the shipped Rust constructors.
+/// Every canonical byte string in it was produced by encoding a real message and
+/// re-read through `from_canonical_bytes` before it was written, every refusal
+/// category was read back from the error Rust returned for that exact input, and
+/// every decoded spelling came out of the Rust decoder rather than out of the
+/// value this file constructed.
+///
+/// One section is unlike the others. `rust_only_refusals` records payloads the
+/// Rust constructors refuse and the generated TypeScript *accepts*, because they
+/// break rules that relate two fields — a continuation that rewinds, a coverage
+/// that contradicts what it carries — and the generated surface holds each
+/// field's own shape rather than the relations between them. The runner asserts
+/// those payloads decode, so the gap is measured rather than described: teaching
+/// the generator one of these rules turns this suite red until the entry moves
+/// to `decode_refusals`, and losing one from the Rust side turns it red here.
+mod runs_surface {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use automonique_protocol::codec::{MAX_REQUEST_ID_BYTES, MajorVersion};
+    use automonique_protocol::codegen::{
+        CommandSurface, ConstantValue, REGENERATE_COMMAND, RUNS_MODULE, RequestValue,
+        ResponseValue, generated_files, maintained_modules, module_file_name,
+    };
+    use automonique_protocol::digest::Sha256;
+    use automonique_protocol::event::Authority;
+    use automonique_protocol::journal::{CursorResume, RetainedRange};
+    use automonique_protocol::primitives::{EpochMillis, ValueError};
+    use automonique_protocol::runs_api::{
+        Continuation, LifecycleCoverage, ListRuns, MAX_LIFECYCLE_EVENTS, MAX_RUN_PAGE_ITEMS,
+        PageSize, RUNS_PROTOCOL, RunCursor, RunDetailView, RunLifecycleEvent, RunListPage,
+        RunState, RunStateFilter, RunSummary, RunsApiError, RunsRefusal, RunsRequest, RunsResponse,
+        SpoolEventKind, SubmissionState,
+    };
+    use automonique_protocol::tools::{MAX_TOOL_FIELD_BYTES, RunId};
+
+    use super::command_surface::{count, hex, raw_message, request_id, text, unhex, write_pretty};
+    use super::*;
+
+    fn corpus_path() -> PathBuf {
+        crate_root().join("fixtures/runs-api-v1.json")
+    }
+
+    fn runner_path() -> PathBuf {
+        package_root().join("conformance/runs-api.ts")
+    }
+
+    fn regenerating() -> bool {
+        std::env::var(automonique_protocol::codegen::REGENERATE_ENV)
+            .is_ok_and(|value| !value.is_empty() && value != "0")
+    }
+
+    /// The command surface the generator describes for this protocol.
+    fn surface() -> CommandSurface {
+        maintained_modules()
+            .into_iter()
+            .find(|module| module.file_name == module_file_name(RUNS_MODULE))
+            .and_then(|module| module.command_surface)
+            .expect("the runs module describes a command surface")
+    }
+
+    /// The generated TypeScript of the runs module.
+    fn generated_runs() -> String {
+        generated_files()
+            .into_iter()
+            .find(|(name, _)| *name == module_file_name(RUNS_MODULE))
+            .map(|(_, contents)| contents)
+            .expect("the runs module is generated")
+    }
+
+    fn run_id(value: &str) -> RunId {
+        RunId::new(value).expect("a valid run identity")
+    }
+
+    /// A decimal string, because the wire carries 64-bit values and a JSON
+    /// reader that used a double would round the largest of them without saying
+    /// so. Every counter in this corpus travels as text for that reason.
+    fn number(value: u64) -> JsonValue {
+        JsonValue::String(value.to_string())
+    }
+
+    fn page_size(items: usize) -> PageSize {
+        PageSize::new(items).expect("a page size within the bound")
+    }
+
+    fn summary(id: &str, submission_id: u64, state: RunState, accepted_at_ms: i64) -> RunSummary {
+        RunSummary::new(
+            run_id(id),
+            submission_id,
+            Sha256::digest(id.as_bytes()),
+            state,
+            SubmissionState::Accepted,
+            EpochMillis::from_millis(accepted_at_ms),
+        )
+        .expect("a well-formed summary")
+    }
+
+    fn event(
+        sequence: u64,
+        at_ms: i64,
+        kind: SpoolEventKind,
+        authority: Authority,
+    ) -> RunLifecycleEvent {
+        RunLifecycleEvent::new(sequence, EpochMillis::from_millis(at_ms), kind, authority)
+            .expect("a well-formed lifecycle event")
+    }
+
+    /// The wire ceiling, which a decoder carrying counters in a double rounds.
+    fn wire_ceiling() -> u64 {
+        u64::try_from(i64::MAX).expect("the wire ceiling is positive")
+    }
+
+    /// A run identity carrying every escape a bounded identifier can reach, a
+    /// three-byte character and a surrogate pair.
+    ///
+    /// Control characters are absent because `RunId::new` refuses them; what
+    /// remains reachable is the quote, the backslash, and the solidus that
+    /// canonical JSON pointedly does *not* escape.
+    fn escaping_run_id() -> String {
+        "run/\"01J8\" \\ naïve 日本語 🚀".to_owned()
+    }
+
+    // -----------------------------------------------------------------------
+    // Requests
+    // -----------------------------------------------------------------------
+
+    struct RequestCase {
+        id: &'static str,
+        note: &'static str,
+        request: RunsRequest,
+        /// Builder parameters, in the shape the runner reads for this kind.
+        ///
+        /// `states` is recorded in an order that is *not* the wire's, so a
+        /// TypeScript builder that forwarded the caller's order instead of
+        /// canonicalizing it would produce different bytes and be caught.
+        params: JsonValue,
+    }
+
+    fn request_cases() -> Vec<RequestCase> {
+        let maximal_request_id = format!("req-{}", "a".repeat(MAX_REQUEST_ID_BYTES - 4));
+        // Every character escapes to two bytes, which is the worst case the
+        // protocol's own frame arithmetic budgets for.
+        let maximal_run_id = "\"".repeat(MAX_TOOL_FIELD_BYTES);
+
+        vec![
+            RequestCase {
+                id: "list-runs-maximal",
+                note: "every bound at once: all six states, a cursor at the wire's integer \
+                       ceiling, the largest page this protocol serves, and a correlation \
+                       identifier at MAX_REQUEST_ID_BYTES. The states are recorded shuffled: \
+                       the wire order is the enum's declaration order, not the caller's and not \
+                       alphabetical",
+                request: RunsRequest::ListRuns {
+                    request_id: request_id(&maximal_request_id),
+                    query: ListRuns::new(
+                        RunStateFilter::only(RunState::ALL).expect("every state is a valid set"),
+                        Some(RunCursor::new(wire_ceiling())),
+                        page_size(MAX_RUN_PAGE_ITEMS),
+                    ),
+                },
+                params: JsonValue::Object(vec![
+                    ("page_size".to_owned(), number(MAX_RUN_PAGE_ITEMS as u64)),
+                    ("since".to_owned(), number(wire_ceiling())),
+                    (
+                        "states".to_owned(),
+                        JsonValue::Array(
+                            [
+                                "timed_out",
+                                "ready",
+                                "failed",
+                                "completed",
+                                "running",
+                                "cancelled",
+                            ]
+                            .into_iter()
+                            .map(text)
+                            .collect(),
+                        ),
+                    ),
+                ]),
+            },
+            RequestCase {
+                id: "list-runs-unfiltered",
+                note: "no filter and no cursor: two explicit nulls, which are different wire \
+                       facts from an absent key and from a filter naming every state",
+                request: RunsRequest::ListRuns {
+                    request_id: request_id("req-list-1"),
+                    query: ListRuns::new(RunStateFilter::any(), None, page_size(1)),
+                },
+                params: JsonValue::Object(vec![
+                    ("page_size".to_owned(), number(1)),
+                    ("since".to_owned(), JsonValue::Null),
+                    ("states".to_owned(), JsonValue::Null),
+                ]),
+            },
+            RequestCase {
+                id: "list-runs-from-position-zero",
+                note: "position zero is a cursor a listing may hold, and is not the absence of \
+                       one",
+                request: RunsRequest::ListRuns {
+                    request_id: request_id("req-list-2"),
+                    query: ListRuns::new(
+                        RunStateFilter::only([RunState::Completed, RunState::Ready])
+                            .expect("a two-state filter"),
+                        Some(RunCursor::new(0)),
+                        page_size(7),
+                    ),
+                },
+                params: JsonValue::Object(vec![
+                    ("page_size".to_owned(), number(7)),
+                    ("since".to_owned(), number(0)),
+                    (
+                        "states".to_owned(),
+                        JsonValue::Array(vec![text("completed"), text("ready")]),
+                    ),
+                ]),
+            },
+            RequestCase {
+                id: "run-detail-escaping",
+                note: "a run identity carrying every escape a bounded identifier can reach, a \
+                       three-byte character and a surrogate pair",
+                request: RunsRequest::RunDetail {
+                    request_id: request_id("req-detail-1"),
+                    run_id: run_id(&escaping_run_id()),
+                },
+                params: JsonValue::Object(vec![("run_id".to_owned(), text(&escaping_run_id()))]),
+            },
+            RequestCase {
+                id: "run-detail-maximal-run-id",
+                note: "a run identity at MAX_TOOL_FIELD_BYTES whose every character escapes to \
+                       two bytes",
+                request: RunsRequest::RunDetail {
+                    request_id: request_id("req-detail-2"),
+                    run_id: run_id(&maximal_run_id),
+                },
+                params: JsonValue::Object(vec![("run_id".to_owned(), text(&maximal_run_id))]),
+            },
+        ]
+    }
+
+    fn request_entry(case: &RequestCase) -> JsonValue {
+        let message = case.request.to_message().expect("the request encodes");
+        let canonical = message.to_canonical_bytes();
+        // What the corpus records is checked against the shipped decoder before
+        // it is written: a fixture Rust would not itself admit proves nothing.
+        assert_eq!(
+            RunsRequest::from_canonical_bytes(&canonical).expect("Rust admits its own encoding"),
+            case.request,
+            "{}: the Rust decoder does not admit the Rust encoding",
+            case.id
+        );
+        assert!(
+            canonical.len() <= automonique_protocol::runs_api::MAX_RUNS_CANONICAL_BYTES,
+            "{}: the encoding does not fit one runs frame",
+            case.id
+        );
+        JsonValue::Object(vec![
+            ("canonical_bytes".to_owned(), count(canonical.len())),
+            ("canonical_hex".to_owned(), text(&hex(&canonical))),
+            ("id".to_owned(), text(case.id)),
+            ("kind".to_owned(), text(message.envelope().kind().as_str())),
+            ("note".to_owned(), text(case.note)),
+            ("params".to_owned(), case.params.clone()),
+            (
+                "request_id".to_owned(),
+                text(message.envelope().request_id().as_str()),
+            ),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // Responses
+    // -----------------------------------------------------------------------
+
+    struct ResponseCase {
+        id: &'static str,
+        note: &'static str,
+        response: RunsResponse,
+    }
+
+    /// A listing answer built through the enforcement path rather than around
+    /// it.
+    ///
+    /// `RunsResponse::listing` is what refuses a page that contradicts the
+    /// retention decision it was built from, so a corpus entry that constructed
+    /// the variant directly would record bytes no daemon could have produced.
+    fn listing(
+        id: &str,
+        query: &ListRuns,
+        retained: RetainedRange,
+        page: RunListPage,
+    ) -> RunsResponse {
+        let decision = query.resume_within(retained);
+        assert!(
+            matches!(decision, CursorResume::Live { .. }),
+            "{id}: this fixture's cursor is inside retention"
+        );
+        RunsResponse::listing(request_id(id), query, decision, Some(page))
+            .expect("the page satisfies the decision it answers")
+    }
+
+    fn response_cases() -> Vec<ResponseCase> {
+        let unfiltered = ListRuns::new(RunStateFilter::any(), None, page_size(MAX_RUN_PAGE_ITEMS));
+        let retained = RetainedRange::new(1, wire_ceiling()).expect("a retained window");
+
+        vec![
+            ResponseCase {
+                id: "run-list-page-more",
+                note: "a page whose last row and whose continuation cursor are both at the \
+                       wire's ceiling, which a decoder carrying counters in a double would round \
+                       to an even neighbour",
+                response: listing(
+                    "run-list-page-more",
+                    &unfiltered,
+                    retained,
+                    RunListPage::new(
+                        vec![
+                            summary("run-first", 1, RunState::Running, 0),
+                            summary(
+                                "run-last",
+                                wire_ceiling() - 1,
+                                RunState::Completed,
+                                i64::MAX,
+                            ),
+                        ],
+                        Continuation::More(RunCursor::new(wire_ceiling())),
+                    )
+                    .expect("a well-formed page"),
+                ),
+            },
+            ResponseCase {
+                id: "run-list-page-empty-more",
+                note: "an empty page that still reports more: a state filter can exclude every \
+                       row in one scanned window while rows remain behind it, so a client that \
+                       inferred `done` from a short page would stop early",
+                response: listing(
+                    "run-list-page-empty-more",
+                    &unfiltered,
+                    retained,
+                    RunListPage::new(Vec::new(), Continuation::More(RunCursor::new(42)))
+                        .expect("an empty page may continue"),
+                ),
+            },
+            ResponseCase {
+                id: "run-list-page-complete",
+                note: "the end of the retained log: `more` false and an explicit null cursor",
+                response: listing(
+                    "run-list-page-complete",
+                    &unfiltered,
+                    retained,
+                    RunListPage::new(
+                        vec![summary(
+                            "run-only",
+                            9,
+                            RunState::TimedOut,
+                            1_700_000_000_000,
+                        )],
+                        Continuation::Complete,
+                    )
+                    .expect("a well-formed page"),
+                ),
+            },
+            ResponseCase {
+                id: "run-detail-truncated",
+                note: "a bounded tail with a coverage that says so; the omitted events stay on \
+                       the subscribe lane, resuming from the last carried sequence",
+                response: RunsResponse::RunDetail {
+                    request_id: request_id("req-detail-1"),
+                    view: RunDetailView::new(
+                        summary("run-busy", 4, RunState::Running, 1_700_000_000_000),
+                        500,
+                        vec![
+                            event(
+                                1,
+                                1_700_000_000_001,
+                                SpoolEventKind::Started,
+                                Authority::Authoritative,
+                            ),
+                            event(
+                                2,
+                                1_700_000_000_002,
+                                SpoolEventKind::AdapterEvent,
+                                Authority::Synthetic,
+                            ),
+                        ],
+                        LifecycleCoverage::Truncated,
+                    )
+                    .expect("a coherent truncated view"),
+                },
+            },
+            ResponseCase {
+                id: "run-detail-complete-terminal",
+                note: "the whole log of an ended run: the final event is terminal exactly \
+                       because the state is",
+                response: RunsResponse::RunDetail {
+                    request_id: request_id("req-detail-2"),
+                    view: RunDetailView::new(
+                        summary("run-done", 5, RunState::Completed, 1_700_000_000_000),
+                        3,
+                        vec![
+                            event(
+                                1,
+                                1_700_000_000_001,
+                                SpoolEventKind::Started,
+                                Authority::Authoritative,
+                            ),
+                            event(
+                                2,
+                                1_700_000_000_002,
+                                SpoolEventKind::CancelRequested,
+                                Authority::Authoritative,
+                            ),
+                            event(
+                                3,
+                                1_700_000_000_003,
+                                SpoolEventKind::Terminal,
+                                Authority::Synthetic,
+                            ),
+                        ],
+                        LifecycleCoverage::Complete,
+                    )
+                    .expect("a coherent complete view"),
+                },
+            },
+            ResponseCase {
+                id: "run-detail-complete-empty",
+                note: "an accepted run with no events yet: an empty array and sequence zero, \
+                       which is a complete log rather than a truncated one",
+                response: RunsResponse::RunDetail {
+                    request_id: request_id("req-detail-3"),
+                    view: RunDetailView::new(
+                        summary("run-ready", 6, RunState::Ready, 0),
+                        0,
+                        Vec::new(),
+                        LifecycleCoverage::Complete,
+                    )
+                    .expect("a coherent empty view"),
+                },
+            },
+            ResponseCase {
+                id: "resync-required",
+                note: "a cursor outside retention receives the window a bounded snapshot must \
+                       cover, and never a partial page",
+                response: RunsResponse::Resync {
+                    request_id: request_id("req-list-3"),
+                    snapshot_from: 10,
+                    snapshot_to: 99,
+                },
+            },
+            ResponseCase {
+                id: "refused-unknown-run",
+                note: "the only refusal this slice can decide; there is no not_authorized, \
+                       because no actor is modelled",
+                response: RunsResponse::Refused {
+                    request_id: request_id("req-detail-4"),
+                    refusal: RunsRefusal::UnknownRun,
+                },
+            },
+        ]
+    }
+
+    /// How one decoded response is spelled in the corpus.
+    ///
+    /// Built from the value the *Rust decoder* recovered, and flattened with
+    /// dotted keys so a nested page compares field by field rather than as one
+    /// opaque blob: a runner that decoded the third summary's state wrongly says
+    /// exactly that.
+    fn decoded_spelling(response: &RunsResponse) -> JsonValue {
+        let mut fields = vec![(
+            "request_id".to_owned(),
+            text(response.request_id().as_str()),
+        )];
+        let summary_fields = |prefix: &str, value: &RunSummary| -> Vec<(String, JsonValue)> {
+            [
+                (
+                    "accepted_at_ms",
+                    JsonValue::String(value.accepted_at().as_millis().to_string()),
+                ),
+                ("run_id", text(value.run_id().as_str())),
+                ("spec_digest", text(&value.spec_digest().to_string())),
+                ("state", text(value.state().as_str())),
+                ("submission_id", number(value.submission_id())),
+                ("submission_state", text(value.submission_state().as_str())),
+            ]
+            .into_iter()
+            .map(|(name, spelled)| (format!("{prefix}{name}"), spelled))
+            .collect()
+        };
+        match response {
+            RunsResponse::RunList { page, .. } => {
+                fields.push((
+                    "more".to_owned(),
+                    text(&page.continuation().has_more().to_string()),
+                ));
+                fields.push((
+                    "next_cursor".to_owned(),
+                    match page.continuation().cursor() {
+                        Some(cursor) => number(cursor.position()),
+                        None => text("null"),
+                    },
+                ));
+                fields.push(("runs.len".to_owned(), number(page.runs().len() as u64)));
+                for (index, run) in page.runs().iter().enumerate() {
+                    fields.extend(summary_fields(&format!("runs.{index}."), run));
+                }
+            }
+            RunsResponse::RunDetail { view, .. } => {
+                fields.push(("coverage".to_owned(), text(view.coverage().as_str())));
+                fields.push(("last_sequence".to_owned(), number(view.last_sequence())));
+                fields.push((
+                    "lifecycle.len".to_owned(),
+                    number(view.lifecycle().len() as u64),
+                ));
+                for (index, carried) in view.lifecycle().iter().enumerate() {
+                    for (name, spelled) in [
+                        (
+                            "at_ms",
+                            JsonValue::String(carried.at().as_millis().to_string()),
+                        ),
+                        ("authority", text(carried.authority().as_str())),
+                        ("kind", text(carried.kind().as_str())),
+                        ("sequence", number(carried.sequence())),
+                    ] {
+                        fields.push((format!("lifecycle.{index}.{name}"), spelled));
+                    }
+                }
+                fields.extend(summary_fields("summary.", view.summary()));
+            }
+            RunsResponse::Resync {
+                snapshot_from,
+                snapshot_to,
+                ..
+            } => {
+                fields.push(("snapshot_from".to_owned(), number(*snapshot_from)));
+                fields.push(("snapshot_to".to_owned(), number(*snapshot_to)));
+            }
+            RunsResponse::Refused { refusal, .. } => {
+                fields.push(("refusal".to_owned(), text(refusal.as_str())));
+            }
+        }
+        JsonValue::Object(fields)
+    }
+
+    fn response_entry(case: &ResponseCase) -> JsonValue {
+        let message = case.response.to_message().expect("the response encodes");
+        let canonical = message.to_canonical_bytes();
+        let decoded =
+            RunsResponse::from_canonical_bytes(&canonical).expect("Rust admits its own encoding");
+        assert_eq!(
+            decoded, case.response,
+            "{}: the Rust decoder does not recover what it encoded",
+            case.id
+        );
+        JsonValue::Object(vec![
+            ("canonical_hex".to_owned(), text(&hex(&canonical))),
+            ("decoded".to_owned(), decoded_spelling(&decoded)),
+            ("id".to_owned(), text(case.id)),
+            ("kind".to_owned(), text(message.envelope().kind().as_str())),
+            ("note".to_owned(), text(case.note)),
+            ("outcome".to_owned(), text(decoded.outcome().as_str())),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // Refusals
+    // -----------------------------------------------------------------------
+
+    /// A payload both implementations must refuse, under one category.
+    struct DecodeRefusal {
+        id: &'static str,
+        note: &'static str,
+        payload: Vec<u8>,
+    }
+
+    /// A well-formed summary body, as a starting point for one that is not.
+    fn summary_body(overrides: &[(&str, JsonValue)]) -> JsonValue {
+        let mut entries: Vec<(String, JsonValue)> = vec![
+            (
+                "accepted_at_ms".to_owned(),
+                JsonValue::Integer(1_700_000_000_000),
+            ),
+            ("run_id".to_owned(), text("run-1")),
+            (
+                "spec_digest".to_owned(),
+                text(&Sha256::digest(b"document").to_string()),
+            ),
+            ("state".to_owned(), text("running")),
+            ("submission_id".to_owned(), JsonValue::Integer(1)),
+            ("submission_state".to_owned(), text("accepted")),
+        ];
+        for (name, value) in overrides {
+            let slot = entries
+                .iter_mut()
+                .find(|(existing, _)| existing == name)
+                .unwrap_or_else(|| panic!("{name} is not a summary field"));
+            slot.1 = value.clone();
+        }
+        JsonValue::Object(entries)
+    }
+
+    /// A well-formed lifecycle event body.
+    fn event_body(overrides: &[(&str, JsonValue)]) -> JsonValue {
+        let mut entries: Vec<(String, JsonValue)> = vec![
+            ("at_ms".to_owned(), JsonValue::Integer(1_700_000_000_001)),
+            ("authority".to_owned(), text("authoritative")),
+            ("kind".to_owned(), text("started")),
+            ("sequence".to_owned(), JsonValue::Integer(1)),
+        ];
+        for (name, value) in overrides {
+            let slot = entries
+                .iter_mut()
+                .find(|(existing, _)| existing == name)
+                .unwrap_or_else(|| panic!("{name} is not a lifecycle field"));
+            slot.1 = value.clone();
+        }
+        JsonValue::Object(entries)
+    }
+
+    /// A page body carrying the given summaries and continuation.
+    fn page_body(runs: Vec<JsonValue>, more: bool, next_cursor: JsonValue) -> JsonValue {
+        JsonValue::Object(vec![
+            ("more".to_owned(), JsonValue::Bool(more)),
+            ("next_cursor".to_owned(), next_cursor),
+            ("runs".to_owned(), JsonValue::Array(runs)),
+        ])
+    }
+
+    /// A detail body carrying the given lifecycle, coverage and last sequence.
+    fn view_body(
+        summary: JsonValue,
+        last_sequence: i64,
+        lifecycle: Vec<JsonValue>,
+        coverage: &str,
+    ) -> JsonValue {
+        JsonValue::Object(vec![
+            ("coverage".to_owned(), text(coverage)),
+            (
+                "last_sequence".to_owned(),
+                JsonValue::Integer(last_sequence),
+            ),
+            ("lifecycle".to_owned(), JsonValue::Array(lifecycle)),
+            ("summary".to_owned(), summary),
+        ])
+    }
+
+    fn runs_message(kind: &str, id: &str, body: JsonValue) -> Vec<u8> {
+        raw_message(RUNS_PROTOCOL, 1, kind, id, body)
+    }
+
+    fn decode_refusals() -> Vec<DecodeRefusal> {
+        // Both array bounds are judged before any item is read, in Rust and in
+        // the generated TypeScript alike, so the over-bound payloads carry
+        // integers rather than bodies: what is wrong with them is their length.
+        let filler = |count: usize| -> Vec<JsonValue> {
+            (0..count)
+                .map(|index| JsonValue::Integer(index as i64))
+                .collect()
+        };
+        vec![
+            DecodeRefusal {
+                id: "state-undefined-spelling",
+                note: "a run state this build does not define fails closed rather than \
+                       decoding to a default a client would act on",
+                payload: runs_message(
+                    "run_list_result",
+                    "req-list-1",
+                    page_body(
+                        vec![summary_body(&[("state", text("paused"))])],
+                        false,
+                        JsonValue::Null,
+                    ),
+                ),
+            },
+            DecodeRefusal {
+                id: "submission-state-undefined-spelling",
+                note: "the store's custody vocabulary is closed at one value in this release, \
+                       and a second one is refused rather than retained",
+                payload: runs_message(
+                    "run_list_result",
+                    "req-list-1",
+                    page_body(
+                        vec![summary_body(&[("submission_state", text("queued"))])],
+                        false,
+                        JsonValue::Null,
+                    ),
+                ),
+            },
+            DecodeRefusal {
+                id: "spool-event-kind-undefined-spelling",
+                note: "the runner's five durable kinds are not the normalized 23-kind event \
+                       vocabulary; a kind from the other one is undefined here",
+                payload: runs_message(
+                    "run_detail_result",
+                    "req-detail-1",
+                    view_body(
+                        summary_body(&[]),
+                        1,
+                        vec![event_body(&[("kind", text("tool_call"))])],
+                        "complete",
+                    ),
+                ),
+            },
+            DecodeRefusal {
+                id: "authority-undefined-spelling",
+                note: "an authority outside the two words both crates carry",
+                payload: runs_message(
+                    "run_detail_result",
+                    "req-detail-1",
+                    view_body(
+                        summary_body(&[]),
+                        1,
+                        vec![event_body(&[("authority", text("inferred"))])],
+                        "complete",
+                    ),
+                ),
+            },
+            DecodeRefusal {
+                id: "coverage-undefined-spelling",
+                note: "a third coverage would be a partial log presented as something a client \
+                       has no rule for",
+                payload: runs_message(
+                    "run_detail_result",
+                    "req-detail-1",
+                    view_body(summary_body(&[]), 0, Vec::new(), "partial"),
+                ),
+            },
+            DecodeRefusal {
+                id: "refusal-not-authorized",
+                note: "this slice models no actor, so it names no authorization refusal; a peer \
+                       claiming one is a peer this build does not understand",
+                payload: runs_message(
+                    "refused",
+                    "req-detail-1",
+                    JsonValue::Object(vec![("refusal".to_owned(), text("not_authorized"))]),
+                ),
+            },
+            DecodeRefusal {
+                id: "submission-id-zero",
+                note: "a durable identity starts at one; zero names a row no writer produced",
+                payload: runs_message(
+                    "run_list_result",
+                    "req-list-1",
+                    page_body(
+                        vec![summary_body(&[("submission_id", JsonValue::Integer(0))])],
+                        false,
+                        JsonValue::Null,
+                    ),
+                ),
+            },
+            DecodeRefusal {
+                id: "submission-id-negative",
+                note: "a negative identity is a malformed body rather than an unwritten row: \
+                       the decoder converts before it judges the domain, and the two categories \
+                       differ",
+                payload: runs_message(
+                    "run_list_result",
+                    "req-list-1",
+                    page_body(
+                        vec![summary_body(&[("submission_id", JsonValue::Integer(-1))])],
+                        false,
+                        JsonValue::Null,
+                    ),
+                ),
+            },
+            DecodeRefusal {
+                id: "accepted-at-before-epoch",
+                note: "an acceptance instant the store's own constraint cannot hold",
+                payload: runs_message(
+                    "run_list_result",
+                    "req-list-1",
+                    page_body(
+                        vec![summary_body(&[("accepted_at_ms", JsonValue::Integer(-1))])],
+                        false,
+                        JsonValue::Null,
+                    ),
+                ),
+            },
+            DecodeRefusal {
+                id: "lifecycle-sequence-zero",
+                note: "spool sequences begin at one; zero is what the status reports when there \
+                       are no events at all",
+                payload: runs_message(
+                    "run_detail_result",
+                    "req-detail-1",
+                    view_body(
+                        summary_body(&[]),
+                        1,
+                        vec![event_body(&[("sequence", JsonValue::Integer(0))])],
+                        "complete",
+                    ),
+                ),
+            },
+            DecodeRefusal {
+                id: "page-over-bound",
+                note: "one row past MAX_RUN_PAGE_ITEMS. The length is judged before any item is \
+                       read, so what these items are does not matter and the refusal names the \
+                       length",
+                payload: runs_message(
+                    "run_list_result",
+                    "req-list-1",
+                    page_body(filler(MAX_RUN_PAGE_ITEMS + 1), false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "lifecycle-over-bound",
+                note: "one event past MAX_LIFECYCLE_EVENTS, judged the same way",
+                payload: runs_message(
+                    "run_detail_result",
+                    "req-detail-1",
+                    view_body(
+                        summary_body(&[]),
+                        1,
+                        filler(MAX_LIFECYCLE_EVENTS + 1),
+                        "complete",
+                    ),
+                ),
+            },
+            DecodeRefusal {
+                id: "page-extra-field",
+                note: "an unexpected key is refused rather than ignored",
+                payload: runs_message(
+                    "run_list_result",
+                    "req-list-1",
+                    JsonValue::Object(vec![
+                        ("more".to_owned(), JsonValue::Bool(false)),
+                        ("next_cursor".to_owned(), JsonValue::Null),
+                        ("runs".to_owned(), JsonValue::Array(Vec::new())),
+                        ("total".to_owned(), JsonValue::Integer(1)),
+                    ]),
+                ),
+            },
+            DecodeRefusal {
+                id: "summary-missing-field",
+                note: "a missing key is refused rather than defaulted, inside a nested body as \
+                       much as at the top level",
+                payload: runs_message(
+                    "run_list_result",
+                    "req-list-1",
+                    page_body(
+                        vec![JsonValue::Object(vec![
+                            ("accepted_at_ms".to_owned(), JsonValue::Integer(0)),
+                            ("run_id".to_owned(), text("run-1")),
+                            ("state".to_owned(), text("running")),
+                            ("submission_id".to_owned(), JsonValue::Integer(1)),
+                            ("submission_state".to_owned(), text("accepted")),
+                        ])],
+                        false,
+                        JsonValue::Null,
+                    ),
+                ),
+            },
+            DecodeRefusal {
+                id: "unknown-kind",
+                note: "a kind this protocol version does not define, which is a different \
+                       answer from a kind it defines and this surface does not decode",
+                payload: runs_message(
+                    "run_events_result",
+                    "req-list-1",
+                    page_body(Vec::new(), false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "admin-protocol-message",
+                note: "the admin lane's name on this lane's decoder, refused on the name axis \
+                       so the two protocols' closed kind sets stay closed",
+                payload: raw_message(
+                    "automonique.admin",
+                    1,
+                    "run_list_result",
+                    "req-list-1",
+                    page_body(Vec::new(), false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "unsupported-version",
+                note: "this protocol at a major version neither side implements",
+                payload: raw_message(
+                    RUNS_PROTOCOL,
+                    2,
+                    "run_list_result",
+                    "req-list-1",
+                    page_body(Vec::new(), false, JsonValue::Null),
+                ),
+            },
+            DecodeRefusal {
+                id: "non-canonical-key-order",
+                note: "a payload that parses but is not canonical is refused, not normalized",
+                payload: br#"{"kind":"refused","body":{"refusal":"unknown_run"},"protocol":"automonique.runs","request_id":"req-detail-1","version":1}"#.to_vec(),
+            },
+            DecodeRefusal {
+                id: "empty-payload",
+                note: "zero bytes is not an empty message",
+                payload: Vec::new(),
+            },
+        ]
+    }
+
+    fn decode_refusal_entry(refusal: &DecodeRefusal) -> JsonValue {
+        let category = RunsResponse::from_canonical_bytes(&refusal.payload)
+            .err()
+            .unwrap_or_else(|| panic!("{}: Rust accepted a payload it must refuse", refusal.id))
+            .category()
+            .to_owned();
+        JsonValue::Object(vec![
+            ("category".to_owned(), text(&category)),
+            ("id".to_owned(), text(refusal.id)),
+            ("note".to_owned(), text(refusal.note)),
+            ("payload_hex".to_owned(), text(&hex(&refusal.payload))),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // The measured gap
+    // -----------------------------------------------------------------------
+
+    /// A payload the Rust constructors refuse and the generated TypeScript
+    /// accepts.
+    ///
+    /// Every one of these breaks a rule that relates two fields, which the
+    /// generated surface does not hold: it carries each field's own shape and
+    /// bounds. Recording them as a corpus section rather than as a sentence
+    /// makes the gap a measurement — the runner asserts these decode, so
+    /// teaching the generator one of these rules turns this suite red until the
+    /// entry moves up to [`decode_refusals`].
+    struct RustOnlyRefusal {
+        id: &'static str,
+        note: &'static str,
+        payload: Vec<u8>,
+    }
+
+    fn rust_only_refusals() -> Vec<RustOnlyRefusal> {
+        vec![
+            RustOnlyRefusal {
+                id: "continuation-incoherent",
+                note: "rows follow, with no cursor to resume from",
+                payload: runs_message(
+                    "run_list_result",
+                    "req-list-1",
+                    page_body(Vec::new(), true, JsonValue::Null),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "continuation-rewinds",
+                note: "a continuation cursor at or below the last row on the page, which would \
+                       re-serve it",
+                payload: runs_message(
+                    "run_list_result",
+                    "req-list-1",
+                    page_body(
+                        vec![summary_body(&[("submission_id", JsonValue::Integer(9))])],
+                        true,
+                        JsonValue::Integer(9),
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "page-out-of-order",
+                note: "summaries that do not strictly increase by submission identity, so the \
+                       next page would re-serve or skip",
+                payload: runs_message(
+                    "run_list_result",
+                    "req-list-1",
+                    page_body(
+                        vec![
+                            summary_body(&[("submission_id", JsonValue::Integer(5))]),
+                            summary_body(&[("submission_id", JsonValue::Integer(2))]),
+                        ],
+                        false,
+                        JsonValue::Null,
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "lifecycle-out-of-order",
+                note: "lifecycle sequences that do not strictly increase",
+                payload: runs_message(
+                    "run_detail_result",
+                    "req-detail-1",
+                    view_body(
+                        summary_body(&[]),
+                        9,
+                        vec![
+                            event_body(&[("sequence", JsonValue::Integer(4))]),
+                            event_body(&[("sequence", JsonValue::Integer(2))]),
+                        ],
+                        "truncated",
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "lifecycle-above-last-sequence",
+                note: "an event above the highest sequence the run's spool reports holding",
+                payload: runs_message(
+                    "run_detail_result",
+                    "req-detail-1",
+                    view_body(
+                        summary_body(&[]),
+                        1,
+                        vec![event_body(&[("sequence", JsonValue::Integer(7))])],
+                        "complete",
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "terminal-event-not-last",
+                note: "a run reaches exactly one terminal event and nothing follows it",
+                payload: runs_message(
+                    "run_detail_result",
+                    "req-detail-1",
+                    view_body(
+                        summary_body(&[("state", text("completed"))]),
+                        2,
+                        vec![
+                            event_body(&[
+                                ("kind", text("terminal")),
+                                ("sequence", JsonValue::Integer(1)),
+                            ]),
+                            event_body(&[
+                                ("kind", text("adapter_event")),
+                                ("sequence", JsonValue::Integer(2)),
+                            ]),
+                        ],
+                        "complete",
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "terminal-event-contradicts-state",
+                note: "a terminal event carried for a run whose state says it has not ended",
+                payload: runs_message(
+                    "run_detail_result",
+                    "req-detail-1",
+                    view_body(
+                        summary_body(&[("state", text("running"))]),
+                        1,
+                        vec![event_body(&[("kind", text("terminal"))])],
+                        "complete",
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "coverage-incoherent",
+                note: "a log declared complete that stops below the last sequence the run holds",
+                payload: runs_message(
+                    "run_detail_result",
+                    "req-detail-1",
+                    view_body(
+                        summary_body(&[]),
+                        9,
+                        vec![event_body(&[("sequence", JsonValue::Integer(1))])],
+                        "complete",
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "resync-inverted-window",
+                note: "a snapshot window that ends before it starts",
+                payload: runs_message(
+                    "resync_required",
+                    "req-list-1",
+                    JsonValue::Object(vec![
+                        ("snapshot_from".to_owned(), JsonValue::Integer(99)),
+                        ("snapshot_to".to_owned(), JsonValue::Integer(10)),
+                    ]),
+                ),
+            },
+        ]
+    }
+
+    fn rust_only_entry(refusal: &RustOnlyRefusal) -> JsonValue {
+        let category = RunsResponse::from_canonical_bytes(&refusal.payload)
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: Rust accepts this, so it is not a rule the generated surface is \
+                     missing",
+                    refusal.id
+                )
+            })
+            .category()
+            .to_owned();
+        JsonValue::Object(vec![
+            ("id".to_owned(), text(refusal.id)),
+            ("note".to_owned(), text(refusal.note)),
+            ("payload_hex".to_owned(), text(&hex(&refusal.payload))),
+            ("rust_category".to_owned(), text(&category)),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // Encode refusals
+    // -----------------------------------------------------------------------
+
+    /// A request the other implementation must refuse while building it.
+    struct EncodeRefusal {
+        id: &'static str,
+        note: &'static str,
+        kind: &'static str,
+        request_id: String,
+        params: JsonValue,
+        category: String,
+        /// The generated constructor that refuses the value, and the violation
+        /// it names.
+        constructor: Option<(&'static str, &'static str)>,
+    }
+
+    /// The category Rust reports for a run identity this lane cannot carry.
+    ///
+    /// Taken from the constructor's own refusal rather than named here: the
+    /// bounded-value error is `RunId`'s, and the category is the one this
+    /// protocol reports when it meets that error on the wire.
+    fn run_id_category(value: &str) -> String {
+        RunsApiError::Field {
+            field: "run_id",
+            error: RunId::new(value).expect_err("this identity is refused"),
+        }
+        .category()
+        .to_owned()
+    }
+
+    fn encode_refusals() -> Vec<EncodeRefusal> {
+        let long_run_id = "r".repeat(MAX_TOOL_FIELD_BYTES + 1);
+        let long_request_id = "r".repeat(MAX_REQUEST_ID_BYTES + 1);
+        let unfiltered = || JsonValue::Null;
+
+        let page_size_category = PageSize::new(0)
+            .expect_err("a page that admits nothing is refused")
+            .category()
+            .to_owned();
+        let cursor_category = RunsRequest::ListRuns {
+            request_id: request_id("req-list-1"),
+            query: ListRuns::new(
+                RunStateFilter::any(),
+                Some(RunCursor::new(wire_ceiling() + 1)),
+                page_size(1),
+            ),
+        }
+        .to_message()
+        .expect_err("a cursor above the wire ceiling is refused")
+        .category()
+        .to_owned();
+        let empty_filter_category = RunStateFilter::only([])
+            .expect_err("an empty filter is refused")
+            .category()
+            .to_owned();
+        let repeat_filter_category = RunStateFilter::only([RunState::Running, RunState::Running])
+            .expect_err("a repeated state is refused")
+            .category()
+            .to_owned();
+        let undefined_state_category =
+            RunsApiError::Codec(automonique_protocol::codec::CodecError::UnknownEnumValue {
+                field: "state",
+            })
+            .category()
+            .to_owned();
+        let long_id_category = RunsApiError::Codec(
+            RequestId::new(&long_request_id).expect_err("an overlong request id is refused"),
+        )
+        .category()
+        .to_owned();
+        let bad_id_category = RunsApiError::Codec(
+            RequestId::new("req 1").expect_err("a space is outside the request id grammar"),
+        )
+        .category()
+        .to_owned();
+
+        let list_params = |size: JsonValue, since: JsonValue, states: JsonValue| {
+            JsonValue::Object(vec![
+                ("page_size".to_owned(), size),
+                ("since".to_owned(), since),
+                ("states".to_owned(), states),
+            ])
+        };
+
+        vec![
+            EncodeRefusal {
+                id: "list-runs-page-size-zero",
+                note: "a page that admits nothing cannot make progress, so zero is refused \
+                       rather than treated as a default",
+                kind: "list_runs",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(number(0), JsonValue::Null, unfiltered()),
+                category: page_size_category.clone(),
+                constructor: Some(("PageSize", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "list-runs-page-size-above-bound",
+                note: "one past MAX_RUN_PAGE_ITEMS",
+                kind: "list_runs",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(
+                    number(MAX_RUN_PAGE_ITEMS as u64 + 1),
+                    JsonValue::Null,
+                    unfiltered(),
+                ),
+                category: page_size_category,
+                constructor: Some(("PageSize", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "list-runs-cursor-above-wire-ceiling",
+                note: "a cursor one past the largest integer this wire carries, which is a \
+                       counter refusal rather than a malformed body",
+                kind: "list_runs",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(number(1), number(wire_ceiling() + 1), unfiltered()),
+                category: cursor_category,
+                constructor: Some(("RunCursor", "out_of_range")),
+            },
+            EncodeRefusal {
+                id: "list-runs-empty-state-filter",
+                note: "an empty filter admits nothing, which no listing could ever answer; it \
+                       is not the same request as no filter at all",
+                kind: "list_runs",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(number(1), JsonValue::Null, JsonValue::Array(Vec::new())),
+                category: empty_filter_category,
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "list-runs-repeated-state",
+                note: "a repeat means a caller believes it asked for something it did not",
+                kind: "list_runs",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(
+                    number(1),
+                    JsonValue::Null,
+                    JsonValue::Array(vec![text("running"), text("running")]),
+                ),
+                category: repeat_filter_category,
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "list-runs-undefined-state",
+                note: "a brand exists only in the type checker, so the builder is where an \
+                       untyped caller's undefined state is stopped",
+                kind: "list_runs",
+                request_id: "req-list-1".to_owned(),
+                params: list_params(
+                    number(1),
+                    JsonValue::Null,
+                    JsonValue::Array(vec![text("paused")]),
+                ),
+                category: undefined_state_category,
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "run-detail-run-id-too-long",
+                note: "one byte over the run identity bound, measured in UTF-8 bytes",
+                kind: "run_detail",
+                request_id: "req-detail-1".to_owned(),
+                params: JsonValue::Object(vec![("run_id".to_owned(), text(&long_run_id))]),
+                category: run_id_category(&long_run_id),
+                constructor: Some(("RunId", "too_long")),
+            },
+            EncodeRefusal {
+                id: "run-detail-run-id-control-character",
+                note: "a control character in a run identity, which the wire never carries raw",
+                kind: "run_detail",
+                request_id: "req-detail-1".to_owned(),
+                params: JsonValue::Object(vec![("run_id".to_owned(), text("run\u{7}1"))]),
+                category: run_id_category("run\u{7}1"),
+                constructor: Some(("RunId", "invalid_character")),
+            },
+            EncodeRefusal {
+                id: "request-id-too-long",
+                note: "the envelope's fields are judged by the shared codec, whose refusal for \
+                       a bound is not the one this protocol uses for a body",
+                kind: "list_runs",
+                request_id: long_request_id,
+                params: list_params(number(1), JsonValue::Null, unfiltered()),
+                category: long_id_category,
+                constructor: Some(("RequestId", "too_long")),
+            },
+            EncodeRefusal {
+                id: "request-id-outside-grammar",
+                note: "a grammar refusal is not a bounds refusal, and the categories differ",
+                kind: "run_detail",
+                request_id: "req 1".to_owned(),
+                params: JsonValue::Object(vec![("run_id".to_owned(), text("run-1"))]),
+                category: bad_id_category,
+                constructor: Some(("RequestId", "invalid_character")),
+            },
+        ]
+    }
+
+    fn encode_refusal_entry(refusal: &EncodeRefusal) -> JsonValue {
+        let mut entry = vec![
+            ("category".to_owned(), text(&refusal.category)),
+            ("id".to_owned(), text(refusal.id)),
+            ("kind".to_owned(), text(refusal.kind)),
+            ("note".to_owned(), text(refusal.note)),
+            ("params".to_owned(), refusal.params.clone()),
+            ("request_id".to_owned(), text(&refusal.request_id)),
+        ];
+        if let Some((constructor, violation)) = refusal.constructor {
+            // Named `refused_by` rather than `constructor`: a JSON object parsed
+            // by a JavaScript reader inherits `constructor` from its prototype.
+            entry.push(("refused_by".to_owned(), text(constructor)));
+            entry.push(("violation".to_owned(), text(violation)));
+        }
+        JsonValue::Object(entry)
+    }
+
+    // -----------------------------------------------------------------------
+    // The corpus file
+    // -----------------------------------------------------------------------
+
+    fn corpus() -> String {
+        let document = JsonValue::Object(vec![
+            (
+                "decode_refusals".to_owned(),
+                JsonValue::Array(decode_refusals().iter().map(decode_refusal_entry).collect()),
+            ),
+            (
+                "encode_refusals".to_owned(),
+                JsonValue::Array(encode_refusals().iter().map(encode_refusal_entry).collect()),
+            ),
+            (
+                "generator".to_owned(),
+                text("automonique-protocol tests/codegen.rs, module runs_surface"),
+            ),
+            (
+                "note".to_owned(),
+                text(
+                    "Generated from the shipped Rust constructors: every canonical byte string \
+                     here was produced by encoding a real message and re-read through \
+                     from_canonical_bytes before it was written, and every refusal category was \
+                     read back from the error Rust returned for that exact input. Counters \
+                     travel as decimal strings because a JSON reader using a double would round \
+                     the largest of them without saying so. Rust is the wire source of truth, so \
+                     a disagreement is fixed in whichever implementation is wrong — never in \
+                     this file.",
+                ),
+            ),
+            ("protocol".to_owned(), text(RUNS_PROTOCOL)),
+            (
+                "requests".to_owned(),
+                JsonValue::Array(request_cases().iter().map(request_entry).collect()),
+            ),
+            (
+                "responses".to_owned(),
+                JsonValue::Array(response_cases().iter().map(response_entry).collect()),
+            ),
+            (
+                "rust_only_refusals".to_owned(),
+                JsonValue::Array(rust_only_refusals().iter().map(rust_only_entry).collect()),
+            ),
+            (
+                "rust_only_refusals_note".to_owned(),
+                text(
+                    "Payloads the Rust constructors refuse and the generated TypeScript accepts. \
+                     Each breaks a rule that relates two fields, which the generated surface \
+                     does not hold: it carries each field's own shape and bounds. The runner \
+                     asserts these decode, so the gap is measured rather than described — \
+                     teaching the generator one of these rules turns the suite red until the \
+                     entry moves to decode_refusals.",
+                ),
+            ),
+            (
+                "version".to_owned(),
+                JsonValue::Integer(i64::from(MajorVersion::FIRST.get())),
+            ),
+        ]);
+        let mut out = String::new();
+        write_pretty(&document, 0, &mut out);
+        out.push('\n');
+        out
+    }
+
+    /// The drift gate over the corpus, and the regeneration that closes it.
+    #[test]
+    fn the_checked_in_corpus_matches_regeneration() {
+        let expected = corpus();
+        let path = corpus_path();
+        if regenerating() {
+            let staging = path.with_extension("json.staging");
+            std::fs::write(&staging, &expected).expect("stage the corpus");
+            std::fs::rename(&staging, &path).expect("publish the corpus");
+            return;
+        }
+        let actual = std::fs::read_to_string(&path)
+            .expect("the corpus is checked in — regenerate it to create it");
+        if actual != expected {
+            let difference = actual
+                .lines()
+                .zip(expected.lines())
+                .enumerate()
+                .find(|(_, (left, right))| left != right)
+                .map_or_else(
+                    || {
+                        format!(
+                            "{} lines on disk, {} lines generated",
+                            actual.lines().count(),
+                            expected.lines().count()
+                        )
+                    },
+                    |(index, (left, right))| {
+                        let shorten = |line: &str| line.chars().take(120).collect::<String>();
+                        format!(
+                            "line {}: on disk {:?}, generated {:?}",
+                            index + 1,
+                            shorten(left),
+                            shorten(right)
+                        )
+                    },
+                );
+            panic!(
+                "the checked-in runs corpus no longer matches the Rust encoders: {difference}\n\n\
+                 Regenerate with: {REGENERATE_COMMAND}"
+            );
+        }
+    }
+
+    /// Every request this protocol version defines is generated or named absent.
+    ///
+    /// The kinds come from encoding one request per [`RunsRequest`] variant, and
+    /// the `match` below is exhaustive, so a request added to the protocol
+    /// fails here rather than quietly falling outside the generated surface.
+    #[test]
+    fn every_request_kind_is_generated_or_named_as_absent() {
+        let id = request_id("req-coverage-1");
+        let requests = vec![
+            RunsRequest::ListRuns {
+                request_id: id.clone(),
+                query: ListRuns::new(RunStateFilter::any(), None, page_size(1)),
+            },
+            RunsRequest::RunDetail {
+                request_id: id,
+                run_id: run_id("run-1"),
+            },
+        ];
+        for request in &requests {
+            match request {
+                RunsRequest::ListRuns { .. } | RunsRequest::RunDetail { .. } => {}
+            }
+        }
+        let encoded: BTreeSet<String> = requests
+            .iter()
+            .map(|request| {
+                request
+                    .to_message()
+                    .expect("each request encodes")
+                    .envelope()
+                    .kind()
+                    .as_str()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            encoded.len(),
+            requests.len(),
+            "one request per variant is required, each with its own kind"
+        );
+
+        let surface = surface();
+        let mut covered: BTreeSet<String> = surface
+            .requests
+            .iter()
+            .map(|request| request.kind.clone())
+            .collect();
+        for kind in &surface.request_kinds_not_generated {
+            assert!(
+                covered.insert(kind.clone()),
+                "{kind} is both generated and named as absent"
+            );
+        }
+        assert_eq!(
+            covered, encoded,
+            "the generated runs surface does not account for every request kind the Rust \
+             encoders produce; regenerate with: {REGENERATE_COMMAND}"
+        );
+    }
+
+    /// Every response this protocol version defines is decoded or named as
+    /// undecoded.
+    #[test]
+    fn every_response_kind_is_decoded_or_named_as_undecoded() {
+        let id = request_id("req-coverage-1");
+        let responses = vec![
+            RunsResponse::RunList {
+                request_id: id.clone(),
+                page: RunListPage::new(Vec::new(), Continuation::Complete).expect("a page"),
+            },
+            RunsResponse::RunDetail {
+                request_id: id.clone(),
+                view: RunDetailView::new(
+                    summary("run-1", 1, RunState::Ready, 0),
+                    0,
+                    Vec::new(),
+                    LifecycleCoverage::Complete,
+                )
+                .expect("a view"),
+            },
+            RunsResponse::Resync {
+                request_id: id.clone(),
+                snapshot_from: 1,
+                snapshot_to: 2,
+            },
+            RunsResponse::Refused {
+                request_id: id,
+                refusal: RunsRefusal::UnknownRun,
+            },
+        ];
+        // The match is the point: a variant added to `RunsResponse` fails to
+        // compile here rather than slipping past a surface that ignores it.
+        for response in &responses {
+            match response {
+                RunsResponse::RunList { .. }
+                | RunsResponse::RunDetail { .. }
+                | RunsResponse::Resync { .. }
+                | RunsResponse::Refused { .. } => {}
+            }
+        }
+        let encoded: BTreeSet<String> = responses
+            .iter()
+            .map(|response| {
+                response
+                    .to_message()
+                    .expect("each response encodes")
+                    .envelope()
+                    .kind()
+                    .as_str()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            encoded.len(),
+            responses.len(),
+            "one response per variant is required, each with its own kind"
+        );
+
+        let surface = surface();
+        let mut covered: BTreeSet<String> = surface
+            .responses
+            .iter()
+            .map(|response| response.kind.clone())
+            .collect();
+        for kind in &surface.response_kinds_not_decoded {
+            assert!(
+                covered.insert(kind.clone()),
+                "{kind} is both decoded and named as undecoded"
+            );
+        }
+        assert_eq!(
+            covered, encoded,
+            "the generated runs surface does not account for every answer the daemon can \
+             produce; regenerate with: {REGENERATE_COMMAND}"
+        );
+    }
+
+    /// The closed vocabularies, restated here rather than read back from the
+    /// generator.
+    ///
+    /// A generator that dropped a variant would agree with itself perfectly.
+    /// This is the second opinion, and the third is the wire order, which is
+    /// checked against `RunState::ALL` rather than against a list: the sorted
+    /// `_VALUES` table is not the order a state filter encodes in, and a
+    /// generator that emitted the sorted one there would produce bytes Rust
+    /// refuses to match.
+    #[test]
+    fn every_closed_vocabulary_carries_all_of_its_variants() {
+        let generated = generated_runs();
+        let expected: [(&str, &[&str]); 6] = [
+            ("Authority", &["authoritative", "synthetic"]),
+            ("LifecycleCoverage", &["complete", "truncated"]),
+            (
+                "RunState",
+                &[
+                    "cancelled",
+                    "completed",
+                    "failed",
+                    "ready",
+                    "running",
+                    "timed_out",
+                ],
+            ),
+            ("RunsRefusal", &["unknown_run"]),
+            (
+                "SpoolEventKind",
+                &[
+                    "adapter_event",
+                    "cancel_requested",
+                    "simulation_event",
+                    "started",
+                    "terminal",
+                ],
+            ),
+            ("SubmissionState", &["accepted"]),
+        ];
+        for (name, values) in expected {
+            let literals: Vec<String> = values.iter().map(|value| format!("\"{value}\"")).collect();
+            let declaration = format!("export type {name} = {};", literals.join(" | "));
+            assert!(
+                generated.contains(&declaration),
+                "the runs surface lost a {name} variant.\nexpected: {declaration}"
+            );
+            assert!(
+                generated.contains(&format!(
+                    "export const {name}_VALUES: readonly {name}[] = [{}];",
+                    literals.join(", ")
+                )),
+                "the {name} table does not match its type"
+            );
+            // Every one of these is a `SecuritySensitiveEnum` in Rust, whose
+            // decoder refuses an undefined spelling rather than retaining it.
+            assert!(
+                generated.contains(&format!(
+                    "export function decode{name}(value: string): {name} {{"
+                )),
+                "the runs surface does not refuse an undefined {name}"
+            );
+        }
+
+        let order: Vec<String> = RunState::ALL
+            .iter()
+            .map(|state| format!("\"{}\"", state.as_str()))
+            .collect();
+        assert!(
+            generated.contains(&format!(
+                "export const RunState_WIRE_ORDER: readonly RunState[] = [{}];",
+                order.join(", ")
+            )),
+            "the generated wire order is not RunState::ALL, so a state filter would encode \
+             bytes Rust does not produce"
+        );
+        assert_ne!(
+            {
+                let mut sorted = order.clone();
+                sorted.sort();
+                sorted
+            },
+            order,
+            "this check is only worth making while the two orders differ"
+        );
+    }
+
+    /// The bounds in the output are the Rust constants, and they are applied.
+    #[test]
+    fn the_generated_runs_bounds_are_the_rust_constants() {
+        let generated = generated_runs();
+        for declaration in [
+            format!("export const MAX_RUN_PAGE_ITEMS = {MAX_RUN_PAGE_ITEMS};"),
+            format!("export const MAX_LIFECYCLE_EVENTS = {MAX_LIFECYCLE_EVENTS};"),
+            format!(
+                "export const MAX_RUNS_CANONICAL_BYTES = {};",
+                automonique_protocol::runs_api::MAX_RUNS_CANONICAL_BYTES
+            ),
+            format!("export const PageSize_MAX = {MAX_RUN_PAGE_ITEMS}n;"),
+            "export const PageSize_MIN = 1n;".to_owned(),
+            "export const SpoolSequence_MIN = 1n;".to_owned(),
+            "export const EpochMillis_MIN = 0n;".to_owned(),
+            format!("export const RunCursor_MAX = {}n;", i64::MAX),
+            format!("export const RUNS_PROTOCOL = \"{RUNS_PROTOCOL}\";"),
+        ] {
+            assert!(
+                generated.contains(&declaration),
+                "the runs surface does not carry the Rust bound: {declaration}"
+            );
+        }
+        // Declaring a bound is not applying it.
+        for application in [
+            format!(
+                "  if (value < 1n || value > {MAX_RUN_PAGE_ITEMS}n) throw new \
+                 ValidationError(\"PageSize\", \"out_of_range\");"
+            ),
+            "bodyArray(fields, \"runs\", RUNS_INVALID_BODY, MAX_RUN_PAGE_ITEMS, \
+             RUNS_PAGE_TOO_LARGE)"
+                .to_owned(),
+            "bodyArray(fields, \"lifecycle\", RUNS_INVALID_BODY, MAX_LIFECYCLE_EVENTS, \
+             RUNS_LIFECYCLE_TOO_LONG)"
+                .to_owned(),
+        ] {
+            assert!(
+                generated.contains(&application),
+                "the runs surface declares a bound it does not apply: {application}"
+            );
+        }
+    }
+
+    /// Every category the generated code refuses with is declared, and every
+    /// declared category is a spelling Rust actually produces.
+    ///
+    /// `frame_size` is the exception and says so: no shipped transport carries
+    /// this protocol, so nothing pins it. The test names that rather than
+    /// pretending otherwise.
+    #[test]
+    fn every_refusal_category_is_declared_and_is_the_rust_spelling() {
+        let surface = surface();
+        let declared: BTreeMap<String, String> = surface
+            .categories
+            .iter()
+            .map(|constant| {
+                let ConstantValue::Text(value) = &constant.value else {
+                    panic!("{} is a refusal category, which is text", constant.name)
+                };
+                (constant.name.clone(), value.clone())
+            })
+            .collect();
+
+        let mut referenced = vec![
+            surface.invalid_body_category.clone(),
+            surface.unknown_kind_category.clone(),
+            surface.oversize_category.clone(),
+            surface.field_invalid_category.clone(),
+            surface.field_grammar_category.clone(),
+        ];
+        for field in surface.requests.iter().flat_map(|request| &request.fields) {
+            match &field.value {
+                RequestValue::Checked {
+                    refusal_category, ..
+                }
+                | RequestValue::Integer {
+                    refusal_category, ..
+                }
+                | RequestValue::NullableInteger {
+                    refusal_category, ..
+                } => referenced.push(refusal_category.clone()),
+                RequestValue::HexBytes {
+                    oversize_category, ..
+                } => referenced.push(oversize_category.clone()),
+                RequestValue::NullableEnumSet {
+                    empty_category,
+                    repeat_category,
+                    unknown_category,
+                    ..
+                } => referenced.extend([
+                    empty_category.clone(),
+                    repeat_category.clone(),
+                    unknown_category.clone(),
+                ]),
+            }
+        }
+        for field in surface
+            .responses
+            .iter()
+            .flat_map(|response| &response.fields)
+            .chain(
+                surface
+                    .body_objects
+                    .iter()
+                    .flat_map(|object| &object.fields),
+            )
+        {
+            match &field.value {
+                ResponseValue::Bool | ResponseValue::Object { .. } => {}
+                ResponseValue::Checked {
+                    refusal_category, ..
+                }
+                | ResponseValue::Integer {
+                    refusal_category, ..
+                }
+                | ResponseValue::NullableInteger {
+                    refusal_category, ..
+                } => referenced.push(refusal_category.clone()),
+                ResponseValue::Enum {
+                    unknown_category, ..
+                } => referenced.push(unknown_category.clone()),
+                ResponseValue::ObjectArray {
+                    oversize_category, ..
+                } => referenced.push(oversize_category.clone()),
+            }
+        }
+        for name in &referenced {
+            assert!(
+                declared.contains_key(name),
+                "the runs surface refuses with {name}, which it does not declare"
+            );
+        }
+
+        let generated = generated_runs();
+        for (name, expected) in [
+            ("RUNS_INVALID_BODY", RunsApiError::InvalidBody.category()),
+            ("RUNS_UNKNOWN_KIND", RunsApiError::UnknownKind.category()),
+            (
+                "RUNS_PAGE_TOO_LARGE",
+                RunsApiError::PageTooLarge {
+                    max_items: 0,
+                    actual_items: 0,
+                }
+                .category(),
+            ),
+            (
+                "RUNS_UNWRITTEN_ROW",
+                RunsApiError::UnwrittenRow { field: "x" }.category(),
+            ),
+            (
+                "RUNS_UNKNOWN_ENUM_VALUE",
+                RunsApiError::Codec(automonique_protocol::codec::CodecError::UnknownEnumValue {
+                    field: "state",
+                })
+                .category(),
+            ),
+            (
+                "RUNS_FIELD_INVALID",
+                RunsApiError::Codec(automonique_protocol::codec::CodecError::Field {
+                    field: "request_id",
+                    error: ValueError::Empty,
+                })
+                .category(),
+            ),
+        ] {
+            assert_eq!(
+                declared.get(name).map(String::as_str),
+                Some(expected),
+                "{name} is not the category Rust reports"
+            );
+            assert!(
+                generated.contains(&format!("export const {name} = \"{expected}\";")),
+                "the generated file does not carry {name} as {expected}"
+            );
+        }
+        assert_eq!(
+            declared.get(&surface.oversize_category).map(String::as_str),
+            Some("frame_size"),
+            "the oversize category is the spelling a transport would report; no shipped \
+             transport carries this protocol yet, so nothing pins it"
+        );
+    }
+
+    /// The SDK has no transport, and the generated file says so.
+    #[test]
+    fn the_generated_surface_says_the_framing_is_excluded() {
+        let generated = generated_runs();
+        for statement in [
+            "The length-delimited framing this protocol travels under is not applied",
+            "This package has no transport.",
+            "The payload is the framed transport's payload, without its length prefix.",
+        ] {
+            assert!(
+                generated.contains(statement),
+                "the generated runs surface does not state where framing lives: {statement}"
+            );
+        }
+    }
+
+    /// The package typecheck actually reads the new files.
+    ///
+    /// `the_package_typechecks_with_the_generated_files` runs `tsc -p`, which
+    /// takes its file set from `tsconfig.json`. A file outside the `include`
+    /// globs would be generated, committed and never typechecked, and the suite
+    /// would stay green. `--listFiles` is what turns "the package typechecks"
+    /// into "the package typechecks *these files*".
+    #[test]
+    fn the_typecheck_reads_the_runs_surface_and_its_runner() {
+        let output = Command::new("npx")
+            .arg("--offline")
+            .arg("tsc")
+            .arg("-p")
+            .arg("./tsconfig.json")
+            .arg("--listFiles")
+            .current_dir(package_root())
+            .output();
+        let Ok(output) = output else {
+            eprintln!("GAP: tsc is unavailable; the runs surface is untypechecked");
+            return;
+        };
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "the protocol package does not typecheck with the runs surface:\n{combined}"
+        );
+        for expected in [
+            "generated/runs.ts",
+            "generated/runtime.ts",
+            "conformance/runs-api.ts",
+        ] {
+            assert!(
+                combined.lines().any(|line| line.trim().ends_with(expected)),
+                "tsc did not read {expected}; it is outside the tsconfig include globs, so \
+                 nothing typechecks it.\n{combined}"
+            );
+        }
+    }
+
+    /// The heart of the wave: the generated TypeScript encodes the same bytes
+    /// Rust does, decodes what Rust answers, refuses what Rust refuses, and
+    /// accepts exactly the cross-field payloads it is documented not to judge.
+    #[test]
+    fn the_generated_typescript_agrees_with_rust_byte_for_byte() {
+        let Some(runtime) = javascript_runtime() else {
+            eprintln!(
+                "GAP: no JavaScript runtime; the runs surface is unmeasured across \
+                       languages"
+            );
+            return;
+        };
+        let directory =
+            std::env::temp_dir().join(format!("automonique-runs-api-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("scratch directory");
+        let produced_path = directory.join("typescript-encodings.txt");
+
+        let output = Command::new(runtime)
+            .arg(runner_path())
+            .arg(corpus_path())
+            .arg(&produced_path)
+            .current_dir(package_root())
+            .output()
+            .expect("the conformance runner starts");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "the generated runs surface disagrees with the Rust corpus under {runtime}:\n\
+             {combined}"
+        );
+
+        // The second direction: the runner reports the bytes it produced, and
+        // they are compared here against what Rust encodes and then fed to the
+        // shipped decoder.
+        let reported = std::fs::read_to_string(&produced_path)
+            .expect("the runner reports the payloads it produced");
+        let mut produced: BTreeMap<String, Vec<u8>> = reported
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let (id, payload) = line
+                    .split_once(' ')
+                    .unwrap_or_else(|| panic!("a reported line is `<id> <hex>`: {line:?}"));
+                (id.to_owned(), unhex(payload))
+            })
+            .collect();
+
+        for case in request_cases() {
+            let expected = case
+                .request
+                .to_message()
+                .expect("the request encodes")
+                .to_canonical_bytes();
+            let actual = produced
+                .remove(case.id)
+                .unwrap_or_else(|| panic!("the runner did not report {}", case.id));
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "{}: {runtime} produced {} canonical bytes, Rust produced {}",
+                case.id,
+                actual.len(),
+                expected.len()
+            );
+            if let Some(index) = actual
+                .iter()
+                .zip(expected.iter())
+                .position(|(left, right)| left != right)
+            {
+                let window = |bytes: &[u8]| {
+                    String::from_utf8_lossy(
+                        &bytes[index.saturating_sub(24)..(index + 24).min(bytes.len())],
+                    )
+                    .into_owned()
+                };
+                panic!(
+                    "{}: the two encodings first differ at byte {index}\n  {runtime}: {}\n  \
+                     rust: {}",
+                    case.id,
+                    window(&actual),
+                    window(&expected)
+                );
+            }
+            assert_eq!(
+                RunsRequest::from_canonical_bytes(&actual).unwrap_or_else(|error| panic!(
+                    "{}: Rust refuses what {runtime} produced: {error}",
+                    case.id
+                )),
+                case.request,
+                "{}: Rust decodes what {runtime} produced as a different request",
+                case.id
+            );
+        }
+        assert!(
+            produced.is_empty(),
+            "the runner reported payloads the corpus has no cases for: {:?}",
+            produced.keys().collect::<Vec<_>>()
+        );
+        println!(
+            "runs api surface under {runtime}: {}",
             String::from_utf8_lossy(&output.stdout).trim()
         );
     }

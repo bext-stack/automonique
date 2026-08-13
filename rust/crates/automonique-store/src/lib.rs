@@ -11,6 +11,7 @@
 pub mod cancel_ledger;
 pub mod generation_audit;
 pub mod provider_journal;
+pub mod run_index;
 pub mod run_submissions;
 pub mod slack_ingress;
 

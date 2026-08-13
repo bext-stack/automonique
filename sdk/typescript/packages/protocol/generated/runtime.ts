@@ -222,3 +222,136 @@ export function bodyBool(
   }
   return value.value;
 }
+
+/**
+ * An integer field the Rust decoder reads through `u64`.
+ *
+ * A negative value is refused here, before any domain bound is applied, because
+ * that is the order the Rust decoders settle it in: `unsigned()` converts and
+ * fails as a malformed body, and only a non-negative value ever reaches the
+ * domain's own refusal. A reader that let the domain judge the sign would
+ * report "unwritten row" for a submission identity of `-1`, which is a
+ * different and wrong statement about what the peer sent.
+ */
+export function bodyUnsigned(
+  fields: ReadonlyMap<string, JsonValue>,
+  name: string,
+  category: string,
+): bigint {
+  const value = fields.get(name);
+  if (value === undefined || value.kind !== "integer") {
+    throw new RefusalError(category, `${name} is not an integer`);
+  }
+  if (value.value < 0n) throw new RefusalError(category, `${name} is negative`);
+  return value.value;
+}
+
+/**
+ * An integer field that is always present and may be `null`.
+ *
+ * Absent and present-and-null are different wire facts. The Rust decoders
+ * refuse a body missing the key and accept one carrying an explicit null, so a
+ * reader that treated the two alike would admit a body Rust refuses.
+ */
+export function bodyIntegerOrNull(
+  fields: ReadonlyMap<string, JsonValue>,
+  name: string,
+  category: string,
+): bigint | null {
+  const value = fields.get(name);
+  if (value === undefined) throw new RefusalError(category, `${name} is absent`);
+  if (value.kind === "null") return null;
+  if (value.kind !== "integer") {
+    throw new RefusalError(category, `${name} is neither an integer nor null`);
+  }
+  return value.value;
+}
+
+/** A field carrying a nested body, handed to that body's own decoder. */
+export function bodyValue(
+  fields: ReadonlyMap<string, JsonValue>,
+  name: string,
+  category: string,
+): JsonValue {
+  const value = fields.get(name);
+  if (value === undefined) throw new RefusalError(category, `${name} is absent`);
+  return value;
+}
+
+/**
+ * A bounded array field.
+ *
+ * The length is judged before any item is read, exactly as the Rust decoders
+ * judge it: a page above its ceiling is refused for being too long, not for
+ * whatever its sixty-fifth item turns out to be. The two refusals carry
+ * different categories, so the order matters to the peer as well as here.
+ */
+export function bodyArray(
+  fields: ReadonlyMap<string, JsonValue>,
+  name: string,
+  category: string,
+  maxItems: number,
+  oversizeCategory: string,
+): readonly JsonValue[] {
+  const value = fields.get(name);
+  if (value === undefined || value.kind !== "array") {
+    throw new RefusalError(category, `${name} is not an array`);
+  }
+  if (value.items.length > maxItems) {
+    throw new RefusalError(
+      oversizeCategory,
+      `${name} carries ${value.items.length} items; maximum is ${maxItems}`,
+    );
+  }
+  return value.items;
+}
+
+/** Apply a reader to a nullable field, keeping `null` the distinct fact it is. */
+export function mapNullable<T, U>(value: T | null, read: (value: T) => U): U | null {
+  return value === null ? null : read(value);
+}
+
+/** How a set of enum spellings is canonicalized before it reaches the wire. */
+export interface EnumSetRules {
+  /** Declaration order, which is the order the wire carries. */
+  readonly order: readonly string[];
+  /** Category for a set that admits nothing. */
+  readonly empty: string;
+  /** Category for a set naming one value twice. */
+  readonly repeat: string;
+  /** Category for a spelling this build does not define. */
+  readonly unknown: string;
+}
+
+/**
+ * Canonicalize a set of enum spellings the way the Rust constructor does.
+ *
+ * Sorted into declaration order, so a set built in any order encodes
+ * identically. An empty set and a repeated value are refused rather than
+ * quietly accepted: both mean the caller asked for something other than what it
+ * believes it asked for, and an empty filter in particular admits nothing that
+ * any listing could ever answer.
+ *
+ * A spelling outside the order is refused too. A brand exists only in the type
+ * checker, so this is the only place an untyped caller's undefined state can be
+ * stopped before it reaches the wire.
+ */
+export function orderedEnumSet<T extends string>(
+  values: readonly T[],
+  rules: EnumSetRules,
+): readonly T[] {
+  if (values.length === 0) throw new RefusalError(rules.empty, "a filter admits no value");
+  const found: {readonly at: number; readonly value: T}[] = [];
+  for (const value of values) {
+    const at = rules.order.indexOf(value);
+    if (at < 0) throw new RefusalError(rules.unknown, value);
+    found.push({at, value});
+  }
+  found.sort((left, right) => left.at - right.at);
+  let previous = -1;
+  for (const entry of found) {
+    if (entry.at === previous) throw new RefusalError(rules.repeat, entry.value);
+    previous = entry.at;
+  }
+  return found.map((entry) => entry.value);
+}

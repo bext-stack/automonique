@@ -40,14 +40,14 @@ import {
   ADMIN_PROTOCOL,
   IntakeActor,
   IntakeReason,
-  PAUSE_INTAKE_REQUEST_KIND,
-  RESUME_INTAKE_REQUEST_KIND,
+  ADMIN_PAUSE_INTAKE_REQUEST_KIND,
+  ADMIN_RESUME_INTAKE_REQUEST_KIND,
   RefusalError,
   RequestId,
   RunSubmissionKey,
-  SHUTDOWN_REQUEST_KIND,
-  STATUS_REQUEST_KIND,
-  SUBMIT_RUN_REQUEST_KIND,
+  ADMIN_SHUTDOWN_REQUEST_KIND,
+  ADMIN_STATUS_REQUEST_KIND,
+  ADMIN_SUBMIT_RUN_REQUEST_KIND,
   SpecDigest,
   ValidationError,
   assertNeverAdminResponse,
@@ -196,20 +196,20 @@ function encodeFixture(
 ): Uint8Array {
   const id = branded(RequestId, requestIdText, brand);
   switch (kind) {
-    case STATUS_REQUEST_KIND:
+    case ADMIN_STATUS_REQUEST_KIND:
       return encodeStatus(id);
-    case SHUTDOWN_REQUEST_KIND:
+    case ADMIN_SHUTDOWN_REQUEST_KIND:
       return encodeShutdown(id);
-    case PAUSE_INTAKE_REQUEST_KIND:
+    case ADMIN_PAUSE_INTAKE_REQUEST_KIND:
       return encodePauseIntake(id, {
         actor: branded(IntakeActor, required(params, "actor"), brand),
         reason: branded(IntakeReason, required(params, "reason"), brand),
       });
-    case RESUME_INTAKE_REQUEST_KIND:
+    case ADMIN_RESUME_INTAKE_REQUEST_KIND:
       return encodeResumeIntake(id, {
         actor: branded(IntakeActor, required(params, "actor"), brand),
       });
-    case SUBMIT_RUN_REQUEST_KIND:
+    case ADMIN_SUBMIT_RUN_REQUEST_KIND:
       return encodeSubmitRun(id, {
         document: documentOf(params),
         idempotency_key: branded(RunSubmissionKey, required(params, "idempotency_key"), brand),

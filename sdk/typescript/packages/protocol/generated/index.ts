@@ -12,4 +12,5 @@
 export * from "./admin-command.ts";
 export * from "./admin-status.ts";
 export * from "./doctor.ts";
+export * from "./runs.ts";
 export * from "./runtime.ts";

@@ -159,7 +159,7 @@ export function encodeAdminRequest(
 }
 
 /** Durably close intake for this generation, naming the deciding operator and the cause. */
-export const PAUSE_INTAKE_REQUEST_KIND = "pause_intake";
+export const ADMIN_PAUSE_INTAKE_REQUEST_KIND = "pause_intake";
 export interface PauseIntakeBody {
   readonly actor: IntakeActor;
   readonly reason: IntakeReason;
@@ -172,14 +172,14 @@ export const PauseIntakeBody_FIELDS: readonly string[] = [
 ];
 
 export function encodePauseIntake(request_id: RequestId, body: PauseIntakeBody): Uint8Array {
-  return encodeAdminRequest(request_id, PAUSE_INTAKE_REQUEST_KIND, [
+  return encodeAdminRequest(request_id, ADMIN_PAUSE_INTAKE_REQUEST_KIND, [
     ["actor", {kind: "string", value: refuse(ADMIN_INVALID_BODY, () => IntakeActor(body.actor))}],
     ["reason", {kind: "string", value: refuse(ADMIN_INVALID_BODY, () => IntakeReason(body.reason))}],
   ]);
 }
 
 /** Reopen intake, naming the operator who decided to. */
-export const RESUME_INTAKE_REQUEST_KIND = "resume_intake";
+export const ADMIN_RESUME_INTAKE_REQUEST_KIND = "resume_intake";
 export interface ResumeIntakeBody {
   readonly actor: IntakeActor;
 }
@@ -190,27 +190,27 @@ export const ResumeIntakeBody_FIELDS: readonly string[] = [
 ];
 
 export function encodeResumeIntake(request_id: RequestId, body: ResumeIntakeBody): Uint8Array {
-  return encodeAdminRequest(request_id, RESUME_INTAKE_REQUEST_KIND, [
+  return encodeAdminRequest(request_id, ADMIN_RESUME_INTAKE_REQUEST_KIND, [
     ["actor", {kind: "string", value: refuse(ADMIN_INVALID_BODY, () => IntakeActor(body.actor))}],
   ]);
 }
 
 /** Stop intake and request an orderly shutdown. */
-export const SHUTDOWN_REQUEST_KIND = "shutdown";
+export const ADMIN_SHUTDOWN_REQUEST_KIND = "shutdown";
 
 export function encodeShutdown(request_id: RequestId): Uint8Array {
-  return encodeAdminRequest(request_id, SHUTDOWN_REQUEST_KIND, []);
+  return encodeAdminRequest(request_id, ADMIN_SHUTDOWN_REQUEST_KIND, []);
 }
 
 /** Read a consistent daemon status snapshot. */
-export const STATUS_REQUEST_KIND = "status";
+export const ADMIN_STATUS_REQUEST_KIND = "status";
 
 export function encodeStatus(request_id: RequestId): Uint8Array {
-  return encodeAdminRequest(request_id, STATUS_REQUEST_KIND, []);
+  return encodeAdminRequest(request_id, ADMIN_STATUS_REQUEST_KIND, []);
 }
 
 /** Take durable custody of one canonical RunSpec document. Acceptance is custody, not execution. */
-export const SUBMIT_RUN_REQUEST_KIND = "submit_run";
+export const ADMIN_SUBMIT_RUN_REQUEST_KIND = "submit_run";
 export interface SubmitRunBody {
   readonly document: Uint8Array;
   readonly idempotency_key: RunSubmissionKey;
@@ -225,7 +225,7 @@ export const SubmitRunBody_FIELDS: readonly string[] = [
 ];
 
 export function encodeSubmitRun(request_id: RequestId, body: SubmitRunBody): Uint8Array {
-  return encodeAdminRequest(request_id, SUBMIT_RUN_REQUEST_KIND, [
+  return encodeAdminRequest(request_id, ADMIN_SUBMIT_RUN_REQUEST_KIND, [
     ["document_hex", {kind: "string", value: refuse(ADMIN_INVALID_BODY, () => hexEncode(boundedBytes(body.document, MAX_SUBMITTED_RUN_SPEC_BYTES, ADMIN_DOCUMENT_TOO_LARGE, ADMIN_INVALID_BODY)))}],
     ["idempotency_key", {kind: "string", value: refuse(ADMIN_INVALID_BODY, () => RunSubmissionKey(body.idempotency_key))}],
     ["spec_digest", {kind: "string", value: refuse(ADMIN_INVALID_BODY, () => SpecDigest(body.spec_digest))}],
@@ -242,7 +242,7 @@ export const ADMIN_REQUEST_KINDS_NOT_GENERATED: readonly string[] = [
 ];
 
 /** Intake is durably closed for this generation. The decision outlives the process. */
-export const INTAKE_PAUSED_RESPONSE_KIND = "intake_paused";
+export const ADMIN_INTAKE_PAUSED_RESPONSE_KIND = "intake_paused";
 export interface IntakePaused {
   readonly pause_id: DurableRowId;
   readonly request_id: RequestId;
@@ -265,7 +265,7 @@ export function decodeIntakePaused(request_id: RequestId, body: JsonValue): Inta
 }
 
 /** A durable pause was closed and intake reopened. The pause row is retained, not deleted. */
-export const INTAKE_RESUMED_RESPONSE_KIND = "intake_resumed";
+export const ADMIN_INTAKE_RESUMED_RESPONSE_KIND = "intake_resumed";
 export interface IntakeResumed {
   readonly pause_id: DurableRowId;
   readonly request_id: RequestId;
@@ -288,7 +288,7 @@ export function decodeIntakeResumed(request_id: RequestId, body: JsonValue): Int
 }
 
 /** The request was definitely refused before a successful mutation. */
-export const REFUSED_RESPONSE_KIND = "refused";
+export const ADMIN_REFUSED_RESPONSE_KIND = "refused";
 export interface Refused {
   readonly category: AdminRefusalCategory;
   readonly request_id: RequestId;
@@ -308,7 +308,7 @@ export function decodeRefused(request_id: RequestId, body: JsonValue): Refused {
 }
 
 /** One RunSpec document is durably held. Custody is all this reports: it is not an admission decision and not a launch. */
-export const RUN_ACCEPTED_RESPONSE_KIND = "run_accepted";
+export const ADMIN_RUN_ACCEPTED_RESPONSE_KIND = "run_accepted";
 export interface RunAccepted {
   readonly replay: boolean;
   readonly request_id: RequestId;
@@ -337,7 +337,7 @@ export function decodeRunAccepted(request_id: RequestId, body: JsonValue): RunAc
 }
 
 /** The daemon accepted an orderly-shutdown request and closed intake. */
-export const SHUTDOWN_ACCEPTED_RESPONSE_KIND = "shutdown_accepted";
+export const ADMIN_SHUTDOWN_ACCEPTED_RESPONSE_KIND = "shutdown_accepted";
 export interface ShutdownAccepted {
   readonly request_id: RequestId;
 }
@@ -399,16 +399,16 @@ export function decodeAdminResponse(payload: Uint8Array): AdminResponse {
     return {kind: "undecoded", request_id, response_kind: kind};
   }
   switch (kind) {
-    case INTAKE_PAUSED_RESPONSE_KIND:
-      return {kind: INTAKE_PAUSED_RESPONSE_KIND, value: decodeIntakePaused(request_id, message.body)};
-    case INTAKE_RESUMED_RESPONSE_KIND:
-      return {kind: INTAKE_RESUMED_RESPONSE_KIND, value: decodeIntakeResumed(request_id, message.body)};
-    case REFUSED_RESPONSE_KIND:
-      return {kind: REFUSED_RESPONSE_KIND, value: decodeRefused(request_id, message.body)};
-    case RUN_ACCEPTED_RESPONSE_KIND:
-      return {kind: RUN_ACCEPTED_RESPONSE_KIND, value: decodeRunAccepted(request_id, message.body)};
-    case SHUTDOWN_ACCEPTED_RESPONSE_KIND:
-      return {kind: SHUTDOWN_ACCEPTED_RESPONSE_KIND, value: decodeShutdownAccepted(request_id, message.body)};
+    case ADMIN_INTAKE_PAUSED_RESPONSE_KIND:
+      return {kind: ADMIN_INTAKE_PAUSED_RESPONSE_KIND, value: decodeIntakePaused(request_id, message.body)};
+    case ADMIN_INTAKE_RESUMED_RESPONSE_KIND:
+      return {kind: ADMIN_INTAKE_RESUMED_RESPONSE_KIND, value: decodeIntakeResumed(request_id, message.body)};
+    case ADMIN_REFUSED_RESPONSE_KIND:
+      return {kind: ADMIN_REFUSED_RESPONSE_KIND, value: decodeRefused(request_id, message.body)};
+    case ADMIN_RUN_ACCEPTED_RESPONSE_KIND:
+      return {kind: ADMIN_RUN_ACCEPTED_RESPONSE_KIND, value: decodeRunAccepted(request_id, message.body)};
+    case ADMIN_SHUTDOWN_ACCEPTED_RESPONSE_KIND:
+      return {kind: ADMIN_SHUTDOWN_ACCEPTED_RESPONSE_KIND, value: decodeShutdownAccepted(request_id, message.body)};
     default:
       throw new RefusalError(
         ADMIN_UNKNOWN_KIND,

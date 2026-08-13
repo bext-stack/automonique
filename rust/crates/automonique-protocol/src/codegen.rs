@@ -38,6 +38,17 @@
 //!   [`crate::admin::AdminResponse::Refused`] and
 //!   [`crate::admin::AdminResponse::ShutdownAccepted`]).
 //!
+//! - The whole read surface of `automonique.runs` from [`crate::runs_api`]:
+//!   both requests ([`crate::runs_api::RunsRequest::ListRuns`] and
+//!   [`crate::runs_api::RunsRequest::RunDetail`]) and all four answers
+//!   ([`crate::runs_api::RunsResponse::RunList`],
+//!   [`crate::runs_api::RunsResponse::RunDetail`],
+//!   [`crate::runs_api::RunsResponse::Resync`] and
+//!   [`crate::runs_api::RunsResponse::Refused`]), with the bodies they nest —
+//!   [`crate::runs_api::RunSummary`] and
+//!   [`crate::runs_api::RunLifecycleEvent`] — and the six closed vocabularies
+//!   they carry.
+//!
 //! # What it does not cover
 //!
 //! Everything else in the crate, including: `RunSpec` and the run surface,
@@ -66,6 +77,42 @@
 //! aggregate, a declared digest that names the document beside it — are
 //! enforced only by the Rust constructors and by the daemon that answers.
 //!
+//! The Runs API brings a longer list of these, and naming it is the point: a
+//! generated decoder that accepted a page the Rust decoder refuses is a real
+//! gap, not a detail. These `automonique.runs` rules relate two fields, and the
+//! generated surface does *not* apply them:
+//!
+//! - `more` agreeing with `next_cursor`
+//!   ([`crate::runs_api::RunsApiError::ContinuationIncoherent`]);
+//! - a continuation cursor advancing past the page ([`ContinuationRewinds`]);
+//! - summaries strictly increasing by submission identity ([`PageOutOfOrder`]);
+//! - lifecycle sequences strictly *increasing* ([`LifecycleOutOfOrder`] — the
+//!   same variant also names a sequence of zero, which the generated surface
+//!   does refuse, because that is one field's own bound);
+//! - no carried sequence above `last_sequence`
+//!   ([`LifecycleAboveLastSequence`]);
+//! - at most one terminal event, last ([`TerminalEventNotLast`]) and only for a
+//!   terminal state ([`TerminalEventContradictsState`]);
+//! - the declared coverage matching what is carried ([`CoverageIncoherent`]);
+//!   and
+//! - a resync window that does not end before it starts ([`InvalidBody`]).
+//!
+//! That list is not a promise: `tests/codegen.rs` carries one payload per rule
+//! in the corpus section `rust_only_refusals`, and the TypeScript runner asserts
+//! each one *decodes*. So the gap is measured from both sides — a rule the Rust
+//! constructors stopped enforcing fails there, and a rule the generator learns
+//! fails there too, until the entry moves to `decode_refusals`. A client that
+//! must be sure of these reads them from the daemon that enforced them.
+//!
+//! [`ContinuationRewinds`]: crate::runs_api::RunsApiError::ContinuationRewinds
+//! [`PageOutOfOrder`]: crate::runs_api::RunsApiError::PageOutOfOrder
+//! [`LifecycleOutOfOrder`]: crate::runs_api::RunsApiError::LifecycleOutOfOrder
+//! [`LifecycleAboveLastSequence`]: crate::runs_api::RunsApiError::LifecycleAboveLastSequence
+//! [`TerminalEventNotLast`]: crate::runs_api::RunsApiError::TerminalEventNotLast
+//! [`TerminalEventContradictsState`]: crate::runs_api::RunsApiError::TerminalEventContradictsState
+//! [`CoverageIncoherent`]: crate::runs_api::RunsApiError::CoverageIncoherent
+//! [`InvalidBody`]: crate::runs_api::RunsApiError::InvalidBody
+//!
 //! Regenerate with the command in [`REGENERATE_COMMAND`].
 //!
 //! Determinism is a property of this module: every collection is emitted in
@@ -78,7 +125,12 @@ use core::fmt::Write as _;
 
 use crate::admin::{AdminError, DaemonState, ExecutionState, OperationalMetric, TelegramState};
 use crate::codec::CodecError;
+use crate::event::Authority;
 use crate::primitives::ValueError;
+use crate::runs_api::{
+    LIFECYCLE_AUTHORITIES, LifecycleCoverage, RunState, RunsApiError, RunsRefusal, SpoolEventKind,
+    SubmissionState,
+};
 use crate::schema::EnumSensitivity;
 use crate::{CheckStatus, ReportStatus};
 
@@ -151,6 +203,14 @@ pub struct GeneratedEnum {
     pub sensitivity: EnumSensitivity,
     /// Declared values.
     pub values: Vec<String>,
+    /// Declaration order, when the wire sorts a set of these into it.
+    ///
+    /// The generated `_VALUES` table is emitted sorted, because sorting is what
+    /// makes the output a pure function of a set. That order is not the wire's:
+    /// `RunStateFilter::only` canonicalizes into `RunState::ALL` order, which is
+    /// the enum's declaration order. A surface that encodes such a set carries
+    /// the second order too, or it cannot reproduce the Rust bytes.
+    pub wire_order: Option<Vec<String>>,
 }
 
 /// The slice of protocol surface this spike generates.
@@ -222,11 +282,13 @@ pub fn hostile_slice() -> SpikeSchema {
                 name: "ApprovalDecision".to_owned(),
                 sensitivity: EnumSensitivity::SecuritySensitive,
                 values: vec!["allow".to_owned(), "deny".to_owned()],
+                wire_order: None,
             },
             GeneratedEnum {
                 name: "RunState".to_owned(),
                 sensitivity: EnumSensitivity::ReadOnly,
                 values: vec!["done".to_owned(), "running".to_owned()],
+                wire_order: None,
             },
         ],
     }
@@ -458,6 +520,23 @@ fn emit_enum(out: &mut String, generated: &GeneratedEnum) {
         union = literals.join(" | "),
         list = literals.join(", ")
     );
+    if let Some(order) = &generated.wire_order {
+        let ordered: Vec<String> = order.iter().map(|value| format!("\"{value}\"")).collect();
+        let _ = write!(
+            out,
+            "/**\n \
+             * Declaration order, which is the order the wire carries a set of these in.\n \
+             *\n \
+             * `{name}_VALUES` is sorted, because a sorted table is what makes this file a\n \
+             * pure function of a set. The wire is not sorted that way: the Rust\n \
+             * constructor canonicalizes a filter into the order below, so a request built\n \
+             * from any other order would encode different bytes.\n \
+             */\n\
+             export const {name}_WIRE_ORDER: readonly {name}[] = [{list}];\n",
+            name = generated.name,
+            list = ordered.join(", ")
+        );
+    }
     match generated.sensitivity {
         EnumSensitivity::SecuritySensitive => {
             let _ = write!(
@@ -532,6 +611,9 @@ pub const ADMIN_STATUS_MODULE: &str = "admin-status";
 
 /// The `automonique.admin` command surface.
 pub const ADMIN_COMMAND_MODULE: &str = "admin-command";
+
+/// The `automonique.runs` read surface.
+pub const RUNS_MODULE: &str = "runs";
 
 /// The file one module is written to.
 #[must_use]
@@ -620,6 +702,12 @@ pub struct ModuleImport {
 }
 
 /// How one request body field's value reaches the wire.
+///
+/// Every variant carries the refusal category the Rust peer answers for a bad
+/// value of that field, rather than sharing one "invalid body" spelling. The
+/// categories genuinely differ — a page size outside its range and a cursor
+/// above the wire's integer ceiling are different faults with different
+/// spellings — and a client told the wrong one cannot act on it.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RequestValue {
     /// A checked string type generated in this module.
@@ -628,13 +716,49 @@ pub enum RequestValue {
     /// caller — the only kind a brand cannot reach, since brands erase at
     /// runtime — is refused rather than allowed to put an overlong value on
     /// the wire.
-    Checked(String),
+    Checked {
+        /// Generated checked-string type.
+        type_name: String,
+        /// Category answered for a value the constructor refuses.
+        refusal_category: String,
+    },
     /// Opaque bytes carried as lowercase hexadecimal under a byte bound.
     HexBytes {
         /// Generated constant naming the bound, in raw rather than hex bytes.
         max_bytes_constant: String,
         /// Refusal category answered above the bound.
         oversize_category: String,
+    },
+    /// A branded bounded integer, carried as a JSON integer.
+    Integer {
+        /// Generated bounded-integer type.
+        type_name: String,
+        /// Category answered for a value outside the bound.
+        refusal_category: String,
+    },
+    /// A branded bounded integer that is always present and may be `null`.
+    ///
+    /// Absent and present-and-null are different wire facts, and the Rust
+    /// decoder refuses a body missing the key. The generated body type is
+    /// therefore `T | null` rather than `T?`.
+    NullableInteger {
+        /// Generated bounded-integer type.
+        type_name: String,
+        /// Category answered for a value outside the bound.
+        refusal_category: String,
+    },
+    /// A set of enum spellings canonicalized into declaration order, or `null`.
+    NullableEnumSet {
+        /// Generated enumeration type.
+        type_name: String,
+        /// Generated constant carrying the declaration order.
+        order_constant: String,
+        /// Category answered for a set that admits nothing.
+        empty_category: String,
+        /// Category answered for a set naming one value twice.
+        repeat_category: String,
+        /// Category answered for a spelling this build does not define.
+        unknown_category: String,
     },
 }
 
@@ -655,10 +779,16 @@ pub struct RequestField {
 
 impl RequestField {
     /// The TypeScript type a caller supplies, derived from the value kind.
-    fn input_type(&self) -> &str {
+    fn input_type(&self) -> String {
         match &self.value {
-            RequestValue::Checked(name) => name,
-            RequestValue::HexBytes { .. } => "Uint8Array",
+            RequestValue::Checked { type_name, .. } | RequestValue::Integer { type_name, .. } => {
+                type_name.clone()
+            }
+            RequestValue::HexBytes { .. } => "Uint8Array".to_owned(),
+            RequestValue::NullableInteger { type_name, .. } => format!("{type_name} | null"),
+            RequestValue::NullableEnumSet { type_name, .. } => {
+                format!("readonly {type_name}[] | null")
+            }
         }
     }
 }
@@ -678,14 +808,67 @@ pub struct RequestCommand {
 }
 
 /// How one response body field is decoded.
+///
+/// As with [`RequestValue`], each variant that can be refused carries the
+/// category the Rust decoder answers for that field: a submission identity of
+/// zero is an unwritten row, an acceptance instant below the epoch is a time
+/// refusal, and an undefined state spelling is an enum refusal — three
+/// spellings a single "invalid body" would erase.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ResponseValue {
-    /// A checked string type generated in this module.
-    Checked(String),
-    /// A bounded integer type generated in this module.
-    Integer(String),
+    /// A checked string type generated in or imported into this module.
+    Checked {
+        /// Generated checked-string type.
+        type_name: String,
+        /// Category answered for a value the constructor refuses.
+        refusal_category: String,
+    },
+    /// A bounded integer type generated in or imported into this module.
+    Integer {
+        /// Generated bounded-integer type.
+        type_name: String,
+        /// Category answered for a value outside the bound.
+        refusal_category: String,
+        /// Whether the Rust decoder converts to `u64` before the domain bound.
+        ///
+        /// Where it does, a negative value is refused as an invalid body
+        /// *before* the domain is consulted, and only a non-negative value can
+        /// reach the domain's own refusal. The two categories differ — a
+        /// submission identity of `-1` is a malformed body, and one of `0` is
+        /// an unwritten row — so a reader that applied the domain bound first
+        /// would report the wrong one for every negative value.
+        unsigned: bool,
+    },
+    /// A bounded integer that is always present and may be `null`.
+    NullableInteger {
+        /// Generated bounded-integer type.
+        type_name: String,
+        /// Category answered for a value outside the bound.
+        refusal_category: String,
+    },
     /// A boolean, which the wire carries as `true` or `false` and nothing else.
     Bool,
+    /// A closed enumeration, refused rather than retained when undefined.
+    Enum {
+        /// Generated enumeration type.
+        type_name: String,
+        /// Category answered for a spelling this build does not define.
+        unknown_category: String,
+    },
+    /// A nested body decoded by a [`BodyObject`] declared on the same surface.
+    Object {
+        /// Generated object type.
+        type_name: String,
+    },
+    /// A bounded array of nested bodies.
+    ObjectArray {
+        /// Generated object type of each item.
+        type_name: String,
+        /// Generated constant naming the largest admissible length.
+        max_items_constant: String,
+        /// Category answered above that length.
+        oversize_category: String,
+    },
 }
 
 /// One field of a response body.
@@ -695,6 +878,22 @@ pub struct ResponseField {
     pub name: String,
     /// How it is decoded.
     pub value: ResponseValue,
+}
+
+/// A nested wire body that is not itself a message.
+///
+/// A run summary is carried inside a listing page, inside a detail view, and
+/// nowhere on its own. It gets its own type and its own exact-field decoder so
+/// the two carriers share one reading of it rather than each spelling the body
+/// out again.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct BodyObject {
+    /// TypeScript type name.
+    pub name: String,
+    /// One-line description emitted above the declarations.
+    pub doc: String,
+    /// Fields, emitted in sorted order.
+    pub fields: Vec<ResponseField>,
 }
 
 /// One response a client can decode.
@@ -741,6 +940,8 @@ pub struct CommandSurface {
     pub field_invalid_category: String,
     /// Category for an envelope field that breaks its own grammar.
     pub field_grammar_category: String,
+    /// Nested bodies the requests and responses carry, emitted in name order.
+    pub body_objects: Vec<BodyObject>,
     /// Requests, emitted in kind order.
     pub requests: Vec<RequestCommand>,
     /// Kinds this protocol version defines that no generated builder produces.
@@ -1147,6 +1348,139 @@ export function bodyBool(
   }
   return value.value;
 }
+
+/**
+ * An integer field the Rust decoder reads through `u64`.
+ *
+ * A negative value is refused here, before any domain bound is applied, because
+ * that is the order the Rust decoders settle it in: `unsigned()` converts and
+ * fails as a malformed body, and only a non-negative value ever reaches the
+ * domain's own refusal. A reader that let the domain judge the sign would
+ * report "unwritten row" for a submission identity of `-1`, which is a
+ * different and wrong statement about what the peer sent.
+ */
+export function bodyUnsigned(
+  fields: ReadonlyMap<string, JsonValue>,
+  name: string,
+  category: string,
+): bigint {
+  const value = fields.get(name);
+  if (value === undefined || value.kind !== "integer") {
+    throw new RefusalError(category, `${name} is not an integer`);
+  }
+  if (value.value < 0n) throw new RefusalError(category, `${name} is negative`);
+  return value.value;
+}
+
+/**
+ * An integer field that is always present and may be `null`.
+ *
+ * Absent and present-and-null are different wire facts. The Rust decoders
+ * refuse a body missing the key and accept one carrying an explicit null, so a
+ * reader that treated the two alike would admit a body Rust refuses.
+ */
+export function bodyIntegerOrNull(
+  fields: ReadonlyMap<string, JsonValue>,
+  name: string,
+  category: string,
+): bigint | null {
+  const value = fields.get(name);
+  if (value === undefined) throw new RefusalError(category, `${name} is absent`);
+  if (value.kind === "null") return null;
+  if (value.kind !== "integer") {
+    throw new RefusalError(category, `${name} is neither an integer nor null`);
+  }
+  return value.value;
+}
+
+/** A field carrying a nested body, handed to that body's own decoder. */
+export function bodyValue(
+  fields: ReadonlyMap<string, JsonValue>,
+  name: string,
+  category: string,
+): JsonValue {
+  const value = fields.get(name);
+  if (value === undefined) throw new RefusalError(category, `${name} is absent`);
+  return value;
+}
+
+/**
+ * A bounded array field.
+ *
+ * The length is judged before any item is read, exactly as the Rust decoders
+ * judge it: a page above its ceiling is refused for being too long, not for
+ * whatever its sixty-fifth item turns out to be. The two refusals carry
+ * different categories, so the order matters to the peer as well as here.
+ */
+export function bodyArray(
+  fields: ReadonlyMap<string, JsonValue>,
+  name: string,
+  category: string,
+  maxItems: number,
+  oversizeCategory: string,
+): readonly JsonValue[] {
+  const value = fields.get(name);
+  if (value === undefined || value.kind !== "array") {
+    throw new RefusalError(category, `${name} is not an array`);
+  }
+  if (value.items.length > maxItems) {
+    throw new RefusalError(
+      oversizeCategory,
+      `${name} carries ${value.items.length} items; maximum is ${maxItems}`,
+    );
+  }
+  return value.items;
+}
+
+/** Apply a reader to a nullable field, keeping `null` the distinct fact it is. */
+export function mapNullable<T, U>(value: T | null, read: (value: T) => U): U | null {
+  return value === null ? null : read(value);
+}
+
+/** How a set of enum spellings is canonicalized before it reaches the wire. */
+export interface EnumSetRules {
+  /** Declaration order, which is the order the wire carries. */
+  readonly order: readonly string[];
+  /** Category for a set that admits nothing. */
+  readonly empty: string;
+  /** Category for a set naming one value twice. */
+  readonly repeat: string;
+  /** Category for a spelling this build does not define. */
+  readonly unknown: string;
+}
+
+/**
+ * Canonicalize a set of enum spellings the way the Rust constructor does.
+ *
+ * Sorted into declaration order, so a set built in any order encodes
+ * identically. An empty set and a repeated value are refused rather than
+ * quietly accepted: both mean the caller asked for something other than what it
+ * believes it asked for, and an empty filter in particular admits nothing that
+ * any listing could ever answer.
+ *
+ * A spelling outside the order is refused too. A brand exists only in the type
+ * checker, so this is the only place an untyped caller's undefined state can be
+ * stopped before it reaches the wire.
+ */
+export function orderedEnumSet<T extends string>(
+  values: readonly T[],
+  rules: EnumSetRules,
+): readonly T[] {
+  if (values.length === 0) throw new RefusalError(rules.empty, "a filter admits no value");
+  const found: {readonly at: number; readonly value: T}[] = [];
+  for (const value of values) {
+    const at = rules.order.indexOf(value);
+    if (at < 0) throw new RefusalError(rules.unknown, value);
+    found.push({at, value});
+  }
+  found.sort((left, right) => left.at - right.at);
+  let previous = -1;
+  for (const entry of found) {
+    if (entry.at === previous) throw new RefusalError(rules.repeat, entry.value);
+    previous = entry.at;
+  }
+  return found.map((entry) => entry.value);
+}
 "#
         .to_owned(),
         ..GeneratedModule::default()
@@ -1191,11 +1525,13 @@ fn doctor_module() -> GeneratedModule {
                 // means, and the safe-looking guess is the wrong one.
                 sensitivity: EnumSensitivity::SecuritySensitive,
                 values: check_status_values(),
+                wire_order: None,
             },
             GeneratedEnum {
                 name: "ReportStatus".to_owned(),
                 sensitivity: EnumSensitivity::SecuritySensitive,
                 values: report_status_values(),
+                wire_order: None,
             },
         ],
         interfaces: vec![
@@ -1272,16 +1608,19 @@ fn admin_status_module() -> GeneratedModule {
                 // `AdminError::UnknownState`; the generated decoder matches it.
                 sensitivity: EnumSensitivity::SecuritySensitive,
                 values: daemon_state_values(),
+                wire_order: None,
             },
             GeneratedEnum {
                 name: "ExecutionState".to_owned(),
                 sensitivity: EnumSensitivity::SecuritySensitive,
                 values: execution_state_values(),
+                wire_order: None,
             },
             GeneratedEnum {
                 name: "TelegramState".to_owned(),
                 sensitivity: EnumSensitivity::SecuritySensitive,
                 values: telegram_state_values(),
+                wire_order: None,
             },
         ],
         unions: vec![Union {
@@ -1347,19 +1686,28 @@ fn category(name: &str, doc: &str, error: &AdminError) -> Constant {
 }
 
 /// A request field whose value is a checked string.
-fn checked_field(name: &str, type_name: &str) -> RequestField {
+fn checked_field(name: &str, type_name: &str, refusal_category: &str) -> RequestField {
     RequestField {
         name: name.to_owned(),
         input_name: name.to_owned(),
-        value: RequestValue::Checked(type_name.to_owned()),
+        value: RequestValue::Checked {
+            type_name: type_name.to_owned(),
+            refusal_category: refusal_category.to_owned(),
+        },
     }
 }
 
 /// A response field carrying a durable row identity.
-fn row_id_field(name: &str) -> ResponseField {
+fn row_id_field(name: &str, refusal_category: &str) -> ResponseField {
     ResponseField {
         name: name.to_owned(),
-        value: ResponseValue::Integer(DURABLE_ROW_ID.to_owned()),
+        value: ResponseValue::Integer {
+            type_name: DURABLE_ROW_ID.to_owned(),
+            refusal_category: refusal_category.to_owned(),
+            // The admin lane reports one category for both faults, so reading
+            // the sign separately would change nothing a peer can observe.
+            unsigned: false,
+        },
     }
 }
 
@@ -1514,6 +1862,7 @@ fn admin_command_module() -> GeneratedModule {
             oversize_category: "ADMIN_FRAME_SIZE".to_owned(),
             field_invalid_category: "WIRE_FIELD_INVALID".to_owned(),
             field_grammar_category: "WIRE_FIELD_GRAMMAR".to_owned(),
+            body_objects: Vec::new(),
             requests: vec![
                 RequestCommand {
                     kind: "status".to_owned(),
@@ -1536,8 +1885,8 @@ fn admin_command_module() -> GeneratedModule {
                                 oversize_category: "ADMIN_DOCUMENT_TOO_LARGE".to_owned(),
                             },
                         },
-                        checked_field("idempotency_key", "RunSubmissionKey"),
-                        checked_field("spec_digest", "SpecDigest"),
+                        checked_field("idempotency_key", "RunSubmissionKey", "ADMIN_INVALID_BODY"),
+                        checked_field("spec_digest", "SpecDigest", "ADMIN_INVALID_BODY"),
                     ],
                 },
                 RequestCommand {
@@ -1547,15 +1896,15 @@ fn admin_command_module() -> GeneratedModule {
                           and the cause."
                         .to_owned(),
                     fields: vec![
-                        checked_field("actor", "IntakeActor"),
-                        checked_field("reason", "IntakeReason"),
+                        checked_field("actor", "IntakeActor", "ADMIN_INVALID_BODY"),
+                        checked_field("reason", "IntakeReason", "ADMIN_INVALID_BODY"),
                     ],
                 },
                 RequestCommand {
                     kind: "resume_intake".to_owned(),
                     name: "ResumeIntake".to_owned(),
                     doc: "Reopen intake, naming the operator who decided to.".to_owned(),
-                    fields: vec![checked_field("actor", "IntakeActor")],
+                    fields: vec![checked_field("actor", "IntakeActor", "ADMIN_INVALID_BODY")],
                 },
                 RequestCommand {
                     kind: "shutdown".to_owned(),
@@ -1578,7 +1927,10 @@ fn admin_command_module() -> GeneratedModule {
                     doc: "Intake is durably closed for this generation. The decision outlives \
                           the process."
                         .to_owned(),
-                    fields: vec![row_id_field("pause_id"), row_id_field("revision")],
+                    fields: vec![
+                        row_id_field("pause_id", "ADMIN_INVALID_BODY"),
+                        row_id_field("revision", "ADMIN_INVALID_BODY"),
+                    ],
                 },
                 ResponseDecoder {
                     kind: "intake_resumed".to_owned(),
@@ -1586,7 +1938,10 @@ fn admin_command_module() -> GeneratedModule {
                     doc: "A durable pause was closed and intake reopened. The pause row is \
                           retained, not deleted."
                         .to_owned(),
-                    fields: vec![row_id_field("pause_id"), row_id_field("revision")],
+                    fields: vec![
+                        row_id_field("pause_id", "ADMIN_INVALID_BODY"),
+                        row_id_field("revision", "ADMIN_INVALID_BODY"),
+                    ],
                 },
                 ResponseDecoder {
                     kind: "refused".to_owned(),
@@ -1595,7 +1950,10 @@ fn admin_command_module() -> GeneratedModule {
                         .to_owned(),
                     fields: vec![ResponseField {
                         name: "category".to_owned(),
-                        value: ResponseValue::Checked("AdminRefusalCategory".to_owned()),
+                        value: ResponseValue::Checked {
+                            type_name: "AdminRefusalCategory".to_owned(),
+                            refusal_category: "ADMIN_INVALID_BODY".to_owned(),
+                        },
                     }],
                 },
                 ResponseDecoder {
@@ -1611,13 +1969,19 @@ fn admin_command_module() -> GeneratedModule {
                         },
                         ResponseField {
                             name: "run_id".to_owned(),
-                            value: ResponseValue::Checked("RunId".to_owned()),
+                            value: ResponseValue::Checked {
+                                type_name: "RunId".to_owned(),
+                                refusal_category: "ADMIN_INVALID_BODY".to_owned(),
+                            },
                         },
                         ResponseField {
                             name: "spec_digest".to_owned(),
-                            value: ResponseValue::Checked("SpecDigest".to_owned()),
+                            value: ResponseValue::Checked {
+                                type_name: "SpecDigest".to_owned(),
+                                refusal_category: "ADMIN_INVALID_BODY".to_owned(),
+                            },
                         },
-                        row_id_field("submission_id"),
+                        row_id_field("submission_id", "ADMIN_INVALID_BODY"),
                     ],
                 },
                 ResponseDecoder {
@@ -1641,6 +2005,593 @@ fn admin_command_module() -> GeneratedModule {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The `automonique.runs` read surface
+//
+// The six closed vocabularies below are each built by mapping the Rust array
+// through an exhaustive `match`. The `match` is the whole point: a variant
+// added to any of these enums fails to compile here rather than dropping out of
+// the generated union while every test still passes. Two of them —
+// `RunState` and `SpoolEventKind` — mirror vocabularies this dependency-free
+// crate cannot import, and `tests/runs_api.rs` pins those against the sibling
+// crate's own source; this file inherits that pin by reading the mirror.
+// ---------------------------------------------------------------------------
+
+/// The declared [`RunState`] spellings, pinned to the Rust wire strings.
+fn run_state_values() -> Vec<String> {
+    RunState::ALL
+        .into_iter()
+        .map(|state| match state {
+            RunState::Ready
+            | RunState::Running
+            | RunState::Completed
+            | RunState::Failed
+            | RunState::Cancelled
+            | RunState::TimedOut => state.as_str().to_owned(),
+        })
+        .collect()
+}
+
+/// The declared [`SubmissionState`] spellings, pinned to the Rust wire strings.
+fn submission_state_values() -> Vec<String> {
+    SubmissionState::ALL
+        .into_iter()
+        .map(|state| match state {
+            SubmissionState::Accepted => state.as_str().to_owned(),
+        })
+        .collect()
+}
+
+/// The declared [`SpoolEventKind`] spellings, pinned to the Rust wire strings.
+fn spool_event_kind_values() -> Vec<String> {
+    SpoolEventKind::ALL
+        .into_iter()
+        .map(|kind| match kind {
+            SpoolEventKind::Started
+            | SpoolEventKind::AdapterEvent
+            | SpoolEventKind::SimulationEvent
+            | SpoolEventKind::CancelRequested
+            | SpoolEventKind::Terminal => kind.as_str().to_owned(),
+        })
+        .collect()
+}
+
+/// The declared [`LifecycleCoverage`] spellings, pinned to the Rust wire
+/// strings.
+fn lifecycle_coverage_values() -> Vec<String> {
+    LifecycleCoverage::ALL
+        .into_iter()
+        .map(|coverage| match coverage {
+            LifecycleCoverage::Complete | LifecycleCoverage::Truncated => {
+                coverage.as_str().to_owned()
+            }
+        })
+        .collect()
+}
+
+/// The declared [`RunsRefusal`] spellings, pinned to the Rust wire strings.
+fn runs_refusal_values() -> Vec<String> {
+    RunsRefusal::ALL
+        .into_iter()
+        .map(|refusal| match refusal {
+            RunsRefusal::UnknownRun => refusal.as_str().to_owned(),
+        })
+        .collect()
+}
+
+/// The authorities a lifecycle event may carry.
+///
+/// Taken from [`LIFECYCLE_AUTHORITIES`] rather than from a spelling table of
+/// its own, exactly as `runs_api` takes it: the spool's authority and this
+/// crate's are the same two words, and writing them down a third time would be
+/// a third thing to keep right.
+fn lifecycle_authority_values() -> Vec<String> {
+    LIFECYCLE_AUTHORITIES
+        .into_iter()
+        .map(|authority| match authority {
+            Authority::Authoritative | Authority::Synthetic => authority.as_str().to_owned(),
+        })
+        .collect()
+}
+
+/// A refusal category, pinned to the spelling the Runs API reports for it.
+fn runs_category(name: &str, doc: &str, error: &RunsApiError) -> Constant {
+    Constant {
+        name: name.to_owned(),
+        doc: doc.to_owned(),
+        value: ConstantValue::Text(error.category().to_owned()),
+    }
+}
+
+/// A security-sensitive enumeration of the Runs API.
+fn runs_enum(name: &str, values: Vec<String>, wire_order: Option<Vec<String>>) -> GeneratedEnum {
+    GeneratedEnum {
+        name: name.to_owned(),
+        // Every vocabulary on this lane is a `SecuritySensitiveEnum` in Rust,
+        // whose decoder answers `unknown_enum_value` rather than a default. A
+        // generated reader that retained an undefined state would have to decide
+        // what it means, and would decide wrong.
+        sensitivity: EnumSensitivity::SecuritySensitive,
+        values,
+        wire_order,
+    }
+}
+
+/// A response or nested-body field carrying a closed vocabulary.
+fn enum_field(name: &str, type_name: &str) -> ResponseField {
+    ResponseField {
+        name: name.to_owned(),
+        value: ResponseValue::Enum {
+            type_name: type_name.to_owned(),
+            unknown_category: "RUNS_UNKNOWN_ENUM_VALUE".to_owned(),
+        },
+    }
+}
+
+/// A response or nested-body field carrying a bounded integer.
+///
+/// `unsigned` mirrors which Rust reader the field goes through: `unsigned()`
+/// converts to `u64` and refuses a negative as an invalid body before the
+/// domain is consulted, while an instant is read as a signed integer and
+/// refused by the domain itself. Getting this wrong reports the domain's
+/// category for a malformed body.
+fn runs_integer_field(
+    name: &str,
+    type_name: &str,
+    refusal_category: &str,
+    unsigned: bool,
+) -> ResponseField {
+    ResponseField {
+        name: name.to_owned(),
+        value: ResponseValue::Integer {
+            type_name: type_name.to_owned(),
+            refusal_category: refusal_category.to_owned(),
+            unsigned,
+        },
+    }
+}
+
+/// TypeScript name of the branded acceptance instant.
+const EPOCH_MILLIS: &str = "EpochMillis";
+
+/// TypeScript name of the branded listing position.
+const RUN_CURSOR: &str = "RunCursor";
+
+/// The `automonique.runs` read surface: what a client asks, and what it decodes.
+fn runs_module() -> GeneratedModule {
+    GeneratedModule {
+        file_name: module_file_name(RUNS_MODULE),
+        doc: "The native Runs API read surface: list runs, read one run, turn a page.".to_owned(),
+        source: "automonique_protocol::runs_api".to_owned(),
+        // A name is declared in exactly one module. `RequestId`, `RunId`,
+        // `SpecDigest` and `DurableRowId` are wire vocabularies rather than
+        // admin ones — a run identity is the same domain on both lanes — so
+        // this module reads them from where they are declared rather than
+        // declaring a second, separately-drifting copy.
+        imports: vec![ModuleImport {
+            module: ADMIN_COMMAND_MODULE.to_owned(),
+            values: vec![
+                DURABLE_ROW_ID.to_owned(),
+                "RequestId".to_owned(),
+                "RunId".to_owned(),
+                "SpecDigest".to_owned(),
+            ],
+            types: Vec::new(),
+        }],
+        constants: vec![
+            Constant {
+                name: "MAX_LIFECYCLE_EVENTS".to_owned(),
+                doc: "Maximum lifecycle events one detail view may carry.".to_owned(),
+                value: ConstantValue::Count(crate::runs_api::MAX_LIFECYCLE_EVENTS),
+            },
+            Constant {
+                name: "MAX_RUNS_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical message bytes this protocol will assemble or admit."
+                    .to_owned(),
+                value: ConstantValue::Count(crate::runs_api::MAX_RUNS_CANONICAL_BYTES),
+            },
+            Constant {
+                name: "MAX_RUN_PAGE_ITEMS".to_owned(),
+                doc: "Maximum summaries one listing page may carry. A page bound is not a paging \
+                      hint: a longer page is refused rather than truncated, because a truncated \
+                      page that still answered `complete` is the silent drop the retention rule \
+                      forbids."
+                    .to_owned(),
+                value: ConstantValue::Count(crate::runs_api::MAX_RUN_PAGE_ITEMS),
+            },
+            Constant {
+                name: "RUNS_API_SCHEMA_V1".to_owned(),
+                doc: "Stable schema identifier for the version-one read surface.".to_owned(),
+                value: ConstantValue::Text(crate::runs_api::RUNS_API_SCHEMA_V1.to_owned()),
+            },
+            Constant {
+                name: "RUNS_PROTOCOL".to_owned(),
+                doc: "Stable protocol name for the native Runs API.".to_owned(),
+                value: ConstantValue::Text(crate::runs_api::RUNS_PROTOCOL.to_owned()),
+            },
+        ],
+        bounded_integers: vec![
+            BoundedInteger {
+                // The store's `accepted_at_ms >= 0` constraint and the spool's
+                // unsigned millisecond field are what this bound is: an instant
+                // before the epoch is one neither can hold, and the Rust
+                // constructors refuse it rather than storing it.
+                name: EPOCH_MILLIS.to_owned(),
+                min: 0,
+                max: i64::MAX,
+            },
+            BoundedInteger {
+                // Zero is the value the spool's status reports when a run has
+                // *no* events, so it is a valid highest-sequence and an invalid
+                // event sequence. The two are separate types for that reason.
+                name: "LastSequence".to_owned(),
+                min: 0,
+                max: i64::MAX,
+            },
+            BoundedInteger {
+                name: "PageSize".to_owned(),
+                min: 1,
+                max: i64::try_from(crate::runs_api::MAX_RUN_PAGE_ITEMS)
+                    .expect("the page bound is within the wire range"),
+            },
+            BoundedInteger {
+                name: RUN_CURSOR.to_owned(),
+                min: 0,
+                max: i64::MAX,
+            },
+            BoundedInteger {
+                name: "SpoolSequence".to_owned(),
+                min: 1,
+                max: i64::MAX,
+            },
+        ],
+        enums: vec![
+            runs_enum("Authority", lifecycle_authority_values(), None),
+            runs_enum("LifecycleCoverage", lifecycle_coverage_values(), None),
+            // The only vocabulary whose declaration order reaches the wire: a
+            // state filter is canonicalized into it.
+            runs_enum("RunState", run_state_values(), Some(run_state_values())),
+            runs_enum("RunsRefusal", runs_refusal_values(), None),
+            runs_enum("SpoolEventKind", spool_event_kind_values(), None),
+            runs_enum("SubmissionState", submission_state_values(), None),
+        ],
+        command_surface: Some(CommandSurface {
+            name: "Runs".to_owned(),
+            protocol_constant: "RUNS_PROTOCOL".to_owned(),
+            protocol: crate::runs_api::RUNS_PROTOCOL.to_owned(),
+            version: crate::codec::MajorVersion::FIRST.get(),
+            max_message_bytes_constant: "MAX_RUNS_CANONICAL_BYTES".to_owned(),
+            request_id_type: "RequestId".to_owned(),
+            categories: vec![
+                runs_category(
+                    "RUNS_COUNTER_OUT_OF_RANGE",
+                    "A counter is outside the range the integer-only wire codec carries.",
+                    &RunsApiError::CounterOutOfRange { field: "since" },
+                ),
+                runs_category(
+                    "RUNS_INVALID_BODY",
+                    "A body was not the exact shape defined for its kind.",
+                    &RunsApiError::InvalidBody,
+                ),
+                runs_category(
+                    "RUNS_INVALID_FIELD",
+                    "A bounded identifier was empty, over-long or control-bearing.",
+                    &RunsApiError::Field {
+                        field: "run_id",
+                        error: ValueError::Empty,
+                    },
+                ),
+                runs_category(
+                    "RUNS_LIFECYCLE_OUT_OF_ORDER",
+                    "A lifecycle sequence was zero, which names a run with no events rather \
+                     than an event.",
+                    &RunsApiError::LifecycleOutOfOrder,
+                ),
+                runs_category(
+                    "RUNS_LIFECYCLE_TOO_LONG",
+                    "A view carried more lifecycle events than one view holds.",
+                    &RunsApiError::LifecycleTooLong {
+                        max_events: 0,
+                        actual_events: 0,
+                    },
+                ),
+                runs_category(
+                    "RUNS_PAGE_SIZE_OUT_OF_RANGE",
+                    "A requested page size was zero — a page that admits nothing cannot make \
+                     progress — or above the largest page this protocol serves.",
+                    &RunsApiError::PageSizeOutOfRange {
+                        max_items: 0,
+                        requested: 0,
+                    },
+                ),
+                runs_category(
+                    "RUNS_PAGE_TOO_LARGE",
+                    "A page carried more summaries than one page holds.",
+                    &RunsApiError::PageTooLarge {
+                        max_items: 0,
+                        actual_items: 0,
+                    },
+                ),
+                runs_category(
+                    "RUNS_STATE_FILTER_EMPTY",
+                    "A state filter admitted nothing, which no listing could ever answer.",
+                    &RunsApiError::StateFilterEmpty,
+                ),
+                runs_category(
+                    "RUNS_STATE_FILTER_REPEATS",
+                    "A state filter named one state twice, which is a caller that believes it \
+                     asked for something it did not.",
+                    &RunsApiError::StateFilterRepeats {
+                        state: RunState::Ready,
+                    },
+                ),
+                runs_category(
+                    "RUNS_TIME_BEFORE_EPOCH",
+                    "A durable instant was before the epoch, which the store cannot hold.",
+                    &RunsApiError::TimeBeforeEpoch {
+                        field: "accepted_at_ms",
+                    },
+                ),
+                runs_category(
+                    "RUNS_UNKNOWN_KIND",
+                    "The message kind is not part of this closed protocol version.",
+                    &RunsApiError::UnknownKind,
+                ),
+                runs_category(
+                    "RUNS_UNWRITTEN_ROW",
+                    "A durable row identity was zero, which names a row no writer produced.",
+                    &RunsApiError::UnwrittenRow {
+                        field: "submission_id",
+                    },
+                ),
+                // The three below are the shared codec's own categories, which
+                // this protocol reports unchanged: `RunsApiError::Codec`
+                // delegates to them rather than restating them. They are spelled
+                // with this lane's prefix because one name has one declaring
+                // module, and `admin-command.ts` already declares its own pair
+                // of the same two spellings.
+                runs_category(
+                    "RUNS_FIELD_GRAMMAR",
+                    "An envelope field cleared the bounded-value rules and broke its own \
+                     grammar.",
+                    &RunsApiError::Codec(CodecError::Grammar {
+                        field: "request_id",
+                    }),
+                ),
+                runs_category(
+                    "RUNS_FIELD_INVALID",
+                    "An envelope field was empty, too long, or carried a control character.",
+                    &RunsApiError::Codec(CodecError::Field {
+                        field: "request_id",
+                        error: ValueError::Empty,
+                    }),
+                ),
+                runs_category(
+                    "RUNS_UNKNOWN_ENUM_VALUE",
+                    "A state, event kind, authority, coverage, submission state or refusal this \
+                     build does not define. Every vocabulary on this lane fails closed.",
+                    &RunsApiError::Codec(CodecError::UnknownEnumValue { field: "state" }),
+                ),
+                Constant {
+                    // Unlike the admin lane's, nothing pins this one: no shipped
+                    // transport carries `automonique.runs` yet, so no peer
+                    // reports a spelling for a payload above the ceiling. The
+                    // spelling is the admin transport's, which is what a Runs
+                    // transport would inherit; until one exists this is a claim
+                    // about the future rather than a mirror of the present, and
+                    // it says so rather than looking like the others.
+                    name: "RUNS_FRAME_SIZE".to_owned(),
+                    doc: "A canonical payload above this protocol's ceiling. No shipped \
+                          transport carries this protocol yet, so nothing pins this spelling; it \
+                          is the one the local admin transport reports for the same fault."
+                        .to_owned(),
+                    value: ConstantValue::Text("frame_size".to_owned()),
+                },
+            ],
+            invalid_body_category: "RUNS_INVALID_BODY".to_owned(),
+            unknown_kind_category: "RUNS_UNKNOWN_KIND".to_owned(),
+            oversize_category: "RUNS_FRAME_SIZE".to_owned(),
+            field_invalid_category: "RUNS_FIELD_INVALID".to_owned(),
+            field_grammar_category: "RUNS_FIELD_GRAMMAR".to_owned(),
+            body_objects: vec![
+                BodyObject {
+                    name: "RunLifecycleEvent".to_owned(),
+                    doc: "One durable lifecycle event, as the runner's spool exposes it. The \
+                          payload bytes and the chained digest are deliberately absent: a detail \
+                          view carries the skeleton, and payload retrieval stays on the \
+                          subscribe lane."
+                        .to_owned(),
+                    fields: vec![
+                        runs_integer_field("at_ms", EPOCH_MILLIS, "RUNS_TIME_BEFORE_EPOCH", false),
+                        enum_field("authority", "Authority"),
+                        enum_field("kind", "SpoolEventKind"),
+                        runs_integer_field(
+                            "sequence",
+                            "SpoolSequence",
+                            "RUNS_LIFECYCLE_OUT_OF_ORDER",
+                            true,
+                        ),
+                    ],
+                },
+                BodyObject {
+                    name: "RunSummary".to_owned(),
+                    doc: "One run, as a listing reports it. `state` is the runner spool's and \
+                          `submission_state` is the store's: they answer different questions, \
+                          and both travel so neither can be mistaken for the other."
+                        .to_owned(),
+                    fields: vec![
+                        runs_integer_field(
+                            "accepted_at_ms",
+                            EPOCH_MILLIS,
+                            "RUNS_TIME_BEFORE_EPOCH",
+                            false,
+                        ),
+                        ResponseField {
+                            name: "run_id".to_owned(),
+                            value: ResponseValue::Checked {
+                                type_name: "RunId".to_owned(),
+                                refusal_category: "RUNS_INVALID_FIELD".to_owned(),
+                            },
+                        },
+                        ResponseField {
+                            name: "spec_digest".to_owned(),
+                            value: ResponseValue::Checked {
+                                type_name: "SpecDigest".to_owned(),
+                                refusal_category: "RUNS_INVALID_BODY".to_owned(),
+                            },
+                        },
+                        enum_field("state", "RunState"),
+                        runs_integer_field(
+                            "submission_id",
+                            DURABLE_ROW_ID,
+                            "RUNS_UNWRITTEN_ROW",
+                            true,
+                        ),
+                        enum_field("submission_state", "SubmissionState"),
+                    ],
+                },
+            ],
+            requests: vec![
+                RequestCommand {
+                    kind: "list_runs".to_owned(),
+                    name: "ListRuns".to_owned(),
+                    doc: "Ask for one bounded page of runs. `states` is null for no filter, \
+                          which is a different request from one naming every state; `since` is \
+                          null to begin at the oldest position still retained, never at position \
+                          one."
+                        .to_owned(),
+                    fields: vec![
+                        RequestField {
+                            name: "page_size".to_owned(),
+                            input_name: "page_size".to_owned(),
+                            value: RequestValue::Integer {
+                                type_name: "PageSize".to_owned(),
+                                refusal_category: "RUNS_PAGE_SIZE_OUT_OF_RANGE".to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "since".to_owned(),
+                            input_name: "since".to_owned(),
+                            value: RequestValue::NullableInteger {
+                                type_name: RUN_CURSOR.to_owned(),
+                                refusal_category: "RUNS_COUNTER_OUT_OF_RANGE".to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "states".to_owned(),
+                            input_name: "states".to_owned(),
+                            value: RequestValue::NullableEnumSet {
+                                type_name: "RunState".to_owned(),
+                                order_constant: "RunState_WIRE_ORDER".to_owned(),
+                                empty_category: "RUNS_STATE_FILTER_EMPTY".to_owned(),
+                                repeat_category: "RUNS_STATE_FILTER_REPEATS".to_owned(),
+                                unknown_category: "RUNS_UNKNOWN_ENUM_VALUE".to_owned(),
+                            },
+                        },
+                    ],
+                },
+                RequestCommand {
+                    kind: "run_detail".to_owned(),
+                    name: "RunDetail".to_owned(),
+                    doc: "Read one run in full: its summary and its lifecycle skeleton.".to_owned(),
+                    fields: vec![checked_field("run_id", "RunId", "RUNS_INVALID_FIELD")],
+                },
+            ],
+            // This protocol version defines exactly the two requests above.
+            // `tests/codegen.rs` proves the list against the Rust encoders
+            // themselves rather than against this claim.
+            request_kinds_not_generated: Vec::new(),
+            responses: vec![
+                ResponseDecoder {
+                    kind: "run_list_result".to_owned(),
+                    name: "RunListPage".to_owned(),
+                    doc: "One bounded page of run summaries. `more` is carried explicitly rather \
+                          than inferred from a short page: a state filter can exclude every row \
+                          in a scanned window and still leave rows behind it."
+                        .to_owned(),
+                    fields: vec![
+                        ResponseField {
+                            name: "more".to_owned(),
+                            value: ResponseValue::Bool,
+                        },
+                        ResponseField {
+                            name: "next_cursor".to_owned(),
+                            value: ResponseValue::NullableInteger {
+                                type_name: RUN_CURSOR.to_owned(),
+                                refusal_category: "RUNS_INVALID_BODY".to_owned(),
+                            },
+                        },
+                        ResponseField {
+                            name: "runs".to_owned(),
+                            value: ResponseValue::ObjectArray {
+                                type_name: "RunSummary".to_owned(),
+                                max_items_constant: "MAX_RUN_PAGE_ITEMS".to_owned(),
+                                oversize_category: "RUNS_PAGE_TOO_LARGE".to_owned(),
+                            },
+                        },
+                    ],
+                },
+                ResponseDecoder {
+                    kind: "run_detail_result".to_owned(),
+                    name: "RunDetailView".to_owned(),
+                    doc: "One run in full. `coverage` says whether the carried lifecycle is the \
+                          whole log, because a bounded list with no statement about what it \
+                          omits is a partial stream presented as a whole one."
+                        .to_owned(),
+                    fields: vec![
+                        enum_field("coverage", "LifecycleCoverage"),
+                        runs_integer_field(
+                            "last_sequence",
+                            "LastSequence",
+                            "RUNS_INVALID_BODY",
+                            true,
+                        ),
+                        ResponseField {
+                            name: "lifecycle".to_owned(),
+                            value: ResponseValue::ObjectArray {
+                                type_name: "RunLifecycleEvent".to_owned(),
+                                max_items_constant: "MAX_LIFECYCLE_EVENTS".to_owned(),
+                                oversize_category: "RUNS_LIFECYCLE_TOO_LONG".to_owned(),
+                            },
+                        },
+                        ResponseField {
+                            name: "summary".to_owned(),
+                            value: ResponseValue::Object {
+                                type_name: "RunSummary".to_owned(),
+                            },
+                        },
+                    ],
+                },
+                ResponseDecoder {
+                    kind: "resync_required".to_owned(),
+                    name: "RunsResync".to_owned(),
+                    doc: "The caller's cursor is outside retention. It carries the window a \
+                          bounded snapshot must cover and never carries rows, because a cursor \
+                          outside retention receives this answer rather than a silent partial \
+                          stream."
+                        .to_owned(),
+                    fields: vec![
+                        runs_integer_field("snapshot_from", RUN_CURSOR, "RUNS_INVALID_BODY", true),
+                        runs_integer_field("snapshot_to", RUN_CURSOR, "RUNS_INVALID_BODY", true),
+                    ],
+                },
+                ResponseDecoder {
+                    kind: "refused".to_owned(),
+                    name: "RunsRefused".to_owned(),
+                    doc: "The query was refused and nothing was read. The vocabulary is \
+                          deliberately small: this slice models no actor, so it names no \
+                          authorization refusal it could not have decided."
+                        .to_owned(),
+                    fields: vec![enum_field("refusal", "RunsRefusal")],
+                },
+            ],
+            // Every kind this protocol version answers with is decoded above.
+            response_kinds_not_decoded: Vec::new(),
+        }),
+        ..GeneratedModule::default()
+    }
+}
+
 /// Every maintained module, in file-name order.
 #[must_use]
 pub fn maintained_modules() -> Vec<GeneratedModule> {
@@ -1649,6 +2600,7 @@ pub fn maintained_modules() -> Vec<GeneratedModule> {
         doctor_module(),
         admin_status_module(),
         admin_command_module(),
+        runs_module(),
     ];
     modules.sort_by(|left, right| left.file_name.cmp(&right.file_name));
     modules
@@ -1681,26 +2633,57 @@ fn runtime_imports(module: &GeneratedModule) -> (Vec<&'static str>, Vec<&'static
             names.push("encodeMessage");
             types.push("JsonValue");
         }
-        if request_fields().any(|field| matches!(field.value, RequestValue::Checked(_))) {
-            names.push("refuse");
-        }
-        if request_fields().any(|field| matches!(field.value, RequestValue::HexBytes { .. })) {
-            names.extend(["boundedBytes", "hexEncode"]);
+        for field in request_fields() {
+            match &field.value {
+                RequestValue::Checked { .. }
+                | RequestValue::Integer { .. }
+                | RequestValue::NullableInteger { .. } => names.push("refuse"),
+                RequestValue::HexBytes { .. } => {
+                    names.extend(["boundedBytes", "hexEncode", "refuse"]);
+                }
+                RequestValue::NullableEnumSet { .. } => names.push("orderedEnumSet"),
+            }
         }
         if !surface.responses.is_empty() {
             names.extend(["decodeMessageAdmitted", "exactFields", "refuse"]);
+            types.push("JsonValue");
+        }
+        if !surface.body_objects.is_empty() {
+            names.push("exactFields");
             types.push("JsonValue");
         }
         for field in surface
             .responses
             .iter()
             .flat_map(|response| &response.fields)
+            .chain(
+                surface
+                    .body_objects
+                    .iter()
+                    .flat_map(|object| &object.fields),
+            )
         {
-            names.push(match field.value {
-                ResponseValue::Bool => "bodyBool",
-                ResponseValue::Checked(_) => "bodyString",
-                ResponseValue::Integer(_) => "bodyInteger",
-            });
+            match &field.value {
+                ResponseValue::Bool => names.push("bodyBool"),
+                ResponseValue::Checked { .. } | ResponseValue::Enum { .. } => {
+                    names.extend(["bodyString", "refuse"]);
+                }
+                ResponseValue::Integer { unsigned, .. } => {
+                    names.extend([
+                        if *unsigned {
+                            "bodyUnsigned"
+                        } else {
+                            "bodyInteger"
+                        },
+                        "refuse",
+                    ]);
+                }
+                ResponseValue::NullableInteger { .. } => {
+                    names.extend(["bodyIntegerOrNull", "mapNullable", "refuse"]);
+                }
+                ResponseValue::Object { .. } => names.push("bodyValue"),
+                ResponseValue::ObjectArray { .. } => names.push("bodyArray"),
+            }
         }
     }
 
@@ -1844,6 +2827,23 @@ fn emit_interface(out: &mut String, interface: &Interface) {
 // Command surface
 // ---------------------------------------------------------------------------
 
+/// The constant naming one wire kind, qualified by the surface that defines it.
+///
+/// Two protocols may spell one kind the same way and mean different things:
+/// `automonique.admin` and `automonique.runs` both answer `refused`, and the
+/// bodies differ. The barrel re-exports every module with `export *`, so an
+/// unqualified `REFUSED_RESPONSE_KIND` in each would be ambiguous for every
+/// consumer — which is exactly what the duplicate-name gate in
+/// `tests/codegen.rs` reported when this surface was first generated.
+fn kind_constant(surface: &CommandSurface, kind: &str, role: &str) -> String {
+    format!(
+        "{surface}_{kind}_{role}_KIND",
+        surface = surface.name.to_uppercase(),
+        kind = kind.to_uppercase(),
+        role = role.to_uppercase()
+    )
+}
+
 /// Emit a `readonly string[]` of wire names.
 fn emit_name_list(out: &mut String, name: &str, doc: &str, values: &[String]) {
     let mut sorted = values.to_vec();
@@ -1927,7 +2927,7 @@ fn emit_request(out: &mut String, surface: &CommandSurface, request: &RequestCom
     } = request;
     let mut fields = fields.clone();
     fields.sort_by(|left, right| left.name.cmp(&right.name));
-    let kind_constant = format!("{}_REQUEST_KIND", kind.to_uppercase());
+    let kind_constant = kind_constant(surface, kind, "request");
     let _ = writeln!(out, "\n/** {doc} */");
     let _ = writeln!(out, "export const {kind_constant} = \"{kind}\";");
 
@@ -1974,34 +2974,211 @@ fn emit_request(out: &mut String, surface: &CommandSurface, request: &RequestCom
         );
         return;
     }
+    // A nullable field is read into a local before it is tested. TypeScript
+    // discards the narrowing of a property access inside a closure created
+    // after it — `body.since` is `RunCursor | null` again inside the arrow the
+    // refusal wrapper takes — while the narrowing of a `const` survives. Without
+    // this the generated file does not typecheck, which is how the package
+    // typecheck found it.
+    let nullable: Vec<&RequestField> = fields
+        .iter()
+        .filter(|field| {
+            matches!(
+                field.value,
+                RequestValue::NullableInteger { .. } | RequestValue::NullableEnumSet { .. }
+            )
+        })
+        .collect();
+    for field in &nullable {
+        let _ = writeln!(
+            out,
+            "  const {input} = body.{input};",
+            input = field.input_name
+        );
+    }
     let _ = writeln!(
         out,
         "  return encode{surface}Request(request_id, {kind_constant}, [",
         surface = surface.name
     );
     for field in &fields {
-        let value = match &field.value {
-            RequestValue::Checked(type_name) => {
-                format!("{type_name}(body.{input})", input = field.input_name)
-            }
+        let input = &field.input_name;
+        // The nullable fields read the local bound above; the rest read `body`
+        // directly, which keeps every other surface's output unchanged.
+        let source = if nullable.iter().any(|other| other.name == field.name) {
+            String::new()
+        } else {
+            "body.".to_owned()
+        };
+        let input = &format!("{source}{input}");
+        let entry = match &field.value {
+            RequestValue::Checked {
+                type_name,
+                refusal_category,
+            } => format!(
+                "{{kind: \"string\", value: refuse({refusal_category}, () => \
+                 {type_name}({input}))}}"
+            ),
             RequestValue::HexBytes {
                 max_bytes_constant,
                 oversize_category,
             } => format!(
-                "hexEncode(boundedBytes(body.{input}, {max_bytes_constant}, {oversize_category}, \
-                 {invalid}))",
-                input = field.input_name,
+                "{{kind: \"string\", value: refuse({invalid}, () => \
+                 hexEncode(boundedBytes({input}, {max_bytes_constant}, {oversize_category}, \
+                 {invalid})))}}",
                 invalid = surface.invalid_body_category,
             ),
+            RequestValue::Integer {
+                type_name,
+                refusal_category,
+            } => format!(
+                "{{kind: \"integer\", value: refuse({refusal_category}, () => \
+                 {type_name}({input}))}}"
+            ),
+            RequestValue::NullableInteger {
+                type_name,
+                refusal_category,
+            } => format!(
+                "{input} === null\n        ? {{kind: \"null\"}}\n        : {{kind: \
+                 \"integer\", value: refuse({refusal_category}, () => {type_name}({input}))}}"
+            ),
+            RequestValue::NullableEnumSet {
+                order_constant,
+                empty_category,
+                repeat_category,
+                unknown_category,
+                ..
+            } => format!(
+                "{input} === null\n        ? {{kind: \"null\"}}\n        : {{\n            \
+                 kind: \"array\",\n            items: orderedEnumSet({input}, {{\n              \
+                 order: {order_constant},\n              empty: {empty_category},\n              \
+                 repeat: {repeat_category},\n              unknown: {unknown_category},\n            \
+                 }}).map((value): JsonValue => ({{kind: \"string\", value}})),\n          }}"
+            ),
         };
-        let _ = writeln!(
-            out,
-            "    [\"{name}\", {{kind: \"string\", value: refuse({invalid}, () => {value})}}],",
-            name = field.name,
-            invalid = surface.invalid_body_category,
-        );
+        let _ = writeln!(out, "    [\"{name}\", {entry}],", name = field.name);
     }
     out.push_str("  ]);\n}\n");
+}
+
+/// Emit one nested body type and the decoder that reads it.
+///
+/// It takes a whole [`JsonValue`] rather than a field map, because a nested
+/// body is a value inside its carrier's body rather than a message of its own.
+/// Its own exact field set is applied here, so a summary carrying one key too
+/// many is refused wherever it is nested.
+fn emit_body_object(out: &mut String, surface: &CommandSurface, object: &BodyObject) {
+    let BodyObject { name, doc, fields } = object;
+    let mut fields = fields.clone();
+    fields.sort_by(|left, right| left.name.cmp(&right.name));
+    let invalid = &surface.invalid_body_category;
+
+    let _ = writeln!(out, "\n/** {doc} */");
+    let _ = writeln!(out, "export interface {name} {{");
+    for field in &fields {
+        let _ = writeln!(
+            out,
+            "  readonly {field_name}: {type_name};",
+            field_name = field.name,
+            type_name = response_field_type(&field.value)
+        );
+    }
+    out.push_str("}\n");
+    emit_name_list(
+        out,
+        &format!("{name}_FIELDS"),
+        "The exact key set this nested body carries.",
+        &fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>(),
+    );
+
+    let _ = writeln!(
+        out,
+        "\nexport function decode{name}(body: JsonValue): {name} {{"
+    );
+    let _ = writeln!(
+        out,
+        "  const fields = exactFields(body, {name}_FIELDS, {invalid});"
+    );
+    out.push_str("  return {\n");
+    for field in &fields {
+        let _ = writeln!(
+            out,
+            "    {field_name}: {value},",
+            field_name = field.name,
+            value = response_field_reader(surface, field)
+        );
+    }
+    out.push_str("  };\n}\n");
+}
+
+/// The TypeScript type one decoded response field has.
+fn response_field_type(value: &ResponseValue) -> String {
+    match value {
+        ResponseValue::Checked { type_name, .. }
+        | ResponseValue::Integer { type_name, .. }
+        | ResponseValue::Enum { type_name, .. }
+        | ResponseValue::Object { type_name } => type_name.clone(),
+        ResponseValue::NullableInteger { type_name, .. } => format!("{type_name} | null"),
+        ResponseValue::Bool => "boolean".to_owned(),
+        ResponseValue::ObjectArray { type_name, .. } => format!("readonly {type_name}[]"),
+    }
+}
+
+/// The expression that reads one decoded response field out of a field map.
+fn response_field_reader(surface: &CommandSurface, field: &ResponseField) -> String {
+    let invalid = &surface.invalid_body_category;
+    let name = &field.name;
+    match &field.value {
+        ResponseValue::Bool => format!("bodyBool(fields, \"{name}\", {invalid})"),
+        ResponseValue::Checked {
+            type_name,
+            refusal_category,
+        } => format!(
+            "refuse({refusal_category}, () => {type_name}(bodyString(fields, \"{name}\", \
+             {invalid})))"
+        ),
+        ResponseValue::Integer {
+            type_name,
+            refusal_category,
+            unsigned,
+        } => format!(
+            "refuse({refusal_category}, () => {type_name}({reader}(fields, \"{name}\", \
+             {invalid})))",
+            reader = if *unsigned {
+                "bodyUnsigned"
+            } else {
+                "bodyInteger"
+            }
+        ),
+        ResponseValue::NullableInteger {
+            type_name,
+            refusal_category,
+        } => format!(
+            "mapNullable(bodyIntegerOrNull(fields, \"{name}\", {invalid}), (value) =>\n      \
+             refuse({refusal_category}, () => {type_name}(value)),\n    )"
+        ),
+        ResponseValue::Enum {
+            type_name,
+            unknown_category,
+        } => format!(
+            "refuse({unknown_category}, () => decode{type_name}(bodyString(fields, \"{name}\", \
+             {invalid})))"
+        ),
+        ResponseValue::Object { type_name } => {
+            format!("decode{type_name}(bodyValue(fields, \"{name}\", {invalid}))")
+        }
+        ResponseValue::ObjectArray {
+            type_name,
+            max_items_constant,
+            oversize_category,
+        } => format!(
+            "bodyArray(fields, \"{name}\", {invalid}, {max_items_constant}, \
+             {oversize_category}).map(\n      decode{type_name},\n    )"
+        ),
+    }
 }
 
 /// Emit one response: its kind, its decoded type, and the decoder.
@@ -2021,20 +3198,14 @@ fn emit_response(out: &mut String, surface: &CommandSurface, response: &Response
     fields.sort_by(|left, right| left.name.cmp(&right.name));
     let invalid = &surface.invalid_body_category;
     let request_id = &surface.request_id_type;
-    let kind_constant = format!("{}_RESPONSE_KIND", kind.to_uppercase());
+    let kind_constant = kind_constant(surface, kind, "response");
 
     let _ = writeln!(out, "\n/** {doc} */");
     let _ = writeln!(out, "export const {kind_constant} = \"{kind}\";");
     let _ = writeln!(out, "export interface {name} {{");
     let mut declarations: Vec<(String, String)> = fields
         .iter()
-        .map(|field| {
-            let type_name = match &field.value {
-                ResponseValue::Checked(name) | ResponseValue::Integer(name) => name.clone(),
-                ResponseValue::Bool => "boolean".to_owned(),
-            };
-            (field.name.clone(), type_name)
-        })
+        .map(|field| (field.name.clone(), response_field_type(&field.value)))
         .collect();
     declarations.push(("request_id".to_owned(), request_id.clone()));
     declarations.sort();
@@ -2069,21 +3240,7 @@ fn emit_response(out: &mut String, surface: &CommandSurface, response: &Response
     out.push_str("  return {\n");
     let mut entries: Vec<(String, String)> = fields
         .iter()
-        .map(|field| {
-            let read = |reader: &str| format!("{reader}(fields, \"{}\", {invalid})", field.name);
-            let value = match &field.value {
-                ResponseValue::Bool => read("bodyBool"),
-                ResponseValue::Checked(type_name) => format!(
-                    "refuse({invalid}, () => {type_name}({}))",
-                    read("bodyString")
-                ),
-                ResponseValue::Integer(type_name) => format!(
-                    "refuse({invalid}, () => {type_name}({}))",
-                    read("bodyInteger")
-                ),
-            };
-            (field.name.clone(), value)
-        })
+        .map(|field| (field.name.clone(), response_field_reader(surface, field)))
         .collect();
     entries.push(("request_id".to_owned(), "request_id".to_owned()));
     entries.sort();
@@ -2194,7 +3351,7 @@ fn emit_response_dispatch(out: &mut String, surface: &CommandSurface) {
             out,
             "    case {constant}:\n      \
              return {{kind: {constant}, value: decode{name}(request_id, message.body)}};\n",
-            constant = format!("{}_RESPONSE_KIND", response.kind.to_uppercase()),
+            constant = kind_constant(surface, &response.kind, "response"),
             name = response.name
         );
     }
@@ -2235,6 +3392,15 @@ fn emit_command_surface(out: &mut String, surface: &CommandSurface) {
                 let _ = writeln!(out, "export const {} = \"{value}\";", constant.name);
             }
         }
+    }
+
+    // Before the messages that carry them: a response decoder names its nested
+    // decoders, and a reader following the file top to bottom meets each one
+    // where it is defined rather than where it is used.
+    let mut objects = surface.body_objects.clone();
+    objects.sort_by(|left, right| left.name.cmp(&right.name));
+    for object in &objects {
+        emit_body_object(out, surface, object);
     }
 
     if !surface.requests.is_empty() {
