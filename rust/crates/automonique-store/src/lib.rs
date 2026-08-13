@@ -10,6 +10,7 @@
 
 pub mod approval_ledger;
 pub mod automation_store;
+pub mod batch_registry;
 pub mod cancel_ledger;
 pub mod generation_audit;
 pub mod provider_journal;
