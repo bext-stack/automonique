@@ -21,7 +21,7 @@
 use automonique_runner::filesystem::PathIntent;
 use automonique_runner::{
     ContainmentDomain, ContainmentError, ContainmentLimits, HELPER_REFUSED_EXIT, LaunchPlan,
-    RunContainment, spawn_sandboxed,
+    RunContainment, SocketGrant, spawn_sandboxed,
 };
 use std::fs;
 use std::io::Read as _;
@@ -197,6 +197,7 @@ echo allowed=$({bb} cat {allowed}/data.txt 2>&1)
 echo etc=$({bb} cat /etc/hostname 2>&1)
 echo cgdir=${{AUTOMONIQUE_CGROUP_DIR:-ABSENT}}
 echo tcp=$({bb} nc -w 1 127.0.0.1 9 2>&1)
+echo udp=$({bb} nslookup example.invalid 127.0.0.1 2>&1 | {bb} head -1)
 echo done=yes
 "#,
         bb = BUSYBOX,
@@ -207,6 +208,13 @@ echo done=yes
             .unwrap()
             // /proc lets the workload report its own cgroup and descriptors.
             .filesystem_grant(PathIntent::Read, "/proc")
+            .unwrap()
+            // TCP socket creation is granted so the TCP probe reaches the
+            // Landlock layer and is denied THERE (EACCES at connect). UDP has
+            // no grant, so its probe dies earlier, at socket(2), with EPERM
+            // from the seccomp layer. The two distinct errnos in one workload
+            // prove the two layers separately.
+            .socket_grant(SocketGrant::Tcp)
             .unwrap()
         // /dev/null backs the workload's replaced stdin; reads need it? No:
         // stdin is already open. /etc deliberately has no grant.
@@ -281,7 +289,27 @@ echo done=yes
         "TCP must be denied by policy, not merely refused; saw {tcp:?}"
     );
 
+    // UDP: the socket cannot even be created — EPERM from the seccomp filter,
+    // a different failure at a different syscall than the TCP denial above.
+    let udp = observed("udp");
+    assert!(
+        udp.contains("Operation not permitted"),
+        "UDP socket creation must be denied by the socket filter; saw {udp:?}"
+    );
+
     containment.dispose(DRAIN_DEADLINE).unwrap();
+}
+
+#[test]
+fn contradictory_tcp_layers_are_refused_at_the_plan() {
+    // A connect exception without the tcp socket grant would make one layer
+    // promise what another forbids; the plan refuses instead of picking a
+    // winner silently.
+    let plan = busybox_plan("true", |plan| plan.allow_connect_port(443).unwrap());
+    assert!(matches!(
+        plan.encode(),
+        Err(automonique_runner::LaunchPlanError::PolicyRejected(_))
+    ));
 }
 
 #[test]
@@ -465,6 +493,10 @@ fn frames_round_trip_and_refuse_corruption() {
         plan.allow_connect_port(443)
             .unwrap()
             .allow_bind_port(8080)
+            .unwrap()
+            .socket_grant(SocketGrant::Tcp)
+            .unwrap()
+            .socket_grant(SocketGrant::Unix)
             .unwrap()
     });
     let frame = plan.encode().unwrap();

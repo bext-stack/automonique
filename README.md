@@ -170,19 +170,51 @@ closure (done) plus a future seccomp socket filter. A read-only capability
 probe reports which of these mechanisms the host can actually enforce and a
 mode selector refuses or degrades loudly, never silently.
 
+A seccomp socket-family filter now closes the socket-creation side of that
+gap: by default a sandboxed workload cannot create any socket at all, and a
+plan may grant only a closed vocabulary of shapes (AF_UNIX stream/datagram,
+AF_UNIX seqpacket, IPv4/IPv6 TCP streams). The filter masks the type flags so
+`SOCK_CLOEXEC`/`SOCK_NONBLOCK` cannot slip past it, applies the same domain
+discipline to `socketpair(2)`, denies the io_uring syscalls and the x32
+syscall ABI, and refuses non-x86_64 builds rather than guessing. Its tests
+record what remains honestly out of reach: descriptors inherited before
+enforcement and `SCM_RIGHTS` passing over a granted unix socket.
+
 A composed launch path ties the mechanisms together: a supervisor encodes a
-bounded, typed `LaunchPlan` (program, argv, filesystem grants, TCP exceptions —
-delivered over stdin, never argv), and a trusted entry helper joins the run
-cgroup, confirms membership from the kernel, replaces stdin with `/dev/null`,
-closes and verifies descriptors, installs both Landlock domains, and only then
-`execve`s the workload with an empty environment. An end-to-end test launches a
-real workload under all four boundaries at once and reads the workload's own
-observations to prove each held simultaneously; a truncated plan refuses before
-anything runs. Enforcement needs a delegated cgroup v2 subtree, which is what
-the daemon gets as a systemd user service with `Delegate=yes`; where no
-delegated domain exists every API refuses fail-closed and never reports partial
-enforcement. This launch path is exercised by tests only — the daemon does not
-yet call it, no provider is wired to it, and provider launch authority still
+bounded, typed `LaunchPlan` (program, argv, filesystem grants, TCP exceptions,
+socket-shape grants — delivered over stdin, never argv), and a trusted entry
+helper joins the run cgroup, confirms membership from the kernel, replaces
+stdin with `/dev/null`, closes and verifies descriptors, installs both
+Landlock domains and the socket filter, and only then `execve`s the workload
+with an empty environment. A plan whose layers contradict each other — a TCP
+port exception without the TCP socket grant — is refused rather than resolved
+silently. An end-to-end test launches a real workload under all five
+boundaries at once and reads the workload's own observations to prove each
+held simultaneously, with the TCP probe denied by Landlock at `connect`
+(EACCES) while the UDP probe dies earlier at `socket` (EPERM) — two distinct
+errnos proving two distinct layers; a truncated plan refuses before anything
+runs.
+
+On top of the launch path sits the first execution backend: a supervised
+direct-process run that records started/terminal lifecycle events in the
+attempt's hash-chained spool, maps helper refusals distinctly from workload
+failures, kills the whole tree on cancellation or deadline through the cgroup,
+and never returns with the spool non-terminal or the cgroup left behind. A
+runner control socket exposes each attempt over a private, versioned Unix
+endpoint that authenticates kernel peer credentials before reading a single
+request byte: bounded `inspect`, cursor-paged byte-exact `subscribe`,
+read-only `heartbeat`, and durably idempotent `cancel` whose replay says
+`already_delivered` and whose reuse across attempts conflicts. The store
+crate gains a provider session journal persisting process, session, turn,
+request, cursor, capability/schema, and approval bindings with revision-checked
+transitions, transactional multi-row commits, and reads that surface
+hand-written corruption as typed errors instead of trusting rows.
+
+Enforcement needs a delegated cgroup v2 subtree, which is what the daemon gets
+as a systemd user service with `Delegate=yes`; where no delegated domain
+exists every API refuses fail-closed and never reports partial enforcement.
+These paths are exercised by tests only — the daemon does not yet call the
+backend, no provider is wired to it, and provider launch authority still
 requires the release-manifest trust chain that remains unbuilt.
 
 The Codex adapter cannot spawn or probe a process. The Telegram poller now has a concrete synchronous HTTPS

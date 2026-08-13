@@ -17,12 +17,16 @@
 //! 5. installs the plan's Landlock filesystem allowlist
 //!    ([`crate::filesystem`]);
 //! 6. installs the plan's Landlock TCP policy ([`crate::network`]);
-//! 7. `execve`s the workload with an empty environment.
+//! 7. installs the plan's seccomp socket-family filter ([`crate::seccomp`]),
+//!    which denies creating every socket shape the plan does not grant —
+//!    including UDP, raw and packet sockets, and non-TCP stream protocols
+//!    that Landlock's TCP rules cannot see;
+//! 8. `execve`s the workload with an empty environment.
 //!
 //! Any failure at any step exits with [`crate::HELPER_REFUSED_EXIT`] before
 //! the workload runs. The workload's very first instruction therefore executes
-//! inside the cgroup, behind both Landlock domains, with exactly three open
-//! descriptors and no inherited environment.
+//! inside the cgroup, behind both Landlock domains and the socket filter,
+//! with exactly three open descriptors and no inherited environment.
 //!
 //! # Why this order
 //!
@@ -39,8 +43,12 @@
 //! # What a composed launch does **not** establish
 //!
 //! - **It is not complete network denial.** The TCP policy governs TCP
-//!   `bind`/`connect` only; see [`crate::network`] for the exact uncovered
-//!   surface (UDP, raw sockets, `AF_UNIX`, inherited connections).
+//!   `bind`/`connect` and the socket filter denies creating undeclared socket
+//!   shapes, but sockets inherited before enforcement, `SCM_RIGHTS` passing
+//!   over a granted `AF_UNIX` socket, and io_uring paths are each only as
+//!   closed as [`crate::descriptors`], the plan's grants, and
+//!   [`crate::seccomp`]'s io_uring denial make them; see those modules for
+//!   the exact residual surface.
 //! - **It does not protect against a same-uid attacker.** The plan travels
 //!   over a private pipe and the cgroup is delegation-checked, but a process
 //!   of the same uid outside the sandbox can already trace the supervisor.
@@ -74,6 +82,7 @@ use crate::containment::join_and_confirm_membership;
 use crate::descriptors::{DescriptorAllowlist, close_all_except, verify_only_allowlist_open};
 use crate::filesystem::{FilesystemPolicy, PathIntent};
 use crate::network::TcpBindConnectPolicy;
+use crate::seccomp::SocketFamilyPolicy;
 use crate::{HELPER_REFUSED_EXIT, RunContainment};
 use std::ffi::CString;
 use std::fmt;
@@ -145,6 +154,41 @@ pub struct LaunchPlan {
     filesystem: Vec<(PathIntent, PathBuf)>,
     connect_ports: Vec<u16>,
     bind_ports: Vec<u16>,
+    socket_grants: Vec<SocketGrant>,
+}
+
+/// One socket-creation grant a plan may carry, mirroring the closed grant
+/// vocabulary of [`SocketFamilyPolicy`]. The default plan carries none, which
+/// denies every `socket(2)` and `socketpair(2)` in the workload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SocketGrant {
+    /// `AF_UNIX` stream and datagram sockets, protocol 0.
+    Unix,
+    /// `AF_UNIX` `SOCK_SEQPACKET` sockets, protocol 0.
+    UnixSeqPacket,
+    /// IPv4/IPv6 `SOCK_STREAM` TCP sockets only.
+    Tcp,
+}
+
+impl SocketGrant {
+    /// Stable frame spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unix => "unix",
+            Self::UnixSeqPacket => "unix-seqpacket",
+            Self::Tcp => "tcp",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "unix" => Some(Self::Unix),
+            "unix-seqpacket" => Some(Self::UnixSeqPacket),
+            "tcp" => Some(Self::Tcp),
+            _ => None,
+        }
+    }
 }
 
 impl LaunchPlan {
@@ -166,7 +210,31 @@ impl LaunchPlan {
             filesystem: Vec::new(),
             connect_ports: Vec::new(),
             bind_ports: Vec::new(),
+            socket_grants: Vec::new(),
         })
+    }
+
+    /// Permit the workload to create sockets of `grant`'s shape.
+    ///
+    /// Without any grant, every `socket(2)` and `socketpair(2)` in the
+    /// workload fails with `EPERM`. A TCP port exception without
+    /// [`SocketGrant::Tcp`] is a contradiction the plan refuses at encode and
+    /// decode time rather than resolving silently in either direction.
+    pub fn socket_grant(mut self, grant: SocketGrant) -> Result<Self, LaunchPlanError> {
+        if self.socket_grants.contains(&grant) {
+            return Err(LaunchPlanError::PolicyRejected(format!(
+                "duplicate socket grant {}",
+                grant.as_str()
+            )));
+        }
+        // Validate against the real policy builder so a plan can never carry
+        // a grant set the seccomp module would refuse.
+        let mut widened = self.socket_grants.clone();
+        widened.push(grant);
+        socket_policy_from_grants(&widened)
+            .map_err(|error| LaunchPlanError::PolicyRejected(error.to_string()))?;
+        self.socket_grants = widened;
+        Ok(self)
     }
 
     /// Append one workload argument (after `argv[0]`, which is the program).
@@ -259,8 +327,31 @@ impl LaunchPlan {
         Ok(policy)
     }
 
+    fn socket_policy(&self) -> Result<SocketFamilyPolicy, LaunchPlanError> {
+        socket_policy_from_grants(&self.socket_grants)
+            .map_err(|error| LaunchPlanError::PolicyRejected(error.to_string()))
+    }
+
+    /// Refuse a plan whose layers contradict each other.
+    ///
+    /// A TCP port exception says "this connect/bind is permitted", while a
+    /// socket policy without [`SocketGrant::Tcp`] makes creating the socket
+    /// impossible. Widening the socket policy silently would betray the
+    /// seccomp layer; dropping the ports silently would betray the caller.
+    fn check_layer_consistency(&self) -> Result<(), LaunchPlanError> {
+        if (!self.connect_ports.is_empty() || !self.bind_ports.is_empty())
+            && !self.socket_grants.contains(&SocketGrant::Tcp)
+        {
+            return Err(LaunchPlanError::PolicyRejected(
+                "TCP port exceptions require the tcp socket grant".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Encode the complete frame the entry helper consumes.
     pub fn encode(&self) -> Result<Vec<u8>, LaunchPlanError> {
+        self.check_layer_consistency()?;
         let mut frame = String::new();
         frame.push_str(FRAME_HEADER);
         frame.push('\n');
@@ -283,6 +374,9 @@ impl LaunchPlan {
         }
         for &port in &self.bind_ports {
             frame.push_str(&format!("bind_port={port}\n"));
+        }
+        for grant in &self.socket_grants {
+            frame.push_str(&format!("socket={}\n", grant.as_str()));
         }
         frame.push_str(FRAME_TERMINATOR);
         frame.push('\n');
@@ -353,13 +447,19 @@ impl LaunchPlan {
                         .map_err(|_| LaunchPlanError::FrameRejected)?;
                     *current = current.clone().allow_bind_port(port)?;
                 }
+                ("socket", Some(current)) => {
+                    let grant = SocketGrant::parse(value).ok_or(LaunchPlanError::FrameRejected)?;
+                    *current = current.clone().socket_grant(grant)?;
+                }
                 _ => return Err(LaunchPlanError::FrameRejected),
             }
         }
         if !terminated {
             return Err(LaunchPlanError::FrameRejected);
         }
-        plan.ok_or(LaunchPlanError::FrameRejected)
+        let plan = plan.ok_or(LaunchPlanError::FrameRejected)?;
+        plan.check_layer_consistency()?;
+        Ok(plan)
     }
 }
 
@@ -478,7 +578,16 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         .enforce_on_current_thread()
         .map_err(|error| error.to_string())?;
 
-    // 7. Exact program, exact argv, empty environment.
+    // 7. The seccomp socket-family filter closes what Landlock cannot reach:
+    //    UDP, raw and packet sockets, and non-TCP stream protocols. It is
+    //    installed last so its own installation needs no carve-outs in the
+    //    layers above, and like them it survives execve.
+    plan.socket_policy()
+        .map_err(|error| error.to_string())?
+        .apply_to_current_thread()
+        .map_err(|error| error.to_string())?;
+
+    // 8. Exact program, exact argv, empty environment.
     let program = CString::new(plan.program.as_os_str().as_encoded_bytes().to_vec())
         .map_err(|_| "program path contains NUL".to_owned())?;
     let mut argv = Vec::with_capacity(plan.arguments.len() + 1);
@@ -490,6 +599,20 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
     nix::unistd::execve(&program, &argv, &environment)
         .map_err(|error| format!("execve failed: {error}"))?;
     unreachable!("execve returned without an error")
+}
+
+fn socket_policy_from_grants(
+    grants: &[SocketGrant],
+) -> Result<SocketFamilyPolicy, crate::seccomp::SocketFilterError> {
+    let mut policy = SocketFamilyPolicy::deny_all();
+    for grant in grants {
+        policy = match grant {
+            SocketGrant::Unix => policy.allowing_unix_sockets()?,
+            SocketGrant::UnixSeqPacket => policy.allowing_unix_seqpacket_sockets()?,
+            SocketGrant::Tcp => policy.allowing_tcp_sockets()?,
+        };
+    }
+    Ok(policy)
 }
 
 fn os_string_from_bytes(bytes: Vec<u8>) -> Result<std::ffi::OsString, LaunchPlanError> {

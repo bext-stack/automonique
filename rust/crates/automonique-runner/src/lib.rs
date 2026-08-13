@@ -7,15 +7,18 @@
 //! A separately named in-process simulation API records deterministic events
 //! without presenting itself as provider execution or sandbox enforcement.
 
+pub mod backend;
 mod boundary;
 pub mod capability;
 mod containment;
+pub mod control;
 pub mod descriptors;
 pub mod filesystem;
 mod landlock_abi;
 mod launch;
 pub mod network;
 mod runner;
+pub mod seccomp;
 mod simulation;
 mod spec;
 mod spec_decode;
@@ -35,7 +38,7 @@ pub use containment::{
 };
 pub use launch::{
     FRAME_HEADER, FRAME_TERMINATOR, LaunchError, LaunchPlan, LaunchPlanError, MAX_FRAME_BYTES,
-    MAX_LAUNCH_ARG_BYTES, MAX_LAUNCH_ARGS, launch_entry_helper_main, spawn_sandboxed,
+    MAX_LAUNCH_ARG_BYTES, MAX_LAUNCH_ARGS, SocketGrant, launch_entry_helper_main, spawn_sandboxed,
 };
 pub use runner::{CancellationToken, ContainmentEvidence, Runner, RunnerError};
 pub use simulation::{

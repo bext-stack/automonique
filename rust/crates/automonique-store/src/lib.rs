@@ -8,6 +8,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod provider_journal;
+
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, OpenOptions};
