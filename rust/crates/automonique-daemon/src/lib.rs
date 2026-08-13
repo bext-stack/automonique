@@ -43,9 +43,12 @@ use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::sys::socket::{getsockopt, sockopt};
 use nix::unistd::geteuid;
 
+pub mod attempt_host;
 pub mod cancel_custody;
 mod synthetic;
 mod telegram;
+
+use attempt_host::DaemonAttemptHost;
 
 /// Socket filename inside the private product runtime directory.
 pub const ADMIN_SOCKET_NAME: &str = concat!("admin", ".sock");
@@ -59,6 +62,15 @@ pub const DATABASE_NAME: &str = concat!("automonique", ".sqlite3");
 /// versions independently of the scheduler's, and a submission is not scheduler
 /// state. What the separation costs is stated in that module's documentation.
 pub const RUN_SUBMISSIONS_NAME: &str = concat!("run-submissions", ".sqlite3");
+
+/// Durable host-wide cancellation ledger, a sibling of [`DATABASE_NAME`].
+///
+/// Separate for the same reason every sibling log is: its schema versions
+/// independently, and a cancellation request is not scheduler state. Being a
+/// sibling *of this state directory* is also what makes the daemon's
+/// single-dispatcher argument work — one state directory admits one daemon, so
+/// one ledger file has one owner. See [`attempt_host`].
+pub const RUN_CANCEL_LEDGER_NAME: &str = concat!("run-cancel-ledger", ".sqlite3");
 
 /// Maximum administration payload accepted by the daemon.
 pub const MAX_ADMIN_PAYLOAD_BYTES: usize = MAX_ADMIN_CANONICAL_BYTES;
@@ -139,6 +151,12 @@ impl DaemonConfig {
     pub fn run_submissions_path(&self) -> PathBuf {
         self.state_dir().join(RUN_SUBMISSIONS_NAME)
     }
+
+    /// Durable host-wide cancellation ledger path.
+    #[must_use]
+    pub fn run_cancel_ledger_path(&self) -> PathBuf {
+        self.state_dir().join(RUN_CANCEL_LEDGER_NAME)
+    }
 }
 
 /// A daemon lifecycle or local-control refusal.
@@ -168,6 +186,10 @@ pub enum DaemonError {
     /// The durable run submission log failed in a way no client caused. The
     /// payload is the stable category from that module.
     RunSubmissionFailed(&'static str),
+    /// The host-wide cancellation host could not be opened or could not be
+    /// disposed cleanly. The payload is the stable category from
+    /// [`attempt_host`].
+    AttemptHostFailed(&'static str),
 }
 
 impl DaemonError {
@@ -186,6 +208,7 @@ impl DaemonError {
             Self::Signal(_) => "signal",
             Self::TelegramRefused(category) => category,
             Self::RunSubmissionFailed(category) => category,
+            Self::AttemptHostFailed(category) => category,
         }
     }
 }
@@ -216,6 +239,9 @@ impl fmt::Display for DaemonError {
             }
             Self::RunSubmissionFailed(category) => {
                 write!(formatter, "run submission log failed: {category}")
+            }
+            Self::AttemptHostFailed(category) => {
+                write!(formatter, "attempt host refused: {category}")
             }
         }
     }
@@ -257,6 +283,13 @@ pub struct Daemon {
     reconciliation_run_id: Option<i64>,
     telegram: telegram::TelegramHost,
     run_submissions: RunSubmissionLog,
+    /// This host's one cancellation dispatcher over its one durable ledger.
+    ///
+    /// `Option` only so [`Daemon::serve`] can dispose of it explicitly while
+    /// the generation fence is still held — this type has a `Drop` impl, so a
+    /// field cannot otherwise be moved out. It is `Some` for the whole life of
+    /// a daemon a caller can observe.
+    attempt_host: Option<DaemonAttemptHost>,
     execution_state: automonique_protocol::admin::ExecutionState,
 }
 
@@ -350,6 +383,16 @@ impl Daemon {
         // publish an endpoint that accepts them.
         let run_submissions = RunSubmissionLog::open(config.run_submissions_path())
             .map_err(|error| DaemonError::RunSubmissionFailed(error.category()))?;
+
+        // The host's one cancellation dispatcher and its durable custody open
+        // beneath the same fence and before the socket guard is disarmed, for
+        // the same reason custody storage does: a daemon that cannot remember
+        // which cancellations it delivered must not publish an endpoint at all.
+        // This is also the moment the dispatcher's single-instance requirement
+        // is satisfied — one bound endpoint and one generation lease per state
+        // directory means one dispatcher per ledger file, with no new lock.
+        let attempt_host = DaemonAttemptHost::open(config.run_cancel_ledger_path())
+            .map_err(|error| DaemonError::AttemptHostFailed(error.category()))?;
         socket_cleanup.disarm();
 
         Ok(Self {
@@ -364,6 +407,7 @@ impl Daemon {
             reconciliation_run_id: None,
             telegram,
             run_submissions,
+            attempt_host: Some(attempt_host),
             execution_state: Self::measure_execution_state(),
         })
     }
@@ -372,6 +416,21 @@ impl Daemon {
     #[must_use]
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// This daemon's single host-wide cancellation dispatcher.
+    ///
+    /// Lent by reference and never by value: a second owner over the same
+    /// ledger file is exactly the composition
+    /// [`attempt_host`](crate::attempt_host) exists to prevent. `None` only
+    /// after [`Daemon::serve`] disposed of it, which no caller can observe
+    /// because `serve` consumes the daemon.
+    ///
+    /// Nothing in this build registers an attempt against it: no administration
+    /// command routes a cancel, so a running daemon's registry stays empty.
+    #[must_use]
+    pub fn attempt_host(&self) -> Option<&DaemonAttemptHost> {
+        self.attempt_host.as_ref()
     }
 
     /// Serve until the supplied stop flag is set or an authenticated shutdown
@@ -429,6 +488,18 @@ impl Daemon {
                 Err(error) => break Err(DaemonError::Io(error)),
             }
         };
+        // Cancellation dispatch ends first, beneath the still-held generation
+        // fence. The lease is what makes "one daemon is one dispatcher" true,
+        // so this process stops owning the ledger before it stops owning the
+        // generation: no successor can hold the generation while our dispatcher
+        // is still live over the same file. Disposal reports exactly one state
+        // — a host a panicking sink poisoned, whose last delivery is unknown —
+        // and reporting it is why shutdown does not simply drop the field.
+        let attempt_host_disposal = self
+            .attempt_host
+            .take()
+            .map_or(Ok(()), DaemonAttemptHost::dispose)
+            .map_err(|error| DaemonError::AttemptHostFailed(error.category()));
         // The bot lease releases before the generation lease so its release
         // still runs under a live generation authority; both results defer to
         // any primary serve failure.
@@ -448,11 +519,12 @@ impl Daemon {
         });
         match result {
             Err(primary) => {
+                let _ = attempt_host_disposal;
                 let _ = telegram_release;
                 let _ = release;
                 Err(primary)
             }
-            Ok(()) => telegram_release.and(release),
+            Ok(()) => attempt_host_disposal.and(telegram_release).and(release),
         }
     }
 

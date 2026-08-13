@@ -28,6 +28,7 @@ pub mod provider;
 pub mod provider_catalog;
 pub mod release;
 pub mod release_trust_root;
+pub mod runs_api;
 pub mod sandbox;
 pub mod schema;
 pub mod tools;
