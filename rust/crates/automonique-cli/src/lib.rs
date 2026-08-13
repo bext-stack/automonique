@@ -12,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 
 mod admin_client;
 mod attempt;
+mod automation;
 mod diagnostics;
 mod kernel;
 mod release;
@@ -40,7 +41,7 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
-const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique shutdown\n";
+const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique automation register <automation-id> <actor>\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique shutdown\n";
 
 #[derive(Clone)]
 enum Command {
@@ -81,6 +82,7 @@ enum Command {
     Shutdown,
     Attempt(attempt::Operation),
     Runs(runs::Operation),
+    Automation(automation::Operation),
 }
 
 /// Execute one closed product command. Arguments exclude the program name.
@@ -211,6 +213,61 @@ where
                 }
             }
         }
+        // `automation` is variadic for the same reason `runs` is: `list`
+        // takes repeating flags while the lifecycle verbs are positional with
+        // three different arities. The remaining words are collected here and
+        // matched by the verb they belong to, so a wrong arity is a usage
+        // refusal rather than a positional match that happened to bind.
+        (Some(command), Some(action), second, third) if command == "automation" => {
+            let words: Vec<OsString> = second
+                .into_iter()
+                .chain(third)
+                .chain(arguments.by_ref())
+                .collect();
+            match (action.to_str(), words.as_slice()) {
+                (Some("list"), _) => {
+                    Command::Automation(automation::Operation::List { flags: words })
+                }
+                (Some("detail"), [automation_id]) => {
+                    Command::Automation(automation::Operation::Detail {
+                        automation_id: automation_id.clone(),
+                    })
+                }
+                (Some("register"), [automation_id, actor]) => {
+                    Command::Automation(automation::Operation::Register {
+                        automation_id: automation_id.clone(),
+                        actor: actor.clone(),
+                    })
+                }
+                (Some("pause"), [automation_id, revision, actor, cause]) => {
+                    Command::Automation(automation::Operation::Pause {
+                        automation_id: automation_id.clone(),
+                        revision: revision.clone(),
+                        actor: actor.clone(),
+                        cause: cause.clone(),
+                    })
+                }
+                (Some("resume"), [automation_id, revision, actor]) => {
+                    Command::Automation(automation::Operation::Resume {
+                        automation_id: automation_id.clone(),
+                        revision: revision.clone(),
+                        actor: actor.clone(),
+                    })
+                }
+                (Some("archive"), [automation_id, revision, actor, cause]) => {
+                    Command::Automation(automation::Operation::Archive {
+                        automation_id: automation_id.clone(),
+                        revision: revision.clone(),
+                        actor: actor.clone(),
+                        cause: cause.clone(),
+                    })
+                }
+                _ => {
+                    let _ = stderr.write_all(USAGE.as_bytes());
+                    return 2;
+                }
+            }
+        }
         (Some(command), Some(operation), Some(socket_path), None)
             if command == "attempt" && operation == "heartbeat" =>
         {
@@ -327,6 +384,9 @@ where
         }
         Command::Runs(operation) => {
             return runs::run(&operation, runtime.as_deref(), &mut stdout, &mut stderr);
+        }
+        Command::Automation(operation) => {
+            return automation::run(&operation, runtime.as_deref(), &mut stdout, &mut stderr);
         }
         Command::Shutdown => {
             return admin_shutdown(runtime.as_deref(), &mut stdout, &mut stderr);

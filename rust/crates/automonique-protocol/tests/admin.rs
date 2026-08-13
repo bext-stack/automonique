@@ -1099,19 +1099,25 @@ fn a_reported_pause_cannot_claim_intake_is_still_open() {
 }
 
 // ---------------------------------------------------------------------------
-// One socket, two protocols.
+// One socket, three protocols.
 //
-// A local endpoint serves administration *and* the native Runs API read
-// surface. `LocalRequest` is the only thing that decides which, and it decides
-// by the protocol name the frame itself declares. These pin that the decision
-// is made once, before either lane reads a body, and that neither lane can be
-// reached through the other's decoder.
+// A local endpoint serves administration, the native Runs API read surface
+// *and* the native Automation control surface. `LocalRequest` is the only thing
+// that decides which, and it decides by the protocol name the frame itself
+// declares. These pin that the decision is made once, before any lane reads a
+// body, and that no lane can be reached through another's decoder.
 // ---------------------------------------------------------------------------
 
 mod local_dispatch {
     use super::*;
 
     use automonique_protocol::admin::{LocalRequest, LocalRequestError};
+    use automonique_protocol::automation::{AutomationActor, EnablementState};
+    use automonique_protocol::automation_api::{
+        AUTOMATION_PROTOCOL, AutomationApiError, AutomationCursor, AutomationId,
+        AutomationPageSize, AutomationRequest, AutomationStateFilter, ListAutomations,
+        MAX_AUTOMATION_CANONICAL_BYTES, PauseReason, RegisterAutomation, SetEnablement,
+    };
     use automonique_protocol::runs_api::{
         ListRuns, MAX_RUNS_CANONICAL_BYTES, PageSize, RUNS_PROTOCOL, RunStateFilter, RunsApiError,
         RunsRequest,
@@ -1138,13 +1144,35 @@ mod local_dispatch {
             .to_canonical_bytes()
     }
 
+    fn automation_id(value: &str) -> AutomationId {
+        AutomationId::new(value).expect("automation identity")
+    }
+
+    fn automation_listing() -> AutomationRequest {
+        AutomationRequest::ListAutomations {
+            request_id: request_id(),
+            query: ListAutomations::new(
+                AutomationStateFilter::any(),
+                AutomationCursor::START,
+                AutomationPageSize::MAX,
+            ),
+        }
+    }
+
+    fn automation_payload(request: &AutomationRequest) -> Vec<u8> {
+        request
+            .to_message()
+            .expect("encode automation request")
+            .to_canonical_bytes()
+    }
+
     #[test]
     fn a_local_frame_is_placed_by_the_protocol_it_declares() {
         let placed =
             LocalRequest::from_canonical_bytes(&admin_payload()).expect("an admin frame is placed");
         assert_eq!(placed.protocol(), ADMIN_PROTOCOL);
         let LocalRequest::Admin(request) = placed else {
-            panic!("an admin frame reached the runs lane")
+            panic!("an admin frame reached another lane")
         };
         assert_eq!(request.command(), AdminCommand::Status);
 
@@ -1159,6 +1187,37 @@ mod local_dispatch {
                 .expect("a runs frame is placed");
             assert_eq!(placed.protocol(), RUNS_PROTOCOL);
             assert_eq!(placed, LocalRequest::Runs(request));
+        }
+
+        for request in [
+            automation_listing(),
+            AutomationRequest::RegisterAutomation {
+                request_id: request_id(),
+                registration: RegisterAutomation::new(
+                    automation_id("nightly-report"),
+                    AutomationActor::new("ben").expect("actor"),
+                ),
+            },
+            AutomationRequest::SetEnablement {
+                request_id: request_id(),
+                transition: SetEnablement::new(
+                    automation_id("nightly-report"),
+                    1,
+                    EnablementState::Paused,
+                    AutomationActor::new("ben").expect("actor"),
+                    Some(PauseReason::new("provider outage").expect("cause")),
+                )
+                .expect("coupled transition"),
+            },
+            AutomationRequest::AutomationDetail {
+                request_id: request_id(),
+                automation_id: automation_id("nightly-report"),
+            },
+        ] {
+            let placed = LocalRequest::from_canonical_bytes(&automation_payload(&request))
+                .expect("an automation frame is placed");
+            assert_eq!(placed.protocol(), AUTOMATION_PROTOCOL);
+            assert_eq!(placed, LocalRequest::Automation(Box::new(request)));
         }
     }
 
@@ -1219,24 +1278,119 @@ mod local_dispatch {
             LocalRequest::from_canonical_bytes(inverted).expect_err("smuggled admin kind"),
             LocalRequestError::Runs(RunsApiError::UnknownKind)
         );
+
+        // The third lane refuses in its own vocabulary too. A listing body
+        // missing its declared `states` member is the Automation lane's
+        // `automation_invalid_body`, which no other lane can produce.
+        let short = br#"{"body":{"page_size":4,"since":0},"kind":"list_automations","protocol":"automonique.automation","request_id":"r","version":1}"#;
+        let error = LocalRequest::from_canonical_bytes(short).expect_err("short listing body");
+        assert_eq!(
+            error,
+            LocalRequestError::Automation(AutomationApiError::InvalidBody)
+        );
+        assert_eq!(error.category(), "automation_invalid_body");
+
+        // An automation kind inside an administration envelope stays the admin
+        // lane's refusal, and an admin kind inside an automation envelope stays
+        // the automation lane's. Neither falls through to the other.
+        let smuggled = br#"{"body":{"actor":"ben","automation_id":"a"},"kind":"register_automation","protocol":"automonique.admin","request_id":"r","version":1}"#;
+        assert_eq!(
+            LocalRequest::from_canonical_bytes(smuggled).expect_err("smuggled automation kind"),
+            LocalRequestError::Admin(AdminError::UnknownKind)
+        );
+        let inverted = br#"{"body":{},"kind":"shutdown","protocol":"automonique.automation","request_id":"r","version":1}"#;
+        assert_eq!(
+            LocalRequest::from_canonical_bytes(inverted).expect_err("smuggled admin kind"),
+            LocalRequestError::Automation(AutomationApiError::UnknownKind)
+        );
+
+        // A runs kind inside an automation envelope, and the reverse: the two
+        // newer lanes do not fall through to one another either.
+        let crossed = br#"{"body":{"page_size":64,"since":null,"states":null},"kind":"list_runs","protocol":"automonique.automation","request_id":"r","version":1}"#;
+        assert_eq!(
+            LocalRequest::from_canonical_bytes(crossed).expect_err("smuggled runs kind"),
+            LocalRequestError::Automation(AutomationApiError::UnknownKind)
+        );
+        let crossed = br#"{"body":{"actor":"ben","automation_id":"a"},"kind":"register_automation","protocol":"automonique.runs","request_id":"r","version":1}"#;
+        assert_eq!(
+            LocalRequest::from_canonical_bytes(crossed).expect_err("smuggled automation kind"),
+            LocalRequestError::Runs(RunsApiError::UnknownKind)
+        );
     }
 
     #[test]
-    fn neither_decoder_admits_the_other_protocol_s_frames() {
+    fn no_decoder_admits_another_protocol_s_frames() {
         // Placement is not the only thing keeping the lanes apart: each lane's
-        // own decoder refuses the other's bytes outright, so a caller that
+        // own decoder refuses the others' bytes outright, so a caller that
         // bypassed `LocalRequest` could not mix them either.
-        assert_eq!(
-            AdminRequest::from_canonical_bytes(&runs_payload(&listing()))
-                .expect_err("a runs frame is not an admin request")
-                .category(),
-            "unknown_protocol"
-        );
-        assert_eq!(
-            RunsRequest::from_canonical_bytes(&admin_payload())
-                .expect_err("an admin frame is not a runs request")
-                .category(),
-            "unknown_protocol"
+        let automation = automation_payload(&automation_listing());
+        for (label, category) in [
+            (
+                "a runs frame is not an admin request",
+                AdminRequest::from_canonical_bytes(&runs_payload(&listing()))
+                    .expect_err("runs into admin")
+                    .category(),
+            ),
+            (
+                "an automation frame is not an admin request",
+                AdminRequest::from_canonical_bytes(&automation)
+                    .expect_err("automation into admin")
+                    .category(),
+            ),
+            (
+                "an admin frame is not a runs request",
+                RunsRequest::from_canonical_bytes(&admin_payload())
+                    .expect_err("admin into runs")
+                    .category(),
+            ),
+            (
+                "an automation frame is not a runs request",
+                RunsRequest::from_canonical_bytes(&automation)
+                    .expect_err("automation into runs")
+                    .category(),
+            ),
+            (
+                "an admin frame is not an automation request",
+                AutomationRequest::from_canonical_bytes(&admin_payload())
+                    .expect_err("admin into automation")
+                    .category(),
+            ),
+            (
+                "a runs frame is not an automation request",
+                AutomationRequest::from_canonical_bytes(&runs_payload(&listing()))
+                    .expect_err("runs into automation")
+                    .category(),
+            ),
+        ] {
+            assert_eq!(category, "unknown_protocol", "{label}");
+        }
+    }
+
+    #[test]
+    fn a_maximal_automation_frame_fits_the_local_administration_read_bound() {
+        // The relation between the ceilings is a compile-time assertion in
+        // `admin.rs`, so this build could not have linked if it stopped
+        // holding. What is measured here is the consequence: a real Automation
+        // message, framed the way this socket frames it, fits the bound the
+        // local endpoint reads under.
+        const LOCAL_READ_BOUND: usize = MAX_ADMIN_CANONICAL_BYTES;
+        let payload = automation_payload(&AutomationRequest::SetEnablement {
+            request_id: request_id(),
+            transition: SetEnablement::new(
+                automation_id(&"\"".repeat(AutomationId::MAX_BYTES)),
+                u64::MAX >> 1,
+                EnablementState::Archived,
+                AutomationActor::new(&"\"".repeat(AutomationId::MAX_BYTES)).expect("actor"),
+                Some(PauseReason::new("\"".repeat(PauseReason::MAX_BYTES)).expect("cause")),
+            )
+            .expect("maximal transition"),
+        });
+        let mut frame = Vec::new();
+        encode_frame(&payload, &mut frame).expect("a maximal transition fits one frame");
+        assert!(
+            frame.len() < MAX_AUTOMATION_CANONICAL_BYTES && frame.len() < LOCAL_READ_BOUND,
+            "a maximal transition framed to {} bytes",
+            frame.len(),
         );
     }
 

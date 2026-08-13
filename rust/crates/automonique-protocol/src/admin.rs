@@ -18,22 +18,28 @@
 //! Carrying is all it does: see that type's documentation for what a carried
 //! pair does *not* establish.
 //!
-//! # One socket, two protocols
+//! # One socket, three protocols
 //!
 //! [`LocalRequest`] is what a local endpoint decodes a frame into. The local
-//! socket serves this protocol *and* [`crate::runs_api`]'s read surface, and
-//! the envelope's declared protocol name is what separates them — not a
-//! heuristic, not a fallback chain, and not a widening of [`AdminCommand`].
-//! That is the arrangement `runs_api` asks for in as many words: its values
-//! travel "on the same canonical-JSON envelope [`crate::admin`] uses, under a
-//! separate protocol name so the admin lane's closed kind set stays closed."
-//! A run listing is therefore not an admin command, does not appear in
+//! socket serves this protocol, [`crate::runs_api`]'s read surface *and*
+//! [`crate::automation_api`]'s control surface, and the envelope's declared
+//! protocol name is what separates them — not a heuristic, not a fallback
+//! chain, and not a widening of [`AdminCommand`]. That is the arrangement
+//! `runs_api` asks for in as many words: its values travel "on the same
+//! canonical-JSON envelope [`crate::admin`] uses, under a separate protocol
+//! name so the admin lane's closed kind set stays closed." A run listing or an
+//! automation pause is therefore not an admin command, does not appear in
 //! [`crate::command_registry`]'s admin surface, and cannot reach
 //! [`DaemonStatus`].
+//!
+//! Adding the third lane cost this module one enum arm, one match arm and one
+//! frame-fit assertion, and cost the admin lane nothing at all — which is the
+//! property the arrangement was chosen for.
 
 use std::error::Error;
 use std::fmt;
 
+use crate::automation_api::{AUTOMATION_PROTOCOL, AutomationApiError, AutomationRequest};
 use crate::codec::{
     CodecError, Envelope, MajorVersion, MessageKind, ProtocolName, RequestId, SupportedProtocol,
     VersionRange,
@@ -1469,21 +1475,35 @@ const _: () = assert!(
     "a maximal runs frame must fit the local administration read bound"
 );
 
+/// A maximal Automation frame must fit the bound a local transport reads under.
+///
+/// The same dependency the Runs ceiling has, stated for the same reason: a
+/// widened `automation_api` ceiling that outgrew this one would turn a legal
+/// Automation message into a `frame_size` refusal at the socket, which is a
+/// size failure discovered by a peer rather than by this build.
+const _: () = assert!(
+    crate::automation_api::MAX_AUTOMATION_CANONICAL_BYTES <= MAX_ADMIN_CANONICAL_BYTES,
+    "a maximal automation frame must fit the local administration read bound"
+);
+
 /// A refusal while deciding which protocol one local frame belongs to.
 ///
-/// The three variants say *who* refused, which is the distinction a metric
+/// The four variants say *who* refused, which is the distinction a metric
 /// label needs: an envelope this socket could not place at all, a well-placed
-/// administration message the admin lane refused, or a well-placed Runs message
-/// the Runs lane refused. Every category spelling is the refusing lane's own.
+/// administration message the admin lane refused, a well-placed Runs message
+/// the Runs lane refused, or a well-placed Automation message the Automation
+/// lane refused. Every category spelling is the refusing lane's own.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalRequestError {
     /// The payload is not a well-formed envelope, or names a protocol this
-    /// socket does not serve. Decided before either lane read a body.
+    /// socket does not serve. Decided before any lane read a body.
     Envelope(CodecError),
     /// The administration lane refused the message it was handed.
     Admin(AdminError),
     /// The Runs lane refused the message it was handed.
     Runs(RunsApiError),
+    /// The Automation control lane refused the message it was handed.
+    Automation(AutomationApiError),
 }
 
 impl LocalRequestError {
@@ -1494,6 +1514,7 @@ impl LocalRequestError {
             Self::Envelope(error) => error.category(),
             Self::Admin(error) => error.category(),
             Self::Runs(error) => error.category(),
+            Self::Automation(error) => error.category(),
         }
     }
 }
@@ -1504,6 +1525,7 @@ impl fmt::Display for LocalRequestError {
             Self::Envelope(error) => write!(formatter, "local frame was not placed: {error}"),
             Self::Admin(error) => write!(formatter, "{error}"),
             Self::Runs(error) => write!(formatter, "{error}"),
+            Self::Automation(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -1542,6 +1564,12 @@ pub enum LocalRequest {
     Admin(Box<AdminRequest>),
     /// A read on the native Runs API.
     Runs(RunsRequest),
+    /// A control operation on the native Automation API.
+    ///
+    /// Boxed for the reason the administration variant is: a
+    /// [`AutomationRequest`] carries three maximal bounded identifiers inline,
+    /// so an unboxed arm would set this enum's size for every lane.
+    Automation(Box<AutomationRequest>),
 }
 
 impl LocalRequest {
@@ -1566,6 +1594,9 @@ impl LocalRequest {
             RUNS_PROTOCOL => RunsRequest::from_canonical_bytes(payload)
                 .map(Self::Runs)
                 .map_err(LocalRequestError::Runs),
+            AUTOMATION_PROTOCOL => AutomationRequest::from_canonical_bytes(payload)
+                .map(|request| Self::Automation(Box::new(request)))
+                .map_err(LocalRequestError::Automation),
             _ => Err(LocalRequestError::Envelope(CodecError::UnknownProtocol)),
         }
     }
@@ -1576,6 +1607,7 @@ impl LocalRequest {
         match self {
             Self::Admin(_) => ADMIN_PROTOCOL,
             Self::Runs(_) => RUNS_PROTOCOL,
+            Self::Automation(_) => AUTOMATION_PROTOCOL,
         }
     }
 }

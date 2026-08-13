@@ -7,6 +7,7 @@
 
 pub mod admin;
 pub mod automation;
+pub mod automation_api;
 pub mod codec;
 pub mod codegen;
 pub mod command_registry;

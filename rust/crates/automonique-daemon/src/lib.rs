@@ -29,6 +29,13 @@ use automonique_protocol::admin::{
     MAX_ADMIN_CANONICAL_BYTES, OperationalMetric, OperationalStatus, OperationalStatusParts,
     OutboxReconciliationDecision,
 };
+use automonique_protocol::automation::{AutomationActor, EnablementState};
+use automonique_protocol::automation_api::{
+    AutomationContinuation, AutomationCursor, AutomationId, AutomationListPage,
+    AutomationReceiptView, AutomationRecordParts, AutomationRecordView, AutomationRefusal,
+    AutomationRequest, AutomationResponse, ListAutomations, PauseReason, RegisterAutomation,
+    SetEnablement,
+};
 use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, RequestId, decode_frame, encode_frame};
 use automonique_protocol::digest::{ALGORITHM, Sha256, Sha256Digest};
 use automonique_protocol::journal::{CursorResume, RetainedRange};
@@ -38,6 +45,10 @@ use automonique_protocol::runs_api::{
 };
 use automonique_protocol::tools::RunId;
 use automonique_runner::{RunSpec, RunSpecDecodeError};
+use automonique_store::automation_store::{
+    AutomationRecord, AutomationRegistration, AutomationStore, AutomationStoreError,
+    EnablementState as StoreEnablementState, EnablementTransition,
+};
 use automonique_store::run_index::{
     RunIndex, RunIndexEntry, RunIndexError, RunIndexRecord, RunSpoolState,
 };
@@ -83,6 +94,20 @@ pub const RUN_SUBMISSIONS_NAME: &str = concat!("run-submissions", ".sqlite3");
 /// read model are different things: the first is the source of truth, the
 /// second is rebuildable from it.
 pub const RUN_INDEX_NAME: &str = concat!("run-index", ".sqlite3");
+
+/// Durable automation enablement registry, a sibling of [`DATABASE_NAME`].
+///
+/// One row per automation, recording whether an operator has it in service and
+/// who withdrew it. Separate for the reason every sibling log is separate — its
+/// schema versions independently — and because an enablement decision is not
+/// scheduler state.
+///
+/// WHAT THIS FILE DOES NOT DO. It holds no schedule, no trigger and no action,
+/// and nothing in this build reads it to decide whether to run anything: there
+/// is no scheduler and no executor. A `paused` row therefore suppresses nothing
+/// today. It is written now so that the scheduler, when it lands, reads its
+/// enablement out of a durable record rather than inventing one.
+pub const AUTOMATION_REGISTRY_NAME: &str = concat!("automations", ".sqlite3");
 
 /// Durable host-wide cancellation ledger, a sibling of [`DATABASE_NAME`].
 ///
@@ -184,6 +209,12 @@ impl DaemonConfig {
     pub fn run_index_path(&self) -> PathBuf {
         self.state_dir().join(RUN_INDEX_NAME)
     }
+
+    /// Durable automation enablement registry path.
+    #[must_use]
+    pub fn automation_registry_path(&self) -> PathBuf {
+        self.state_dir().join(AUTOMATION_REGISTRY_NAME)
+    }
 }
 
 /// A daemon lifecycle or local-control refusal.
@@ -225,6 +256,15 @@ pub enum DaemonError {
     /// disposed cleanly. The payload is the stable category from
     /// [`attempt_host`].
     AttemptHostFailed(&'static str),
+    /// The durable automation registry failed in a way no client caused. The
+    /// payload is the stable category from that module.
+    ///
+    /// Deliberately separate from the refusals an operator earns: a malformed
+    /// field, an illegal transition and a stale revision are answered to the
+    /// client, while corruption, a schema mismatch and storage failure say the
+    /// daemon's own durable state is unsound and must not be presented as an
+    /// operator error. [`automation_refusal`] is where the line is drawn.
+    AutomationStoreFailed(&'static str),
 }
 
 impl DaemonError {
@@ -245,6 +285,7 @@ impl DaemonError {
             Self::RunSubmissionFailed(category) => category,
             Self::RunIndexFailed(category) => category,
             Self::AttemptHostFailed(category) => category,
+            Self::AutomationStoreFailed(category) => category,
         }
     }
 }
@@ -281,6 +322,9 @@ impl fmt::Display for DaemonError {
             }
             Self::AttemptHostFailed(category) => {
                 write!(formatter, "attempt host refused: {category}")
+            }
+            Self::AutomationStoreFailed(category) => {
+                write!(formatter, "automation registry failed: {category}")
             }
         }
     }
@@ -331,6 +375,14 @@ pub struct Daemon {
     /// for the reason custody storage is — a daemon that cannot record what it
     /// accepted must not publish an endpoint that accepts.
     run_index: RunIndex,
+    /// The durable record of which automations an operator has in service.
+    ///
+    /// A plain field for the same reason [`Daemon::run_index`] is: it owns no
+    /// dispatcher and needs no ordered disposal. Nothing in this daemon *reads*
+    /// it to decide anything — no scheduler consults it, because there is no
+    /// scheduler — so its whole role in this build is to answer the automation
+    /// control lane truthfully across restarts.
+    automations: AutomationStore,
     /// This host's one cancellation dispatcher over its one durable ledger.
     ///
     /// `Option` only so [`Daemon::serve`] can dispose of it explicitly while
@@ -440,6 +492,16 @@ impl Daemon {
         let run_index = RunIndex::open(config.run_index_path())
             .map_err(|error| DaemonError::RunIndexFailed(error.category()))?;
 
+        // The automation registry opens under the same fence and before the
+        // socket guard is disarmed, for the reason custody storage does: a
+        // daemon that cannot durably record an operator's decision to pause an
+        // automation must not publish an endpoint that accepts one. An
+        // in-memory pause that a restart forgets is exactly the failure this
+        // registry exists to remove, and serving the lane from a registry that
+        // failed to open would reintroduce it silently.
+        let automations = AutomationStore::open(config.automation_registry_path())
+            .map_err(|error| DaemonError::AutomationStoreFailed(error.category()))?;
+
         // The host's one cancellation dispatcher and its durable custody open
         // beneath the same fence and before the socket guard is disarmed, for
         // the same reason custody storage does: a daemon that cannot remember
@@ -464,6 +526,7 @@ impl Daemon {
             telegram,
             run_submissions,
             run_index,
+            automations,
             attempt_host: Some(attempt_host),
             execution_state: Self::measure_execution_state(),
         })
@@ -659,11 +722,11 @@ impl Daemon {
     /// Authenticate the peer, read one bounded frame, and hand it to the lane
     /// its envelope names.
     ///
-    /// The socket serves two protocols. Which one a frame belongs to is read
+    /// The socket serves three protocols. Which one a frame belongs to is read
     /// off its declared protocol name by
     /// [`LocalRequest::from_canonical_bytes`], never guessed and never tried in
-    /// sequence, so an administration client and a Runs client receive their
-    /// own lane's refusals rather than each other's.
+    /// sequence, so an administration client, a Runs client and an Automation
+    /// client receive their own lane's refusals rather than each other's.
     fn handle_stream(
         &mut self,
         stream: &mut UnixStream,
@@ -678,6 +741,7 @@ impl Daemon {
         {
             LocalRequest::Admin(request) => self.handle_admin(stream, &request, stop),
             LocalRequest::Runs(request) => self.handle_runs(stream, &request),
+            LocalRequest::Automation(request) => self.handle_automation(stream, &request),
         }
     }
 
@@ -1484,6 +1548,218 @@ impl Daemon {
         Ok(low)
     }
 
+    /// Answer one operation on the native Automation control API.
+    ///
+    /// # What an accepted write here does, and what it does not
+    ///
+    /// It commits one row to the durable registry saying that somebody
+    /// claiming to be `actor` decided this automation is, or is no longer, in
+    /// service. **Nothing else happens.** This daemon has no scheduler, no
+    /// trigger evaluator and no executor, so:
+    ///
+    /// - registering an automation starts nothing;
+    /// - pausing one suppresses nothing, because nothing was running; and
+    /// - resuming one resumes nothing.
+    ///
+    /// That is why an accepted write answers `accepted` rather than
+    /// `completed`: the row is committed, and the decision the row records has
+    /// not taken effect anywhere, because there is nowhere for it to take
+    /// effect yet.
+    ///
+    /// # Fencing
+    ///
+    /// Fenced exactly as [`Daemon::handle_runs`] is, and for a stronger reason:
+    /// this lane *writes*. A daemon that has lost its generation must not
+    /// record an operator's decision into a database another generation now
+    /// owns, and must not serve one out of it either.
+    ///
+    /// Unlike the intake arms, this is *not* closed by an operator pause or by
+    /// a degraded generation. An intake pause stops the daemon taking custody
+    /// of new work; withdrawing an automation from service is the opposite of
+    /// taking on work, and an operator repairing a degraded generation is
+    /// precisely the person who needs to pause the automations on it.
+    fn handle_automation(
+        &mut self,
+        stream: &mut UnixStream,
+        request: &AutomationRequest,
+    ) -> Result<(), DaemonError> {
+        let now_ms = unix_millis()?;
+        let snapshot = self.store.status_snapshot_at(GENERATION_ID, now_ms)?;
+        let generation = snapshot.generation().ok_or(StoreError::StaleEpoch)?;
+        if generation.holder_id() != self.instance_id.as_str()
+            || generation.lease_epoch() != self.lease_epoch
+            || generation.lease_expires_ms() != self.lease_expires_ms
+            || generation.lease_expires_ms() <= now_ms
+        {
+            return Err(DaemonError::Store(StoreError::StaleEpoch));
+        }
+        let response = match request {
+            AutomationRequest::RegisterAutomation {
+                request_id,
+                registration,
+            } => self.register_automation(request_id, registration, now_ms)?,
+            AutomationRequest::SetEnablement {
+                request_id,
+                transition,
+            } => self.set_enablement(request_id, transition, now_ms)?,
+            AutomationRequest::ListAutomations { request_id, query } => {
+                self.list_automations(request_id, query)?
+            }
+            AutomationRequest::AutomationDetail {
+                request_id,
+                automation_id,
+            } => self.automation_detail(request_id, automation_id)?,
+        };
+        let response = response
+            .to_message()
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
+            .to_canonical_bytes();
+        let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + response.len());
+        encode_frame(&response, &mut frame)
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
+        stream.write_all(&frame)?;
+        stream.flush()?;
+        Ok(())
+    }
+
+    /// Record one new automation, enabled, at revision one.
+    fn register_automation(
+        &mut self,
+        request_id: &RequestId,
+        registration: &RegisterAutomation,
+        now_ms: i64,
+    ) -> Result<AutomationResponse, DaemonError> {
+        let receipt = match self.automations.register(AutomationRegistration {
+            automation_id: registration.automation_id().as_str(),
+            actor: registration.actor().as_str(),
+            now_ms,
+        }) {
+            Ok(receipt) => receipt,
+            Err(error) => return refuse_automation(request_id, &error),
+        };
+        Ok(AutomationResponse::Accepted {
+            request_id: request_id.clone(),
+            receipt: AutomationReceiptView::new(
+                checked_row_id(receipt.entry_id)?,
+                registration.automation_id().clone(),
+                enablement_state(receipt.enablement),
+                receipt.revision,
+                automonique_protocol::primitives::EpochMillis::from_millis(receipt.updated_at_ms),
+            )
+            .map_err(automation_refused)?,
+        })
+    }
+
+    /// Move one automation along the enablement lattice.
+    ///
+    /// The cause coupling was already decided by the protocol's own decoder —
+    /// a causeless pause never reaches this function — and the store decides it
+    /// again. Neither check is redundant: the first refuses a malformed request
+    /// before it touches durable state, and the second refuses a malformed row
+    /// without trusting us.
+    fn set_enablement(
+        &mut self,
+        request_id: &RequestId,
+        transition: &SetEnablement,
+        now_ms: i64,
+    ) -> Result<AutomationResponse, DaemonError> {
+        let receipt = match self.automations.transition(EnablementTransition {
+            automation_id: transition.automation_id().as_str(),
+            expected_revision: transition.expected_revision(),
+            new_enablement: store_enablement_state(transition.target()),
+            actor: transition.actor().as_str(),
+            cause: transition.cause().map(PauseReason::as_str),
+            now_ms,
+        }) {
+            Ok(receipt) => receipt,
+            // A stale expected revision is a `conflict`, not a `rejected`: the
+            // caller's request was well-formed and the row simply moved, and
+            // the two are retried differently. The durable revision travels
+            // with the answer so a retry does not need a second round trip.
+            Err(AutomationStoreError::RevisionMismatch { expected, durable }) => {
+                return AutomationResponse::conflict(request_id.clone(), expected, durable)
+                    .map_err(automation_refused);
+            }
+            Err(error) => return refuse_automation(request_id, &error),
+        };
+        Ok(AutomationResponse::Accepted {
+            request_id: request_id.clone(),
+            receipt: AutomationReceiptView::new(
+                checked_row_id(receipt.entry_id)?,
+                transition.automation_id().clone(),
+                enablement_state(receipt.enablement),
+                receipt.revision,
+                automonique_protocol::primitives::EpochMillis::from_millis(receipt.updated_at_ms),
+            )
+            .map_err(automation_refused)?,
+        })
+    }
+
+    /// One bounded page of automations.
+    ///
+    /// The wire cursor is the store's own exclusive `entry_id` position, so
+    /// nothing is translated between the two coordinate spaces and there is no
+    /// off-by-one to re-derive — the failure the run listing had to work around
+    /// because it pages by a different key than it is cursored on.
+    fn list_automations(
+        &self,
+        request_id: &RequestId,
+        query: &ListAutomations,
+    ) -> Result<AutomationResponse, DaemonError> {
+        let cursor = query.since().position();
+        let limit = query.page_size().get();
+        let page = match query.states().states() {
+            // Translated variant by variant, so a state this build cannot name
+            // is a compile failure rather than a row the listing silently
+            // drops.
+            Some(states) => {
+                let states: Vec<StoreEnablementState> =
+                    states.iter().copied().map(store_enablement_state).collect();
+                self.automations.page_in_states(cursor, limit, &states)
+            }
+            None => self.automations.page(cursor, limit),
+        };
+        let page = match page {
+            Ok(page) => page,
+            Err(error) => return refuse_automation(request_id, &error),
+        };
+        let mut entries = Vec::with_capacity(page.entries.len());
+        for record in &page.entries {
+            entries.push(automation_record(record)?);
+        }
+        // `next_cursor` is set only when the store saw a further *matching*
+        // row, so a page shortened by the state filter still reports itself
+        // complete only when nothing matching remains.
+        let continuation = match page.next_cursor {
+            Some(next) => AutomationContinuation::More(AutomationCursor::new(next)),
+            None => AutomationContinuation::Complete,
+        };
+        let page = AutomationListPage::new(entries, continuation).map_err(automation_refused)?;
+        AutomationResponse::listing(request_id.clone(), query, page).map_err(automation_refused)
+    }
+
+    /// One automation in full, or [`AutomationRefusal::UnknownAutomation`].
+    fn automation_detail(
+        &self,
+        request_id: &RequestId,
+        automation_id: &AutomationId,
+    ) -> Result<AutomationResponse, DaemonError> {
+        let record = match self.automations.entry(automation_id.as_str()) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return Ok(AutomationResponse::Refused {
+                    request_id: request_id.clone(),
+                    refusal: AutomationRefusal::UnknownAutomation,
+                });
+            }
+            Err(error) => return refuse_automation(request_id, &error),
+        };
+        Ok(AutomationResponse::AutomationDetail {
+            request_id: request_id.clone(),
+            record: automation_record(&record)?,
+        })
+    }
+
     fn write_refusal(
         &self,
         stream: &mut UnixStream,
@@ -1565,6 +1841,106 @@ fn checked_row_id(value: i64) -> Result<u64, DaemonError> {
 
 fn runs_refused(error: automonique_protocol::runs_api::RunsApiError) -> DaemonError {
     DaemonError::ProtocolRefused(error.category())
+}
+
+fn automation_refused(
+    error: automonique_protocol::automation_api::AutomationApiError,
+) -> DaemonError {
+    DaemonError::ProtocolRefused(error.category())
+}
+
+/// Translate the registry's enablement vocabulary into the wire's.
+///
+/// Two closed three-word enums that mirror one another and one exhaustive match
+/// between them. Deliberately not a spelling comparison: a variant added or
+/// renamed on either side fails to compile here, where a lookup by word would
+/// have failed at runtime on the first row that carried it.
+const fn enablement_state(state: StoreEnablementState) -> EnablementState {
+    match state {
+        StoreEnablementState::Enabled => EnablementState::Enabled,
+        StoreEnablementState::Paused => EnablementState::Paused,
+        StoreEnablementState::Archived => EnablementState::Archived,
+    }
+}
+
+/// Translate the wire's enablement vocabulary into the registry's.
+const fn store_enablement_state(state: EnablementState) -> StoreEnablementState {
+    match state {
+        EnablementState::Enabled => StoreEnablementState::Enabled,
+        EnablementState::Paused => StoreEnablementState::Paused,
+        EnablementState::Archived => StoreEnablementState::Archived,
+    }
+}
+
+/// Project one validated registry row onto the wire.
+///
+/// Every field is re-validated by the protocol's own constructor rather than
+/// trusted through: the store validated it against its grammar, and this
+/// validates it against the wire's, which is the one a client will decode
+/// under. A row the wire cannot carry is a typed daemon failure rather than a
+/// row silently omitted from a page — the same rule the run listing follows for
+/// a dangling index row.
+fn automation_record(record: &AutomationRecord) -> Result<AutomationRecordView, DaemonError> {
+    use automonique_protocol::primitives::EpochMillis;
+
+    AutomationRecordView::new(AutomationRecordParts {
+        entry_id: checked_row_id(record.entry_id)?,
+        automation_id: AutomationId::new(&record.automation_id)
+            .map_err(|_| DaemonError::AutomationStoreFailed("automation_id_ungrammatical"))?,
+        revision: record.revision,
+        enablement: enablement_state(record.enablement),
+        actor: AutomationActor::new(&record.actor)
+            .map_err(|_| DaemonError::AutomationStoreFailed("actor_ungrammatical"))?,
+        cause: record
+            .cause
+            .as_deref()
+            .map(PauseReason::new)
+            .transpose()
+            .map_err(|_| DaemonError::AutomationStoreFailed("cause_ungrammatical"))?,
+        created_at: EpochMillis::from_millis(record.created_at_ms),
+        updated_at: EpochMillis::from_millis(record.updated_at_ms),
+    })
+    .map_err(automation_refused)
+}
+
+/// Answer one automation-registry failure to the client, or report it as ours.
+///
+/// The split is the same one the submission log gets: a malformed field, a
+/// duplicate registration, an illegal move, an incoherent cause, a lost cursor
+/// and a full registry are the operator's to fix and are answered with one
+/// closed word carrying no echo of what they sent. Corruption, a schema
+/// mismatch, an unsafe path and storage failure are *ours* — they say the
+/// daemon's own durable state is unsound — and presenting them as a refusal
+/// would blame an operator for our broken database.
+///
+/// [`AutomationStoreError::RevisionMismatch`] never reaches here: it is the
+/// `conflict` answer, handled at the call site before this function is asked.
+fn refuse_automation(
+    request_id: &RequestId,
+    error: &AutomationStoreError,
+) -> Result<AutomationResponse, DaemonError> {
+    let refusal = match error {
+        AutomationStoreError::InvalidField(_) => AutomationRefusal::InvalidField,
+        AutomationStoreError::AlreadyRegistered { .. } => AutomationRefusal::AlreadyRegistered,
+        AutomationStoreError::NotFound(_) => AutomationRefusal::UnknownAutomation,
+        AutomationStoreError::IllegalTransition { .. } => AutomationRefusal::IllegalTransition,
+        AutomationStoreError::CauseRequired { .. } => AutomationRefusal::CauseRequired,
+        AutomationStoreError::CauseForbidden { .. } => AutomationRefusal::CauseForbidden,
+        AutomationStoreError::CursorOutOfRange { .. } => AutomationRefusal::CursorOutOfRange,
+        AutomationStoreError::RegistryFull { .. } => AutomationRefusal::RegistryFull,
+        AutomationStoreError::RevisionMismatch { .. }
+        | AutomationStoreError::InsecurePath(_)
+        | AutomationStoreError::SchemaVersion { .. }
+        | AutomationStoreError::Corrupt(_)
+        | AutomationStoreError::Io(_)
+        | AutomationStoreError::Sqlite(_) => {
+            return Err(DaemonError::AutomationStoreFailed(error.category()));
+        }
+    };
+    Ok(AutomationResponse::Refused {
+        request_id: request_id.clone(),
+        refusal,
+    })
 }
 
 fn index_failed(error: RunIndexError) -> DaemonError {
