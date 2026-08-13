@@ -6,8 +6,21 @@
 //! configuration file must surface as `lease_owned_no_client` with a durable
 //! poller lease in the store; an absent file must remain `disabled_no_client`;
 //! and a present-but-wrong file must refuse startup rather than degrade into
-//! an honest-looking disabled state. No test involves the network: the whole
-//! point of this state is that HTTP stays deliberately unavailable.
+//! an honest-looking disabled state.
+//!
+//! # No test here reaches the network, and one of them proves it
+//!
+//! [`valid_config`] deliberately carries no `allow=` line, which is the gate:
+//! without one the daemon validates the token, drops it, constructs no client,
+//! and owns nothing but the lease. Every test that *serves* a daemon uses that
+//! configuration.
+//!
+//! One test does write an allowlist, and it must never call
+//! [`Daemon::serve`](automonique_daemon::Daemon::serve). Opening a daemon
+//! composes the live bridge; serving it is what puts the bridge on a thread and
+//! starts long-polling `api.telegram.org`. That separation is the invariant the
+//! test exists to hold, and moving the spawn into `open` would make this suite
+//! send real traffic.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -64,6 +77,10 @@ fn write_config(config: &DaemonConfig, content: &str, mode: u32) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("config mode");
 }
 
+/// A configured bot with nobody authorized to command it.
+///
+/// This is the whole gate in one fixture: a token and no `allow=` line, so the
+/// daemon owns the lease, drops the credential, and constructs no client.
 fn valid_config() -> String {
     [
         "schema=automonique.telegram-bot/v1",
@@ -228,6 +245,32 @@ fn a_token_for_a_different_bot_refuses_startup() {
     let mismatched = valid_config().replace("token=123456:", "token=999999:");
     write_config(&config, &mismatched, 0o600);
     assert_open_refuses(&config, "telegram_config_token");
+}
+
+#[test]
+fn a_malformed_allowlist_entry_refuses_startup() {
+    let (_root, config) = fixture();
+    let broken = valid_config().replace("bot_id=123456", "bot_id=123456\nallow=not-a-user");
+    write_config(&config, &broken, 0o600);
+    assert_open_refuses(&config, "telegram_config_allowlist");
+}
+
+/// Opening a daemon with an allowlist composes the live control bridge — three
+/// store connections, two clients, and a parked poller — and dials nothing.
+///
+/// This test must never serve. See the module documentation: `open` composes and
+/// `serve` starts, and that split is the only reason this assertion is hermetic.
+#[test]
+fn an_allowlisted_configuration_composes_without_dialling_anything() {
+    let (_root, config) = fixture();
+    let allowlisted = valid_config().replace("bot_id=123456", "bot_id=123456\nallow=7654321");
+    write_config(&config, &allowlisted, 0o600);
+
+    let daemon = Daemon::open(&config).expect("a live configuration opens");
+    assert!(config.admin_socket().exists(), "the endpoint is published");
+    // Dropped without serving: the composed bridge is released, no thread was
+    // ever spawned, and no request was ever prepared.
+    drop(daemon);
 }
 
 #[test]

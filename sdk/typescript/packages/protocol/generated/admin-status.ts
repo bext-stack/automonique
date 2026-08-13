@@ -57,8 +57,8 @@ export function decodeExecutionState(value: string): ExecutionState {
   return value as ExecutionState;
 }
 
-export type TelegramState = "disabled_no_client" | "lease_owned_no_client";
-export const TelegramState_VALUES: readonly TelegramState[] = ["disabled_no_client", "lease_owned_no_client"];
+export type TelegramState = "disabled_no_client" | "lease_owned_no_client" | "polling_live";
+export const TelegramState_VALUES: readonly TelegramState[] = ["disabled_no_client", "lease_owned_no_client", "polling_live"];
 /** Security-sensitive: an undefined value is refused. */
 export function decodeTelegramState(value: string): TelegramState {
   if (!(TelegramState_VALUES as readonly string[]).includes(value)) {

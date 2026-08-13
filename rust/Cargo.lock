@@ -68,6 +68,7 @@ dependencies = [
  "automonique-runner",
  "automonique-store",
  "automonique-transport-runtime",
+ "automonique-transports",
  "nix",
  "rusqlite",
  "tempfile",

@@ -100,6 +100,7 @@ pub mod cancel_custody;
 pub mod execute;
 mod synthetic;
 mod telegram;
+pub mod telegram_bridge;
 
 use attempt_host::DaemonAttemptHost;
 
@@ -708,18 +709,29 @@ impl Daemon {
             now_ms,
         )?;
 
+        // The execution measurement is taken here rather than beside the lane
+        // below, because the Telegram host reports it in a status reply and a
+        // second probe would be a second answer to a question with one.
+        let execution_state = Self::measure_execution_state();
+
         // The Telegram host loads its explicit configuration and, when one
         // exists, acquires the durable bot lease beneath the generation fence
         // established above. An absent configuration is the disabled state; a
         // present-but-refused one fails startup rather than being ignored.
-        let telegram = telegram::TelegramHost::open(
-            &state_dir,
-            &config.database_path(),
-            GENERATION_ID,
-            instance_id.as_str(),
-            lease.epoch,
-            TELEGRAM_LEASE_TTL_MS,
-        )
+        //
+        // A configuration that also names authorized users *composes* a live
+        // control bridge here and dials nothing: `TelegramHost::start` is what
+        // puts it on a thread, and only `serve` calls that.
+        let telegram = telegram::TelegramHost::open(&telegram::TelegramHostParams {
+            state_dir: &state_dir,
+            database_path: &config.database_path(),
+            run_index_path: &config.run_index_path(),
+            generation_id: GENERATION_ID,
+            holder_id: instance_id.as_str(),
+            authority_lease_epoch: lease.epoch,
+            ttl_ms: TELEGRAM_LEASE_TTL_MS,
+            execution_state,
+        })
         .map_err(|error| DaemonError::TelegramRefused(error.category()))?;
 
         // Custody storage opens beneath the same fence and before the socket
@@ -788,7 +800,6 @@ impl Daemon {
         // deferred to the first request, because preparing one moves this
         // process into a supervisor leaf, and a daemon nobody asks to execute
         // anything must not have its own placement changed.
-        let execution_state = Self::measure_execution_state();
         let execution = execute::ExecutionLane::open(
             Arc::clone(&attempt_host),
             state_dir.clone(),
@@ -857,51 +868,68 @@ impl Daemon {
     /// closed and do not stop the daemon.
     pub fn serve(mut self, stop: &AtomicBool) -> Result<(), DaemonError> {
         let mut next_renewal = std::time::Instant::now() + LEASE_RENEW_INTERVAL;
-        let result = loop {
-            if stop.load(Ordering::Acquire) {
-                break Ok(());
-            }
-            if std::time::Instant::now() >= next_renewal {
-                if let Err(error) = self.renew_lease() {
+        // LIVE TELEGRAM POLLING BEGINS HERE, AND NOWHERE ELSE.
+        //
+        // Opening a daemon composes the bridge; serving it is what puts the
+        // bridge on a thread. That split is why a process that opened a daemon
+        // and never served — a refused startup, or a caller that only wanted the
+        // socket path — has issued no request to anybody. A host with no
+        // configured allowlist has nothing to start and this is a no-op.
+        //
+        // A failure here still falls through to the shutdown block below rather
+        // than returning: this process already holds the generation and has an
+        // open tenure row, and both have to be closed under it.
+        let result = match self.telegram.start() {
+            Err(error) => Err(DaemonError::TelegramRefused(error.category())),
+            Ok(()) => loop {
+                if stop.load(Ordering::Acquire) {
+                    break Ok(());
+                }
+                if std::time::Instant::now() >= next_renewal {
+                    if let Err(error) = self.renew_lease() {
+                        break Err(error);
+                    }
+                    // The bot lease renews on the same cadence and beneath the
+                    // just-renewed generation authority; losing it is fencing
+                    // evidence, not a condition to poll through. A live host
+                    // republishes the renewed lease to its poller here, which is
+                    // what keeps the next long poll inside its own expiry.
+                    if let Err(error) = self.telegram.renew() {
+                        break Err(DaemonError::TelegramRefused(error.category()));
+                    }
+                    next_renewal = std::time::Instant::now() + LEASE_RENEW_INTERVAL;
+                }
+                if self.reconciliation_run_id.is_none()
+                    && let Err(error) = self.tick_synthetic()
+                {
                     break Err(error);
                 }
-                // The bot lease renews on the same cadence and beneath the
-                // just-renewed generation authority; losing it is fencing
-                // evidence, not a condition to poll through.
-                if let Err(error) = self.telegram.renew() {
-                    break Err(DaemonError::TelegramRefused(error.category()));
-                }
-                next_renewal = std::time::Instant::now() + LEASE_RENEW_INTERVAL;
-            }
-            if self.reconciliation_run_id.is_none()
-                && let Err(error) = self.tick_synthetic()
-            {
-                break Err(error);
-            }
-            match self.listener.accept() {
-                Ok((mut stream, _)) => {
-                    // The timed renewal and each store mutation validate the
-                    // durable epoch. Read-only status additionally compares a
-                    // consistent lease snapshot, so client polling must not
-                    // turn into an fsync/lease-write storm.
-                    match self.handle_stream(&mut stream, stop) {
-                        Ok(()) => {}
-                        Err(DaemonError::Store(store_error)) => {
-                            if fatal_store_error(&store_error) {
-                                break Err(DaemonError::Store(store_error));
+                match self.listener.accept() {
+                    Ok((mut stream, _)) => {
+                        // The timed renewal and each store mutation validate the
+                        // durable epoch. Read-only status additionally compares
+                        // a consistent lease snapshot, so client polling must not
+                        // turn into an fsync/lease-write storm.
+                        match self.handle_stream(&mut stream, stop) {
+                            Ok(()) => {}
+                            Err(DaemonError::Store(store_error)) => {
+                                if fatal_store_error(&store_error) {
+                                    break Err(DaemonError::Store(store_error));
+                                }
+                            }
+                            Err(_) => {
+                                // A hostile or incomplete peer is isolated to
+                                // this connection. Refusal details never contain
+                                // bytes.
                             }
                         }
-                        Err(_) => {
-                            // A hostile or incomplete peer is isolated to this
-                            // connection. Refusal details never contain bytes.
-                        }
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(ACCEPT_POLL);
+                    }
+                    Err(error) => break Err(DaemonError::Io(error)),
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(ACCEPT_POLL);
-                }
-                Err(error) => break Err(DaemonError::Io(error)),
-            }
+            },
         };
         // LIVE ATTEMPTS END FIRST, AND THEY END BY FINISHING.
         //
@@ -937,7 +965,10 @@ impl Daemon {
         });
         // The bot lease releases before the generation lease so its release
         // still runs under a live generation authority; both results defer to
-        // any primary serve failure.
+        // any primary serve failure. A live host stops and joins its poller
+        // first, for the reason the execution lane is joined above: that thread
+        // commits to durable state this generation owns, and it holds the very
+        // lease being released.
         let telegram_release = self
             .telegram
             .release()

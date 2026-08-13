@@ -291,12 +291,33 @@ impl DaemonState {
 }
 
 /// Telegram capability state reported independently from local synthetic intake.
+///
+/// The three states are ordered by capability, and the boundary that matters to
+/// an operator is between the second and the third: the first two both say no
+/// trusted HTTP client exists, so no message can arrive and no reply can leave,
+/// while the third says one does. A host must never report a no-client state
+/// while holding a client — that field is the only place an operator can read
+/// whether their bot is answering, and a hopeful answer there is worse than no
+/// field at all.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TelegramState {
     /// No trusted HTTP client or configured bot exists; no bot lease is owned.
     DisabledNoClient,
-    /// A configured bot lease is owned, but HTTP remains deliberately unavailable.
+    /// A configured bot lease is owned, but HTTP is unavailable: no client is
+    /// held and no credential is retained, so nothing can arrive or leave.
+    ///
+    /// About what is *held*, not about what was once constructed. A host whose
+    /// poller stopped and released its client is in this state as truthfully as
+    /// one that never built a client at all — both mean the same thing to the
+    /// operator reading it, which is that the bot is not answering.
     LeaseOwnedNoClient,
+    /// A configured bot lease is owned *and* a trusted HTTP client is bound to
+    /// it, so this host is the live poller for that bot.
+    ///
+    /// The client and the lease are acquired together, which is what makes this
+    /// one state rather than two: a host that holds the lease and could talk to
+    /// Telegram is exactly the host that will, for as long as it serves.
+    PollingLive,
 }
 
 impl TelegramState {
@@ -305,6 +326,7 @@ impl TelegramState {
         match self {
             Self::DisabledNoClient => "disabled_no_client",
             Self::LeaseOwnedNoClient => "lease_owned_no_client",
+            Self::PollingLive => "polling_live",
         }
     }
 
@@ -312,6 +334,7 @@ impl TelegramState {
         match value {
             "disabled_no_client" => Ok(Self::DisabledNoClient),
             "lease_owned_no_client" => Ok(Self::LeaseOwnedNoClient),
+            "polling_live" => Ok(Self::PollingLive),
             _ => Err(AdminError::InvalidBody),
         }
     }
@@ -2262,6 +2285,12 @@ impl DaemonStatus {
     }
 
     /// Replace the default disabled Telegram observation with an exact coherent state.
+    ///
+    /// The pairing is the coherence rule, and it is exhaustive over the state:
+    /// the disabled state owns no lease and so has no epoch, and both states
+    /// that own one must name it. A live poller is fenced by the same epoch its
+    /// lease carries, so it is held to the same requirement rather than a
+    /// weaker one.
     pub fn with_telegram(
         mut self,
         telegram_state: TelegramState,
@@ -2270,7 +2299,10 @@ impl DaemonStatus {
         if !matches!(
             (telegram_state, telegram_poller_epoch),
             (TelegramState::DisabledNoClient, None)
-                | (TelegramState::LeaseOwnedNoClient, Some(1..))
+                | (
+                    TelegramState::LeaseOwnedNoClient | TelegramState::PollingLive,
+                    Some(1..)
+                )
         ) {
             return Err(AdminError::InvalidBody);
         }

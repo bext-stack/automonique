@@ -1486,12 +1486,13 @@ fn telegram_state_values() -> Vec<String> {
     [
         TelegramState::DisabledNoClient,
         TelegramState::LeaseOwnedNoClient,
+        TelegramState::PollingLive,
     ]
     .into_iter()
     .map(|state| match state {
-        TelegramState::DisabledNoClient | TelegramState::LeaseOwnedNoClient => {
-            state.as_str().to_owned()
-        }
+        TelegramState::DisabledNoClient
+        | TelegramState::LeaseOwnedNoClient
+        | TelegramState::PollingLive => state.as_str().to_owned(),
     })
     .collect()
 }

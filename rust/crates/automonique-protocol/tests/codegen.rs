@@ -1053,7 +1053,11 @@ mod maintained_surface {
             (
                 ADMIN_STATUS_MODULE,
                 "TelegramState",
-                &["disabled_no_client", "lease_owned_no_client"],
+                &[
+                    "disabled_no_client",
+                    "lease_owned_no_client",
+                    "polling_live",
+                ],
             ),
         ];
         for (file_name, name, values) in expected {

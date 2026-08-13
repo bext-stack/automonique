@@ -821,6 +821,30 @@ fn telegram_status_is_closed_and_epoch_coherent() {
     })
     .expect("owned no-client state");
     assert_eq!(owned.telegram_poller_epoch(), Some(9));
+    // A live poller owns the same lease and is held to the same pairing: it
+    // must name the epoch that fences it.
+    let live = DaemonStatus::new(
+        AdminInstanceId::new("daemon-telegram").expect("instance"),
+        DaemonState::Ready,
+        1,
+        1,
+        0,
+        0,
+        0,
+        true,
+    )
+    .and_then(|status| {
+        status.with_telegram(
+            automonique_protocol::admin::TelegramState::PollingLive,
+            Some(9),
+        )
+    })
+    .expect("live polling state");
+    assert_eq!(
+        live.telegram_state(),
+        automonique_protocol::admin::TelegramState::PollingLive
+    );
+    assert_eq!(live.telegram_poller_epoch(), Some(9));
     for (state, epoch) in [
         (
             automonique_protocol::admin::TelegramState::DisabledNoClient,
@@ -829,6 +853,14 @@ fn telegram_status_is_closed_and_epoch_coherent() {
         (
             automonique_protocol::admin::TelegramState::LeaseOwnedNoClient,
             None,
+        ),
+        (
+            automonique_protocol::admin::TelegramState::PollingLive,
+            None,
+        ),
+        (
+            automonique_protocol::admin::TelegramState::PollingLive,
+            Some(0),
         ),
     ] {
         assert_eq!(
@@ -863,6 +895,43 @@ fn telegram_status_is_closed_and_epoch_coherent() {
             .expect_err("unknown telegram state"),
         AdminError::InvalidBody
     );
+
+    // Every state survives the wire as itself. A live poller that decoded as an
+    // owned-but-clientless one would be the exact misreport this field exists
+    // to prevent, so the round trip is asserted rather than assumed.
+    for state in [
+        automonique_protocol::admin::TelegramState::DisabledNoClient,
+        automonique_protocol::admin::TelegramState::LeaseOwnedNoClient,
+        automonique_protocol::admin::TelegramState::PollingLive,
+    ] {
+        let epoch = match state {
+            automonique_protocol::admin::TelegramState::DisabledNoClient => None,
+            automonique_protocol::admin::TelegramState::LeaseOwnedNoClient
+            | automonique_protocol::admin::TelegramState::PollingLive => Some(4),
+        };
+        let payload = AdminResponse::Status {
+            request_id: request_id(),
+            status: status()
+                .with_telegram(state, epoch)
+                .expect("coherent telegram pair"),
+        }
+        .to_message()
+        .expect("status message")
+        .to_canonical_bytes();
+        assert!(
+            String::from_utf8(payload.clone())
+                .expect("UTF-8")
+                .contains(&format!("\"telegram_state\":\"{}\"", state.as_str())),
+            "{state:?} did not encode as its own spelling"
+        );
+        let AdminResponse::Status { status, .. } =
+            AdminResponse::from_canonical_bytes(&payload).expect("admitted response")
+        else {
+            panic!("wrong response variant")
+        };
+        assert_eq!(status.telegram_state(), state);
+        assert_eq!(status.telegram_poller_epoch(), epoch);
+    }
 }
 
 #[test]

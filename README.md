@@ -254,15 +254,21 @@ paths at that level. The concrete store adapter persists dispositions and the
 offset atomically. The daemon now loads an explicit operator-written bot
 configuration from a private `telegram/bot.conf` under its state directory —
 header/terminator-framed, owner-only permissions required, the token validated
-against its `bot_id` and then dropped rather than retained — and, when one is
-present, acquires, renews, and cleanly releases the durable per-bot poller
-lease beneath its generation fence, reporting `lease_owned_no_client` with the
-lease epoch over the authenticated status command. An absent configuration
-stays honestly `disabled_no_client`; a present-but-invalid or insecure one
-refuses startup instead of degrading silently, and a live predecessor's bot
-lease is fenced out by expiry, never seized. HTTP polling itself remains
-deliberately unavailable: no client is constructed, and enabling it requires a
-future admin-protocol extension. The observability crate derives bounded metrics from one timestamped
+against its `bot_id` — and, when one is present, acquires, renews, and cleanly
+releases the durable per-bot poller lease beneath its generation fence. An
+absent configuration stays honestly `disabled_no_client`; a present-but-invalid
+or insecure one refuses startup instead of degrading silently, and a live
+predecessor's bot lease is fenced out by expiry, never seized. Whether that
+lease is *used* is a second, explicit decision: without an `allow=` line naming
+who may command the bot, the token is dropped, no client is constructed, and
+the daemon reports `lease_owned_no_client` with the lease epoch. With one, the
+token is retained in memory, one worker thread long-polls beneath the same
+lease, and the status reports `polling_live` — a daemon holding a client never
+reports a no-client state. That poller answers `/help`, `/status` and `/runs`
+from the daemon's own read surfaces on its own store connections, refuses a
+sender outside the allowlist without reading their message, and replies to
+`/run`, `/cancel`, `/approve` and `/deny` that the surface behind them does not
+exist yet rather than faking an effect. The observability crate derives bounded metrics from one timestamped
 SQLite snapshot and serves them over the local authenticated status command,
 but it has no metrics exporter. A release-manifest candidate can bind the
 descriptor helper, boundary installer, fixture, workspace, and runner digests
