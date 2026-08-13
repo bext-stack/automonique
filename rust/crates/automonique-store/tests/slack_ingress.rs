@@ -589,3 +589,57 @@ fn a_group_readable_log_file_is_refused() {
     let error = SlackIngressLog::open(private.path()).expect_err("privacy refusal");
     assert_eq!(error.category(), "insecure_path");
 }
+
+// ---------------------------------------------------------------------------
+// CHECK-constraint audit: a NULL must not slip the digest coupling
+//
+// SQLite treats a CHECK that evaluates to NULL as *satisfied*, so a coupling
+// written over a nullable column as a bare comparison admits the very row it
+// was written to refuse — `length(NULL) = 64` is `NULL`, not false. This
+// coupling spells `content_digest IS NOT NULL` before it measures anything, so
+// the admitted-without-a-digest row is refused rather than believed. The
+// opposite half, a digest on a content-free disposition, is covered by
+// `the_database_itself_refuses_a_digest_on_a_content_free_disposition`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_null_never_slips_the_content_digest_coupling() {
+    let (private, log) = log();
+    drop(log);
+
+    let raw = Connection::open(private.path()).expect("raw write");
+    let disposition = |source_key: &str, coupled: &str| {
+        format!(
+            "INSERT INTO slack_ingress_dispositions
+                 (source_key, app_id, envelope_id, retry_attempt, recorded_at_ms,
+                  disposition, content_digest)
+             VALUES ('{source_key}', 'A0FIRST', 'envelope-x', 0, 1500, {coupled})"
+        )
+    };
+    let whole = digest('a');
+
+    for (what, statement) in [
+        (
+            "an admitted delivery with no digest at all",
+            disposition("slack:audit:none", "'admitted', NULL"),
+        ),
+        (
+            "an admitted delivery with a short digest",
+            disposition("slack:audit:short", "'admitted', 'abc'"),
+        ),
+    ] {
+        assert!(
+            raw.execute(&statement, []).is_err(),
+            "the database must refuse {what}"
+        );
+    }
+
+    // Tightness, not mere strictness: both legal pairings still land.
+    raw.execute(
+        &disposition("slack:audit:whole", &format!("'admitted', '{whole}'")),
+        [],
+    )
+    .expect("an admitted delivery with a whole digest");
+    raw.execute(&disposition("slack:audit:denied", "'denied', NULL"), [])
+        .expect("a denied delivery with no digest");
+}

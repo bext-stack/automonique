@@ -1229,3 +1229,56 @@ fn the_schema_version_this_module_owns_is_stable() {
     // A bump here is a migration decision, not an implementation detail.
     assert_eq!(APPROVAL_LEDGER_SCHEMA_VERSION, 1);
 }
+
+// ---------------------------------------------------------------------------
+// CHECK-constraint audit: the write-once revision has no nullable side
+//
+// SQLite treats a CHECK that evaluates to NULL as *satisfied*, which is only a
+// hazard where a CHECK can be handed a NULL. Every column this table's CHECKs
+// speak about is `NOT NULL`, so `revision = 1` — the constraint that makes
+// write-once a property of the table rather than of this file — can never
+// evaluate to NULL and be waved through.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_nullable_column_reaches_a_check_in_this_table() {
+    let (private, ledger) = ledger();
+    drop(ledger);
+
+    let raw = Connection::open(private.path()).expect("raw write");
+    let decision = |approval_key: &str, coupled: &str| {
+        format!(
+            "INSERT INTO approval_decisions
+                 (approval_key, subject, decider, decided_at_ms,
+                  decision, revision)
+             VALUES ('{approval_key}', 'subject:a', 'operator', 0, {coupled})"
+        )
+    };
+
+    for (what, statement) in [
+        // A NULL is refused by the column, so no CHECK here is ever handed one.
+        (
+            "a revisionless decision",
+            decision("audit:a", "'granted', NULL"),
+        ),
+        ("a decisionless decision", decision("audit:a", "NULL, 1")),
+        // And the constraints themselves bite on the values that do reach them.
+        (
+            "a decision at a second revision",
+            decision("audit:a", "'granted', 2"),
+        ),
+        (
+            "a decision outside the vocabulary",
+            decision("audit:a", "'deferred', 1"),
+        ),
+    ] {
+        assert!(
+            raw.execute(&statement, []).is_err(),
+            "the database must refuse {what}"
+        );
+    }
+
+    // Tightness, not mere strictness: a legal decision still lands.
+    raw.execute(&decision("audit:a", "'granted', 1"), [])
+        .expect("a granted decision at revision one");
+}

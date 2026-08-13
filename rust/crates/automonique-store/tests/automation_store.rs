@@ -1367,3 +1367,66 @@ fn the_stored_vocabulary_is_closed_to_anything_else() {
         .expect("the column admits every spelling this build defines");
     }
 }
+
+// ---------------------------------------------------------------------------
+// CHECK-constraint audit: a NULL must not slip the cause coupling
+//
+// SQLite treats a CHECK that evaluates to NULL as *satisfied*, so a coupling
+// written over a nullable column as a bare comparison admits the very row it
+// was written to refuse. `cause` is the nullable column here, and the coupling
+// is NULL-safe by construction: `(enablement = 'enabled') = (cause IS NULL)`
+// compares two results that are each `0` or `1`, because `enablement` is
+// `NOT NULL` and `IS NULL` never yields `NULL`. The causeless-withdrawal half is
+// the one a bare comparison would have lost, so it is spelled out below.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_null_never_slips_the_cause_coupling() {
+    let (private, store) = registry();
+    drop(store);
+
+    let raw = Connection::open(private.path()).expect("raw write");
+    let automation = |automation_id: &str, coupled: &str| {
+        format!(
+            "INSERT INTO automations
+                 (automation_id, revision, actor, created_at_ms, updated_at_ms,
+                  enablement, cause)
+             VALUES ('{automation_id}', 1, 'operator', 0, 0, {coupled})"
+        )
+    };
+
+    for (what, statement) in [
+        (
+            "a pause with no stated cause",
+            automation("auto:paused", "'paused', NULL"),
+        ),
+        (
+            "an archival with no stated cause",
+            automation("auto:archived", "'archived', NULL"),
+        ),
+        (
+            "an enabled automation carrying a cause",
+            automation("auto:enabled", "'enabled', 'why'"),
+        ),
+    ] {
+        assert!(
+            raw.execute(&statement, []).is_err(),
+            "the database must refuse {what}"
+        );
+    }
+
+    // Tightness, not mere strictness: both legal pairings still land.
+    for (what, statement) in [
+        (
+            "an enabled automation with no cause",
+            automation("auto:live", "'enabled', NULL"),
+        ),
+        (
+            "a pause with a stated cause",
+            automation("auto:withdrawn", "'paused', 'why'"),
+        ),
+    ] {
+        raw.execute(&statement, [])
+            .unwrap_or_else(|error| panic!("the database must admit {what}: {error}"));
+    }
+}

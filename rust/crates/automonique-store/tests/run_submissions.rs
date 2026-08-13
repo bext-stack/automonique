@@ -485,3 +485,63 @@ fn hand_written_rows_surface_as_corruption_on_read_and_on_record() {
     assert_eq!(error.category(), "corrupt");
     assert!(error.to_string().contains("run_id"), "{error}");
 }
+
+// ---------------------------------------------------------------------------
+// CHECK-constraint audit: no CHECK here can be handed a NULL
+//
+// SQLite treats a CHECK that evaluates to NULL as *satisfied*, which is only a
+// hazard where a CHECK can be handed a NULL. Every column this table constrains
+// is `NOT NULL`, so the digest width and the non-empty document are decided
+// rather than waved through.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_nullable_column_reaches_a_check_in_this_table() {
+    let (private, log) = log();
+    drop(log);
+
+    let raw = Connection::open(private.path()).expect("raw write");
+    let submission = |coupled: &str| {
+        format!(
+            "INSERT INTO run_submissions
+                 (idempotency_key, run_id, accepted_at_ms,
+                  spec_digest, document, state)
+             VALUES ('audit:key', 'run:alpha', 0, {coupled})"
+        )
+    };
+    let whole = "a".repeat(64);
+
+    for (what, statement) in [
+        // A NULL is refused by the column, so no CHECK here is ever handed one.
+        (
+            "a digestless submission",
+            submission("NULL, x'01', 'accepted'"),
+        ),
+        (
+            "a documentless submission",
+            submission(&format!("'{whole}', NULL, 'accepted'")),
+        ),
+        // And the constraints themselves bite on the values that do reach them.
+        (
+            "a digest of the wrong width",
+            submission("'abc', x'01', 'accepted'"),
+        ),
+        (
+            "an empty document",
+            submission(&format!("'{whole}', x'', 'accepted'")),
+        ),
+        (
+            "a state outside the one-word vocabulary",
+            submission(&format!("'{whole}', x'01', 'pending'")),
+        ),
+    ] {
+        assert!(
+            raw.execute(&statement, []).is_err(),
+            "the database must refuse {what}"
+        );
+    }
+
+    // Tightness, not mere strictness: a legal submission still lands.
+    raw.execute(&submission(&format!("'{whole}', x'01', 'accepted'")), [])
+        .expect("a whole digest over a non-empty document");
+}

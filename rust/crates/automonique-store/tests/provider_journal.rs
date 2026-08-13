@@ -1245,3 +1245,163 @@ fn reopen_keeps_wal_foreign_keys_and_durable_rows() {
         .expect_err("orphan turn refusal");
     assert_eq!(error.category(), "not_found");
 }
+
+// ---------------------------------------------------------------------------
+// CHECK-constraint audit: a NULL must not slip a terminal coupling
+//
+// SQLite treats a CHECK that evaluates to NULL as *satisfied*, so a coupling
+// written over a nullable column as a bare comparison admits the very row it was
+// written to refuse. Every terminal coupling in this schema is stated in
+// `IS NULL`/`IS NOT NULL` terms rather than in comparisons, so none of them can
+// evaluate to NULL at all — and this test is what stops one of them from being
+// restated as a comparison later. Each refusal is paired with the legal terminal
+// row the coupling must still admit.
+// ---------------------------------------------------------------------------
+
+/// Runs one raw statement per case and asserts every one of them is refused.
+fn each_refused(raw: &Connection, cases: &[(&str, &str)]) {
+    for (what, statement) in cases {
+        assert!(
+            raw.execute(statement, []).is_err(),
+            "the database must refuse {what}"
+        );
+    }
+}
+
+/// Runs one raw statement per case and asserts every one of them is admitted.
+fn each_admitted(raw: &Connection, cases: &[(&str, &str)]) {
+    for (what, statement) in cases {
+        raw.execute(statement, [])
+            .unwrap_or_else(|error| panic!("the database must admit {what}: {error}"));
+    }
+}
+
+#[test]
+fn a_null_never_slips_the_terminal_state_couplings() {
+    let (private, mut journal) = journal();
+    let (process_id, session_id, turn_id) = live_turn(&mut journal);
+    assert_eq!((process_id, session_id, turn_id), (1, 1, 1));
+    drop(journal);
+
+    let raw = Connection::open(private.path()).expect("raw write");
+    each_refused(
+        &raw,
+        &[
+            (
+                "a process that exited at no instant",
+                "INSERT INTO provider_processes
+                     (spawn_key, attempt_id, provider_kind, executable_digest,
+                      spawned_ms, revision, state, exited_ms)
+                 VALUES ('spawn:audit', 'attempt:audit', 'kind',
+                         'abababababababababababababababababababababababababababababababab',
+                         0, 1, 'exited', NULL)",
+            ),
+            (
+                "a live process that exited anyway",
+                "UPDATE provider_processes SET exited_ms = 5 WHERE process_id = 1",
+            ),
+            (
+                "a session that closed at no instant",
+                "INSERT INTO provider_sessions
+                     (process_id, provider_session_key, opened_ms, revision,
+                      state, closed_ms)
+                 VALUES (1, 'session:audit', 0, 1, 'closed', NULL)",
+            ),
+            (
+                "a turn that aborted at no instant",
+                "INSERT INTO provider_turns
+                     (session_id, ordinal, turn_key, opened_ms, revision,
+                      state, closed_ms)
+                 VALUES (1, 7, 'turn:audit', 0, 1, 'aborted', NULL)",
+            ),
+            (
+                "an answered request that settled at no instant",
+                "INSERT INTO provider_requests
+                     (turn_id, request_key, direction, payload_digest, created_ms,
+                      revision, outcome, response_digest, failure_reason, settled_ms)
+                 VALUES (1, 'req:audit-a', 'to_provider',
+                         'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd',
+                         0, 1, 'answered',
+                         'efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef',
+                         NULL, NULL)",
+            ),
+            (
+                "an answered request with no answer",
+                "INSERT INTO provider_requests
+                     (turn_id, request_key, direction, payload_digest, created_ms,
+                      revision, outcome, response_digest, failure_reason, settled_ms)
+                 VALUES (1, 'req:audit-b', 'to_provider',
+                         'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd',
+                         0, 1, 'answered', NULL, NULL, 5)",
+            ),
+            (
+                "a failed request with no stated reason",
+                "INSERT INTO provider_requests
+                     (turn_id, request_key, direction, payload_digest, created_ms,
+                      revision, outcome, response_digest, failure_reason, settled_ms)
+                 VALUES (1, 'req:audit-c', 'to_provider',
+                         'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd',
+                         0, 1, 'failed', NULL, NULL, 5)",
+            ),
+            (
+                "a pending request that already settled",
+                "INSERT INTO provider_requests
+                     (turn_id, request_key, direction, payload_digest, created_ms,
+                      revision, outcome, response_digest, failure_reason, settled_ms)
+                 VALUES (1, 'req:audit-d', 'to_provider',
+                         'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd',
+                         0, 1, 'pending', NULL, NULL, 5)",
+            ),
+        ],
+    );
+
+    // Tightness, not mere strictness: every legal terminal shape still lands.
+    each_admitted(
+        &raw,
+        &[
+            (
+                "a process that exited at an instant",
+                "INSERT INTO provider_processes
+                     (spawn_key, attempt_id, provider_kind, executable_digest,
+                      spawned_ms, revision, state, exited_ms)
+                 VALUES ('spawn:audit', 'attempt:audit', 'kind',
+                         'abababababababababababababababababababababababababababababababab',
+                         0, 1, 'exited', 5)",
+            ),
+            (
+                "a session that closed at an instant",
+                "INSERT INTO provider_sessions
+                     (process_id, provider_session_key, opened_ms, revision,
+                      state, closed_ms)
+                 VALUES (1, 'session:audit', 0, 1, 'closed', 5)",
+            ),
+            (
+                "a turn that aborted at an instant",
+                "INSERT INTO provider_turns
+                     (session_id, ordinal, turn_key, opened_ms, revision,
+                      state, closed_ms)
+                 VALUES (1, 7, 'turn:audit', 0, 1, 'aborted', 5)",
+            ),
+            (
+                "an answered request carrying its answer and its instant",
+                "INSERT INTO provider_requests
+                     (turn_id, request_key, direction, payload_digest, created_ms,
+                      revision, outcome, response_digest, failure_reason, settled_ms)
+                 VALUES (1, 'req:audit-a', 'to_provider',
+                         'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd',
+                         0, 1, 'answered',
+                         'efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef',
+                         NULL, 5)",
+            ),
+            (
+                "a failed request carrying its reason and its instant",
+                "INSERT INTO provider_requests
+                     (turn_id, request_key, direction, payload_digest, created_ms,
+                      revision, outcome, response_digest, failure_reason, settled_ms)
+                 VALUES (1, 'req:audit-c', 'to_provider',
+                         'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd',
+                         0, 1, 'failed', NULL, 'provider hung up', 5)",
+            ),
+        ],
+    );
+}

@@ -1169,3 +1169,58 @@ fn the_stored_vocabulary_is_closed_to_anything_else() {
         .expect("the column admits every spelling this build defines");
     }
 }
+
+// ---------------------------------------------------------------------------
+// CHECK-constraint audit: the ready binding has no nullable side
+//
+// SQLite treats a CHECK that evaluates to NULL as *satisfied*, which is only a
+// hazard where a CHECK can be handed a NULL. Every column this table's CHECKs
+// speak about is `NOT NULL`, so none of them ever can be, and this test is what
+// keeps that true: it drives a NULL at each of them through a raw connection and
+// watches the column refuse it before the CHECK is ever consulted.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_nullable_column_reaches_a_check_in_this_table() {
+    let (private, index) = index();
+    drop(index);
+
+    let raw = Connection::open(private.path()).expect("raw write");
+    let entry = |submission_id: &str, coupled: &str| {
+        format!(
+            "INSERT INTO run_index
+                 (submission_id, run_id, updated_at_ms, revision,
+                  spool_state, last_sequence)
+             VALUES ({submission_id}, 'run:alpha', 0, 1, {coupled})"
+        )
+    };
+
+    for (what, statement) in [
+        // A NULL on either side of the binding is refused by the column, so the
+        // binding is never asked a question it would answer with NULL.
+        ("a stateless entry", entry("1", "NULL, 0")),
+        ("a sequenceless entry", entry("1", "'ready', NULL")),
+        (
+            "an entry belonging to no submission",
+            entry("NULL", "'ready', 0"),
+        ),
+        // And the binding itself bites on the values that do reach it.
+        ("a ready entry past sequence zero", entry("1", "'ready', 5")),
+        (
+            "a running entry still at sequence zero",
+            entry("1", "'running', 0"),
+        ),
+        ("a submission identity below one", entry("0", "'ready', 0")),
+    ] {
+        assert!(
+            raw.execute(&statement, []).is_err(),
+            "the database must refuse {what}"
+        );
+    }
+
+    // Tightness, not mere strictness: both legal pairings still land.
+    raw.execute(&entry("1", "'ready', 0"), [])
+        .expect("a fresh entry sits at ready and sequence zero");
+    raw.execute(&entry("2", "'running', 5"), [])
+        .expect("a started entry carries the sequence it reached");
+}

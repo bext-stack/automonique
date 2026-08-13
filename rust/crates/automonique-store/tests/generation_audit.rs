@@ -1005,3 +1005,80 @@ fn a_lowered_capacity_refuses_new_tenures_without_disturbing_recorded_ones() {
         Some(EndKind::Released)
     );
 }
+
+// ---------------------------------------------------------------------------
+// CHECK-constraint audit: a NULL must not slip the end coupling
+//
+// SQLite treats a CHECK that evaluates to NULL as *satisfied*, so a coupling
+// written over a nullable column as a bare comparison admits the very row it
+// was written to refuse. This table has two nullable columns and both couplings
+// are already NULL-safe by construction, which is exactly what this test pins:
+// `(ended_at_ms IS NULL) = (end_kind IS NULL)` compares two `IS NULL` results,
+// each of them `0` or `1` and never `NULL`, and the ordering rule guards its own
+// nullable side with `ended_at_ms IS NULL OR ...` before it compares. The right
+// side of that comparison, `started_at_ms`, is `NOT NULL`, so the comparison is
+// decidable whenever it is reached at all.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_null_never_slips_the_tenure_end_coupling() {
+    let (private, mut audit) = audit();
+    audit
+        .open_tenure(opening("holder:one", 1, 1_000))
+        .expect("open");
+    drop(audit);
+
+    let raw = Connection::open(private.path()).expect("raw write");
+    for (what, statement) in [
+        (
+            "an end kind with no instant to go with it",
+            "UPDATE generation_tenures SET end_kind = 'released'",
+        ),
+        (
+            "an end instant with no kind to go with it",
+            "UPDATE generation_tenures SET ended_at_ms = 2000",
+        ),
+        (
+            "an end before the epoch",
+            "UPDATE generation_tenures SET ended_at_ms = -1, end_kind = 'released'",
+        ),
+        (
+            "an end before its own start",
+            "UPDATE generation_tenures SET ended_at_ms = 999, end_kind = 'released'",
+        ),
+    ] {
+        assert!(
+            raw.execute(statement, []).is_err(),
+            "the database must refuse {what}"
+        );
+    }
+
+    // A tenure that starts and never began is not representable either, which is
+    // what keeps `ended_at_ms >= started_at_ms` from ever being asked a question
+    // it can only answer with NULL.
+    raw.execute(
+        "INSERT INTO generation_tenures
+             (generation_id, holder_id, lease_epoch, started_at_ms,
+              ended_at_ms, end_kind, revision)
+         VALUES ('generation:beta', 'holder:two', 1, NULL, NULL, NULL, 1)",
+        [],
+    )
+    .expect_err("started_at_ms is NOT NULL, so the ordering rule is decidable");
+
+    // Tightness, not mere strictness: both legal shapes still land.
+    raw.execute(
+        "INSERT INTO generation_tenures
+             (generation_id, holder_id, lease_epoch, started_at_ms,
+              ended_at_ms, end_kind, revision)
+         VALUES ('generation:beta', 'holder:two', 1, 1000, NULL, NULL, 1)",
+        [],
+    )
+    .expect("an open tenure carries neither instant nor kind");
+    raw.execute(
+        "UPDATE generation_tenures
+         SET ended_at_ms = 1000, end_kind = 'released'
+         WHERE generation_id = 'generation:alpha'",
+        [],
+    )
+    .expect("a tenure may end on the instant it started");
+}

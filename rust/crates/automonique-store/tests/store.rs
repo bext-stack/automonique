@@ -3024,3 +3024,263 @@ fn only_the_inbox_transport_key_widened_and_it_still_ends() {
     let short = submit(&mut store, "telegram:7:42", "scope:short");
     assert_eq!(submit(&mut store, "telegram:7:42", "scope:short"), short);
 }
+
+// ---------------------------------------------------------------------------
+// CHECK-constraint audit: a NULL must not slip a coupling
+//
+// SQLite treats a CHECK that evaluates to NULL as *satisfied*. A coupling
+// written over a nullable column as a bare comparison — `col >= 1` — therefore
+// admits the very row it was written to refuse, because `NULL >= 1` is `NULL`
+// rather than false. Every coupling below spells `IS NULL` or `IS NOT NULL`
+// before it compares anything, and these tests are what stops that spelling
+// from being tidied back into a hole. Each drives the constraint through a raw
+// connection, the only writer that can present a row this API never would, and
+// each pairs its refusals with the legal row the fix must still admit.
+// ---------------------------------------------------------------------------
+
+/// Runs one raw statement per case and asserts every one of them is refused.
+fn each_refused(raw: &Connection, cases: &[(&str, String)]) {
+    for (what, statement) in cases {
+        assert!(
+            raw.execute(statement, []).is_err(),
+            "the database must refuse {what}"
+        );
+    }
+}
+
+/// Runs one raw statement per case and asserts every one of them is admitted.
+fn each_admitted(raw: &Connection, cases: &[(&str, String)]) {
+    for (what, statement) in cases {
+        raw.execute(statement, [])
+            .unwrap_or_else(|error| panic!("the database must admit {what}: {error}"));
+    }
+}
+
+#[test]
+fn a_null_never_slips_the_outbox_state_coupling() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let epoch = lease(&mut store, "holder-a", 1);
+    add_effect(&mut store, epoch, "audit", 10);
+    drop(store);
+
+    let raw = Connection::open(database.path()).expect("raw write");
+    let event_id: i64 = raw
+        .query_row("SELECT event_id FROM domain_events LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .expect("an event to hang an effect on");
+    // Everything a row needs but the eight columns the coupling speaks about is
+    // fixed, so a refusal can only have come from the coupling under test.
+    let effect = |intent: &str, coupled: &str| {
+        format!(
+            "INSERT INTO outbox
+                 (intent_key, event_id, transport, kind, payload, revision,
+                  attempts, available_ms, last_error, created_ms,
+                  state, lease_token, lease_generation_id, lease_holder,
+                  lease_epoch, lease_expires_ms, delivery_receipt_key,
+                  delivered_ms)
+             VALUES ('{intent}', {event_id}, 'test', 'test.effect', x'00', 1,
+                     0, 0, NULL, 0, {coupled})"
+        )
+    };
+
+    each_refused(
+        &raw,
+        &[
+            (
+                "an in-flight effect whose lease has no epoch",
+                effect(
+                    "audit:no-epoch",
+                    "'in_flight', 'lt', 'generation-a', 'holder-a', NULL, 5, NULL, NULL",
+                ),
+            ),
+            (
+                "an in-flight effect whose lease never expires",
+                effect(
+                    "audit:no-expiry",
+                    "'in_flight', 'lt', 'generation-a', 'holder-a', 1, NULL, NULL, NULL",
+                ),
+            ),
+            (
+                "an in-flight effect leased at epoch zero",
+                effect(
+                    "audit:epoch-zero",
+                    "'in_flight', 'lt', 'generation-a', 'holder-a', 0, 5, NULL, NULL",
+                ),
+            ),
+            (
+                "a delivered effect with no delivery instant",
+                effect(
+                    "audit:no-instant",
+                    "'delivered', NULL, NULL, NULL, NULL, NULL, 'receipt:audit', NULL",
+                ),
+            ),
+            (
+                "a dead-lettered effect with no delivery instant",
+                effect(
+                    "audit:no-death",
+                    "'dead_lettered', NULL, NULL, NULL, NULL, NULL, NULL, NULL",
+                ),
+            ),
+        ],
+    );
+
+    // The coupling is tight, not merely strict: every legal shape still lands.
+    each_admitted(
+        &raw,
+        &[
+            (
+                "a pending effect carrying no lease at all",
+                effect(
+                    "audit:pending",
+                    "'pending', NULL, NULL, NULL, NULL, NULL, NULL, NULL",
+                ),
+            ),
+            (
+                "an in-flight effect carrying a whole lease",
+                effect(
+                    "audit:leased",
+                    "'in_flight', 'lt', 'generation-a', 'holder-a', 1, 5, NULL, NULL",
+                ),
+            ),
+            (
+                "a delivered effect carrying a receipt and an instant",
+                effect(
+                    "audit:delivered",
+                    "'delivered', NULL, NULL, NULL, NULL, NULL, 'receipt:done', 7",
+                ),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_null_never_slips_the_telegram_ingress_content_coupling() {
+    let database = PrivateDatabase::new();
+    let store = Store::open(database.path()).expect("open");
+    drop(store);
+
+    let raw = Connection::open(database.path()).expect("raw write");
+    raw.execute(
+        "INSERT INTO telegram_offsets (bot_id, next_offset, revision, updated_ms)
+         VALUES (77, x'0000000000000000', 1, 0)",
+        [],
+    )
+    .expect("an offset row to hang updates on");
+    let update = |update_id: u8, source: &str, coupled: &str| {
+        format!(
+            "INSERT INTO telegram_ingress
+                 (bot_id, update_id, source_key, scope, received_ms,
+                  disposition, content)
+             VALUES (77, x'00000000000000{update_id:02x}', '{source}', 'scope:a',
+                     0, {coupled})"
+        )
+    };
+
+    each_refused(
+        &raw,
+        &[
+            (
+                "an admitted update with no content",
+                update(1, "src:1", "'admitted', NULL"),
+            ),
+            (
+                "an admitted update with empty content",
+                update(2, "src:2", "'admitted', x''"),
+            ),
+            (
+                "a denied update carrying content anyway",
+                update(3, "src:3", "'denied', x'00'"),
+            ),
+        ],
+    );
+    each_admitted(
+        &raw,
+        &[
+            (
+                "an admitted update with content",
+                update(4, "src:4", "'admitted', x'00'"),
+            ),
+            (
+                "a denied update with no content",
+                update(5, "src:5", "'denied', NULL"),
+            ),
+        ],
+    );
+
+    // The columns v5 bolted onto `telegram_batches` guard their own NULL, since
+    // an ALTER TABLE cannot add a table-level coupling to lean on.
+    let batch = |expected: u8, next: u8, coupled: &str| {
+        format!(
+            "INSERT INTO telegram_batches
+                 (bot_id, expected_offset, next_offset, disposition_count,
+                  received_ms, poller_generation_id, poller_holder_id,
+                  batch_digest, poller_epoch)
+             VALUES (77, x'00000000000000{expected:02x}',
+                     x'00000000000000{next:02x}', 1, 0, NULL, NULL, {coupled})"
+        )
+    };
+    each_refused(
+        &raw,
+        &[
+            ("a digest of the wrong width", batch(1, 2, "x'00', NULL")),
+            ("a poller epoch of zero", batch(3, 4, "NULL, 0")),
+        ],
+    );
+    each_admitted(
+        &raw,
+        &[
+            ("a batch no poller has claimed", batch(5, 6, "NULL, NULL")),
+            (
+                "a batch a poller claimed at epoch one",
+                batch(7, 8, &format!("x'{}', 1", "ab".repeat(32))),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_null_never_slips_the_intake_pause_resume_coupling() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let epoch = lease(&mut store, "holder-a", 1);
+    pause(
+        &mut store,
+        "holder-a",
+        epoch,
+        "operator-a",
+        "maintenance",
+        5,
+    )
+    .expect("pause");
+    drop(store);
+
+    let raw = Connection::open(database.path()).expect("raw write");
+    let resumption = |set: &str| format!("UPDATE intake_pauses SET {set}");
+
+    each_refused(
+        &raw,
+        &[
+            (
+                "a resume instant with nobody who decided it",
+                resumption("resumed_at_ms = 10"),
+            ),
+            (
+                "a resuming actor with no instant",
+                resumption("resume_actor = 'operator-b'"),
+            ),
+            (
+                "a resume before the epoch",
+                resumption("resumed_at_ms = -1, resume_actor = 'operator-b'"),
+            ),
+        ],
+    );
+    each_admitted(
+        &raw,
+        &[(
+            "a whole resume",
+            resumption("resumed_at_ms = 10, resume_actor = 'operator-b'"),
+        )],
+    );
+}

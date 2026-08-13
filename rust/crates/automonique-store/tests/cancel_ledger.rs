@@ -833,3 +833,45 @@ fn pruning_frees_capacity_for_new_entries() {
         .expect("delivery after prune");
     assert_eq!(receipt.disposition, CancelDisposition::Delivered);
 }
+
+// ---------------------------------------------------------------------------
+// CHECK-constraint audit: no CHECK here can be handed a NULL
+//
+// SQLite treats a CHECK that evaluates to NULL as *satisfied*, which is only a
+// hazard where a CHECK can be handed a NULL. Every column this table constrains
+// is `NOT NULL`, so both non-negative ranges are decided rather than waved
+// through.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_nullable_column_reaches_a_check_in_this_table() {
+    let (private, ledger) = ledger();
+    drop(ledger);
+
+    let raw = Connection::open(private.path()).expect("raw write");
+    let request = |coupled: &str| {
+        format!(
+            "INSERT INTO cancel_requests
+                 (request_ref, attempt_id, observed_sequence, requested_at_ms)
+             VALUES ('audit:ref', 'attempt:a', {coupled})"
+        )
+    };
+
+    for (what, statement) in [
+        // A NULL is refused by the column, so no CHECK here is ever handed one.
+        ("a sequenceless request", request("NULL, 0")),
+        ("a request at no instant", request("0, NULL")),
+        // And the ranges themselves bite on the values that do reach them.
+        ("a request behind sequence zero", request("-1, 0")),
+        ("a request before the epoch", request("0, -1")),
+    ] {
+        assert!(
+            raw.execute(&statement, []).is_err(),
+            "the database must refuse {what}"
+        );
+    }
+
+    // Tightness, not mere strictness: a legal request still lands.
+    raw.execute(&request("0, 0"), [])
+        .expect("a first observation at the epoch");
+}
