@@ -219,6 +219,7 @@ pub struct Daemon {
     controller: automonique_core::Controller,
     reconciliation_run_id: Option<i64>,
     telegram: telegram::TelegramHost,
+    execution_state: automonique_protocol::admin::ExecutionState,
 }
 
 struct SocketCleanup {
@@ -318,6 +319,7 @@ impl Daemon {
             controller: automonique_core::Controller::new(),
             reconciliation_run_id: None,
             telegram,
+            execution_state: Self::measure_execution_state(),
         })
     }
 
@@ -406,6 +408,31 @@ impl Daemon {
                 Err(primary)
             }
             Ok(()) => telegram_release.and(release),
+        }
+    }
+
+    /// Measure whether this host could enforce the composed sandbox.
+    ///
+    /// The measurement is the capability module's read-only probe asking for
+    /// exactly the properties the composed launch path enforces: containment,
+    /// filesystem restriction, TCP denial, and syscall restriction. It runs
+    /// once at startup: delegation is a property of the daemon's own cgroup
+    /// placement, which does not change while the process lives. The answer
+    /// says nothing about executing work — this release wires no lane — and a
+    /// refusal is the expected truthful state on an undelegated host.
+    fn measure_execution_state() -> automonique_protocol::admin::ExecutionState {
+        use automonique_protocol::admin::ExecutionState;
+        use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
+
+        let selection = HostCapabilities::probe().select_mode(&[
+            BoundaryProperty::DescendantContainment,
+            BoundaryProperty::FilesystemRestriction,
+            BoundaryProperty::TcpDenial,
+            BoundaryProperty::SyscallRestriction,
+        ]);
+        match selection {
+            Ok(_) => ExecutionState::SandboxEnforceableNoLane,
+            Err(_) => ExecutionState::SandboxUnavailableNoLane,
         }
     }
 
@@ -499,6 +526,7 @@ impl Daemon {
                     !degraded,
                 )
                 .and_then(|status| status.with_telegram(telegram_state, telegram_poller_epoch))
+                .map(|status| status.with_execution(self.execution_state))
                 .and_then(|status| status.with_operational(operational))
                 .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
                 AdminResponse::Status {

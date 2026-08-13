@@ -10,8 +10,9 @@
 //!    no plan content appears in process listings;
 //! 2. migrates itself into the run's [`RunContainment`] cgroup and confirms
 //!    membership from the kernel ([`crate::containment`]);
-//! 3. replaces stdin with `/dev/null`, so the workload cannot read the plan
-//!    channel;
+//! 3. replaces stdin with the prompt descriptor the plan names — an anonymous,
+//!    sealed, memory-backed file — or with `/dev/null` when it names none, so
+//!    the workload cannot read the plan channel either way;
 //! 4. closes every descriptor except the standard streams and verifies the
 //!    closure ([`crate::descriptors`]);
 //! 5. installs the plan's Landlock filesystem allowlist
@@ -21,12 +22,13 @@
 //!    which denies creating every socket shape the plan does not grant —
 //!    including UDP, raw and packet sockets, and non-TCP stream protocols
 //!    that Landlock's TCP rules cannot see;
-//! 8. `execve`s the workload with an empty environment.
+//! 8. `execve`s the workload with exactly the environment the plan names.
 //!
 //! Any failure at any step exits with [`crate::HELPER_REFUSED_EXIT`] before
 //! the workload runs. The workload's very first instruction therefore executes
-//! inside the cgroup, behind both Landlock domains and the socket filter,
-//! with exactly three open descriptors and no inherited environment.
+//! inside the cgroup, behind both Landlock domains and the socket filter, with
+//! exactly three open descriptors and exactly the environment the plan spells
+//! out — empty unless it spells one, and never anything inherited.
 //!
 //! # Why this order
 //!
@@ -40,6 +42,18 @@
 //! the Landlock crate's ruleset and grant-path descriptors, which are opened
 //! close-on-exec and dropped before `execve`; they cannot reach the workload.
 //!
+//! The prompt descriptor occupies the same pre-Landlock window, for three
+//! reasons rather than one. Landlock governs path resolution, not descriptors
+//! already open — the principle [`crate::network`] relies on for inherited
+//! sockets — so a descriptor created before enforcement keeps working after
+//! it, and the workload's filesystem allowlist need not mention the prompt at
+//! all. But a descriptor is still a descriptor, so it must exist before
+//! closure verifies the fd table; it is written, sealed, and `dup2`ed onto
+//! fd 0 in exactly the slot `/dev/null` otherwise occupies, and the original
+//! is closed immediately. And it is created *after* the cgroup join, so the
+//! pages holding the prompt are charged to the run's own memory bound rather
+//! than to the supervisor's.
+//!
 //! # What a composed launch does **not** establish
 //!
 //! - **It is not complete network denial.** The TCP policy governs TCP
@@ -52,6 +66,23 @@
 //! - **It does not protect against a same-uid attacker.** The plan travels
 //!   over a private pipe and the cgroup is delegation-checked, but a process
 //!   of the same uid outside the sandbox can already trace the supervisor.
+//! - **Environment values are not hidden from the host.** Frame delivery keeps
+//!   them out of argv, so no process listing shows them, but from `execve`
+//!   until exit any same-uid reader can read `/proc/<pid>/environ`. That is
+//!   the same-uid limit named above rather than a new one, and it is the
+//!   reason a secret placed in the environment is a secret shared with the
+//!   whole host account.
+//! - **The prompt is closed to the path namespace, not to the host.** Prompt
+//!   bytes live in an anonymous memory-backed file that no directory entry
+//!   names, so there is no path to open and no grant that could reach it, and
+//!   its seals make the bytes immutable — the workload cannot rewrite its own
+//!   prompt and hand a different one to a child. A same-uid reader can still
+//!   reach the same bytes through `/proc/<pid>/fd/0`.
+//! - **Naming a variable can name a mechanism.** `LD_PRELOAD`,
+//!   `LD_LIBRARY_PATH` and their kin change what a dynamically linked program
+//!   loads. There is deliberately no denylist here: a denylist would be
+//!   hidden policy, the plan is the review point, and what such a variable can
+//!   actually reach is bounded by the filesystem allowlist, not by this API.
 //! - **It is not attestation.** Nothing here proves to a third party what
 //!   was launched; the release-manifest trust chain is a separate concern.
 //! - **The supervisor cannot distinguish a helper refusal from a workload
@@ -77,6 +108,28 @@
 //! framing. The frame ends with an explicit terminator line; a frame without
 //! it is treated as truncated and refused, so a supervisor that dies mid-write
 //! cannot cause a partial policy to be enforced.
+//!
+//! An `env=` line carries one variable, as `env=<name-hex>:<value-hex>`. Both
+//! halves are hex, so the `:` separator is unambiguous and a value may hold
+//! any byte but NUL. Names obey a strict grammar — `[A-Z_][A-Z0-9_]*`, at
+//! most [`MAX_LAUNCH_ENV_NAME_BYTES`] — values are at most
+//! [`MAX_LAUNCH_ENV_VALUE_BYTES`], there are at most
+//! [`MAX_LAUNCH_ENV_ENTRIES`] of them, and a repeated name is refused rather
+//! than resolved in either direction.
+//!
+//! A `prompt_hex=` line appears at most once and carries the bytes the
+//! workload reads from its own stdin. Its ceiling is chosen so that one
+//! prompt can never crowd the rest of a plan out of the frame: at
+//! [`MAX_LAUNCH_PROMPT_BYTES`] = 16 KiB the line costs `11 + 2×16384 + 1 =
+//! 32780` bytes of the 65536-byte budget, which alongside the 29-byte header
+//! and 26-byte terminator leaves 32701 bytes for the program, argv, grants,
+//! ports and environment.
+//!
+//! Per-item ceilings bound shape; the frame bound is separate and binding.
+//! Neither 64 maximal argv entries (`64 × 8197 = 524608`) nor four maximal
+//! environment entries beside a maximal prompt (`4 × 8454 = 33816`) fit in
+//! 65536 bytes, and [`LaunchPlan::encode`] refuses such a plan with
+//! [`LaunchPlanError::FrameTooLarge`] rather than truncating it.
 
 use crate::containment::join_and_confirm_membership;
 use crate::descriptors::{DescriptorAllowlist, close_all_except, verify_only_allowlist_open};
@@ -84,10 +137,12 @@ use crate::filesystem::{FilesystemPolicy, PathIntent};
 use crate::network::TcpBindConnectPolicy;
 use crate::seccomp::SocketFamilyPolicy;
 use crate::{HELPER_REFUSED_EXIT, RunContainment};
+use nix::fcntl::{FcntlArg, SealFlag};
+use nix::sys::memfd::MemFdCreateFlag;
 use std::ffi::CString;
 use std::fmt;
 use std::fs::File;
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -102,6 +157,17 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_LAUNCH_ARGS: usize = 64;
 /// Upper bound on one argv entry or path, in raw bytes before encoding.
 pub const MAX_LAUNCH_ARG_BYTES: usize = 4096;
+/// Upper bound on environment entries one plan may name.
+pub const MAX_LAUNCH_ENV_ENTRIES: usize = 32;
+/// Upper bound on one environment variable name, in raw bytes.
+pub const MAX_LAUNCH_ENV_NAME_BYTES: usize = 128;
+/// Upper bound on one environment variable value, in raw bytes.
+pub const MAX_LAUNCH_ENV_VALUE_BYTES: usize = 4096;
+/// Upper bound on the prompt delivered as the workload's stdin, in raw bytes.
+///
+/// See the module's frame-grammar section for the budget arithmetic that
+/// picks this number.
+pub const MAX_LAUNCH_PROMPT_BYTES: usize = 16 * 1024;
 
 /// Why a launch plan is refused, before any child exists.
 ///
@@ -114,6 +180,12 @@ pub enum LaunchPlanError {
     ArgumentsRejected,
     /// A path, argument, or port failed policy validation.
     PolicyRejected(String),
+    /// An environment entry is malformed, oversized, repeated, or one too
+    /// many. The reason names no plan content, because helper refusals reach
+    /// stderr and a variable name is plan content.
+    EnvironmentRejected(&'static str),
+    /// The prompt is empty, repeated, or exceeds [`MAX_LAUNCH_PROMPT_BYTES`].
+    PromptRejected,
     /// The encoded frame exceeds [`MAX_FRAME_BYTES`].
     FrameTooLarge,
     /// The frame is malformed, truncated, or carries an unknown key.
@@ -130,6 +202,14 @@ impl fmt::Display for LaunchPlanError {
                 formatter.write_str("workload arguments are oversized or too many")
             }
             Self::PolicyRejected(reason) => write!(formatter, "policy rejected: {reason}"),
+            Self::EnvironmentRejected(reason) => {
+                write!(formatter, "environment entry rejected: {reason}")
+            }
+            Self::PromptRejected => write!(
+                formatter,
+                "prompt must be present at most once, non-empty, and at most \
+                 {MAX_LAUNCH_PROMPT_BYTES} bytes"
+            ),
             Self::FrameTooLarge => write!(
                 formatter,
                 "encoded launch frame exceeds {MAX_FRAME_BYTES} bytes"
@@ -147,7 +227,7 @@ impl std::error::Error for LaunchPlanError {}
 ///
 /// The plan is data: constructing one launches nothing and enforces nothing.
 /// Its encoded frame is what the supervisor delivers to the entry helper.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct LaunchPlan {
     program: PathBuf,
     arguments: Vec<Vec<u8>>,
@@ -155,6 +235,30 @@ pub struct LaunchPlan {
     connect_ports: Vec<u16>,
     bind_ports: Vec<u16>,
     socket_grants: Vec<SocketGrant>,
+    environment: Vec<(String, Vec<u8>)>,
+    prompt: Option<Vec<u8>>,
+}
+
+/// Redacting: a derived `Debug` would print environment values and prompt
+/// bytes, which are exactly the two things a plan may carry that a log must
+/// never hold. Names and lengths are enough to identify a plan.
+impl fmt::Debug for LaunchPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LaunchPlan")
+            .field("program", &self.program)
+            .field("arguments", &self.arguments)
+            .field("filesystem", &self.filesystem)
+            .field("connect_ports", &self.connect_ports)
+            .field("bind_ports", &self.bind_ports)
+            .field("socket_grants", &self.socket_grants)
+            .field(
+                "environment_names",
+                &self.environment_names().collect::<Vec<_>>(),
+            )
+            .field("prompt_bytes", &self.prompt_len())
+            .finish()
+    }
 }
 
 /// One socket-creation grant a plan may carry, mirroring the closed grant
@@ -194,8 +298,9 @@ impl SocketGrant {
 impl LaunchPlan {
     /// Start a plan for `program`, which must be a bounded absolute path.
     ///
-    /// The program is executed by exact path with an empty environment; there
-    /// is no `PATH` search and no inherited variable.
+    /// The program is executed by exact path; there is no `PATH` search, and a
+    /// fresh plan carries no environment at all. Variables exist only where
+    /// [`LaunchPlan::environment`] puts them, never by inheritance.
     pub fn new(program: impl Into<PathBuf>) -> Result<Self, LaunchPlanError> {
         let program = program.into();
         if !program.is_absolute()
@@ -211,6 +316,8 @@ impl LaunchPlan {
             connect_ports: Vec::new(),
             bind_ports: Vec::new(),
             socket_grants: Vec::new(),
+            environment: Vec::new(),
+            prompt: None,
         })
     }
 
@@ -296,10 +403,82 @@ impl LaunchPlan {
         Ok(self)
     }
 
+    /// Deliver one variable, and by delivering it name it.
+    ///
+    /// The helper `execve`s with exactly the entries a plan carries: nothing
+    /// is inherited from the supervisor and nothing is synthesized, so a
+    /// provider that needs `CODEX_HOME` or `SSL_CERT_FILE` gets it because the
+    /// plan said so and gets nothing else because the plan did not.
+    ///
+    /// `name` obeys `[A-Z_][A-Z0-9_]*` within [`MAX_LAUNCH_ENV_NAME_BYTES`];
+    /// `value` is arbitrary bytes without NUL, within
+    /// [`MAX_LAUNCH_ENV_VALUE_BYTES`]. A repeated name is refused: two
+    /// bindings of one variable have no correct resolution, and picking the
+    /// first or the last would be a silent policy decision.
+    pub fn environment(
+        mut self,
+        name: impl AsRef<str>,
+        value: impl AsRef<[u8]>,
+    ) -> Result<Self, LaunchPlanError> {
+        let name = name.as_ref();
+        let value = value.as_ref();
+        check_environment_entry(name, value)?;
+        if self.environment.len() >= MAX_LAUNCH_ENV_ENTRIES {
+            return Err(LaunchPlanError::EnvironmentRejected(
+                "too many environment entries",
+            ));
+        }
+        if self
+            .environment
+            .iter()
+            .any(|(existing, _)| existing == name)
+        {
+            return Err(LaunchPlanError::EnvironmentRejected(
+                "one name is bound twice",
+            ));
+        }
+        self.environment.push((name.to_owned(), value.to_vec()));
+        Ok(self)
+    }
+
+    /// Deliver `bytes` to the workload as its stdin.
+    ///
+    /// Prompt bytes never appear in argv, so no process listing shows them,
+    /// and they never travel as a filesystem path, so no grant is needed to
+    /// read them. The helper stages them in an anonymous memory-backed file
+    /// and hands the workload that descriptor as fd 0 — which is what a
+    /// provider invoked with `-` reads. Without this line stdin is
+    /// `/dev/null`, exactly as before.
+    ///
+    /// An empty prompt is refused rather than encoded: "the workload's stdin
+    /// is empty" already has one spelling, which is naming no prompt at all.
+    pub fn prompt(mut self, bytes: impl AsRef<[u8]>) -> Result<Self, LaunchPlanError> {
+        let bytes = bytes.as_ref();
+        if self.prompt.is_some() || bytes.is_empty() || bytes.len() > MAX_LAUNCH_PROMPT_BYTES {
+            return Err(LaunchPlanError::PromptRejected);
+        }
+        self.prompt = Some(bytes.to_vec());
+        Ok(self)
+    }
+
     /// Exact workload program path.
     #[must_use]
     pub fn program(&self) -> &Path {
         &self.program
+    }
+
+    /// Names this plan delivers, in frame order.
+    ///
+    /// Values have no accessor on purpose: a plan is built, encoded, and
+    /// enforced. Nothing downstream needs to read a secret back out of one.
+    pub fn environment_names(&self) -> impl Iterator<Item = &str> {
+        self.environment.iter().map(|(name, _)| name.as_str())
+    }
+
+    /// Length of the prompt this plan delivers, or `None` when it names none.
+    #[must_use]
+    pub fn prompt_len(&self) -> Option<usize> {
+        self.prompt.as_ref().map(Vec::len)
     }
 
     fn tcp_policy(&self) -> Result<TcpBindConnectPolicy, LaunchPlanError> {
@@ -338,6 +517,11 @@ impl LaunchPlan {
     /// socket policy without [`SocketGrant::Tcp`] makes creating the socket
     /// impossible. Widening the socket policy silently would betray the
     /// seccomp layer; dropping the ports silently would betray the caller.
+    ///
+    /// The environment and prompt bounds are re-checked here rather than
+    /// trusted from construction, so that both frame directions enforce them
+    /// at the same place: whatever built the value, it does not encode and
+    /// does not decode unless every entry still holds.
     fn check_layer_consistency(&self) -> Result<(), LaunchPlanError> {
         if (!self.connect_ports.is_empty() || !self.bind_ports.is_empty())
             && !self.socket_grants.contains(&SocketGrant::Tcp)
@@ -345,6 +529,29 @@ impl LaunchPlan {
             return Err(LaunchPlanError::PolicyRejected(
                 "TCP port exceptions require the tcp socket grant".to_owned(),
             ));
+        }
+        if self.environment.len() > MAX_LAUNCH_ENV_ENTRIES {
+            return Err(LaunchPlanError::EnvironmentRejected(
+                "too many environment entries",
+            ));
+        }
+        for (index, (name, value)) in self.environment.iter().enumerate() {
+            check_environment_entry(name, value)?;
+            if self.environment[..index]
+                .iter()
+                .any(|(earlier, _)| earlier == name)
+            {
+                return Err(LaunchPlanError::EnvironmentRejected(
+                    "one name is bound twice",
+                ));
+            }
+        }
+        if self
+            .prompt
+            .as_ref()
+            .is_some_and(|bytes| bytes.is_empty() || bytes.len() > MAX_LAUNCH_PROMPT_BYTES)
+        {
+            return Err(LaunchPlanError::PromptRejected);
         }
         Ok(())
     }
@@ -377,6 +584,12 @@ impl LaunchPlan {
         }
         for grant in &self.socket_grants {
             frame.push_str(&format!("socket={}\n", grant.as_str()));
+        }
+        for (name, value) in &self.environment {
+            frame.push_str(&format!("env={}:{}\n", hex(name.as_bytes()), hex(value)));
+        }
+        if let Some(prompt) = &self.prompt {
+            frame.push_str(&format!("prompt_hex={}\n", hex(prompt)));
         }
         frame.push_str(FRAME_TERMINATOR);
         frame.push('\n');
@@ -450,6 +663,22 @@ impl LaunchPlan {
                 ("socket", Some(current)) => {
                     let grant = SocketGrant::parse(value).ok_or(LaunchPlanError::FrameRejected)?;
                     *current = current.clone().socket_grant(grant)?;
+                }
+                ("env", Some(current)) => {
+                    let (name_hex, value_hex) = value
+                        .split_once(':')
+                        .ok_or(LaunchPlanError::FrameRejected)?;
+                    let name = unhex(name_hex).ok_or(LaunchPlanError::FrameRejected)?;
+                    let name =
+                        String::from_utf8(name).map_err(|_| LaunchPlanError::FrameRejected)?;
+                    let value = unhex(value_hex).ok_or(LaunchPlanError::FrameRejected)?;
+                    *current = current.clone().environment(name, value)?;
+                }
+                ("prompt_hex", Some(current)) => {
+                    let bytes = unhex(value).ok_or(LaunchPlanError::FrameRejected)?;
+                    // A second prompt line refuses here: the builder already
+                    // holds one, and there is no rule for which would win.
+                    *current = current.clone().prompt(bytes)?;
                 }
                 _ => return Err(LaunchPlanError::FrameRejected),
             }
@@ -556,11 +785,18 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         .ok_or_else(|| "no containment target".to_owned())?;
     join_and_confirm_membership(Path::new(&target)).map_err(|error| error.to_string())?;
 
-    // 3. The plan channel must not reach the workload: stdin becomes
-    //    /dev/null before descriptors are sealed.
-    let devnull = File::open("/dev/null").map_err(|_| "/dev/null unavailable".to_owned())?;
-    nix::unistd::dup2(devnull.as_raw_fd(), 0).map_err(|_| "stdin replacement failed".to_owned())?;
-    drop(devnull);
+    // 3. The plan channel must not reach the workload: stdin becomes the
+    //    plan's prompt descriptor, or /dev/null when it names no prompt.
+    //    Either source is opened before descriptor closure, so the closure
+    //    verification below still proves exactly the standard streams remain,
+    //    and after the dup2 the original is closed immediately.
+    let stdin_source = match plan.prompt.as_deref() {
+        Some(prompt) => sealed_prompt_descriptor(prompt)?,
+        None => File::open("/dev/null").map_err(|_| "/dev/null unavailable".to_owned())?,
+    };
+    nix::unistd::dup2(stdin_source.as_raw_fd(), 0)
+        .map_err(|_| "stdin replacement failed".to_owned())?;
+    drop(stdin_source);
 
     // 4. Close and verify descriptors while /proc is still reachable.
     let allowlist = DescriptorAllowlist::standard_streams();
@@ -587,7 +823,9 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         .apply_to_current_thread()
         .map_err(|error| error.to_string())?;
 
-    // 8. Exact program, exact argv, empty environment.
+    // 8. Exact program, exact argv, exactly the named environment — which is
+    //    empty when the plan named none, as every plan did before `env=`
+    //    existed.
     let program = CString::new(plan.program.as_os_str().as_encoded_bytes().to_vec())
         .map_err(|_| "program path contains NUL".to_owned())?;
     let mut argv = Vec::with_capacity(plan.arguments.len() + 1);
@@ -595,10 +833,93 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
     for argument in &plan.arguments {
         argv.push(CString::new(argument.clone()).map_err(|_| "argument contains NUL".to_owned())?);
     }
-    let environment: [CString; 0] = [];
+    let mut environment = Vec::with_capacity(plan.environment.len());
+    for (name, value) in &plan.environment {
+        let mut entry = Vec::with_capacity(name.len() + 1 + value.len());
+        entry.extend_from_slice(name.as_bytes());
+        entry.push(b'=');
+        entry.extend_from_slice(value);
+        environment
+            .push(CString::new(entry).map_err(|_| "environment entry contains NUL".to_owned())?);
+    }
     nix::unistd::execve(&program, &argv, &environment)
         .map_err(|error| format!("execve failed: {error}"))?;
     unreachable!("execve returned without an error")
+}
+
+/// An anonymous, sealed, memory-backed descriptor holding `prompt`, rewound.
+///
+/// `memfd_create` rather than an unlinked temporary file, for three reasons.
+/// The buffer has no name in any directory — not even for the instant between
+/// `open` and `unlink` that a temp file would need — so there is no path a
+/// racing same-uid process could open and no window in which one exists. It
+/// needs no writable directory, so it does not depend on `/tmp` existing, on
+/// `TMPDIR`, or on the plan granting anything: the filesystem allowlist stays
+/// exactly what the plan wrote. And it can be sealed, which an ordinary file
+/// cannot, so the bytes become immutable before any workload sees them.
+///
+/// The descriptor is created close-on-exec; the `dup2` onto fd 0 in the caller
+/// produces a descriptor that is *not* close-on-exec, which is what carries
+/// the prompt across `execve`.
+fn sealed_prompt_descriptor(prompt: &[u8]) -> Result<File, String> {
+    let name = CString::new("automonique-prompt").expect("literal has no interior NUL");
+    let descriptor = nix::sys::memfd::memfd_create(
+        &name,
+        MemFdCreateFlag::MFD_CLOEXEC | MemFdCreateFlag::MFD_ALLOW_SEALING,
+    )
+    .map_err(|error| format!("prompt descriptor unavailable: {error}"))?;
+    let mut file = File::from(descriptor);
+    file.write_all(prompt)
+        .map_err(|_| "prompt could not be staged".to_owned())?;
+    // Seal before the workload can reach it: writing, growing and shrinking
+    // are all closed, and F_SEAL_SEAL closes the sealing itself, so neither
+    // the workload nor a descendant can restore any of them.
+    nix::fcntl::fcntl(
+        file.as_raw_fd(),
+        FcntlArg::F_ADD_SEALS(
+            SealFlag::F_SEAL_WRITE
+                | SealFlag::F_SEAL_GROW
+                | SealFlag::F_SEAL_SHRINK
+                | SealFlag::F_SEAL_SEAL,
+        ),
+    )
+    .map_err(|error| format!("prompt could not be sealed: {error}"))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| "prompt rewind failed".to_owned())?;
+    Ok(file)
+}
+
+/// Shape check for one environment entry, shared by construction and decode.
+///
+/// The reasons deliberately quote nothing: a refusal reaches the supervisor's
+/// stderr, and a variable name is plan content.
+fn check_environment_entry(name: &str, value: &[u8]) -> Result<(), LaunchPlanError> {
+    let name = name.as_bytes();
+    if name.is_empty() || name.len() > MAX_LAUNCH_ENV_NAME_BYTES {
+        return Err(LaunchPlanError::EnvironmentRejected(
+            "environment name is empty or oversized",
+        ));
+    }
+    let shaped = matches!(name[0], b'A'..=b'Z' | b'_')
+        && name
+            .iter()
+            .all(|byte| matches!(byte, b'A'..=b'Z' | b'0'..=b'9' | b'_'));
+    if !shaped {
+        return Err(LaunchPlanError::EnvironmentRejected(
+            "environment name is not [A-Z_][A-Z0-9_]*",
+        ));
+    }
+    if value.len() > MAX_LAUNCH_ENV_VALUE_BYTES {
+        return Err(LaunchPlanError::EnvironmentRejected(
+            "environment value is oversized",
+        ));
+    }
+    if value.contains(&0) {
+        return Err(LaunchPlanError::EnvironmentRejected(
+            "environment value contains NUL",
+        ));
+    }
+    Ok(())
 }
 
 fn socket_policy_from_grants(

@@ -210,6 +210,33 @@ request, cursor, capability/schema, and approval bindings with revision-checked
 transitions, transactional multi-row commits, and reads that surface
 hand-written corruption as typed errors instead of trusting rows.
 
+The launch frame now also carries an explicit environment allowlist and an
+optional prompt: variables are validated by grammar and bounds and passed to
+`execve` exactly as named (nothing inherited, nothing synthesized), and prompt
+bytes are delivered as the workload's stdin through a sealed anonymous memfd —
+no path ever names them, they cannot appear in argv, and without a prompt the
+workload's stdin is still `/dev/null`. A supervised attempt now composes the
+backend with the runner control socket: a peer can inspect and heartbeat a
+live run over the authenticated endpoint and cancel it for real, with the
+kill proven against a `setsid`-escaped descendant. The store crate adds a
+durable host-wide cancellation ledger whose delivered/already-delivered/
+conflict answers survive restart, ready to replace the control socket's
+documented in-memory ledger when the daemon composition wires the two
+together. Provider execution is planned but still cannot happen: the agents
+crate builds exact sandboxed launch plans for a digest-pinned provider
+executable and parses provider event streams incrementally, while refusing
+the things it cannot yet deliver honestly rather than approximating them.
+The daemon's status now reports a measured `execution_state`
+(`sandbox_unavailable_no_lane` / `sandbox_enforceable_no_lane`): what the
+host could enforce for a launcher, never a claim that any lane exists. The
+admin status read surface and the doctor report schema are now generated
+into the Apache-2.0 TypeScript SDK by a maintained generator with a drift
+gate that fails when the checked-in files no longer match, a typecheck
+against the package's strict tsconfig, and a test comparing the Rust
+encoder's own field sets against the generated ones. A strict Slack Socket
+Mode envelope parser with typed plan-then-ack acknowledgement discipline
+joins the Telegram parser as the second network-free connector core.
+
 Enforcement needs a delegated cgroup v2 subtree, which is what the daemon gets
 as a systemd user service with `Delegate=yes`; where no delegated domain
 exists every API refuses fail-closed and never reports partial enforcement.

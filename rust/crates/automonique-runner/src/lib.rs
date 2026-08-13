@@ -39,7 +39,9 @@ pub use containment::{
 };
 pub use launch::{
     FRAME_HEADER, FRAME_TERMINATOR, LaunchError, LaunchPlan, LaunchPlanError, MAX_FRAME_BYTES,
-    MAX_LAUNCH_ARG_BYTES, MAX_LAUNCH_ARGS, SocketGrant, launch_entry_helper_main, spawn_sandboxed,
+    MAX_LAUNCH_ARG_BYTES, MAX_LAUNCH_ARGS, MAX_LAUNCH_ENV_ENTRIES, MAX_LAUNCH_ENV_NAME_BYTES,
+    MAX_LAUNCH_ENV_VALUE_BYTES, MAX_LAUNCH_PROMPT_BYTES, SocketGrant, launch_entry_helper_main,
+    spawn_sandboxed,
 };
 pub use runner::{CancellationToken, ContainmentEvidence, Runner, RunnerError};
 pub use simulation::{

@@ -204,6 +204,43 @@ impl TelegramState {
     }
 }
 
+/// Sandboxed-execution capability state, reported independently from intake.
+///
+/// Both states end in `NoLane` because this release has no execution lane:
+/// neither value says any work can be executed. The distinction is what the
+/// host could enforce for a future launcher — measured, like every capability
+/// claim in this product, rather than assumed.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ExecutionState {
+    /// The daemon's process has no delegated cgroup v2 domain or lacks another
+    /// required enforcement mechanism, so the composed sandbox is
+    /// unenforceable here and an execution lane would refuse fail-closed.
+    SandboxUnavailableNoLane,
+    /// The host can enforce the full composed sandbox for a launcher —
+    /// delegated cgroup v2 containment, Landlock filesystem and TCP domains,
+    /// and the seccomp socket filter. The execution lane itself remains
+    /// deliberately unwired.
+    SandboxEnforceableNoLane,
+}
+
+impl ExecutionState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SandboxUnavailableNoLane => "sandbox_unavailable_no_lane",
+            Self::SandboxEnforceableNoLane => "sandbox_enforceable_no_lane",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, AdminError> {
+        match value {
+            "sandbox_unavailable_no_lane" => Ok(Self::SandboxUnavailableNoLane),
+            "sandbox_enforceable_no_lane" => Ok(Self::SandboxEnforceableNoLane),
+            _ => Err(AdminError::InvalidBody),
+        }
+    }
+}
+
 /// Commands admitted by the first local administration protocol.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AdminCommand {
@@ -885,6 +922,7 @@ pub struct DaemonStatus {
     accepting_intake: bool,
     telegram_state: TelegramState,
     telegram_poller_epoch: Option<u64>,
+    execution_state: ExecutionState,
     operational: Option<OperationalStatus>,
 }
 
@@ -1242,8 +1280,16 @@ impl DaemonStatus {
             accepting_intake,
             telegram_state: TelegramState::DisabledNoClient,
             telegram_poller_epoch: None,
+            execution_state: ExecutionState::SandboxUnavailableNoLane,
             operational: None,
         })
+    }
+
+    /// Replace the default unavailable execution observation with a measured one.
+    #[must_use]
+    pub const fn with_execution(mut self, execution_state: ExecutionState) -> Self {
+        self.execution_state = execution_state;
+        self
     }
 
     /// Replace the default disabled Telegram observation with an exact coherent state.
@@ -1340,6 +1386,12 @@ impl DaemonStatus {
         self.telegram_state
     }
 
+    /// Measured sandboxed-execution capability of the daemon's own host.
+    #[must_use]
+    pub const fn execution_state(&self) -> ExecutionState {
+        self.execution_state
+    }
+
     #[must_use]
     pub const fn telegram_poller_epoch(&self) -> Option<u64> {
         self.telegram_poller_epoch
@@ -1396,13 +1448,18 @@ impl DaemonStatus {
                 "telegram_state".to_owned(),
                 JsonValue::String(self.telegram_state.as_str().to_owned()),
             ),
+            (
+                "execution_state".to_owned(),
+                JsonValue::String(self.execution_state.as_str().to_owned()),
+            ),
         ]))
     }
 
     fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
-        const FIELDS: [&str; 11] = [
+        const FIELDS: [&str; 12] = [
             "accepting_intake",
             "event_cursor",
+            "execution_state",
             "generation",
             "inbox_pending",
             "instance_id",
@@ -1450,6 +1507,11 @@ impl DaemonStatus {
                 TelegramState::parse(required_body_string(body, "telegram_state")?.as_str())?,
                 optional_unsigned(body, "telegram_poller_epoch")?,
             )
+        })
+        .and_then(|status| {
+            Ok(status.with_execution(ExecutionState::parse(
+                required_body_string(body, "execution_state")?.as_str(),
+            )?))
         })
         .and_then(|status| {
             status.with_operational(OperationalStatus::from_body(

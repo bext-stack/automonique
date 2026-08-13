@@ -14,6 +14,15 @@ use std::fmt;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
+mod slack;
+
+pub use slack::{
+    MAX_SLACK_ENVELOPE_BYTES, MAX_SLACK_IDENTIFIER_BYTES, MAX_SLACK_RETRY_ATTEMPT,
+    MAX_SLACK_TEXT_BYTES, SlackAccessPolicy, SlackAckPlan, SlackAppId, SlackDisposition,
+    SlackEnvelope, SlackEnvelopeId, SlackEnvelopeType, SlackError, SlackIngress, SlackInputKind,
+    SlackPrincipal, SlackRefusal, SlackRetry, parse_slack_envelope,
+};
+
 /// Maximum response body accepted from one Telegram long poll.
 pub const MAX_TELEGRAM_RESPONSE_BYTES: usize = 1024 * 1024;
 /// Maximum updates accepted in one Telegram response.

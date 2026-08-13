@@ -11,6 +11,7 @@ publish.workspace = true
 automonique-core = { path = "../automonique-core" }
 automonique-observability = { path = "../automonique-observability" }
 automonique-protocol = { path = "../automonique-protocol" }
+automonique-runner = { path = "../automonique-runner" }
 automonique-store = { path = "../automonique-store" }
 automonique-transport-runtime = { path = "../automonique-transport-runtime" }
 nix.workspace = true

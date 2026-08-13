@@ -575,3 +575,599 @@ mod verdict_quality {
         );
     }
 }
+
+/// The maintained read surface: the doctor report and the admin status read.
+///
+/// These files differ from `generated/spike.ts` in one way that matters. The
+/// spike file is rewritten by an ordinary test run, so the check that it
+/// matches the generator can never fail — the same run that compares it wrote
+/// it. These files are only rewritten when `REGENERATE_ENV` is set, so the
+/// comparison is a real gate: a hand edit, a stale checkout or a generator
+/// change without a regeneration all turn the suite red.
+mod maintained_surface {
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
+
+    use automonique_protocol::admin::{
+        AdminInstanceId, AdminResponse, DaemonState, DaemonStatus, MAX_ADMIN_CANONICAL_BYTES,
+        MAX_INSTANCE_ID_BYTES, OperationalMetric, OperationalStatus, OperationalStatusParts,
+    };
+    use automonique_protocol::codec::RequestId;
+    use automonique_protocol::codegen::{
+        ADMIN_STATUS_MODULE, BARREL_MODULE, DOCTOR_MODULE, GENERATED_DIRECTORY, REGENERATE_COMMAND,
+        REGENERATE_ENV, RUNTIME_MODULE, generated_files, maintained_modules, module_file_name,
+    };
+    use automonique_protocol::wire::{JsonValue, Message};
+    use automonique_protocol::{
+        MAX_DOCTOR_CHECKS, MAX_FINDING_CODE_BYTES, MAX_FINDING_MESSAGE_BYTES,
+    };
+
+    use super::*;
+
+    fn generated_directory() -> PathBuf {
+        package_root().join("generated")
+    }
+
+    fn files() -> BTreeMap<String, String> {
+        generated_files().into_iter().collect()
+    }
+
+    /// The generated contents of one module, by stem.
+    fn file(module: &str) -> String {
+        let name = module_file_name(module);
+        files()
+            .remove(&name)
+            .unwrap_or_else(|| panic!("{name} is not a generated file"))
+    }
+
+    /// Whether this run was asked to rewrite the checked-in files.
+    fn regenerating() -> bool {
+        std::env::var(REGENERATE_ENV).is_ok_and(|value| !value.is_empty() && value != "0")
+    }
+
+    /// The first place two texts diverge, named precisely enough to act on.
+    fn first_difference(actual: &str, expected: &str) -> String {
+        for (index, (left, right)) in actual.lines().zip(expected.lines()).enumerate() {
+            if left != right {
+                return format!("line {}: on disk {left:?}, generated {right:?}", index + 1);
+            }
+        }
+        format!(
+            "{} lines on disk, {} lines generated",
+            actual.lines().count(),
+            expected.lines().count()
+        )
+    }
+
+    /// The field names one generated `_FIELDS` array carries, sorted.
+    fn generated_fields(contents: &str, name: &str) -> Vec<String> {
+        let marker = format!("export const {name}_FIELDS: readonly string[] = [\n");
+        let start = contents
+            .find(&marker)
+            .unwrap_or_else(|| panic!("{name} has no generated field array"))
+            + marker.len();
+        let rest = &contents[start..];
+        let end = rest
+            .find("];")
+            .unwrap_or_else(|| panic!("{name}'s generated field array is unterminated"));
+        let mut names: Vec<String> = rest[..end]
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                Some(trimmed.strip_prefix('"')?.strip_suffix("\",")?.to_owned())
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A real encoded status message, built through the shipped constructors.
+    ///
+    /// The projection is required and its counts have to agree with the
+    /// aggregate, so this is the smallest snapshot `to_message` will accept.
+    fn encoded_status() -> Message {
+        let status = DaemonStatus::new(
+            AdminInstanceId::new("codegen-status").expect("valid instance"),
+            DaemonState::Ready,
+            7,
+            41,
+            2,
+            3,
+            1,
+            true,
+        )
+        .expect("base status")
+        .with_operational(
+            OperationalStatus::new(OperationalStatusParts {
+                observed_ms: 100,
+                reconciliation_pending: 0,
+                outbox_pending_ready: 2,
+                outbox_pending_delayed: 1,
+                outbox_in_flight_live: 4,
+                outbox_in_flight_ambiguous: 0,
+                outbox_delivered: 5,
+                outbox_dead_lettered: 6,
+                outbox_oldest_ready_age_ms: 7,
+                telegram_pollers_live: 0,
+                telegram_pollers_expired: 0,
+                telegram_offset_lag: OperationalMetric::Unavailable,
+                provider_available: OperationalMetric::Unavailable,
+                sandbox_launch_refusals: OperationalMetric::Unavailable,
+            })
+            .expect("valid projection"),
+        )
+        .expect("coherent snapshot");
+        AdminResponse::Status {
+            request_id: RequestId::new("req-codegen-1").expect("valid request ID"),
+            status,
+        }
+        .to_message()
+        .expect("a complete status encodes")
+    }
+
+    /// The drift gate, and the regeneration that closes it.
+    #[test]
+    fn the_checked_in_files_match_regeneration() {
+        let directory = generated_directory();
+        let regenerating = regenerating();
+        let mut stale = Vec::new();
+        for (file_name, expected) in generated_files() {
+            let path = directory.join(&file_name);
+            if regenerating {
+                std::fs::create_dir_all(&directory).expect("generated directory");
+                // Publish atomically: the typecheck below reads these files in
+                // the same parallel run, and a partial write would fail it for
+                // a reason unrelated to the code under test.
+                let staging = path.with_extension("ts.staging");
+                std::fs::write(&staging, &expected).expect("stage generated file");
+                std::fs::rename(&staging, &path).expect("publish generated file");
+                continue;
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(actual) if actual == expected => {}
+                Ok(actual) => stale.push(format!(
+                    "{file_name}: {}",
+                    first_difference(&actual, &expected)
+                )),
+                Err(error) => stale.push(format!("{file_name}: cannot be read ({error})")),
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "the checked-in TypeScript in {GENERATED_DIRECTORY} no longer matches the generator:\
+             \n  {}\n\nRegenerate with: {REGENERATE_COMMAND}",
+            stale.join("\n  ")
+        );
+    }
+
+    /// A module deleted from the generator must not leave its output behind.
+    ///
+    /// Without this, dropping a schema would pass every other check while a
+    /// stale file kept serving the surface it described.
+    #[test]
+    fn the_generated_directory_holds_nothing_the_generator_does_not_own() {
+        if regenerating() {
+            // A regeneration is publishing into this directory from a test
+            // running beside this one, so its contents are legitimately in
+            // flux. The ordinary run — the one CI makes — is the measurement.
+            eprintln!("GAP: skipped during regeneration; rerun without {REGENERATE_ENV}");
+            return;
+        }
+        let owned: BTreeSet<String> = generated_files()
+            .into_iter()
+            .map(|(name, _)| name)
+            .chain(std::iter::once("spike.ts".to_owned()))
+            .collect();
+        let present: BTreeSet<String> = std::fs::read_dir(generated_directory())
+            .expect("the generated directory is checked in")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                // `.ts` only: this skips `VERDICT.md` and the `.ts.staging`
+                // file a concurrent regeneration may be holding open.
+                (path.extension()?.to_str()? == "ts")
+                    .then(|| path.file_name()?.to_str().map(str::to_owned))?
+            })
+            .collect();
+        assert_eq!(
+            present, owned,
+            "{GENERATED_DIRECTORY} does not hold exactly the files the generator owns; \
+             regenerate with: {REGENERATE_COMMAND}"
+        );
+    }
+
+    #[test]
+    fn regeneration_is_byte_identical() {
+        let first = generated_files();
+        for _ in 0..8 {
+            assert_eq!(
+                generated_files(),
+                first,
+                "generation of the maintained surface is not deterministic"
+            );
+        }
+    }
+
+    #[test]
+    fn the_output_embeds_nothing_time_or_host_dependent() {
+        for (file_name, contents) in generated_files() {
+            for forbidden in ["generated at", "timestamp", "/home/", "2026-", "2025-"] {
+                assert!(
+                    !contents.to_lowercase().contains(forbidden),
+                    "{file_name} contains {forbidden:?}"
+                );
+            }
+        }
+    }
+
+    /// Every bound in the output is the Rust constant, not a number retyped
+    /// next to it.
+    ///
+    /// The expected text is built from the constant itself, so changing
+    /// `MAX_FINDING_MESSAGE_BYTES` and forgetting to regenerate fails here as
+    /// well as at the drift gate.
+    #[test]
+    fn the_generated_bounds_are_the_rust_constants() {
+        let doctor = file(DOCTOR_MODULE);
+        let admin = file(ADMIN_STATUS_MODULE);
+        for (file_name, contents, declaration) in [
+            (
+                DOCTOR_MODULE,
+                &doctor,
+                format!("export const FindingCode_MAX_BYTES = {MAX_FINDING_CODE_BYTES};"),
+            ),
+            (
+                DOCTOR_MODULE,
+                &doctor,
+                format!("export const FindingMessage_MAX_BYTES = {MAX_FINDING_MESSAGE_BYTES};"),
+            ),
+            (
+                DOCTOR_MODULE,
+                &doctor,
+                format!("export const MAX_DOCTOR_CHECKS = {MAX_DOCTOR_CHECKS};"),
+            ),
+            (
+                ADMIN_STATUS_MODULE,
+                &admin,
+                format!("export const AdminInstanceId_MAX_BYTES = {MAX_INSTANCE_ID_BYTES};"),
+            ),
+            (
+                ADMIN_STATUS_MODULE,
+                &admin,
+                format!("export const MAX_ADMIN_CANONICAL_BYTES = {MAX_ADMIN_CANONICAL_BYTES};"),
+            ),
+            (
+                ADMIN_STATUS_MODULE,
+                &admin,
+                format!("export const WireCounter_MAX = {}n;", i64::MAX),
+            ),
+        ] {
+            assert!(
+                contents.contains(&declaration),
+                "{file_name} does not carry the Rust bound: {declaration}"
+            );
+        }
+
+        // Declaring the bound is not using it. A generator that emitted the
+        // right constant and then compared against a different literal would
+        // pass everything above.
+        for (file_name, contents, name, max_bytes) in [
+            (
+                DOCTOR_MODULE,
+                &doctor,
+                "FindingCode",
+                MAX_FINDING_CODE_BYTES,
+            ),
+            (
+                DOCTOR_MODULE,
+                &doctor,
+                "FindingMessage",
+                MAX_FINDING_MESSAGE_BYTES,
+            ),
+            (
+                ADMIN_STATUS_MODULE,
+                &admin,
+                "AdminInstanceId",
+                MAX_INSTANCE_ID_BYTES,
+            ),
+        ] {
+            let check = format!(
+                "  if (byteLength(value) > {max_bytes}) throw new ValidationError(\"{name}\", \
+                 \"too_long\");"
+            );
+            assert!(
+                contents.contains(&check),
+                "{file_name} declares {name}'s bound but does not check it: {check}"
+            );
+        }
+    }
+
+    /// The closed value sets, restated here rather than read back from the
+    /// generator.
+    ///
+    /// A generator that dropped a variant would agree with itself perfectly;
+    /// this is the second opinion that catches it.
+    #[test]
+    fn every_closed_enumeration_carries_all_of_its_variants() {
+        let expected: [(&str, &str, &[&str]); 5] = [
+            (
+                DOCTOR_MODULE,
+                "CheckStatus",
+                &["finding", "healthy", "unavailable"],
+            ),
+            (
+                DOCTOR_MODULE,
+                "ReportStatus",
+                &["degraded", "failed", "healthy"],
+            ),
+            (
+                ADMIN_STATUS_MODULE,
+                "DaemonState",
+                &["draining", "failed", "ready", "starting", "stopped"],
+            ),
+            (
+                ADMIN_STATUS_MODULE,
+                "ExecutionState",
+                &["sandbox_enforceable_no_lane", "sandbox_unavailable_no_lane"],
+            ),
+            (
+                ADMIN_STATUS_MODULE,
+                "TelegramState",
+                &["disabled_no_client", "lease_owned_no_client"],
+            ),
+        ];
+        for (file_name, name, values) in expected {
+            let contents = file(file_name);
+            let literals: Vec<String> = values.iter().map(|value| format!("\"{value}\"")).collect();
+            let declaration = format!("export type {name} = {};", literals.join(" | "));
+            assert!(
+                contents.contains(&declaration),
+                "{file_name} lost a {name} variant.\nexpected: {declaration}"
+            );
+            let table = format!(
+                "export const {name}_VALUES: readonly {name}[] = [{}];",
+                literals.join(", ")
+            );
+            assert!(
+                contents.contains(&table),
+                "{file_name}'s {name} table does not match its type.\nexpected: {table}"
+            );
+            // Every one of these refuses an undefined spelling in Rust, so the
+            // decoder must refuse it too rather than retain it.
+            assert!(
+                contents.contains(&format!(
+                    "export function decode{name}(value: string): {name} {{"
+                )),
+                "{file_name} does not refuse an undefined {name}"
+            );
+        }
+    }
+
+    /// The unavailable arm is the one that must survive.
+    ///
+    /// `OperationalMetric` exists to stop a missing measurement from reading
+    /// as a zero. A generated type that widened `value` to a plain counter
+    /// would hand that mistake straight back to every client.
+    #[test]
+    fn the_operational_metric_union_keeps_its_unavailable_arm() {
+        let admin = file(ADMIN_STATUS_MODULE);
+        for arm in [
+            "  | {readonly state: \"measured\"; readonly value: WireCounter}",
+            "  | {readonly state: \"unavailable\"; readonly value: null}",
+        ] {
+            assert!(
+                admin.contains(arm),
+                "the OperationalMetric union lost an arm.\nexpected: {arm}"
+            );
+        }
+        assert!(
+            admin.contains("export function assertNeverOperationalMetric(value: never): never {"),
+            "OperationalMetric has no exhaustiveness helper, so a dropped arm would go unnoticed \
+             in TypeScript too"
+        );
+    }
+
+    /// The generated field sets, measured against the encoder that produces the
+    /// wire rather than against a list restated here.
+    ///
+    /// A list retyped in this file would only prove the generator agrees with
+    /// my memory of `admin.rs`. Encoding a real [`DaemonStatus`] and reading
+    /// the keys back compares the generated arrays with what the daemon
+    /// actually sends, so a field added to the Rust body fails here on the
+    /// next run instead of shipping a `_FIELDS` array the decoder would
+    /// refuse.
+    #[test]
+    fn the_status_field_sets_are_the_encoders_own_field_sets() {
+        let admin = file(ADMIN_STATUS_MODULE);
+        let JsonValue::Object(body) = encoded_status().body().clone() else {
+            panic!("a status message body is an object");
+        };
+        let keys = |entries: &[(String, JsonValue)]| -> Vec<String> {
+            let mut names: Vec<String> = entries.iter().map(|(name, _)| name.clone()).collect();
+            names.sort();
+            names
+        };
+
+        assert_eq!(
+            generated_fields(&admin, "DaemonStatus"),
+            keys(&body),
+            "the generated DaemonStatus field set is not what the admin encoder writes; \
+             regenerate with: {REGENERATE_COMMAND}"
+        );
+
+        let Some(JsonValue::Object(operational)) = body
+            .iter()
+            .find(|(name, _)| name == "operational")
+            .map(|(_, value)| value.clone())
+        else {
+            panic!("the status body carries an operational projection");
+        };
+        assert_eq!(
+            generated_fields(&admin, "OperationalStatus"),
+            keys(&operational),
+            "the generated OperationalStatus field set is not what the admin encoder writes; \
+             regenerate with: {REGENERATE_COMMAND}"
+        );
+    }
+
+    /// Present-and-null is not the same fact as absent, and the status body
+    /// carries exactly one field of the first kind.
+    #[test]
+    fn the_status_snapshot_keeps_nullable_apart_from_optional() {
+        let admin = file(ADMIN_STATUS_MODULE);
+        assert!(
+            admin.contains("  readonly telegram_poller_epoch: WireCounter | null;"),
+            "the nullable poller epoch lost its null"
+        );
+        assert!(
+            admin.contains("  readonly operational: OperationalStatus;"),
+            "the operational projection is required on the wire, not nullable"
+        );
+        assert!(
+            !admin.contains("?:"),
+            "no field of the status body may be absent; every key is required"
+        );
+    }
+
+    /// The doctor report's own shapes.
+    #[test]
+    fn the_doctor_report_carries_its_bounded_reason() {
+        let doctor = file(DOCTOR_MODULE);
+        for declaration in [
+            "  readonly code: FindingCode;",
+            "  readonly message: FindingMessage;",
+            "  readonly reason: DoctorReason | null;",
+            "  readonly status: CheckStatus;",
+            "  readonly checks: readonly DoctorCheck[];",
+            "  readonly schema: typeof DOCTOR_REPORT_SCHEMA_V1;",
+        ] {
+            assert!(
+                doctor.contains(declaration),
+                "the doctor surface lost a declaration.\nexpected: {declaration}"
+            );
+        }
+        // The grammars, not only the lengths. A code is lowercase and starts
+        // with a letter; a message carries no control character.
+        assert!(doctor.contains("export const FindingCode_PATTERN = /^[a-z][a-z0-9._-]*$/u;"));
+        assert!(doctor.contains("export const FindingMessage_PATTERN = /^[^\\p{Cc}]+$/u;"));
+    }
+
+    /// The barrel must re-export every maintained module and not the spike.
+    ///
+    /// A module added to the generator but left out of the barrel would be
+    /// generated, typechecked and unreachable — the failure mode that makes
+    /// codegen look like it is working when nothing consumes it.
+    #[test]
+    fn the_barrel_reaches_every_maintained_module() {
+        let name = module_file_name(BARREL_MODULE);
+        let barrel = file(BARREL_MODULE);
+        for module in maintained_modules() {
+            let line = format!("export * from \"./{}\";", module.file_name);
+            assert!(
+                barrel.contains(&line),
+                "{name} does not re-export {}, so nothing importing the package can reach \
+                 it.\nexpected: {line}",
+                module.file_name
+            );
+        }
+        assert!(
+            !barrel.contains("spike"),
+            "the barrel re-exports the spike, whose own ValidationError collides with the \
+             runtime module's"
+        );
+        // The barrel is a list of re-exports and nothing else; a declaration
+        // here would be surface no schema describes.
+        for line in barrel.lines() {
+            assert!(
+                line.is_empty() || line.starts_with("//") || line.starts_with("export * from "),
+                "{name} carries something other than a re-export: {line:?}"
+            );
+        }
+    }
+
+    /// A generated file must say how to rewrite itself, and the command it
+    /// names must be the one that works.
+    #[test]
+    fn every_generated_file_names_the_command_that_rewrites_it() {
+        assert!(
+            REGENERATE_COMMAND.contains(REGENERATE_ENV),
+            "the documented regeneration command does not set the variable that triggers it"
+        );
+        for (file_name, contents) in generated_files() {
+            assert!(
+                contents.starts_with("// SPDX-License-Identifier: Apache-2.0\n"),
+                "{file_name} does not open with the Apache-2.0 identifier the SDK tree requires"
+            );
+            assert!(
+                !contents.contains("Elastic-2.0"),
+                "{file_name} carries an Elastic-2.0 marker into the Apache-2.0 tree"
+            );
+            assert!(
+                contents.contains(&format!("// Regenerate with: {REGENERATE_COMMAND}")),
+                "{file_name} does not name the command that rewrites it"
+            );
+            assert!(
+                contents.contains("GENERATED by automonique_protocol::codegen"),
+                "{file_name} does not say it is generated"
+            );
+            assert!(
+                !contents.contains("constructor(readonly"),
+                "{file_name} uses a parameter property, which Node's strip-only loader rejects"
+            );
+            assert!(!contents.contains("TODO"), "{file_name} ships a TODO");
+        }
+    }
+
+    /// Only the shared runtime file is hand-written prose; everything else is
+    /// a description of a wire shape.
+    #[test]
+    fn only_the_shared_runtime_module_is_verbatim_typescript() {
+        let mut seen_runtime = false;
+        for module in maintained_modules() {
+            if module.file_name == module_file_name(RUNTIME_MODULE) {
+                seen_runtime = true;
+                assert!(
+                    !module.preamble.is_empty(),
+                    "the runtime module lost the helpers every other module imports"
+                );
+                continue;
+            }
+            assert!(
+                module.preamble.is_empty(),
+                "{} smuggles hand-written TypeScript past the schema description",
+                module.file_name
+            );
+        }
+        assert!(
+            seen_runtime,
+            "no module provides the shared runtime helpers"
+        );
+    }
+
+    /// The package's own tsconfig, over the whole package, generated files
+    /// included. This is stricter than the flag set the spike's negative cases
+    /// use: it turns on `exactOptionalPropertyTypes` and
+    /// `noUncheckedIndexedAccess` as the SDK actually ships them.
+    #[test]
+    fn the_package_typechecks_with_the_generated_files() {
+        let output = Command::new("npx")
+            .arg("--offline")
+            .arg("tsc")
+            .arg("-p")
+            .arg("./tsconfig.json")
+            .current_dir(package_root())
+            .output();
+        let Ok(output) = output else {
+            eprintln!("GAP: tsc is unavailable; the generated surface is untypechecked");
+            return;
+        };
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "the protocol package does not typecheck with the generated files:\n{combined}"
+        );
+    }
+}
