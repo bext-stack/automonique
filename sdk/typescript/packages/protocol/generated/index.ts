@@ -9,6 +9,7 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
+export * from "./admin-command.ts";
 export * from "./admin-status.ts";
 export * from "./doctor.ts";
 export * from "./runtime.ts";

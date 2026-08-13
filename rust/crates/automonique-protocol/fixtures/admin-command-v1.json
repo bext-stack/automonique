@@ -1,0 +1,312 @@
+{
+  "decode_refusals": [
+    {
+      "category": "admin_invalid_body",
+      "id": "run-accepted-zero-submission",
+      "note": "a durable row identity starts at one; zero is an unwritten row reported as accepted",
+      "payload_hex": "7b22626f6479223a7b227265706c6179223a66616c73652c2272756e5f6964223a2272756e2d30314a385a3951222c22737065635f646967657374223a227368613235363a34336363323366613532623837623463633164303262356231313431353431353164366164646462313763396664646330366230323766613939653234303038222c227375626d697373696f6e5f6964223a307d2c226b696e64223a2272756e5f6163636570746564222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d7375626d69742d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "admin_invalid_body",
+      "id": "intake-paused-extra-field",
+      "note": "an unexpected key is refused rather than ignored",
+      "payload_hex": "7b22626f6479223a7b2270617573655f6964223a31322c227265766973696f6e223a332c227375727072697365223a747275657d2c226b696e64223a22696e74616b655f706175736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d70617573652d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "admin_invalid_body",
+      "id": "intake-paused-missing-revision",
+      "note": "a missing key is refused rather than defaulted",
+      "payload_hex": "7b22626f6479223a7b2270617573655f6964223a31327d2c226b696e64223a22696e74616b655f706175736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d70617573652d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "admin_invalid_body",
+      "id": "refused-uppercase-category",
+      "note": "a refusal category is lowercase; an uppercase spelling is not folded",
+      "payload_hex": "7b22626f6479223a7b2263617465676f7279223a22496e74616b655f506175736564227d2c226b696e64223a2272656675736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d7375626d69742d32222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "admin_unknown_kind",
+      "id": "unknown-kind",
+      "note": "a kind this protocol version does not define",
+      "payload_hex": "7b22626f6479223a7b2270617573655f6964223a31322c227265766973696f6e223a337d2c226b696e64223a22696e74616b655f66726f7a656e222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d70617573652d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "unknown_protocol",
+      "id": "unknown-protocol",
+      "note": "another protocol's message, refused on the name axis",
+      "payload_hex": "7b22626f6479223a7b2270617573655f6964223a31322c227265766973696f6e223a337d2c226b696e64223a22696e74616b655f706175736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e72756e6e6572222c22726571756573745f6964223a227265712d70617573652d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "unsupported_version",
+      "id": "unsupported-version",
+      "note": "this protocol at a major version neither side implements",
+      "payload_hex": "7b22626f6479223a7b2270617573655f6964223a31322c227265766973696f6e223a337d2c226b696e64223a22696e74616b655f706175736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d70617573652d31222c2276657273696f6e223a327d"
+    },
+    {
+      "category": "non_canonical_json",
+      "id": "non-canonical-key-order",
+      "note": "a payload that parses but is not canonical is refused, not normalized",
+      "payload_hex": "7b226b696e64223a22696e74616b655f706175736564222c22626f6479223a7b2270617573655f6964223a31322c227265766973696f6e223a337d2c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d70617573652d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "duplicate_key",
+      "id": "duplicate-body-key",
+      "note": "one key, one value: a repeated key is refused rather than last-wins",
+      "payload_hex": "7b22626f6479223a7b2270617573655f6964223a31322c2270617573655f6964223a31332c227265766973696f6e223a337d2c226b696e64223a22696e74616b655f706175736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d70617573652d31222c2276657273696f6e223a317d"
+    },
+    {
+      "category": "malformed_json",
+      "id": "empty-payload",
+      "note": "zero bytes is not an empty message",
+      "payload_hex": ""
+    }
+  ],
+  "document_rule": {
+    "note": "byte i = (seed + (i mod 256) * step) mod 256; a document too large to review as a literal is built from this rule on both sides",
+    "seed": 7,
+    "step": 37
+  },
+  "encode_refusals": [
+    {
+      "category": "admin_invalid_body",
+      "id": "pause-intake-reason-too-long",
+      "kind": "pause_intake",
+      "note": "one byte over the reason bound, measured in UTF-8 bytes",
+      "params": {
+        "actor": "ops",
+        "reason": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+      },
+      "refused_by": "IntakeReason",
+      "request_id": "req-pause-1",
+      "violation": "too_long"
+    },
+    {
+      "category": "admin_invalid_body",
+      "id": "pause-intake-actor-control-character",
+      "kind": "pause_intake",
+      "note": "a control character in an actor, which the wire never carries raw",
+      "params": {
+        "actor": "ops\u0007",
+        "reason": "why"
+      },
+      "refused_by": "IntakeActor",
+      "request_id": "req-pause-1",
+      "violation": "invalid_character"
+    },
+    {
+      "category": "admin_invalid_body",
+      "id": "submit-run-key-too-long",
+      "kind": "submit_run",
+      "note": "one byte over the idempotency key bound",
+      "params": {
+        "document_hex": "7b22736368656d61223a226175746f6d6f6e697175652e72756e2d737065632f7631227d",
+        "idempotency_key": "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+        "spec_digest": "sha256:43cc23fa52b87b4cc1d02b5b114154151d6adddb17c9fddc06b027fa99e24008"
+      },
+      "refused_by": "RunSubmissionKey",
+      "request_id": "req-submit-1",
+      "violation": "too_long"
+    },
+    {
+      "category": "admin_document_too_large",
+      "id": "submit-run-document-too-large",
+      "kind": "submit_run",
+      "note": "one byte over the document bound, which is its own refusal rather than a generic invalid body",
+      "params": {
+        "document_length": 24577,
+        "idempotency_key": "submit-run-key-1",
+        "spec_digest": "sha256:43cc23fa52b87b4cc1d02b5b114154151d6adddb17c9fddc06b027fa99e24008"
+      },
+      "request_id": "req-submit-1"
+    },
+    {
+      "category": "admin_invalid_body",
+      "id": "submit-run-empty-document",
+      "kind": "submit_run",
+      "note": "an empty document is a different fault from an oversized one",
+      "params": {
+        "document_hex": "",
+        "idempotency_key": "submit-run-key-1",
+        "spec_digest": "sha256:43cc23fa52b87b4cc1d02b5b114154151d6adddb17c9fddc06b027fa99e24008"
+      },
+      "request_id": "req-submit-1"
+    },
+    {
+      "category": "field_invalid",
+      "id": "request-id-too-long",
+      "kind": "status",
+      "note": "the envelope's fields are judged by the shared codec, whose refusal for a bound is not the one this protocol uses for a body",
+      "params": {},
+      "refused_by": "RequestId",
+      "request_id": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "violation": "too_long"
+    },
+    {
+      "category": "field_grammar",
+      "id": "request-id-outside-grammar",
+      "kind": "status",
+      "note": "a grammar refusal is not a bounds refusal, and the categories differ",
+      "params": {},
+      "refused_by": "RequestId",
+      "request_id": "req 1",
+      "violation": "invalid_character"
+    }
+  ],
+  "generator": "automonique-protocol tests/codegen.rs, module command_surface",
+  "note": "Generated from the shipped Rust constructors: every canonical byte string here was produced by encoding a real message, and every refusal category was read back from the error Rust returned for that exact input. Rust is the wire source of truth, so a disagreement is fixed in whichever implementation is wrong — never in this file.",
+  "protocol": "automonique.admin",
+  "requests": [
+    {
+      "canonical_bytes": 98,
+      "canonical_hex": "7b22626f6479223a7b7d2c226b696e64223a22737461747573222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d7374617475732d31222c2276657273696f6e223a317d",
+      "id": "status-minimal",
+      "kind": "status",
+      "note": "a command with no arguments carries an empty object, not an absent body",
+      "params": {},
+      "request_id": "req-status-1"
+    },
+    {
+      "canonical_bytes": 102,
+      "canonical_hex": "7b22626f6479223a7b7d2c226b696e64223a2273687574646f776e222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d73687574646f776e2d31222c2276657273696f6e223a317d",
+      "id": "shutdown-minimal",
+      "kind": "shutdown",
+      "note": "the other argument-free command, which differs only in its kind",
+      "params": {},
+      "request_id": "req-shutdown-1"
+    },
+    {
+      "canonical_bytes": 207,
+      "canonical_hex": "7b22626f6479223a7b226163746f72223a226f70733a6f6e2d63616c6c222c22726561736f6e223a2268656c643a205c226d61696e74656e616e63655c22205c5c20706175736564206279206f70732f6f6e63616c6c20e28094206e61c3af766520e697a5e69cace8aa9e20f09f9a80227d2c226b696e64223a2270617573655f696e74616b65222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d70617573652d31222c2276657273696f6e223a317d",
+      "id": "pause-intake-escaping",
+      "kind": "pause_intake",
+      "note": "a reason carrying every escape a bounded coordinate can reach, a three-byte character and a surrogate pair",
+      "params": {
+        "actor": "ops:on-call",
+        "reason": "held: \"maintenance\" \\ paused by ops/oncall — naïve 日本語 🚀"
+      },
+      "request_id": "req-pause-1"
+    },
+    {
+      "canonical_bytes": 126,
+      "canonical_hex": "7b22626f6479223a7b226163746f72223a226f70733a6f6e2d63616c6c227d2c226b696e64223a22726573756d655f696e74616b65222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d726573756d652d31222c2276657273696f6e223a317d",
+      "id": "resume-intake-ascii",
+      "kind": "resume_intake",
+      "note": "the resume body carries no reason: the durable pause already has one",
+      "params": {
+        "actor": "ops:on-call"
+      },
+      "request_id": "req-resume-1"
+    },
+    {
+      "canonical_bytes": 316,
+      "canonical_hex": "7b22626f6479223a7b22646f63756d656e745f686578223a22376232323733363336383635366436313232336132323631373537343666366436663665363937313735363532653732373536653264373337303635363332663736333132323764222c226964656d706f74656e63795f6b6579223a227375626d69742d72756e2d6b65792d31222c22737065635f646967657374223a227368613235363a63643533656466383061633338336339636565336137353732656234306130613465623363356562646533346131383766366630623232633232353962333430227d2c226b696e64223a227375626d69745f72756e222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d7375626d69742d31222c2276657273696f6e223a317d",
+      "id": "submit-run-small",
+      "kind": "submit_run",
+      "note": "a document small enough to review as a literal, under its own digest",
+      "params": {
+        "document_hex": "7b22736368656d61223a226175746f6d6f6e697175652e72756e2d737065632f7631227d",
+        "idempotency_key": "submit-run-key-1",
+        "spec_digest": "sha256:cd53edf80ac383c9cee3a7572eb40a0a4eb3c5ebde34a187f6f0b22c2259b340"
+      },
+      "request_id": "req-submit-1"
+    },
+    {
+      "canonical_bytes": 49752,
+      "id": "submit-run-maximal",
+      "kind": "submit_run",
+      "note": "every bound at once: a document at MAX_SUBMITTED_RUN_SPEC_BYTES, a correlation identifier at MAX_REQUEST_ID_BYTES, and an idempotency key at its bound whose every character escapes to two bytes",
+      "params": {
+        "document_length": 24576,
+        "idempotency_key": "\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"",
+        "spec_digest": "sha256:9919e42b786187bf537cc9b21f7f2c7ff4f91b8929f34ef64dfbb8a6f02be536"
+      },
+      "request_id": "req-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "responses": [
+    {
+      "canonical_hex": "7b22626f6479223a7b227265706c6179223a66616c73652c2272756e5f6964223a2272756e2d30314a385a3951222c22737065635f646967657374223a227368613235363a64303936363238343534646135313834313862633538623462306666646364323839306232636361613361346162306161313463633064646436363563643836222c227375626d697373696f6e5f6964223a393232333337323033363835343737353830377d2c226b696e64223a2272756e5f6163636570746564222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d7375626d69742d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "replay": "false",
+        "request_id": "req-submit-1",
+        "run_id": "run-01J8Z9Q",
+        "spec_digest": "sha256:d096628454da518418bc58b4b0ffdcd2890b2ccaa3a4ab0aa14cc0ddd665cd86",
+        "submission_id": "9223372036854775807"
+      },
+      "id": "run-accepted-largest-submission",
+      "kind": "run_accepted",
+      "note": "a submission identity at the wire's ceiling, which a decoder carrying identities in a double would round to an even neighbour"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b227265706c6179223a747275652c2272756e5f6964223a2272756e2d30314a385a3951222c22737065635f646967657374223a227368613235363a64303936363238343534646135313834313862633538623462306666646364323839306232636361613361346162306161313463633064646436363563643836222c227375626d697373696f6e5f6964223a317d2c226b696e64223a2272756e5f6163636570746564222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d7375626d69742d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "replay": "true",
+        "request_id": "req-submit-1",
+        "run_id": "run-01J8Z9Q",
+        "spec_digest": "sha256:d096628454da518418bc58b4b0ffdcd2890b2ccaa3a4ab0aa14cc0ddd665cd86",
+        "submission_id": "1"
+      },
+      "id": "run-accepted-replay",
+      "kind": "run_accepted",
+      "note": "the exact retry of a submission already held; custody, not a second one"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b2270617573655f6964223a31322c227265766973696f6e223a337d2c226b696e64223a22696e74616b655f706175736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d70617573652d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "pause_id": "12",
+        "request_id": "req-pause-1",
+        "revision": "3"
+      },
+      "id": "intake-paused",
+      "kind": "intake_paused",
+      "note": "the fencing revision an exact resume must present"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b2270617573655f6964223a31322c227265766973696f6e223a347d2c226b696e64223a22696e74616b655f726573756d6564222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d726573756d652d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "pause_id": "12",
+        "request_id": "req-resume-1",
+        "revision": "4"
+      },
+      "id": "intake-resumed",
+      "kind": "intake_resumed",
+      "note": "the same body under a different kind: the pause row is retained"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b2263617465676f7279223a22696e74616b655f706175736564227d2c226b696e64223a2272656675736564222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d7375626d69742d32222c2276657273696f6e223a317d",
+      "decoded": {
+        "category": "intake_paused",
+        "request_id": "req-submit-2"
+      },
+      "id": "refused-while-paused",
+      "kind": "refused",
+      "note": "the category both intake lanes answer with while an operator pause is live"
+    },
+    {
+      "canonical_hex": "7b22626f6479223a7b7d2c226b696e64223a2273687574646f776e5f6163636570746564222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d73687574646f776e2d31222c2276657273696f6e223a317d",
+      "decoded": {
+        "request_id": "req-shutdown-1"
+      },
+      "id": "shutdown-accepted",
+      "kind": "shutdown_accepted",
+      "note": "an empty body, which is not the same fact as an absent one"
+    }
+  ],
+  "undecoded_responses": [
+    {
+      "id": "status-result-undecoded",
+      "kind": "status_result",
+      "note": "the status snapshot: admin-status.ts carries its types, and no generated decoder builds them",
+      "payload_hex": "7b22626f6479223a7b22616363657074696e675f696e74616b65223a747275652c226576656e745f637572736f72223a34312c22657865637574696f6e5f7374617465223a2273616e64626f785f756e617661696c61626c655f6e6f5f6c616e65222c2267656e65726174696f6e223a372c22696e626f785f70656e64696e67223a322c22696e7374616e63655f6964223a22636f646567656e2d737461747573222c22696e74616b655f706175736564223a66616c73652c226f7065726174696f6e616c223a7b226f627365727665645f6d73223a3130302c226f7574626f785f646561645f6c65747465726564223a362c226f7574626f785f64656c697665726564223a352c226f7574626f785f696e5f666c696768745f616d626967756f7573223a302c226f7574626f785f696e5f666c696768745f6c697665223a342c226f7574626f785f6f6c646573745f72656164795f6167655f6d73223a372c226f7574626f785f70656e64696e675f64656c61796564223a312c226f7574626f785f70656e64696e675f7265616479223a322c2270726f76696465725f617661696c61626c65223a7b227374617465223a22756e617661696c61626c65222c2276616c7565223a6e756c6c7d2c227265636f6e63696c696174696f6e5f70656e64696e67223a302c2273616e64626f785f6c61756e63685f7265667573616c73223a7b227374617465223a22756e617661696c61626c65222c2276616c7565223a6e756c6c7d2c2274656c656772616d5f6f66667365745f6c6167223a7b227374617465223a22756e617661696c61626c65222c2276616c7565223a6e756c6c7d2c2274656c656772616d5f706f6c6c6572735f65787069726564223a302c2274656c656772616d5f706f6c6c6572735f6c697665223a307d2c226f7574626f785f70656e64696e67223a332c2272756e6e696e67223a312c227374617465223a227265616479222c2274656c656772616d5f706f6c6c65725f65706f6368223a6e756c6c2c2274656c656772616d5f7374617465223a2264697361626c65645f6e6f5f636c69656e74227d2c226b696e64223a227374617475735f726573756c74222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d636f646567656e2d31222c2276657273696f6e223a317d",
+      "request_id": "req-codegen-1"
+    },
+    {
+      "id": "synthetic-accepted-undecoded",
+      "kind": "synthetic_accepted",
+      "note": "the synthetic intake receipt, whose command this surface does not build either",
+      "payload_hex": "7b22626f6479223a7b226475706c6963617465223a747275652c22696e626f785f6964223a397d2c226b696e64223a2273796e7468657469635f6163636570746564222c2270726f746f636f6c223a226175746f6d6f6e697175652e61646d696e222c22726571756573745f6964223a227265712d73796e7468657469632d31222c2276657273696f6e223a317d",
+      "request_id": "req-synthetic-1"
+    }
+  ],
+  "version": 1
+}

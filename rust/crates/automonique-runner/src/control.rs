@@ -85,14 +85,17 @@
 //!   `Admission` do not exist. [`PeerIdentity`] and [`admit_peer`] carry the
 //!   same rule — exactly the server's own non-root effective UID, with GID and
 //!   PID diagnostic only, and no caller-selectable policy.
-//! - **Cancellation service.** R2-06's host cancellation dispatcher still does
-//!   not exist, and neither does R1-25 `RequestRef`. What *does* now exist is
-//!   the durable half of it: idempotency is expressed as the [`CancelCustody`]
-//!   seam, and `automonique-store`'s `cancel_ledger` implements it host-wide
-//!   and restart-surviving. The runner cannot depend on that crate — the
-//!   dependency runs the other way and a SQLite handle has no business inside a
-//!   runner — so the trait lives here and the implementation lives daemon-side.
-//!   What remains diverged:
+//! - **Cancellation service.** R1-25 `RequestRef` still does not exist, and
+//!   neither does the contract's typed non-wire `AttemptCancelRequest`. What
+//!   *does* now exist is both halves of the service: idempotency is expressed as
+//!   the [`CancelCustody`] seam, `automonique-store`'s `cancel_ledger`
+//!   implements it host-wide and restart-surviving, and
+//!   [`CancelDispatcher`](crate::dispatch::CancelDispatcher) is the
+//!   server-held, non-cloneable, registration-based owner of the whole
+//!   classify-deliver-record sequence. The runner cannot depend on the store
+//!   crate — the dependency runs the other way and a SQLite handle has no
+//!   business inside a runner — so the trait lives here and the durable
+//!   implementation lives daemon-side. What remains diverged:
 //!   - **The default is still in-memory.** [`ControlServer::bind`] installs
 //!     [`InMemoryCancelCustody`], bounded at [`MAX_CANCEL_LEDGER_ENTRIES`],
 //!     because a runner that opened a database on `bind` would put durable
@@ -104,11 +107,14 @@
 //!     unavailable sink records nothing and a retry is a real second attempt.
 //!     The cost is stated rather than hidden: a crash between delivery and
 //!     recording loses the record, and a replay then delivers twice.
-//!   - **Custody is not a dispatcher.** Each binding still carries its own
-//!     [`CancelSink`]; custody decides *whether* to call it and never calls it.
-//!     Composing a sink onto a real
+//!   - **Custody here is still not a dispatcher.** Each binding carries its own
+//!     [`CancelSink`]; custody decides *whether* to call it and never calls it,
+//!     and this module holds no containment handle. Composing a sink onto a real
 //!     [`RunContainment::kill`](crate::RunContainment::kill) is the backend's
-//!     decision, not this module's; this module holds no containment handle.
+//!     decision, and owning the sequence across servers is
+//!     [`crate::dispatch`]'s — a server reaches it by binding a
+//!     [`ControlSeat`](crate::dispatch::ControlSeat)'s custody and sinks, which
+//!     needs no change to the code here.
 //! - **`observed_sequence`.** The contract's cancel body carries an observed
 //!   sequence that participates in conflict detection, and custody now records
 //!   one, so the wire carries it as an optional fourth `cancel` token
@@ -116,12 +122,28 @@
 //!   absent: heartbeat here claims nothing about any attempt. `requested_at_ms`
 //!   is deliberately **not** on the wire — it is stamped by the custody
 //!   implementation's own clock, so a client cannot backdate a ledger row.
-//! - **Custody races.** Two servers sharing one durable custody can interleave
-//!   between classify and record. The window is stated rather than locked:
-//!   if the record then replays, the answer is still `delivered` because this
-//!   server's sink did fire; if it conflicts, the answer is `cancel_conflict`
-//!   even though delivery already happened. Closing that needs a dispatcher
-//!   that owns both halves, which is R2-06's job, not this endpoint's.
+//! - **Custody races.** This module classifies, delivers and records as three
+//!   separate calls and holds no lock across them, so two servers sharing one
+//!   durable custody can interleave between classify and record. Left alone the
+//!   window is stated rather than locked: if the record then replays, the answer
+//!   is still `delivered` because this server's sink did fire; if it conflicts,
+//!   the answer is `cancel_conflict` even though delivery already happened.
+//!
+//!   Closing it needs one owner of both halves, which is
+//!   [`CancelDispatcher`](crate::dispatch::CancelDispatcher). Servers bound
+//!   through [`ControlSeat`](crate::dispatch::ControlSeat)s over one dispatcher
+//!   do not double-deliver: the whole sequence runs under the dispatcher's lock
+//!   inside the sink call, so the loser of the race is refused a second delivery
+//!   instead of granted one. Two things that composition cannot fix from outside
+//!   this module, both stated there in full: this server picks its answer at
+//!   classify time, so a losing caller is told `delivered` rather than
+//!   `already_delivered`; and [`CancelSink::deliver`]'s single error collapses a
+//!   conflict or a full ledger *discovered inside* that section into
+//!   `cancel_unavailable`. Each needs a change here — an answer taken from one
+//!   call, and a richer sink error — and neither can produce a second delivery
+//!   or record a delivery that did not happen. Host-wide still means one
+//!   dispatcher instance: two dispatchers over one ledger file interleave
+//!   exactly as two bare servers do.
 //! - **Subscribe pages.** The contract returns exactly one record per request
 //!   with digest, byte count and hex fragments. This module returns up to
 //!   [`MAX_SUBSCRIBE_PAGE_EVENTS`] whole events per request and omits the

@@ -9,6 +9,24 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
+// The canonical JSON codec is not generated twice.
+//
+// `src/canonical.ts` mirrors `wire.rs` byte for byte and is held to that claim
+// by the cross-language corpus in `tests/cross_language.rs`, in both
+// directions. A second copy emitted here would be a second thing to keep
+// right, and the copy that drifted would be the one nothing measured. This
+// line is the whole of the generated tree's dependency on hand-written code:
+// every other generated module imports from this file and from nothing else.
+export {
+  WireError,
+  decodeMessageAdmitted,
+  encodeMessage,
+  toCanonicalBytes,
+  type JsonValue,
+} from "../src/canonical.ts";
+
+import {type JsonValue} from "../src/canonical.ts";
+
 const encoder = new TextEncoder();
 
 /** UTF-8 byte length, which is the unit every protocol bound is stated in. */
@@ -43,4 +61,164 @@ export function hasExactFields(
     Object.keys(value).length === fields.length &&
     fields.every((field) => Object.hasOwn(value, field))
   );
+}
+
+/**
+ * A refusal under the stable category the Rust peer reports for it.
+ *
+ * `ValidationError` says a value this program built is wrong; this says a
+ * message was refused, under the spelling the daemon's own logs and refusal
+ * metrics use. Keeping the category rather than a sentence is what lets a
+ * cross-language fixture assert that both implementations refused the same
+ * input for the same reason.
+ */
+export class RefusalError extends Error {
+  readonly category: string;
+  constructor(category: string, detail: string) {
+    super(`${category}: ${detail}`);
+    this.name = "RefusalError";
+    this.category = category;
+  }
+}
+
+/**
+ * Run a validating step, reporting the category the Rust peer would report.
+ *
+ * The generated constructors refuse a value with a `ValidationError`, which is
+ * the right error for a caller who built one. Inside an encoder or a decoder
+ * the same refusal is a message-level one, and the peer names it with a
+ * category; this is where the first becomes the second without losing what was
+ * wrong.
+ */
+export function refuse<T>(category: string, action: () => T): T {
+  try {
+    return action();
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      throw new RefusalError(category, error.message);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Refuse an envelope field the way the shared codec does.
+ *
+ * The codec settles the bounded-value rules before it judges a grammar, and
+ * reports the two under different categories: an empty, overlong or
+ * control-bearing value is a bounded-value refusal, and only a value that
+ * cleared those rules can be refused for its grammar. A single category here
+ * would tell a peer its identifier was the wrong shape when the length was
+ * what was wrong.
+ */
+export function refuseField<T>(
+  boundsCategory: string,
+  grammarCategory: string,
+  action: () => T,
+): T {
+  try {
+    return action();
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      const category = error.violation === "invalid_character" ? grammarCategory : boundsCategory;
+      throw new RefusalError(category, error.message);
+    }
+    throw error;
+  }
+}
+
+/** Lowercase hexadecimal, two digits per byte. */
+export function hexEncode(bytes: Uint8Array): string {
+  let hex = "";
+  for (const byte of bytes) {
+    hex += byte.toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
+/**
+ * Bound an opaque byte string before it is encoded.
+ *
+ * The two categories are distinct because the Rust constructor's are: a
+ * document over the ceiling and an empty one are different faults, and a
+ * submitter told only "invalid" cannot tell which it made.
+ */
+export function boundedBytes(
+  value: Uint8Array,
+  maxBytes: number,
+  oversizeCategory: string,
+  emptyCategory: string,
+): Uint8Array {
+  if (value.length > maxBytes) {
+    throw new RefusalError(
+      oversizeCategory,
+      `${value.length} bytes; maximum is ${maxBytes}`,
+    );
+  }
+  if (value.length === 0) throw new RefusalError(emptyCategory, "empty document");
+  return value;
+}
+
+/**
+ * Read a body whose key set must be exactly `fields`.
+ *
+ * The Rust decoders refuse a body with a missing or unexpected key rather than
+ * ignoring it, so a body carrying one more field than it should is refused
+ * here too. The returned map is what the field readers below take, so a
+ * decoder cannot read a field it did not first declare.
+ */
+export function exactFields(
+  body: JsonValue,
+  fields: readonly string[],
+  category: string,
+): ReadonlyMap<string, JsonValue> {
+  if (body.kind !== "object") throw new RefusalError(category, "body is not an object");
+  const found = new Map<string, JsonValue>();
+  for (const [key, value] of body.entries) {
+    if (found.has(key)) throw new RefusalError(category, `duplicate field ${key}`);
+    found.set(key, value);
+  }
+  if (found.size !== fields.length || !fields.every((field) => found.has(field))) {
+    throw new RefusalError(category, "body is not the exact shape for its kind");
+  }
+  return found;
+}
+
+/** A string field, refused when absent or of another JSON type. */
+export function bodyString(
+  fields: ReadonlyMap<string, JsonValue>,
+  name: string,
+  category: string,
+): string {
+  const value = fields.get(name);
+  if (value === undefined || value.kind !== "string") {
+    throw new RefusalError(category, `${name} is not a string`);
+  }
+  return value.value;
+}
+
+/** An integer field, refused when absent or of another JSON type. */
+export function bodyInteger(
+  fields: ReadonlyMap<string, JsonValue>,
+  name: string,
+  category: string,
+): bigint {
+  const value = fields.get(name);
+  if (value === undefined || value.kind !== "integer") {
+    throw new RefusalError(category, `${name} is not an integer`);
+  }
+  return value.value;
+}
+
+/** A boolean field. The wire carries `true` or `false` and nothing else. */
+export function bodyBool(
+  fields: ReadonlyMap<string, JsonValue>,
+  name: string,
+  category: string,
+): boolean {
+  const value = fields.get(name);
+  if (value === undefined || value.kind !== "bool") {
+    throw new RefusalError(category, `${name} is not a boolean`);
+  }
+  return value.value;
 }

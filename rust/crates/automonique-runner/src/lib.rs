@@ -14,6 +14,7 @@ pub mod capability;
 mod containment;
 pub mod control;
 pub mod descriptors;
+pub mod dispatch;
 pub mod filesystem;
 mod landlock_abi;
 mod launch;

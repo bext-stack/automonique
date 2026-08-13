@@ -13,7 +13,13 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use automonique_protocol::admin::{
+    AdminInstanceId, AdminResponse, DaemonState, DaemonStatus, MAX_ADMIN_CANONICAL_BYTES,
+    MAX_INSTANCE_ID_BYTES, OperationalMetric, OperationalStatus, OperationalStatusParts,
+};
+use automonique_protocol::codec::RequestId;
 use automonique_protocol::codegen::{SpikeSchema, emit_typescript, hostile_slice};
+use automonique_protocol::wire::{JsonValue, Message};
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -576,6 +582,50 @@ mod verdict_quality {
     }
 }
 
+/// A real encoded status message, built through the shipped constructors.
+///
+/// The projection is required and its counts have to agree with the aggregate,
+/// so this is the smallest snapshot `to_message` will accept.
+fn encoded_status() -> Message {
+    let status = DaemonStatus::new(
+        AdminInstanceId::new("codegen-status").expect("valid instance"),
+        DaemonState::Ready,
+        7,
+        41,
+        2,
+        3,
+        1,
+        true,
+    )
+    .expect("base status")
+    .with_operational(
+        OperationalStatus::new(OperationalStatusParts {
+            observed_ms: 100,
+            reconciliation_pending: 0,
+            outbox_pending_ready: 2,
+            outbox_pending_delayed: 1,
+            outbox_in_flight_live: 4,
+            outbox_in_flight_ambiguous: 0,
+            outbox_delivered: 5,
+            outbox_dead_lettered: 6,
+            outbox_oldest_ready_age_ms: 7,
+            telegram_pollers_live: 0,
+            telegram_pollers_expired: 0,
+            telegram_offset_lag: OperationalMetric::Unavailable,
+            provider_available: OperationalMetric::Unavailable,
+            sandbox_launch_refusals: OperationalMetric::Unavailable,
+        })
+        .expect("valid projection"),
+    )
+    .expect("coherent snapshot");
+    AdminResponse::Status {
+        request_id: RequestId::new("req-codegen-1").expect("valid request ID"),
+        status,
+    }
+    .to_message()
+    .expect("a complete status encodes")
+}
+
 /// The maintained read surface: the doctor report and the admin status read.
 ///
 /// These files differ from `generated/spike.ts` in one way that matters. The
@@ -588,16 +638,10 @@ mod maintained_surface {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
 
-    use automonique_protocol::admin::{
-        AdminInstanceId, AdminResponse, DaemonState, DaemonStatus, MAX_ADMIN_CANONICAL_BYTES,
-        MAX_INSTANCE_ID_BYTES, OperationalMetric, OperationalStatus, OperationalStatusParts,
-    };
-    use automonique_protocol::codec::RequestId;
     use automonique_protocol::codegen::{
         ADMIN_STATUS_MODULE, BARREL_MODULE, DOCTOR_MODULE, GENERATED_DIRECTORY, REGENERATE_COMMAND,
         REGENERATE_ENV, RUNTIME_MODULE, generated_files, maintained_modules, module_file_name,
     };
-    use automonique_protocol::wire::{JsonValue, Message};
     use automonique_protocol::{
         MAX_DOCTOR_CHECKS, MAX_FINDING_CODE_BYTES, MAX_FINDING_MESSAGE_BYTES,
     };
@@ -659,50 +703,6 @@ mod maintained_surface {
             .collect();
         names.sort();
         names
-    }
-
-    /// A real encoded status message, built through the shipped constructors.
-    ///
-    /// The projection is required and its counts have to agree with the
-    /// aggregate, so this is the smallest snapshot `to_message` will accept.
-    fn encoded_status() -> Message {
-        let status = DaemonStatus::new(
-            AdminInstanceId::new("codegen-status").expect("valid instance"),
-            DaemonState::Ready,
-            7,
-            41,
-            2,
-            3,
-            1,
-            true,
-        )
-        .expect("base status")
-        .with_operational(
-            OperationalStatus::new(OperationalStatusParts {
-                observed_ms: 100,
-                reconciliation_pending: 0,
-                outbox_pending_ready: 2,
-                outbox_pending_delayed: 1,
-                outbox_in_flight_live: 4,
-                outbox_in_flight_ambiguous: 0,
-                outbox_delivered: 5,
-                outbox_dead_lettered: 6,
-                outbox_oldest_ready_age_ms: 7,
-                telegram_pollers_live: 0,
-                telegram_pollers_expired: 0,
-                telegram_offset_lag: OperationalMetric::Unavailable,
-                provider_available: OperationalMetric::Unavailable,
-                sandbox_launch_refusals: OperationalMetric::Unavailable,
-            })
-            .expect("valid projection"),
-        )
-        .expect("coherent snapshot");
-        AdminResponse::Status {
-            request_id: RequestId::new("req-codegen-1").expect("valid request ID"),
-            status,
-        }
-        .to_message()
-        .expect("a complete status encodes")
     }
 
     /// The drift gate, and the regeneration that closes it.
@@ -1168,6 +1168,1500 @@ mod maintained_surface {
         assert!(
             output.status.success(),
             "the protocol package does not typecheck with the generated files:\n{combined}"
+        );
+    }
+}
+
+/// The `automonique.admin` command surface, measured across two languages.
+///
+/// # Where the comparison runs, and what each side is trusted for
+///
+/// `fixtures/admin-command-v1.json` is *generated* from the shipped Rust
+/// constructors, unlike the hand-written corpus in `fixtures/wire-v1.json`.
+/// Nothing in it is a prediction: every canonical byte string was produced by
+/// encoding a real request, every refusal category was read back from the error
+/// the Rust constructor or decoder actually returned, and every decoded
+/// spelling came out of `AdminResponse::from_canonical_bytes` rather than out
+/// of the value this file constructed.
+///
+/// `conformance/admin-command.ts` then rebuilds each request from the recorded
+/// parameters with the *generated* encoders and compares its canonical bytes
+/// with the recorded ones, decodes each recorded response and compares the
+/// decoded spellings, and asserts the same inputs are refused under the same
+/// categories. It writes every payload it produced to a file, and
+/// [`the_generated_typescript_agrees_with_rust_byte_for_byte`] compares those
+/// bytes with Rust's own encoding and feeds them back through
+/// `AdminRequest::from_canonical_bytes`.
+///
+/// So the byte comparison happens twice, in both languages, and the maximal
+/// `submit_run` — 24 KiB of document, too large to review as a literal and
+/// therefore built on both sides from a rule — is compared in Rust, where the
+/// bytes it should have are available rather than recorded.
+mod command_surface {
+    use core::fmt::Write as _;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use automonique_protocol::admin::{
+        ADMIN_PROTOCOL, AdminCommand, AdminError, AdminOutboxEvidence, AdminOutboxEvidenceParts,
+        AdminReconciliationEvidence, AdminRefusalCategory, AdminRequest, IntakePause, IntakeResume,
+        MAX_INTAKE_REASON_BYTES, MAX_RUN_SUBMISSION_KEY_BYTES, MAX_SUBMITTED_RUN_SPEC_BYTES,
+        OutboxReconciliation, OutboxReconciliationDecision, OutboxReconciliationParts,
+        ReconciliationFailure, SubmittedRunSpec, SyntheticSubmission,
+    };
+    use automonique_protocol::codec::{
+        Envelope, MAX_REQUEST_ID_BYTES, MajorVersion, MessageKind, ProtocolName,
+    };
+    use automonique_protocol::codegen::{
+        ADMIN_COMMAND_MODULE, CommandSurface, ConstantValue, REGENERATE_COMMAND, REGENERATE_ENV,
+        RequestValue, generated_files, maintained_modules, module_file_name,
+    };
+    use automonique_protocol::digest::Sha256;
+    use automonique_protocol::tools::RunId;
+
+    use super::*;
+
+    fn corpus_path() -> PathBuf {
+        crate_root().join("fixtures/admin-command-v1.json")
+    }
+
+    fn runner_path() -> PathBuf {
+        package_root().join("conformance/admin-command.ts")
+    }
+
+    /// Whether this run was asked to rewrite the checked-in corpus.
+    fn regenerating() -> bool {
+        std::env::var(REGENERATE_ENV).is_ok_and(|value| !value.is_empty() && value != "0")
+    }
+
+    /// The command surface the generator describes.
+    fn surface() -> CommandSurface {
+        maintained_modules()
+            .into_iter()
+            .find(|module| module.file_name == module_file_name(ADMIN_COMMAND_MODULE))
+            .and_then(|module| module.command_surface)
+            .expect("the admin command module describes a command surface")
+    }
+
+    /// The generated TypeScript of the command module.
+    fn generated_admin_command() -> String {
+        generated_files()
+            .into_iter()
+            .find(|(name, _)| *name == module_file_name(ADMIN_COMMAND_MODULE))
+            .map(|(_, contents)| contents)
+            .expect("the command module is generated")
+    }
+
+    fn request_id(value: &str) -> RequestId {
+        RequestId::new(value).expect("a valid correlation identifier")
+    }
+
+    // -----------------------------------------------------------------------
+    // The document rule
+    //
+    // A 24 KiB literal is not reviewable, so the corpus carries a rule and each
+    // implementation builds the bytes from it. That the two read the rule the
+    // same way is measured before any verdict about the encoders is believed:
+    // the TypeScript side reports the payload it built, and the comparison is
+    // against the payload Rust built from the same rule.
+    // -----------------------------------------------------------------------
+
+    const DOCUMENT_SEED: u8 = 7;
+    const DOCUMENT_STEP: u8 = 37;
+
+    fn ruled_document(length: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| {
+                let index = u8::try_from(index % 256).expect("a value below 256 is a byte");
+                DOCUMENT_SEED.wrapping_add(index.wrapping_mul(DOCUMENT_STEP))
+            })
+            .collect()
+    }
+
+    fn text(value: &str) -> JsonValue {
+        JsonValue::String(value.to_owned())
+    }
+
+    fn count(value: usize) -> JsonValue {
+        JsonValue::Integer(i64::try_from(value).expect("a corpus count is within the wire range"))
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            let _ = write!(encoded, "{byte:02x}");
+        }
+        encoded
+    }
+
+    fn unhex(value: &str) -> Vec<u8> {
+        assert!(value.len().is_multiple_of(2), "hex has two digits per byte");
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                u8::from_str_radix(
+                    core::str::from_utf8(pair).expect("hex digits are ASCII"),
+                    16,
+                )
+                .expect("a hex byte")
+            })
+            .collect()
+    }
+
+    /// Every escape the canonical writer defines that a bounded coordinate may
+    /// carry, and the two multibyte classes a UTF-16 runtime is most likely to
+    /// mishandle: a three-byte character and a surrogate pair.
+    ///
+    /// Control characters are absent because the Rust constructor refuses them,
+    /// so `\n` and `\t` cannot appear in a reason at all; the escapes that
+    /// remain reachable are the quote and the backslash, and the solidus that
+    /// canonical JSON pointedly does *not* escape.
+    fn escaping_reason() -> String {
+        "held: \"maintenance\" \\ paused by ops/oncall — naïve 日本語 🚀".to_owned()
+    }
+
+    // -----------------------------------------------------------------------
+    // Requests
+    // -----------------------------------------------------------------------
+
+    /// One request fixture: what Rust encodes, and the parameters the other
+    /// implementation builds the same request from.
+    struct RequestCase {
+        id: &'static str,
+        note: &'static str,
+        request: AdminRequest,
+        /// Builder parameters, in the shape the runner reads for this kind.
+        params: JsonValue,
+        /// Whether the canonical bytes are small enough to review as a literal.
+        inline_hex: bool,
+    }
+
+    fn request_cases() -> Vec<RequestCase> {
+        let small_document = br#"{"schema":"automonique.run-spec/v1"}"#.to_vec();
+        let small_submission = SubmittedRunSpec::sealed(small_document.clone(), "submit-run-key-1")
+            .expect("a small document is carried");
+        // A key of quotes is the worst case the Rust bound arithmetic budgets
+        // for: every character escapes to two bytes, so a maximal key costs
+        // twice its length inside the canonical body.
+        let maximal_key = "\"".repeat(MAX_RUN_SUBMISSION_KEY_BYTES);
+        let maximal_document = ruled_document(MAX_SUBMITTED_RUN_SPEC_BYTES);
+        let maximal_submission =
+            SubmittedRunSpec::sealed(maximal_document, maximal_key.clone()).expect("at the bound");
+        let maximal_request_id = format!("req-{}", "a".repeat(MAX_REQUEST_ID_BYTES - 4));
+
+        vec![
+            RequestCase {
+                id: "status-minimal",
+                note: "a command with no arguments carries an empty object, not an absent body",
+                request: AdminRequest::new(request_id("req-status-1"), AdminCommand::Status),
+                params: JsonValue::Object(Vec::new()),
+                inline_hex: true,
+            },
+            RequestCase {
+                id: "shutdown-minimal",
+                note: "the other argument-free command, which differs only in its kind",
+                request: AdminRequest::new(request_id("req-shutdown-1"), AdminCommand::Shutdown),
+                params: JsonValue::Object(Vec::new()),
+                inline_hex: true,
+            },
+            RequestCase {
+                id: "pause-intake-escaping",
+                note: "a reason carrying every escape a bounded coordinate can reach, a \
+                       three-byte character and a surrogate pair",
+                request: AdminRequest::pause_intake(
+                    request_id("req-pause-1"),
+                    IntakePause::new("ops:on-call", escaping_reason()).expect("a valid pause"),
+                ),
+                params: JsonValue::Object(vec![
+                    ("actor".to_owned(), text("ops:on-call")),
+                    ("reason".to_owned(), text(&escaping_reason())),
+                ]),
+                inline_hex: true,
+            },
+            RequestCase {
+                id: "resume-intake-ascii",
+                note: "the resume body carries no reason: the durable pause already has one",
+                request: AdminRequest::resume_intake(
+                    request_id("req-resume-1"),
+                    IntakeResume::new("ops:on-call").expect("a valid resume"),
+                ),
+                params: JsonValue::Object(vec![("actor".to_owned(), text("ops:on-call"))]),
+                inline_hex: true,
+            },
+            RequestCase {
+                id: "submit-run-small",
+                note: "a document small enough to review as a literal, under its own digest",
+                params: JsonValue::Object(vec![
+                    ("document_hex".to_owned(), text(&hex(&small_document))),
+                    ("idempotency_key".to_owned(), text("submit-run-key-1")),
+                    (
+                        "spec_digest".to_owned(),
+                        text(&small_submission.spec_digest().to_string()),
+                    ),
+                ]),
+                request: AdminRequest::submit_run(request_id("req-submit-1"), small_submission),
+                inline_hex: true,
+            },
+            RequestCase {
+                id: "submit-run-maximal",
+                note: "every bound at once: a document at MAX_SUBMITTED_RUN_SPEC_BYTES, a \
+                       correlation identifier at MAX_REQUEST_ID_BYTES, and an idempotency key \
+                       at its bound whose every character escapes to two bytes",
+                params: JsonValue::Object(vec![
+                    (
+                        "document_length".to_owned(),
+                        count(MAX_SUBMITTED_RUN_SPEC_BYTES),
+                    ),
+                    ("idempotency_key".to_owned(), text(&maximal_key)),
+                    (
+                        "spec_digest".to_owned(),
+                        text(&maximal_submission.spec_digest().to_string()),
+                    ),
+                ]),
+                request: AdminRequest::submit_run(
+                    request_id(&maximal_request_id),
+                    maximal_submission,
+                ),
+                // 49 KiB of hex is not a reviewable literal; the bytes are
+                // compared in Rust instead, against what Rust encoded.
+                inline_hex: false,
+            },
+        ]
+    }
+
+    fn request_entry(case: &RequestCase) -> JsonValue {
+        let message = case.request.to_message().expect("the request encodes");
+        let canonical = message.to_canonical_bytes();
+        // What the corpus records is checked against the shipped decoder before
+        // it is written: a fixture Rust would not itself admit proves nothing.
+        assert_eq!(
+            AdminRequest::from_canonical_bytes(&canonical).expect("Rust admits its own encoding"),
+            case.request,
+            "{}: the Rust decoder does not admit the Rust encoding",
+            case.id
+        );
+        assert!(
+            canonical.len() <= MAX_ADMIN_CANONICAL_BYTES,
+            "{}: the encoding does not fit one admin frame",
+            case.id
+        );
+        let mut entry = vec![
+            ("canonical_bytes".to_owned(), count(canonical.len())),
+            ("id".to_owned(), text(case.id)),
+            ("kind".to_owned(), text(message.envelope().kind().as_str())),
+            ("note".to_owned(), text(case.note)),
+            ("params".to_owned(), case.params.clone()),
+            (
+                "request_id".to_owned(),
+                text(message.envelope().request_id().as_str()),
+            ),
+        ];
+        if case.inline_hex {
+            entry.push(("canonical_hex".to_owned(), text(&hex(&canonical))));
+        }
+        JsonValue::Object(entry)
+    }
+
+    // -----------------------------------------------------------------------
+    // Responses
+    // -----------------------------------------------------------------------
+
+    struct ResponseCase {
+        id: &'static str,
+        note: &'static str,
+        response: AdminResponse,
+    }
+
+    fn response_cases() -> Vec<ResponseCase> {
+        let digest = Sha256::digest(b"a canonical run specification document");
+        vec![
+            ResponseCase {
+                id: "run-accepted-largest-submission",
+                note: "a submission identity at the wire's ceiling, which a decoder carrying \
+                       identities in a double would round to an even neighbour",
+                response: AdminResponse::RunAccepted {
+                    request_id: request_id("req-submit-1"),
+                    run_id: RunId::new("run-01J8Z9Q").expect("a valid run identity"),
+                    spec_digest: digest,
+                    submission_id: u64::try_from(i64::MAX).expect("the wire ceiling is positive"),
+                    replay: false,
+                },
+            },
+            ResponseCase {
+                id: "run-accepted-replay",
+                note: "the exact retry of a submission already held; custody, not a second one",
+                response: AdminResponse::RunAccepted {
+                    request_id: request_id("req-submit-1"),
+                    run_id: RunId::new("run-01J8Z9Q").expect("a valid run identity"),
+                    spec_digest: digest,
+                    submission_id: 1,
+                    replay: true,
+                },
+            },
+            ResponseCase {
+                id: "intake-paused",
+                note: "the fencing revision an exact resume must present",
+                response: AdminResponse::IntakePaused {
+                    request_id: request_id("req-pause-1"),
+                    pause_id: 12,
+                    revision: 3,
+                },
+            },
+            ResponseCase {
+                id: "intake-resumed",
+                note: "the same body under a different kind: the pause row is retained",
+                response: AdminResponse::IntakeResumed {
+                    request_id: request_id("req-resume-1"),
+                    pause_id: 12,
+                    revision: 4,
+                },
+            },
+            ResponseCase {
+                id: "refused-while-paused",
+                note: "the category both intake lanes answer with while an operator pause is live",
+                response: AdminResponse::Refused {
+                    request_id: request_id("req-submit-2"),
+                    category: AdminRefusalCategory::new("intake_paused").expect("a valid category"),
+                },
+            },
+            ResponseCase {
+                id: "shutdown-accepted",
+                note: "an empty body, which is not the same fact as an absent one",
+                response: AdminResponse::ShutdownAccepted {
+                    request_id: request_id("req-shutdown-1"),
+                },
+            },
+        ]
+    }
+
+    /// How one decoded response is spelled in the corpus.
+    ///
+    /// Built from the value the *Rust decoder* recovered rather than from the
+    /// value this file constructed, so an entry cannot record a field the
+    /// decoder does not actually produce. Integers are decimal strings because
+    /// the wire carries 64-bit values and a reader that used a double would
+    /// round the largest of them without saying so.
+    fn decoded_spelling(response: &AdminResponse) -> JsonValue {
+        let number = |value: u64| JsonValue::String(value.to_string());
+        let mut fields = vec![(
+            "request_id".to_owned(),
+            text(response.request_id().as_str()),
+        )];
+        match response {
+            AdminResponse::RunAccepted {
+                run_id,
+                spec_digest,
+                submission_id,
+                replay,
+                ..
+            } => {
+                fields.push(("replay".to_owned(), text(&replay.to_string())));
+                fields.push(("run_id".to_owned(), text(run_id.as_str())));
+                fields.push(("spec_digest".to_owned(), text(&spec_digest.to_string())));
+                fields.push(("submission_id".to_owned(), number(*submission_id)));
+            }
+            AdminResponse::IntakePaused {
+                pause_id, revision, ..
+            }
+            | AdminResponse::IntakeResumed {
+                pause_id, revision, ..
+            } => {
+                fields.push(("pause_id".to_owned(), number(*pause_id)));
+                fields.push(("revision".to_owned(), number(*revision)));
+            }
+            AdminResponse::Refused { category, .. } => {
+                fields.push(("category".to_owned(), text(category.as_str())));
+            }
+            AdminResponse::ShutdownAccepted { .. } => {}
+            other => panic!("the corpus has no spelling for {other:?}"),
+        }
+        JsonValue::Object(fields)
+    }
+
+    fn response_entry(case: &ResponseCase) -> JsonValue {
+        let message = case.response.to_message().expect("the response encodes");
+        let canonical = message.to_canonical_bytes();
+        let decoded =
+            AdminResponse::from_canonical_bytes(&canonical).expect("Rust admits its own encoding");
+        assert_eq!(
+            decoded, case.response,
+            "{}: the Rust decoder does not recover what it encoded",
+            case.id
+        );
+        JsonValue::Object(vec![
+            ("canonical_hex".to_owned(), text(&hex(&canonical))),
+            ("decoded".to_owned(), decoded_spelling(&decoded)),
+            ("id".to_owned(), text(case.id)),
+            ("kind".to_owned(), text(message.envelope().kind().as_str())),
+            ("note".to_owned(), text(case.note)),
+        ])
+    }
+
+    /// A response this protocol version defines and the generated surface does
+    /// not decode.
+    ///
+    /// These are the evidence that the `undecoded` arm is reachable and honest:
+    /// Rust admits every payload here, so a client told "undefined kind" about
+    /// one of them would have been told something false.
+    struct UndecodedCase {
+        id: &'static str,
+        note: &'static str,
+        payload: Vec<u8>,
+    }
+
+    fn undecoded_cases() -> Vec<UndecodedCase> {
+        vec![
+            UndecodedCase {
+                id: "status-result-undecoded",
+                note: "the status snapshot: admin-status.ts carries its types, and no generated \
+                       decoder builds them",
+                payload: encoded_status().to_canonical_bytes(),
+            },
+            UndecodedCase {
+                id: "synthetic-accepted-undecoded",
+                note: "the synthetic intake receipt, whose command this surface does not build \
+                       either",
+                payload: AdminResponse::SyntheticAccepted {
+                    request_id: request_id("req-synthetic-1"),
+                    inbox_id: 9,
+                    duplicate: true,
+                }
+                .to_message()
+                .expect("the receipt encodes")
+                .to_canonical_bytes(),
+            },
+        ]
+    }
+
+    fn undecoded_entry(case: &UndecodedCase) -> JsonValue {
+        let message = Message::from_canonical_bytes(&case.payload).expect("a well-formed message");
+        AdminResponse::from_canonical_bytes(&case.payload).unwrap_or_else(|error| {
+            panic!(
+                "{}: Rust does not define this kind, so it is unknown rather than undecoded: \
+                 {error}",
+                case.id
+            )
+        });
+        JsonValue::Object(vec![
+            ("id".to_owned(), text(case.id)),
+            ("kind".to_owned(), text(message.envelope().kind().as_str())),
+            ("note".to_owned(), text(case.note)),
+            ("payload_hex".to_owned(), text(&hex(&case.payload))),
+            (
+                "request_id".to_owned(),
+                text(message.envelope().request_id().as_str()),
+            ),
+        ])
+    }
+
+    // -----------------------------------------------------------------------
+    // Refusals
+    // -----------------------------------------------------------------------
+
+    /// A payload both implementations must refuse.
+    struct DecodeRefusal {
+        id: &'static str,
+        note: &'static str,
+        payload: Vec<u8>,
+    }
+
+    /// Build one message with full control over the envelope, including the
+    /// parts a valid request could not carry.
+    fn raw_message(protocol: &str, version: u32, kind: &str, id: &str, body: JsonValue) -> Vec<u8> {
+        Message::new(
+            Envelope::new(
+                ProtocolName::new(protocol).expect("a protocol name"),
+                MajorVersion::new(version).expect("a major version"),
+                request_id(id),
+                MessageKind::new(kind).expect("a message kind"),
+            ),
+            body,
+        )
+        .to_canonical_bytes()
+    }
+
+    fn decode_refusals() -> Vec<DecodeRefusal> {
+        let row = |name: &str, value: i64| (name.to_owned(), JsonValue::Integer(value));
+        let paused_body = || JsonValue::Object(vec![row("pause_id", 12), row("revision", 3)]);
+        vec![
+            DecodeRefusal {
+                id: "run-accepted-zero-submission",
+                note: "a durable row identity starts at one; zero is an unwritten row reported \
+                       as accepted",
+                payload: raw_message(
+                    ADMIN_PROTOCOL,
+                    1,
+                    "run_accepted",
+                    "req-submit-1",
+                    JsonValue::Object(vec![
+                        ("replay".to_owned(), JsonValue::Bool(false)),
+                        ("run_id".to_owned(), text("run-01J8Z9Q")),
+                        (
+                            "spec_digest".to_owned(),
+                            text(&Sha256::digest(b"document").to_string()),
+                        ),
+                        row("submission_id", 0),
+                    ]),
+                ),
+            },
+            DecodeRefusal {
+                id: "intake-paused-extra-field",
+                note: "an unexpected key is refused rather than ignored",
+                payload: raw_message(
+                    ADMIN_PROTOCOL,
+                    1,
+                    "intake_paused",
+                    "req-pause-1",
+                    JsonValue::Object(vec![
+                        row("pause_id", 12),
+                        row("revision", 3),
+                        ("surprise".to_owned(), JsonValue::Bool(true)),
+                    ]),
+                ),
+            },
+            DecodeRefusal {
+                id: "intake-paused-missing-revision",
+                note: "a missing key is refused rather than defaulted",
+                payload: raw_message(
+                    ADMIN_PROTOCOL,
+                    1,
+                    "intake_paused",
+                    "req-pause-1",
+                    JsonValue::Object(vec![row("pause_id", 12)]),
+                ),
+            },
+            DecodeRefusal {
+                id: "refused-uppercase-category",
+                note: "a refusal category is lowercase; an uppercase spelling is not folded",
+                payload: raw_message(
+                    ADMIN_PROTOCOL,
+                    1,
+                    "refused",
+                    "req-submit-2",
+                    JsonValue::Object(vec![("category".to_owned(), text("Intake_Paused"))]),
+                ),
+            },
+            DecodeRefusal {
+                id: "unknown-kind",
+                note: "a kind this protocol version does not define",
+                payload: raw_message(
+                    ADMIN_PROTOCOL,
+                    1,
+                    "intake_frozen",
+                    "req-pause-1",
+                    paused_body(),
+                ),
+            },
+            DecodeRefusal {
+                id: "unknown-protocol",
+                note: "another protocol's message, refused on the name axis",
+                payload: raw_message(
+                    "automonique.runner",
+                    1,
+                    "intake_paused",
+                    "req-pause-1",
+                    paused_body(),
+                ),
+            },
+            DecodeRefusal {
+                id: "unsupported-version",
+                note: "this protocol at a major version neither side implements",
+                payload: raw_message(ADMIN_PROTOCOL, 2, "intake_paused", "req-pause-1", paused_body()),
+            },
+            DecodeRefusal {
+                id: "non-canonical-key-order",
+                note: "a payload that parses but is not canonical is refused, not normalized",
+                payload: br#"{"kind":"intake_paused","body":{"pause_id":12,"revision":3},"protocol":"automonique.admin","request_id":"req-pause-1","version":1}"#.to_vec(),
+            },
+            DecodeRefusal {
+                id: "duplicate-body-key",
+                note: "one key, one value: a repeated key is refused rather than last-wins",
+                payload: br#"{"body":{"pause_id":12,"pause_id":13,"revision":3},"kind":"intake_paused","protocol":"automonique.admin","request_id":"req-pause-1","version":1}"#.to_vec(),
+            },
+            DecodeRefusal {
+                id: "empty-payload",
+                note: "zero bytes is not an empty message",
+                payload: Vec::new(),
+            },
+        ]
+    }
+
+    fn decode_refusal_entry(refusal: &DecodeRefusal) -> JsonValue {
+        let category = AdminResponse::from_canonical_bytes(&refusal.payload)
+            .err()
+            .unwrap_or_else(|| panic!("{}: Rust accepted a payload it must refuse", refusal.id))
+            .category()
+            .to_owned();
+        JsonValue::Object(vec![
+            ("category".to_owned(), text(&category)),
+            ("id".to_owned(), text(refusal.id)),
+            ("note".to_owned(), text(refusal.note)),
+            ("payload_hex".to_owned(), text(&hex(&refusal.payload))),
+        ])
+    }
+
+    /// A request the other implementation must refuse while building it, under
+    /// the category the Rust constructor answers for the same input.
+    struct EncodeRefusal {
+        id: &'static str,
+        note: &'static str,
+        kind: &'static str,
+        request_id: String,
+        params: JsonValue,
+        category: String,
+        /// The generated constructor that refuses the value, when one does, and
+        /// the violation it names.
+        constructor: Option<(&'static str, &'static str)>,
+    }
+
+    fn encode_refusals() -> Vec<EncodeRefusal> {
+        let long_reason = "r".repeat(MAX_INTAKE_REASON_BYTES + 1);
+        let long_key = "k".repeat(MAX_RUN_SUBMISSION_KEY_BYTES + 1);
+        let long_request_id = "r".repeat(MAX_REQUEST_ID_BYTES + 1);
+        let digest = Sha256::digest(b"document").to_string();
+        let document = br#"{"schema":"automonique.run-spec/v1"}"#.to_vec();
+
+        let reason_category = IntakePause::new("ops", &long_reason)
+            .expect_err("an overlong reason is refused")
+            .category()
+            .to_owned();
+        let actor_category = IntakePause::new("ops\u{7}", "why")
+            .expect_err("a control character in an actor is refused")
+            .category()
+            .to_owned();
+        let key_category = SubmittedRunSpec::sealed(document.clone(), &long_key)
+            .expect_err("an overlong idempotency key is refused")
+            .category()
+            .to_owned();
+        let oversize_category = SubmittedRunSpec::sealed(
+            ruled_document(MAX_SUBMITTED_RUN_SPEC_BYTES + 1),
+            "submit-run-key-1",
+        )
+        .expect_err("a document over the bound is refused")
+        .category()
+        .to_owned();
+        let empty_category = SubmittedRunSpec::sealed(Vec::new(), "submit-run-key-1")
+            .expect_err("an empty document is refused")
+            .category()
+            .to_owned();
+        let long_id_category = AdminError::from(
+            RequestId::new(&long_request_id).expect_err("an overlong request id is refused"),
+        )
+        .category()
+        .to_owned();
+        let bad_id_category = AdminError::from(
+            RequestId::new("req 1").expect_err("a space is outside the request id grammar"),
+        )
+        .category()
+        .to_owned();
+
+        vec![
+            EncodeRefusal {
+                id: "pause-intake-reason-too-long",
+                note: "one byte over the reason bound, measured in UTF-8 bytes",
+                kind: "pause_intake",
+                request_id: "req-pause-1".to_owned(),
+                params: JsonValue::Object(vec![
+                    ("actor".to_owned(), text("ops")),
+                    ("reason".to_owned(), text(&long_reason)),
+                ]),
+                category: reason_category,
+                constructor: Some(("IntakeReason", "too_long")),
+            },
+            EncodeRefusal {
+                id: "pause-intake-actor-control-character",
+                note: "a control character in an actor, which the wire never carries raw",
+                kind: "pause_intake",
+                request_id: "req-pause-1".to_owned(),
+                params: JsonValue::Object(vec![
+                    ("actor".to_owned(), text("ops\u{7}")),
+                    ("reason".to_owned(), text("why")),
+                ]),
+                category: actor_category,
+                constructor: Some(("IntakeActor", "invalid_character")),
+            },
+            EncodeRefusal {
+                id: "submit-run-key-too-long",
+                note: "one byte over the idempotency key bound",
+                kind: "submit_run",
+                request_id: "req-submit-1".to_owned(),
+                params: JsonValue::Object(vec![
+                    ("document_hex".to_owned(), text(&hex(&document))),
+                    ("idempotency_key".to_owned(), text(&long_key)),
+                    ("spec_digest".to_owned(), text(&digest)),
+                ]),
+                category: key_category,
+                constructor: Some(("RunSubmissionKey", "too_long")),
+            },
+            EncodeRefusal {
+                id: "submit-run-document-too-large",
+                note: "one byte over the document bound, which is its own refusal rather than \
+                       a generic invalid body",
+                kind: "submit_run",
+                request_id: "req-submit-1".to_owned(),
+                params: JsonValue::Object(vec![
+                    (
+                        "document_length".to_owned(),
+                        count(MAX_SUBMITTED_RUN_SPEC_BYTES + 1),
+                    ),
+                    ("idempotency_key".to_owned(), text("submit-run-key-1")),
+                    ("spec_digest".to_owned(), text(&digest)),
+                ]),
+                category: oversize_category,
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "submit-run-empty-document",
+                note: "an empty document is a different fault from an oversized one",
+                kind: "submit_run",
+                request_id: "req-submit-1".to_owned(),
+                params: JsonValue::Object(vec![
+                    ("document_hex".to_owned(), text("")),
+                    ("idempotency_key".to_owned(), text("submit-run-key-1")),
+                    ("spec_digest".to_owned(), text(&digest)),
+                ]),
+                category: empty_category,
+                constructor: None,
+            },
+            EncodeRefusal {
+                id: "request-id-too-long",
+                note: "the envelope's fields are judged by the shared codec, whose refusal for \
+                       a bound is not the one this protocol uses for a body",
+                kind: "status",
+                request_id: long_request_id,
+                params: JsonValue::Object(Vec::new()),
+                category: long_id_category,
+                constructor: Some(("RequestId", "too_long")),
+            },
+            EncodeRefusal {
+                id: "request-id-outside-grammar",
+                note: "a grammar refusal is not a bounds refusal, and the categories differ",
+                kind: "status",
+                request_id: "req 1".to_owned(),
+                params: JsonValue::Object(Vec::new()),
+                category: bad_id_category,
+                constructor: Some(("RequestId", "invalid_character")),
+            },
+        ]
+    }
+
+    fn encode_refusal_entry(refusal: &EncodeRefusal) -> JsonValue {
+        let mut entry = vec![
+            ("category".to_owned(), text(&refusal.category)),
+            ("id".to_owned(), text(refusal.id)),
+            ("kind".to_owned(), text(refusal.kind)),
+            ("note".to_owned(), text(refusal.note)),
+            ("params".to_owned(), refusal.params.clone()),
+            ("request_id".to_owned(), text(&refusal.request_id)),
+        ];
+        if let Some((constructor, violation)) = refusal.constructor {
+            // Named `refused_by` rather than `constructor`: a JSON object
+            // parsed by a JavaScript reader inherits `constructor` from its
+            // prototype, so a runner asking whether the key is present would be
+            // told yes for every entry that omits it.
+            entry.push(("refused_by".to_owned(), text(constructor)));
+            entry.push(("violation".to_owned(), text(violation)));
+        }
+        JsonValue::Object(entry)
+    }
+
+    // -----------------------------------------------------------------------
+    // The corpus file
+    // -----------------------------------------------------------------------
+
+    /// Write one JSON value as reviewable text: two-space indentation, keys in
+    /// the wire's own order, scalars in the wire's own escaping.
+    fn write_pretty(value: &JsonValue, indent: usize, out: &mut String) {
+        let pad = |depth: usize| "  ".repeat(depth);
+        match value {
+            JsonValue::Object(entries) if !entries.is_empty() => {
+                let mut ordered: Vec<&(String, JsonValue)> = entries.iter().collect();
+                ordered.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+                out.push_str("{\n");
+                for (index, (key, item)) in ordered.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(",\n");
+                    }
+                    out.push_str(&pad(indent + 1));
+                    write_pretty(&JsonValue::String(key.clone()), indent + 1, out);
+                    out.push_str(": ");
+                    write_pretty(item, indent + 1, out);
+                }
+                out.push('\n');
+                out.push_str(&pad(indent));
+                out.push('}');
+            }
+            JsonValue::Array(items) if !items.is_empty() => {
+                out.push_str("[\n");
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(",\n");
+                    }
+                    out.push_str(&pad(indent + 1));
+                    write_pretty(item, indent + 1, out);
+                }
+                out.push('\n');
+                out.push_str(&pad(indent));
+                out.push(']');
+            }
+            scalar => out.push_str(
+                &String::from_utf8(scalar.to_canonical_bytes())
+                    .expect("canonical JSON is UTF-8 text"),
+            ),
+        }
+    }
+
+    fn corpus() -> String {
+        let document = JsonValue::Object(vec![
+            (
+                "document_rule".to_owned(),
+                JsonValue::Object(vec![
+                    (
+                        "note".to_owned(),
+                        text(
+                            "byte i = (seed + (i mod 256) * step) mod 256; a document too large \
+                             to review as a literal is built from this rule on both sides",
+                        ),
+                    ),
+                    ("seed".to_owned(), count(usize::from(DOCUMENT_SEED))),
+                    ("step".to_owned(), count(usize::from(DOCUMENT_STEP))),
+                ]),
+            ),
+            (
+                "decode_refusals".to_owned(),
+                JsonValue::Array(decode_refusals().iter().map(decode_refusal_entry).collect()),
+            ),
+            (
+                "encode_refusals".to_owned(),
+                JsonValue::Array(encode_refusals().iter().map(encode_refusal_entry).collect()),
+            ),
+            (
+                "generator".to_owned(),
+                text("automonique-protocol tests/codegen.rs, module command_surface"),
+            ),
+            (
+                "note".to_owned(),
+                text(
+                    "Generated from the shipped Rust constructors: every canonical byte string \
+                     here was produced by encoding a real message, and every refusal category \
+                     was read back from the error Rust returned for that exact input. Rust is \
+                     the wire source of truth, so a disagreement is fixed in whichever \
+                     implementation is wrong — never in this file.",
+                ),
+            ),
+            ("protocol".to_owned(), text(ADMIN_PROTOCOL)),
+            (
+                "requests".to_owned(),
+                JsonValue::Array(request_cases().iter().map(request_entry).collect()),
+            ),
+            (
+                "responses".to_owned(),
+                JsonValue::Array(response_cases().iter().map(response_entry).collect()),
+            ),
+            (
+                "undecoded_responses".to_owned(),
+                JsonValue::Array(undecoded_cases().iter().map(undecoded_entry).collect()),
+            ),
+            (
+                "version".to_owned(),
+                JsonValue::Integer(i64::from(MajorVersion::FIRST.get())),
+            ),
+        ]);
+        let mut out = String::new();
+        write_pretty(&document, 0, &mut out);
+        out.push('\n');
+        out
+    }
+
+    /// The drift gate over the corpus, and the regeneration that closes it.
+    ///
+    /// The corpus is generated, so it is held to the same rule as the generated
+    /// TypeScript: an ordinary run compares, and only a run that asks for it
+    /// rewrites. A constructor whose refusal category changed, a bound that
+    /// moved, or an encoder that started spelling a body differently all turn
+    /// this red rather than silently rewriting the evidence they are measured
+    /// against.
+    #[test]
+    fn the_checked_in_corpus_matches_regeneration() {
+        let expected = corpus();
+        let path = corpus_path();
+        if regenerating() {
+            let staging = path.with_extension("json.staging");
+            std::fs::write(&staging, &expected).expect("stage the corpus");
+            std::fs::rename(&staging, &path).expect("publish the corpus");
+            return;
+        }
+        let actual = std::fs::read_to_string(&path)
+            .expect("the corpus is checked in — regenerate it to create it");
+        if actual != expected {
+            let difference = actual
+                .lines()
+                .zip(expected.lines())
+                .enumerate()
+                .find(|(_, (left, right))| left != right)
+                .map_or_else(
+                    || {
+                        format!(
+                            "{} lines on disk, {} lines generated",
+                            actual.lines().count(),
+                            expected.lines().count()
+                        )
+                    },
+                    |(index, (left, right))| {
+                        let shorten = |line: &str| line.chars().take(120).collect::<String>();
+                        format!(
+                            "line {}: on disk {:?}, generated {:?}",
+                            index + 1,
+                            shorten(left),
+                            shorten(right)
+                        )
+                    },
+                );
+            panic!(
+                "the checked-in command corpus no longer matches the Rust encoders: \
+                 {difference}\n\nRegenerate with: {REGENERATE_COMMAND}"
+            );
+        }
+    }
+
+    /// Every command this protocol version defines is either built by the
+    /// generated surface or named as one it does not build.
+    ///
+    /// The kinds come from encoding one request per [`AdminCommand`] variant,
+    /// so a command added to the protocol appears here without anyone
+    /// remembering to add it, and a generated surface that quietly did not
+    /// cover it fails.
+    #[test]
+    fn every_command_kind_is_generated_or_named_as_absent() {
+        let id = request_id("req-coverage-1");
+        let requests = vec![
+            AdminRequest::new(id.clone(), AdminCommand::Status),
+            AdminRequest::new(id.clone(), AdminCommand::Shutdown),
+            AdminRequest::submit(
+                id.clone(),
+                SyntheticSubmission::new("scope", "key", "task").expect("a synthetic submission"),
+            ),
+            AdminRequest::submit_run(
+                id.clone(),
+                SubmittedRunSpec::sealed(b"document".to_vec(), "key").expect("a carried document"),
+            ),
+            AdminRequest::inspect_reconciliation(id.clone(), 1).expect("an inspection"),
+            AdminRequest::fail_reconciliation(
+                id.clone(),
+                ReconciliationFailure::new(1, "generation", 1, 1, "decision", "reason")
+                    .expect("a fail decision"),
+            ),
+            AdminRequest::inspect_outbox(id.clone(), 1).expect("an outbox inspection"),
+            AdminRequest::reconcile_outbox(
+                id.clone(),
+                OutboxReconciliation::new(OutboxReconciliationParts {
+                    outbox_id: 1,
+                    expected_generation_id: "generation".to_owned(),
+                    expected_lease_epoch: 1,
+                    expected_lease_token: "token".to_owned(),
+                    expected_attempt: 1,
+                    expected_revision: 1,
+                    decision: OutboxReconciliationDecision::Delivered {
+                        receipt_key: "receipt".to_owned(),
+                    },
+                })
+                .expect("an outbox decision"),
+            ),
+            AdminRequest::pause_intake(
+                id.clone(),
+                IntakePause::new("ops", "why").expect("a pause"),
+            ),
+            AdminRequest::resume_intake(id, IntakeResume::new("ops").expect("a resume")),
+        ];
+        // Every variant of the command enum is represented above. The match is
+        // the point: a command added to `AdminCommand` fails to compile here.
+        let mut declared: BTreeSet<String> = BTreeSet::new();
+        for command in [
+            AdminCommand::Status,
+            AdminCommand::SubmitSynthetic,
+            AdminCommand::SubmitRun,
+            AdminCommand::InspectReconciliation,
+            AdminCommand::FailReconciliation,
+            AdminCommand::InspectOutbox,
+            AdminCommand::ReconcileOutbox,
+            AdminCommand::PauseIntake,
+            AdminCommand::ResumeIntake,
+            AdminCommand::Shutdown,
+        ] {
+            match command {
+                AdminCommand::Status
+                | AdminCommand::SubmitSynthetic
+                | AdminCommand::SubmitRun
+                | AdminCommand::InspectReconciliation
+                | AdminCommand::FailReconciliation
+                | AdminCommand::InspectOutbox
+                | AdminCommand::ReconcileOutbox
+                | AdminCommand::PauseIntake
+                | AdminCommand::ResumeIntake
+                | AdminCommand::Shutdown => {}
+            }
+            declared.insert(format!("{command:?}"));
+        }
+        let encoded: BTreeSet<String> = requests
+            .iter()
+            .map(|request| {
+                request
+                    .to_message()
+                    .expect("each command encodes")
+                    .envelope()
+                    .kind()
+                    .as_str()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            encoded.len(),
+            declared.len(),
+            "one request per command variant is required; {} were built for {} variants",
+            encoded.len(),
+            declared.len()
+        );
+
+        let surface = surface();
+        let mut covered: BTreeSet<String> = surface
+            .requests
+            .iter()
+            .map(|request| request.kind.clone())
+            .collect();
+        for kind in &surface.request_kinds_not_generated {
+            assert!(
+                covered.insert(kind.clone()),
+                "{kind} is both generated and named as absent"
+            );
+        }
+        assert_eq!(
+            covered, encoded,
+            "the generated command surface does not account for every kind the Rust encoders \
+             produce; regenerate with: {REGENERATE_COMMAND}"
+        );
+    }
+
+    /// Every response this protocol version defines is either decoded by the
+    /// generated surface or named as one it does not decode.
+    #[test]
+    fn every_response_kind_is_decoded_or_named_as_undecoded() {
+        let id = request_id("req-coverage-1");
+        let digest = Sha256::digest(b"document");
+        let responses = vec![
+            AdminResponse::from_canonical_bytes(&encoded_status().to_canonical_bytes())
+                .expect("a status response"),
+            AdminResponse::SyntheticAccepted {
+                request_id: id.clone(),
+                inbox_id: 1,
+                duplicate: false,
+            },
+            AdminResponse::RunAccepted {
+                request_id: id.clone(),
+                run_id: RunId::new("run-1").expect("a run identity"),
+                spec_digest: digest,
+                submission_id: 1,
+                replay: false,
+            },
+            AdminResponse::ReconciliationInspected {
+                request_id: id.clone(),
+                evidence: AdminReconciliationEvidence::new(
+                    1,
+                    "scope",
+                    "generation",
+                    1,
+                    1,
+                    false,
+                    0,
+                )
+                .expect("reconciliation evidence"),
+            },
+            AdminResponse::ReconciliationFailed {
+                request_id: id.clone(),
+                run_event_id: 1,
+                inbox_event_id: 2,
+                outbox_id: 3,
+                duplicate: false,
+            },
+            AdminResponse::OutboxInspected {
+                request_id: id.clone(),
+                evidence: AdminOutboxEvidence::new(AdminOutboxEvidenceParts {
+                    outbox_id: 1,
+                    intent_key: "intent".to_owned(),
+                    transport: "telegram".to_owned(),
+                    kind: "message".to_owned(),
+                    state: "pending".to_owned(),
+                    revision: 1,
+                    attempt: 0,
+                    lease_token: None,
+                    lease_generation_id: None,
+                    lease_holder: None,
+                    lease_epoch: None,
+                    lease_expires_ms: None,
+                    delivery_receipt_key: None,
+                })
+                .expect("outbox evidence"),
+            },
+            AdminResponse::OutboxReconciled {
+                request_id: id.clone(),
+                outbox_id: 1,
+                state: "delivered".to_owned(),
+                revision: 1,
+                duplicate: false,
+            },
+            AdminResponse::IntakePaused {
+                request_id: id.clone(),
+                pause_id: 1,
+                revision: 1,
+            },
+            AdminResponse::IntakeResumed {
+                request_id: id.clone(),
+                pause_id: 1,
+                revision: 2,
+            },
+            AdminResponse::Refused {
+                request_id: id.clone(),
+                category: AdminRefusalCategory::new("intake_paused").expect("a category"),
+            },
+            AdminResponse::ShutdownAccepted { request_id: id },
+        ];
+        // The match is the point: a variant added to `AdminResponse` fails to
+        // compile here rather than slipping past a surface that ignores it.
+        for response in &responses {
+            match response {
+                AdminResponse::Status { .. }
+                | AdminResponse::SyntheticAccepted { .. }
+                | AdminResponse::RunAccepted { .. }
+                | AdminResponse::ReconciliationInspected { .. }
+                | AdminResponse::ReconciliationFailed { .. }
+                | AdminResponse::OutboxInspected { .. }
+                | AdminResponse::OutboxReconciled { .. }
+                | AdminResponse::IntakePaused { .. }
+                | AdminResponse::IntakeResumed { .. }
+                | AdminResponse::Refused { .. }
+                | AdminResponse::ShutdownAccepted { .. } => {}
+            }
+        }
+        let encoded: BTreeSet<String> = responses
+            .iter()
+            .map(|response| {
+                response
+                    .to_message()
+                    .expect("each response encodes")
+                    .envelope()
+                    .kind()
+                    .as_str()
+                    .to_owned()
+            })
+            .collect();
+
+        let surface = surface();
+        let mut covered: BTreeSet<String> = surface
+            .responses
+            .iter()
+            .map(|response| response.kind.clone())
+            .collect();
+        for kind in &surface.response_kinds_not_decoded {
+            assert!(
+                covered.insert(kind.clone()),
+                "{kind} is both decoded and named as undecoded"
+            );
+        }
+        assert_eq!(
+            covered, encoded,
+            "the generated response surface does not account for every kind the daemon can \
+             answer with; regenerate with: {REGENERATE_COMMAND}"
+        );
+    }
+
+    /// Every category the generated code refuses with is declared, and every
+    /// declared category is a spelling Rust actually produces.
+    #[test]
+    fn every_refusal_category_is_declared_and_is_the_rust_spelling() {
+        let surface = surface();
+        let declared: BTreeMap<String, String> = surface
+            .categories
+            .iter()
+            .map(|constant| {
+                let ConstantValue::Text(value) = &constant.value else {
+                    panic!("{} is a refusal category, which is text", constant.name)
+                };
+                (constant.name.clone(), value.clone())
+            })
+            .collect();
+
+        let mut referenced = vec![
+            surface.invalid_body_category.clone(),
+            surface.unknown_kind_category.clone(),
+            surface.oversize_category.clone(),
+            surface.field_invalid_category.clone(),
+            surface.field_grammar_category.clone(),
+        ];
+        for field in surface.requests.iter().flat_map(|request| &request.fields) {
+            if let RequestValue::HexBytes {
+                oversize_category, ..
+            } = &field.value
+            {
+                referenced.push(oversize_category.clone());
+            }
+        }
+        for name in &referenced {
+            assert!(
+                declared.contains_key(name),
+                "the surface refuses with {name}, which it does not declare"
+            );
+        }
+
+        // The spellings, against the errors themselves rather than against a
+        // list retyped here. `frame_size` is the exception and says so: the
+        // protocol crate has no constant for it, and the test names where it
+        // does live.
+        let generated = generated_admin_command();
+        for (name, expected) in [
+            (
+                surface.invalid_body_category.as_str(),
+                AdminError::InvalidBody.category(),
+            ),
+            (
+                surface.unknown_kind_category.as_str(),
+                AdminError::UnknownKind.category(),
+            ),
+            (
+                surface.field_invalid_category.as_str(),
+                AdminError::from(automonique_protocol::codec::CodecError::Field {
+                    field: "request_id",
+                    error: automonique_protocol::primitives::ValueError::Empty,
+                })
+                .category(),
+            ),
+            (
+                surface.field_grammar_category.as_str(),
+                AdminError::from(automonique_protocol::codec::CodecError::Grammar {
+                    field: "request_id",
+                })
+                .category(),
+            ),
+        ] {
+            assert_eq!(
+                declared.get(name).map(String::as_str),
+                Some(expected),
+                "{name} is not the category Rust reports"
+            );
+            assert!(
+                generated.contains(&format!("export const {name} = \"{expected}\";")),
+                "the generated file does not carry {name} as {expected}"
+            );
+        }
+        assert_eq!(
+            declared.get(&surface.oversize_category).map(String::as_str),
+            Some("frame_size"),
+            "the oversize category is the spelling automonique-daemon and automonique-cli \
+             report for a payload above MAX_ADMIN_PAYLOAD_BYTES"
+        );
+    }
+
+    /// One name, one declaring module.
+    ///
+    /// The barrel re-exports every module with `export *`, so a name declared
+    /// twice is ambiguous for every consumer — and the second declaration is
+    /// exactly what a new module copying an existing constant would produce.
+    #[test]
+    fn no_two_generated_modules_export_the_same_name() {
+        let mut owner: BTreeMap<String, String> = BTreeMap::new();
+        for (file_name, contents) in generated_files() {
+            for line in contents.lines() {
+                let Some(rest) = line
+                    .strip_prefix("export const ")
+                    .or_else(|| line.strip_prefix("export function "))
+                    .or_else(|| line.strip_prefix("export interface "))
+                    .or_else(|| line.strip_prefix("export type "))
+                else {
+                    continue;
+                };
+                let name: String = rest
+                    .chars()
+                    .take_while(|character| character.is_alphanumeric() || *character == '_')
+                    .collect();
+                if name.is_empty() {
+                    continue;
+                }
+                if let Some(first) = owner.get(&name) {
+                    assert_eq!(
+                        first, &file_name,
+                        "{name} is declared in both {first} and {file_name}, which makes it \
+                         ambiguous through the barrel"
+                    );
+                } else {
+                    owner.insert(name, file_name.clone());
+                }
+            }
+        }
+        assert!(
+            owner.contains_key("decodeAdminResponse"),
+            "the command surface is not in the generated tree at all"
+        );
+    }
+
+    /// The command module's bounds are the Rust constants, and its grammars are
+    /// the Rust grammars.
+    #[test]
+    fn the_generated_command_bounds_are_the_rust_constants() {
+        let generated = generated_admin_command();
+        for declaration in [
+            format!("export const MAX_SUBMITTED_RUN_SPEC_BYTES = {MAX_SUBMITTED_RUN_SPEC_BYTES};"),
+            format!("export const IntakeReason_MAX_BYTES = {MAX_INTAKE_REASON_BYTES};"),
+            format!("export const RunSubmissionKey_MAX_BYTES = {MAX_RUN_SUBMISSION_KEY_BYTES};"),
+            format!("export const RequestId_MAX_BYTES = {MAX_REQUEST_ID_BYTES};"),
+            format!("export const DurableRowId_MAX = {}n;", i64::MAX),
+            "export const DurableRowId_MIN = 1n;".to_owned(),
+            format!(
+                "export const SpecDigest_PATTERN = /^{}:[0-9a-f]{{{}}}$/u;",
+                automonique_protocol::digest::ALGORITHM,
+                automonique_protocol::digest::DIGEST_BYTES * 2
+            ),
+        ] {
+            assert!(
+                generated.contains(&declaration),
+                "the command surface does not carry the Rust bound: {declaration}"
+            );
+        }
+        // Declaring a bound is not checking it.
+        assert!(
+            generated.contains(&format!(
+                "  if (byteLength(value) > {MAX_INTAKE_REASON_BYTES}) throw new \
+                 ValidationError(\"IntakeReason\", \"too_long\");"
+            )),
+            "IntakeReason declares its bound but does not check it"
+        );
+        assert!(
+            generated.contains(
+                "boundedBytes(body.document, MAX_SUBMITTED_RUN_SPEC_BYTES, \
+                 ADMIN_DOCUMENT_TOO_LARGE, ADMIN_INVALID_BODY)"
+            ),
+            "the document bound is declared but not applied where the document is encoded"
+        );
+    }
+
+    /// The SDK has no transport, and the generated file says so where a reader
+    /// would otherwise have to guess whether these bytes are framed.
+    #[test]
+    fn the_generated_surface_says_the_framing_is_excluded() {
+        let generated = generated_admin_command();
+        for statement in [
+            "The length-delimited framing this protocol travels under is not applied",
+            "This package has no transport.",
+            "The payload is the framed transport's payload, without its length prefix.",
+        ] {
+            assert!(
+                generated.contains(statement),
+                "the generated command surface does not state where framing lives: {statement}"
+            );
+        }
+    }
+
+    /// The heart of the wave: the generated TypeScript encodes the same bytes
+    /// Rust does, decodes what Rust answers, and refuses what Rust refuses.
+    #[test]
+    fn the_generated_typescript_agrees_with_rust_byte_for_byte() {
+        let Some(runtime) = javascript_runtime() else {
+            eprintln!(
+                "GAP: no JavaScript runtime; the command surface is unmeasured across languages"
+            );
+            return;
+        };
+        let directory =
+            std::env::temp_dir().join(format!("automonique-admin-command-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("scratch directory");
+        let produced_path = directory.join("typescript-encodings.txt");
+
+        let output = Command::new(runtime)
+            .arg(runner_path())
+            .arg(corpus_path())
+            .arg(&produced_path)
+            .current_dir(package_root())
+            .output()
+            .expect("the conformance runner starts");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "the generated command surface disagrees with the Rust corpus under {runtime}:\n\
+             {combined}"
+        );
+
+        // The second direction. The runner reports the bytes it produced, and
+        // they are compared here against what Rust encodes — which is the only
+        // comparison the maximal submit_run gets, because its 49 KiB of hex is
+        // not a reviewable literal — and then fed to the shipped decoder.
+        let reported = std::fs::read_to_string(&produced_path)
+            .expect("the runner reports the payloads it produced");
+        let mut produced: BTreeMap<String, Vec<u8>> = reported
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let (id, payload) = line
+                    .split_once(' ')
+                    .unwrap_or_else(|| panic!("a reported line is `<id> <hex>`: {line:?}"));
+                (id.to_owned(), unhex(payload))
+            })
+            .collect();
+
+        for case in request_cases() {
+            let expected = case
+                .request
+                .to_message()
+                .expect("the request encodes")
+                .to_canonical_bytes();
+            let actual = produced
+                .remove(case.id)
+                .unwrap_or_else(|| panic!("the runner did not report {}", case.id));
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "{}: {runtime} produced {} canonical bytes, Rust produced {}",
+                case.id,
+                actual.len(),
+                expected.len()
+            );
+            if let Some(index) = actual
+                .iter()
+                .zip(expected.iter())
+                .position(|(left, right)| left != right)
+            {
+                let window = |bytes: &[u8]| {
+                    String::from_utf8_lossy(
+                        &bytes[index.saturating_sub(24)..(index + 24).min(bytes.len())],
+                    )
+                    .into_owned()
+                };
+                panic!(
+                    "{}: the two encodings first differ at byte {index}\n  {runtime}: {}\n  \
+                     rust: {}",
+                    case.id,
+                    window(&actual),
+                    window(&expected)
+                );
+            }
+            assert_eq!(
+                AdminRequest::from_canonical_bytes(&actual).unwrap_or_else(|error| panic!(
+                    "{}: Rust refuses what {runtime} produced: {error}",
+                    case.id
+                )),
+                case.request,
+                "{}: Rust decodes what {runtime} produced as a different request",
+                case.id
+            );
+        }
+        assert!(
+            produced.is_empty(),
+            "the runner reported payloads the corpus has no cases for: {:?}",
+            produced.keys().collect::<Vec<_>>()
+        );
+        println!(
+            "admin command surface under {runtime}: {}",
+            String::from_utf8_lossy(&output.stdout).trim()
         );
     }
 }
