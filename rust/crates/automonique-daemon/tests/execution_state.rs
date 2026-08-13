@@ -80,7 +80,10 @@ fn reported_execution_state_matches_an_independent_measurement() {
     let stop = Arc::new(AtomicBool::new(false));
     let serve_stop = Arc::clone(&stop);
     let thread = std::thread::spawn(move || daemon.serve(&serve_stop));
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Generous on purpose, as in every other suite here: everything before the
+    // bind is disk-bound, so a short deadline measures the test host under
+    // concurrent load rather than the daemon.
+    let deadline = Instant::now() + Duration::from_secs(15);
     while !config.admin_socket().exists() {
         assert!(Instant::now() < deadline, "daemon did not bind");
         std::thread::sleep(Duration::from_millis(5));

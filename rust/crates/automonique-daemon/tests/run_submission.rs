@@ -113,7 +113,11 @@ fn submit(config: &DaemonConfig, label: &str, submission: SubmittedRunSpec) -> A
 }
 
 fn wait_for_socket(config: &DaemonConfig) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Generous on purpose. Everything before the bind is disk-bound — several
+    // SQLite databases opened `synchronous = FULL`, each fsyncing its own WAL —
+    // so a short deadline here measures the test host under concurrent load
+    // rather than the daemon.
+    let deadline = Instant::now() + Duration::from_secs(15);
     while !config.admin_socket().exists() {
         assert!(Instant::now() < deadline, "daemon did not bind");
         std::thread::sleep(Duration::from_millis(5));

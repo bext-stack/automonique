@@ -49,6 +49,10 @@ use automonique_store::automation_store::{
     AutomationRecord, AutomationRegistration, AutomationStore, AutomationStoreError,
     EnablementState as StoreEnablementState, EnablementTransition,
 };
+use automonique_store::generation_audit::{
+    GenerationAudit, GenerationAuditError, SelfEndKind, Succession, TenureEnding, TenureOpening,
+    TenureRecord,
+};
 use automonique_store::run_index::{
     RunIndex, RunIndexEntry, RunIndexError, RunIndexRecord, RunSpoolState,
 };
@@ -117,6 +121,21 @@ pub const AUTOMATION_REGISTRY_NAME: &str = concat!("automations", ".sqlite3");
 /// single-dispatcher argument work — one state directory admits one daemon, so
 /// one ledger file has one owner. See [`attempt_host`].
 pub const RUN_CANCEL_LEDGER_NAME: &str = concat!("run-cancel-ledger", ".sqlite3");
+
+/// Durable append-only record of this generation's hand-offs, a sibling of
+/// [`DATABASE_NAME`].
+///
+/// The `generations` row in the main database is overwritten in place on every
+/// takeover, so it answers only "who may act right now". This file is the
+/// history that row destroys: one tenure per `(generation_id, lease_epoch)`,
+/// closed exactly once, and one handoff row per successor recording what it
+/// found open when it arrived.
+///
+/// WHAT THIS FILE DOES NOT DO. It carries no authority. Nothing in this daemon
+/// reads it to decide whether it may act — that decision is the generation
+/// lease's alone, and is taken before this file is opened at all. A tenure row
+/// proves only that a claim was recorded.
+pub const GENERATION_AUDIT_NAME: &str = concat!("generation-audit", ".sqlite3");
 
 /// Maximum administration payload accepted by the daemon.
 pub const MAX_ADMIN_PAYLOAD_BYTES: usize = MAX_ADMIN_CANONICAL_BYTES;
@@ -215,6 +234,12 @@ impl DaemonConfig {
     pub fn automation_registry_path(&self) -> PathBuf {
         self.state_dir().join(AUTOMATION_REGISTRY_NAME)
     }
+
+    /// Durable generation hand-off audit path.
+    #[must_use]
+    pub fn generation_audit_path(&self) -> PathBuf {
+        self.state_dir().join(GENERATION_AUDIT_NAME)
+    }
 }
 
 /// A daemon lifecycle or local-control refusal.
@@ -265,6 +290,13 @@ pub enum DaemonError {
     /// daemon's own durable state is unsound and must not be presented as an
     /// operator error. [`automation_refusal`] is where the line is drawn.
     AutomationStoreFailed(&'static str),
+    /// The durable generation hand-off audit could not be opened, could not
+    /// record this daemon's tenure, or could not close it. The payload is the
+    /// stable category from that module.
+    ///
+    /// No client can cause this and no client is told about it: the audit is
+    /// never on a request path.
+    GenerationAuditFailed(&'static str),
 }
 
 impl DaemonError {
@@ -286,6 +318,7 @@ impl DaemonError {
             Self::RunIndexFailed(category) => category,
             Self::AttemptHostFailed(category) => category,
             Self::AutomationStoreFailed(category) => category,
+            Self::GenerationAuditFailed(category) => category,
         }
     }
 }
@@ -325,6 +358,9 @@ impl fmt::Display for DaemonError {
             }
             Self::AutomationStoreFailed(category) => {
                 write!(formatter, "automation registry failed: {category}")
+            }
+            Self::GenerationAuditFailed(category) => {
+                write!(formatter, "generation audit failed: {category}")
             }
         }
     }
@@ -390,6 +426,20 @@ pub struct Daemon {
     /// field cannot otherwise be moved out. It is `Some` for the whole life of
     /// a daemon a caller can observe.
     attempt_host: Option<DaemonAttemptHost>,
+    /// The durable history of who has held this generation.
+    ///
+    /// A plain field, like [`Daemon::run_index`]: it owns no dispatcher, and
+    /// dropping it closes a database. Unlike that field it has one ordered
+    /// duty at shutdown — closing this daemon's own tenure row while the
+    /// generation lease that authorized it is still held — which
+    /// [`Daemon::serve`] performs explicitly rather than leaving to `Drop`.
+    generation_audit: GenerationAudit,
+    /// Durable revision of this daemon's own open tenure row.
+    ///
+    /// Recorded from what the audit returned rather than assumed to be one:
+    /// closing is compare-and-set on it, and a constant here would be this
+    /// crate asserting a fact about another crate's schema.
+    tenure_revision: u64,
     execution_state: automonique_protocol::admin::ExecutionState,
 }
 
@@ -464,6 +514,44 @@ impl Daemon {
             Err(error) => return Err(DaemonError::Store(error)),
         };
 
+        // THE TENURE IS RECORDED SECOND, AND IMMEDIATELY.
+        //
+        // `generation_audit` states the ordering duty this code is the caller
+        // for: acquire the lease first, record second. Recording first would
+        // leave a row for a tenure that never had authority. Recording *late*
+        // — after the four sibling databases below — would widen the window in
+        // which this process holds the generation with nothing written down,
+        // so the audit opens here rather than beside them.
+        //
+        // WHY AN UNRECORDABLE TENURE IS FATAL. A tenure row is derived audit
+        // and holds custody of nothing, so refusing startup over it costs a
+        // control plane that would otherwise have run. It is still the right
+        // trade, for a reason that is not "consistency with the other opens":
+        // an unrecorded tenure is not merely absent from the history, it
+        // *corrupts* the next daemon's reading of it. The successor supersedes
+        // whatever tenure it finds open, so a generation this process really
+        // held and never wrote down makes the successor link its handoff row
+        // to some older predecessor and claim adjacency that never existed.
+        // The log would be wrong rather than short. A daemon whose own
+        // hand-off story is unprovable also has no reload story, and this
+        // build's entire claim about reload is that it is auditable.
+        let mut generation_audit = GenerationAudit::open(config.generation_audit_path())
+            .map_err(generation_audit_failed)?;
+        // A failure anywhere below this point returns with the tenure open and
+        // the generation lease held, and both are left that way deliberately:
+        // this process did hold the generation, and it dies without releasing
+        // it. Closing the row while abandoning the lease would manufacture
+        // that module's crash window 4 — a log saying the tenure ended while
+        // the main database still fences writes to it — on every refused
+        // startup. Letting both lapse together is the honest pairing, and the
+        // successor closes the row `superseded` when the lease expires.
+        let tenure = record_tenure(
+            &mut generation_audit,
+            instance_id.as_str(),
+            lease.epoch,
+            now_ms,
+        )?;
+
         // The Telegram host loads its explicit configuration and, when one
         // exists, acquires the durable bot lease beneath the generation fence
         // established above. An absent configuration is the disabled state; a
@@ -528,6 +616,8 @@ impl Daemon {
             run_index,
             automations,
             attempt_host: Some(attempt_host),
+            generation_audit,
+            tenure_revision: tenure.revision,
             execution_state: Self::measure_execution_state(),
         })
     }
@@ -627,6 +717,36 @@ impl Daemon {
             .telegram
             .release()
             .map_err(|error| DaemonError::TelegramRefused(error.category()));
+        // The tenure closes last before the lease, and beneath it. Closing
+        // beneath the still-held generation is what makes `released` a true
+        // statement — a row closed after the lease was gone would be this
+        // process writing history for a generation somebody else may already
+        // own — and closing immediately before the release narrows that
+        // module's crash window 4, where the log says a tenure ended while the
+        // main database still fences writes to it, to the gap between these
+        // two statements.
+        //
+        // ONLY THE CLEAN PATH WRITES `released`. There is no unclean path here
+        // that writes `expired` instead: this daemon breaks its serve loop on a
+        // lost fence and then still reaches this line, so the honest self-claim
+        // is the one it can make — it stood down. A process that dies without
+        // reaching here writes nothing at all, and its row stays open until the
+        // successor closes it `superseded`. That is the design, not a gap:
+        // `superseded` is the successor's observation, and it is the only end
+        // kind anybody can honestly write about a process that stopped.
+        let tenure_close = unix_millis().and_then(|now_ms| {
+            self.generation_audit
+                .end_tenure(TenureEnding {
+                    generation_id: GENERATION_ID,
+                    holder_id: self.instance_id.as_str(),
+                    lease_epoch: self.lease_epoch,
+                    expected_revision: self.tenure_revision,
+                    ended_at_ms: now_ms,
+                    end_kind: SelfEndKind::Released,
+                })
+                .map(|_| ())
+                .map_err(generation_audit_failed)
+        });
         let release = unix_millis().and_then(|now_ms| {
             self.store
                 .release_generation_lease(
@@ -641,10 +761,14 @@ impl Daemon {
             Err(primary) => {
                 let _ = attempt_host_disposal;
                 let _ = telegram_release;
+                let _ = tenure_close;
                 let _ = release;
                 Err(primary)
             }
-            Ok(()) => attempt_host_disposal.and(telegram_release).and(release),
+            Ok(()) => attempt_host_disposal
+                .and(telegram_release)
+                .and(tenure_close)
+                .and(release),
         }
     }
 
@@ -1945,6 +2069,76 @@ fn refuse_automation(
 
 fn index_failed(error: RunIndexError) -> DaemonError {
     DaemonError::RunIndexFailed(error.category())
+}
+
+fn generation_audit_failed(error: GenerationAuditError) -> DaemonError {
+    DaemonError::GenerationAuditFailed(error.category())
+}
+
+/// Record this daemon's tenure over the generation it has just leased.
+///
+/// # The decision is "has this generation any recorded history", not "is a tenure open"
+///
+/// It is tempting to read this as a crash check — supersede when a predecessor
+/// left a row open, open plainly otherwise — and that reading is wrong in the
+/// ordinary case. `open_tenure` refuses
+/// [`GenerationAuditError::PredecessorRecorded`] for a generation whose tenures
+/// are all *terminal*, which is precisely what a clean restart finds: the
+/// previous daemon closed its row `released` on the way out. So the clean
+/// restart, the most common startup this daemon will ever perform, takes the
+/// succession path too, and its handoff row records the `released` it found.
+///
+/// That is the audit's design rather than a workaround. A successor owes the
+/// log an observation of what it displaced, whether or not that predecessor
+/// managed to close its own row, and `succeed_tenure` decides which end kind
+/// the predecessor gets — this caller never names one. `open_tenure` is
+/// therefore reachable exactly once per generation, on the first daemon ever to
+/// hold it, which is the one startup with no predecessor to observe.
+///
+/// # What a refusal here means
+///
+/// [`GenerationAuditError::EpochRegression`] is the interesting one and it is
+/// reachable: the lease lives in one database and this log in another, so an
+/// audit carrying an epoch at or above the one just leased says the two files
+/// disagree about how far this generation has got — a main database restored,
+/// replaced or deleted out from under a log that remembers more. Refusing is
+/// the only safe answer, because the alternative is writing a second tenure at
+/// an epoch already recorded and calling two different processes the same
+/// authority. It also covers, without a special case, the impossible-looking
+/// state of finding *our own* `(holder, epoch)` already open: a second row at
+/// our epoch is a regression whatever name is on it.
+fn record_tenure(
+    audit: &mut GenerationAudit,
+    holder_id: &str,
+    lease_epoch: u64,
+    now_ms: i64,
+) -> Result<TenureRecord, DaemonError> {
+    let opening = TenureOpening {
+        generation_id: GENERATION_ID,
+        holder_id,
+        lease_epoch,
+        started_at_ms: now_ms,
+    };
+    // One row is enough: the question is whether this generation has ever been
+    // recorded, not what its history says.
+    let recorded = audit
+        .history(GENERATION_ID, 0, 1)
+        .map_err(generation_audit_failed)?;
+    if recorded.tenures.is_empty() {
+        return audit.open_tenure(opening).map_err(generation_audit_failed);
+    }
+    // `observed_at_ms` is the instant the lease was taken, not a fresh reading.
+    // When the predecessor's row is still open this is also the `ended_at_ms`
+    // written for it, and the acquisition is the first moment anything could
+    // durably know that tenure was over — a later timestamp would be this
+    // process dating the predecessor's end by how long its own startup took.
+    audit
+        .succeed_tenure(Succession {
+            opening,
+            observed_at_ms: now_ms,
+        })
+        .map(|succeeded| succeeded.tenure)
+        .map_err(generation_audit_failed)
 }
 
 fn snapshot_requires_reconciliation(snapshot: &StatusSnapshot) -> bool {
