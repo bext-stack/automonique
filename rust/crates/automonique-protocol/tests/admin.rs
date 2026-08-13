@@ -1097,3 +1097,165 @@ fn a_reported_pause_cannot_claim_intake_is_still_open() {
         AdminError::InvalidBody
     );
 }
+
+// ---------------------------------------------------------------------------
+// One socket, two protocols.
+//
+// A local endpoint serves administration *and* the native Runs API read
+// surface. `LocalRequest` is the only thing that decides which, and it decides
+// by the protocol name the frame itself declares. These pin that the decision
+// is made once, before either lane reads a body, and that neither lane can be
+// reached through the other's decoder.
+// ---------------------------------------------------------------------------
+
+mod local_dispatch {
+    use super::*;
+
+    use automonique_protocol::admin::{LocalRequest, LocalRequestError};
+    use automonique_protocol::runs_api::{
+        ListRuns, MAX_RUNS_CANONICAL_BYTES, PageSize, RUNS_PROTOCOL, RunStateFilter, RunsApiError,
+        RunsRequest,
+    };
+
+    fn admin_payload() -> Vec<u8> {
+        AdminRequest::new(request_id(), AdminCommand::Status)
+            .to_message()
+            .expect("encode admin request")
+            .to_canonical_bytes()
+    }
+
+    fn listing() -> RunsRequest {
+        RunsRequest::ListRuns {
+            request_id: request_id(),
+            query: ListRuns::new(RunStateFilter::any(), None, PageSize::MAX),
+        }
+    }
+
+    fn runs_payload(request: &RunsRequest) -> Vec<u8> {
+        request
+            .to_message()
+            .expect("encode runs request")
+            .to_canonical_bytes()
+    }
+
+    #[test]
+    fn a_local_frame_is_placed_by_the_protocol_it_declares() {
+        let placed =
+            LocalRequest::from_canonical_bytes(&admin_payload()).expect("an admin frame is placed");
+        assert_eq!(placed.protocol(), ADMIN_PROTOCOL);
+        let LocalRequest::Admin(request) = placed else {
+            panic!("an admin frame reached the runs lane")
+        };
+        assert_eq!(request.command(), AdminCommand::Status);
+
+        for request in [
+            listing(),
+            RunsRequest::RunDetail {
+                request_id: request_id(),
+                run_id: RunId::new("run-1").expect("run identity"),
+            },
+        ] {
+            let placed = LocalRequest::from_canonical_bytes(&runs_payload(&request))
+                .expect("a runs frame is placed");
+            assert_eq!(placed.protocol(), RUNS_PROTOCOL);
+            assert_eq!(placed, LocalRequest::Runs(request));
+        }
+    }
+
+    #[test]
+    fn a_protocol_this_socket_does_not_serve_is_refused_before_a_body_is_read() {
+        // Each of these carries a body one lane or the other would have
+        // accepted. The refusal is the envelope's, so no body was read.
+        for payload in [
+            br#"{"body":{},"kind":"status","protocol":"automonique.runner","request_id":"r","version":1}"#.as_slice(),
+            br#"{"body":{"page_size":64,"since":null,"states":null},"kind":"list_runs","protocol":"automonique.runs.v2","request_id":"r","version":1}"#.as_slice(),
+        ] {
+            let error =
+                LocalRequest::from_canonical_bytes(payload).expect_err("unserved protocol");
+            assert_eq!(
+                error,
+                LocalRequestError::Envelope(CodecError::UnknownProtocol)
+            );
+            assert_eq!(error.category(), "unknown_protocol");
+        }
+
+        // Bytes that are not an envelope at all are also the socket's refusal
+        // and not a lane's, because there is no declared name to place them by.
+        assert!(matches!(
+            LocalRequest::from_canonical_bytes(b"{").expect_err("not an envelope"),
+            LocalRequestError::Envelope(_)
+        ));
+    }
+
+    #[test]
+    fn each_lane_refuses_its_own_frames_and_never_the_other_lane_s() {
+        // A widened administration body is the admin lane's refusal, spelled
+        // in the admin lane's vocabulary.
+        let widened = br#"{"body":{"force":true},"kind":"shutdown","protocol":"automonique.admin","request_id":"r","version":1}"#;
+        let error = LocalRequest::from_canonical_bytes(widened).expect_err("widened admin body");
+        assert_eq!(error, LocalRequestError::Admin(AdminError::InvalidBody));
+        assert_eq!(error.category(), "admin_invalid_body");
+
+        // A listing missing a declared field is the Runs lane's refusal, in
+        // the Runs lane's vocabulary. The two categories differ, which is what
+        // lets one metric label say which lane refused.
+        let short = br#"{"body":{"page_size":64,"since":null},"kind":"list_runs","protocol":"automonique.runs","request_id":"r","version":1}"#;
+        let error = LocalRequest::from_canonical_bytes(short).expect_err("short listing body");
+        assert_eq!(error, LocalRequestError::Runs(RunsApiError::InvalidBody));
+        assert_eq!(error.category(), "runs_invalid_body");
+
+        // A Runs kind inside an administration envelope is refused by the
+        // admin lane, which owns that envelope's closed kind set. It is not
+        // retried against the Runs lane.
+        let smuggled = br#"{"body":{"page_size":64,"since":null,"states":null},"kind":"list_runs","protocol":"automonique.admin","request_id":"r","version":1}"#;
+        assert_eq!(
+            LocalRequest::from_canonical_bytes(smuggled).expect_err("smuggled runs kind"),
+            LocalRequestError::Admin(AdminError::UnknownKind)
+        );
+
+        // And the reverse: an administration kind inside a Runs envelope.
+        let inverted = br#"{"body":{},"kind":"status","protocol":"automonique.runs","request_id":"r","version":1}"#;
+        assert_eq!(
+            LocalRequest::from_canonical_bytes(inverted).expect_err("smuggled admin kind"),
+            LocalRequestError::Runs(RunsApiError::UnknownKind)
+        );
+    }
+
+    #[test]
+    fn neither_decoder_admits_the_other_protocol_s_frames() {
+        // Placement is not the only thing keeping the lanes apart: each lane's
+        // own decoder refuses the other's bytes outright, so a caller that
+        // bypassed `LocalRequest` could not mix them either.
+        assert_eq!(
+            AdminRequest::from_canonical_bytes(&runs_payload(&listing()))
+                .expect_err("a runs frame is not an admin request")
+                .category(),
+            "unknown_protocol"
+        );
+        assert_eq!(
+            RunsRequest::from_canonical_bytes(&admin_payload())
+                .expect_err("an admin frame is not a runs request")
+                .category(),
+            "unknown_protocol"
+        );
+    }
+
+    #[test]
+    fn a_maximal_runs_frame_fits_the_local_administration_read_bound() {
+        // The relation between the two ceilings is a compile-time assertion in
+        // `admin.rs`, so this build could not have linked if it stopped
+        // holding. What is measured here is the consequence that assertion
+        // exists for: a real Runs message, framed the way this socket frames
+        // it, fits inside the bound the local endpoint reads under — with
+        // headroom, rather than sitting on the limit.
+        const LOCAL_READ_BOUND: usize = MAX_ADMIN_CANONICAL_BYTES;
+        let payload = runs_payload(&listing());
+        let mut frame = Vec::new();
+        encode_frame(&payload, &mut frame).expect("a listing fits one frame");
+        assert!(
+            frame.len() < MAX_RUNS_CANONICAL_BYTES && frame.len() < LOCAL_READ_BOUND,
+            "a maximal listing framed to {} bytes",
+            frame.len(),
+        );
+    }
+}

@@ -17,6 +17,19 @@
 //! document as bounded bytes and the digest a submitter declares for them.
 //! Carrying is all it does: see that type's documentation for what a carried
 //! pair does *not* establish.
+//!
+//! # One socket, two protocols
+//!
+//! [`LocalRequest`] is what a local endpoint decodes a frame into. The local
+//! socket serves this protocol *and* [`crate::runs_api`]'s read surface, and
+//! the envelope's declared protocol name is what separates them — not a
+//! heuristic, not a fallback chain, and not a widening of [`AdminCommand`].
+//! That is the arrangement `runs_api` asks for in as many words: its values
+//! travel "on the same canonical-JSON envelope [`crate::admin`] uses, under a
+//! separate protocol name so the admin lane's closed kind set stays closed."
+//! A run listing is therefore not an admin command, does not appear in
+//! [`crate::command_registry`]'s admin surface, and cannot reach
+//! [`DaemonStatus`].
 
 use std::error::Error;
 use std::fmt;
@@ -26,6 +39,7 @@ use crate::codec::{
     VersionRange,
 };
 use crate::digest::{Sha256, Sha256Digest};
+use crate::runs_api::{RUNS_PROTOCOL, RunsApiError, RunsRequest};
 use crate::tools::RunId;
 use crate::wire::{JsonValue, Message};
 
@@ -1440,6 +1454,128 @@ impl AdminRequest {
                 Ok(Self::new(message.envelope().request_id().clone(), command))
             }
             _ => Err(AdminError::UnknownKind),
+        }
+    }
+}
+
+/// A maximal Runs frame must fit the bound a local transport reads under.
+///
+/// The two ceilings are equal today and this states the dependency rather than
+/// leaving it a coincidence: a widened `runs_api` ceiling that outgrew this one
+/// would turn a legal Runs message into a `frame_size` refusal at the socket,
+/// which is a size failure discovered by a peer rather than by this build.
+const _: () = assert!(
+    crate::runs_api::MAX_RUNS_CANONICAL_BYTES <= MAX_ADMIN_CANONICAL_BYTES,
+    "a maximal runs frame must fit the local administration read bound"
+);
+
+/// A refusal while deciding which protocol one local frame belongs to.
+///
+/// The three variants say *who* refused, which is the distinction a metric
+/// label needs: an envelope this socket could not place at all, a well-placed
+/// administration message the admin lane refused, or a well-placed Runs message
+/// the Runs lane refused. Every category spelling is the refusing lane's own.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalRequestError {
+    /// The payload is not a well-formed envelope, or names a protocol this
+    /// socket does not serve. Decided before either lane read a body.
+    Envelope(CodecError),
+    /// The administration lane refused the message it was handed.
+    Admin(AdminError),
+    /// The Runs lane refused the message it was handed.
+    Runs(RunsApiError),
+}
+
+impl LocalRequestError {
+    /// Stable category suitable for logs and refusal metrics.
+    #[must_use]
+    pub const fn category(&self) -> &'static str {
+        match self {
+            Self::Envelope(error) => error.category(),
+            Self::Admin(error) => error.category(),
+            Self::Runs(error) => error.category(),
+        }
+    }
+}
+
+impl fmt::Display for LocalRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Envelope(error) => write!(formatter, "local frame was not placed: {error}"),
+            Self::Admin(error) => write!(formatter, "{error}"),
+            Self::Runs(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl Error for LocalRequestError {}
+
+/// One decoded request on a local endpoint that serves both local protocols.
+///
+/// # Why this is a dispatch and not a tenth admin command
+///
+/// A `list_runs` command inside [`AdminCommand`] would put a read of the Runs
+/// surface inside the closed admin kind set, inside the generated admin command
+/// registry, and inside the drift gate that pins both. The Runs API defines its
+/// own envelope, its own version range, its own bounded bodies and its own
+/// refusal vocabulary; re-spelling any of that here would create a second
+/// authority for one wire format, and the two would drift.
+///
+/// So the frame's own `protocol` member decides. Both lanes then admit their
+/// own message independently — including its major version, which each lane
+/// owns — so nothing is guessed, downgraded, or tried in sequence until
+/// something parses.
+///
+/// The payload is parsed twice: once here to read the declared name, and once
+/// by the lane that owns it. That is the cost of leaving each lane's decoder
+/// the sole authority over its own bytes, on a bounded local frame of at most
+/// [`MAX_ADMIN_CANONICAL_BYTES`], and it is preferred over a shape this module
+/// would have to keep in agreement with two others.
+/// The administration variant is boxed because an [`AdminRequest`] carries
+/// every command's body inline and is several times the size of a Runs
+/// request; an unboxed enum would move that much for a run listing too. One
+/// allocation per decoded local frame is the cost, and a local socket decodes
+/// one frame per connection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalRequest {
+    /// A local administration command.
+    Admin(Box<AdminRequest>),
+    /// A read on the native Runs API.
+    Runs(RunsRequest),
+}
+
+impl LocalRequest {
+    /// Decode one frame payload into the lane that owns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocalRequestError::Envelope`] for a payload that is not a
+    /// well-formed envelope or that names a protocol this socket does not
+    /// serve, and otherwise the owning lane's own refusal.
+    pub fn from_canonical_bytes(payload: &[u8]) -> Result<Self, LocalRequestError> {
+        let envelope = Message::from_canonical_bytes(payload)
+            .map_err(LocalRequestError::Envelope)?
+            .envelope()
+            .protocol()
+            .as_str()
+            .to_owned();
+        match envelope.as_str() {
+            ADMIN_PROTOCOL => AdminRequest::from_canonical_bytes(payload)
+                .map(|request| Self::Admin(Box::new(request)))
+                .map_err(LocalRequestError::Admin),
+            RUNS_PROTOCOL => RunsRequest::from_canonical_bytes(payload)
+                .map(Self::Runs)
+                .map_err(LocalRequestError::Runs),
+            _ => Err(LocalRequestError::Envelope(CodecError::UnknownProtocol)),
+        }
+    }
+
+    /// The protocol name of the lane that owns this request.
+    #[must_use]
+    pub const fn protocol(&self) -> &'static str {
+        match self {
+            Self::Admin(_) => ADMIN_PROTOCOL,
+            Self::Runs(_) => RUNS_PROTOCOL,
         }
     }
 }

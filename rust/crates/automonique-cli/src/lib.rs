@@ -16,6 +16,7 @@ mod diagnostics;
 mod kernel;
 mod release;
 mod run_submit;
+mod runs;
 mod supervisor;
 
 pub use diagnostics::{
@@ -39,7 +40,7 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
-const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique shutdown\n";
+const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique shutdown\n";
 
 #[derive(Clone)]
 enum Command {
@@ -79,6 +80,7 @@ enum Command {
     },
     Shutdown,
     Attempt(attempt::Operation),
+    Runs(runs::Operation),
 }
 
 /// Execute one closed product command. Arguments exclude the program name.
@@ -186,6 +188,28 @@ where
             if command == "run" && action == "submit" =>
         {
             Command::RunSubmit { idempotency_key }
+        }
+        // `runs` is variadic where the rest of this CLI is positional: a state
+        // filter repeats and the two paging flags are optional. The remaining
+        // argument words are collected here and judged by the verb itself, so
+        // an unknown flag is refused by name rather than silently dropped by a
+        // positional match that happened to bind.
+        (Some(command), Some(action), second, third) if command == "runs" => {
+            let flags: Vec<OsString> = second
+                .into_iter()
+                .chain(third)
+                .chain(arguments.by_ref())
+                .collect();
+            match (action.to_str(), flags.as_slice()) {
+                (Some("list"), _) => Command::Runs(runs::Operation::List { flags }),
+                (Some("detail"), [run_id]) => Command::Runs(runs::Operation::Detail {
+                    run_id: run_id.clone(),
+                }),
+                _ => {
+                    let _ = stderr.write_all(USAGE.as_bytes());
+                    return 2;
+                }
+            }
         }
         (Some(command), Some(operation), Some(socket_path), None)
             if command == "attempt" && operation == "heartbeat" =>
@@ -300,6 +324,9 @@ where
                 &mut stdout,
                 &mut stderr,
             );
+        }
+        Command::Runs(operation) => {
+            return runs::run(&operation, runtime.as_deref(), &mut stdout, &mut stderr);
         }
         Command::Shutdown => {
             return admin_shutdown(runtime.as_deref(), &mut stdout, &mut stderr);

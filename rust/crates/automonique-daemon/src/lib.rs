@@ -25,14 +25,25 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use automonique_observability::{MetricName, MetricValue, StoreProjection};
 use automonique_protocol::admin::{
     AdminInstanceId, AdminOutboxEvidence, AdminOutboxEvidenceParts, AdminReconciliationEvidence,
-    AdminRefusalCategory, AdminRequest, AdminResponse, DaemonState, DaemonStatus,
+    AdminRefusalCategory, AdminRequest, AdminResponse, DaemonState, DaemonStatus, LocalRequest,
     MAX_ADMIN_CANONICAL_BYTES, OperationalMetric, OperationalStatus, OperationalStatusParts,
     OutboxReconciliationDecision,
 };
-use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, decode_frame, encode_frame};
-use automonique_protocol::digest::Sha256;
+use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, RequestId, decode_frame, encode_frame};
+use automonique_protocol::digest::{ALGORITHM, Sha256, Sha256Digest};
+use automonique_protocol::journal::{CursorResume, RetainedRange};
+use automonique_protocol::runs_api::{
+    Continuation, LifecycleCoverage, ListRuns, RunCursor, RunDetailView, RunListPage, RunState,
+    RunSummary, RunsRefusal, RunsRequest, RunsResponse, SubmissionState,
+};
+use automonique_protocol::tools::RunId;
 use automonique_runner::{RunSpec, RunSpecDecodeError};
-use automonique_store::run_submissions::{RunSubmission, RunSubmissionError, RunSubmissionLog};
+use automonique_store::run_index::{
+    RunIndex, RunIndexEntry, RunIndexError, RunIndexRecord, RunSpoolState,
+};
+use automonique_store::run_submissions::{
+    RunSubmission, RunSubmissionError, RunSubmissionLog, RunSubmissionState,
+};
 use automonique_store::{
     InboxSubmission, IntakePauseRequest, IntakeResumeRequest, LeaseRenewal, LeaseRequest,
     OutboxReconciliationDecision as StoreOutboxDecision, OutboxReconciliationRequest,
@@ -62,6 +73,16 @@ pub const DATABASE_NAME: &str = concat!("automonique", ".sqlite3");
 /// versions independently of the scheduler's, and a submission is not scheduler
 /// state. What the separation costs is stated in that module's documentation.
 pub const RUN_SUBMISSIONS_NAME: &str = concat!("run-submissions", ".sqlite3");
+
+/// Durable run index, a sibling of [`DATABASE_NAME`].
+///
+/// The derived read model behind the Runs API listing: one row per accepted
+/// submission, binding it to its run and to the last state a writer reported.
+/// Separate from [`RUN_SUBMISSIONS_NAME`] for the reason every sibling log is
+/// separate — its schema versions independently — and because custody and a
+/// read model are different things: the first is the source of truth, the
+/// second is rebuildable from it.
+pub const RUN_INDEX_NAME: &str = concat!("run-index", ".sqlite3");
 
 /// Durable host-wide cancellation ledger, a sibling of [`DATABASE_NAME`].
 ///
@@ -157,6 +178,12 @@ impl DaemonConfig {
     pub fn run_cancel_ledger_path(&self) -> PathBuf {
         self.state_dir().join(RUN_CANCEL_LEDGER_NAME)
     }
+
+    /// Durable run index path.
+    #[must_use]
+    pub fn run_index_path(&self) -> PathBuf {
+        self.state_dir().join(RUN_INDEX_NAME)
+    }
 }
 
 /// A daemon lifecycle or local-control refusal.
@@ -186,6 +213,14 @@ pub enum DaemonError {
     /// The durable run submission log failed in a way no client caused. The
     /// payload is the stable category from that module.
     RunSubmissionFailed(&'static str),
+    /// The durable run index failed in a way no client caused. The payload is
+    /// the stable category from that module, or one of this crate's own for a
+    /// disagreement between the index and the custody it derives from.
+    ///
+    /// A submission is durable before its index row is written, so this never
+    /// reports a lost document: it reports a read model that could not be
+    /// extended or could not be believed.
+    RunIndexFailed(&'static str),
     /// The host-wide cancellation host could not be opened or could not be
     /// disposed cleanly. The payload is the stable category from
     /// [`attempt_host`].
@@ -208,6 +243,7 @@ impl DaemonError {
             Self::Signal(_) => "signal",
             Self::TelegramRefused(category) => category,
             Self::RunSubmissionFailed(category) => category,
+            Self::RunIndexFailed(category) => category,
             Self::AttemptHostFailed(category) => category,
         }
     }
@@ -239,6 +275,9 @@ impl fmt::Display for DaemonError {
             }
             Self::RunSubmissionFailed(category) => {
                 write!(formatter, "run submission log failed: {category}")
+            }
+            Self::RunIndexFailed(category) => {
+                write!(formatter, "run index failed: {category}")
             }
             Self::AttemptHostFailed(category) => {
                 write!(formatter, "attempt host refused: {category}")
@@ -283,6 +322,15 @@ pub struct Daemon {
     reconciliation_run_id: Option<i64>,
     telegram: telegram::TelegramHost,
     run_submissions: RunSubmissionLog,
+    /// The listing read model derived from `run_submissions`.
+    ///
+    /// A plain field rather than an `Option`, because unlike
+    /// [`Daemon::attempt_host`] this handle owns no dispatcher and needs no
+    /// ordered disposal: it is a database, and dropping it closes it. It is
+    /// opened beneath the same fence and before the socket guard is disarmed,
+    /// for the reason custody storage is — a daemon that cannot record what it
+    /// accepted must not publish an endpoint that accepts.
+    run_index: RunIndex,
     /// This host's one cancellation dispatcher over its one durable ledger.
     ///
     /// `Option` only so [`Daemon::serve`] can dispose of it explicitly while
@@ -384,6 +432,14 @@ impl Daemon {
         let run_submissions = RunSubmissionLog::open(config.run_submissions_path())
             .map_err(|error| DaemonError::RunSubmissionFailed(error.category()))?;
 
+        // The listing read model opens beside custody and under the same
+        // fence. It is opened even though nothing has to read it: an index
+        // that only appears once someone lists would be an index whose first
+        // write races its first read, and a submission accepted while it was
+        // absent would never be listed at all.
+        let run_index = RunIndex::open(config.run_index_path())
+            .map_err(|error| DaemonError::RunIndexFailed(error.category()))?;
+
         // The host's one cancellation dispatcher and its durable custody open
         // beneath the same fence and before the socket guard is disarmed, for
         // the same reason custody storage does: a daemon that cannot remember
@@ -407,6 +463,7 @@ impl Daemon {
             reconciliation_run_id: None,
             telegram,
             run_submissions,
+            run_index,
             attempt_host: Some(attempt_host),
             execution_state: Self::measure_execution_state(),
         })
@@ -599,6 +656,14 @@ impl Daemon {
         }
     }
 
+    /// Authenticate the peer, read one bounded frame, and hand it to the lane
+    /// its envelope names.
+    ///
+    /// The socket serves two protocols. Which one a frame belongs to is read
+    /// off its declared protocol name by
+    /// [`LocalRequest::from_canonical_bytes`], never guessed and never tried in
+    /// sequence, so an administration client and a Runs client receive their
+    /// own lane's refusals rather than each other's.
     fn handle_stream(
         &mut self,
         stream: &mut UnixStream,
@@ -608,8 +673,20 @@ impl Daemon {
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         let payload = read_payload(stream)?;
-        let request = AdminRequest::from_canonical_bytes(&payload)
-            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
+        match LocalRequest::from_canonical_bytes(&payload)
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
+        {
+            LocalRequest::Admin(request) => self.handle_admin(stream, &request, stop),
+            LocalRequest::Runs(request) => self.handle_runs(stream, &request),
+        }
+    }
+
+    fn handle_admin(
+        &mut self,
+        stream: &mut UnixStream,
+        request: &AdminRequest,
+        stop: &AtomicBool,
+    ) -> Result<(), DaemonError> {
         let response = match request.command() {
             automonique_protocol::admin::AdminCommand::Status => {
                 let now_ms = unix_millis()?;
@@ -825,6 +902,48 @@ impl Daemon {
                     }
                     Err(error) => return Err(DaemonError::RunSubmissionFailed(error.category())),
                 };
+                // CUSTODY FIRST, READ MODEL SECOND — and the order is the
+                // whole of the guarantee.
+                //
+                // The document is durable above. The index row below is a
+                // derived read model of it: it holds nothing the submission
+                // log does not, and a rebuild from custody could reconstruct
+                // every row it contains. Writing it second means a crash
+                // between the two loses a listing entry and never a document.
+                // The reverse order would let an index name a submission
+                // nobody accepted, which `automonique_store::run_index`
+                // describes as a broken listing — the failure this ordering
+                // buys, in exchange for never presenting a lost document as an
+                // absent one.
+                //
+                // There is no transaction across the two databases and there
+                // cannot be one; they are separate files. So a failed
+                // registration is a typed daemon error rather than a client
+                // refusal: the submitter's document is held, their receipt
+                // would be true, and the thing that failed is ours.
+                //
+                // A replay registers nothing. The store would refuse it with
+                // `AlreadyRegistered` anyway — the refusal is tolerated below
+                // rather than relied upon — but the deeper reason is ordering:
+                // rows are registered in submission order, which is what makes
+                // a page ordered by `index_id` also ordered by
+                // `submission_id`, and that is the order `RunListPage`
+                // requires. Back-filling a submission whose registration
+                // failed would insert a row whose submission identity is below
+                // its predecessors', and every later listing would be refused
+                // as out of order. Such a submission stays unlisted, and a
+                // reconcile that rebuilds the read model in order is where it
+                // would come back.
+                if !receipt.disposition.is_replay() {
+                    match self.run_index.register(RunIndexEntry {
+                        submission_id: receipt.submission_id,
+                        run_id: spec.run_id().as_str(),
+                        registered_at_ms: now_ms,
+                    }) {
+                        Ok(_) | Err(RunIndexError::AlreadyRegistered { .. }) => {}
+                        Err(error) => return Err(DaemonError::RunIndexFailed(error.category())),
+                    }
+                }
                 AdminResponse::RunAccepted {
                     request_id: request.request_id().clone(),
                     run_id: spec.run_id().clone(),
@@ -1090,6 +1209,281 @@ impl Daemon {
         Ok(())
     }
 
+    /// Answer one read on the native Runs API.
+    ///
+    /// Fenced like every other arm: a daemon that has lost its generation
+    /// answers nothing, because a read served from a database another
+    /// generation now owns is a read of somebody else's state.
+    ///
+    /// Unlike the intake arms, this is *not* closed by a pause or by a
+    /// degraded generation. A pause stops the daemon taking custody of new
+    /// work; it does not make what is already held unreadable, and an operator
+    /// diagnosing a degraded generation is precisely the person who needs to
+    /// list what it holds.
+    fn handle_runs(
+        &mut self,
+        stream: &mut UnixStream,
+        request: &RunsRequest,
+    ) -> Result<(), DaemonError> {
+        let now_ms = unix_millis()?;
+        let snapshot = self.store.status_snapshot_at(GENERATION_ID, now_ms)?;
+        let generation = snapshot.generation().ok_or(StoreError::StaleEpoch)?;
+        if generation.holder_id() != self.instance_id.as_str()
+            || generation.lease_epoch() != self.lease_epoch
+            || generation.lease_expires_ms() != self.lease_expires_ms
+            || generation.lease_expires_ms() <= now_ms
+        {
+            return Err(DaemonError::Store(StoreError::StaleEpoch));
+        }
+        let response = match request {
+            RunsRequest::ListRuns { request_id, query } => self.list_runs(request_id, query)?,
+            RunsRequest::RunDetail { request_id, run_id } => self.run_detail(request_id, run_id)?,
+        };
+        let response = response
+            .to_message()
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
+            .to_canonical_bytes();
+        let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + response.len());
+        encode_frame(&response, &mut frame)
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
+        stream.write_all(&frame)?;
+        stream.flush()?;
+        Ok(())
+    }
+
+    /// One bounded page of runs, or the resync a lost cursor earns.
+    ///
+    /// Every answer is built by [`RunsResponse::listing`] from the decision
+    /// [`ListRuns::resume_within`] made, so a page that contradicts its own
+    /// retention decision is refused here rather than served. This handler
+    /// supplies the two things that module deliberately does not have — the
+    /// real retained window and the rows — and nothing else.
+    fn list_runs(
+        &self,
+        request_id: &RequestId,
+        query: &ListRuns,
+    ) -> Result<RunsResponse, DaemonError> {
+        let Some(retained) = self.retained_runs()? else {
+            // AN EMPTY INDEX RETAINS NOTHING AND HAS LOST NOTHING.
+            //
+            // There is no window to judge a cursor against, and inventing one
+            // would mean answering `resync_required` — "positions you wanted
+            // are gone" — about a log from which nothing has ever been
+            // removed. Nothing here deletes, so a cursor ahead of an empty
+            // index is caught up rather than lost, and the truthful answer is
+            // an empty page that says it is complete.
+            let from = query.since().map_or(1, RunCursor::position);
+            let page =
+                RunListPage::new(Vec::new(), Continuation::Complete).map_err(runs_refused)?;
+            return RunsResponse::listing(
+                request_id.clone(),
+                query,
+                CursorResume::Live { from },
+                Some(page),
+            )
+            .map_err(runs_refused);
+        };
+        let decision = query.resume_within(retained.window);
+        let CursorResume::Live { from } = decision else {
+            return RunsResponse::listing(request_id.clone(), query, decision, None)
+                .map_err(runs_refused);
+        };
+        let cursor = self.index_cursor_below(from, &retained)?;
+        let limit = query.page_size().get();
+        let page = match query.states().states() {
+            // The filter is translated variant by variant, so a state this
+            // build cannot name is a compile failure rather than a row the
+            // listing silently drops.
+            Some(states) => {
+                let states: Vec<RunSpoolState> = states.iter().copied().map(spool_state).collect();
+                self.run_index.page_in_states(cursor, limit, &states)
+            }
+            None => self.run_index.page(cursor, limit),
+        }
+        .map_err(index_failed)?;
+        let mut runs = Vec::with_capacity(page.entries.len());
+        for record in &page.entries {
+            runs.push(self.summary(record)?);
+        }
+        // `next_cursor` is set only when the store saw a further *matching*
+        // row, so a page shortened by the state filter still reports itself
+        // complete only when nothing matching remains. The cursor is one past
+        // the last submission served, which is the next identity a caller
+        // receives — the coordinate a `RunCursor` names.
+        let continuation = match (page.next_cursor, runs.last()) {
+            (Some(_), Some(last)) => Continuation::More(RunCursor::new(
+                last.submission_id()
+                    .checked_add(1)
+                    .ok_or(DaemonError::ProtocolRefused("counter_out_of_range"))?,
+            )),
+            _ => Continuation::Complete,
+        };
+        let page = RunListPage::new(runs, continuation).map_err(runs_refused)?;
+        RunsResponse::listing(request_id.clone(), query, decision, Some(page)).map_err(runs_refused)
+    }
+
+    /// One run in full, or [`RunsRefusal::UnknownRun`].
+    ///
+    /// A run identity is not unique — `run_submissions` admits two submissions
+    /// naming one run, and so does the index — so this answers with the most
+    /// recently registered of them. The summary carries the exact
+    /// `submission_id` it was built from, so the answer says which one it is
+    /// rather than leaving a caller to assume there was only ever one.
+    fn run_detail(
+        &self,
+        request_id: &RequestId,
+        run_id: &RunId,
+    ) -> Result<RunsResponse, DaemonError> {
+        let records = self
+            .run_index
+            .by_run_id(run_id.as_str())
+            .map_err(index_failed)?;
+        let Some(record) = records.last() else {
+            return Ok(RunsResponse::Refused {
+                request_id: request_id.clone(),
+                refusal: RunsRefusal::UnknownRun,
+            });
+        };
+        // THE LIFECYCLE IS THE SUBSCRIBE LANE'S, NOT THIS HANDLER'S.
+        //
+        // The index holds a state and a last sequence. It does not hold the
+        // events themselves — those live in the runner's durable spool, one
+        // directory per run, served by that endpoint's `subscribe`. So a view
+        // built here carries no lifecycle at all, and `LifecycleCoverage`
+        // makes that a statement rather than an omission: `complete` with an
+        // empty lifecycle is only coherent for a `ready` run at sequence zero,
+        // which is exactly what a run whose events do not exist is.
+        //
+        // A row that has moved cannot be served from here at all. `truncated`
+        // requires at least one carried event, so this handler would have to
+        // invent one or misdeclare coverage, and it will do neither. Nothing
+        // in this build advances an index row — no execution lane writes a
+        // spool — so this is unreachable today; when that lane lands, this
+        // arm reads the spool rather than growing a synthetic event.
+        if record.spool_state != RunSpoolState::Ready || record.last_sequence != 0 {
+            return Err(DaemonError::ProtocolRefused("run_lifecycle_unavailable"));
+        }
+        let view = RunDetailView::new(
+            self.summary(record)?,
+            record.last_sequence,
+            Vec::new(),
+            LifecycleCoverage::Complete,
+        )
+        .map_err(runs_refused)?;
+        Ok(RunsResponse::RunDetail {
+            request_id: request_id.clone(),
+            view,
+        })
+    }
+
+    /// Join one index row against the custody it derives from.
+    ///
+    /// The index knows the run's state; the submission log knows the digest
+    /// the daemon verified and the instant it accepted. A summary is the pair,
+    /// and this is the join `runs_api` names as the seam it left open.
+    ///
+    /// An index row whose submission is absent is refused rather than skipped.
+    /// Skipping would shorten a page without saying so, which is the silent
+    /// drop the whole retention rule exists to prevent; refusing makes a
+    /// broken read model visible on the first read instead of on none.
+    fn summary(&self, record: &RunIndexRecord) -> Result<RunSummary, DaemonError> {
+        let entry = self
+            .run_submissions
+            .run_submissions(&record.run_id)
+            .map_err(|error| DaemonError::RunSubmissionFailed(error.category()))?
+            .into_iter()
+            .find(|entry| entry.submission_id == record.submission_id)
+            .ok_or(DaemonError::RunIndexFailed("run_index_dangling_row"))?;
+        // The digest is the column the daemon wrote after verifying it against
+        // the document bytes at acceptance. It is re-parsed, not re-computed:
+        // re-hashing every stored document on every page would make a listing
+        // a custody audit, which is a different operation with a different
+        // cost, and this read does not claim to have performed one.
+        let spec_digest: Sha256Digest = format!("{ALGORITHM}:{}", entry.spec_digest)
+            .parse()
+            .map_err(|_| DaemonError::RunSubmissionFailed("corrupt"))?;
+        RunSummary::new(
+            RunId::new(&record.run_id)
+                .map_err(|_| DaemonError::RunIndexFailed("run_index_run_id_ungrammatical"))?,
+            checked_row_id(record.submission_id)?,
+            spec_digest,
+            run_state(record.spool_state),
+            submission_state(entry.state),
+            automonique_protocol::primitives::EpochMillis::from_millis(entry.accepted_at_ms),
+        )
+        .map_err(runs_refused)
+    }
+
+    /// The window of submission identities the index still holds, and the
+    /// highest index position it holds them at.
+    ///
+    /// Both bounds are read from the index rather than assumed: nothing
+    /// deletes today, so the floor is the first row ever registered, but a
+    /// later retention policy would move it and this keeps saying something
+    /// true when it does.
+    ///
+    /// `None` when the index is empty, which is a different answer than a
+    /// window and is treated as one by the caller.
+    fn retained_runs(&self) -> Result<Option<RetainedRuns>, DaemonError> {
+        let Some(window) = self.run_index.retained_range().map_err(index_failed)? else {
+            return Ok(None);
+        };
+        let first = self.submission_after(window.first.saturating_sub(1))?;
+        let last = self.submission_after(window.last.saturating_sub(1))?;
+        Ok(Some(RetainedRuns {
+            window: RetainedRange::new(first, last)
+                .map_err(|_| DaemonError::RunIndexFailed("run_index_inverted_window"))?,
+            last_index: window.last,
+        }))
+    }
+
+    /// The submission identity of the first row above an exclusive index
+    /// cursor.
+    fn submission_after(&self, cursor: u64) -> Result<u64, DaemonError> {
+        let page = self.run_index.page(cursor, 1).map_err(index_failed)?;
+        let record = page
+            .entries
+            .first()
+            .ok_or(DaemonError::RunIndexFailed("run_index_row_missing"))?;
+        checked_row_id(record.submission_id)
+    }
+
+    /// The exclusive index cursor a page beginning at submission `from` starts
+    /// after.
+    ///
+    /// The listing's cursor is a *submission* identity, because that is what a
+    /// `RunCursor` names and what `RunListPage` orders by. The store pages by
+    /// `index_id`. The two agree in order — rows are registered in submission
+    /// order, and nothing back-fills — but they are not the same number, so
+    /// one has to be translated into the other.
+    ///
+    /// The translation is a binary search over index positions, which costs at
+    /// most sixteen single-row reads against a full 65 536-row index and none
+    /// at all in the common case of a listing that starts at the floor. A scan
+    /// would also be correct and would cost the whole table; a
+    /// submission-keyed page query in the store would cost nothing and is
+    /// where this belongs when that store grows one.
+    fn index_cursor_below(&self, from: u64, retained: &RetainedRuns) -> Result<u64, DaemonError> {
+        if from <= retained.window.first() {
+            return Ok(0);
+        }
+        // Invariant: every row at or below `low` carries a submission below
+        // `from`, and the row above `high` — if any — carries one at or above
+        // it. `high` starts at the last index position, where the invariant
+        // holds because there is no row above it.
+        let mut low = 0;
+        let mut high = retained.last_index;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.submission_after(middle)? >= from {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        Ok(low)
+    }
+
     fn write_refusal(
         &self,
         stream: &mut UnixStream,
@@ -1111,6 +1505,70 @@ impl Daemon {
         stream.flush()?;
         Ok(())
     }
+}
+
+/// What the run index retains, in the two coordinate spaces a listing needs.
+struct RetainedRuns {
+    /// Submission identities still listable, which is what a cursor names.
+    window: RetainedRange,
+    /// Highest `index_id` recorded, which is what the store pages by.
+    last_index: u64,
+}
+
+/// Translate the index's state vocabulary into the wire's.
+///
+/// Two closed six-word enums that mirror one another and one exhaustive match
+/// between them. Deliberately not a spelling comparison: a variant added or
+/// renamed on either side fails to compile here, where a lookup by word would
+/// have failed at runtime on the first row that carried it.
+const fn run_state(state: RunSpoolState) -> RunState {
+    match state {
+        RunSpoolState::Ready => RunState::Ready,
+        RunSpoolState::Running => RunState::Running,
+        RunSpoolState::Completed => RunState::Completed,
+        RunSpoolState::Failed => RunState::Failed,
+        RunSpoolState::Cancelled => RunState::Cancelled,
+        RunSpoolState::TimedOut => RunState::TimedOut,
+    }
+}
+
+/// Translate a wire state filter into the index's vocabulary.
+const fn spool_state(state: RunState) -> RunSpoolState {
+    match state {
+        RunState::Ready => RunSpoolState::Ready,
+        RunState::Running => RunSpoolState::Running,
+        RunState::Completed => RunSpoolState::Completed,
+        RunState::Failed => RunSpoolState::Failed,
+        RunState::Cancelled => RunSpoolState::Cancelled,
+        RunState::TimedOut => RunSpoolState::TimedOut,
+    }
+}
+
+/// Translate the custody vocabulary into the wire's.
+///
+/// One variant each, because the store's `CHECK (state IN ('accepted'))` admits
+/// one value. The match grows when that constraint does, and not before.
+const fn submission_state(state: RunSubmissionState) -> SubmissionState {
+    match state {
+        RunSubmissionState::Accepted => SubmissionState::Accepted,
+    }
+}
+
+/// A durable row identity, refused rather than wrapped when it is not one.
+///
+/// SQLite rowids are signed and the protocol's are not. A negative identity is
+/// a row this build could not have written, so it is refused here instead of
+/// becoming an enormous unsigned coordinate further down.
+fn checked_row_id(value: i64) -> Result<u64, DaemonError> {
+    u64::try_from(value).map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))
+}
+
+fn runs_refused(error: automonique_protocol::runs_api::RunsApiError) -> DaemonError {
+    DaemonError::ProtocolRefused(error.category())
+}
+
+fn index_failed(error: RunIndexError) -> DaemonError {
+    DaemonError::RunIndexFailed(error.category())
 }
 
 fn snapshot_requires_reconciliation(snapshot: &StatusSnapshot) -> bool {

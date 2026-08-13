@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 //! Bounded client for the peer-authenticated local daemon endpoint.
+//!
+//! The endpoint serves two protocols over one socket — local administration
+//! and the native Runs API read surface — so this module has one transport and
+//! two typed exchanges over it. [`exchange`] owns everything that is a property
+//! of the socket rather than of a protocol: the path judgement, the peer check,
+//! the deadlines, and the frame bound. Neither lane repeats any of it, so
+//! neither lane can weaken it.
 
 use std::ffi::OsStr;
 use std::io::{Read, Write};
@@ -15,6 +22,7 @@ use automonique_protocol::admin::{
     ReconciliationFailure, SubmittedRunSpec, SyntheticSubmission,
 };
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
+use automonique_protocol::runs_api::{RunsRequest, RunsResponse};
 use nix::sys::socket::{getsockopt, sockopt};
 use nix::unistd::geteuid;
 
@@ -69,13 +77,7 @@ pub(crate) fn request(
         Operation::ReconcileOutbox(_) => "outbox-reconcile",
         Operation::Shutdown => "shutdown",
     };
-    let request_id = format!(
-        "cli-{operation_name}-{}-{}",
-        std::process::id(),
-        REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    );
-    let request_id =
-        RequestId::new(&request_id).map_err(|error| ClientError::Protocol(error.category()))?;
+    let request_id = correlation(operation_name)?;
     let request = match operation {
         Operation::Submit(submission) => AdminRequest::submit(request_id, submission),
         Operation::SubmitRun(run_submission) => {
@@ -101,11 +103,71 @@ pub(crate) fn request(
         .to_message()
         .map_err(|error| ClientError::Protocol(error.category()))?
         .to_canonical_bytes();
+    let payload = exchange(runtime, &payload)?;
+    let response = AdminResponse::from_canonical_bytes(&payload)
+        .map_err(|error| ClientError::Protocol(error.category()))?;
+    if response.request_id().as_str() != request_id {
+        return Err(ClientError::Protocol("request_id_mismatch"));
+    }
+    if let AdminResponse::Refused { category, .. } = response {
+        return Err(ClientError::Refused(category.as_str().to_owned()));
+    }
+    Ok(response)
+}
+
+/// Ask the daemon one bounded question on the native Runs API.
+///
+/// The request travels under its own protocol name on the same socket, so the
+/// daemon places it by envelope rather than by which client sent it. A typed
+/// refusal is mapped onto [`ClientError::Refused`] exactly as the
+/// administration lane's is, so both render identically; a `resync_required`
+/// answer is *not* a refusal and is returned for the caller to report with the
+/// window it carries.
+pub(crate) fn runs_request(
+    runtime: Option<&OsStr>,
+    request: &RunsRequest,
+) -> Result<RunsResponse, ClientError> {
+    let request_id = request.request_id().as_str().to_owned();
+    let payload = request
+        .to_message()
+        .map_err(|error| ClientError::Protocol(error.category()))?
+        .to_canonical_bytes();
+    let payload = exchange(runtime, &payload)?;
+    let response = RunsResponse::from_canonical_bytes(&payload)
+        .map_err(|error| ClientError::Protocol(error.category()))?;
+    if response.request_id().as_str() != request_id {
+        return Err(ClientError::Protocol("request_id_mismatch"));
+    }
+    if let RunsResponse::Refused { refusal, .. } = response {
+        return Err(ClientError::Refused(refusal.as_str().to_owned()));
+    }
+    Ok(response)
+}
+
+/// Correlation identifier for one client request, unique within this process.
+pub(crate) fn correlation(operation: &str) -> Result<RequestId, ClientError> {
+    let request_id = format!(
+        "cli-{operation}-{}-{}",
+        std::process::id(),
+        REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    RequestId::new(&request_id).map_err(|error| ClientError::Protocol(error.category()))
+}
+
+/// Send one canonical payload to the local endpoint and read one back.
+///
+/// Everything here is a property of the socket rather than of a protocol: the
+/// path is judged before a `connect`, the peer is checked after it, both
+/// directions carry a deadline, and both frames are bounded by the transport's
+/// own ceiling. The Runs protocol's canonical ceiling is asserted at compile
+/// time in `automonique_protocol::admin` to be no larger than this one, so a
+/// legal message of either lane fits a frame this function will carry.
+fn exchange(runtime: Option<&OsStr>, payload: &[u8]) -> Result<Vec<u8>, ClientError> {
     if payload.is_empty() || payload.len() > MAX_ADMIN_PAYLOAD_BYTES {
         return Err(ClientError::Protocol("frame_size"));
     }
     let mut frame = Vec::with_capacity(payload.len() + 4);
-    encode_frame(&payload, &mut frame).map_err(|error| ClientError::Protocol(error.category()))?;
+    encode_frame(payload, &mut frame).map_err(|error| ClientError::Protocol(error.category()))?;
 
     let runtime = runtime.ok_or(ClientError::RuntimeUnavailable)?;
     let runtime = Path::new(runtime);
@@ -147,20 +209,12 @@ pub(crate) fn request(
     stream
         .read_exact(&mut response[4..])
         .map_err(|_| ClientError::Io)?;
-    let payload =
-        match decode_frame(&response).map_err(|error| ClientError::Protocol(error.category()))? {
-            FrameDecode::Frame { payload, consumed } if consumed == response.len() => payload,
-            _ => return Err(ClientError::Protocol("incomplete_frame")),
-        };
-    let response = AdminResponse::from_canonical_bytes(payload)
-        .map_err(|error| ClientError::Protocol(error.category()))?;
-    if response.request_id().as_str() != request_id {
-        return Err(ClientError::Protocol("request_id_mismatch"));
+    match decode_frame(&response).map_err(|error| ClientError::Protocol(error.category()))? {
+        FrameDecode::Frame { payload, consumed } if consumed == response.len() => {
+            Ok(payload.to_vec())
+        }
+        _ => Err(ClientError::Protocol("incomplete_frame")),
     }
-    if let AdminResponse::Refused { category, .. } = response {
-        return Err(ClientError::Refused(category.as_str().to_owned()));
-    }
-    Ok(response)
 }
 
 fn validate_private_directory(path: &Path) -> Result<(), ClientError> {
