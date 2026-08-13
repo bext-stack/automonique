@@ -1,22 +1,68 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Exact, synchronous HTTPS transport for Telegram `getUpdates`.
+//! Exact, synchronous HTTPS transport for the three Telegram methods this
+//! product uses: inbound `getUpdates`, and the outbound pair an operator
+//! control surface needs — `sendMessage` and `setMyCommands`.
+//!
+//! # Target lock
+//!
+//! No caller supplies a URL, a host, or a method name. The inbound plan names
+//! its single method through [`TelegramTarget`], the outbound plan names its
+//! closed pair through [`TelegramOutbound`], and both funnel into one private
+//! [`WireMethod`] enum that is the only thing a request path is ever rendered
+//! from. A control layer that is talked into asking for something else cannot
+//! spell it: there is no variant for it, and no string from a message ever
+//! reaches the URL.
+//!
+//! # Credential
+//!
+//! Telegram carries the bot token *in the request path*, so the URL is secret
+//! material and is built, used, and dropped inside this module. It is never
+//! returned, never rendered by any `Debug`, and never named in a failure — the
+//! closed [`HttpFailure`] and [`OutboundRefusal`] vocabularies carry no
+//! borrowed input at all. What a host can observe of an outbound request is its
+//! method name and its canonical body, neither of which contains the token.
 
+use std::error::Error;
 use std::fmt;
 use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use automonique_transports::MAX_TELEGRAM_INPUT_BYTES;
 use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::{
-    CancellationToken, HttpFailure, HttpMethod, MAX_TELEGRAM_RESPONSE_BYTES, TelegramHttpClient,
-    TelegramHttpPlan, TelegramHttpResponse, TelegramTarget,
+    CancellationToken, HttpFailure, HttpMethod, MAX_TELEGRAM_RESPONSE_BYTES, OpaqueBotToken,
+    TelegramAuthorization, TelegramHttpClient, TelegramHttpPlan, TelegramHttpResponse,
+    TelegramTarget,
 };
 
 const TELEGRAM_ORIGIN: &str = "https://api.telegram.org";
 const HTTP_TRANSPORT_ALLOWANCE_SECONDS: u64 = 3;
 const MAX_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
 const _: () = assert!((log::STATIC_MAX_LEVEL as usize) <= (log::LevelFilter::Debug as usize));
+
+/// Whole-request budget for an outbound call, which never long-polls.
+const OUTBOUND_REQUEST_TIMEOUT_SECONDS: u64 = 10;
+const _: () = assert!(OUTBOUND_REQUEST_TIMEOUT_SECONDS >= HTTP_TRANSPORT_ALLOWANCE_SECONDS);
+
+/// Longest `sendMessage` text Telegram accepts, in UTF-16 code units.
+///
+/// Telegram counts text in UTF-16 code units, not bytes and not `char`s, so
+/// this bound is measured the same way rather than in a unit that would admit
+/// a message the API then truncates or refuses.
+pub const MAX_SEND_MESSAGE_TEXT_UNITS: usize = 4096;
+/// Longest command list `setMyCommands` accepts.
+pub const MAX_BOT_COMMANDS: usize = 100;
+/// Longest command name `setMyCommands` accepts, in characters.
+pub const MAX_BOT_COMMAND_NAME_CHARS: usize = 32;
+/// Longest command description `setMyCommands` accepts, in characters.
+pub const MAX_BOT_COMMAND_DESCRIPTION_CHARS: usize = 256;
+
+/// A text at the unit ceiling always fits the byte ceiling this crate already
+/// applies to Telegram content: the worst case is a BMP character costing three
+/// bytes per UTF-16 unit, since an astral character costs four bytes for two.
+const _: () = assert!(MAX_SEND_MESSAGE_TEXT_UNITS * 3 <= MAX_TELEGRAM_INPUT_BYTES);
 
 /// Production synchronous Telegram HTTPS client.
 ///
@@ -67,18 +113,16 @@ impl fmt::Debug for TelegramHttpsClient {
     }
 }
 
-impl TelegramHttpClient for TelegramHttpsClient {
-    fn execute(
+impl TelegramHttpsClient {
+    /// Issue one prepared request and validate its response metadata.
+    ///
+    /// `prepared.url` is token-bearing; it is borrowed here and nowhere else.
+    fn post(
         &mut self,
-        plan: &TelegramHttpPlan<'_>,
+        prepared: &PreparedRequest,
+        timeout: Duration,
         cancellation: &CancellationToken,
     ) -> Result<TelegramHttpResponse, HttpFailure> {
-        if cancellation.is_cancelled() {
-            return Err(HttpFailure::Cancelled);
-        }
-        let prepared = PreparedRequest::from_plan(plan)?;
-        let timeout = request_timeout(plan.body.timeout_seconds);
-
         let mut response = self
             .agent
             .post(&prepared.url)
@@ -117,6 +161,61 @@ impl TelegramHttpClient for TelegramHttpsClient {
     }
 }
 
+impl TelegramHttpClient for TelegramHttpsClient {
+    fn execute(
+        &mut self,
+        plan: &TelegramHttpPlan<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<TelegramHttpResponse, HttpFailure> {
+        if cancellation.is_cancelled() {
+            return Err(HttpFailure::Cancelled);
+        }
+        let prepared = PreparedRequest::from_plan(plan)?;
+        let timeout = request_timeout(plan.body.timeout_seconds);
+        self.post(&prepared, timeout, cancellation)
+    }
+}
+
+impl TelegramOutboundClient for TelegramHttpsClient {
+    fn send(
+        &mut self,
+        plan: &TelegramOutboundPlan<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<TelegramHttpResponse, HttpFailure> {
+        if cancellation.is_cancelled() {
+            return Err(HttpFailure::Cancelled);
+        }
+        let prepared = PreparedRequest::from_outbound(plan)?;
+        self.post(
+            &prepared,
+            Duration::from_secs(OUTBOUND_REQUEST_TIMEOUT_SECONDS),
+            cancellation,
+        )
+    }
+}
+
+/// The complete set of request paths this module can render.
+///
+/// Private on purpose: it is the target lock itself. Every URL is built from
+/// one of these three constants, so no caller-supplied text can ever become a
+/// method name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WireMethod {
+    GetUpdates,
+    SendMessage,
+    SetMyCommands,
+}
+
+impl WireMethod {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::GetUpdates => "getUpdates",
+            Self::SendMessage => "sendMessage",
+            Self::SetMyCommands => "setMyCommands",
+        }
+    }
+}
+
 struct PreparedRequest {
     url: String,
     body: String,
@@ -135,26 +234,503 @@ impl PreparedRequest {
             return Err(HttpFailure::Unavailable);
         }
 
-        let url = plan.authorization().with_secret(|secret| {
-            let token = std::str::from_utf8(secret).map_err(|_| HttpFailure::Unavailable)?;
-            let (token_bot, token_secret) =
-                token.split_once(':').ok_or(HttpFailure::Unavailable)?;
-            if token_bot != plan.bot_id.to_string()
-                || token_secret.is_empty()
-                || !token_secret
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-            {
-                return Err(HttpFailure::Unavailable);
-            }
-            Ok(format!("{TELEGRAM_ORIGIN}/bot{token}/getUpdates"))
-        })?;
+        let url = method_url(&plan.authorization(), plan.bot_id, WireMethod::GetUpdates)?;
         let body = format!(
             "{{\"offset\":{},\"limit\":{},\"timeout\":{}}}",
             plan.body.offset, plan.body.limit, plan.body.timeout_seconds
         );
         Ok(Self { url, body })
     }
+
+    fn from_outbound(plan: &TelegramOutboundPlan<'_>) -> Result<Self, HttpFailure> {
+        if plan.method != HttpMethod::Post || plan.bot_id <= 0 {
+            return Err(HttpFailure::Unavailable);
+        }
+        let url = method_url(
+            &plan.authorization(),
+            plan.bot_id,
+            plan.request.wire_method(),
+        )?;
+        Ok(Self {
+            url,
+            body: plan.request.canonical_body(),
+        })
+    }
+}
+
+/// Materialize the token-bearing request path for exactly one bot and method.
+///
+/// The token is checked against the plan's `bot_id` before it is spent: a token
+/// whose own numeric prefix names a different bot is refused rather than
+/// silently used, so a misconfigured host cannot address another bot's API with
+/// this bot's identity. The comparison is against the decimal rendering of
+/// `bot_id`, so an alternate spelling such as a leading zero is refused too.
+fn method_url(
+    authorization: &TelegramAuthorization<'_>,
+    bot_id: i64,
+    method: WireMethod,
+) -> Result<String, HttpFailure> {
+    authorization.with_secret(|secret| {
+        let token = std::str::from_utf8(secret).map_err(|_| HttpFailure::Unavailable)?;
+        let (token_bot, token_secret) = token.split_once(':').ok_or(HttpFailure::Unavailable)?;
+        if token_bot != bot_id.to_string()
+            || token_secret.is_empty()
+            || !token_secret
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(HttpFailure::Unavailable);
+        }
+        Ok(format!("{TELEGRAM_ORIGIN}/bot{token}/{}", method.as_str()))
+    })
+}
+
+/// Closed refusals from building an outbound request.
+///
+/// Each names the field that was wrong and nothing else — never the value, so
+/// a refusal is safe to log beside operator content it may have been built
+/// from. Every one of these is decided before any I/O.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutboundRefusal {
+    /// The bot id is not a positive Telegram bot identifier.
+    BotId,
+    /// The chat id is zero, which addresses no Telegram chat.
+    ChatId,
+    /// The text is empty, over the length ceiling, or carries control
+    /// characters other than tab and newline.
+    Text,
+    /// A reply target was named but is not a positive message id.
+    ReplyTarget,
+    /// A command name is empty, over-long, repeated, or outside Telegram's
+    /// lowercase `a-z0-9_` grammar.
+    CommandName,
+    /// A command description is empty, over-long, or control-bearing.
+    CommandDescription,
+    /// The command list is empty or over Telegram's ceiling.
+    CommandCount,
+}
+
+impl OutboundRefusal {
+    /// Stable, content-free category for logging and metrics.
+    #[must_use]
+    pub const fn category(&self) -> &'static str {
+        match self {
+            Self::BotId => "bot_id",
+            Self::ChatId => "chat_id",
+            Self::Text => "text",
+            Self::ReplyTarget => "reply_target",
+            Self::CommandName => "command_name",
+            Self::CommandDescription => "command_description",
+            Self::CommandCount => "command_count",
+        }
+    }
+}
+
+impl fmt::Display for OutboundRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Telegram outbound refused: {}", self.category())
+    }
+}
+
+impl Error for OutboundRefusal {}
+
+/// A validated `sendMessage` body.
+///
+/// Construction is the only validation point: a value of this type is already
+/// within Telegram's ceilings, so rendering it cannot fail.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SendMessageRequest {
+    chat_id: i64,
+    text: String,
+    reply_to_message_id: Option<i64>,
+}
+
+impl SendMessageRequest {
+    /// Validate one outbound message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboundRefusal::ChatId`] for a zero chat,
+    /// [`OutboundRefusal::Text`] for text that is empty, longer than
+    /// [`MAX_SEND_MESSAGE_TEXT_UNITS`] UTF-16 units or
+    /// [`MAX_TELEGRAM_INPUT_BYTES`] bytes, or carries a control character other
+    /// than tab or newline, and [`OutboundRefusal::ReplyTarget`] for a
+    /// non-positive reply id.
+    pub fn new(
+        chat_id: i64,
+        text: impl Into<String>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<Self, OutboundRefusal> {
+        if chat_id == 0 {
+            return Err(OutboundRefusal::ChatId);
+        }
+        let text = text.into();
+        if !is_sendable_text(&text) {
+            return Err(OutboundRefusal::Text);
+        }
+        if reply_to_message_id.is_some_and(|id| id <= 0) {
+            return Err(OutboundRefusal::ReplyTarget);
+        }
+        Ok(Self {
+            chat_id,
+            text,
+            reply_to_message_id,
+        })
+    }
+
+    /// Chat this message is addressed to.
+    #[must_use]
+    pub const fn chat_id(&self) -> i64 {
+        self.chat_id
+    }
+
+    /// The validated text.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The message this reply is threaded under, if any.
+    #[must_use]
+    pub const fn reply_to_message_id(&self) -> Option<i64> {
+        self.reply_to_message_id
+    }
+}
+
+/// Message text is product content and may quote a run's output, so `Debug`
+/// reports its size and never its bytes — the same discipline the durable
+/// dispositions in this crate follow.
+impl fmt::Debug for SendMessageRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SendMessageRequest")
+            .field("chat_id", &self.chat_id)
+            .field("reply_to_message_id", &self.reply_to_message_id)
+            .field(
+                "text",
+                &format_args!("<redacted:{} bytes>", self.text.len()),
+            )
+            .finish()
+    }
+}
+
+/// One entry of Telegram's advertised command menu.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TelegramBotCommand {
+    name: String,
+    description: String,
+}
+
+impl TelegramBotCommand {
+    /// Validate one menu entry against Telegram's documented grammar.
+    ///
+    /// The name is given without its leading slash, is one to
+    /// [`MAX_BOT_COMMAND_NAME_CHARS`] characters, and may contain only
+    /// lowercase ASCII letters, digits and underscores.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboundRefusal::CommandName`] or
+    /// [`OutboundRefusal::CommandDescription`] for a field outside those
+    /// bounds.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Result<Self, OutboundRefusal> {
+        let name = name.into();
+        let description = description.into();
+        if name.is_empty()
+            || name.chars().count() > MAX_BOT_COMMAND_NAME_CHARS
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(OutboundRefusal::CommandName);
+        }
+        let described = description.chars().count();
+        if described == 0
+            || described > MAX_BOT_COMMAND_DESCRIPTION_CHARS
+            || description.chars().any(char::is_control)
+        {
+            return Err(OutboundRefusal::CommandDescription);
+        }
+        Ok(Self { name, description })
+    }
+
+    /// The validated name, without its leading slash.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The validated description.
+    #[must_use]
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+}
+
+/// A validated `setMyCommands` body.
+///
+/// Only the `commands` array is sent. Telegram's optional `scope` and
+/// `language_code` are omitted, which is its documented default scope; a host
+/// that needs a narrower scope must have that spelled here rather than passing
+/// one through, because this module renders no field it does not validate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetMyCommandsRequest {
+    commands: Vec<TelegramBotCommand>,
+}
+
+impl SetMyCommandsRequest {
+    /// Validate a whole command menu.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboundRefusal::CommandCount`] for an empty list or one over
+    /// [`MAX_BOT_COMMANDS`], and [`OutboundRefusal::CommandName`] if two
+    /// entries share a name — a repeated name is a menu whose meaning depends
+    /// on Telegram's tie-breaking, which this product does not rely on.
+    pub fn new(
+        commands: impl IntoIterator<Item = TelegramBotCommand>,
+    ) -> Result<Self, OutboundRefusal> {
+        let commands: Vec<TelegramBotCommand> = commands.into_iter().collect();
+        if commands.is_empty() || commands.len() > MAX_BOT_COMMANDS {
+            return Err(OutboundRefusal::CommandCount);
+        }
+        for (index, command) in commands.iter().enumerate() {
+            if commands[..index]
+                .iter()
+                .any(|earlier| earlier.name == command.name)
+            {
+                return Err(OutboundRefusal::CommandName);
+            }
+        }
+        Ok(Self { commands })
+    }
+
+    /// The validated menu, in the order it will be sent.
+    #[must_use]
+    pub fn commands(&self) -> &[TelegramBotCommand] {
+        &self.commands
+    }
+}
+
+/// The closed set of outbound Telegram methods this product may call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TelegramOutbound {
+    /// Deliver one message to one chat.
+    SendMessage(SendMessageRequest),
+    /// Replace the advertised command menu.
+    SetMyCommands(SetMyCommandsRequest),
+}
+
+impl TelegramOutbound {
+    const fn wire_method(&self) -> WireMethod {
+        match self {
+            Self::SendMessage(_) => WireMethod::SendMessage,
+            Self::SetMyCommands(_) => WireMethod::SetMyCommands,
+        }
+    }
+
+    /// Telegram's method name for this request. Carries no credential.
+    #[must_use]
+    pub const fn method_name(&self) -> &'static str {
+        self.wire_method().as_str()
+    }
+
+    /// The exact JSON body that will be sent, in a fixed field order.
+    ///
+    /// Token-free by construction, so a host may log or fixture it. Every
+    /// string is escaped here; nothing is interpolated raw.
+    #[must_use]
+    pub fn canonical_body(&self) -> String {
+        let mut body = String::new();
+        match self {
+            Self::SendMessage(request) => {
+                body.push_str("{\"chat_id\":");
+                body.push_str(&request.chat_id.to_string());
+                body.push_str(",\"text\":");
+                push_json_string(&mut body, &request.text);
+                if let Some(reply_to) = request.reply_to_message_id {
+                    body.push_str(",\"reply_to_message_id\":");
+                    body.push_str(&reply_to.to_string());
+                }
+                body.push('}');
+            }
+            Self::SetMyCommands(request) => {
+                body.push_str("{\"commands\":[");
+                for (index, command) in request.commands.iter().enumerate() {
+                    if index > 0 {
+                        body.push(',');
+                    }
+                    body.push_str("{\"command\":");
+                    push_json_string(&mut body, &command.name);
+                    body.push_str(",\"description\":");
+                    push_json_string(&mut body, &command.description);
+                    body.push('}');
+                }
+                body.push_str("]}");
+            }
+        }
+        body
+    }
+}
+
+/// Exact outbound request plan handed to a trusted HTTP boundary.
+///
+/// It mirrors [`TelegramHttpPlan`]: a typed method, a bot, a validated body and
+/// a borrowed credential that only the boundary may spend.
+pub struct TelegramOutboundPlan<'a> {
+    method: HttpMethod,
+    bot_id: i64,
+    request: TelegramOutbound,
+    authorization: &'a OpaqueBotToken,
+}
+
+impl<'a> TelegramOutboundPlan<'a> {
+    /// Bind one validated request to one bot and its credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboundRefusal::BotId`] for a non-positive bot id.
+    pub fn new(
+        bot_id: i64,
+        request: TelegramOutbound,
+        authorization: &'a OpaqueBotToken,
+    ) -> Result<Self, OutboundRefusal> {
+        if bot_id <= 0 {
+            return Err(OutboundRefusal::BotId);
+        }
+        Ok(Self {
+            method: HttpMethod::Post,
+            bot_id,
+            request,
+            authorization,
+        })
+    }
+
+    /// The verb this plan is issued with. Always [`HttpMethod::Post`].
+    #[must_use]
+    pub const fn method(&self) -> HttpMethod {
+        self.method
+    }
+
+    /// Bot this request addresses.
+    #[must_use]
+    pub const fn bot_id(&self) -> i64 {
+        self.bot_id
+    }
+
+    /// The validated request.
+    #[must_use]
+    pub const fn request(&self) -> &TelegramOutbound {
+        &self.request
+    }
+
+    /// The exact token-free JSON body that will be sent.
+    #[must_use]
+    pub fn canonical_body(&self) -> String {
+        self.request.canonical_body()
+    }
+
+    /// Whether an opaque authorization capability is present.
+    #[must_use]
+    pub fn has_authorization(&self) -> bool {
+        self.authorization.is_present()
+    }
+
+    /// Borrow the credential only at the trusted HTTP boundary.
+    ///
+    /// The borrow is constructed the same way [`TelegramHttpPlan`] constructs
+    /// its own: this module is a child of the one that owns the token, which is
+    /// why no wider accessor had to be opened on [`OpaqueBotToken`] to reach it.
+    #[must_use]
+    pub fn authorization(&self) -> TelegramAuthorization<'_> {
+        TelegramAuthorization(&self.authorization.0)
+    }
+}
+
+impl fmt::Debug for TelegramOutboundPlan<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TelegramOutboundPlan")
+            .field("method", &self.method)
+            .field("bot_id", &self.bot_id)
+            .field("method_name", &self.request.method_name())
+            .field("request", &self.request)
+            .field("authorization", &"<redacted>")
+            .finish()
+    }
+}
+
+/// An outbound implementation consumes only the typed plan and cancellation
+/// flag, exactly as [`TelegramHttpClient`] does for the inbound direction.
+///
+/// A 200 response with a JSON content type is the whole success signal this
+/// seam reports: Telegram answers a rejected method call with a non-200 status,
+/// which [`HttpFailure::UnexpectedStatus`] already refuses. The body is
+/// returned unparsed — this crate does not interpret outbound results.
+pub trait TelegramOutboundClient {
+    /// Issue one outbound call.
+    ///
+    /// # Errors
+    ///
+    /// Returns the closed [`HttpFailure`] vocabulary, including
+    /// [`HttpFailure::Cancelled`] when cancellation is observed before the
+    /// request is issued or before its body is accepted.
+    fn send(
+        &mut self,
+        plan: &TelegramOutboundPlan<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<TelegramHttpResponse, HttpFailure>;
+}
+
+/// Whether text may be sent as a Telegram message body.
+///
+/// Tab and newline are admitted because operators format multi-line replies
+/// with them; every other control character is refused rather than escaped, so
+/// a terminal rendering the eventual reply cannot be driven by message content.
+fn is_sendable_text(text: &str) -> bool {
+    if text.is_empty() || text.len() > MAX_TELEGRAM_INPUT_BYTES {
+        return false;
+    }
+    let mut units = 0_usize;
+    for character in text.chars() {
+        if character.is_control() && !matches!(character, '\n' | '\t') {
+            return false;
+        }
+        units += character.len_utf16();
+        if units > MAX_SEND_MESSAGE_TEXT_UNITS {
+            return false;
+        }
+    }
+    true
+}
+
+/// Append one JSON string literal, escaping every character JSON requires.
+///
+/// Written out rather than delegated because this crate carries no JSON
+/// serializer; the escape set is the whole of RFC 8259's requirement — the two
+/// mandatory escapes plus every code point below `0x20` — with `DEL` escaped as
+/// well so no C0/C1-adjacent byte reaches a log verbatim.
+fn push_json_string(out: &mut String, value: &str) {
+    out.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            control if control < '\u{20}' || control == '\u{7f}' => {
+                out.push_str(&format!("\\u{:04x}", control as u32));
+            }
+            plain => out.push(plain),
+        }
+    }
+    out.push('"');
 }
 
 fn is_json_content_type(value: &str) -> bool {
@@ -340,6 +916,268 @@ mod tests {
         assert_eq!(
             client.execute(&plan(&token), &cancellation),
             Err(HttpFailure::Cancelled)
+        );
+    }
+
+    fn outbound_plan<'a>(
+        token: &'a OpaqueBotToken,
+        request: TelegramOutbound,
+    ) -> TelegramOutboundPlan<'a> {
+        TelegramOutboundPlan::new(42, request, token).expect("plan")
+    }
+
+    fn send_message(text: &str) -> TelegramOutbound {
+        TelegramOutbound::SendMessage(
+            SendMessageRequest::new(-1_001, text, None).expect("send message"),
+        )
+    }
+
+    #[test]
+    fn outbound_urls_are_exact_and_reach_only_the_two_permitted_methods() {
+        let token = OpaqueBotToken::new(b"42:fixture-token".to_vec()).expect("token");
+        let sending = PreparedRequest::from_outbound(&outbound_plan(&token, send_message("hi")))
+            .expect("prepare send");
+        assert_eq!(
+            sending.url,
+            "https://api.telegram.org/bot42:fixture-token/sendMessage"
+        );
+        let menu = TelegramOutbound::SetMyCommands(
+            SetMyCommandsRequest::new([TelegramBotCommand::new(
+                "status",
+                "Report the daemon status snapshot",
+            )
+            .expect("command")])
+            .expect("menu"),
+        );
+        let publishing =
+            PreparedRequest::from_outbound(&outbound_plan(&token, menu)).expect("prepare menu");
+        assert_eq!(
+            publishing.url,
+            "https://api.telegram.org/bot42:fixture-token/setMyCommands"
+        );
+
+        // The lock is the enum: these three renderings are the complete set of
+        // request paths this module can produce.
+        assert_eq!(WireMethod::GetUpdates.as_str(), "getUpdates");
+        assert_eq!(WireMethod::SendMessage.as_str(), "sendMessage");
+        assert_eq!(WireMethod::SetMyCommands.as_str(), "setMyCommands");
+    }
+
+    #[test]
+    fn outbound_refuses_a_mismatched_or_malformed_token_before_io() {
+        let wrong_bot = OpaqueBotToken::new(b"41:fixture-token".to_vec()).expect("token");
+        assert_eq!(
+            PreparedRequest::from_outbound(&outbound_plan(&wrong_bot, send_message("hi"))).err(),
+            Some(HttpFailure::Unavailable)
+        );
+        let malformed = OpaqueBotToken::new(b"42-no-separator".to_vec()).expect("token");
+        assert_eq!(
+            PreparedRequest::from_outbound(&outbound_plan(&malformed, send_message("hi"))).err(),
+            Some(HttpFailure::Unavailable)
+        );
+        assert_eq!(
+            TelegramOutboundPlan::new(0, send_message("hi"), &wrong_bot).err(),
+            Some(OutboundRefusal::BotId)
+        );
+    }
+
+    #[test]
+    fn the_token_never_reaches_a_rendered_outbound_request() {
+        let secret = "42:fixture-secret-never-print";
+        let token = OpaqueBotToken::new(secret.as_bytes().to_vec()).expect("token");
+        let plan = outbound_plan(&token, send_message("run 7 finished"));
+        let rendered = format!(
+            "{plan:?}{}{}{:?}{:?}{:?}",
+            plan.canonical_body(),
+            OutboundRefusal::Text,
+            OutboundRefusal::Text,
+            token,
+            plan.authorization()
+        );
+        assert!(!rendered.contains("fixture-secret-never-print"));
+        assert!(rendered.contains("<redacted"));
+        // The message text is the caller's, and the body is the one rendering
+        // that must reproduce it exactly; the plan's Debug still withholds it.
+        assert!(plan.canonical_body().contains("run 7 finished"));
+        assert!(!format!("{plan:?}").contains("run 7 finished"));
+
+        // Only the prepared request holds the credential, and only as the path
+        // Telegram requires.
+        let prepared = PreparedRequest::from_outbound(&plan).expect("prepare");
+        assert!(prepared.url.contains(secret));
+        assert!(!prepared.body.contains(secret));
+    }
+
+    #[test]
+    fn send_message_body_is_canonical_and_escaped() {
+        let plain = TelegramOutbound::SendMessage(
+            SendMessageRequest::new(-1_001, "run 7 done", None).expect("request"),
+        );
+        assert_eq!(plain.method_name(), "sendMessage");
+        assert_eq!(
+            plain.canonical_body(),
+            r#"{"chat_id":-1001,"text":"run 7 done"}"#
+        );
+
+        let threaded = TelegramOutbound::SendMessage(
+            SendMessageRequest::new(7, "ok", Some(31)).expect("request"),
+        );
+        assert_eq!(
+            threaded.canonical_body(),
+            r#"{"chat_id":7,"text":"ok","reply_to_message_id":31}"#
+        );
+
+        let hostile = TelegramOutbound::SendMessage(
+            SendMessageRequest::new(7, "quote\" slash\\ line\n tab\t", None).expect("request"),
+        );
+        assert_eq!(
+            hostile.canonical_body(),
+            r#"{"chat_id":7,"text":"quote\" slash\\ line\n tab\t"}"#
+        );
+    }
+
+    #[test]
+    fn set_my_commands_body_is_canonical_and_ordered() {
+        let menu = TelegramOutbound::SetMyCommands(
+            SetMyCommandsRequest::new([
+                TelegramBotCommand::new("help", "Show \"the\" commands").expect("command"),
+                TelegramBotCommand::new("run", "Submit a run").expect("command"),
+            ])
+            .expect("menu"),
+        );
+        assert_eq!(menu.method_name(), "setMyCommands");
+        assert_eq!(
+            menu.canonical_body(),
+            r#"{"commands":[{"command":"help","description":"Show \"the\" commands"},{"command":"run","description":"Submit a run"}]}"#
+        );
+    }
+
+    #[test]
+    fn json_escaping_covers_every_control_code_point() {
+        let mut rendered = String::new();
+        push_json_string(&mut rendered, "\u{0}\u{1}\u{8}\u{c}\u{1f}\u{7f}");
+        assert_eq!(rendered, r#""\u0000\u0001\b\f\u001f\u007f""#);
+        let mut kept = String::new();
+        push_json_string(&mut kept, "héllo 😀");
+        assert_eq!(kept, "\"héllo 😀\"");
+    }
+
+    #[test]
+    fn send_message_bounds_are_exact() {
+        assert_eq!(
+            SendMessageRequest::new(0, "hi", None).err(),
+            Some(OutboundRefusal::ChatId)
+        );
+        assert_eq!(
+            SendMessageRequest::new(7, "", None).err(),
+            Some(OutboundRefusal::Text)
+        );
+        assert_eq!(
+            SendMessageRequest::new(7, "bell\u{7}", None).err(),
+            Some(OutboundRefusal::Text)
+        );
+        assert!(SendMessageRequest::new(7, "line\nbreak\tkept", None).is_ok());
+        assert_eq!(
+            SendMessageRequest::new(7, "hi", Some(0)).err(),
+            Some(OutboundRefusal::ReplyTarget)
+        );
+        assert_eq!(
+            SendMessageRequest::new(7, "hi", Some(-1)).err(),
+            Some(OutboundRefusal::ReplyTarget)
+        );
+
+        let at_limit = "a".repeat(MAX_SEND_MESSAGE_TEXT_UNITS);
+        assert!(SendMessageRequest::new(7, at_limit.clone(), None).is_ok());
+        assert_eq!(
+            SendMessageRequest::new(7, format!("{at_limit}a"), None).err(),
+            Some(OutboundRefusal::Text)
+        );
+        // Telegram counts UTF-16 units, so an astral character costs two.
+        let astral = "😀".repeat(MAX_SEND_MESSAGE_TEXT_UNITS / 2);
+        assert!(SendMessageRequest::new(7, astral.clone(), None).is_ok());
+        assert_eq!(
+            SendMessageRequest::new(7, format!("{astral}😀"), None).err(),
+            Some(OutboundRefusal::Text)
+        );
+    }
+
+    #[test]
+    fn bot_command_bounds_match_telegrams_grammar() {
+        assert_eq!(
+            TelegramBotCommand::new("Status", "upper case").err(),
+            Some(OutboundRefusal::CommandName)
+        );
+        assert_eq!(
+            TelegramBotCommand::new("with-dash", "dash").err(),
+            Some(OutboundRefusal::CommandName)
+        );
+        assert_eq!(
+            TelegramBotCommand::new("", "empty").err(),
+            Some(OutboundRefusal::CommandName)
+        );
+        assert!(TelegramBotCommand::new("a_9", "fine").is_ok());
+        assert!(
+            TelegramBotCommand::new("n".repeat(MAX_BOT_COMMAND_NAME_CHARS), "at limit").is_ok()
+        );
+        assert_eq!(
+            TelegramBotCommand::new("n".repeat(MAX_BOT_COMMAND_NAME_CHARS + 1), "over").err(),
+            Some(OutboundRefusal::CommandName)
+        );
+        assert_eq!(
+            TelegramBotCommand::new("ok", "").err(),
+            Some(OutboundRefusal::CommandDescription)
+        );
+        assert_eq!(
+            TelegramBotCommand::new("ok", "control\u{1}").err(),
+            Some(OutboundRefusal::CommandDescription)
+        );
+        assert!(
+            TelegramBotCommand::new("ok", "d".repeat(MAX_BOT_COMMAND_DESCRIPTION_CHARS)).is_ok()
+        );
+        assert_eq!(
+            TelegramBotCommand::new("ok", "d".repeat(MAX_BOT_COMMAND_DESCRIPTION_CHARS + 1)).err(),
+            Some(OutboundRefusal::CommandDescription)
+        );
+    }
+
+    #[test]
+    fn command_menu_bounds_and_uniqueness_are_exact() {
+        let command = |index: usize| {
+            TelegramBotCommand::new(format!("c{index}"), "fixture").expect("command")
+        };
+        assert_eq!(
+            SetMyCommandsRequest::new([]).err(),
+            Some(OutboundRefusal::CommandCount)
+        );
+        assert!(SetMyCommandsRequest::new((0..MAX_BOT_COMMANDS).map(command)).is_ok());
+        assert_eq!(
+            SetMyCommandsRequest::new((0..=MAX_BOT_COMMANDS).map(command)).err(),
+            Some(OutboundRefusal::CommandCount)
+        );
+        assert_eq!(
+            SetMyCommandsRequest::new([command(1), command(1)]).err(),
+            Some(OutboundRefusal::CommandName)
+        );
+    }
+
+    #[test]
+    fn outbound_cancellation_before_io_is_closed() {
+        let token = OpaqueBotToken::new(b"42:fixture-token".to_vec()).expect("token");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut client = TelegramHttpsClient::new();
+        assert_eq!(
+            client.send(&outbound_plan(&token, send_message("hi")), &cancellation),
+            Err(HttpFailure::Cancelled)
+        );
+    }
+
+    #[test]
+    fn the_outbound_budget_is_bounded_and_needs_no_long_poll_allowance() {
+        assert_eq!(OUTBOUND_REQUEST_TIMEOUT_SECONDS, 10);
+        assert!(
+            Duration::from_secs(OUTBOUND_REQUEST_TIMEOUT_SECONDS) < request_timeout(50),
+            "an outbound call must never outlive an inbound long poll"
         );
     }
 }

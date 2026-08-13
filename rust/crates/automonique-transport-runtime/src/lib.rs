@@ -21,12 +21,24 @@ use sha2::{Digest, Sha256};
 mod https_client;
 mod slack_sink;
 mod store_sink;
+mod telegram_control;
 
-pub use https_client::TelegramHttpsClient;
+pub use https_client::{
+    MAX_BOT_COMMAND_DESCRIPTION_CHARS, MAX_BOT_COMMAND_NAME_CHARS, MAX_BOT_COMMANDS,
+    MAX_SEND_MESSAGE_TEXT_UNITS, OutboundRefusal, SendMessageRequest, SetMyCommandsRequest,
+    TelegramBotCommand, TelegramHttpsClient, TelegramOutbound, TelegramOutboundClient,
+    TelegramOutboundPlan,
+};
 pub use slack_sink::{
     SlackDurableReceipt, SlackSinkFailure, StoreSlackDurableSink, slack_content_digest,
 };
 pub use store_sink::{Clock, ClockFailure, StoreTelegramDurableSink, SystemClock};
+pub use telegram_control::{
+    AllowedUsers, AllowlistError, ArgumentShape, COMMAND_COUNT, CommandKind, CommandManifestEntry,
+    CommandRefusal, CommandSpec, ControlCommand, ControlRef, MAX_ALLOWED_USERS,
+    MAX_BOT_SUFFIX_BYTES, MAX_COMMAND_NAME_BYTES, MAX_COMMAND_TEXT_BYTES, MAX_CONTROL_REF_BYTES,
+    MAX_RUN_TASK_BYTES, RunTask, authorize_and_parse, command_manifest, help_text, parse_command,
+};
 
 const MAX_LEASE_ID_BYTES: usize = 256;
 const MAX_LONG_POLL_SECONDS: u16 = 50;
