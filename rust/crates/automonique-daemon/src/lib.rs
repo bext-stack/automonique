@@ -50,6 +50,10 @@ pub const MAX_ADMIN_PAYLOAD_BYTES: usize = MAX_ADMIN_CANONICAL_BYTES;
 const GENERATION_ID: &str = "foreground";
 const LEASE_TTL_MS: i64 = 30_000;
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
+/// Bot-lease TTL, strictly inside the generation TTL: the store refuses a bot
+/// lease that would outlive its generation authority, and the bot lease is
+/// always acquired or renewed moments after the generation lease.
+const TELEGRAM_LEASE_TTL_MS: i64 = 20_000;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const ACCEPT_POLL: Duration = Duration::from_millis(25);
 
@@ -128,6 +132,9 @@ pub enum DaemonError {
     ReconciliationRequired,
     /// Host signal setup failed.
     Signal(nix::Error),
+    /// The Telegram configuration or bot-lease lifecycle was refused. The
+    /// payload is the stable category from the telegram module.
+    TelegramRefused(&'static str),
 }
 
 impl DaemonError {
@@ -144,6 +151,7 @@ impl DaemonError {
             Self::Store(error) => error.category(),
             Self::ReconciliationRequired => "reconciliation_required",
             Self::Signal(_) => "signal",
+            Self::TelegramRefused(category) => category,
         }
     }
 }
@@ -169,6 +177,9 @@ impl fmt::Display for DaemonError {
                 formatter.write_str("synthetic scheduler requires reconciliation")
             }
             Self::Signal(error) => write!(formatter, "daemon signal setup failed: {error}"),
+            Self::TelegramRefused(category) => {
+                write!(formatter, "telegram host refused: {category}")
+            }
         }
     }
 }
@@ -280,6 +291,20 @@ impl Daemon {
             Ok(lease) => lease,
             Err(error) => return Err(DaemonError::Store(error)),
         };
+
+        // The Telegram host loads its explicit configuration and, when one
+        // exists, acquires the durable bot lease beneath the generation fence
+        // established above. An absent configuration is the disabled state; a
+        // present-but-refused one fails startup rather than being ignored.
+        let telegram = telegram::TelegramHost::open(
+            &state_dir,
+            &config.database_path(),
+            GENERATION_ID,
+            instance_id.as_str(),
+            lease.epoch,
+            TELEGRAM_LEASE_TTL_MS,
+        )
+        .map_err(|error| DaemonError::TelegramRefused(error.category()))?;
         socket_cleanup.disarm();
 
         Ok(Self {
@@ -292,7 +317,7 @@ impl Daemon {
             socket_identity,
             controller: automonique_core::Controller::new(),
             reconciliation_run_id: None,
-            telegram: telegram::TelegramHost::disabled(),
+            telegram,
         })
     }
 
@@ -318,6 +343,12 @@ impl Daemon {
             if std::time::Instant::now() >= next_renewal {
                 if let Err(error) = self.renew_lease() {
                     break Err(error);
+                }
+                // The bot lease renews on the same cadence and beneath the
+                // just-renewed generation authority; losing it is fencing
+                // evidence, not a condition to poll through.
+                if let Err(error) = self.telegram.renew() {
+                    break Err(DaemonError::TelegramRefused(error.category()));
                 }
                 next_renewal = std::time::Instant::now() + LEASE_RENEW_INTERVAL;
             }
@@ -351,6 +382,13 @@ impl Daemon {
                 Err(error) => break Err(DaemonError::Io(error)),
             }
         };
+        // The bot lease releases before the generation lease so its release
+        // still runs under a live generation authority; both results defer to
+        // any primary serve failure.
+        let telegram_release = self
+            .telegram
+            .release()
+            .map_err(|error| DaemonError::TelegramRefused(error.category()));
         let release = unix_millis().and_then(|now_ms| {
             self.store
                 .release_generation_lease(
@@ -363,10 +401,11 @@ impl Daemon {
         });
         match result {
             Err(primary) => {
+                let _ = telegram_release;
                 let _ = release;
                 Err(primary)
             }
-            Ok(()) => release,
+            Ok(()) => telegram_release.and(release),
         }
     }
 

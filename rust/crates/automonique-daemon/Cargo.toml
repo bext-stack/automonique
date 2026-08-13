@@ -12,6 +12,7 @@ automonique-core = { path = "../automonique-core" }
 automonique-observability = { path = "../automonique-observability" }
 automonique-protocol = { path = "../automonique-protocol" }
 automonique-store = { path = "../automonique-store" }
+automonique-transport-runtime = { path = "../automonique-transport-runtime" }
 nix.workspace = true
 rusqlite.workspace = true
 

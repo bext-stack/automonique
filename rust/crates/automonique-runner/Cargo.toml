@@ -10,7 +10,8 @@ publish = false
 [dependencies]
 automonique-protocol = { path = "../automonique-protocol" }
 landlock = { workspace = true }
-nix = { version = "=0.29.0", default-features = false, features = ["fs", "process", "signal", "user"] }
+seccompiler = { workspace = true }
+nix = { version = "=0.29.0", default-features = false, features = ["fs", "poll", "process", "signal", "socket", "user"] }
 sha2 = "=0.10.9"
 
 [lints.rust]

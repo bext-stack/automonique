@@ -192,8 +192,18 @@ lease margin. Telegram's required token-bearing URL exists only during that
 request and is absent from public errors and Debug output; the dependency graph
 statically disables Trace logging because the HTTP library exposes request
 paths at that level. The concrete store adapter persists dispositions and the
-offset atomically, but no token is loaded and the client is not wired into the
-daemon. The observability crate derives bounded metrics from one timestamped
+offset atomically. The daemon now loads an explicit operator-written bot
+configuration from a private `telegram/bot.conf` under its state directory —
+header/terminator-framed, owner-only permissions required, the token validated
+against its `bot_id` and then dropped rather than retained — and, when one is
+present, acquires, renews, and cleanly releases the durable per-bot poller
+lease beneath its generation fence, reporting `lease_owned_no_client` with the
+lease epoch over the authenticated status command. An absent configuration
+stays honestly `disabled_no_client`; a present-but-invalid or insecure one
+refuses startup instead of degrading silently, and a live predecessor's bot
+lease is fenced out by expiry, never seized. HTTP polling itself remains
+deliberately unavailable: no client is constructed, and enabling it requires a
+future admin-protocol extension. The observability crate derives bounded metrics from one timestamped
 SQLite snapshot and serves them over the local authenticated status command,
 but it has no metrics exporter. A release-manifest candidate can bind the
 descriptor helper, boundary installer, fixture, workspace, and runner digests
