@@ -15,6 +15,7 @@ members = [
     "crates/automonique-runner",
     "crates/automonique-sandbox",
     "crates/automonique-store",
+    "crates/automonique-support-connector",
     "crates/automonique-transport-runtime",
     "crates/automonique-transports",
 ]

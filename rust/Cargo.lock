@@ -136,6 +136,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "automonique-support-connector"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "automonique-transport-runtime"
 version = "0.1.0"
 dependencies = [
