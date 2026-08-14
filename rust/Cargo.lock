@@ -75,6 +75,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "automonique-egress-broker"
+version = "0.1.0"
+
+[[package]]
 name = "automonique-lab"
 version = "0.1.0"
 dependencies = [
