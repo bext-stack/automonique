@@ -338,8 +338,8 @@ fn the_manifest_is_exhaustive_over_the_registry_and_round_trips() {
     assert_eq!(
         manifest.map(|entry| entry.name),
         [
-            "help", "status", "runs", "tickets", "ticket", "work", "run", "cancel", "approve",
-            "deny", "admin"
+            "help", "status", "runs", "tickets", "ticket", "slack", "work", "run", "say", "cancel",
+            "approve", "deny", "admin"
         ]
     );
     for entry in manifest {
@@ -348,6 +348,8 @@ fn the_manifest_is_exhaustive_over_the_registry_and_round_trips() {
             ArgumentShape::Task => format!("/{} do the thing", entry.name),
             ArgumentShape::Reference => format!("/{} reference-1", entry.name),
             ArgumentShape::Directive => format!("/{} list", entry.name),
+            ArgumentShape::Channel => format!("/{} ops", entry.name),
+            ArgumentShape::ChannelMessage => format!("/{} ops bonjour", entry.name),
         };
         assert_eq!(
             parse_command(&typed).as_ref().map(ControlCommand::kind),

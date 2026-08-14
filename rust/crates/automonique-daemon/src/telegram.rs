@@ -601,7 +601,16 @@ impl TelegramHost {
     ///
     /// Nothing is dialled here. A live configuration is *composed* and then
     /// parked; [`Self::start`] is what puts it on a thread.
-    pub(crate) fn open(params: &TelegramHostParams<'_>) -> Result<Self, TelegramHostError> {
+    ///
+    /// `slack` is taken by value rather than by reference in the params, because
+    /// a composed Slack client is *moved* into the bridge that will spend it. A
+    /// host with no Telegram configuration drops it here, which is exactly
+    /// right: nothing would ever have called it, and the credential should not
+    /// outlive the surface that could.
+    pub(crate) fn open(
+        params: &TelegramHostParams<'_>,
+        slack: crate::slack::SlackHost,
+    ) -> Result<Self, TelegramHostError> {
         let Some(config) =
             TelegramBotConfig::load(params.state_dir).map_err(TelegramHostError::Config)?
         else {
@@ -625,7 +634,7 @@ impl TelegramHost {
         else {
             return Ok(Self::LeaseOwned { coordinator });
         };
-        let bridge = Self::compose(params, bot_id, *live)?;
+        let bridge = Self::compose(params, bot_id, *live, slack)?;
         Ok(Self::Live {
             coordinator,
             control: Box::new(PollerControl {
@@ -643,6 +652,7 @@ impl TelegramHost {
         params: &TelegramHostParams<'_>,
         bot_id: i64,
         live: LiveControl,
+        slack: crate::slack::SlackHost,
     ) -> Result<LiveBridge, TelegramHostError> {
         let surface = StoreControlSurface::open(
             params.database_path,
@@ -673,6 +683,11 @@ impl TelegramHost {
             sink: StoreTelegramDurableSink::new(poller_store, SystemClock),
             surface,
             lane,
+            // `None` on a host with no `slack.conf`, which is what makes
+            // `/slack` and `/say` answer that Slack is not configured rather
+            // than fail. A refused configuration never reaches here: it failed
+            // startup before this host was opened.
+            slack: slack.into_surface(),
             roster: live.roster,
             inbound_token: live.inbound_token,
             outbound_token: live.outbound_token,
@@ -983,7 +998,8 @@ mod tests {
     #[test]
     fn an_absent_configuration_reports_the_disabled_state() {
         let fixture = HostFixture::new(None);
-        let host = TelegramHost::open(&fixture.params()).expect("host opens");
+        let host = TelegramHost::open(&fixture.params(), crate::slack::SlackHost::Disabled)
+            .expect("host opens");
         assert!(matches!(host, TelegramHost::Disabled));
         assert_eq!(host.status(), (TelegramState::DisabledNoClient, None));
     }
@@ -993,7 +1009,8 @@ mod tests {
     #[test]
     fn a_host_without_an_allowlist_reports_the_no_client_state() {
         let fixture = HostFixture::new(Some(&config(&[])));
-        let mut host = TelegramHost::open(&fixture.params()).expect("host opens");
+        let mut host = TelegramHost::open(&fixture.params(), crate::slack::SlackHost::Disabled)
+            .expect("host opens");
         assert!(matches!(host, TelegramHost::LeaseOwned { .. }));
         let (state, epoch) = host.status();
         assert_eq!(state, TelegramState::LeaseOwnedNoClient);
@@ -1007,7 +1024,8 @@ mod tests {
     #[test]
     fn a_host_with_an_allowlist_reports_polling_live_with_its_epoch() {
         let fixture = HostFixture::new(Some(&config(&["7654321"])));
-        let mut host = TelegramHost::open(&fixture.params()).expect("host opens");
+        let mut host = TelegramHost::open(&fixture.params(), crate::slack::SlackHost::Disabled)
+            .expect("host opens");
         let TelegramHost::Live { control, .. } = &host else {
             panic!("an allowlisted configuration must compose a live host")
         };
@@ -1048,7 +1066,8 @@ mod tests {
     #[test]
     fn a_stopped_poller_is_reported_as_holding_no_client() {
         let fixture = HostFixture::new(Some(&config(&["7654321"])));
-        let mut host = TelegramHost::open(&fixture.params()).expect("host opens");
+        let mut host = TelegramHost::open(&fixture.params(), crate::slack::SlackHost::Disabled)
+            .expect("host opens");
         let TelegramHost::Live { control, .. } = &mut host else {
             panic!("an allowlisted configuration must compose a live host")
         };

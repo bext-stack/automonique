@@ -807,6 +807,68 @@ fn insecure_roots_are_refused_without_creating_product_paths() {
     assert!(!config.runtime_dir().exists());
 }
 
+/// THE SLACK GATE, AT STARTUP. A present-but-wrong `slack.conf` refuses the
+/// daemon rather than being ignored, and no admin socket is published — an
+/// operator error about which channels are reachable must not hide behind a
+/// daemon that came up looking healthy.
+#[test]
+fn a_refused_slack_configuration_refuses_startup_and_publishes_no_socket() {
+    /// Write one `slack.conf` into a fresh fixture and try to open a daemon
+    /// over it. A fixture each, because a refused open leaves a durable
+    /// generation lease behind and the next one would be refused for holding
+    /// it rather than for the configuration.
+    fn open_with(
+        body: &str,
+        mode: u32,
+    ) -> (tempfile::TempDir, DaemonConfig, Result<(), DaemonError>) {
+        let (root, config) = fixture();
+        let slack = config.state_dir().join("slack");
+        std::fs::create_dir_all(&slack).expect("slack directory");
+        std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state directory");
+        std::fs::set_permissions(&slack, std::fs::Permissions::from_mode(0o700))
+            .expect("private slack directory");
+        let path = slack.join("slack.conf");
+        std::fs::write(&path, body).expect("configuration written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("configuration permissions");
+        let opened = Daemon::open(&config).map(drop);
+        (root, config, opened)
+    }
+
+    const VALID: &str = "schema=automonique.slack/v1\n\
+                         token=xoxb-0000000000-fixture-secret-never-print\n\
+                         channel=ops:C0RESERVED01\n\
+                         end=automonique.slack/v1\n";
+
+    // A channel map naming an id that is not one.
+    let (_root, config, opened) = open_with(
+        "schema=automonique.slack/v1\n\
+         token=xoxb-0000000000-fixture-secret-never-print\n\
+         channel=ops:not-an-id\n\
+         end=automonique.slack/v1\n",
+        0o600,
+    );
+    let error = opened.expect_err("bad channel map refused");
+    assert!(matches!(error, DaemonError::SlackRefused(_)));
+    assert_eq!(error.category(), "slack_config_channel");
+    assert!(!config.admin_socket().exists());
+
+    // A credential anybody on the host can read is refused before it is parsed.
+    let (_root, config, opened) = open_with(VALID, 0o644);
+    let error = opened.expect_err("exposed credential refused");
+    assert_eq!(error.category(), "slack_config_insecure");
+    assert!(!config.admin_socket().exists());
+
+    // The same file, private, is the configured state — and this daemon opens.
+    let (_root, _config, opened) = open_with(VALID, 0o600);
+    opened.expect("a valid configuration opens");
+
+    // And an absent file is the disabled state, which is not an error at all.
+    let (_root, config) = fixture();
+    Daemon::open(&config).expect("an absent configuration is deliberate");
+}
+
 #[test]
 fn store_open_failure_never_publishes_an_admin_socket() {
     let (_root, config) = fixture();

@@ -67,6 +67,7 @@ dependencies = [
  "automonique-observability",
  "automonique-protocol",
  "automonique-runner",
+ "automonique-slack-connector",
  "automonique-store",
  "automonique-support-connector",
  "automonique-transport-runtime",

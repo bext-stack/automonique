@@ -20,10 +20,11 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use automonique_daemon::slack::SLACK_NOT_CONFIGURED;
 use automonique_daemon::telegram_bridge::{
     BridgeParts, ControlSurface, DispatchReport, HostFacts, MemberChange, NO_TICKETS_RECORDED,
-    OperatorRoster, RunFailure, RunLane, StoreControlSurface, TICKET_NOT_FOUND, TICKETS_LISTED,
-    TICKETS_NOT_ENABLED, TelegramControlBridge, Unavailable,
+    OperatorRoster, RunFailure, RunLane, SlackSurface, StoreControlSurface, TICKET_NOT_FOUND,
+    TICKETS_LISTED, TICKETS_NOT_ENABLED, TelegramControlBridge, Unavailable,
 };
 use automonique_protocol::admin::ExecutionState;
 use automonique_store::operator_members::OperatorMemberStore;
@@ -33,10 +34,11 @@ use automonique_store::support_tickets::{
 };
 use automonique_store::{LeaseRequest, Store};
 use automonique_transport_runtime::{
-    CancellationToken, CommandTier, DurableCommitReceipt, DurableDisposition, DurableTelegramBatch,
-    HttpFailure, OffsetReceipt, OpaqueBotToken, PollerLease, RuntimeError, SinkFailure,
-    TelegramDurableSink, TelegramHttpClient, TelegramHttpPlan, TelegramHttpResponse,
-    TelegramOutboundClient, TelegramOutboundPlan, command_manifest,
+    CancellationToken, ChannelName, CommandRefusal, CommandTier, DurableCommitReceipt,
+    DurableDisposition, DurableTelegramBatch, HttpFailure, OffsetReceipt, OpaqueBotToken,
+    PollerLease, RuntimeError, SinkFailure, TelegramDurableSink, TelegramHttpClient,
+    TelegramHttpPlan, TelegramHttpResponse, TelegramOutboundClient, TelegramOutboundPlan,
+    command_manifest,
 };
 use automonique_transports::{TelegramBotId, TelegramPrincipal};
 
@@ -593,6 +595,82 @@ impl RunLane for FakeRunLane {
     }
 }
 
+/// A Slack workspace that answers from a script and never opens a socket.
+///
+/// The seam is the whole point: the production workspace is the only thing in
+/// this product that can post to a channel other people read, and no test in
+/// this file can reach one. What this fake records is what *would* have been
+/// posted, which is how a test can prove a refused `/say` posted nothing.
+#[derive(Clone, Default)]
+struct FakeSlack {
+    state: Arc<Mutex<FakeSlackState>>,
+}
+
+#[derive(Default)]
+struct FakeSlackState {
+    /// Every `(channel, text)` a post reached the workspace with.
+    posts: Vec<(String, String)>,
+    /// Every channel a read reached the workspace with.
+    reads: Vec<String>,
+    /// What a read answers.
+    read: Option<Result<String, String>>,
+    /// What a post answers.
+    post: Option<Result<String, String>>,
+}
+
+impl FakeSlack {
+    fn reading(page: &str) -> Self {
+        let slack = Self::default();
+        slack.state.lock().expect("slack state").read = Some(Ok(page.to_owned()));
+        slack
+    }
+
+    fn posting(confirmation: &str) -> Self {
+        let slack = Self::reading("#ops, 1 most recent:\n1723542000 amelie: bonjour");
+        slack.state.lock().expect("slack state").post = Some(Ok(confirmation.to_owned()));
+        slack
+    }
+
+    fn refusing(reply: &str) -> Self {
+        let slack = Self::default();
+        let mut state = slack.state.lock().expect("slack state");
+        state.read = Some(Err(reply.to_owned()));
+        state.post = Some(Err(reply.to_owned()));
+        drop(state);
+        slack
+    }
+
+    fn posts(&self) -> Vec<(String, String)> {
+        self.state.lock().expect("slack state").posts.clone()
+    }
+
+    fn reads(&self) -> Vec<String> {
+        self.state.lock().expect("slack state").reads.clone()
+    }
+}
+
+impl SlackSurface for FakeSlack {
+    fn recent_messages(&mut self, channel: &ChannelName) -> Result<String, String> {
+        let mut state = self.state.lock().expect("slack state");
+        state.reads.push(channel.as_str().to_owned());
+        state
+            .read
+            .clone()
+            .unwrap_or_else(|| Err(String::from("no scripted read")))
+    }
+
+    fn post_message(&mut self, channel: &ChannelName, text: &str) -> Result<String, String> {
+        let mut state = self.state.lock().expect("slack state");
+        state
+            .posts
+            .push((channel.as_str().to_owned(), text.to_owned()));
+        state
+            .post
+            .clone()
+            .unwrap_or_else(|| Err(String::from("no scripted post")))
+    }
+}
+
 type Bridge =
     TelegramControlBridge<FakeClient, FakeOutbound, FakeSink, StoreControlSurface, FakeRunLane>;
 
@@ -618,12 +696,27 @@ fn bridge_with_roster(
     lane: FakeRunLane,
     roster: OperatorRoster,
 ) -> Bridge {
+    // `None`: every test that is not about Slack composes a host with no
+    // `slack.conf`, which is what every host is until an owner writes one.
+    bridge_with_slack(fixture, client, outbound, sink, lane, roster, None)
+}
+
+fn bridge_with_slack(
+    fixture: &Fixture,
+    client: FakeClient,
+    outbound: FakeOutbound,
+    sink: FakeSink,
+    lane: FakeRunLane,
+    roster: OperatorRoster,
+    slack: Option<FakeSlack>,
+) -> Bridge {
     TelegramControlBridge::new(BridgeParts {
         client,
         outbound,
         sink,
         surface: fixture.surface(),
         lane,
+        slack: slack.map(|slack| Box::new(slack) as Box<dyn SlackSurface + Send>),
         roster,
         inbound_token: token(),
         outbound_token: token(),
@@ -803,6 +896,245 @@ fn commands_without_a_surface_say_nothing_happened() {
     assert_eq!(
         surface.runs_text().expect("runs render"),
         "No runs recorded."
+    );
+}
+
+// ------------------------------------------------------------------- slack
+
+/// THE TIER LINE, ON THE ONE COMMAND THAT LEAVES THIS SYSTEM. A member may read
+/// a channel; only an administrator may post to one, and a member's `/say`
+/// reaches the workspace not at all.
+#[test]
+fn a_member_may_read_a_channel_and_only_an_administrator_may_post_to_one() {
+    let fixture = Fixture::new(&[]);
+    let slack = FakeSlack::posting("Posted to #ops (ts 1723542000.000100).");
+    let client = FakeClient::new([updates(&[
+        (1, MEMBER, "/slack ops"),
+        (2, MEMBER, "/say ops bonjour tout le monde"),
+        (3, OPERATOR, "/say ops bonjour tout le monde"),
+    ])]);
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge_with_slack(
+        &fixture,
+        client,
+        outbound.clone(),
+        FakeSink::default(),
+        FakeRunLane::default(),
+        roster(&[OPERATOR], &[MEMBER]),
+        Some(slack.clone()),
+    );
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.updates, 3);
+    // The read and the administrator's post were answered; the member's `/say`
+    // was refused by the tier gate before any argument was parsed.
+    assert_eq!(report.answered, 2);
+    assert_eq!(report.refused, 1);
+    assert_eq!(report.slack_posted, 1);
+    assert_eq!(report.slack_failed, 0);
+    assert_eq!(report.sent, 3);
+
+    let messages = outbound.messages();
+    assert!(
+        messages[0].contains("1723542000 amelie: bonjour"),
+        "{}",
+        messages[0]
+    );
+    assert!(
+        messages[1].contains(CommandRefusal::NotPermitted.operator_reply()),
+        "{}",
+        messages[1]
+    );
+    assert!(messages[2].contains("Posted to #ops"), "{}", messages[2]);
+
+    // THE PROOF THAT MATTERS. Exactly one post reached the workspace, and it is
+    // the administrator's — a member's `/say` never became a call at all.
+    assert_eq!(
+        slack.posts(),
+        vec![(String::from("ops"), String::from("bonjour tout le monde"))],
+        "a member's /say must not reach Slack"
+    );
+    assert_eq!(slack.reads(), vec![String::from("ops")]);
+}
+
+/// The channel a sender names is resolved by the workspace and nothing else, so
+/// what reaches the seam is the *name* and never anything a sender could point
+/// at a conversation of their own choosing.
+#[test]
+fn only_the_named_channel_reaches_the_workspace() {
+    let fixture = Fixture::new(&[]);
+    let slack = FakeSlack::reading("#incidents has no recent messages.");
+    let client = FakeClient::new([updates(&[
+        (1, OPERATOR, "/slack #Incidents"),
+        // A conversation id is admitted by the *name* grammar and is simply a
+        // name: the workspace resolves it against the configured map, where no
+        // host has an entry under that label.
+        (2, OPERATOR, "/slack C0RESERVED01"),
+        // These are not channel names at all and never reach the seam.
+        (3, OPERATOR, "/slack ops incidents"),
+        (4, OPERATOR, "/slack ops.eu"),
+    ])]);
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge_with_slack(
+        &fixture,
+        client,
+        outbound.clone(),
+        FakeSink::default(),
+        FakeRunLane::default(),
+        single_tier_roster(),
+        Some(slack.clone()),
+    );
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.updates, 4);
+    assert_eq!(report.refused, 2, "two are refused by the grammar");
+    assert_eq!(
+        slack.reads(),
+        vec![String::from("incidents"), String::from("c0reserved01")],
+        "only a well-formed, lowercased name reaches the workspace"
+    );
+    let messages = outbound.messages();
+    assert!(
+        messages[2].contains(CommandRefusal::UnexpectedArgument.operator_reply()),
+        "{}",
+        messages[2]
+    );
+    assert!(
+        messages[3].contains(CommandRefusal::ArgumentInvalid.operator_reply()),
+        "{}",
+        messages[3]
+    );
+}
+
+/// A host with no `slack.conf` says so, and posts nothing. Not a fault: this
+/// daemon was never given a workspace.
+#[test]
+fn a_host_with_no_slack_configuration_says_so_and_posts_nothing() {
+    let fixture = Fixture::new(&[]);
+    let client = FakeClient::new([updates(&[
+        (1, OPERATOR, "/slack ops"),
+        (2, OPERATOR, "/say ops bonjour"),
+    ])]);
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge_with_slack(
+        &fixture,
+        client,
+        outbound.clone(),
+        FakeSink::default(),
+        FakeRunLane::default(),
+        single_tier_roster(),
+        None,
+    );
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.updates, 2);
+    assert_eq!(report.sent, 2);
+    assert_eq!(report.slack_posted, 0, "nothing was posted anywhere");
+    // The read is an answered fact; the post is a thing that did not happen.
+    assert_eq!(report.answered, 1);
+    assert_eq!(report.slack_failed, 1);
+    for message in outbound.messages() {
+        assert!(message.contains(SLACK_NOT_CONFIGURED), "{message}");
+    }
+}
+
+/// Slack's own refusal is a clear reply and never a panic, and it is counted as
+/// a post that did not happen rather than as one that did.
+#[test]
+fn a_slack_refusal_is_answered_as_the_repair_it_calls_for() {
+    let fixture = Fixture::new(&[]);
+    let slack = FakeSlack::refusing(
+        "Slack refused: this bot is not in #ops. Invite it to the channel. \
+         Nothing was posted. (not_in_channel)",
+    );
+    let client = FakeClient::new([updates(&[
+        (1, OPERATOR, "/slack ops"),
+        (2, OPERATOR, "/say ops bonjour"),
+    ])]);
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge_with_slack(
+        &fixture,
+        client,
+        outbound.clone(),
+        FakeSink::default(),
+        FakeRunLane::default(),
+        single_tier_roster(),
+        Some(slack.clone()),
+    );
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.slack_failed, 2, "neither read nor posted");
+    assert_eq!(report.slack_posted, 0);
+    assert_eq!(report.answered, 0);
+    assert_eq!(
+        report.sent, 2,
+        "a refusal is still answered to the operator"
+    );
+    for message in outbound.messages() {
+        assert!(message.contains("not_in_channel"), "{message}");
+        assert!(message.contains("Invite it to the channel"), "{message}");
+    }
+    // The call was attempted — this is Slack's refusal, not a gate here.
+    assert_eq!(slack.posts().len(), 1);
+}
+
+/// A workspace reply longer than one Telegram message is cut and marked rather
+/// than refused by the outbound bounds.
+#[test]
+fn an_over_long_slack_reply_is_bounded_into_one_message() {
+    let fixture = Fixture::new(&[]);
+    let huge = format!("#ops, 10 most recent:\n{}", "e\u{301}".repeat(60_000));
+    let slack = FakeSlack::reading(&huge);
+    let client = FakeClient::new([updates(&[(1, OPERATOR, "/slack ops")])]);
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge_with_slack(
+        &fixture,
+        client,
+        outbound.clone(),
+        FakeSink::default(),
+        FakeRunLane::default(),
+        single_tier_roster(),
+        Some(slack),
+    );
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.answered, 1);
+    assert_eq!(report.sent, 1, "the reply fits one message");
+    assert_eq!(report.send_refused, 0);
+    assert!(
+        outbound.messages()[0].contains("truncated"),
+        "a cut reply must say it was cut"
+    );
+}
+
+/// The free functions the bridge dispatches through, driven with no transport
+/// at all — including the one case a bridge test cannot reach, where a channel
+/// name is well-formed and the seam is absent.
+#[test]
+fn the_slack_seam_answers_the_same_way_without_a_transport() {
+    let channel = ChannelName::new("ops").expect("channel");
+    let mut slack = FakeSlack::posting("Posted to #ops (ts 1.1).");
+
+    assert_eq!(
+        automonique_daemon::telegram_bridge::slack_post(Some(&mut slack), &channel, "bonjour"),
+        Ok(String::from("Posted to #ops (ts 1.1)."))
+    );
+    assert_eq!(
+        slack.posts(),
+        vec![(String::from("ops"), String::from("bonjour"))]
+    );
+
+    // No workspace: the read is a fact and the post is a failure, and neither
+    // is a panic.
+    let absent: Option<&mut FakeSlack> = None;
+    assert_eq!(
+        automonique_daemon::telegram_bridge::slack_read(absent, &channel),
+        Ok(String::from(SLACK_NOT_CONFIGURED))
+    );
+    let absent: Option<&mut FakeSlack> = None;
+    assert_eq!(
+        automonique_daemon::telegram_bridge::slack_post(absent, &channel, "bonjour"),
+        Err(String::from(SLACK_NOT_CONFIGURED))
     );
 }
 

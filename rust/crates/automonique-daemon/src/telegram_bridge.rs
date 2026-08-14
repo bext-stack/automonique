@@ -3,14 +3,33 @@
 //! The bridge between one Telegram poll and this daemon's read surfaces.
 //!
 //! [`TelegramControlBridge`] is the only place in this product where an inbound
-//! Telegram message becomes an answer. It owns four injected seams — an HTTP
+//! Telegram message becomes an answer. It owns six injected seams — an HTTP
 //! client for `getUpdates`, an outbound client for `sendMessage`/`setMyCommands`,
 //! the durable sink that commits offsets, a [`ControlSurface`] that can read
-//! what this daemon holds, and a [`RunLane`] that can carry out one `/run` — and
+//! what this daemon holds, a [`RunLane`] that can carry out one `/run`, and an
+//! optional [`SlackSurface`] that can read and post to one Slack workspace — and
 //! nothing else. Every one of them is a trait, so the whole dispatch table is
-//! exercised in tests with no network, no daemon and no provider at all.
+//! exercised in tests with no network, no daemon, no provider and no Slack at
+//! all.
 //!
-//! # Two commands here are effects
+//! # One command here is visible outside this system
+//!
+//! `/say` posts to a Slack channel. It is the only command in this product whose
+//! effect is seen by people who are not operators of it, and the only one that
+//! cannot be undone by anything this daemon can do afterwards. Three things
+//! follow and are worth stating together:
+//!
+//! - **The tier is the gate.** `/say` is admin-only in the registry, and there
+//!   is no second confirmation in this dispatch. An administrator typing it is
+//!   the deliberate act; a bot that asked "are you sure" after every one would
+//!   train them to answer without reading.
+//! - **The destination is configuration, not input.** A sender names a label,
+//!   and only [`crate::slack`]'s configured map turns one into a channel id. The
+//!   reachable set is the file's, not the sender's.
+//! - **An unconfirmed post is reported as unknown.** See
+//!   [`SlackSurface::post_message`].
+//!
+//! # Two commands here spend a run
 //!
 //! Every other command on this surface is a read. `/run` composes a document,
 //! submits it to custody, starts a contained attempt and waits for it, and the
@@ -93,7 +112,7 @@ use automonique_store::support_tickets::{
     SupportTicketError, SupportTicketStore, TicketLifecycle, TicketRecord,
 };
 use automonique_transport_runtime::{
-    AdminDirective, AllowedUsers, CancellationToken, ControlCommand, HttpFailure,
+    AdminDirective, AllowedUsers, CancellationToken, ChannelName, ControlCommand, HttpFailure,
     MAX_ALLOWED_USERS, MAX_SEND_MESSAGE_TEXT_UNITS, OpaqueBotToken, OperatorAuthority, PollOutcome,
     PollerLease, RuntimeError, SendMessageRequest, SetMyCommandsRequest, TelegramBotCommand,
     TelegramDurableSink, TelegramHttpClient, TelegramHttpPlan, TelegramHttpResponse,
@@ -636,6 +655,8 @@ impl Unavailable {
             | ControlCommand::Runs
             | ControlCommand::Tickets
             | ControlCommand::Ticket { .. }
+            | ControlCommand::Slack { .. }
+            | ControlCommand::Say { .. }
             | ControlCommand::Work { .. }
             | ControlCommand::Admin { .. }
             | ControlCommand::Run { .. } => None,
@@ -716,6 +737,42 @@ impl RunFailure {
     }
 }
 
+/// The Slack workspace a `/slack` reads and a `/say` posts to.
+///
+/// A seam for the reason [`ControlSurface`] and [`RunLane`] are, and one more:
+/// [`crate::slack`]'s production implementation is the only thing in this
+/// product that can post to a channel other people read, so every test of this
+/// dispatch drives an injected one and no test can reach a workspace.
+///
+/// The bridge holds `Option<Box<dyn SlackSurface + Send>>`. `None` is a host
+/// with no `slack.conf`, and it is what makes both commands answer
+/// [`SLACK_NOT_CONFIGURED`](crate::slack::SLACK_NOT_CONFIGURED): the
+/// not-configured reply lives here rather than inside a workspace that would
+/// have to exist in order to say it does not.
+pub trait SlackSurface {
+    /// The channel's recent messages, rendered as one bounded reply.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operator-facing sentence for a read that produced nothing —
+    /// a channel this host has not configured, Slack's own refusal, or a call
+    /// that did not reach an answer. Nothing was read in any of them.
+    fn recent_messages(&mut self, channel: &ChannelName) -> Result<String, String>;
+
+    /// Post one message to the channel, and confirm it.
+    ///
+    /// **This is an outward effect.** The text goes in front of every human in
+    /// that channel and nothing takes it back. The admin tier on `/say` is the
+    /// whole authorization; there is no second gate here, by design.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operator-facing sentence for a post that did not certainly
+    /// land. An implementation must tell Slack's own refusal — which did not
+    /// post — apart from a transport failure, which is *unknown* and may have.
+    fn post_message(&mut self, channel: &ChannelName, text: &str) -> Result<String, String>;
+}
+
 /// The lane that turns one task string into one contained run and its answer.
 ///
 /// A seam for the same reason [`ControlSurface`] is one: the whole dispatch
@@ -758,6 +815,21 @@ pub struct DispatchReport {
     pub tickets_worked: usize,
     /// `/work` commands that stored nothing, for any reason.
     pub ticket_work_failed: usize,
+    /// `/say` commands Slack confirmed it had posted.
+    ///
+    /// Counted on its own because it is the only number here that says
+    /// *something left this system and other people can see it*. It is not
+    /// folded into [`Self::answered`] for the same reason
+    /// [`Self::member_mutations`] is not.
+    pub slack_posted: usize,
+    /// `/slack` and `/say` commands that produced neither a page nor a
+    /// confirmed post.
+    ///
+    /// A refused post and an unconfirmed one are both counted here, and the
+    /// difference between them lives in the reply the operator received: this
+    /// counter deliberately does not claim to know which happened, because for
+    /// a transport failure this host does not.
+    pub slack_failed: usize,
     /// `/admin` commands that moved a durable roster row.
     ///
     /// Counted apart from [`Self::answered`] because it is the only number here
@@ -792,6 +864,8 @@ impl DispatchReport {
         self.runs_failed += other.runs_failed;
         self.tickets_worked += other.tickets_worked;
         self.ticket_work_failed += other.ticket_work_failed;
+        self.slack_posted += other.slack_posted;
+        self.slack_failed += other.slack_failed;
         self.member_mutations += other.member_mutations;
         self.refused += other.refused;
         self.denied_senders += other.denied_senders;
@@ -882,6 +956,12 @@ pub struct BridgeParts<C, O, S, R, L> {
     pub surface: R,
     /// The lane one `/run` is carried out through.
     pub lane: L,
+    /// The Slack workspace `/slack` and `/say` address, when one is configured.
+    ///
+    /// `None` on a host with no `slack.conf`, which is every host until an
+    /// owner writes one — and the reason both commands can be in the registry
+    /// on a daemon that cannot reach Slack at all.
+    pub slack: Option<Box<dyn SlackSurface + Send>>,
     /// The configured operator roster, from which both authority models — the
     /// transport's chat/actor policy and the tiered control gate — are composed
     /// together with whatever the durable member roster holds.
@@ -901,6 +981,7 @@ pub struct TelegramControlBridge<C, O, S, R, L> {
     outbound: O,
     surface: R,
     lane: L,
+    slack: Option<Box<dyn SlackSurface + Send>>,
     policy: TelegramAccessPolicy,
     roster: OperatorRoster,
     authority: OperatorAuthority,
@@ -942,6 +1023,7 @@ where
             sink,
             surface,
             lane,
+            slack,
             roster,
             inbound_token,
             outbound_token,
@@ -965,6 +1047,7 @@ where
             outbound,
             surface,
             lane,
+            slack,
             policy,
             roster,
             authority,
@@ -1252,6 +1335,26 @@ where
                             Err(text) => Answer::TicketWorkFailed { chat_id, text },
                         }
                     }
+                    Ok(ControlCommand::Slack { channel }) => {
+                        let chat_id = principal.chat_id();
+                        // A read, at the allowed tier, that leaves this host —
+                        // and the only one. It blocks this thread for one
+                        // bounded Slack request budget plus its author lookups.
+                        match slack_read(self.slack.as_deref_mut(), &channel) {
+                            Ok(text) => Answer::SlackAnswered { chat_id, text },
+                            Err(text) => Answer::SlackFailed { chat_id, text },
+                        }
+                    }
+                    Ok(ControlCommand::Say { channel, text }) => {
+                        let chat_id = principal.chat_id();
+                        // THE ONE OUTWARD EFFECT. The tier gate above is the
+                        // whole authorization: only an administrator's `/say`
+                        // reaches here, and reaching here posts.
+                        match slack_post(self.slack.as_deref_mut(), &channel, text.as_str()) {
+                            Ok(text) => Answer::SlackPosted { chat_id, text },
+                            Err(text) => Answer::SlackFailed { chat_id, text },
+                        }
+                    }
                     Ok(ControlCommand::Admin { directive }) => {
                         let chat_id = principal.chat_id();
                         // The tier gate above is the whole authorization for
@@ -1292,9 +1395,11 @@ where
                 .unwrap_or_else(refused),
             // `answer_for` carried these out before `render` was reached;
             // answering them here would be a second dispatch table over
-            // commands whose answers are effects.
+            // commands whose answers reach outside this daemon.
             ControlCommand::Run { .. }
             | ControlCommand::Work { .. }
+            | ControlCommand::Slack { .. }
+            | ControlCommand::Say { .. }
             | ControlCommand::Admin { .. } => String::new(),
             // `Unavailable::for_command` decided these before `render` was
             // reached. Answering them here would be a second dispatch table.
@@ -1508,6 +1613,20 @@ where
                 report.ticket_work_failed += 1;
                 (chat_id, text)
             }
+            Answer::SlackAnswered { chat_id, text } => {
+                report.answered += 1;
+                (chat_id, text)
+            }
+            Answer::SlackPosted { chat_id, text } => {
+                report.answered += 1;
+                report.slack_posted += 1;
+                (chat_id, text)
+            }
+            Answer::SlackFailed { chat_id, text } => {
+                report.unavailable += 1;
+                report.slack_failed += 1;
+                (chat_id, text)
+            }
             Answer::Administered {
                 chat_id,
                 text,
@@ -1581,6 +1700,12 @@ enum Answer {
     TicketWorked { chat_id: i64, text: String },
     /// A `/work` that stored nothing.
     TicketWorkFailed { chat_id: i64, text: String },
+    /// A `/slack` that read a channel, or reported that there is no Slack.
+    SlackAnswered { chat_id: i64, text: String },
+    /// A `/say` that Slack confirmed.
+    SlackPosted { chat_id: i64, text: String },
+    /// A `/slack` or `/say` that produced no answer and no confirmed post.
+    SlackFailed { chat_id: i64, text: String },
     /// An `/admin` that was carried out, and whether it moved a roster row.
     Administered {
         chat_id: i64,
@@ -1606,6 +1731,62 @@ fn id_list(ids: &[i64]) -> String {
         .map(i64::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Read one Slack channel, or say that this host has no Slack.
+///
+/// A free function over the seam rather than a method on the bridge, for the
+/// reason [`work_ticket`] is one: the whole sequence can then be driven against
+/// a workspace directly, with no Telegram transport in the test at all. The
+/// bridge calls exactly this.
+///
+/// # Errors
+///
+/// Returns the operator-facing sentence for a read that produced no messages.
+/// Nothing was read in any of those cases.
+pub fn slack_read<S>(slack: Option<&mut S>, channel: &ChannelName) -> Result<String, String>
+where
+    S: SlackSurface + ?Sized,
+{
+    // Not configured is an `Ok` fact rather than a failure: nothing went wrong,
+    // this daemon was never given a workspace. It is the same reading
+    // `TICKETS_NOT_ENABLED` gets on the ticket reads.
+    let Some(slack) = slack else {
+        return Ok(String::from(crate::slack::SLACK_NOT_CONFIGURED));
+    };
+    slack
+        .recent_messages(channel)
+        .map(|text| bounded_text(&text))
+}
+
+/// Post one message to one Slack channel, or say that this host has no Slack.
+///
+/// **Calling this posts.** There is no confirmation step between the parsed
+/// command and the effect, because the tier gate already decided: an
+/// administrator typed `/say`, and adding a second "are you sure" to a command
+/// an administrator issued deliberately would train them to answer it without
+/// reading.
+///
+/// # Errors
+///
+/// Returns the operator-facing sentence for a post that did not certainly land.
+/// A host with no Slack is an *error* here rather than the fact it is on the
+/// read: the operator asked for something to happen and nothing did.
+pub fn slack_post<S>(
+    slack: Option<&mut S>,
+    channel: &ChannelName,
+    text: &str,
+) -> Result<String, String>
+where
+    S: SlackSurface + ?Sized,
+{
+    let Some(slack) = slack else {
+        return Err(String::from(crate::slack::SLACK_NOT_CONFIGURED));
+    };
+    slack
+        .post_message(channel, text)
+        .map(|reply| bounded_text(&reply))
+        .map_err(|reply| bounded_text(&reply))
 }
 
 /// Work one ticket: look it up, run the instruction it composes, store the

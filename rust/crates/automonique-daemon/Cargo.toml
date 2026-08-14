@@ -15,6 +15,11 @@ automonique-egress-broker = { path = "../automonique-egress-broker" }
 automonique-observability = { path = "../automonique-observability" }
 automonique-protocol = { path = "../automonique-protocol" }
 automonique-runner = { path = "../automonique-runner" }
+# The two Slack commands on the Telegram surface read and post through this
+# client. It is behind an enablement gate of the same shape the support fleet
+# has: an unconfigured daemon composes no client and can reach Slack at all.
+# See `slack`.
+automonique-slack-connector = { path = "../automonique-slack-connector" }
 automonique-store = { path = "../automonique-store" }
 # The ticket intake worker consumes the fleet client and the typed SupportIssue
 # it decodes. It is behind an enablement gate: an unconfigured daemon composes

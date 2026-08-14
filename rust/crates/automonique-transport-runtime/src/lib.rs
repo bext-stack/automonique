@@ -35,11 +35,11 @@ pub use slack_sink::{
 pub use store_sink::{Clock, ClockFailure, StoreTelegramDurableSink, SystemClock};
 pub use telegram_control::{
     ADMIN_HELP_MARK, AdminDirective, AllowedUsers, AllowlistError, ArgumentShape, COMMAND_COUNT,
-    CommandKind, CommandManifestEntry, CommandRefusal, CommandSpec, CommandTier, ControlCommand,
-    ControlRef, MAX_ALLOWED_USERS, MAX_BOT_SUFFIX_BYTES, MAX_COMMAND_NAME_BYTES,
-    MAX_COMMAND_TEXT_BYTES, MAX_CONTROL_REF_BYTES, MAX_RUN_TASK_BYTES, MAX_USER_ID_BYTES,
-    OperatorAuthority, OperatorUserId, RunTask, authorize_and_parse, authorize_and_parse_tiered,
-    command_manifest, help_text, parse_command,
+    ChannelName, CommandKind, CommandManifestEntry, CommandRefusal, CommandSpec, CommandTier,
+    ControlCommand, ControlRef, MAX_ALLOWED_USERS, MAX_BOT_SUFFIX_BYTES, MAX_CHANNEL_NAME_BYTES,
+    MAX_COMMAND_NAME_BYTES, MAX_COMMAND_TEXT_BYTES, MAX_CONTROL_REF_BYTES, MAX_RUN_TASK_BYTES,
+    MAX_SAY_TEXT_BYTES, MAX_USER_ID_BYTES, OperatorAuthority, OperatorUserId, RunTask, SayText,
+    authorize_and_parse, authorize_and_parse_tiered, command_manifest, help_text, parse_command,
 };
 
 const MAX_LEASE_ID_BYTES: usize = 256;

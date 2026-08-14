@@ -101,6 +101,7 @@ pub mod compose;
 pub mod egress;
 pub mod execute;
 pub mod run_lane;
+pub mod slack;
 mod synthetic;
 mod telegram;
 pub mod telegram_bridge;
@@ -480,6 +481,15 @@ pub enum DaemonError {
     /// rather than being ignored, because ignoring it would hide an operator
     /// error behind an honest-looking disabled state.
     TicketIntakeRefused(&'static str),
+    /// The Slack configuration was present and refused. The payload is the
+    /// stable category from [`slack`].
+    ///
+    /// The same gate the support fleet and Telegram have, and refused at
+    /// startup for the same reason — with one extra: this file is the only
+    /// thing that decides which channels `/say` can post to, and a host that
+    /// ignored a malformed channel map would be a host whose reachable set is
+    /// not the one the owner wrote down.
+    SlackRefused(&'static str),
 }
 
 impl DaemonError {
@@ -505,6 +515,7 @@ impl DaemonError {
             Self::BatchRegistryFailed(category) => category,
             Self::GenerationAuditFailed(category) => category,
             Self::TicketIntakeRefused(category) => category,
+            Self::SlackRefused(category) => category,
         }
     }
 }
@@ -556,6 +567,9 @@ impl fmt::Display for DaemonError {
             }
             Self::TicketIntakeRefused(category) => {
                 write!(formatter, "support ticket intake refused: {category}")
+            }
+            Self::SlackRefused(category) => {
+                write!(formatter, "slack configuration refused: {category}")
             }
         }
     }
@@ -814,19 +828,33 @@ impl Daemon {
         // A configuration that also names authorized users *composes* a live
         // control bridge here and dials nothing: `TelegramHost::start` is what
         // puts it on a thread, and only `serve` calls that.
-        let telegram = telegram::TelegramHost::open(&telegram::TelegramHostParams {
-            state_dir: &state_dir,
-            database_path: &config.database_path(),
-            run_index_path: &config.run_index_path(),
-            support_tickets_path: &config.support_tickets_path(),
-            operator_members_path: &config.operator_members_path(),
-            admin_socket: &config.admin_socket(),
-            generation_id: GENERATION_ID,
-            holder_id: instance_id.as_str(),
-            authority_lease_epoch: lease.epoch,
-            ttl_ms: TELEGRAM_LEASE_TTL_MS,
-            execution_state,
-        })
+        //
+        // THE SLACK GATE, loaded first because it is the Telegram bridge's
+        // sixth seam and because its refusal is its own. An absent
+        // `slack/slack.conf` is the disabled state: no credential is read, no
+        // client is constructed, and the two Slack commands answer that Slack
+        // is not configured. A present-but-refused one fails startup here even
+        // on a host with no Telegram at all, which is the point of loading it
+        // outside the Telegram host: an operator who wrote a bad `slack.conf`
+        // is told so whether or not anything is composed to use it.
+        let slack = slack::SlackHost::open(&state_dir)
+            .map_err(|error| DaemonError::SlackRefused(error.category()))?;
+        let telegram = telegram::TelegramHost::open(
+            &telegram::TelegramHostParams {
+                state_dir: &state_dir,
+                database_path: &config.database_path(),
+                run_index_path: &config.run_index_path(),
+                support_tickets_path: &config.support_tickets_path(),
+                operator_members_path: &config.operator_members_path(),
+                admin_socket: &config.admin_socket(),
+                generation_id: GENERATION_ID,
+                holder_id: instance_id.as_str(),
+                authority_lease_epoch: lease.epoch,
+                ttl_ms: TELEGRAM_LEASE_TTL_MS,
+                execution_state,
+            },
+            slack,
+        )
         .map_err(|error| DaemonError::TelegramRefused(error.category()))?;
 
         // Custody storage opens beneath the same fence and before the socket

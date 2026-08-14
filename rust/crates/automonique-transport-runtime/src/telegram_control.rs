@@ -70,6 +70,22 @@ pub const MAX_RUN_TASK_BYTES: usize = 1024;
 /// Longest reference a `/cancel`, `/approve`, `/deny`, `/ticket` or `/work` may
 /// name.
 pub const MAX_CONTROL_REF_BYTES: usize = 128;
+/// Longest configured channel name a `/slack` or `/say` may address.
+///
+/// A Slack channel name is at most 80 characters, and the name an operator
+/// types here is not Slack's anyway — it is the friendly label a host wrote
+/// down in its own configuration. The bound is the same so a label can always
+/// be spelled the same as the channel it points at.
+pub const MAX_CHANNEL_NAME_BYTES: usize = 80;
+/// Longest message body one `/say` may carry.
+///
+/// Far below Slack's own 40,000-character ceiling and below
+/// [`MAX_RUN_TASK_BYTES`], because this is text an operator types into a chat
+/// on a phone to put in front of other humans, not a task for a model. A longer
+/// message is refused rather than truncated: silently posting half of what
+/// somebody wrote, to a channel other people read, is the worst available
+/// answer.
+pub const MAX_SAY_TEXT_BYTES: usize = 900;
 /// Most Telegram user ids one allowlist may hold.
 pub const MAX_ALLOWED_USERS: usize = 256;
 /// Longest user id one `/admin` directive may name, in bytes.
@@ -79,13 +95,17 @@ pub const MAX_ALLOWED_USERS: usize = 256;
 /// being read rather than after an allocation.
 pub const MAX_USER_ID_BYTES: usize = 20;
 /// Number of commands in the closed registry.
-pub const COMMAND_COUNT: usize = 11;
+pub const COMMAND_COUNT: usize = 13;
 
 const _: () = assert!(COMMAND_COUNT == CommandKind::ALL.len());
 const _: () = assert!(MAX_COMMAND_NAME_BYTES <= MAX_COMMAND_TEXT_BYTES);
 const _: () = assert!(MAX_RUN_TASK_BYTES < MAX_COMMAND_TEXT_BYTES);
 const _: () = assert!(MAX_CONTROL_REF_BYTES < MAX_RUN_TASK_BYTES);
 const _: () = assert!(MAX_USER_ID_BYTES < MAX_CONTROL_REF_BYTES);
+const _: () = assert!(MAX_CHANNEL_NAME_BYTES < MAX_CONTROL_REF_BYTES);
+// A `/say` is one Telegram message carrying one channel name and one body, so
+// the two together have to fit inside the message this parser will look at.
+const _: () = assert!(MAX_SAY_TEXT_BYTES + MAX_CHANNEL_NAME_BYTES < MAX_COMMAND_TEXT_BYTES);
 
 /// What a command takes after its name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +124,19 @@ pub enum ArgumentShape {
     /// letting a dispatcher work out what it meant is exactly the wrong shape
     /// for the one command that changes the allowlist.
     Directive,
+    /// One [`ChannelName`], and nothing after it.
+    ///
+    /// Distinct from [`Self::Reference`] because a channel name is not an
+    /// opaque token this layer passes through: it is a label the *host's own*
+    /// configuration has to carry, and its grammar is what stops a Slack
+    /// conversation id — or anything else with a `C0…` shape — being typed
+    /// straight at the connector from a chat.
+    Channel,
+    /// One [`ChannelName`] and then one bounded [`SayText`] body.
+    ///
+    /// The only shape with two fields, and the only one whose second field is
+    /// free text an operator wrote to be read by people outside this system.
+    ChannelMessage,
 }
 
 /// Which tier of operator a command belongs to.
@@ -176,6 +209,10 @@ pub enum CommandKind {
     Deny,
     /// Manage the non-admin members who may command this bot.
     Admin,
+    /// Read one configured Slack channel's recent messages.
+    Slack,
+    /// Post one message to a configured Slack channel.
+    Say,
 }
 
 impl CommandKind {
@@ -187,8 +224,10 @@ impl CommandKind {
         Self::Runs,
         Self::Tickets,
         Self::Ticket,
+        Self::Slack,
         Self::Work,
         Self::Run,
+        Self::Say,
         Self::Cancel,
         Self::Approve,
         Self::Deny,
@@ -207,8 +246,10 @@ impl CommandKind {
     /// | `/runs` | allowed | a read of the run index |
     /// | `/tickets` | allowed | a read of the ticket store |
     /// | `/ticket` | allowed | a read of one ticket |
+    /// | `/slack` | allowed | a read of a channel the host already configured |
     /// | `/work` | admin | spends a provider call and writes a draft |
     /// | `/run` | admin | spends a provider call |
+    /// | `/say` | admin | puts text in front of everyone in a Slack channel |
     /// | `/cancel` | admin | ends somebody else's run |
     /// | `/approve` | admin | a decision with an effect behind it |
     /// | `/deny` | admin | the same decision, the other way |
@@ -217,6 +258,12 @@ impl CommandKind {
     /// The line between the two is *spend and effect*, not sensitivity: a member
     /// can already read everything the reads report, and the thing an owner
     /// cannot un-spend is a provider call.
+    ///
+    /// `/say` is the clearest case on the admin side and the one that says what
+    /// the line is really about. It spends nothing and writes nothing durable
+    /// here — and it is still admin-only, because it is the only command whose
+    /// effect is visible to people who are not operators of this system at all.
+    /// An unsend does not exist.
     #[must_use]
     pub const fn spec(self) -> CommandSpec {
         match self {
@@ -249,6 +296,18 @@ impl CommandKind {
                 description: "Show the tracked support ticket with the given reference",
                 argument: ArgumentShape::Reference,
                 tier: CommandTier::Allowed,
+            },
+            Self::Slack => CommandSpec {
+                name: "slack",
+                description: "Show the recent messages in the named Slack channel",
+                argument: ArgumentShape::Channel,
+                tier: CommandTier::Allowed,
+            },
+            Self::Say => CommandSpec {
+                name: "say",
+                description: "Post a message to the named Slack channel",
+                argument: ArgumentShape::ChannelMessage,
+                tier: CommandTier::Admin,
             },
             Self::Work => CommandSpec {
                 name: "work",
@@ -378,6 +437,8 @@ pub fn help_text() -> String {
             ArgumentShape::Task => String::from(" <task>"),
             ArgumentShape::Reference => String::from(" <reference>"),
             ArgumentShape::Directive => String::from(" <add|remove|list> [user_id]"),
+            ArgumentShape::Channel => String::from(" <channel>"),
+            ArgumentShape::ChannelMessage => String::from(" <channel> <message>"),
         };
         let mark = match entry.tier {
             CommandTier::Allowed => "",
@@ -494,6 +555,121 @@ impl fmt::Debug for ControlRef {
 impl fmt::Display for ControlRef {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
+    }
+}
+
+/// The friendly name of one Slack channel, as a host wrote it down.
+///
+/// **Not a Slack channel id, and deliberately unable to be one.** The grammar
+/// is ASCII lowercase letters, digits, `-` and `_`, which is Slack's own
+/// channel-name grammar and excludes nothing an operator would type — but the
+/// name never reaches Slack either way. It is a key into a map the host's
+/// configuration owns, and only the id that map yields is ever addressed. So a
+/// sender who types a conversation id, a URL, or a name the host never
+/// configured addresses nothing: there is no code path from this value to a
+/// request except through the configured map.
+///
+/// A leading `#` is dropped, because that is how everybody writes a channel and
+/// refusing it would be pedantry. The name is lowercased, which is what Slack
+/// does to its own channel names, so `#Ops` and `ops` are the same key.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ChannelName(String);
+
+impl ChannelName {
+    /// Validate one channel name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRefusal::MissingArgument`] when empty,
+    /// [`CommandRefusal::ArgumentTooLong`] beyond [`MAX_CHANNEL_NAME_BYTES`],
+    /// and [`CommandRefusal::ArgumentInvalid`] outside the accepted grammar.
+    pub fn new(value: impl AsRef<str>) -> Result<Self, CommandRefusal> {
+        let value = value.as_ref().strip_prefix('#').unwrap_or(value.as_ref());
+        if value.is_empty() {
+            return Err(CommandRefusal::MissingArgument);
+        }
+        if value.len() > MAX_CHANNEL_NAME_BYTES {
+            return Err(CommandRefusal::ArgumentTooLong);
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(CommandRefusal::ArgumentInvalid);
+        }
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+
+    /// The validated, lowercased name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ChannelName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "ChannelName({})", self.0)
+    }
+}
+
+impl fmt::Display for ChannelName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Bounded text one `/say` would post to a Slack channel.
+///
+/// The one field on this surface whose content leaves the system, so it is the
+/// one with the tightest reason to be bounded and checked here rather than at
+/// the connector: a refusal at this layer is a reply in the chat the operator
+/// is already looking at, while a refusal at the connector is a failed call
+/// they have to interpret.
+///
+/// Newline and tab are admitted because a posted message is multi-line; every
+/// other control character is refused. The text is *not* trimmed of its
+/// interior and is never reformatted — what an operator typed is what would be
+/// posted. Like [`RunTask`], `Debug` reports its size and not its bytes.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SayText(String);
+
+impl SayText {
+    /// Validate one message body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRefusal::MissingArgument`] when empty,
+    /// [`CommandRefusal::ArgumentTooLong`] beyond [`MAX_SAY_TEXT_BYTES`], and
+    /// [`CommandRefusal::ArgumentInvalid`] for a control character other than
+    /// newline or tab.
+    pub fn new(text: impl AsRef<str>) -> Result<Self, CommandRefusal> {
+        let text = text.as_ref().trim();
+        if text.is_empty() {
+            return Err(CommandRefusal::MissingArgument);
+        }
+        if text.len() > MAX_SAY_TEXT_BYTES {
+            return Err(CommandRefusal::ArgumentTooLong);
+        }
+        if text
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+        {
+            return Err(CommandRefusal::ArgumentInvalid);
+        }
+        Ok(Self(text.to_owned()))
+    }
+
+    /// The validated message text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SayText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "SayText(<redacted:{} bytes>)", self.0.len())
     }
 }
 
@@ -627,6 +803,23 @@ pub enum ControlCommand {
         /// The fleet issue being asked about.
         ticket_ref: ControlRef,
     },
+    /// Report the recent messages in the Slack channel this name resolves to.
+    Slack {
+        /// The configured channel being read.
+        channel: ChannelName,
+    },
+    /// Post one message to the Slack channel this name resolves to.
+    ///
+    /// The only command in this vocabulary whose effect is visible outside the
+    /// system: holding this value still does nothing, but dispatching it puts
+    /// `text` in front of every human in that channel, and nothing takes it
+    /// back.
+    Say {
+        /// The configured channel being posted to.
+        channel: ChannelName,
+        /// The exact body to post.
+        text: SayText,
+    },
     /// Work the tracked support ticket this reference names into a draft answer.
     ///
     /// The reference is the whole of the operator's input. Everything the work
@@ -676,6 +869,8 @@ impl ControlCommand {
             Self::Runs => CommandKind::Runs,
             Self::Tickets => CommandKind::Tickets,
             Self::Ticket { .. } => CommandKind::Ticket,
+            Self::Slack { .. } => CommandKind::Slack,
+            Self::Say { .. } => CommandKind::Say,
             Self::Work { .. } => CommandKind::Work,
             Self::Run { .. } => CommandKind::Run,
             Self::Cancel { .. } => CommandKind::Cancel,
@@ -1100,6 +1295,10 @@ fn parse_arguments(kind: CommandKind, rest: &str) -> Result<ControlCommand, Comm
         CommandKind::Ticket => {
             one_reference(rest).map(|ticket_ref| ControlCommand::Ticket { ticket_ref })
         }
+        CommandKind::Slack => one_channel(rest).map(|channel| ControlCommand::Slack { channel }),
+        CommandKind::Say => {
+            one_channel_message(rest).map(|(channel, text)| ControlCommand::Say { channel, text })
+        }
         CommandKind::Work => {
             one_reference(rest).map(|ticket_ref| ControlCommand::Work { ticket_ref })
         }
@@ -1155,6 +1354,36 @@ fn one_reference(rest: &str) -> Result<ControlRef, CommandRefusal> {
         return Err(CommandRefusal::UnexpectedArgument);
     }
     ControlRef::new(first)
+}
+
+/// Accept exactly one channel name and refuse a second.
+fn one_channel(rest: &str) -> Result<ChannelName, CommandRefusal> {
+    let mut tokens = rest.split_whitespace();
+    let first = tokens.next().ok_or(CommandRefusal::MissingArgument)?;
+    if tokens.next().is_some() {
+        return Err(CommandRefusal::UnexpectedArgument);
+    }
+    ChannelName::new(first)
+}
+
+/// Accept one channel name followed by the rest of the message as its body.
+///
+/// The split is on the *first* run of whitespace and nothing further: everything
+/// after the channel is the message, whitespace and all, because a message is
+/// free text and a parser that tokenized it would be deciding what somebody
+/// meant to say. The channel is validated first, so a `/say` naming a channel
+/// this grammar refuses never allocates the body it would have posted.
+fn one_channel_message(rest: &str) -> Result<(ChannelName, SayText), CommandRefusal> {
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return Err(CommandRefusal::MissingArgument);
+    }
+    let (head, body) = match rest.find(char::is_whitespace) {
+        Some(boundary) => rest.split_at(boundary),
+        None => (rest, ""),
+    };
+    let channel = ChannelName::new(head)?;
+    Ok((channel, SayText::new(body)?))
 }
 
 /// Accept exactly one `/admin` directive.
@@ -1229,6 +1458,8 @@ mod tests {
             assert!(text.contains(entry.description), "{}", entry.name);
         }
         assert!(text.contains("/run <task>"));
+        assert!(text.contains("/slack <channel>"));
+        assert!(text.contains("/say <channel> <message>"));
         assert!(text.contains("/cancel <reference>"));
         assert!(text.contains("/ticket <reference>"));
         assert!(!text.contains("/status <"));
@@ -1299,6 +1530,122 @@ mod tests {
         assert_eq!(CommandKind::Work.argument(), ArgumentShape::Reference);
     }
 
+    /// The read and the post are different commands over the same channel
+    /// vocabulary, and the difference is the whole safety story: one of them is
+    /// visible to people outside this system.
+    #[test]
+    fn reading_a_channel_is_a_different_command_from_posting_to_one() {
+        let channel = ChannelName::new("ops").expect("channel");
+        assert_eq!(
+            parse_command("/slack ops"),
+            Ok(ControlCommand::Slack {
+                channel: channel.clone()
+            })
+        );
+        assert_eq!(
+            parse_command("/say ops bonjour"),
+            Ok(ControlCommand::Say {
+                channel: channel.clone(),
+                text: SayText::new("bonjour").expect("text"),
+            })
+        );
+        assert_ne!(
+            parse_command("/slack ops"),
+            parse_command("/say ops bonjour"),
+            "a read and an outward effect must not parse to the same value"
+        );
+        assert_eq!(CommandKind::Slack.tier(), CommandTier::Allowed);
+        assert_eq!(CommandKind::Say.tier(), CommandTier::Admin);
+
+        // The `#` everybody writes is dropped, and the case Slack ignores is
+        // ignored here too, so all three spellings are one key.
+        for spelling in ["#ops", "OPS", "#OPS"] {
+            assert_eq!(
+                parse_command(&format!("/slack {spelling}")),
+                Ok(ControlCommand::Slack {
+                    channel: channel.clone()
+                }),
+                "{spelling}"
+            );
+        }
+        assert_eq!(channel.as_str(), "ops");
+        assert_eq!(channel.to_string(), "ops");
+
+        // One channel and no second one: a `/slack` cannot be talked into
+        // naming two, and the extra token is not silently dropped.
+        assert_eq!(
+            parse_command("/slack"),
+            Err(CommandRefusal::MissingArgument)
+        );
+        assert_eq!(
+            parse_command("/slack ops incidents"),
+            Err(CommandRefusal::UnexpectedArgument)
+        );
+
+        // Nothing that is not a configured channel *name* is a channel name.
+        // A conversation id survives the grammar as a name — and that is fine,
+        // because a name is only ever a key into the host's own map, and no
+        // host configures one under that label.
+        for token in ["ops/incidents", "ops!", "ops.eu", "C0RESERVED:1"] {
+            assert_eq!(
+                parse_command(&format!("/slack {token}")),
+                Err(CommandRefusal::ArgumentInvalid),
+                "{token}"
+            );
+        }
+        // A bare `#` names nothing once the sigil is dropped, which is a
+        // missing argument rather than a malformed one.
+        assert_eq!(
+            parse_command("/slack #"),
+            Err(CommandRefusal::MissingArgument)
+        );
+        assert_eq!(
+            parse_command(&format!(
+                "/slack {}",
+                "c".repeat(MAX_CHANNEL_NAME_BYTES + 1)
+            )),
+            Err(CommandRefusal::ArgumentTooLong)
+        );
+
+        // A `/say` needs both fields, and the body is everything after the
+        // channel — spaces, punctuation and newlines included, unreformatted.
+        assert_eq!(parse_command("/say"), Err(CommandRefusal::MissingArgument));
+        assert_eq!(
+            parse_command("/say ops"),
+            Err(CommandRefusal::MissingArgument)
+        );
+        assert_eq!(
+            parse_command("/say ops   deux mots\nligne deux"),
+            Ok(ControlCommand::Say {
+                channel: channel.clone(),
+                text: SayText::new("deux mots\nligne deux").expect("text"),
+            })
+        );
+        assert_eq!(
+            parse_command(&format!("/say ops {}", "x".repeat(MAX_SAY_TEXT_BYTES + 1))),
+            Err(CommandRefusal::ArgumentTooLong)
+        );
+        assert_eq!(
+            parse_command("/say ops bell\u{7}"),
+            Err(CommandRefusal::ArgumentInvalid)
+        );
+        // The channel is validated before the body, so a `/say` at a channel
+        // this grammar refuses is refused for the channel it named.
+        assert_eq!(
+            parse_command("/say #ops/eu bonjour"),
+            Err(CommandRefusal::ArgumentInvalid)
+        );
+
+        // Neither the name nor the body is rendered by `Debug` in a form that
+        // could put a message body in a log.
+        let posted = SayText::new("secret-body-never-printed").expect("text");
+        let rendered = format!("{posted:?}");
+        assert!(!rendered.contains("secret-body"), "rendered: {rendered}");
+        assert!(rendered.contains("<redacted:"));
+        assert_eq!(posted.as_str(), "secret-body-never-printed");
+        assert_eq!(format!("{channel:?}"), "ChannelName(ops)");
+    }
+
     #[test]
     fn every_declared_argument_shape_matches_what_the_parser_accepts() {
         for entry in command_manifest() {
@@ -1323,6 +1670,44 @@ mod tests {
                     assert_eq!(bare, Err(CommandRefusal::MissingArgument), "{}", entry.name);
                     assert_eq!(
                         with_argument.as_ref().map(ControlCommand::kind),
+                        Ok(entry.kind),
+                        "{}",
+                        entry.name
+                    );
+                }
+                ArgumentShape::Channel => {
+                    assert_eq!(bare, Err(CommandRefusal::MissingArgument), "{}", entry.name);
+                    assert_eq!(
+                        with_argument.as_ref().map(ControlCommand::kind),
+                        Ok(entry.kind),
+                        "{}",
+                        entry.name
+                    );
+                    // A channel name's grammar is narrower than a reference's,
+                    // and this is the part of it that matters: nothing shaped
+                    // like a Slack conversation id survives the lowercasing
+                    // into something the configured map would answer to.
+                    assert_eq!(
+                        parse_command(&format!("/{} ops.eu:1", entry.name)),
+                        Err(CommandRefusal::ArgumentInvalid),
+                        "{}",
+                        entry.name
+                    );
+                }
+                ArgumentShape::ChannelMessage => {
+                    assert_eq!(bare, Err(CommandRefusal::MissingArgument), "{}", entry.name);
+                    // A channel with no message is not a message: the second
+                    // field is required, and the first alone cannot stand in.
+                    assert_eq!(
+                        parse_command(&format!("/{} ops", entry.name)),
+                        Err(CommandRefusal::MissingArgument),
+                        "{}",
+                        entry.name
+                    );
+                    assert_eq!(
+                        parse_command(&format!("/{} ops bonjour", entry.name))
+                            .as_ref()
+                            .map(ControlCommand::kind),
                         Ok(entry.kind),
                         "{}",
                         entry.name
@@ -1362,8 +1747,10 @@ mod tests {
             (CommandKind::Runs, CommandTier::Allowed),
             (CommandKind::Tickets, CommandTier::Allowed),
             (CommandKind::Ticket, CommandTier::Allowed),
+            (CommandKind::Slack, CommandTier::Allowed),
             (CommandKind::Work, CommandTier::Admin),
             (CommandKind::Run, CommandTier::Admin),
+            (CommandKind::Say, CommandTier::Admin),
             (CommandKind::Cancel, CommandTier::Admin),
             (CommandKind::Approve, CommandTier::Admin),
             (CommandKind::Deny, CommandTier::Admin),
@@ -1380,6 +1767,7 @@ mod tests {
                 kind,
                 CommandKind::Run
                     | CommandKind::Work
+                    | CommandKind::Say
                     | CommandKind::Cancel
                     | CommandKind::Approve
                     | CommandKind::Deny
@@ -1513,6 +1901,8 @@ mod tests {
                 ArgumentShape::Task => format!("/{} do the thing", kind.name()),
                 ArgumentShape::Reference => format!("/{} SUP-1042", kind.name()),
                 ArgumentShape::Directive => format!("/{} list", kind.name()),
+                ArgumentShape::Channel => format!("/{} ops", kind.name()),
+                ArgumentShape::ChannelMessage => format!("/{} ops bonjour", kind.name()),
             };
             // The administrator's parse is exactly the untiered one.
             assert_eq!(
@@ -1555,6 +1945,11 @@ mod tests {
             &format!("/run {}", "x".repeat(MAX_RUN_TASK_BYTES + 1)),
             "/work",
             "/work SUP-1042;rm",
+            "/say",
+            "/say ops",
+            "/say ops bonjour tout le monde",
+            "/say NOT A CHANNEL bonjour",
+            &format!("/say ops {}", "x".repeat(MAX_SAY_TEXT_BYTES + 1)),
             "/admin",
             "/admin add 7654321",
             "/admin nonsense",
