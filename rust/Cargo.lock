@@ -80,6 +80,16 @@ name = "automonique-egress-broker"
 version = "0.1.0"
 
 [[package]]
+name = "automonique-github-connector"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "automonique-lab"
 version = "0.1.0"
 dependencies = [

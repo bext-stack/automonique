@@ -1,0 +1,612 @@
+// SPDX-License-Identifier: Elastic-2.0
+
+//! The synchronous GitHub client.
+//!
+//! One origin, nine operations. The client is the composition of
+//! [`GitHubOperation`]'s rendering and the `decode_*` functions around a single
+//! bounded HTTP call — it adds no field to a request and repairs no field in a
+//! response, so everything it can send or accept is already provable without a
+//! socket.
+//!
+//! The ureq agent mirrors `FleetClient` and `TelegramHttpsClient`: pinned
+//! WebPKI roots, no environment proxy, no redirects, a header-size ceiling, and
+//! statuses surfaced as values rather than errors. `https_only` is relaxed only
+//! for a [`GitHubBase`] that proved itself the plaintext-loopback shape, which
+//! is how the hermetic tests reach an in-process fake without a certificate.
+//!
+//! # Why redirects are refused rather than followed
+//!
+//! The credential is bound to one origin. A redirect is an instruction to send
+//! the next request somewhere else, and a client that follows one has handed
+//! the decision about where its token goes to the response it just received.
+
+use std::fmt;
+use std::io::Read;
+use std::time::Duration;
+
+use ureq::tls::{RootCerts, TlsConfig};
+
+use crate::request::HttpMethod;
+use crate::response::{
+    CommentRef, GitHubComment, GitHubIssue, GitHubReply, IssueListPage, IssueSearchPage, Viewer,
+    decode_comment_ref, decode_comments, decode_error_message, decode_issue, decode_issue_list,
+    decode_issue_ref, decode_labels, decode_search, decode_viewer,
+};
+use crate::{
+    CommentRequest, CreateIssueRequest, GITHUB_REQUEST_TIMEOUT_SECONDS, GetCommentsRequest,
+    GetIssueRequest, GitHubBase, GitHubFailure, GitHubOperation, GitHubOutcome, GitHubRejection,
+    GitHubToken, ListIssuesRequest, MAX_GITHUB_RESPONSE_BYTES, RateLimit, ReplaceLabelsRequest,
+    SearchIssuesRequest, SetStateRequest,
+};
+
+/// The API version every request pins.
+///
+/// GitHub versions its REST API by date and reserves the right to change
+/// behaviour for a client that does not pin one. This is the version the
+/// contract was read against.
+pub const GITHUB_API_VERSION: &str = "2022-11-28";
+
+/// The media type every request asks for.
+pub const GITHUB_ACCEPT: &str = "application/vnd.github+json";
+
+/// How this connector identifies itself.
+///
+/// GitHub requires a `User-Agent` naming the application. The legacy client
+/// sends the name of the console it is part of; this is a different program and
+/// says so, because a shared user agent makes two applications' traffic
+/// indistinguishable in an audit log.
+pub const GITHUB_USER_AGENT: &str = "automonique-github-connector";
+
+const MAX_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
+
+/// The workspace caps the `log` facade at Debug because ureq redacts request
+/// metadata at Debug and reveals more at Trace. Rebuilding with Trace enabled
+/// is intentionally unsupported, and this assertion is what says so.
+const _: () = assert!((log::STATIC_MAX_LEVEL as usize) <= (log::LevelFilter::Debug as usize));
+
+/// A synchronous client for one GitHub origin and one credential.
+pub struct GitHubClient {
+    agent: ureq::Agent,
+    base: GitHubBase,
+    token: GitHubToken,
+    timeout: Duration,
+}
+
+impl GitHubClient {
+    /// Bind one origin and one credential.
+    ///
+    /// The request budget is [`GITHUB_REQUEST_TIMEOUT_SECONDS`].
+    #[must_use]
+    pub fn new(base: GitHubBase, token: GitHubToken) -> Self {
+        Self::with_request_timeout(
+            base,
+            token,
+            Duration::from_secs(GITHUB_REQUEST_TIMEOUT_SECONDS),
+        )
+    }
+
+    /// Bind a client with a *tighter* request budget.
+    ///
+    /// The budget is clamped to [`GITHUB_REQUEST_TIMEOUT_SECONDS`], so a caller
+    /// may only shorten it, never extend it: a host that is talked into asking
+    /// for an hour still gets eight seconds. A zero budget is read as "the
+    /// ceiling" rather than "no wait at all", because a zero-length deadline is
+    /// never what a caller means.
+    #[must_use]
+    pub fn with_request_timeout(base: GitHubBase, token: GitHubToken, timeout: Duration) -> Self {
+        let ceiling = Duration::from_secs(GITHUB_REQUEST_TIMEOUT_SECONDS);
+        let timeout = if timeout.is_zero() {
+            ceiling
+        } else {
+            timeout.min(ceiling)
+        };
+        let tls = TlsConfig::builder().root_certs(RootCerts::WebPki).build();
+        let config = ureq::Agent::config_builder()
+            .https_only(!base.is_plaintext_loopback())
+            .proxy(None)
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .max_response_header_size(MAX_RESPONSE_HEADER_BYTES)
+            .user_agent(GITHUB_USER_AGENT)
+            .tls_config(tls)
+            .build();
+        Self {
+            agent: config.new_agent(),
+            base,
+            token,
+            timeout,
+        }
+    }
+
+    /// The origin this client is locked to.
+    #[must_use]
+    pub const fn base(&self) -> &GitHubBase {
+        &self.base
+    }
+
+    /// The whole-call budget this client issues requests with.
+    #[must_use]
+    pub const fn request_timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// The exact URL an operation would address, without addressing it.
+    #[must_use]
+    pub fn endpoint(&self, operation: &GitHubOperation) -> String {
+        format!("{}{}", self.base.origin(), operation.path())
+    }
+
+    /// Open one issue. An externally visible effect: call it only from a
+    /// confirmed-action path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the closed [`GitHubFailure`] vocabulary for a transport problem
+    /// or a response that is not this operation's contract. GitHub's own
+    /// refusal is an `Ok` reply carrying a [`GitHubRejection`].
+    pub fn create_issue(
+        &self,
+        request: &CreateIssueRequest,
+    ) -> Result<GitHubReply<GitHubIssue>, GitHubFailure> {
+        self.call(&GitHubOperation::CreateIssue(request.clone()), |bytes| {
+            decode_issue_ref(bytes)
+        })
+    }
+
+    /// Add one comment. An externally visible effect.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::create_issue`], for this operation's contract.
+    pub fn comment(
+        &self,
+        request: &CommentRequest,
+    ) -> Result<GitHubReply<CommentRef>, GitHubFailure> {
+        self.call(
+            &GitHubOperation::Comment(request.clone()),
+            decode_comment_ref,
+        )
+    }
+
+    /// Open or close one issue. An externally visible effect.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::create_issue`], for this operation's contract.
+    pub fn set_state(
+        &self,
+        request: &SetStateRequest,
+    ) -> Result<GitHubReply<GitHubIssue>, GitHubFailure> {
+        self.call(&GitHubOperation::SetState(request.clone()), |bytes| {
+            decode_issue_ref(bytes)
+        })
+    }
+
+    /// Replace *every* label on one issue. An externally visible effect.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::create_issue`], for this operation's contract.
+    pub fn replace_labels(
+        &self,
+        request: &ReplaceLabelsRequest,
+    ) -> Result<GitHubReply<Vec<String>>, GitHubFailure> {
+        self.call(
+            &GitHubOperation::ReplaceLabels(request.clone()),
+            decode_labels,
+        )
+    }
+
+    /// Read one issue back.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::create_issue`], for this operation's contract.
+    pub fn get_issue(
+        &self,
+        request: &GetIssueRequest,
+    ) -> Result<GitHubReply<GitHubIssue>, GitHubFailure> {
+        self.call(&GitHubOperation::GetIssue(request.clone()), decode_issue)
+    }
+
+    /// Read one page of an issue's comments.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::create_issue`], for this operation's contract.
+    pub fn get_comments(
+        &self,
+        request: &GetCommentsRequest,
+    ) -> Result<GitHubReply<Vec<GitHubComment>>, GitHubFailure> {
+        let per_page = request.page().per_page();
+        self.call(&GitHubOperation::GetComments(request.clone()), |bytes| {
+            decode_comments(bytes, per_page)
+        })
+    }
+
+    /// Read one page of a repository's issues.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::create_issue`], for this operation's contract.
+    pub fn list_issues(
+        &self,
+        request: &ListIssuesRequest,
+    ) -> Result<GitHubReply<IssueListPage>, GitHubFailure> {
+        let per_page = request.page().per_page();
+        self.call(&GitHubOperation::ListIssues(request.clone()), |bytes| {
+            decode_issue_list(bytes, per_page)
+        })
+    }
+
+    /// Search issues across repositories.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::create_issue`], for this operation's contract.
+    pub fn search_issues(
+        &self,
+        request: &SearchIssuesRequest,
+    ) -> Result<GitHubReply<IssueSearchPage>, GitHubFailure> {
+        let per_page = request.page().per_page();
+        self.call(&GitHubOperation::SearchIssues(request.clone()), |bytes| {
+            decode_search(bytes, per_page)
+        })
+    }
+
+    /// Identify the account the credential belongs to.
+    ///
+    /// The cheap connectivity and scope probe, and the only operation that
+    /// names no repository.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::create_issue`], for this operation's contract.
+    pub fn whoami(&self) -> Result<GitHubReply<Viewer>, GitHubFailure> {
+        self.call(&GitHubOperation::Whoami, decode_viewer)
+    }
+
+    /// Issue one operation and decode its answer.
+    fn call<T>(
+        &self,
+        operation: &GitHubOperation,
+        decode: impl FnOnce(&[u8]) -> Result<T, GitHubFailure>,
+    ) -> Result<GitHubReply<T>, GitHubFailure> {
+        let answer = self.send(operation)?;
+        if (300..400).contains(&answer.status) {
+            // The credential is bound to one origin; a redirect is an
+            // instruction to send the next one elsewhere.
+            return Err(GitHubFailure::Redirected);
+        }
+        if !(200..300).contains(&answer.status) {
+            let message = decode_error_message(&answer.body, answer.status);
+            return Ok(GitHubReply::new(
+                answer.rate,
+                GitHubOutcome::Rejected(GitHubRejection::new(
+                    answer.status,
+                    message,
+                    &answer.rate,
+                    answer.retry_after_seconds,
+                )),
+            ));
+        }
+        if !answer.json {
+            return Err(GitHubFailure::UnexpectedContentType);
+        }
+        Ok(GitHubReply::new(
+            answer.rate,
+            GitHubOutcome::Accepted(decode(&answer.body)?),
+        ))
+    }
+
+    /// Issue one request and return its status, window and bounded body.
+    ///
+    /// The credential is rendered into an `Authorization` header inside the
+    /// callback and dropped when it returns; it is never stored on the request
+    /// builder beyond that, never logged, and never named in a failure.
+    fn send(&self, operation: &GitHubOperation) -> Result<Answer, GitHubFailure> {
+        let url = self.endpoint(operation);
+        let body = operation.body().unwrap_or_default();
+        let mut response = self
+            .token
+            .authorization()
+            .with_header_value(|authorization| match operation.method() {
+                HttpMethod::Get => self
+                    .prepared(self.agent.get(&url), authorization, false)
+                    .call(),
+                HttpMethod::Post => self
+                    .prepared(self.agent.post(&url), authorization, true)
+                    .send(&body),
+                HttpMethod::Patch => self
+                    .prepared(self.agent.patch(&url), authorization, true)
+                    .send(&body),
+                HttpMethod::Put => self
+                    .prepared(self.agent.put(&url), authorization, true)
+                    .send(&body),
+            })
+            .map_err(map_ureq_error)?;
+
+        let status = response.status().as_u16();
+        let headers = response.headers();
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        let rate = RateLimit::new(
+            header("x-ratelimit-remaining").and_then(|value| value.parse().ok()),
+            header("x-ratelimit-limit").and_then(|value| value.parse().ok()),
+            header("x-ratelimit-reset").and_then(|value| value.parse().ok()),
+        );
+        let retry_after_seconds = header("retry-after").and_then(|value| value.parse().ok());
+        let json = header("content-type").is_some_and(|value| is_github_json(&value));
+
+        let reader = response
+            .body_mut()
+            .with_config()
+            .limit((MAX_GITHUB_RESPONSE_BYTES + 1) as u64)
+            .reader();
+        Ok(Answer {
+            status,
+            rate,
+            retry_after_seconds,
+            json,
+            body: read_bounded_body(reader)?,
+        })
+    }
+
+    /// Apply the four fixed headers and the request budget.
+    ///
+    /// Written once, generically over ureq's body typestate, so a `GET` and a
+    /// `PUT` cannot drift apart in what they send.
+    fn prepared<Any>(
+        &self,
+        builder: ureq::RequestBuilder<Any>,
+        authorization: &str,
+        has_body: bool,
+    ) -> ureq::RequestBuilder<Any> {
+        let builder = builder
+            .header("authorization", authorization)
+            .header("accept", GITHUB_ACCEPT)
+            .header("x-github-api-version", GITHUB_API_VERSION)
+            .header("user-agent", GITHUB_USER_AGENT);
+        let builder = if has_body {
+            builder.header("content-type", "application/json")
+        } else {
+            builder
+        };
+        builder.config().timeout_global(Some(self.timeout)).build()
+    }
+}
+
+/// One raw answer, before it is classified.
+struct Answer {
+    status: u16,
+    rate: RateLimit,
+    retry_after_seconds: Option<u32>,
+    json: bool,
+    body: Vec<u8>,
+}
+
+/// No field of this client is safe to print except the origin, so `Debug`
+/// prints that and says so about the rest.
+impl fmt::Debug for GitHubClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitHubClient")
+            .field("origin", &self.base.origin())
+            .field("authorization", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Whether a content type is the JSON GitHub answers with.
+///
+/// GitHub sends `application/json; charset=utf-8` for a payload and the
+/// versioned media type is only ever *requested*, so both spellings are
+/// admitted and nothing else is.
+fn is_github_json(value: &str) -> bool {
+    let mut fields = value.split(';');
+    if !fields.next().is_some_and(|mime| {
+        let mime = mime.trim();
+        mime.eq_ignore_ascii_case("application/json") || mime.eq_ignore_ascii_case(GITHUB_ACCEPT)
+    }) {
+        return false;
+    }
+    fields.all(|parameter| {
+        let Some((name, value)) = parameter.trim().split_once('=') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case("charset")
+            && value.trim().trim_matches('"').eq_ignore_ascii_case("utf-8")
+    })
+}
+
+fn read_bounded_body(mut reader: impl Read) -> Result<Vec<u8>, GitHubFailure> {
+    let mut body = Vec::new();
+    reader
+        .read_to_end(&mut body)
+        .map_err(|error| map_ureq_error(ureq::Error::from(error)))?;
+    if body.len() > MAX_GITHUB_RESPONSE_BYTES {
+        return Err(GitHubFailure::ResponseTooLarge);
+    }
+    Ok(body)
+}
+
+/// Map a transport error onto the closed vocabulary, borrowing nothing from it.
+///
+/// ureq's own error rendering can name the URL it was dialling; none of it is
+/// carried across this boundary.
+fn map_ureq_error(error: ureq::Error) -> GitHubFailure {
+    match error {
+        ureq::Error::Timeout(_) => GitHubFailure::TimedOut,
+        ureq::Error::BodyExceedsLimit(_) => GitHubFailure::ResponseTooLarge,
+        _ => GitHubFailure::Unavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::request::Page;
+    use crate::target::{IssueNumber, RepoTarget};
+    use crate::ticket::{IssueBodyText, IssueTitle};
+
+    const SECRET: &str = "ghp_fixture-secret-never-print";
+
+    fn client(base: &str) -> GitHubClient {
+        GitHubClient::new(
+            GitHubBase::new(base).expect("base"),
+            GitHubToken::new(SECRET.as_bytes().to_vec()).expect("token"),
+        )
+    }
+
+    fn create() -> GitHubOperation {
+        GitHubOperation::CreateIssue(
+            CreateIssueRequest::new(
+                RepoTarget::parse("example-org", "example-repo").expect("target"),
+                IssueTitle::new("Panne de paiement").expect("title"),
+                IssueBodyText::new("corps").expect("body"),
+                Vec::new(),
+            )
+            .expect("create"),
+        )
+    }
+
+    #[test]
+    fn an_endpoint_is_the_locked_origin_plus_the_operations_own_path() {
+        let client = client("https://api.github.com");
+        assert_eq!(
+            client.endpoint(&create()),
+            "https://api.github.com/repos/example-org/example-repo/issues"
+        );
+        assert_eq!(
+            client.endpoint(&GitHubOperation::Whoami),
+            "https://api.github.com/user"
+        );
+        assert_eq!(client.base().origin(), "https://api.github.com");
+    }
+
+    #[test]
+    fn a_tls_base_yields_a_direct_verified_non_redirecting_agent() {
+        let client = client("https://api.github.com");
+        let config = client.agent.config();
+        assert!(config.https_only());
+        assert!(config.proxy().is_none());
+        assert_eq!(config.max_redirects(), 0);
+        assert!(!config.http_status_as_error());
+        assert_eq!(config.max_response_header_size(), MAX_RESPONSE_HEADER_BYTES);
+        assert!(matches!(
+            config.tls_config().root_certs(),
+            RootCerts::WebPki
+        ));
+        assert!(log::STATIC_MAX_LEVEL <= log::LevelFilter::Debug);
+    }
+
+    #[test]
+    fn only_a_loopback_base_relaxes_https_only() {
+        assert!(client("https://api.github.com").agent.config().https_only());
+        assert!(!client("http://127.0.0.1:8080").agent.config().https_only());
+    }
+
+    #[test]
+    fn the_credential_never_reaches_debug_an_endpoint_or_a_body() {
+        let client = client("https://api.github.com");
+        let rendered = format!(
+            "{client:?}|{}|{}|{:?}|{}",
+            client.endpoint(&create()),
+            create().body().unwrap_or_default(),
+            GitHubFailure::Unavailable,
+            GitHubFailure::Unavailable
+        );
+        assert!(!rendered.contains(SECRET), "rendered: {rendered}");
+        assert!(!rendered.contains("ghp_"), "rendered: {rendered}");
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn the_request_budget_may_only_be_tightened_never_extended() {
+        let ceiling = Duration::from_secs(GITHUB_REQUEST_TIMEOUT_SECONDS);
+        let tighten = |timeout| {
+            GitHubClient::with_request_timeout(
+                GitHubBase::production(),
+                GitHubToken::new(b"ghp_fixture".to_vec()).expect("token"),
+                timeout,
+            )
+            .request_timeout()
+        };
+        assert_eq!(client("https://api.github.com").request_timeout(), ceiling);
+        assert_eq!(tighten(Duration::from_secs(1)), Duration::from_secs(1));
+        assert_eq!(tighten(Duration::from_secs(3600)), ceiling);
+        assert_eq!(tighten(Duration::ZERO), ceiling);
+    }
+
+    #[test]
+    fn the_response_content_type_is_closed() {
+        assert!(is_github_json("application/json"));
+        assert!(is_github_json("Application/Json; charset=UTF-8"));
+        assert!(is_github_json("application/vnd.github+json; charset=utf-8"));
+        assert!(!is_github_json("text/json"));
+        assert!(!is_github_json("application/json; profile=secret"));
+        assert!(!is_github_json("application/json; charset=latin1"));
+        assert!(!is_github_json("text/html"));
+    }
+
+    #[test]
+    fn the_body_cap_accepts_the_boundary_and_refuses_one_over() {
+        let at_limit = vec![b'a'; MAX_GITHUB_RESPONSE_BYTES];
+        assert_eq!(
+            read_bounded_body(std::io::Cursor::new(&at_limit)).expect("at limit"),
+            at_limit
+        );
+        assert_eq!(
+            read_bounded_body(std::io::Cursor::new(vec![
+                b'a';
+                MAX_GITHUB_RESPONSE_BYTES + 1
+            ])),
+            Err(GitHubFailure::ResponseTooLarge)
+        );
+    }
+
+    #[test]
+    fn every_operation_has_an_endpoint_under_the_locked_origin() {
+        let client = client("https://api.github.com");
+        let target = RepoTarget::parse("example-org", "example-repo").expect("target");
+        let number = IssueNumber::new(42).expect("number");
+        let page = Page::new(1, 30).expect("page");
+        let operations = [
+            create(),
+            GitHubOperation::Comment(CommentRequest::new(
+                target.clone(),
+                number,
+                IssueBodyText::new("merci").expect("body"),
+            )),
+            GitHubOperation::SetState(SetStateRequest::new(
+                target.clone(),
+                number,
+                crate::IssueState::Closed,
+            )),
+            GitHubOperation::ReplaceLabels(
+                ReplaceLabelsRequest::new(target.clone(), number, Vec::new()).expect("labels"),
+            ),
+            GitHubOperation::GetIssue(GetIssueRequest::new(target.clone(), number)),
+            GitHubOperation::GetComments(GetCommentsRequest::new(target.clone(), number, page)),
+            GitHubOperation::ListIssues(ListIssuesRequest::new(
+                target,
+                crate::IssueFilter::default(),
+                page,
+            )),
+            GitHubOperation::SearchIssues(SearchIssuesRequest::new("panne", page).expect("search")),
+            GitHubOperation::Whoami,
+        ];
+        for operation in operations {
+            let endpoint = client.endpoint(&operation);
+            assert!(
+                endpoint.starts_with("https://api.github.com/"),
+                "{endpoint} leaves the locked origin"
+            );
+            assert!(!endpoint.contains(SECRET));
+        }
+    }
+}
