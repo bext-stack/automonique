@@ -21,11 +21,15 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use automonique_daemon::telegram_bridge::{
-    BridgeParts, ControlSurface, DispatchReport, HostFacts, RunFailure, RunLane,
-    StoreControlSurface, TelegramControlBridge, Unavailable,
+    BridgeParts, ControlSurface, DispatchReport, HostFacts, NO_TICKETS_RECORDED, RunFailure,
+    RunLane, StoreControlSurface, TICKET_NOT_FOUND, TICKETS_LISTED, TICKETS_NOT_ENABLED,
+    TelegramControlBridge, Unavailable,
 };
 use automonique_protocol::admin::ExecutionState;
 use automonique_store::run_index::{RunIndex, RunIndexEntry};
+use automonique_store::support_tickets::{
+    FleetTicket, SupportTicketStore, TicketLifecycle, TicketTransition,
+};
 use automonique_store::{LeaseRequest, Store};
 use automonique_transport_runtime::{
     AllowedUsers, CancellationToken, DurableCommitReceipt, DurableTelegramBatch, HttpFailure,
@@ -244,12 +248,56 @@ impl TelegramDurableSink for FakeSink {
 
 // ------------------------------------------------------------------ fixtures
 
+/// The instant every seeded ticket is observed at. The read surface never reads
+/// a clock for a ticket, so this is the only one these fixtures need.
+const TICKET_OBSERVED_MS: i64 = 1_699_000_000_000;
+
 /// A private temporary tree holding a store, a run index, and a live generation.
 struct Fixture {
     _root: tempfile::TempDir,
     facts: HostFacts,
     database_path: std::path::PathBuf,
     run_index_path: std::path::PathBuf,
+    support_tickets_path: std::path::PathBuf,
+}
+
+/// One synthetic support ticket a fixture records.
+///
+/// Every field is invented for this file. No fleet identifier, tenant, site or
+/// requester here names anything real, and nothing in this file reads a live
+/// board: the store is seeded directly, which is the whole point of the seam.
+#[derive(Clone, Copy)]
+struct SeedTicket<'a> {
+    fleet_issue_id: &'a str,
+    title: &'a str,
+    tenant_name: &'a str,
+    fleet_status: &'a str,
+    /// Where this host has taken the ticket, reached one lattice step at a time
+    /// from `new`.
+    lifecycle: TicketLifecycle,
+}
+
+impl<'a> SeedTicket<'a> {
+    /// A ticket at `new`, which is what a first sighting always records.
+    const fn new(fleet_issue_id: &'a str, title: &'a str) -> Self {
+        Self {
+            fleet_issue_id,
+            title,
+            tenant_name: "reserved-tenant",
+            fleet_status: "triaging",
+            lifecycle: TicketLifecycle::New,
+        }
+    }
+
+    const fn at(mut self, lifecycle: TicketLifecycle) -> Self {
+        self.lifecycle = lifecycle;
+        self
+    }
+
+    const fn for_tenant(mut self, tenant_name: &'a str) -> Self {
+        self.tenant_name = tenant_name;
+        self
+    }
 }
 
 impl Fixture {
@@ -260,6 +308,9 @@ impl Fixture {
             .expect("private root");
         let database_path = root.path().join("automonique.sqlite3");
         let run_index_path = root.path().join("run-index.sqlite3");
+        // Named and deliberately not created: a fixture that seeds no ticket is
+        // a host whose support intake was never configured.
+        let support_tickets_path = root.path().join("support-tickets.sqlite3");
         let now_ms = real_now_ms();
         let mut store = Store::open(&database_path).expect("store opens");
         let lease = store
@@ -291,6 +342,7 @@ impl Fixture {
             },
             database_path,
             run_index_path,
+            support_tickets_path,
         }
     }
 
@@ -301,6 +353,57 @@ impl Fixture {
             self.facts.clone(),
         )
         .expect("read surface opens")
+        .with_support_tickets(&self.support_tickets_path)
+    }
+
+    /// Record these tickets in this host's ticket store, creating it.
+    ///
+    /// This is the intake worker's job in production and is done directly here:
+    /// no fleet is polled, no credential exists in this tree, and the store is
+    /// the only thing the bridge reads. A ticket is recorded at `new` and then
+    /// walked one lattice step at a time to whatever lifecycle the seed asks
+    /// for, because that is the only way this host is allowed to move one.
+    fn seed_tickets(&self, seeds: &[SeedTicket<'_>]) {
+        let mut store = SupportTicketStore::open(&self.support_tickets_path)
+            .expect("support ticket store opens");
+        for seed in seeds {
+            let receipt = store
+                .record(&FleetTicket {
+                    fleet_issue_id: seed.fleet_issue_id,
+                    title: seed.title,
+                    tenant_name: seed.tenant_name,
+                    site_label: Some("reserved-site"),
+                    fleet_status: seed.fleet_status,
+                    priority: "normal",
+                    source: "email",
+                    requested_by: "reserved-requester",
+                    comment_count: 2,
+                    created_at: "2026-01-01T00:00:00Z",
+                    updated_at: "2026-01-02T00:00:00Z",
+                    observed_at_ms: TICKET_OBSERVED_MS,
+                })
+                .expect("ticket recorded");
+            let mut revision = receipt.revision;
+            for step in TicketLifecycle::ALL.into_iter().filter(|lifecycle| {
+                lifecycle.rank() > 0 && lifecycle.rank() <= seed.lifecycle.rank()
+            }) {
+                revision = store
+                    .transition(TicketTransition {
+                        fleet_issue_id: seed.fleet_issue_id,
+                        expected_revision: revision,
+                        lifecycle: step,
+                        now_ms: TICKET_OBSERVED_MS,
+                    })
+                    .expect("lifecycle advances")
+                    .revision;
+            }
+        }
+    }
+
+    /// Create an empty ticket store, as a configured host that has polled a
+    /// board with nothing open on it would have.
+    fn seed_empty_ticket_store(&self) {
+        SupportTicketStore::open(&self.support_tickets_path).expect("support ticket store opens");
     }
 }
 
@@ -876,6 +979,241 @@ fn a_refused_run_is_a_typed_reply_and_not_a_crash() {
         assert!(
             messages[0].contains(expected),
             "{failure:?} must be reported as itself: {messages:?}"
+        );
+    }
+}
+
+/// `/tickets` lists what the ticket store holds, newest first, and `/ticket`
+/// answers with that exact ticket.
+///
+/// The store is real and seeded directly; no board is polled anywhere in this
+/// file. What is proved is the whole path: the parser produced two new commands,
+/// the bridge routed them to the ticket reads rather than to the unavailable
+/// table, and the surface rendered the durable rows.
+#[test]
+fn tickets_are_listed_and_one_ticket_is_answered_from_the_store() {
+    let fixture = Fixture::new(&[]);
+    fixture.seed_tickets(&[
+        SeedTicket::new("SUP-1001", "Printer offline in the back room")
+            .at(TicketLifecycle::Working)
+            .for_tenant("reserved-tenant-one"),
+        SeedTicket::new("SUP-1002", "Mail relay rejects attachments")
+            .for_tenant("reserved-tenant-two"),
+    ]);
+    let client = FakeClient::new([updates(&[
+        (1, OPERATOR, "/tickets"),
+        (2, OPERATOR, "/ticket SUP-1001"),
+    ])]);
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge(&fixture, client, outbound.clone(), FakeSink::default());
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.answered, 2);
+    assert_eq!(
+        report.unavailable, 0,
+        "ticket reads are not an unavailable command"
+    );
+    assert_eq!(report.refused, 0);
+    assert_eq!(report.sent, 2);
+    assert_eq!(report.send_refused, 0, "both replies fit one message");
+
+    let messages = outbound.messages();
+    // The listing names both tickets, newest first, with both states beside
+    // each other: this host's lifecycle and the fleet's own status.
+    assert!(messages[0].contains("Recent tickets (2 of 2)"));
+    assert!(messages[0].contains("SUP-1001"));
+    assert!(messages[0].contains("SUP-1002"));
+    assert!(messages[0].contains("working/triaging"));
+    assert!(messages[0].contains("new/triaging"));
+    assert!(messages[0].contains("reserved-tenant-one"));
+    let second = messages[0].find("SUP-1002").expect("second listed");
+    let first = messages[0].find("SUP-1001").expect("first listed");
+    assert!(second < first, "the newest ticket is listed first");
+
+    // The detail is the row that reference names, and no other.
+    assert!(messages[1].contains("Ticket SUP-1001"));
+    assert!(messages[1].contains("Printer offline in the back room"));
+    assert!(messages[1].contains("lifecycle working"));
+    assert!(messages[1].contains("fleet status triaging"));
+    assert!(messages[1].contains("tenant reserved-tenant-one"));
+    assert!(
+        !messages[1].contains("SUP-1002"),
+        "a detail must answer about one ticket: {:?}",
+        messages[1]
+    );
+    for message in &messages {
+        assert!(message.contains(&format!("\"chat_id\":{OPERATOR}")));
+        assert!(!message.contains("AAFixtureSecretNeverPrinted"));
+    }
+}
+
+/// A reference this host has no ticket for is answered as such, and never as a
+/// broken read.
+#[test]
+fn an_unrecorded_reference_is_answered_as_not_found() {
+    let fixture = Fixture::new(&[]);
+    fixture.seed_tickets(&[SeedTicket::new("SUP-2001", "Only ticket recorded here")]);
+    // The last of these is longer than the ticket store's own identifier
+    // ceiling and shorter than the command layer's, so it is a reference that
+    // parses and can name nothing.
+    let overlong = "S".repeat(121);
+    let client = FakeClient::new([updates(&[
+        (1, OPERATOR, "/ticket SUP-9999"),
+        (2, OPERATOR, &format!("/ticket {overlong}")),
+    ])]);
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge(&fixture, client, outbound.clone(), FakeSink::default());
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.answered, 2);
+    assert_eq!(report.sent, 2);
+    let messages = outbound.messages();
+    for message in &messages {
+        assert!(
+            message.contains(TICKET_NOT_FOUND),
+            "an unrecorded reference must say so: {message:?}"
+        );
+        assert!(
+            !message.contains("SUP-9999") && !message.contains(&overlong),
+            "a not-found reply must not echo the reference"
+        );
+        assert!(
+            !message.contains("SUP-2001"),
+            "and must name no other ticket"
+        );
+    }
+}
+
+/// A daemon with no ticket store says ticket tracking is not enabled, and asking
+/// does not bring a store into existence.
+#[test]
+fn a_host_without_a_ticket_store_says_tracking_is_not_enabled() {
+    let fixture = Fixture::new(&[]);
+    let client = FakeClient::new([updates(&[
+        (1, OPERATOR, "/tickets"),
+        (2, OPERATOR, "/ticket SUP-1001"),
+    ])]);
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge(&fixture, client, outbound.clone(), FakeSink::default());
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.answered, 2, "an honest answer is still an answer");
+    assert_eq!(report.sent, 2);
+    for message in outbound.messages() {
+        assert!(
+            message.contains("not enabled"),
+            "a host with no intake must say so: {message:?}"
+        );
+        assert!(
+            !message.contains("unavailable") && !message.contains("No tickets recorded"),
+            "\"not enabled\" is neither a fault nor an empty board: {message:?}"
+        );
+    }
+    assert!(
+        !fixture.support_tickets_path.exists(),
+        "a read surface must not create the store it reads"
+    );
+}
+
+/// A store that exists and holds nothing is an empty board, which is a different
+/// answer from an unconfigured host.
+#[test]
+fn an_empty_ticket_store_answers_that_nothing_is_recorded() {
+    let fixture = Fixture::new(&[]);
+    fixture.seed_empty_ticket_store();
+    let mut surface = fixture.surface();
+    assert_eq!(
+        surface.tickets_text().expect("tickets render"),
+        NO_TICKETS_RECORDED
+    );
+    assert_eq!(
+        surface.ticket_text("SUP-1001").expect("ticket renders"),
+        TICKET_NOT_FOUND
+    );
+
+    // And the same surface on a tree with no store at all says the other thing.
+    let unconfigured = Fixture::new(&[]);
+    let mut surface = unconfigured.surface();
+    assert_eq!(
+        surface.tickets_text().expect("tickets render"),
+        TICKETS_NOT_ENABLED
+    );
+    assert_eq!(
+        surface.ticket_text("SUP-1001").expect("ticket renders"),
+        TICKETS_NOT_ENABLED
+    );
+}
+
+/// A listing is bounded in rows and in width: the newest page only, and a title
+/// too wide for a line is cut where an operator can see it was.
+#[test]
+fn a_ticket_listing_is_bounded_in_rows_and_in_width() {
+    let fixture = Fixture::new(&[]);
+    let wide = "w".repeat(200);
+    let seeds: Vec<SeedTicket<'_>> = (1..=(TICKETS_LISTED + 2))
+        .map(|index| {
+            if index == TICKETS_LISTED + 2 {
+                SeedTicket::new("SUP-3999", wide.as_str())
+            } else {
+                SeedTicket::new(SEEDED_IDS[index - 1], "Bounded fixture ticket")
+            }
+        })
+        .collect();
+    fixture.seed_tickets(&seeds);
+
+    let mut surface = fixture.surface();
+    let rendered = surface.tickets_text().expect("tickets render");
+    assert!(
+        rendered.contains(&format!(
+            "Recent tickets ({TICKETS_LISTED} of {})",
+            seeds.len()
+        )),
+        "only the newest page is listed: {rendered}"
+    );
+    assert_eq!(
+        rendered.lines().count(),
+        TICKETS_LISTED + 1,
+        "one header and one line per listed ticket"
+    );
+    assert!(
+        !rendered.contains(SEEDED_IDS[0]),
+        "the oldest ticket is off the newest page"
+    );
+    assert!(rendered.contains('…'), "a cut title must be marked");
+    assert!(!rendered.contains(&wide), "and must not be sent whole");
+}
+
+/// Fixed identifiers for the bounded-listing fixture, so no test invents one at
+/// runtime and no identifier here resembles a real board's.
+const SEEDED_IDS: [&str; TICKETS_LISTED + 2] = [
+    "SUP-3001", "SUP-3002", "SUP-3003", "SUP-3004", "SUP-3005", "SUP-3006", "SUP-3007", "SUP-3008",
+    "SUP-3009", "SUP-3010", "SUP-3011", "SUP-3012",
+];
+
+/// A sender the access policy denied cannot reach the ticket store, even with a
+/// command that would otherwise be answered.
+#[test]
+fn an_unauthorized_sender_cannot_read_tickets() {
+    let fixture = Fixture::new(&[]);
+    fixture.seed_tickets(&[SeedTicket::new("SUP-4001", "Confidential fixture title")]);
+    let client = FakeClient::new([updates(&[
+        (1, OUTSIDER, "/tickets"),
+        (2, OUTSIDER, "/ticket SUP-4001"),
+    ])]);
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge(&fixture, client, outbound.clone(), FakeSink::default());
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.denied_senders, 2);
+    assert_eq!(
+        report.answered, 0,
+        "no ticket read happened for an outsider"
+    );
+    for message in outbound.messages() {
+        assert!(message.contains("Not authorized."));
+        assert!(
+            !message.contains("SUP-4001") && !message.contains("Confidential fixture title"),
+            "a refusal must carry nothing from the store: {message:?}"
         );
     }
 }

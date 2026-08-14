@@ -795,6 +795,7 @@ impl Daemon {
             state_dir: &state_dir,
             database_path: &config.database_path(),
             run_index_path: &config.run_index_path(),
+            support_tickets_path: &config.support_tickets_path(),
             admin_socket: &config.admin_socket(),
             generation_id: GENERATION_ID,
             holder_id: instance_id.as_str(),

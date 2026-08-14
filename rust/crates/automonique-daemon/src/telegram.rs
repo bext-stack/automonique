@@ -397,6 +397,13 @@ pub(crate) struct TelegramHostParams<'a> {
     /// The runs read model a `/runs` reply lists from, and that a `/run` waits
     /// on.
     pub(crate) run_index_path: &'a Path,
+    /// The support ticket store a `/tickets` or `/ticket` reply reads.
+    ///
+    /// Named even on a host whose support intake is disabled, where the file
+    /// never appears and both commands answer that ticket tracking is not
+    /// enabled. Nothing here creates it: the intake gate is the only writer, and
+    /// [`StoreControlSurface::with_support_tickets`] only remembers the path.
+    pub(crate) support_tickets_path: &'a Path,
     /// This daemon's own admin endpoint, which a `/run` submits and starts
     /// through. See [`crate::run_lane`] for why the poller thread is a client
     /// of the daemon it belongs to.
@@ -562,7 +569,8 @@ impl TelegramHost {
                 execution_state: params.execution_state,
             },
         )
-        .map_err(|_| TelegramHostError::SurfaceUnavailable)?;
+        .map_err(|_| TelegramHostError::SurfaceUnavailable)?
+        .with_support_tickets(params.support_tickets_path);
         let poller_store =
             Store::open(params.database_path).map_err(|_| TelegramHostError::StoreUnavailable)?;
         // The lane opens successfully on a deployment that has not configured
@@ -808,6 +816,7 @@ mod tests {
         state_dir: PathBuf,
         database_path: PathBuf,
         run_index_path: PathBuf,
+        support_tickets_path: PathBuf,
         admin_socket: PathBuf,
         lease_epoch: u64,
     }
@@ -834,6 +843,9 @@ mod tests {
             }
             let database_path = state_dir.join("automonique.sqlite3");
             let run_index_path = state_dir.join("run-index.sqlite3");
+            // Named and never created: composing a host must not bring a ticket
+            // store into existence on a tree whose intake is disabled.
+            let support_tickets_path = state_dir.join(crate::SUPPORT_TICKETS_NAME);
             let admin_socket = state_dir.join("admin.sock");
             let mut store = Store::open(&database_path).expect("store opens");
             let lease = store
@@ -849,6 +861,7 @@ mod tests {
                 state_dir,
                 database_path,
                 run_index_path,
+                support_tickets_path,
                 admin_socket,
                 lease_epoch: lease.epoch,
             }
@@ -859,6 +872,7 @@ mod tests {
                 state_dir: &self.state_dir,
                 database_path: &self.database_path,
                 run_index_path: &self.run_index_path,
+                support_tickets_path: &self.support_tickets_path,
                 admin_socket: &self.admin_socket,
                 generation_id: crate::GENERATION_ID,
                 holder_id: "telegram-host-fixture",

@@ -19,6 +19,13 @@ fn every_command_in_the_vocabulary_parses_to_its_typed_value() {
     assert_eq!(parse_command("/help"), Ok(ControlCommand::Help));
     assert_eq!(parse_command("/status"), Ok(ControlCommand::Status));
     assert_eq!(parse_command("/runs"), Ok(ControlCommand::Runs));
+    assert_eq!(parse_command("/tickets"), Ok(ControlCommand::Tickets));
+    assert_eq!(
+        parse_command("/ticket SUP-1042"),
+        Ok(ControlCommand::Ticket {
+            ticket_ref: ControlRef::new("SUP-1042").expect("reference")
+        })
+    );
     assert_eq!(
         parse_command("/run build the release notes"),
         Ok(ControlCommand::Run {
@@ -135,6 +142,22 @@ fn argument_bounds_are_exact_at_the_boundary() {
     assert_eq!(
         parse_command("/runs 5"),
         Err(CommandRefusal::UnexpectedArgument)
+    );
+    assert_eq!(
+        parse_command("/tickets open"),
+        Err(CommandRefusal::UnexpectedArgument)
+    );
+    assert_eq!(
+        parse_command("/ticket"),
+        Err(CommandRefusal::MissingArgument)
+    );
+    assert_eq!(
+        parse_command("/ticket SUP-1 SUP-2"),
+        Err(CommandRefusal::UnexpectedArgument)
+    );
+    assert_eq!(
+        parse_command("/ticket bad*ref"),
+        Err(CommandRefusal::ArgumentInvalid)
     );
     assert_eq!(parse_command("/run"), Err(CommandRefusal::MissingArgument));
     assert_eq!(
@@ -269,6 +292,9 @@ fn authorization_is_decided_before_the_message_is_read() {
         ("/nonesuch", Some(CommandRefusal::UnknownCommand)),
         ("/run", Some(CommandRefusal::MissingArgument)),
         ("/cancel bad*ref", Some(CommandRefusal::ArgumentInvalid)),
+        ("/tickets", None),
+        ("/ticket SUP-1042", None),
+        ("/ticket", Some(CommandRefusal::MissingArgument)),
     ] {
         if let Some(expected) = parsed_refusal {
             assert_eq!(parse_command(text), Err(expected), "{text:?}");
@@ -311,7 +337,9 @@ fn the_manifest_is_exhaustive_over_the_registry_and_round_trips() {
     // the ones an operator has been told to type.
     assert_eq!(
         manifest.map(|entry| entry.name),
-        ["help", "status", "runs", "run", "cancel", "approve", "deny"]
+        [
+            "help", "status", "runs", "tickets", "ticket", "run", "cancel", "approve", "deny"
+        ]
     );
     for entry in manifest {
         let typed = match entry.kind.argument() {

@@ -47,12 +47,12 @@ pub const MAX_COMMAND_NAME_BYTES: usize = 32;
 pub const MAX_BOT_SUFFIX_BYTES: usize = 32;
 /// Longest task text a `/run` may carry.
 pub const MAX_RUN_TASK_BYTES: usize = 1024;
-/// Longest reference a `/cancel`, `/approve` or `/deny` may name.
+/// Longest reference a `/cancel`, `/approve`, `/deny` or `/ticket` may name.
 pub const MAX_CONTROL_REF_BYTES: usize = 128;
 /// Most Telegram user ids one allowlist may hold.
 pub const MAX_ALLOWED_USERS: usize = 256;
 /// Number of commands in the closed registry.
-pub const COMMAND_COUNT: usize = 7;
+pub const COMMAND_COUNT: usize = 9;
 
 const _: () = assert!(COMMAND_COUNT == CommandKind::ALL.len());
 const _: () = assert!(MAX_COMMAND_NAME_BYTES <= MAX_COMMAND_TEXT_BYTES);
@@ -84,10 +84,10 @@ pub struct CommandSpec {
 /// The closed operator vocabulary.
 ///
 /// Each kind names a capability the control plane already has: a status
-/// snapshot, the Runs read surface, run submission, cancellation, and the
-/// approval lane's two decisions. Nothing here is aspirational — a kind with no
-/// lane behind it would be a command that refuses at dispatch, which is worse
-/// than one that does not exist.
+/// snapshot, the Runs read surface, the tracked support tickets, run
+/// submission, cancellation, and the approval lane's two decisions. Nothing
+/// here is aspirational — a kind with no lane behind it would be a command that
+/// refuses at dispatch, which is worse than one that does not exist.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CommandKind {
     /// Render the command menu.
@@ -96,6 +96,10 @@ pub enum CommandKind {
     Status,
     /// List recent runs.
     Runs,
+    /// List recently tracked support tickets.
+    Tickets,
+    /// One tracked support ticket.
+    Ticket,
     /// Submit one run.
     Run,
     /// Cancel one run.
@@ -113,6 +117,8 @@ impl CommandKind {
         Self::Help,
         Self::Status,
         Self::Runs,
+        Self::Tickets,
+        Self::Ticket,
         Self::Run,
         Self::Cancel,
         Self::Approve,
@@ -137,6 +143,16 @@ impl CommandKind {
                 name: "runs",
                 description: "List the most recent runs",
                 argument: ArgumentShape::None,
+            },
+            Self::Tickets => CommandSpec {
+                name: "tickets",
+                description: "List the most recently tracked support tickets",
+                argument: ArgumentShape::None,
+            },
+            Self::Ticket => CommandSpec {
+                name: "ticket",
+                description: "Show the tracked support ticket with the given reference",
+                argument: ArgumentShape::Reference,
             },
             Self::Run => CommandSpec {
                 name: "run",
@@ -282,8 +298,12 @@ impl fmt::Debug for RunTask {
 /// A bounded, opaque reference to something the daemon owns.
 ///
 /// This module never parses it, derives nothing from it and gives it no
-/// structure — it is a run identifier or an approval key on its way to the lane
-/// that understands it. The grammar is deliberately narrower than those lanes
+/// structure — it is a run identifier, an approval key or a fleet issue id on
+/// its way to the lane that understands it. A reference this grammar admits may
+/// still be one no lane recognizes, and answering that is the lane's job: the
+/// support ticket store's own identifiers are shorter than this ceiling, so a
+/// reference at the ceiling is a ticket nobody recorded rather than a refusal
+/// here. The grammar is deliberately narrower than those lanes
 /// accept: refusing whitespace, quoting and control characters here means a
 /// reference cannot smuggle a second argument, and a legitimate identifier this
 /// tight grammar rejects is a reference the operator can still pass through the
@@ -350,6 +370,13 @@ pub enum ControlCommand {
     Status,
     /// List the most recent runs.
     Runs,
+    /// List the most recently tracked support tickets.
+    Tickets,
+    /// Report the tracked support ticket this reference names.
+    Ticket {
+        /// The fleet issue being asked about.
+        ticket_ref: ControlRef,
+    },
     /// Submit one run carrying this task text.
     Run {
         /// The bounded task body.
@@ -383,6 +410,8 @@ impl ControlCommand {
             Self::Help => CommandKind::Help,
             Self::Status => CommandKind::Status,
             Self::Runs => CommandKind::Runs,
+            Self::Tickets => CommandKind::Tickets,
+            Self::Ticket { .. } => CommandKind::Ticket,
             Self::Run { .. } => CommandKind::Run,
             Self::Cancel { .. } => CommandKind::Cancel,
             Self::Approve { .. } => CommandKind::Approve,
@@ -619,6 +648,10 @@ pub fn parse_command(text: &str) -> Result<ControlCommand, CommandRefusal> {
         CommandKind::Help => no_argument(rest).map(|()| ControlCommand::Help),
         CommandKind::Status => no_argument(rest).map(|()| ControlCommand::Status),
         CommandKind::Runs => no_argument(rest).map(|()| ControlCommand::Runs),
+        CommandKind::Tickets => no_argument(rest).map(|()| ControlCommand::Tickets),
+        CommandKind::Ticket => {
+            one_reference(rest).map(|ticket_ref| ControlCommand::Ticket { ticket_ref })
+        }
         CommandKind::Run => RunTask::new(rest).map(|task| ControlCommand::Run { task }),
         CommandKind::Cancel => {
             one_reference(rest).map(|run_ref| ControlCommand::Cancel { run_ref })
@@ -707,7 +740,39 @@ mod tests {
         }
         assert!(text.contains("/run <task>"));
         assert!(text.contains("/cancel <reference>"));
+        assert!(text.contains("/ticket <reference>"));
         assert!(!text.contains("/status <"));
+        // The two ticket commands differ by one character and by their argument
+        // shape, so the help an operator reads has to keep them apart.
+        assert!(text.contains("/tickets — "));
+    }
+
+    #[test]
+    fn the_two_ticket_commands_are_distinct_names_with_distinct_shapes() {
+        assert_eq!(parse_command("/tickets"), Ok(ControlCommand::Tickets));
+        assert_eq!(
+            parse_command("/ticket SUP-1042"),
+            Ok(ControlCommand::Ticket {
+                ticket_ref: ControlRef::new("SUP-1042").expect("reference")
+            })
+        );
+        // Neither name may be reached by the other's spelling: a plural that
+        // parsed as a lookup, or a lookup that parsed as a listing, would answer
+        // a question the operator did not ask.
+        assert_eq!(
+            parse_command("/tickets SUP-1042"),
+            Err(CommandRefusal::UnexpectedArgument)
+        );
+        assert_eq!(
+            parse_command("/ticket"),
+            Err(CommandRefusal::MissingArgument)
+        );
+        assert_eq!(
+            CommandKind::from_name("tickets"),
+            Some(CommandKind::Tickets)
+        );
+        assert_eq!(CommandKind::from_name("ticket"), Some(CommandKind::Ticket));
+        assert_eq!(CommandKind::from_name("ticketss"), None);
     }
 
     #[test]

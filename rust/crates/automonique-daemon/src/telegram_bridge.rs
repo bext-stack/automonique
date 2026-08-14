@@ -61,7 +61,7 @@
 //! these counters are observable to tests and to nothing else. That is a real
 //! gap, named here rather than papered over with a `println!`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -70,6 +70,7 @@ use std::time::Duration;
 use automonique_protocol::admin::ExecutionState;
 use automonique_store::Store;
 use automonique_store::run_index::{RunIndex, RunIndexRecord};
+use automonique_store::support_tickets::{SupportTicketError, SupportTicketStore, TicketRecord};
 use automonique_transport_runtime::{
     AllowedUsers, CancellationToken, ControlCommand, HttpFailure, MAX_SEND_MESSAGE_TEXT_UNITS,
     OpaqueBotToken, PollOutcome, PollerLease, RuntimeError, SendMessageRequest,
@@ -95,12 +96,47 @@ const BACKOFF_SLICE: Duration = Duration::from_millis(25);
 /// How many runs one `/runs` reply lists.
 pub const RUNS_LISTED: usize = 10;
 
+/// How many tickets one `/tickets` reply lists.
+pub const TICKETS_LISTED: usize = 10;
+
 /// Longest run identity echoed into a reply, in bytes.
 ///
 /// A run id is operator content from an admin submission rather than anything a
 /// Telegram sender chose, but a listing still has to fit one message, and ten
 /// unbounded identities would not.
 pub const MAX_LISTED_RUN_ID_BYTES: usize = 48;
+
+/// Longest fleet issue id one *listed* ticket carries, in bytes.
+///
+/// The store admits an id four times this long, and a detail reply prints it
+/// whole. A listing may not: ten rows of full-width fields would not fit one
+/// message, and an operator reading the list is reading it to find the id they
+/// will then ask about, which a marked truncation still tells them.
+pub const MAX_LISTED_TICKET_ID_BYTES: usize = 40;
+
+/// Longest ticket title one listed row carries, in bytes.
+pub const MAX_LISTED_TICKET_TITLE_BYTES: usize = 72;
+
+/// Longest tenant name one listed row carries, in bytes.
+pub const MAX_LISTED_TENANT_BYTES: usize = 32;
+
+/// The whole answer to a ticket command on a host with no ticket store.
+///
+/// Not a refusal. Nothing failed: this daemon was never configured to read a
+/// support fleet, so there is no ticket to have. Saying "unavailable" would send
+/// an operator looking for a fault that does not exist.
+pub const TICKETS_NOT_ENABLED: &str =
+    "Ticket tracking is not enabled on this daemon, so no tickets are recorded.";
+
+/// The answer when a ticket store holds nothing at all.
+pub const NO_TICKETS_RECORDED: &str = "No tickets recorded.";
+
+/// The answer for a reference this host has no ticket for.
+///
+/// Content-free, like every refusal on this surface: it names no id, so the
+/// reply cannot be used to make the bot repeat a sender's text into a chat, and
+/// it reads the same for a mistyped id as for one the board never carried.
+pub const TICKET_NOT_FOUND: &str = "No ticket is recorded for that reference.";
 
 /// Why a read surface could not answer.
 ///
@@ -134,9 +170,9 @@ impl SurfaceRefusal {
 
 /// The daemon reads a Telegram operator may ask for.
 ///
-/// Both answers are rendered text and both may refuse. An implementation must
-/// read its *own* durable handles: the production one runs on the poller thread
-/// and shares nothing with the serve loop.
+/// Every answer is rendered text and every one may refuse. An implementation
+/// must read its *own* durable handles: the production one runs on the poller
+/// thread and shares nothing with the serve loop.
 pub trait ControlSurface {
     /// This daemon's status snapshot, rendered for an operator.
     ///
@@ -152,6 +188,32 @@ pub trait ControlSurface {
     ///
     /// Returns [`SurfaceRefusal::Unavailable`] when the index cannot be read.
     fn runs_text(&mut self) -> Result<String, SurfaceRefusal>;
+
+    /// The most recently tracked support tickets, rendered as a compact list.
+    ///
+    /// A host with no ticket store answers [`TICKETS_NOT_ENABLED`], which is a
+    /// fact and not a refusal: nothing failed, this daemon was simply never
+    /// pointed at a support fleet, and an operator told "unavailable" would go
+    /// looking for a fault that does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SurfaceRefusal::Unavailable`] when a store this host *does*
+    /// have cannot be opened or read.
+    fn tickets_text(&mut self) -> Result<String, SurfaceRefusal>;
+
+    /// One tracked support ticket, named by its fleet issue id.
+    ///
+    /// A reference naming no recorded ticket is answered [`TICKET_NOT_FOUND`]
+    /// rather than refused: "nothing here matches that" is the true answer, and
+    /// it is the same answer whether the id was mistyped, was longer than the
+    /// store's own ceiling, or names a ticket this host never saw.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SurfaceRefusal::Unavailable`] when a store this host *does*
+    /// have cannot be opened or read.
+    fn ticket_text(&mut self, ticket_ref: &str) -> Result<String, SurfaceRefusal>;
 }
 
 /// A command this vocabulary can spell and this build cannot yet perform.
@@ -207,6 +269,8 @@ impl Unavailable {
             ControlCommand::Help
             | ControlCommand::Status
             | ControlCommand::Runs
+            | ControlCommand::Tickets
+            | ControlCommand::Ticket { .. }
             | ControlCommand::Run { .. } => None,
             ControlCommand::Cancel { .. } => Some(Self::CancelVerb),
             ControlCommand::Approve { .. } | ControlCommand::Deny { .. } => {
@@ -736,6 +800,11 @@ where
             ControlCommand::Help => help_text(),
             ControlCommand::Status => self.surface.status_text().unwrap_or_else(refused),
             ControlCommand::Runs => self.surface.runs_text().unwrap_or_else(refused),
+            ControlCommand::Tickets => self.surface.tickets_text().unwrap_or_else(refused),
+            ControlCommand::Ticket { ticket_ref } => self
+                .surface
+                .ticket_text(ticket_ref.as_str())
+                .unwrap_or_else(refused),
             // `answer_for` carried this one out through the run lane before
             // `render` was reached; answering it here would be a second
             // dispatch table over a command whose answer is an effect.
@@ -864,17 +933,33 @@ pub const TRUNCATION_MARK: &str = "\n[…truncated]";
 
 /// Fit one run's answer into a single reply.
 ///
-/// Three things happen here and no more: control characters the transport
-/// refuses are replaced, the text is cut to [`MAX_RUN_ANSWER_UNITS`] UTF-16
-/// units at a character boundary, and an empty result becomes a fixed sentence.
+/// [`bounded_text`] plus one thing: an answer that came back empty becomes a
+/// fixed sentence, because a run that wrote nothing is a fact about the run and
+/// an empty message is not sendable anyway. Every other reply on this surface is
+/// rendered from durable state and is never empty, which is why they use
+/// [`bounded_text`] directly and do not carry this sentence.
+fn bounded_reply(answer: &str) -> String {
+    let text = bounded_text(answer);
+    if text.trim().is_empty() {
+        return String::from("The run completed but its answer was empty.");
+    }
+    text
+}
+
+/// Fit any reply into one Telegram message.
+///
+/// Two things happen here and no more: control characters the transport refuses
+/// are replaced, and the text is cut to [`MAX_RUN_ANSWER_UNITS`] UTF-16 units at
+/// a character boundary, marked with [`TRUNCATION_MARK`] when it was cut.
 /// Nothing is reformatted and nothing is interpreted — the bytes are a
-/// provider's answer and this is a transport bound, not a renderer.
+/// provider's answer or a fleet's own words, and this is a transport bound, not
+/// a renderer.
 ///
 /// The unit is UTF-16 because that is the unit Telegram counts in and the one
 /// [`SendMessageRequest`] validates against; counting bytes or characters here
 /// would let an answer of astral-plane text be refused after this function said
 /// it fit.
-fn bounded_reply(answer: &str) -> String {
+fn bounded_text(answer: &str) -> String {
     let mut text = String::with_capacity(answer.len());
     let mut units = 0_usize;
     let mut truncated = false;
@@ -897,9 +982,6 @@ fn bounded_reply(answer: &str) -> String {
     }
     if truncated {
         text.push_str(TRUNCATION_MARK);
-    }
-    if text.trim().is_empty() {
-        return String::from("The run completed but its answer was empty.");
     }
     text
 }
@@ -938,18 +1020,42 @@ pub struct HostFacts {
 
 /// The production [`ControlSurface`], over its own store connections.
 ///
-/// Both handles are opened by this type and belong to the poller thread, which
+/// Every handle is opened by this type and belongs to the poller thread, which
 /// is the same discipline the execution lane's workers follow: a worker that
 /// borrowed the serve loop's handles would either need a lock around every admin
-/// request or would race one. SQLite serializes the two connections itself.
+/// request or would race one. SQLite serializes the connections itself.
 pub struct StoreControlSurface {
     store: Store,
     run_index: RunIndex,
+    tickets: TicketReads,
     facts: HostFacts,
+}
+
+/// This surface's own read connection to the support ticket store.
+///
+/// Its own, for the reason the other two handles are: the intake worker writes
+/// to that database from a different thread, and a reader that borrowed its
+/// connection would serialize a chat reply behind a fleet poll.
+///
+/// Opened lazily rather than at composition, because the daemon composes this
+/// bridge *before* the support intake gate opens — and therefore creates — the
+/// ticket store. A surface that decided "enabled" at composition would answer
+/// "not enabled" for the whole life of a process whose intake is running.
+enum TicketReads {
+    /// No ticket store path was attached, so this host offers no ticket reads.
+    Detached,
+    /// A path was attached and nothing is open yet.
+    Unopened(PathBuf),
+    /// An open read connection to the ticket store.
+    Open(Box<SupportTicketStore>),
 }
 
 impl StoreControlSurface {
     /// Open one surface's own connections.
+    ///
+    /// The support ticket store is not among them: it is attached separately by
+    /// [`Self::with_support_tickets`], because a host with no support fleet has
+    /// no such database and must not be given an empty one.
     ///
     /// # Errors
     ///
@@ -965,14 +1071,64 @@ impl StoreControlSurface {
         Ok(Self {
             store,
             run_index,
+            tickets: TicketReads::Detached,
             facts,
         })
+    }
+
+    /// Point this surface at the host's support ticket store.
+    ///
+    /// The path is remembered and nothing is opened: see [`TicketReads`] for why
+    /// the connection cannot be made here. Attaching a path to a host whose
+    /// intake is disabled is harmless and is what the daemon does — the file
+    /// never appears, and every ticket command answers
+    /// [`TICKETS_NOT_ENABLED`].
+    #[must_use]
+    pub fn with_support_tickets(mut self, support_tickets_path: &Path) -> Self {
+        self.tickets = TicketReads::Unopened(support_tickets_path.to_path_buf());
+        self
     }
 
     /// The facts this surface reports as unchanging.
     #[must_use]
     pub const fn facts(&self) -> &HostFacts {
         &self.facts
+    }
+
+    /// This host's ticket store, opening it on first use.
+    ///
+    /// `Ok(None)` is the enabled/not-enabled answer and never a fault: no path
+    /// was attached, or the intake gate never created the database. Absence is
+    /// re-checked on every call rather than remembered, so a surface cannot keep
+    /// saying "not enabled" about a host that has since recorded its first
+    /// ticket.
+    ///
+    /// Nothing here creates the file. [`SupportTicketStore::open`] would, which
+    /// is exactly what a read surface must not do: an empty store conjured on a
+    /// host with no support fleet would answer "no tickets recorded" to a
+    /// question whose true answer is "this daemon does not track tickets".
+    fn ticket_store(&mut self) -> Result<Option<&SupportTicketStore>, SurfaceRefusal> {
+        let path = match &self.tickets {
+            TicketReads::Detached => return Ok(None),
+            TicketReads::Open(store) => store.path().to_path_buf(),
+            TicketReads::Unopened(path) => path.clone(),
+        };
+        if !path.is_file() {
+            // The store was removed, or was never created. Either way this host
+            // has no tickets to report, and a connection it may still hold is
+            // one to a file nobody can reach.
+            self.tickets = TicketReads::Unopened(path);
+            return Ok(None);
+        }
+        if let TicketReads::Unopened(path) = &self.tickets {
+            let opened = SupportTicketStore::open(path).map_err(|_| SurfaceRefusal::Unavailable)?;
+            self.tickets = TicketReads::Open(Box::new(opened));
+        }
+        match &self.tickets {
+            TicketReads::Open(store) => Ok(Some(store)),
+            // Unreachable: the arm above just replaced every other state.
+            TicketReads::Detached | TicketReads::Unopened(_) => Err(SurfaceRefusal::Unavailable),
+        }
     }
 }
 
@@ -1066,6 +1222,60 @@ impl ControlSurface for StoreControlSurface {
         }
         Ok(text)
     }
+
+    /// The newest [`TICKETS_LISTED`] tracked tickets, newest first.
+    ///
+    /// The listing is the store's own record of the fleet board, not a look at
+    /// the board: every field is what the intake worker last recorded, and the
+    /// lifecycle beside it is what *this host* has done about the ticket, which
+    /// the fleet's own status does not say.
+    fn tickets_text(&mut self) -> Result<String, SurfaceRefusal> {
+        let Some(store) = self.ticket_store()? else {
+            return Ok(String::from(TICKETS_NOT_ENABLED));
+        };
+        let Some(range) = store
+            .retained_range()
+            .map_err(|_| SurfaceRefusal::Unavailable)?
+        else {
+            return Ok(String::from(NO_TICKETS_RECORDED));
+        };
+        // The cursor is exclusive and must not exceed what is retained, so the
+        // newest page is the window ending at the last row.
+        let listed = u64::try_from(TICKETS_LISTED).map_err(|_| SurfaceRefusal::Unavailable)?;
+        let cursor = range.last.saturating_sub(listed);
+        let page = store
+            .page(cursor, TICKETS_LISTED)
+            .map_err(|_| SurfaceRefusal::Unavailable)?;
+        if page.tickets.is_empty() {
+            return Ok(String::from(NO_TICKETS_RECORDED));
+        }
+        let mut text = format!("Recent tickets ({} of {}):", page.tickets.len(), range.last);
+        for record in page.tickets.iter().rev() {
+            text.push('\n');
+            text.push_str(&ticket_line(record));
+        }
+        Ok(bounded_text(&text))
+    }
+
+    /// One recorded ticket, or the fixed sentence for one nobody recorded.
+    ///
+    /// A malformed reference is answered exactly as an unrecorded one. The
+    /// command layer's grammar is wider than the store's — it admits 128 bytes
+    /// where the store admits 120 — and a surface that turned that overhang into
+    /// "unavailable" would report a fault for a reference that simply names no
+    /// ticket.
+    fn ticket_text(&mut self, ticket_ref: &str) -> Result<String, SurfaceRefusal> {
+        let Some(store) = self.ticket_store()? else {
+            return Ok(String::from(TICKETS_NOT_ENABLED));
+        };
+        match store.ticket(ticket_ref) {
+            Ok(Some(record)) => Ok(bounded_text(&ticket_detail(&record))),
+            Ok(None) | Err(SupportTicketError::InvalidField(_)) => {
+                Ok(String::from(TICKET_NOT_FOUND))
+            }
+            Err(_) => Err(SurfaceRefusal::Unavailable),
+        }
+    }
 }
 
 /// One run's line in a `/runs` reply.
@@ -1084,12 +1294,97 @@ fn run_line(record: &RunIndexRecord) -> String {
 /// Truncation is marked, because a silently shortened identity is one an
 /// operator would paste back into the admin socket and be refused for.
 fn bounded_run_id(run_id: &str) -> String {
-    if run_id.len() <= MAX_LISTED_RUN_ID_BYTES {
-        return run_id.to_owned();
+    bounded_field(run_id, MAX_LISTED_RUN_ID_BYTES)
+}
+
+/// One listed field, cut at a character boundary and marked when it was cut.
+fn bounded_field(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
     }
-    let mut cut = MAX_LISTED_RUN_ID_BYTES;
-    while cut > 0 && !run_id.is_char_boundary(cut) {
+    let mut cut = max_bytes;
+    while cut > 0 && !value.is_char_boundary(cut) {
         cut -= 1;
     }
-    format!("{}…", &run_id[..cut])
+    format!("{}…", &value[..cut])
+}
+
+/// One listed field that the fleet is allowed to leave empty.
+///
+/// An empty tenant or requester is a real state of a real ticket — the store
+/// admits it because the connector does — and printing nothing would silently
+/// shift every field after it.
+fn listed_field(value: &str, max_bytes: usize) -> String {
+    if value.is_empty() {
+        return String::from(EMPTY_FIELD);
+    }
+    bounded_field(value, max_bytes)
+}
+
+/// The same substitution for a detail reply, which prints its fields whole.
+fn or_dash(value: &str) -> &str {
+    if value.is_empty() { EMPTY_FIELD } else { value }
+}
+
+/// What an empty fleet field is printed as.
+const EMPTY_FIELD: &str = "-";
+
+/// One ticket's line in a `/tickets` reply.
+///
+/// The fleet issue id leads because it is the reference an operator types back
+/// into `/ticket`. The two states are printed as a pair and always in the same
+/// order — this host's lifecycle first, the fleet's own status second — because
+/// they are different claims by different owners and a reader has to be able to
+/// tell which is which.
+fn ticket_line(record: &TicketRecord) -> String {
+    format!(
+        "#{} {} {}/{} {} — {}",
+        record.ticket_id,
+        bounded_field(&record.fleet_issue_id, MAX_LISTED_TICKET_ID_BYTES),
+        record.lifecycle.as_str(),
+        bounded_field(&record.fleet_status, MAX_LISTED_TENANT_BYTES),
+        listed_field(&record.tenant_name, MAX_LISTED_TENANT_BYTES),
+        bounded_field(&record.title, MAX_LISTED_TICKET_TITLE_BYTES),
+    )
+}
+
+/// One ticket's detail reply.
+///
+/// Fields the fleet owns are printed verbatim and whole — that is what a detail
+/// view is for, and the store's own ceilings already keep them inside one
+/// message — while [`bounded_text`] remains the backstop that keeps the reply
+/// sendable no matter what the row holds.
+///
+/// The two observation instants are this host's, printed as the Unix
+/// milliseconds they are stored as. Rendering them as dates would need a
+/// calendar this crate does not carry, and inventing a format for a value an
+/// operator can already correlate against the fleet's own timestamps would be a
+/// second opinion about a number with one.
+fn ticket_detail(record: &TicketRecord) -> String {
+    format!(
+        "Ticket {}\n\
+         {}\n\
+         tenant {} | site {}\n\
+         fleet status {} | priority {} | source {}\n\
+         lifecycle {} | revision {} | comments {}\n\
+         requested by {}\n\
+         fleet created {} | fleet updated {}\n\
+         first seen {}ms | last synced {}ms | row #{}",
+        record.fleet_issue_id,
+        record.title,
+        or_dash(&record.tenant_name),
+        record.site_label.as_deref().unwrap_or(EMPTY_FIELD),
+        record.fleet_status,
+        record.priority,
+        or_dash(&record.source),
+        record.lifecycle.as_str(),
+        record.revision,
+        record.comment_count,
+        or_dash(&record.requested_by),
+        record.created_at,
+        record.updated_at,
+        record.first_seen_ms,
+        record.last_synced_ms,
+        record.ticket_id,
+    )
 }
