@@ -138,6 +138,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "automonique-slack-connector"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "automonique-store"
 version = "0.1.0"
 dependencies = [
