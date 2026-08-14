@@ -21,8 +21,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use automonique_daemon::telegram_bridge::{
-    BridgeParts, ControlSurface, DispatchReport, HostFacts, StoreControlSurface,
-    TelegramControlBridge, Unavailable,
+    BridgeParts, ControlSurface, DispatchReport, HostFacts, RunFailure, RunLane,
+    StoreControlSurface, TelegramControlBridge, Unavailable,
 };
 use automonique_protocol::admin::ExecutionState;
 use automonique_store::run_index::{RunIndex, RunIndexEntry};
@@ -361,14 +361,73 @@ fn serde_json_string(value: &str) -> String {
     out
 }
 
-type Bridge = TelegramControlBridge<FakeClient, FakeOutbound, FakeSink, StoreControlSurface>;
+/// A run lane that runs nothing and records exactly what it was asked.
+///
+/// The dispatch is what these tests are about, so the lane is a seam here for
+/// the same reason the transports are: whether a real run answers is
+/// `run_compose`'s question, and it needs a contained host to ask it.
+#[derive(Clone, Default)]
+struct FakeRunLane {
+    state: Arc<Mutex<FakeRunLaneState>>,
+}
+
+#[derive(Default)]
+struct FakeRunLaneState {
+    tasks: Vec<String>,
+    answer: Option<String>,
+    failure: Option<RunFailure>,
+}
+
+impl FakeRunLane {
+    fn answering(answer: &str) -> Self {
+        let lane = Self::default();
+        lane.state.lock().expect("lane state").answer = Some(answer.to_owned());
+        lane
+    }
+
+    fn failing(failure: RunFailure) -> Self {
+        let lane = Self::default();
+        lane.state.lock().expect("lane state").failure = Some(failure);
+        lane
+    }
+
+    fn tasks(&self) -> Vec<String> {
+        self.state.lock().expect("lane state").tasks.clone()
+    }
+}
+
+impl RunLane for FakeRunLane {
+    fn run(&mut self, task: &str) -> Result<String, RunFailure> {
+        let mut state = self.state.lock().expect("lane state");
+        state.tasks.push(task.to_owned());
+        match (state.answer.clone(), state.failure) {
+            (Some(answer), _) => Ok(answer),
+            (None, Some(failure)) => Err(failure),
+            (None, None) => Err(RunFailure::NotConfigured),
+        }
+    }
+}
+
+type Bridge =
+    TelegramControlBridge<FakeClient, FakeOutbound, FakeSink, StoreControlSurface, FakeRunLane>;
 
 fn bridge(fixture: &Fixture, client: FakeClient, outbound: FakeOutbound, sink: FakeSink) -> Bridge {
+    bridge_with_lane(fixture, client, outbound, sink, FakeRunLane::default())
+}
+
+fn bridge_with_lane(
+    fixture: &Fixture,
+    client: FakeClient,
+    outbound: FakeOutbound,
+    sink: FakeSink,
+    lane: FakeRunLane,
+) -> Bridge {
     TelegramControlBridge::new(BridgeParts {
         client,
         outbound,
         sink,
         surface: fixture.surface(),
+        lane,
         policy: policy(),
         allowed: AllowedUsers::new([OPERATOR]).expect("allowlist"),
         inbound_token: token(),
@@ -510,11 +569,13 @@ fn unknown_and_malformed_commands_reply_their_refusals() {
 }
 
 /// Every command with no surface behind it says so, and does nothing.
+///
+/// `/run` is deliberately absent: it has a surface now, and
+/// [`a_run_reaches_the_lane_and_its_answer_is_the_reply`] is where it is proved.
 #[test]
 fn commands_without_a_surface_say_nothing_happened() {
     let fixture = Fixture::new(&[]);
     let client = FakeClient::new([updates(&[
-        (1, OPERATOR, "/run ship the thing"),
         (2, OPERATOR, "/cancel run-alpha"),
         (3, OPERATOR, "/approve approval-1"),
         (4, OPERATOR, "/deny approval-1"),
@@ -528,15 +589,14 @@ fn commands_without_a_surface_say_nothing_happened() {
     );
 
     let report = poll(&mut bridge).expect("poll commits");
-    assert_eq!(report.unavailable, 4);
+    assert_eq!(report.unavailable, 3);
     assert_eq!(report.answered, 0);
-    assert_eq!(report.sent, 4);
+    assert_eq!(report.sent, 3);
 
     let messages = outbound.messages();
-    assert!(messages[0].contains(Unavailable::RunComposition.operator_reply()));
-    assert!(messages[1].contains(Unavailable::CancelVerb.operator_reply()));
+    assert!(messages[0].contains(Unavailable::CancelVerb.operator_reply()));
+    assert!(messages[1].contains(Unavailable::ApprovalWiring.operator_reply()));
     assert!(messages[2].contains(Unavailable::ApprovalWiring.operator_reply()));
-    assert!(messages[3].contains(Unavailable::ApprovalWiring.operator_reply()));
     for message in &messages {
         assert!(
             message.contains("Not available yet."),
@@ -738,4 +798,118 @@ fn fixture_state_is_private_and_temporary() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o077, 0, "the fixture tree must be private");
+}
+
+/// A `/run` reaches the lane with exactly the operator's task, and the run's
+/// own answer is what the operator is sent back.
+///
+/// The lane is faked, so what is proved here is the *dispatch*: that `/run` is
+/// no longer answered from the unavailable table, that the task text arrives
+/// unaltered and unquoted, and that the reply is the answer rather than a
+/// rendering of it.
+#[test]
+fn a_run_reaches_the_lane_and_its_answer_is_the_reply() {
+    let fixture = Fixture::new(&[]);
+    let client = FakeClient::new([updates(&[(
+        1,
+        OPERATOR,
+        "/run summarise the release notes",
+    )])]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering("AUTOMONIQUE-ANSWER-OK");
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        client,
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.runs_answered, 1);
+    assert_eq!(report.runs_failed, 0);
+    assert_eq!(report.answered, 1);
+    assert_eq!(report.unavailable, 0, "/run is no longer unavailable");
+    assert_eq!(report.sent, 1);
+
+    assert_eq!(
+        lane.tasks(),
+        vec![String::from("summarise the release notes")],
+        "the lane must receive the operator's task, and only the task"
+    );
+    let messages = outbound.messages();
+    assert!(
+        messages[0].contains("AUTOMONIQUE-ANSWER-OK"),
+        "the reply must be the run's own answer: {messages:?}"
+    );
+    assert!(
+        !messages[0].contains("Not available yet."),
+        "an answered run must not read as an unavailable command"
+    );
+}
+
+/// A lane that cannot run anything answers in one closed word, and the daemon
+/// keeps polling.
+#[test]
+fn a_refused_run_is_a_typed_reply_and_not_a_crash() {
+    for (failure, expected) in [
+        (RunFailure::NotConfigured, "Not configured."),
+        (RunFailure::TimedOut, "deadline"),
+        (RunFailure::NoAnswer, "wrote no answer"),
+    ] {
+        let fixture = Fixture::new(&[]);
+        let client = FakeClient::new([updates(&[(1, OPERATOR, "/run anything")])]);
+        let outbound = FakeOutbound::default();
+        let mut bridge = bridge_with_lane(
+            &fixture,
+            client,
+            outbound.clone(),
+            FakeSink::default(),
+            FakeRunLane::failing(failure),
+        );
+
+        let report = poll(&mut bridge).expect("poll commits");
+        assert_eq!(report.runs_failed, 1, "{failure:?}");
+        assert_eq!(report.runs_answered, 0, "{failure:?}");
+        assert_eq!(report.sent, 1, "{failure:?}");
+        let messages = outbound.messages();
+        assert!(
+            messages[0].contains(expected),
+            "{failure:?} must be reported as itself: {messages:?}"
+        );
+    }
+}
+
+/// An answer larger than one Telegram message is cut and marked, never dropped
+/// and never sent whole.
+#[test]
+fn an_oversized_answer_is_truncated_visibly() {
+    let fixture = Fixture::new(&[]);
+    let huge = "x".repeat(20_000);
+    let client = FakeClient::new([updates(&[(1, OPERATOR, "/run anything")])]);
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        client,
+        outbound.clone(),
+        FakeSink::default(),
+        FakeRunLane::answering(&huge),
+    );
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(
+        report.sent, 1,
+        "an oversized answer must still be delivered"
+    );
+    assert_eq!(report.send_refused, 0, "the transport must not refuse it");
+    let messages = outbound.messages();
+    assert!(
+        messages[0].contains("truncated"),
+        "truncation must be visible: {:?}",
+        &messages[0][..messages[0].len().min(120)]
+    );
+    assert!(
+        !messages[0].contains(&huge),
+        "the whole answer must not be sent"
+    );
 }

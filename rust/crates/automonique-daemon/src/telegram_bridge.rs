@@ -5,9 +5,20 @@
 //! [`TelegramControlBridge`] is the only place in this product where an inbound
 //! Telegram message becomes an answer. It owns four injected seams — an HTTP
 //! client for `getUpdates`, an outbound client for `sendMessage`/`setMyCommands`,
-//! the durable sink that commits offsets, and a [`ControlSurface`] that can read
-//! what this daemon holds — and nothing else. Every one of them is a trait, so
-//! the whole dispatch table is exercised in tests with no network at all.
+//! the durable sink that commits offsets, a [`ControlSurface`] that can read
+//! what this daemon holds, and a [`RunLane`] that can carry out one `/run` — and
+//! nothing else. Every one of them is a trait, so the whole dispatch table is
+//! exercised in tests with no network, no daemon and no provider at all.
+//!
+//! # One command here is an effect
+//!
+//! Every other command on this surface is a read. `/run` composes a document,
+//! submits it to custody, starts a contained attempt and waits for it, and the
+//! reply is what that run wrote. Two consequences follow and are worth stating
+//! together: the dispatch that answers a `/run` blocks for the length of the run
+//! (see [`crate::run_lane`]), and the reply carries *provider output*, which is
+//! why [`bounded_reply`] is a transport bound applied to it rather than a
+//! renderer.
 //!
 //! # Durable first, answer second
 //!
@@ -60,11 +71,11 @@ use automonique_protocol::admin::ExecutionState;
 use automonique_store::Store;
 use automonique_store::run_index::{RunIndex, RunIndexRecord};
 use automonique_transport_runtime::{
-    AllowedUsers, CancellationToken, ControlCommand, HttpFailure, OpaqueBotToken, PollOutcome,
-    PollerLease, RuntimeError, SendMessageRequest, SetMyCommandsRequest, TelegramBotCommand,
-    TelegramDurableSink, TelegramHttpClient, TelegramHttpPlan, TelegramHttpResponse,
-    TelegramOutbound, TelegramOutboundClient, TelegramOutboundPlan, TelegramPoller,
-    authorize_and_parse, command_manifest, help_text,
+    AllowedUsers, CancellationToken, ControlCommand, HttpFailure, MAX_SEND_MESSAGE_TEXT_UNITS,
+    OpaqueBotToken, PollOutcome, PollerLease, RuntimeError, SendMessageRequest,
+    SetMyCommandsRequest, TelegramBotCommand, TelegramDurableSink, TelegramHttpClient,
+    TelegramHttpPlan, TelegramHttpResponse, TelegramOutbound, TelegramOutboundClient,
+    TelegramOutboundPlan, TelegramPoller, authorize_and_parse, command_manifest, help_text,
 };
 use automonique_transports::{
     TelegramAccessPolicy, TelegramDisposition, TelegramIngress, TelegramInputKind,
@@ -150,8 +161,6 @@ pub trait ControlSurface {
 /// this enum is the whole outcome of the command that produced it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Unavailable {
-    /// `/run`: no lane composes a RunSpec document from free message text.
-    RunComposition,
     /// `/cancel`: the admin protocol has no cancel verb to route to the
     /// host-wide dispatcher this daemon already owns.
     CancelVerb,
@@ -165,7 +174,6 @@ impl Unavailable {
     #[must_use]
     pub const fn category(self) -> &'static str {
         match self {
-            Self::RunComposition => "run_composition_absent",
             Self::CancelVerb => "cancel_verb_absent",
             Self::ApprovalWiring => "approval_wiring_absent",
         }
@@ -178,9 +186,6 @@ impl Unavailable {
     #[must_use]
     pub const fn operator_reply(self) -> &'static str {
         match self {
-            Self::RunComposition => {
-                "Not available yet. This build composes no run document from message text, so nothing was submitted. Submit over the admin socket."
-            }
             Self::CancelVerb => {
                 "Not available yet. This build has no cancel command on the admin protocol, so nothing was cancelled."
             }
@@ -199,14 +204,105 @@ impl Unavailable {
     #[must_use]
     pub const fn for_command(command: &ControlCommand) -> Option<Self> {
         match command {
-            ControlCommand::Help | ControlCommand::Status | ControlCommand::Runs => None,
-            ControlCommand::Run { .. } => Some(Self::RunComposition),
+            ControlCommand::Help
+            | ControlCommand::Status
+            | ControlCommand::Runs
+            | ControlCommand::Run { .. } => None,
             ControlCommand::Cancel { .. } => Some(Self::CancelVerb),
             ControlCommand::Approve { .. } | ControlCommand::Deny { .. } => {
                 Some(Self::ApprovalWiring)
             }
         }
     }
+}
+
+/// Why a `/run` produced no answer.
+///
+/// Every variant is an outcome an operator can read as a fact about their own
+/// request. There is deliberately no variant for "the execute lane refused with
+/// `lane_saturated` rather than `containment_unavailable`": that distinction is
+/// a *daemon* fact, the admin socket answers it properly, and a chat reply that
+/// carried it would be leaking the shape of the host to whoever can type in the
+/// chat.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunFailure {
+    /// This deployment has no provider, or no destination policy, so no
+    /// document could be composed. Nothing was submitted.
+    NotConfigured,
+    /// The task text is empty or larger than a prompt slot carries.
+    TaskRejected,
+    /// The daemon refused the submission or the start. No attempt exists and
+    /// nothing was recorded.
+    Refused,
+    /// The run reached a terminal state that is not a completion.
+    Failed,
+    /// The run exceeded its own deadline and its tree was killed.
+    TimedOut,
+    /// The run was cancelled.
+    Cancelled,
+    /// The run completed and left no answer where it was told to write one.
+    NoAnswer,
+    /// This lane could not carry the request through, or could not observe what
+    /// happened to it. It says nothing about whether a run is live.
+    Unavailable,
+}
+
+impl RunFailure {
+    /// Stable, content-free category.
+    #[must_use]
+    pub const fn category(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "run_not_configured",
+            Self::TaskRejected => "run_task_rejected",
+            Self::Refused => "run_refused",
+            Self::Failed => "run_failed",
+            Self::TimedOut => "run_timed_out",
+            Self::Cancelled => "run_cancelled",
+            Self::NoAnswer => "run_no_answer",
+            Self::Unavailable => "run_unavailable",
+        }
+    }
+
+    /// The reply an operator receives.
+    ///
+    /// Each one says what happened to *their* request and, where there is one, a
+    /// thing they can do. None of them quotes a path, a run identity or any part
+    /// of the message that produced it.
+    #[must_use]
+    pub const fn operator_reply(self) -> &'static str {
+        match self {
+            Self::NotConfigured => {
+                "Not configured. This daemon has no provider or no egress destinations, so nothing was submitted."
+            }
+            Self::TaskRejected => "That task is empty or too long, so nothing was submitted.",
+            Self::Refused => "Refused. Nothing was started; the admin socket says why.",
+            Self::Failed => "The run failed. Its record is under /runs.",
+            Self::TimedOut => "The run hit its deadline and was stopped.",
+            Self::Cancelled => "The run was cancelled.",
+            Self::NoAnswer => "The run completed but wrote no answer.",
+            Self::Unavailable => "That could not be carried out right now.",
+        }
+    }
+}
+
+/// The lane that turns one task string into one contained run and its answer.
+///
+/// A seam for the same reason [`ControlSurface`] is one: the whole dispatch
+/// table is exercised in tests with no daemon, no socket and no provider. An
+/// implementation must own its own handles — the production one runs on the
+/// poller thread and shares nothing with the serve loop.
+pub trait RunLane {
+    /// Compose, submit, start and await one run, and answer with what it wrote.
+    ///
+    /// This blocks for the length of the run. See [`crate::run_lane`] for what
+    /// that costs and why this slice pays it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`RunFailure`] that names the outcome. Every one of them is
+    /// a complete answer: a refusal started nothing, and a failure is a run
+    /// whose record exists.
+    fn run(&mut self, task: &str) -> Result<String, RunFailure>;
 }
 
 /// What one poll-and-dispatch iteration did. Content-free by construction.
@@ -218,6 +314,11 @@ pub struct DispatchReport {
     pub answered: usize,
     /// Commands refused as unavailable in this build.
     pub unavailable: usize,
+    /// `/run` commands that were carried out and answered with what the run
+    /// wrote.
+    pub runs_answered: usize,
+    /// `/run` commands that reached a typed failure instead of an answer.
+    pub runs_failed: usize,
     /// Messages the command layer refused, including an unauthorized sender the
     /// transport policy admitted.
     pub refused: usize,
@@ -242,6 +343,8 @@ impl DispatchReport {
         self.updates += other.updates;
         self.answered += other.answered;
         self.unavailable += other.unavailable;
+        self.runs_answered += other.runs_answered;
+        self.runs_failed += other.runs_failed;
         self.refused += other.refused;
         self.denied_senders += other.denied_senders;
         self.ignored += other.ignored;
@@ -312,7 +415,7 @@ where
 }
 
 /// The seams one bridge is composed from.
-pub struct BridgeParts<C, O, S, R> {
+pub struct BridgeParts<C, O, S, R, L> {
     /// Inbound `getUpdates` transport.
     pub client: C,
     /// Outbound `sendMessage`/`setMyCommands` transport.
@@ -321,6 +424,8 @@ pub struct BridgeParts<C, O, S, R> {
     pub sink: S,
     /// The daemon reads this bridge may answer from.
     pub surface: R,
+    /// The lane one `/run` is carried out through.
+    pub lane: L,
     /// The transport access policy: which chat/actor pairs create work.
     pub policy: TelegramAccessPolicy,
     /// The control gate: which Telegram users may command this bot.
@@ -334,11 +439,12 @@ pub struct BridgeParts<C, O, S, R> {
 }
 
 /// One bot's polling loop and its dispatch table.
-pub struct TelegramControlBridge<C, O, S, R> {
+pub struct TelegramControlBridge<C, O, S, R, L> {
     poller: TelegramPoller<CapturingClient<C>, S>,
     captured: Arc<Mutex<Option<Vec<u8>>>>,
     outbound: O,
     surface: R,
+    lane: L,
     policy: TelegramAccessPolicy,
     allowed: AllowedUsers,
     bot_id: i64,
@@ -348,12 +454,13 @@ pub struct TelegramControlBridge<C, O, S, R> {
     terminal: Option<&'static str>,
 }
 
-impl<C, O, S, R> TelegramControlBridge<C, O, S, R>
+impl<C, O, S, R, L> TelegramControlBridge<C, O, S, R, L>
 where
     C: TelegramHttpClient,
     O: TelegramOutboundClient,
     S: TelegramDurableSink,
     R: ControlSurface,
+    L: RunLane,
 {
     /// Compose one bridge over its four seams.
     ///
@@ -361,12 +468,13 @@ where
     ///
     /// Returns whatever [`TelegramPoller::new`] refuses, which is a long-poll
     /// timeout outside the runtime's bounds.
-    pub fn new(parts: BridgeParts<C, O, S, R>) -> Result<Self, RuntimeError> {
+    pub fn new(parts: BridgeParts<C, O, S, R, L>) -> Result<Self, RuntimeError> {
         let BridgeParts {
             client,
             outbound,
             sink,
             surface,
+            lane,
             policy,
             allowed,
             inbound_token,
@@ -387,6 +495,7 @@ where
             captured,
             outbound,
             surface,
+            lane,
             policy,
             allowed,
             bot_id,
@@ -589,6 +698,22 @@ where
                         chat_id: principal.chat_id(),
                         text: refusal.operator_reply().to_owned(),
                     },
+                    Ok(ControlCommand::Run { task }) => {
+                        let chat_id = principal.chat_id();
+                        // The one command whose answer is an effect. It blocks
+                        // this thread for the length of the run; see
+                        // `crate::run_lane` for what that costs.
+                        match self.lane.run(task.as_str()) {
+                            Ok(answer) => Answer::RunAnswered {
+                                chat_id,
+                                text: bounded_reply(&answer),
+                            },
+                            Err(failure) => Answer::RunFailed {
+                                chat_id,
+                                text: failure.operator_reply().to_owned(),
+                            },
+                        }
+                    }
                     Ok(command) => match Unavailable::for_command(&command) {
                         Some(unavailable) => Answer::Unavailable {
                             chat_id: principal.chat_id(),
@@ -611,10 +736,13 @@ where
             ControlCommand::Help => help_text(),
             ControlCommand::Status => self.surface.status_text().unwrap_or_else(refused),
             ControlCommand::Runs => self.surface.runs_text().unwrap_or_else(refused),
+            // `answer_for` carried this one out through the run lane before
+            // `render` was reached; answering it here would be a second
+            // dispatch table over a command whose answer is an effect.
+            ControlCommand::Run { .. } => String::new(),
             // `Unavailable::for_command` decided these before `render` was
             // reached. Answering them here would be a second dispatch table.
-            ControlCommand::Run { .. }
-            | ControlCommand::Cancel { .. }
+            ControlCommand::Cancel { .. }
             | ControlCommand::Approve { .. }
             | ControlCommand::Deny { .. } => Unavailable::for_command(command)
                 .map_or_else(String::new, |unavailable| {
@@ -649,6 +777,16 @@ where
             }
             Answer::Answered { chat_id, text } => {
                 report.answered += 1;
+                (chat_id, text)
+            }
+            Answer::RunAnswered { chat_id, text } => {
+                report.answered += 1;
+                report.runs_answered += 1;
+                (chat_id, text)
+            }
+            Answer::RunFailed { chat_id, text } => {
+                report.unavailable += 1;
+                report.runs_failed += 1;
                 (chat_id, text)
             }
         };
@@ -705,6 +843,65 @@ enum Answer {
     Unavailable { chat_id: i64, text: String },
     /// A command this build answered.
     Answered { chat_id: i64, text: String },
+    /// A `/run` that produced an answer.
+    RunAnswered { chat_id: i64, text: String },
+    /// A `/run` that produced a typed failure.
+    RunFailed { chat_id: i64, text: String },
+}
+
+/// Longest `/run` answer one reply carries, in UTF-16 units.
+///
+/// Deliberately below [`MAX_SEND_MESSAGE_TEXT_UNITS`] rather than equal to it,
+/// so [`TRUNCATION_MARK`] and any future framing still fit inside the transport's
+/// own ceiling. An answer at the limit is sent; one over it is cut and marked.
+pub const MAX_RUN_ANSWER_UNITS: usize = MAX_SEND_MESSAGE_TEXT_UNITS - 64;
+
+/// What a truncated answer ends with.
+///
+/// Marked rather than silent: an operator reading a provider's answer has to be
+/// able to tell "this is the whole thing" from "this is the part that fit".
+pub const TRUNCATION_MARK: &str = "\n[…truncated]";
+
+/// Fit one run's answer into a single reply.
+///
+/// Three things happen here and no more: control characters the transport
+/// refuses are replaced, the text is cut to [`MAX_RUN_ANSWER_UNITS`] UTF-16
+/// units at a character boundary, and an empty result becomes a fixed sentence.
+/// Nothing is reformatted and nothing is interpreted — the bytes are a
+/// provider's answer and this is a transport bound, not a renderer.
+///
+/// The unit is UTF-16 because that is the unit Telegram counts in and the one
+/// [`SendMessageRequest`] validates against; counting bytes or characters here
+/// would let an answer of astral-plane text be refused after this function said
+/// it fit.
+fn bounded_reply(answer: &str) -> String {
+    let mut text = String::with_capacity(answer.len());
+    let mut units = 0_usize;
+    let mut truncated = false;
+    for character in answer.chars() {
+        // The transport refuses every control character but tab and newline, so
+        // one that reached here is replaced rather than allowed to turn a real
+        // answer into a refused send.
+        let character = if character.is_control() && !matches!(character, '\n' | '\t') {
+            ' '
+        } else {
+            character
+        };
+        let width = character.len_utf16();
+        if units + width > MAX_RUN_ANSWER_UNITS {
+            truncated = true;
+            break;
+        }
+        text.push(character);
+        units += width;
+    }
+    if truncated {
+        text.push_str(TRUNCATION_MARK);
+    }
+    if text.trim().is_empty() {
+        return String::from("The run completed but its answer was empty.");
+    }
+    text
 }
 
 /// Wait out one retry interval, giving up early when the host asks to stop.

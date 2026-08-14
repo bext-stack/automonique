@@ -97,8 +97,10 @@ use nix::unistd::geteuid;
 
 pub mod attempt_host;
 pub mod cancel_custody;
+pub mod compose;
 pub mod egress;
 pub mod execute;
+pub mod run_lane;
 mod synthetic;
 mod telegram;
 pub mod telegram_bridge;
@@ -744,6 +746,7 @@ impl Daemon {
             state_dir: &state_dir,
             database_path: &config.database_path(),
             run_index_path: &config.run_index_path(),
+            admin_socket: &config.admin_socket(),
             generation_id: GENERATION_ID,
             holder_id: instance_id.as_str(),
             authority_lease_epoch: lease.epoch,

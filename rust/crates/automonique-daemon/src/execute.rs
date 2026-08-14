@@ -333,6 +333,35 @@ const WORKSPACE_LEAF: &str = "workspace";
 /// The run's authoritative spool directory, outside every grant.
 const SPOOL_LEAF: &str = "spool";
 
+/// Where this daemon resolves one run's `cwd_token` to, as a pure function of
+/// the state directory and the run identity.
+///
+/// # Why this is public, and why it is a function rather than a convention
+///
+/// [`DAEMON_WORKSPACE_REGISTRY`] says this daemon resolves exactly one
+/// workspace: a private empty directory it creates for the run. Everything
+/// downstream of that — a document whose argv has to name an absolute path
+/// inside the workspace, and a reader that has to find a file the workload left
+/// there — needs the *same* answer this lane will compute, and needs it before
+/// the run exists.
+///
+/// Exporting the resolution as one function is what keeps those callers from
+/// re-deriving it. A composer that rebuilt the path from constants would be a
+/// second owner of this directory tree, and the two would drift silently: the
+/// document would name a path the lane never granted, the workload would be
+/// denied by Landlock, and the failure would look like a provider fault.
+///
+/// The answer is a path, not a promise. The directory is created at admission
+/// time and only for a document that was admitted; a run that was refused, or
+/// that never executed, has nothing here.
+#[must_use]
+pub fn run_workspace(state_dir: &Path, run_id: &str) -> PathBuf {
+    state_dir
+        .join(RUNS_DIRECTORY)
+        .join(run_id)
+        .join(WORKSPACE_LEAF)
+}
+
 /// Everything the execution lane needs, or the reason it has nothing.
 ///
 /// Not [`Clone`]: it owns the daemon's worker threads and lends the attempt
@@ -443,6 +472,13 @@ impl ExecutionLane {
             .join(SPOOL_LEAF)
     }
 
+    /// Where one run's workspace resolves, through this lane's own state
+    /// directory. See [`run_workspace`].
+    #[must_use]
+    pub fn workspace_root(&self, run_id: &str) -> PathBuf {
+        run_workspace(&self.state_dir, run_id)
+    }
+
     /// Runs with a live attempt right now.
     ///
     /// `None` when the live set was poisoned by a panicking worker, which is
@@ -540,7 +576,9 @@ impl ExecutionLane {
         // leave no trace, including an empty directory tree that would make a
         // refused run look like one that started and vanished.
         let run_root = self.state_dir.join(RUNS_DIRECTORY).join(run_id);
-        let workspace = run_root.join(WORKSPACE_LEAF);
+        // One owner for this path: a composer that has to write it into a
+        // document computes the same value through the same function.
+        let workspace = self.workspace_root(run_id);
         let spool_root = run_root.join(SPOOL_LEAF);
 
         let prompt = self.resolve_prompt(spec)?;

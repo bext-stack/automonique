@@ -116,6 +116,47 @@ pub const MAX_DESTINATION_HOST_BYTES: usize = 253;
 /// refusal rather than a direct connection attempt.
 pub const BROKER_PROXY_VARIABLES: [&str; 2] = ["HTTPS_PROXY", "HTTP_PROXY"];
 
+/// Why a brokered launch may create `AF_UNIX` sockets, and why nothing else may.
+///
+/// # The problem this answers
+///
+/// Every real provider this build is aimed at is an async program, and an async
+/// runtime cannot even be *constructed* without `socketpair(AF_UNIX)` — tokio
+/// builds one as its signal self-pipe before any work starts. A plan with no
+/// socket grant fails every `socket(2)` and `socketpair(2)` with `EPERM`, so
+/// such a provider does not start at all. No lane granted `AF_UNIX`, so until
+/// now no admitted document could run one.
+///
+/// # The rule
+///
+/// [`AdmittedLaunch::with_broker`] composes [`SocketGrant::Unix`](crate::SocketGrant::Unix)
+/// alongside the TCP grant, the connect port and the proxy variables. Attaching
+/// a broker is the exact moment a launch stops being "a program that touches
+/// nothing" and becomes a networked client, so the grant lands on precisely the
+/// launches that need it: a document that denies egress gets no broker, and
+/// therefore no socket of any kind — not `AF_UNIX` either.
+///
+/// # Why this is not egress
+///
+/// An `AF_UNIX` socket cannot leave the host. A `socketpair` has both ends held
+/// by the workload and no external peer at all. A *pathname* socket could in
+/// principle reach a listener outside the run, and what bounds that is the
+/// Landlock filesystem policy the same plan installs: connecting to a pathname
+/// socket requires the path, and this plan grants the run's own workspace, its
+/// own program, and whatever the document's `path_grants` named — nothing else
+/// is reachable, and nothing in the composition adds a path.
+///
+/// # The honest residual
+///
+/// This is a rule the *admission bridge* applies, not something the document
+/// declares. A reviewer reading a RunSpec cannot see that its brokered launch
+/// will also be able to create local sockets; they can only see it here. That is
+/// the same shape as the brokered-destination gap [`AdmissionContext`] documents,
+/// and it closes the same way: a `required_local_socket_families` field on the
+/// sandbox spec, which is a wire change deliberately not made here.
+pub const LOCAL_IPC_IS_NOT_EGRESS: &str =
+    "a brokered launch may create AF_UNIX sockets; an unbrokered one may create none";
+
 /// Spec fields this bridge deliberately does not consult, and why.
 ///
 /// This list is closed and asserted by the module's tests. A field is on it
@@ -848,11 +889,15 @@ impl AdmittedLaunch {
     /// list in one place. What it adds, in full:
     ///
     /// - [`SocketGrant::Tcp`](crate::SocketGrant::Tcp) — the workload may create TCP sockets;
+    /// - [`SocketGrant::Unix`](crate::SocketGrant::Unix) — the workload may create local
+    ///   `AF_UNIX` sockets, which is [`LOCAL_IPC_IS_NOT_EGRESS`];
     /// - [`LaunchPlan::allow_connect_port`] for the broker's own port;
     /// - `HTTPS_PROXY` and `HTTP_PROXY`, both bound to `http://<endpoint>`.
     ///
     /// And what it deliberately does not add, each of which the pre-broker
-    /// live-provider path had: no `SocketGrant::InetDatagram`, so the workload
+    /// live-provider path had — the `AF_UNIX` grant above is the one the two
+    /// paths share, for the reason [`LOCAL_IPC_IS_NOT_EGRESS`] states: no
+    /// `SocketGrant::InetDatagram`, so the workload
     /// cannot create a UDP socket and cannot do DNS; no `connect` grant for 443
     /// or any other port a public service listens on; no `bind` port, so it
     /// cannot listen on the broker's port and impersonate it; and no resolver
@@ -895,6 +940,12 @@ impl AdmittedLaunch {
             .plan
             .clone()
             .socket_grant(crate::SocketGrant::Tcp)
+            .map_err(refused)?
+            // See `LOCAL_IPC_IS_NOT_EGRESS`. Composed here, in the one reviewed
+            // list, rather than offered as a second attachment a supervisor
+            // could choose: which sockets a workload may create is not a
+            // decision this crate delegates to its caller.
+            .socket_grant(crate::SocketGrant::Unix)
             .map_err(refused)?
             .allow_connect_port(endpoint.port())
             .map_err(refused)?;

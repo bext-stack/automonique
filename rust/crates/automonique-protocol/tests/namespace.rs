@@ -1031,6 +1031,15 @@ mod surface_coverage {
                 // `supervisor.adapter` does: a diagnostic identifier that a
                 // scanner cannot distinguish from a protocol name by shape.
                 "admission.origin",
+                // A **filename**, not a protocol name: the leaf the daemon's
+                // run composer tells a provider to write its final message to.
+                // It is on this list for exactly the reason the comment above
+                // gives for `state.sqlite3` and `filter.sh` — a scanner cannot
+                // tell a dotted filename from a dotted protocol name by shape —
+                // and it is entered here rather than renamed because the answer
+                // file really is markdown and saying so in its extension is
+                // worth more than avoiding a shape.
+                "answer.md",
                 "checkpoint.create",
                 "checkpoint.list",
                 "checkpoint.restore",

@@ -68,6 +68,7 @@
 //! module cannot zero, which is the same limit the validate-and-drop path
 //! already had. Nothing in this crate renders, logs or replies with it.
 
+use crate::run_lane::SocketRunLane;
 use crate::telegram_bridge::{BridgeParts, HostFacts, StoreControlSurface, TelegramControlBridge};
 use automonique_protocol::admin::{ExecutionState, TelegramState};
 use automonique_store::Store;
@@ -117,6 +118,7 @@ type LiveBridge = TelegramControlBridge<
     TelegramHttpsClient,
     StoreTelegramDurableSink<SystemClock>,
     StoreControlSurface,
+    SocketRunLane,
 >;
 
 /// Why a present Telegram configuration was refused.
@@ -392,8 +394,13 @@ pub(crate) struct TelegramHostParams<'a> {
     pub(crate) state_dir: &'a Path,
     /// The daemon's main database, which carries the bot lease and the status.
     pub(crate) database_path: &'a Path,
-    /// The runs read model a `/runs` reply lists from.
+    /// The runs read model a `/runs` reply lists from, and that a `/run` waits
+    /// on.
     pub(crate) run_index_path: &'a Path,
+    /// This daemon's own admin endpoint, which a `/run` submits and starts
+    /// through. See [`crate::run_lane`] for why the poller thread is a client
+    /// of the daemon it belongs to.
+    pub(crate) admin_socket: &'a Path,
     /// Generation this daemon holds.
     pub(crate) generation_id: &'a str,
     /// This daemon's instance identity.
@@ -558,11 +565,19 @@ impl TelegramHost {
         .map_err(|_| TelegramHostError::SurfaceUnavailable)?;
         let poller_store =
             Store::open(params.database_path).map_err(|_| TelegramHostError::StoreUnavailable)?;
+        // The lane opens successfully on a deployment that has not configured
+        // `/run` at all and refuses every one with `not configured`; only an
+        // unopenable read model is a startup refusal, because a lane that could
+        // not observe a run would report every one of them as unavailable.
+        let lane =
+            SocketRunLane::open(params.state_dir, params.admin_socket, params.run_index_path)
+                .map_err(|_| TelegramHostError::SurfaceUnavailable)?;
         TelegramControlBridge::new(BridgeParts {
             client: TelegramHttpsClient::new(),
             outbound: TelegramHttpsClient::new(),
             sink: StoreTelegramDurableSink::new(poller_store, SystemClock),
             surface,
+            lane,
             policy: live.policy,
             allowed: live.allowed,
             inbound_token: live.inbound_token,
@@ -793,6 +808,7 @@ mod tests {
         state_dir: PathBuf,
         database_path: PathBuf,
         run_index_path: PathBuf,
+        admin_socket: PathBuf,
         lease_epoch: u64,
     }
 
@@ -818,6 +834,7 @@ mod tests {
             }
             let database_path = state_dir.join("automonique.sqlite3");
             let run_index_path = state_dir.join("run-index.sqlite3");
+            let admin_socket = state_dir.join("admin.sock");
             let mut store = Store::open(&database_path).expect("store opens");
             let lease = store
                 .acquire_generation_lease(automonique_store::LeaseRequest {
@@ -832,6 +849,7 @@ mod tests {
                 state_dir,
                 database_path,
                 run_index_path,
+                admin_socket,
                 lease_epoch: lease.epoch,
             }
         }
@@ -841,6 +859,7 @@ mod tests {
                 state_dir: &self.state_dir,
                 database_path: &self.database_path,
                 run_index_path: &self.run_index_path,
+                admin_socket: &self.admin_socket,
                 generation_id: crate::GENERATION_ID,
                 holder_id: "telegram-host-fixture",
                 authority_lease_epoch: self.lease_epoch,
