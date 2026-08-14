@@ -337,8 +337,8 @@ fn the_auth_test_method_sends_its_exact_request_and_parses_the_identity_back() {
     let captured = fake.only_request();
     assert_wire_shape(&captured, "/api/auth.test");
     assert_eq!(
-        captured.body, "{}",
-        "the one method with no argument sends the empty object"
+        captured.body, "",
+        "the one method with no argument sends an empty form body"
     );
 
     let identity = outcome.accepted().expect("accepted identity");
@@ -368,7 +368,7 @@ fn the_conversations_list_method_sends_its_exact_request_and_parses_the_page_bac
     assert_wire_shape(&captured, "/api/conversations.list");
     assert_eq!(
         captured.body,
-        "{\"types\":\"public_channel,private_channel\",\"limit\":200}"
+        "types=public_channel%2Cprivate_channel&limit=200"
     );
 
     let page = outcome.accepted().expect("accepted page");
@@ -399,7 +399,7 @@ fn the_conversations_info_method_sends_its_exact_request_and_parses_the_channel_
 
     let captured = fake.only_request();
     assert_wire_shape(&captured, "/api/conversations.info");
-    assert_eq!(captured.body, "{\"channel\":\"C0RESERVED\"}");
+    assert_eq!(captured.body, "channel=C0RESERVED");
 
     let channel = outcome.accepted().expect("accepted channel");
     assert_eq!(channel.id.as_str(), CHANNEL);
@@ -435,8 +435,7 @@ fn the_conversations_history_method_reads_a_channels_recent_messages() {
     assert_wire_shape(&captured, "/api/conversations.history");
     assert_eq!(
         captured.body,
-        "{\"channel\":\"C0RESERVED\",\"limit\":40,\"cursor\":\"cHJldjox\",\
-         \"oldest\":\"1723500000.000000\"}"
+        "channel=C0RESERVED&limit=40&cursor=cHJldjox&oldest=1723500000.000000"
     );
 
     let page = outcome.accepted().expect("accepted page");
@@ -504,10 +503,10 @@ fn paging_a_history_returns_slacks_own_cursor_verbatim_on_the_next_request() {
 
     let captured = fake.captured();
     assert_eq!(captured.len(), 2);
-    assert_eq!(captured[0].body, "{\"channel\":\"C0RESERVED\",\"limit\":1}");
+    assert_eq!(captured[0].body, "channel=C0RESERVED&limit=1");
     assert_eq!(
         captured[1].body,
-        "{\"channel\":\"C0RESERVED\",\"limit\":1,\"cursor\":\"bmV4dF90czoxNzIzNTQxMDAw\"}",
+        "channel=C0RESERVED&limit=1&cursor=bmV4dF90czoxNzIzNTQxMDAw",
         "the cursor must go back exactly as Slack issued it"
     );
 }
@@ -527,7 +526,7 @@ fn the_users_info_method_resolves_an_author_to_a_display_name() {
 
     let captured = fake.only_request();
     assert_wire_shape(&captured, "/api/users.info");
-    assert_eq!(captured.body, "{\"user\":\"U0RESERVED\"}");
+    assert_eq!(captured.body, "user=U0RESERVED");
 
     let user = outcome.accepted().expect("accepted user");
     assert_eq!(user.id.as_str(), USER);
@@ -561,8 +560,7 @@ fn the_post_message_method_sends_its_exact_request_and_parses_the_receipt_back()
     assert_wire_shape(&captured, "/api/chat.postMessage");
     assert_eq!(
         captured.body,
-        "{\"channel\":\"C0RESERVED\",\"text\":\"Bonjour,\\nc'est regle.\",\
-         \"thread_ts\":\"1723542000.000100\"}"
+        "channel=C0RESERVED&text=Bonjour%2C%0Ac%27est%20regle.&thread_ts=1723542000.000100"
     );
 
     let posted = outcome.accepted().expect("accepted receipt");
@@ -591,9 +589,12 @@ fn hostile_message_content_survives_one_round_trip_byte_exactly() {
         .expect("call");
 
     let captured = fake.only_request();
-    let body: serde_json::Value = serde_json::from_str(&captured.body).expect("body is JSON");
-    assert_eq!(body["text"], hostile);
-    assert_eq!(body["channel"], CHANNEL);
+    // Every JSON and form metacharacter in the text is percent-encoded, so the
+    // text arrives as the value of `text` and cannot become body structure.
+    assert_eq!(
+        captured.body,
+        "channel=C0RESERVED&text=quote%22%20slash%5C%20brace%7D%20newline%0Aend"
+    );
 }
 
 #[test]

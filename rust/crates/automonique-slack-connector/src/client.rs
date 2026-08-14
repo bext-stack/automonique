@@ -51,11 +51,13 @@ pub const SLACK_ACCEPT: &str = "application/json";
 
 /// The media type every request sends.
 ///
-/// The charset is explicit because Slack answers a JSON body without one by
-/// setting a `missing_charset` warning on an otherwise successful call, and a
-/// connector that provokes a warning on every write is a connector nobody can
-/// read the logs of.
-pub const SLACK_CONTENT_TYPE: &str = "application/json; charset=utf-8";
+/// Form-encoded rather than JSON: Slack's read methods reject a JSON request
+/// body with `invalid_arguments` (confirmed live), so
+/// `application/x-www-form-urlencoded` is the one spelling every method accepts.
+/// The body is pure ASCII after percent-encoding, so no charset parameter is
+/// carried — the value matches what the live API accepts from a plain
+/// form-encoded `POST`.
+pub const SLACK_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 
 /// How this connector identifies itself.
 ///
@@ -550,7 +552,7 @@ mod tests {
                 ConversationsListRequest::new(ConversationTypes::all_channels(), 200)
                     .expect("list")
             )),
-            "{\"types\":\"public_channel,private_channel\",\"limit\":200}"
+            "types=public_channel%2Cprivate_channel&limit=200"
         );
     }
 }

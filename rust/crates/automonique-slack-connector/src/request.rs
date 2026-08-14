@@ -8,21 +8,40 @@
 //! asking for `chat.delete` or `admin.conversations.archive` cannot spell one,
 //! because no variant exists.
 //!
-//! Every argument travels in a JSON request body rather than a query string.
-//! Slack accepts both, and the legacy bot's SDK form-encodes; JSON is chosen
-//! here because it is the spelling Slack documents for a `Bearer`-authenticated
-//! call, because it is the only spelling that will carry a Block Kit payload
-//! when one is added, and because it lets this crate reuse the same audited
-//! [`crate::push_json_string`] escaping the other connectors use. Every string
-//! is escaped there; nothing is interpolated raw.
+//! Every argument travels form-encoded in a `POST` body rather than in a query
+//! string. This is not a free choice: Slack's read methods
+//! (`conversations.info`, `conversations.history`, `users.info`,
+//! `conversations.list`) reject a JSON request body with `invalid_arguments`
+//! even under a `Bearer` credential — confirmed against the live API — so
+//! `application/x-www-form-urlencoded` is the one spelling every method accepts.
+//! A `POST` body keeps every caller value out of the URL entirely, which is what
+//! makes the target lock a statement about the whole request, not its path
+//! alone. Every value is percent-encoded through the audited
+//! [`crate::push_form_value`]; nothing is interpolated raw, and the keys are the
+//! fixed ASCII argument names below.
 //!
-//! Field order within a body is fixed and documented per method. JSON objects
-//! are order-insensitive to a server, so this is a testability property rather
-//! than a protocol one: it lets a test assert one exact captured request
-//! instead of a set of permutations.
+//! Field order within a body is fixed and documented per method. A server reads
+//! the fields order-insensitively, so this is a testability property rather than
+//! a protocol one: it lets a test assert one exact captured request instead of a
+//! set of permutations.
 
 use crate::target::{ChannelId, Cursor, MessageTs, UserId};
-use crate::{MAX_MESSAGE_TEXT_BYTES, MAX_PAGE_LIMIT, SlackRefusal, is_body_text, push_json_string};
+use crate::{MAX_MESSAGE_TEXT_BYTES, MAX_PAGE_LIMIT, SlackRefusal, is_body_text, push_form_value};
+
+/// Append one `key=value` field to a form body, prefixed with `&` unless it is
+/// the first field.
+///
+/// The key is one of the fixed ASCII argument names in [`SlackOperation::body`],
+/// every one of which is already within the unreserved set, so only the value is
+/// percent-encoded.
+fn push_form_field(out: &mut String, key: &str, value: &str) {
+    if !out.is_empty() {
+        out.push('&');
+    }
+    out.push_str(key);
+    out.push('=');
+    push_form_value(out, value);
+}
 
 /// The prefix every Slack Web API method hangs from.
 const API_PREFIX: &str = "/api";
@@ -435,66 +454,48 @@ impl SlackOperation {
         matches!(self, Self::ChatPostMessage(_))
     }
 
-    /// The exact JSON body, in the documented field order.
+    /// The exact form-encoded body, in the documented field order.
     ///
     /// Credential-free by construction, so a host may log or fixture it. Every
-    /// method carries a body — `auth.test` takes no argument and sends the
-    /// empty object.
+    /// value is percent-encoded; `auth.test` takes no argument and sends the
+    /// empty body.
     #[must_use]
     pub fn body(&self) -> String {
+        let mut body = String::new();
         match self {
-            Self::AuthTest => String::from("{}"),
+            Self::AuthTest => {}
             Self::ConversationsList(request) => {
-                let mut body = String::from("{\"types\":");
-                push_json_string(&mut body, request.types().as_wire());
-                body.push_str(&format!(",\"limit\":{}", request.limit()));
+                push_form_field(&mut body, "types", request.types().as_wire());
+                push_form_field(&mut body, "limit", &request.limit().to_string());
                 if let Some(cursor) = request.cursor() {
-                    body.push_str(",\"cursor\":");
-                    push_json_string(&mut body, cursor.as_str());
+                    push_form_field(&mut body, "cursor", cursor.as_str());
                 }
-                body.push('}');
-                body
             }
             Self::ConversationsInfo(request) => {
-                let mut body = String::from("{\"channel\":");
-                push_json_string(&mut body, request.channel().as_str());
-                body.push('}');
-                body
+                push_form_field(&mut body, "channel", request.channel().as_str());
             }
             Self::ConversationsHistory(request) => {
-                let mut body = String::from("{\"channel\":");
-                push_json_string(&mut body, request.channel().as_str());
-                body.push_str(&format!(",\"limit\":{}", request.limit()));
+                push_form_field(&mut body, "channel", request.channel().as_str());
+                push_form_field(&mut body, "limit", &request.limit().to_string());
                 if let Some(cursor) = request.cursor() {
-                    body.push_str(",\"cursor\":");
-                    push_json_string(&mut body, cursor.as_str());
+                    push_form_field(&mut body, "cursor", cursor.as_str());
                 }
                 if let Some(oldest) = request.oldest() {
-                    body.push_str(",\"oldest\":");
-                    push_json_string(&mut body, oldest.as_str());
+                    push_form_field(&mut body, "oldest", oldest.as_str());
                 }
-                body.push('}');
-                body
             }
             Self::UsersInfo(request) => {
-                let mut body = String::from("{\"user\":");
-                push_json_string(&mut body, request.user().as_str());
-                body.push('}');
-                body
+                push_form_field(&mut body, "user", request.user().as_str());
             }
             Self::ChatPostMessage(request) => {
-                let mut body = String::from("{\"channel\":");
-                push_json_string(&mut body, request.channel().as_str());
-                body.push_str(",\"text\":");
-                push_json_string(&mut body, request.text().as_str());
+                push_form_field(&mut body, "channel", request.channel().as_str());
+                push_form_field(&mut body, "text", request.text().as_str());
                 if let Some(thread) = request.thread_ts() {
-                    body.push_str(",\"thread_ts\":");
-                    push_json_string(&mut body, thread.as_str());
+                    push_form_field(&mut body, "thread_ts", thread.as_str());
                 }
-                body.push('}');
-                body
             }
         }
+        body
     }
 }
 
@@ -533,14 +534,16 @@ mod tests {
 
     #[test]
     fn every_body_is_exact_and_credential_free() {
-        assert_eq!(SlackOperation::AuthTest.body(), "{}");
+        // The one method with no argument sends an empty form body.
+        assert_eq!(SlackOperation::AuthTest.body(), "");
 
         let list = SlackOperation::ConversationsList(
             ConversationsListRequest::new(ConversationTypes::all_channels(), 200).expect("list"),
         );
+        // The comma between the two channel types is percent-encoded to %2C.
         assert_eq!(
             list.body(),
-            "{\"types\":\"public_channel,private_channel\",\"limit\":200}"
+            "types=public_channel%2Cprivate_channel&limit=200"
         );
 
         let paged = SlackOperation::ConversationsList(
@@ -550,16 +553,16 @@ mod tests {
         );
         assert_eq!(
             paged.body(),
-            "{\"types\":\"private_channel\",\"limit\":50,\"cursor\":\"dGVhbTpDMFJFU0VSVkVE\"}"
+            "types=private_channel&limit=50&cursor=dGVhbTpDMFJFU0VSVkVE"
         );
 
         let info = SlackOperation::ConversationsInfo(ConversationsInfoRequest::new(channel()));
-        assert_eq!(info.body(), "{\"channel\":\"C0RESERVED\"}");
+        assert_eq!(info.body(), "channel=C0RESERVED");
 
         let history = SlackOperation::ConversationsHistory(
             ConversationsHistoryRequest::new(channel(), 40).expect("history"),
         );
-        assert_eq!(history.body(), "{\"channel\":\"C0RESERVED\",\"limit\":40}");
+        assert_eq!(history.body(), "channel=C0RESERVED&limit=40");
 
         let windowed = SlackOperation::ConversationsHistory(
             ConversationsHistoryRequest::new(channel(), 200)
@@ -569,22 +572,18 @@ mod tests {
         );
         assert_eq!(
             windowed.body(),
-            "{\"channel\":\"C0RESERVED\",\"limit\":200,\
-             \"cursor\":\"dGVhbTpDMFJFU0VSVkVE\",\"oldest\":\"1723542000.000100\"}"
+            "channel=C0RESERVED&limit=200&cursor=dGVhbTpDMFJFU0VSVkVE&oldest=1723542000.000100"
         );
 
         let user =
             SlackOperation::UsersInfo(UsersInfoRequest::new(UserId::new(USER).expect("user")));
-        assert_eq!(user.body(), "{\"user\":\"U0RESERVED\"}");
+        assert_eq!(user.body(), "user=U0RESERVED");
 
         let post = SlackOperation::ChatPostMessage(PostMessageRequest::new(
             channel(),
             MessageText::new("bonjour").expect("text"),
         ));
-        assert_eq!(
-            post.body(),
-            "{\"channel\":\"C0RESERVED\",\"text\":\"bonjour\"}"
-        );
+        assert_eq!(post.body(), "channel=C0RESERVED&text=bonjour");
 
         let reply = SlackOperation::ChatPostMessage(
             PostMessageRequest::new(channel(), MessageText::new("suite").expect("text"))
@@ -592,8 +591,7 @@ mod tests {
         );
         assert_eq!(
             reply.body(),
-            "{\"channel\":\"C0RESERVED\",\"text\":\"suite\",\
-             \"thread_ts\":\"1723542000.000100\"}"
+            "channel=C0RESERVED&text=suite&thread_ts=1723542000.000100"
         );
     }
 
@@ -603,9 +601,14 @@ mod tests {
             channel(),
             MessageText::new("quote\" slash\\ brace} newline\nend\"}").expect("text"),
         ));
-        let parsed: serde_json::Value = serde_json::from_str(&post.body()).expect("valid JSON");
-        assert_eq!(parsed["channel"], CHANNEL);
-        assert_eq!(parsed["text"], "quote\" slash\\ brace} newline\nend\"}");
+        // Every metacharacter that could break out of a form field — the field
+        // separator `&`, the pair separator `=`, quotes, backslashes, braces,
+        // and the newline — is percent-encoded, so the text can only arrive as
+        // the value of `text`, never as structure.
+        assert_eq!(
+            post.body(),
+            "channel=C0RESERVED&text=quote%22%20slash%5C%20brace%7D%20newline%0Aend%22%7D"
+        );
     }
 
     #[test]

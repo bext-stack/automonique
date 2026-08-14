@@ -493,30 +493,31 @@ pub(crate) fn is_body_text(text: &str, max_bytes: usize) -> bool {
             .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
 }
 
-/// Append one JSON string literal, escaping everything RFC 8259 requires.
+/// Append one value as an `application/x-www-form-urlencoded` field value,
+/// percent-encoding every byte outside the RFC 3986 unreserved set.
 ///
-/// Written out rather than delegated to a serializer so a body's field order is
-/// exactly the one this crate documents; a map-backed serializer would reorder
-/// it. `DEL` is escaped as well, so no C0/C1-adjacent byte reaches a captured
-/// request verbatim.
-pub(crate) fn push_json_string(out: &mut String, value: &str) {
-    out.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            control if control < '\u{20}' || control == '\u{7f}' => {
-                out.push_str(&format!("\\u{:04x}", control as u32));
-            }
-            plain => out.push(plain),
+/// Slack's read methods (`conversations.info`, `conversations.history`,
+/// `users.info`, `conversations.list`) do not parse a JSON request body — a
+/// `Bearer` call carrying one answers `invalid_arguments`, confirmed against the
+/// live API — so every argument this connector sends travels form-encoded, the
+/// one spelling every Web API method accepts. Written out rather than delegated
+/// to a crate so a body's field order is exactly the one this connector
+/// documents and a test can assert one exact captured request. Every
+/// non-unreserved byte — each metacharacter, each control byte, and each byte of
+/// a multi-byte UTF-8 sequence — becomes `%XX` with upper-case hex, so nothing
+/// this crate sends reaches a captured request verbatim except letters, digits,
+/// and `-._~`; `+` in particular becomes `%2B` rather than a space.
+pub(crate) fn push_form_value(out: &mut String, value: &str) {
+    const UPPER_HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(UPPER_HEX[usize::from(byte >> 4)] as char);
+            out.push(UPPER_HEX[usize::from(byte & 0x0f)] as char);
         }
     }
-    out.push('"');
 }
 
 #[cfg(test)]
@@ -649,13 +650,24 @@ mod tests {
     }
 
     #[test]
-    fn json_escaping_covers_every_control_code_point() {
+    fn form_encoding_percent_escapes_every_non_unreserved_byte() {
+        // Control bytes and metacharacters each become %XX with upper-case hex.
         let mut rendered = String::new();
-        push_json_string(&mut rendered, "\u{0}\u{1}\u{8}\u{c}\u{1f}\u{7f}");
-        assert_eq!(rendered, "\"\\u0000\\u0001\\b\\f\\u001f\\u007f\"");
-        let mut kept = String::new();
-        push_json_string(&mut kept, "re\u{301}ponse \"cite\u{301}e\"");
-        assert_eq!(kept, "\"re\u{301}ponse \\\"cite\u{301}e\\\"\"");
+        push_form_value(&mut rendered, "\u{0}\u{1}\u{8}\u{c}\u{1f}\u{7f}");
+        assert_eq!(rendered, "%00%01%08%0C%1F%7F");
+        // A space is %20 (never +), a quote is %22, and `+` is %2B so it can
+        // never be read back as a space.
+        let mut punctuation = String::new();
+        push_form_value(&mut punctuation, "a b+c\"d");
+        assert_eq!(punctuation, "a%20b%2Bc%22d");
+        // The unreserved set passes through untouched.
+        let mut unreserved = String::new();
+        push_form_value(&mut unreserved, "Az09-_.~");
+        assert_eq!(unreserved, "Az09-_.~");
+        // Each byte of a multi-byte UTF-8 sequence is encoded on its own.
+        let mut accented = String::new();
+        push_form_value(&mut accented, "re\u{301}ponse");
+        assert_eq!(accented, "re%CC%81ponse");
     }
 
     #[test]
