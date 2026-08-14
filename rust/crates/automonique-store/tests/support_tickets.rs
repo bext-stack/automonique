@@ -18,9 +18,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use automonique_store::support_tickets::{
-    FleetTicket, MAX_COMMENT_COUNT, MAX_FLEET_ISSUE_ID_BYTES, MAX_REQUESTED_BY_BYTES,
-    MAX_SITE_LABEL_BYTES, MAX_SUPPORT_TICKETS, MAX_TENANT_NAME_BYTES, MAX_TICKET_PAGE,
-    MAX_TICKET_TITLE_BYTES, MAX_TICKET_TOKEN_BYTES, MAX_TIMESTAMP_BYTES,
+    FleetTicket, MAX_COMMENT_COUNT, MAX_DRAFT_ANSWER_BYTES, MAX_FLEET_ISSUE_ID_BYTES,
+    MAX_REQUESTED_BY_BYTES, MAX_SITE_LABEL_BYTES, MAX_SUPPORT_TICKETS, MAX_TENANT_NAME_BYTES,
+    MAX_TICKET_PAGE, MAX_TICKET_TITLE_BYTES, MAX_TICKET_TOKEN_BYTES, MAX_TIMESTAMP_BYTES,
     SUPPORT_TICKETS_SCHEMA_VERSION, SupportTicketStore, TicketLifecycle, TicketRecord,
     TicketTransition,
 };
@@ -1110,4 +1110,554 @@ fn the_lifecycle_spellings_are_pinned() {
     for outside in ["", "NEW", "open", "done", "escalated"] {
         assert_eq!(TicketLifecycle::from_spelling(outside), None);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The draft answer, and the lifecycle it carries the ticket to
+// ---------------------------------------------------------------------------
+
+/// The draft every test below records, unless it is testing what is refused.
+const DRAFT: &str = "Bonjour Claire,\n\nnous avons identifié la panne de paiement.\n";
+
+/// THE WHOLE POINT OF THE COLUMN. A draft lands, the ticket reaches `answered`,
+/// and both survive a restart.
+#[test]
+fn a_draft_lands_with_the_lifecycle_and_both_survive_a_restart() {
+    let (private, mut store) = store();
+    drive(&mut store, "iss-1", TicketLifecycle::Working);
+    let before = store.ticket("iss-1").expect("read").expect("present");
+    assert_eq!(before.draft_answer_bytes, None, "nothing is drafted yet");
+    assert_eq!(before.draft_answer_at_ms, None);
+
+    let receipt = store
+        .record_draft("iss-1", DRAFT, 7_000)
+        .expect("draft recorded");
+    assert_eq!(receipt.lifecycle, TicketLifecycle::Answered);
+    assert!(!receipt.inserted, "a draft creates no row");
+    assert!(receipt.changed);
+    assert_eq!(
+        receipt.revision,
+        before.revision + 1,
+        "one call is one revision, not one per lattice step"
+    );
+    drop(store);
+
+    // DURABLE, not remembered: this is a different connection to the same file.
+    let reopened = SupportTicketStore::open(private.path()).expect("reopen");
+    let draft = reopened
+        .draft("iss-1")
+        .expect("draft read")
+        .expect("a draft is recorded");
+    assert_eq!(draft.text, DRAFT, "the draft is stored byte for byte");
+    assert_eq!(draft.recorded_at_ms, 7_000);
+    assert_eq!(draft.lifecycle, TicketLifecycle::Answered);
+
+    let record = reopened.ticket("iss-1").expect("read").expect("present");
+    assert_eq!(record.lifecycle, TicketLifecycle::Answered);
+    assert_eq!(record.revision, receipt.revision);
+    assert_eq!(
+        record.draft_answer_bytes,
+        Some(DRAFT.len()),
+        "a row reports the draft's size and never its text"
+    );
+    assert_eq!(record.draft_answer_at_ms, Some(7_000));
+    assert_eq!(record.last_synced_ms, 7_000);
+}
+
+/// The multi-step walk. A ticket at `acknowledged` — or at `new` — reaches
+/// `answered` in one call, along the same lattice `transition` walks one step at
+/// a time, and pays one revision for the one thing that happened.
+#[test]
+fn a_draft_walks_the_lattice_from_wherever_the_ticket_is() {
+    for (start, steps_skipped) in [
+        (TicketLifecycle::New, 3),
+        (TicketLifecycle::Acknowledged, 2),
+        (TicketLifecycle::Working, 1),
+    ] {
+        let (_private, mut store) = store();
+        drive(&mut store, "iss-1", start);
+        let before = store.ticket("iss-1").expect("read").expect("present");
+        assert_eq!(before.lifecycle, start);
+
+        let receipt = store
+            .record_draft("iss-1", DRAFT, 7_000)
+            .expect("draft recorded");
+        assert_eq!(receipt.lifecycle, TicketLifecycle::Answered, "{start:?}");
+        assert_eq!(
+            receipt.revision,
+            before.revision + 1,
+            "{start:?}: {steps_skipped} lattice steps are still one change"
+        );
+    }
+}
+
+/// The lattice refuses what it refuses. A ticket that has already been answered,
+/// or that has been closed, cannot acquire a draft — which is what stops a second
+/// draft from overwriting a first.
+#[test]
+fn a_ticket_that_cannot_reach_answered_is_refused_and_keeps_its_draft() {
+    let (_private, mut store) = store();
+    drive(&mut store, "iss-1", TicketLifecycle::Working);
+    let receipt = store
+        .record_draft("iss-1", DRAFT, 7_000)
+        .expect("first draft");
+
+    // Already answered: there is no step left, so the second draft is refused
+    // and the first is exactly where it was.
+    let error = store
+        .record_draft("iss-1", "a second and different draft", 8_000)
+        .expect_err("a second draft is refused");
+    assert_eq!(error.category(), "illegal_transition");
+    assert!(error.to_string().contains("answered"));
+    let draft = store.draft("iss-1").expect("read").expect("present");
+    assert_eq!(draft.text, DRAFT, "the first draft is not overwritten");
+    let record = store.ticket("iss-1").expect("read").expect("present");
+    assert_eq!(
+        record.revision, receipt.revision,
+        "a refused draft moves nothing"
+    );
+
+    // Closed: the terminal state leaves nothing, including this.
+    store
+        .transition(TicketTransition {
+            fleet_issue_id: "iss-1",
+            expected_revision: receipt.revision,
+            lifecycle: TicketLifecycle::Closed,
+            now_ms: 9_000,
+        })
+        .expect("close");
+    let error = store
+        .record_draft("iss-1", "after the close", 10_000)
+        .expect_err("a closed ticket is refused");
+    assert_eq!(error.category(), "illegal_transition");
+    assert_eq!(
+        store.draft("iss-1").expect("read").expect("present").text,
+        DRAFT,
+        "closing keeps the draft that was written before it"
+    );
+}
+
+/// A reference naming no ticket is `not_found`, and nothing is created for it.
+#[test]
+fn a_draft_for_an_unrecorded_ticket_is_not_found() {
+    let (_private, mut store) = store();
+    let error = store
+        .record_draft("iss-absent", DRAFT, 7_000)
+        .expect_err("no such ticket");
+    assert_eq!(error.category(), "not_found");
+    assert_eq!(store.ticket_count().expect("count"), 0);
+
+    let error = store.draft("iss-absent").expect_err("no such ticket");
+    assert_eq!(error.category(), "not_found");
+}
+
+/// Every draft this store refuses, and the two shapes it admits that no other
+/// text column here does.
+#[test]
+fn a_draft_outside_its_grammar_is_refused_by_field() {
+    let (_private, mut store) = store();
+    drive(&mut store, "iss-1", TicketLifecycle::Working);
+
+    for refused in [
+        String::new(),
+        "x".repeat(MAX_DRAFT_ANSWER_BYTES + 1),
+        String::from("a draft with a bell\u{7}in it"),
+        String::from("a draft with a carriage return\r"),
+    ] {
+        let error = store
+            .record_draft("iss-1", &refused, 7_000)
+            .expect_err("refused draft");
+        assert_eq!(
+            error.category(),
+            "invalid_field",
+            "a draft of {} bytes must be refused",
+            refused.len()
+        );
+        assert!(error.to_string().contains("draft_answer"));
+    }
+
+    // An instant before the row's last observation is the caller's clock going
+    // backwards, refused exactly as `record` and `transition` refuse it.
+    let error = store
+        .record_draft("iss-1", DRAFT, 1_999)
+        .expect_err("stale instant");
+    assert_eq!(error.category(), "invalid_field");
+    assert!(error.to_string().contains("now_ms"));
+    let error = store
+        .record_draft("iss-1", DRAFT, -1)
+        .expect_err("negative instant");
+    assert_eq!(error.category(), "invalid_field");
+
+    // Nothing above moved the ticket.
+    let record = store.ticket("iss-1").expect("read").expect("present");
+    assert_eq!(record.lifecycle, TicketLifecycle::Working);
+    assert_eq!(record.draft_answer_bytes, None);
+
+    // Newlines and tabs are what a written answer is made of.
+    store
+        .record_draft("iss-1", "line\tone\nline two\n", 7_000)
+        .expect("a multi-line draft is a draft");
+}
+
+/// A draft at the ceiling exactly is admitted, rather than refused for being at
+/// it. The pair with the over-long case above is what makes the bound a bound.
+#[test]
+fn a_draft_at_the_ceiling_exactly_is_admitted() {
+    let (_private, mut store) = store();
+    drive(&mut store, "iss-1", TicketLifecycle::Working);
+    let at_ceiling = "y".repeat(MAX_DRAFT_ANSWER_BYTES);
+    store
+        .record_draft("iss-1", &at_ceiling, 7_000)
+        .expect("a draft at the ceiling lands");
+    assert_eq!(
+        store
+            .ticket("iss-1")
+            .expect("read")
+            .expect("present")
+            .draft_answer_bytes,
+        Some(MAX_DRAFT_ANSWER_BYTES)
+    );
+    assert_eq!(
+        store.draft("iss-1").expect("read").expect("present").text,
+        at_ceiling
+    );
+}
+
+/// The reported size is bytes, not characters — the unit the ceiling is stated
+/// in. A draft of multi-byte text would pass a character count it exceeds.
+#[test]
+fn the_reported_draft_size_is_bytes() {
+    let (_private, mut store) = store();
+    drive(&mut store, "iss-1", TicketLifecycle::Working);
+    let draft = "é".repeat(10);
+    assert_eq!(draft.chars().count(), 10);
+    assert_eq!(draft.len(), 20);
+    store.record_draft("iss-1", &draft, 7_000).expect("draft");
+    assert_eq!(
+        store
+            .ticket("iss-1")
+            .expect("read")
+            .expect("present")
+            .draft_answer_bytes,
+        Some(20)
+    );
+}
+
+/// A ticket with no draft answers that, rather than refusing or inventing one.
+#[test]
+fn a_ticket_without_a_draft_reads_as_no_draft() {
+    let (_private, mut store) = store();
+    store.record(&ticket("iss-1")).expect("record");
+    assert_eq!(store.draft("iss-1").expect("read"), None);
+    let record = store.ticket("iss-1").expect("read").expect("present");
+    assert_eq!(record.draft_answer_bytes, None);
+    assert_eq!(record.draft_answer_at_ms, None);
+}
+
+/// The fleet's writer does not touch this host's draft.
+#[test]
+fn a_re_poll_leaves_the_draft_and_the_answered_lifecycle_alone() {
+    let (_private, mut store) = store();
+    drive(&mut store, "iss-1", TicketLifecycle::Working);
+    store.record_draft("iss-1", DRAFT, 7_000).expect("draft");
+
+    let mut again = ticket("iss-1");
+    again.observed_at_ms = 11_000;
+    again.comment_count = 9;
+    store.record(&again).expect("re-poll");
+
+    let record = store.ticket("iss-1").expect("read").expect("present");
+    assert_eq!(record.comment_count, 9, "the fleet's own field moved");
+    assert_eq!(record.lifecycle, TicketLifecycle::Answered);
+    assert_eq!(record.draft_answer_bytes, Some(DRAFT.len()));
+    assert_eq!(record.draft_answer_at_ms, Some(7_000));
+    assert_eq!(
+        store.draft("iss-1").expect("read").expect("present").text,
+        DRAFT
+    );
+}
+
+/// The second nullable-CHECK trap, watched exactly as the first one is.
+///
+/// The draft is two columns that are present or absent *together*, and a bare
+/// `length(draft_answer) > 0` would evaluate to `NULL` for the absent case and be
+/// admitted. Every shape below is refused by the database itself.
+#[test]
+fn the_draft_columns_never_reach_a_check_that_would_answer_null() {
+    let (private, store) = store();
+    drop(store);
+
+    let raw = Connection::open(private.path()).expect("raw write");
+    let row = |key: &str, lifecycle: &str, draft: &str, at_ms: &str| {
+        format!(
+            "INSERT INTO support_tickets
+             (fleet_issue_id, title, tenant_name, site_label, fleet_status, priority,
+              source, requested_by, comment_count, created_at, updated_at,
+              first_seen_ms, last_synced_ms, lifecycle, revision,
+              draft_answer, draft_answer_at_ms)
+             VALUES ('{key}', 'Titre', 'Tenant', NULL, 'open', 'normal',
+                     'email', 'Claire', 0, '2026-01-01', '2026-01-01', 0, 0,
+                     '{lifecycle}', 1, {draft}, {at_ms})"
+        )
+    };
+
+    for (what, statement) in [
+        (
+            "a draft with no instant",
+            row("a", "answered", "'un brouillon'", "NULL"),
+        ),
+        (
+            "an instant with no draft",
+            row("b", "answered", "NULL", "7000"),
+        ),
+        ("an empty draft", row("c", "answered", "''", "7000")),
+        (
+            "an over-long draft",
+            row(
+                "d",
+                "answered",
+                &format!("'{}'", "v".repeat(MAX_DRAFT_ANSWER_BYTES + 1)),
+                "7000",
+            ),
+        ),
+        (
+            "a draft measured in characters rather than bytes",
+            row(
+                "e",
+                "answered",
+                // Half the ceiling in characters, over it in bytes: a check
+                // written as `length(draft_answer)` would admit this.
+                &format!("'{}'", "é".repeat(MAX_DRAFT_ANSWER_BYTES / 2 + 1)),
+                "7000",
+            ),
+        ),
+        (
+            "a negative draft instant",
+            row("f", "answered", "'un brouillon'", "-1"),
+        ),
+        (
+            "a draft on a ticket that has not been answered",
+            row("g", "working", "'un brouillon'", "7000"),
+        ),
+    ] {
+        assert!(
+            raw.execute(&statement, []).is_err(),
+            "the database must refuse {what}"
+        );
+    }
+
+    // Tightness, not mere strictness: both legal shapes land.
+    raw.execute(&row("absent", "working", "NULL", "NULL"), [])
+        .expect("a ticket with no draft lands");
+    raw.execute(&row("present", "answered", "'un brouillon'", "7000"), [])
+        .expect("a drafted ticket lands");
+    raw.execute(&row("closed", "closed", "'un brouillon'", "7000"), [])
+        .expect("closing a drafted ticket keeps its draft");
+}
+
+/// A draft row smuggled past the CHECKs is refused on read rather than believed.
+#[test]
+fn a_hand_written_draft_outside_this_apis_grammar_surfaces_as_corruption() {
+    for (what, statement) in [
+        (
+            "a half-written draft",
+            "UPDATE support_tickets SET draft_answer_at_ms = NULL",
+        ),
+        (
+            "an empty draft",
+            "UPDATE support_tickets SET draft_answer = ''",
+        ),
+        (
+            "a draft on a ticket at working",
+            "UPDATE support_tickets SET lifecycle = 'working'",
+        ),
+        (
+            "a draft carrying a control character",
+            "UPDATE support_tickets SET draft_answer = 'un\u{7}brouillon'",
+        ),
+    ] {
+        let (private, mut store) = store();
+        drive(&mut store, "iss-1", TicketLifecycle::Working);
+        store.record_draft("iss-1", DRAFT, 7_000).expect("draft");
+        drop(store);
+
+        let raw = Connection::open(private.path()).expect("raw write");
+        raw.pragma_update(None, "ignore_check_constraints", true)
+            .expect("disable checks");
+        raw.execute(statement, []).expect("smuggle row");
+        drop(raw);
+
+        let reopened = SupportTicketStore::open(private.path()).expect("reopen");
+        // Both readers refuse it: the one that reports the draft's size and the
+        // one that hands back its text.
+        let by_record = reopened.ticket("iss-1");
+        let by_draft = reopened.draft("iss-1");
+        assert!(
+            by_record.is_err() || by_draft.is_err(),
+            "{what} must be refused by a reader"
+        );
+        for error in [by_record.err(), by_draft.err()].into_iter().flatten() {
+            assert_eq!(error.category(), "corrupt", "{what}");
+        }
+    }
+}
+
+/// A v1 database keeps its rows and gains the draft columns.
+///
+/// The old schema is written out here by hand rather than imported, because that
+/// is the only way this test can still be about a database this build did not
+/// create.
+#[test]
+fn a_v1_database_migrates_and_keeps_every_row() {
+    let private = PrivateStore::new();
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(private.path())
+        .expect("private file");
+
+    let raw = Connection::open(private.path()).expect("raw create");
+    raw.execute_batch(
+        "CREATE TABLE support_tickets (
+            ticket_id INTEGER PRIMARY KEY,
+            fleet_issue_id TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            tenant_name TEXT NOT NULL,
+            site_label TEXT,
+            fleet_status TEXT NOT NULL,
+            priority TEXT NOT NULL,
+            source TEXT NOT NULL,
+            requested_by TEXT NOT NULL,
+            comment_count INTEGER NOT NULL CHECK (
+                comment_count >= 0 AND comment_count <= 10000
+            ),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            first_seen_ms INTEGER NOT NULL CHECK (first_seen_ms >= 0),
+            last_synced_ms INTEGER NOT NULL CHECK (last_synced_ms >= 0),
+            lifecycle TEXT NOT NULL CHECK (
+                lifecycle IN ('new', 'acknowledged', 'working', 'answered', 'closed')
+            ),
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            CHECK (last_synced_ms >= first_seen_ms),
+            CHECK (
+                site_label IS NULL
+                OR (site_label IS NOT NULL
+                    AND length(site_label) > 0
+                    AND length(site_label) <= 200)
+            )
+        ) STRICT;
+        CREATE INDEX support_tickets_by_lifecycle ON support_tickets(lifecycle, ticket_id);
+        CREATE INDEX support_tickets_by_sync ON support_tickets(last_synced_ms, ticket_id);
+        INSERT INTO support_tickets
+            (fleet_issue_id, title, tenant_name, site_label, fleet_status, priority,
+             source, requested_by, comment_count, created_at, updated_at,
+             first_seen_ms, last_synced_ms, lifecycle, revision)
+         VALUES ('iss-old', 'Titre ancien', 'Tenant', 'milo.invalid', 'open', 'normal',
+                 'email', 'Claire', 4, '2026-01-01', '2026-01-02', 100, 200, 'working', 3);",
+    )
+    .expect("v1 schema");
+    raw.pragma_update(None, "user_version", 1u32)
+        .expect("stamp v1");
+    drop(raw);
+
+    let mut migrated = SupportTicketStore::open(private.path()).expect("v1 opens");
+    let record = migrated
+        .ticket("iss-old")
+        .expect("read")
+        .expect("the v1 row survived");
+    assert_eq!(record.title, "Titre ancien");
+    assert_eq!(record.comment_count, 4);
+    assert_eq!(record.site_label.as_deref(), Some("milo.invalid"));
+    assert_eq!(record.lifecycle, TicketLifecycle::Working);
+    assert_eq!(record.revision, 3);
+    assert_eq!(record.first_seen_ms, 100);
+    assert_eq!(record.last_synced_ms, 200);
+    assert_eq!(
+        record.draft_answer_bytes, None,
+        "nothing in v1 could have recorded a draft"
+    );
+
+    // The migrated database is the schema this build writes, not merely one that
+    // opens: the new column works and the new constraint bites.
+    migrated
+        .record_draft("iss-old", DRAFT, 7_000)
+        .expect("a migrated row takes a draft");
+    assert_eq!(
+        migrated
+            .draft("iss-old")
+            .expect("read")
+            .expect("present")
+            .text,
+        DRAFT
+    );
+    drop(migrated);
+
+    let raw = Connection::open(private.path()).expect("raw reopen");
+    let version: u32 = raw
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user_version");
+    assert_eq!(version, SUPPORT_TICKETS_SCHEMA_VERSION);
+    let leftovers: u32 = raw
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'support_tickets_v1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(leftovers, 0, "the migration leaves no old table behind");
+    let indexes: u32 = raw
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'index'
+             AND name IN ('support_tickets_by_lifecycle', 'support_tickets_by_sync')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(indexes, 2, "a migrated store keeps both indexes");
+    assert!(
+        raw.execute(
+            "UPDATE support_tickets SET draft_answer_at_ms = NULL WHERE fleet_issue_id = 'iss-old'",
+            [],
+        )
+        .is_err(),
+        "the migrated table carries the v2 cross-column CHECK"
+    );
+}
+
+/// `may_reach` is the transitive closure of `may_advance_to`, and nothing wider.
+#[test]
+fn may_reach_is_exactly_the_chains_the_lattice_allows() {
+    for from in TicketLifecycle::ALL {
+        for to in TicketLifecycle::ALL {
+            // Walk every chain of single steps from `from` and see whether `to`
+            // is on one of them.
+            let mut reachable = false;
+            let mut at = from;
+            while !at.is_terminal() {
+                let next = TicketLifecycle::ALL
+                    .into_iter()
+                    .find(|candidate| candidate.rank() == at.rank() + 1)
+                    .expect("a non-terminal lifecycle has a successor");
+                assert!(at.may_advance_to(next), "{at:?} -> {next:?}");
+                if next == to {
+                    reachable = true;
+                }
+                at = next;
+            }
+            assert_eq!(
+                from.may_reach(to),
+                reachable,
+                "{from:?} -> {to:?} must agree with the single-step lattice"
+            );
+        }
+    }
+    // The one this exists for: a ticket at `new` can still become `answered`,
+    // which `may_advance_to` alone would deny.
+    assert!(!TicketLifecycle::New.may_advance_to(TicketLifecycle::Answered));
+    assert!(TicketLifecycle::New.may_reach(TicketLifecycle::Answered));
+    assert!(!TicketLifecycle::Answered.may_reach(TicketLifecycle::Answered));
+    assert!(!TicketLifecycle::Closed.may_reach(TicketLifecycle::Answered));
 }

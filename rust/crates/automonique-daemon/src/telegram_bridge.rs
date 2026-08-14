@@ -10,7 +10,7 @@
 //! nothing else. Every one of them is a trait, so the whole dispatch table is
 //! exercised in tests with no network, no daemon and no provider at all.
 //!
-//! # One command here is an effect
+//! # Two commands here are effects
 //!
 //! Every other command on this surface is a read. `/run` composes a document,
 //! submits it to custody, starts a contained attempt and waits for it, and the
@@ -19,6 +19,21 @@
 //! (see [`crate::run_lane`]), and the reply carries *provider output*, which is
 //! why [`bounded_reply`] is a transport bound applied to it rather than a
 //! renderer.
+//!
+//! `/work` is the second, and it is the first command whose effect is *durable
+//! here*: it reads one recorded support ticket, composes a work instruction from
+//! it ([`crate::ticket_work`]), puts that through the same lane a `/run` goes
+//! through, and stores what comes back as that ticket's draft answer. Three
+//! things are deliberately true of it:
+//!
+//! - **It sends nothing to anybody.** The draft is a row in this host's own
+//!   ticket store. No fleet call, no support thread, no requester. A surface
+//!   that posts a draft is a later, owner-gated wave, and this build has none.
+//! - **Its reply is small.** A confirmation naming the ticket, the draft's size
+//!   and the lifecycle it reached — not the draft. An operator reads the draft
+//!   deliberately, from a view built for it, rather than having a customer-facing
+//!   answer land in a chat as a side effect of asking for one.
+//! - **It blocks exactly as `/run` does**, for exactly the same reason.
 //!
 //! # Durable first, answer second
 //!
@@ -70,7 +85,9 @@ use std::time::Duration;
 use automonique_protocol::admin::ExecutionState;
 use automonique_store::Store;
 use automonique_store::run_index::{RunIndex, RunIndexRecord};
-use automonique_store::support_tickets::{SupportTicketError, SupportTicketStore, TicketRecord};
+use automonique_store::support_tickets::{
+    SupportTicketError, SupportTicketStore, TicketLifecycle, TicketRecord,
+};
 use automonique_transport_runtime::{
     AllowedUsers, CancellationToken, ControlCommand, HttpFailure, MAX_SEND_MESSAGE_TEXT_UNITS,
     OpaqueBotToken, PollOutcome, PollerLease, RuntimeError, SendMessageRequest,
@@ -137,6 +154,23 @@ pub const NO_TICKETS_RECORDED: &str = "No tickets recorded.";
 /// reply cannot be used to make the bot repeat a sender's text into a chat, and
 /// it reads the same for a mistyped id as for one the board never carried.
 pub const TICKET_NOT_FOUND: &str = "No ticket is recorded for that reference.";
+
+/// The answer for a `/work` on a ticket that has already been answered or has
+/// been closed.
+///
+/// Not a fault and not a refusal of the operator: the lattice has no step left
+/// to `answered`, which is exactly what stops a second run from overwriting the
+/// draft somebody may already have sent.
+pub const TICKET_ALREADY_WORKED: &str =
+    "That ticket has already been answered or closed, so nothing was run and no draft was stored.";
+
+/// The answer for a `/work` whose run produced nothing storable.
+///
+/// The run happened and its record is under `/runs`; what it wrote was empty, or
+/// was nothing but whitespace once the control characters a draft may not carry
+/// were taken out.
+pub const TICKET_DRAFT_EMPTY: &str =
+    "The run completed but wrote nothing that could be stored as a draft.";
 
 /// Why a read surface could not answer.
 ///
@@ -214,6 +248,74 @@ pub trait ControlSurface {
     /// Returns [`SurfaceRefusal::Unavailable`] when a store this host *does*
     /// have cannot be opened or read.
     fn ticket_text(&mut self, ticket_ref: &str) -> Result<String, SurfaceRefusal>;
+
+    /// The work instruction one recorded ticket becomes, or the whole answer
+    /// when there is nothing to work.
+    ///
+    /// This is the gate a `/work` passes *before* a run is started, and it is
+    /// deliberately the only place that decides whether one should be: a ticket
+    /// nobody recorded, a host that tracks none, and a ticket that can no longer
+    /// reach `answered` are all answered here, so no contained run is spent
+    /// producing a draft that could not be stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SurfaceRefusal::Unavailable`] when a store this host *does*
+    /// have cannot be opened or read.
+    fn ticket_work_order(&mut self, ticket_ref: &str) -> Result<WorkLookup, SurfaceRefusal>;
+
+    /// Store one draft answer against a ticket and advance its lifecycle.
+    ///
+    /// The one write on this surface. It stores locally and sends nothing: see
+    /// this module's own note on `/work`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SurfaceRefusal::Unavailable`] when the store cannot be written.
+    /// A store that refuses the draft on its own terms — the ticket moved to a
+    /// lifecycle with no step left while the run was in flight — is
+    /// [`DraftOutcome::Refused`] rather than an error, because nothing failed.
+    fn record_ticket_draft(
+        &mut self,
+        ticket_ref: &str,
+        draft: &str,
+    ) -> Result<DraftOutcome, SurfaceRefusal>;
+}
+
+/// What a `/work` found when it looked the ticket up.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkLookup {
+    /// A ticket that can still be worked, and the instruction composed from it.
+    Order(WorkOrder),
+    /// There is nothing to work, and this fixed sentence is the whole answer.
+    Answer(&'static str),
+}
+
+/// One ticket, ready to be run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkOrder {
+    /// The ticket's durable fleet identifier, which the confirmation names.
+    ///
+    /// Taken from the stored row rather than echoed from the sender's message:
+    /// the two are equal by construction — the lookup is exact — and reading it
+    /// from the row means no reply on this path carries a byte a sender chose.
+    pub fleet_issue_id: String,
+    /// The bounded work instruction, composed by [`crate::ticket_work`].
+    pub task: String,
+}
+
+/// What the store did with one draft.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DraftOutcome {
+    /// Stored, and the ticket advanced.
+    Recorded {
+        /// Characters of the draft that was stored.
+        draft_chars: usize,
+        /// The lifecycle the ticket now carries.
+        lifecycle: TicketLifecycle,
+    },
+    /// Nothing was stored, and this fixed sentence is the whole answer.
+    Refused(&'static str),
 }
 
 /// A command this vocabulary can spell and this build cannot yet perform.
@@ -271,6 +373,7 @@ impl Unavailable {
             | ControlCommand::Runs
             | ControlCommand::Tickets
             | ControlCommand::Ticket { .. }
+            | ControlCommand::Work { .. }
             | ControlCommand::Run { .. } => None,
             ControlCommand::Cancel { .. } => Some(Self::CancelVerb),
             ControlCommand::Approve { .. } | ControlCommand::Deny { .. } => {
@@ -383,6 +486,14 @@ pub struct DispatchReport {
     pub runs_answered: usize,
     /// `/run` commands that reached a typed failure instead of an answer.
     pub runs_failed: usize,
+    /// `/work` commands that stored a draft against a ticket.
+    ///
+    /// Counted apart from [`Self::runs_answered`] even though a `/work` spends a
+    /// run: the two say different things, and a host that worked three tickets
+    /// and answered no `/run` should not read as the reverse.
+    pub tickets_worked: usize,
+    /// `/work` commands that stored nothing, for any reason.
+    pub ticket_work_failed: usize,
     /// Messages the command layer refused, including an unauthorized sender the
     /// transport policy admitted.
     pub refused: usize,
@@ -409,6 +520,8 @@ impl DispatchReport {
         self.unavailable += other.unavailable;
         self.runs_answered += other.runs_answered;
         self.runs_failed += other.runs_failed;
+        self.tickets_worked += other.tickets_worked;
+        self.ticket_work_failed += other.ticket_work_failed;
         self.refused += other.refused;
         self.denied_senders += other.denied_senders;
         self.ignored += other.ignored;
@@ -778,6 +891,16 @@ where
                             },
                         }
                     }
+                    Ok(ControlCommand::Work { ticket_ref }) => {
+                        let chat_id = principal.chat_id();
+                        // The second command whose answer is an effect, and the
+                        // first whose effect is durable here. It blocks this
+                        // thread for the length of the run it spends.
+                        match work_ticket(&mut self.surface, &mut self.lane, ticket_ref.as_str()) {
+                            Ok(text) => Answer::TicketWorked { chat_id, text },
+                            Err(text) => Answer::TicketWorkFailed { chat_id, text },
+                        }
+                    }
                     Ok(command) => match Unavailable::for_command(&command) {
                         Some(unavailable) => Answer::Unavailable {
                             chat_id: principal.chat_id(),
@@ -805,10 +928,10 @@ where
                 .surface
                 .ticket_text(ticket_ref.as_str())
                 .unwrap_or_else(refused),
-            // `answer_for` carried this one out through the run lane before
-            // `render` was reached; answering it here would be a second
-            // dispatch table over a command whose answer is an effect.
-            ControlCommand::Run { .. } => String::new(),
+            // `answer_for` carried these out through the run lane before
+            // `render` was reached; answering them here would be a second
+            // dispatch table over commands whose answers are effects.
+            ControlCommand::Run { .. } | ControlCommand::Work { .. } => String::new(),
             // `Unavailable::for_command` decided these before `render` was
             // reached. Answering them here would be a second dispatch table.
             ControlCommand::Cancel { .. }
@@ -856,6 +979,16 @@ where
             Answer::RunFailed { chat_id, text } => {
                 report.unavailable += 1;
                 report.runs_failed += 1;
+                (chat_id, text)
+            }
+            Answer::TicketWorked { chat_id, text } => {
+                report.answered += 1;
+                report.tickets_worked += 1;
+                (chat_id, text)
+            }
+            Answer::TicketWorkFailed { chat_id, text } => {
+                report.unavailable += 1;
+                report.ticket_work_failed += 1;
                 (chat_id, text)
             }
         };
@@ -916,6 +1049,65 @@ enum Answer {
     RunAnswered { chat_id: i64, text: String },
     /// A `/run` that produced a typed failure.
     RunFailed { chat_id: i64, text: String },
+    /// A `/work` that stored a draft against its ticket.
+    TicketWorked { chat_id: i64, text: String },
+    /// A `/work` that stored nothing.
+    TicketWorkFailed { chat_id: i64, text: String },
+}
+
+/// Work one ticket: look it up, run the instruction it composes, store the
+/// answer as its draft.
+///
+/// A free function over the two seams rather than a method on the bridge, so the
+/// whole sequence can be driven against the *production* surface and the
+/// *production* run lane in a test that has no Telegram transport at all —
+/// which is the only way the durable half of `/work` gets a proof under real
+/// containment. The bridge calls exactly this.
+///
+/// The order is the point. The lookup happens first and decides, on its own,
+/// whether a run should be spent: a ticket that cannot reach `answered` costs no
+/// run. The run happens second. The store write happens third and is checked
+/// again, because the run took minutes and the ticket may have been closed
+/// underneath it.
+///
+/// # Errors
+///
+/// Returns the operator-facing sentence for a `/work` that stored nothing. Every
+/// one of them is a complete answer: either no run was started, or one was and
+/// its outcome is named. Nothing here is retried and nothing is sent anywhere.
+pub fn work_ticket<S, L>(surface: &mut S, lane: &mut L, ticket_ref: &str) -> Result<String, String>
+where
+    S: ControlSurface + ?Sized,
+    L: RunLane + ?Sized,
+{
+    let unavailable = |refusal: SurfaceRefusal| refusal.operator_reply().to_owned();
+    let order = match surface.ticket_work_order(ticket_ref).map_err(unavailable)? {
+        WorkLookup::Order(order) => order,
+        WorkLookup::Answer(answer) => return Err(answer.to_owned()),
+    };
+    // The same lane a `/run` goes through, under the same gates. An unconfigured
+    // deployment answers `NotConfigured` here exactly as it does there.
+    let answer = lane
+        .run(&order.task)
+        .map_err(|failure| failure.operator_reply().to_owned())?;
+    let Some(draft) = crate::ticket_work::storable_draft(&answer) else {
+        return Err(String::from(TICKET_DRAFT_EMPTY));
+    };
+    match surface
+        .record_ticket_draft(ticket_ref, &draft)
+        .map_err(unavailable)?
+    {
+        DraftOutcome::Recorded {
+            draft_chars,
+            lifecycle,
+        } => Ok(format!(
+            "Worked ticket {}; draft stored ({draft_chars} chars); lifecycle -> {}. \
+             Nothing was sent to anyone.",
+            order.fleet_issue_id,
+            lifecycle.as_str(),
+        )),
+        DraftOutcome::Refused(answer) => Err(answer.to_owned()),
+    }
 }
 
 /// Longest `/run` answer one reply carries, in UTF-16 units.
@@ -1107,7 +1299,7 @@ impl StoreControlSurface {
     /// is exactly what a read surface must not do: an empty store conjured on a
     /// host with no support fleet would answer "no tickets recorded" to a
     /// question whose true answer is "this daemon does not track tickets".
-    fn ticket_store(&mut self) -> Result<Option<&SupportTicketStore>, SurfaceRefusal> {
+    fn ticket_store(&mut self) -> Result<Option<&mut SupportTicketStore>, SurfaceRefusal> {
         let path = match &self.tickets {
             TicketReads::Detached => return Ok(None),
             TicketReads::Open(store) => store.path().to_path_buf(),
@@ -1124,7 +1316,7 @@ impl StoreControlSurface {
             let opened = SupportTicketStore::open(path).map_err(|_| SurfaceRefusal::Unavailable)?;
             self.tickets = TicketReads::Open(Box::new(opened));
         }
-        match &self.tickets {
+        match &mut self.tickets {
             TicketReads::Open(store) => Ok(Some(store)),
             // Unreachable: the arm above just replaced every other state.
             TicketReads::Detached | TicketReads::Unopened(_) => Err(SurfaceRefusal::Unavailable),
@@ -1276,6 +1468,66 @@ impl ControlSurface for StoreControlSurface {
             Err(_) => Err(SurfaceRefusal::Unavailable),
         }
     }
+
+    /// The gate, and the composition, in one read.
+    ///
+    /// A malformed reference is answered exactly as an unrecorded one, for the
+    /// reason [`Self::ticket_text`] gives: the command layer's grammar is wider
+    /// than the store's, and an overhang is a reference that names no ticket
+    /// rather than a fault.
+    fn ticket_work_order(&mut self, ticket_ref: &str) -> Result<WorkLookup, SurfaceRefusal> {
+        let Some(store) = self.ticket_store()? else {
+            return Ok(WorkLookup::Answer(TICKETS_NOT_ENABLED));
+        };
+        let record = match store.ticket(ticket_ref) {
+            Ok(Some(record)) => record,
+            Ok(None) | Err(SupportTicketError::InvalidField(_)) => {
+                return Ok(WorkLookup::Answer(TICKET_NOT_FOUND));
+            }
+            Err(_) => return Err(SurfaceRefusal::Unavailable),
+        };
+        // Asked here so no run is spent on a ticket whose draft could not be
+        // stored. The store asks it again at the write, because minutes pass.
+        if !record.lifecycle.may_reach(TicketLifecycle::Answered) {
+            return Ok(WorkLookup::Answer(TICKET_ALREADY_WORKED));
+        }
+        Ok(WorkLookup::Order(WorkOrder {
+            fleet_issue_id: record.fleet_issue_id.clone(),
+            task: crate::ticket_work::work_instruction(&record),
+        }))
+    }
+
+    /// The one durable write this surface performs.
+    ///
+    /// The instant is this host's clock, read here rather than passed in, for
+    /// the same reason every other durable write in this daemon reads it at the
+    /// point of writing: the caller has been inside a run for minutes and an
+    /// instant it captured before that would be a lie about when the draft was
+    /// produced.
+    fn record_ticket_draft(
+        &mut self,
+        ticket_ref: &str,
+        draft: &str,
+    ) -> Result<DraftOutcome, SurfaceRefusal> {
+        let now_ms = crate::unix_millis().map_err(|_| SurfaceRefusal::Unavailable)?;
+        let Some(store) = self.ticket_store()? else {
+            return Ok(DraftOutcome::Refused(TICKETS_NOT_ENABLED));
+        };
+        match store.record_draft(ticket_ref, draft, now_ms) {
+            Ok(receipt) => Ok(DraftOutcome::Recorded {
+                draft_chars: draft.chars().count(),
+                lifecycle: receipt.lifecycle,
+            }),
+            // The ticket moved while the run was in flight: somebody closed it,
+            // or a second `/work` got there first. Nothing failed, and nothing
+            // was stored.
+            Err(SupportTicketError::IllegalTransition { .. }) => {
+                Ok(DraftOutcome::Refused(TICKET_ALREADY_WORKED))
+            }
+            Err(SupportTicketError::NotFound(_)) => Ok(DraftOutcome::Refused(TICKET_NOT_FOUND)),
+            Err(_) => Err(SurfaceRefusal::Unavailable),
+        }
+    }
 }
 
 /// One run's line in a `/runs` reply.
@@ -1348,6 +1600,20 @@ fn ticket_line(record: &TicketRecord) -> String {
     )
 }
 
+/// Whether a ticket carries a draft answer, and how big it is.
+///
+/// The size, never the text. A detail reply is what an operator asks for to see
+/// where a ticket stands, and a customer-facing draft arriving in a chat because
+/// somebody typed `/ticket` is exactly the accident `/work`'s own small reply
+/// exists to avoid. The store reports the size without loading the draft at all,
+/// so this line costs nothing to render.
+fn draft_line(record: &TicketRecord) -> String {
+    match (record.draft_answer_bytes, record.draft_answer_at_ms) {
+        (Some(bytes), Some(at_ms)) => format!("draft {bytes} bytes, recorded {at_ms}ms"),
+        _ => String::from("draft none"),
+    }
+}
+
 /// One ticket's detail reply.
 ///
 /// Fields the fleet owns are printed verbatim and whole — that is what a detail
@@ -1368,6 +1634,7 @@ fn ticket_detail(record: &TicketRecord) -> String {
          fleet status {} | priority {} | source {}\n\
          lifecycle {} | revision {} | comments {}\n\
          requested by {}\n\
+         {}\n\
          fleet created {} | fleet updated {}\n\
          first seen {}ms | last synced {}ms | row #{}",
         record.fleet_issue_id,
@@ -1381,6 +1648,7 @@ fn ticket_detail(record: &TicketRecord) -> String {
         record.revision,
         record.comment_count,
         or_dash(&record.requested_by),
+        draft_line(record),
         record.created_at,
         record.updated_at,
         record.first_seen_ms,

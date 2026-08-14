@@ -1251,3 +1251,362 @@ fn an_oversized_answer_is_truncated_visibly() {
         "the whole answer must not be sent"
     );
 }
+
+// ------------------------------------------------------------------- /work
+
+/// THE WHOLE COMMAND, MINUS THE RUN. `/work` reads a ticket, composes an
+/// instruction from it, puts that through the run lane, and stores what comes
+/// back as the ticket's draft.
+///
+/// The lane is faked here for the reason it is faked for `/run`: whether a
+/// contained provider answers is `ticket_work`'s question and it needs a
+/// delegated cgroup scope to ask it. Everything else on this path is the
+/// production code — the real ticket store, the real composition, the real
+/// draft write, the real lifecycle move.
+#[test]
+fn work_composes_from_the_ticket_runs_it_and_stores_the_draft() {
+    let fixture = Fixture::new(&[]);
+    fixture.seed_tickets(&[
+        SeedTicket::new("SUP-1001", "Printer offline in the back room")
+            .at(TicketLifecycle::Working)
+            .for_tenant("reserved-tenant-one"),
+        SeedTicket::new("SUP-1002", "Mail relay rejects attachments"),
+    ]);
+    let client = FakeClient::new([updates(&[(1, OPERATOR, "/work SUP-1001")])]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering("Bonjour, nous avons identifié la panne.");
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        client,
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.tickets_worked, 1);
+    assert_eq!(report.ticket_work_failed, 0);
+    assert_eq!(report.answered, 1);
+    assert_eq!(report.unavailable, 0, "/work is not an unavailable command");
+    assert_eq!(report.sent, 1);
+    assert_eq!(
+        report.runs_answered, 0,
+        "a worked ticket is counted as itself, not as a /run"
+    );
+
+    // THE INSTRUCTION IS COMPOSED FROM THE TICKET, and it is a work order.
+    let tasks = lane.tasks();
+    assert_eq!(tasks.len(), 1, "one command is one run");
+    let task = &tasks[0];
+    assert!(task.contains("Ticket: SUP-1001"), "{task}");
+    assert!(task.contains("Subject: Printer offline in the back room"));
+    assert!(task.contains("Tenant: reserved-tenant-one"));
+    assert!(task.contains("Draft a support answer"));
+    assert!(
+        task.contains("nothing is sent to the requester"),
+        "the instruction must say the draft goes nowhere"
+    );
+    assert!(
+        !task.contains("SUP-1002"),
+        "a work order must carry one ticket and no others: {task}"
+    );
+
+    // THE DRAFT IS STORED, DURABLY, AND THE LIFECYCLE MOVED.
+    let store =
+        SupportTicketStore::open(&fixture.support_tickets_path).expect("ticket store reopens");
+    let draft = store
+        .draft("SUP-1001")
+        .expect("draft read")
+        .expect("a draft was stored");
+    assert_eq!(draft.text, "Bonjour, nous avons identifié la panne.");
+    assert_eq!(draft.lifecycle, TicketLifecycle::Answered);
+    let record = store
+        .ticket("SUP-1001")
+        .expect("read")
+        .expect("present")
+        .clone();
+    assert_eq!(record.lifecycle, TicketLifecycle::Answered);
+    assert_eq!(record.draft_answer_bytes, Some(draft.text.len()));
+    // The other ticket was not touched by working this one.
+    let untouched = store.ticket("SUP-1002").expect("read").expect("present");
+    assert_eq!(untouched.lifecycle, TicketLifecycle::New);
+    assert_eq!(untouched.draft_answer_bytes, None);
+
+    // THE REPLY IS A CONFIRMATION, NOT THE DRAFT.
+    let messages = outbound.messages();
+    assert!(
+        messages[0].contains("Worked ticket SUP-1001"),
+        "{messages:?}"
+    );
+    assert!(messages[0].contains("lifecycle -> answered"));
+    assert!(
+        messages[0].contains(&format!("({} chars)", draft.text.chars().count())),
+        "the confirmation must say how much was stored: {messages:?}"
+    );
+    assert!(
+        !messages[0].contains("Bonjour"),
+        "the draft itself must not be sent to the chat: {messages:?}"
+    );
+    assert!(messages[0].contains(&format!("\"chat_id\":{OPERATOR}")));
+    assert!(!messages[0].contains("AAFixtureSecretNeverPrinted"));
+}
+
+/// A ticket at `new` is worked in one command: the store walks the lattice, and
+/// the operator does not have to type three transitions they have no command
+/// for.
+#[test]
+fn a_ticket_at_new_is_walked_all_the_way_to_answered() {
+    let fixture = Fixture::new(&[]);
+    fixture.seed_tickets(&[SeedTicket::new("SUP-3001", "Nobody has looked at this yet")]);
+    let client = FakeClient::new([updates(&[(1, OPERATOR, "/work SUP-3001")])]);
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        client,
+        outbound.clone(),
+        FakeSink::default(),
+        FakeRunLane::answering("a draft for a brand new ticket"),
+    );
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.tickets_worked, 1);
+    let store =
+        SupportTicketStore::open(&fixture.support_tickets_path).expect("ticket store reopens");
+    let record = store.ticket("SUP-3001").expect("read").expect("present");
+    assert_eq!(record.lifecycle, TicketLifecycle::Answered);
+    assert_eq!(
+        record.revision, 2,
+        "three lattice steps and a draft are one change"
+    );
+}
+
+/// THE FALSIFICATION. Every way a `/work` stores nothing is answered as itself,
+/// and none of them moves the ticket.
+///
+/// Without this, the test above would pass just as well against a dispatch that
+/// stored a draft for anything anybody typed.
+#[test]
+fn a_work_that_stores_nothing_says_which_way_it_failed() {
+    // A reference this host has no ticket for. No run is spent on it.
+    let fixture = Fixture::new(&[]);
+    fixture.seed_tickets(&[SeedTicket::new("SUP-5001", "The only ticket here")]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering("a draft nobody asked for");
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        FakeClient::new([updates(&[(1, OPERATOR, "/work SUP-9999")])]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.ticket_work_failed, 1);
+    assert_eq!(report.tickets_worked, 0);
+    assert!(outbound.messages()[0].contains(TICKET_NOT_FOUND));
+    assert!(
+        lane.tasks().is_empty(),
+        "an unrecorded reference must not spend a run"
+    );
+
+    // A lane that is not configured: the same word `/run` answers with, and
+    // still no draft.
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        FakeClient::new([updates(&[(1, OPERATOR, "/work SUP-5001")])]),
+        outbound.clone(),
+        FakeSink::default(),
+        FakeRunLane::failing(RunFailure::NotConfigured),
+    );
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.ticket_work_failed, 1);
+    assert!(
+        outbound.messages()[0].contains("Not configured."),
+        "{:?}",
+        outbound.messages()
+    );
+    let store =
+        SupportTicketStore::open(&fixture.support_tickets_path).expect("ticket store reopens");
+    let record = store.ticket("SUP-5001").expect("read").expect("present");
+    assert_eq!(
+        record.lifecycle,
+        TicketLifecycle::New,
+        "a refused run must leave the ticket where it was"
+    );
+    assert_eq!(record.draft_answer_bytes, None);
+    drop(store);
+
+    // A run that completed and wrote nothing storable.
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        FakeClient::new([updates(&[(1, OPERATOR, "/work SUP-5001")])]),
+        outbound.clone(),
+        FakeSink::default(),
+        FakeRunLane::answering("   \n\t  "),
+    );
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.ticket_work_failed, 1);
+    assert!(outbound.messages()[0].contains("wrote nothing that could be stored"));
+    let store =
+        SupportTicketStore::open(&fixture.support_tickets_path).expect("ticket store reopens");
+    assert_eq!(
+        store
+            .ticket("SUP-5001")
+            .expect("read")
+            .expect("present")
+            .lifecycle,
+        TicketLifecycle::New
+    );
+}
+
+/// A ticket that has already been answered is not worked twice, and the first
+/// draft is not overwritten.
+#[test]
+fn a_re_work_is_refused_and_the_first_draft_stands() {
+    let fixture = Fixture::new(&[]);
+    fixture.seed_tickets(&[
+        SeedTicket::new("SUP-6001", "Worked once already").at(TicketLifecycle::Working)
+    ]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering("the first draft");
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        FakeClient::new([updates(&[(1, OPERATOR, "/work SUP-6001")])]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane,
+    );
+    assert_eq!(poll(&mut bridge).expect("poll commits").tickets_worked, 1);
+
+    // The second `/work` is refused before a run is started.
+    let outbound = FakeOutbound::default();
+    let second = FakeRunLane::answering("a second and different draft");
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        FakeClient::new([updates(&[(1, OPERATOR, "/work SUP-6001")])]),
+        outbound.clone(),
+        FakeSink::default(),
+        second.clone(),
+    );
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.ticket_work_failed, 1);
+    assert_eq!(report.tickets_worked, 0);
+    assert!(
+        outbound.messages()[0].contains("already been answered or closed"),
+        "{:?}",
+        outbound.messages()
+    );
+    assert!(
+        second.tasks().is_empty(),
+        "an answered ticket must not spend a second run"
+    );
+
+    let store =
+        SupportTicketStore::open(&fixture.support_tickets_path).expect("ticket store reopens");
+    assert_eq!(
+        store
+            .draft("SUP-6001")
+            .expect("read")
+            .expect("present")
+            .text,
+        "the first draft",
+        "the first draft must stand"
+    );
+}
+
+/// A host that tracks no tickets says so, and working one brings no store into
+/// existence.
+#[test]
+fn a_host_without_a_ticket_store_cannot_be_asked_to_work_one() {
+    let fixture = Fixture::new(&[]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering("a draft that must never be composed");
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        FakeClient::new([updates(&[(1, OPERATOR, "/work SUP-7001")])]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.ticket_work_failed, 1);
+    assert!(outbound.messages()[0].contains(TICKETS_NOT_ENABLED));
+    assert!(lane.tasks().is_empty(), "no run may be spent");
+    assert!(
+        !fixture.support_tickets_path.exists(),
+        "asking must not create a ticket store"
+    );
+}
+
+/// A sender the access policy denied cannot work a ticket, which is the whole
+/// authorization story for the one durable write on this surface.
+#[test]
+fn an_unauthorized_sender_cannot_work_a_ticket() {
+    let fixture = Fixture::new(&[]);
+    fixture.seed_tickets(&[SeedTicket::new("SUP-8001", "Confidential fixture title")]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering("a draft an outsider must not cause");
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        FakeClient::new([updates(&[(1, OUTSIDER, "/work SUP-8001")])]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.denied_senders, 1);
+    assert_eq!(report.tickets_worked, 0);
+    assert!(lane.tasks().is_empty(), "no run for an outsider");
+    assert!(outbound.messages()[0].contains("Not authorized."));
+
+    let store =
+        SupportTicketStore::open(&fixture.support_tickets_path).expect("ticket store reopens");
+    let record = store.ticket("SUP-8001").expect("read").expect("present");
+    assert_eq!(record.lifecycle, TicketLifecycle::New);
+    assert_eq!(record.draft_answer_bytes, None);
+}
+
+/// The detail view reports that a draft exists and how big it is, and never the
+/// draft itself.
+#[test]
+fn a_ticket_detail_reports_a_draft_by_size_and_never_by_text() {
+    let fixture = Fixture::new(&[]);
+    fixture
+        .seed_tickets(&[SeedTicket::new("SUP-9001", "Has a draft").at(TicketLifecycle::Working)]);
+    let draft = "Bonjour, voici la réponse proposée.";
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        FakeClient::new([
+            updates(&[(1, OPERATOR, "/ticket SUP-9001")]),
+            updates(&[(2, OPERATOR, "/work SUP-9001")]),
+            updates(&[(3, OPERATOR, "/ticket SUP-9001")]),
+        ]),
+        outbound.clone(),
+        FakeSink::default(),
+        FakeRunLane::answering(draft),
+    );
+    for _ in 0..3 {
+        poll(&mut bridge).expect("poll commits");
+    }
+
+    let messages = outbound.messages();
+    assert!(
+        messages[0].contains("draft none"),
+        "before the work: {:?}",
+        messages[0]
+    );
+    assert!(
+        messages[2].contains(&format!("draft {} bytes", draft.len())),
+        "after the work: {:?}",
+        messages[2]
+    );
+    assert!(
+        !messages[2].contains("voici la réponse"),
+        "a detail view must not carry the draft's text: {:?}",
+        messages[2]
+    );
+}

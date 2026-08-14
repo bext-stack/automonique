@@ -41,6 +41,20 @@
 //! `created_at` cannot answer, because a ticket may have existed for a week
 //! before this host first looked at the board.
 //!
+//! `draft_answer` belongs to this host as well, and belongs to it completely: it
+//! is what *Automonique* wrote about the ticket, never anything the fleet said.
+//! It is written once, by [`SupportTicketStore::record_draft`], and no re-poll
+//! touches it.
+//!
+//! # The draft is a local record, not a reply
+//!
+//! Storing a draft sends nothing to anybody. This module has no fleet IO at all,
+//! and the column is a row in a private SQLite file on this host — an operator
+//! reads it, decides, and posts it (or does not) through a surface that does not
+//! exist yet. `answered` therefore means *this host has produced an answer*,
+//! which is the same thing every other lifecycle word means: what Automonique
+//! did, not what the requester received.
+//!
 //! # Upsert, and why it is not an insert
 //!
 //! A poller re-reads the whole open board on every cadence, so the *same* issue
@@ -74,6 +88,14 @@
 //! `closed`, and a re-report of the state a row already carries is refused
 //! rather than silently accepted — a caller asking for it is acting on a stale
 //! read, and answering "fine" would hide that.
+//!
+//! [`SupportTicketStore::record_draft`] is the one caller that moves *more than
+//! one* step, because recording an answer for a ticket at `acknowledged` means
+//! work started and finished. It walks the same lattice one step at a time and
+//! refuses exactly what [`TicketLifecycle::may_advance_to`] refuses at every
+//! step, so the path it takes is one [`SupportTicketStore::transition`] could
+//! have taken; what it does not do is charge three revisions for one thing that
+//! happened. See [`TicketLifecycle::may_reach`].
 //!
 //! `closed` is reachable from everywhere for one concrete reason: the fleet can
 //! mark an issue `done` while this host still has it at `new`, and a store that
@@ -115,7 +137,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use crate::{BUSY_TIMEOUT, StoreError, validate_database_path};
 
 /// The only support ticket schema this build can read and write.
-pub const SUPPORT_TICKETS_SCHEMA_VERSION: u32 = 1;
+pub const SUPPORT_TICKETS_SCHEMA_VERSION: u32 = 2;
 
 /// Largest number of tickets any store will hold.
 ///
@@ -141,6 +163,19 @@ pub const MAX_TICKET_TOKEN_BYTES: usize = 40;
 pub const MAX_REQUESTED_BY_BYTES: usize = 160;
 /// Highest accepted comment count.
 pub const MAX_COMMENT_COUNT: u32 = 10_000;
+/// Longest draft answer one ticket may carry, in bytes.
+///
+/// A draft is something this host wrote rather than a field the fleet owns, so
+/// it is bounded far above the fleet's own ceilings and far below anything
+/// unbounded. 32 KiB is more than a support reply is and less than any one
+/// message a chat transport carries, so a draft at this ceiling is one an
+/// operator reads in pieces, never one this store could not hold.
+pub const MAX_DRAFT_ANSWER_BYTES: usize = 32 * 1024;
+
+/// The schema spells this ceiling as a literal, because a CHECK cannot read a
+/// Rust constant. This is the one place the two are held together.
+const _: () = assert!(MAX_DRAFT_ANSWER_BYTES == 32_768);
+
 /// Longest accepted fleet timestamp, in bytes.
 ///
 /// Retained verbatim and never parsed. The connector documents why: the fleet's
@@ -149,25 +184,30 @@ pub const MAX_COMMENT_COUNT: u32 = 10_000;
 /// timestamp the fleet legitimately sends.
 pub const MAX_TIMESTAMP_BYTES: usize = 60;
 
-/// Schema v1.
+/// Schema v2, the table.
 ///
 /// The invariants a second writer must not be able to break are database
 /// constraints: one row per fleet issue, the closed five-word lifecycle
 /// vocabulary, a comment count inside its range, non-negative observation
-/// instants that do not travel backwards, a positive revision, and the binding
-/// that an absent site label is `NULL` rather than an empty string.
+/// instants that do not travel backwards, a positive revision, the binding that
+/// an absent site label is `NULL` rather than an empty string, and the three
+/// facts about a draft — that its text and its instant are present or absent
+/// together, that a present one is non-empty and inside its ceiling, and that a
+/// row carrying one has reached `answered` or gone past it.
 ///
 /// The identifier grammar, the length bounds and the transition lattice are
 /// deliberately *not* database constraints: they are enforced on write and
 /// re-checked on every read, so a row written around this API is refused rather
 /// than believed.
 ///
-/// Every CHECK that touches the one nullable column spells `IS NOT NULL`
-/// explicitly on the branch that reads it. A bare `length(site_label) > 0` would
-/// evaluate to `NULL` for an absent label, and SQLite admits a `NULL` CHECK — so
-/// the constraint would silently stop constraining exactly the rows it was
-/// written for.
-const SCHEMA_V1: &str = r#"
+/// Every CHECK that touches a nullable column spells `IS NOT NULL` explicitly on
+/// the branch that reads it. A bare `length(site_label) > 0` would evaluate to
+/// `NULL` for an absent label, and SQLite admits a `NULL` CHECK — so the
+/// constraint would silently stop constraining exactly the rows it was written
+/// for. The draft's ceiling is measured on `CAST(... AS BLOB)` because
+/// `length()` of TEXT counts characters, and a bound stated in bytes has to be
+/// checked in bytes or a multi-byte draft passes a check it exceeds.
+const TABLE_V2: &str = r#"
 CREATE TABLE support_tickets (
     ticket_id INTEGER PRIMARY KEY,
     fleet_issue_id TEXT NOT NULL UNIQUE,
@@ -189,18 +229,63 @@ CREATE TABLE support_tickets (
         lifecycle IN ('new', 'acknowledged', 'working', 'answered', 'closed')
     ),
     revision INTEGER NOT NULL CHECK (revision >= 1),
+    draft_answer TEXT,
+    draft_answer_at_ms INTEGER,
     CHECK (last_synced_ms >= first_seen_ms),
     CHECK (
         site_label IS NULL
         OR (site_label IS NOT NULL
             AND length(site_label) > 0
             AND length(site_label) <= 200)
+    ),
+    CHECK (
+        (draft_answer IS NULL AND draft_answer_at_ms IS NULL)
+        OR (draft_answer IS NOT NULL
+            AND draft_answer_at_ms IS NOT NULL
+            AND length(draft_answer) > 0
+            AND length(CAST(draft_answer AS BLOB)) <= 32768
+            AND draft_answer_at_ms >= 0
+            AND lifecycle IN ('answered', 'closed'))
     )
 ) STRICT;
+"#;
 
+/// Schema v2, the indexes. Applied after the table, on a fresh store and after a
+/// migration alike, so the two are the same schema and not merely similar.
+const INDEXES_V2: &str = r#"
 CREATE INDEX support_tickets_by_lifecycle ON support_tickets(lifecycle, ticket_id);
 
 CREATE INDEX support_tickets_by_sync ON support_tickets(last_synced_ms, ticket_id);
+"#;
+
+/// v1 to v2: the two draft columns, added by rebuilding the table.
+///
+/// A rebuild rather than two `ALTER TABLE ADD COLUMN`s, because the invariant
+/// being added is a *cross-column* CHECK — text and instant present together, a
+/// draft only on a row that reached `answered` — and `ADD COLUMN` cannot add a
+/// table constraint. A migrated database that carried the columns without the
+/// CHECK would be a different schema wearing the same `user_version`.
+///
+/// Every v1 row migrates to a row with no draft, which is exactly true: nothing
+/// in v1 could record one.
+const MIGRATE_V1_RENAME: &str = "ALTER TABLE support_tickets RENAME TO support_tickets_v1;";
+
+/// The copy, and the disposal of the old table — which takes v1's indexes with
+/// it, freeing their names for [`INDEXES_V2`].
+const MIGRATE_V1_COPY: &str = r#"
+INSERT INTO support_tickets
+    (ticket_id, fleet_issue_id, title, tenant_name, site_label, fleet_status,
+     priority, source, requested_by, comment_count, created_at, updated_at,
+     first_seen_ms, last_synced_ms, lifecycle, revision,
+     draft_answer, draft_answer_at_ms)
+SELECT
+    ticket_id, fleet_issue_id, title, tenant_name, site_label, fleet_status,
+    priority, source, requested_by, comment_count, created_at, updated_at,
+    first_seen_ms, last_synced_ms, lifecycle, revision,
+    NULL, NULL
+FROM support_tickets_v1;
+
+DROP TABLE support_tickets_v1;
 "#;
 
 /// A support ticket store error with stable refusal categories.
@@ -432,6 +517,24 @@ impl TicketLifecycle {
         }
         next.is_terminal() || next.rank() == self.rank() + 1
     }
+
+    /// Whether a ticket here could still be walked forward to `next`, in one
+    /// step or several.
+    ///
+    /// The transitive closure of [`Self::may_advance_to`], and nothing more:
+    /// every pair this admits is joined by a chain of single steps that lattice
+    /// allows, and every pair it refuses has no such chain. It exists because
+    /// [`SupportTicketStore::record_draft`] has to answer "can this ticket still
+    /// become `answered`?" *before* spending a run on it, and asking
+    /// `may_advance_to` would answer no for a ticket at `new` that has two
+    /// perfectly legal steps left.
+    #[must_use]
+    pub const fn may_reach(self, next: Self) -> bool {
+        if self.is_terminal() {
+            return false;
+        }
+        next.is_terminal() || next.rank() > self.rank()
+    }
 }
 
 impl fmt::Display for TicketLifecycle {
@@ -549,6 +652,20 @@ pub struct TicketRecord {
     pub lifecycle: TicketLifecycle,
     /// `1` at first recording, and one higher after every accepted change.
     pub revision: u64,
+    /// Size of the draft answer this host recorded, in bytes, or `None` when
+    /// there is none.
+    ///
+    /// The size and not the text, deliberately. A listing renders many rows and
+    /// a detail view renders one, and neither has any use for 32 KiB of draft;
+    /// a caller that wants the text asks [`SupportTicketStore::draft`] for that
+    /// one ticket. Loading every draft into memory to report that one exists
+    /// would be paying the whole cost of the column for a boolean.
+    pub draft_answer_bytes: Option<usize>,
+    /// When the draft was recorded, or `None` when there is none.
+    ///
+    /// Present exactly when [`Self::draft_answer_bytes`] is; the schema will not
+    /// hold a row where one is set and the other is not.
+    pub draft_answer_at_ms: Option<i64>,
 }
 
 impl TicketRecord {
@@ -570,6 +687,23 @@ impl TicketRecord {
             || self.created_at != ticket.created_at
             || self.updated_at != ticket.updated_at
     }
+}
+
+/// The draft answer one ticket carries, and when this host wrote it.
+///
+/// Read by [`SupportTicketStore::draft`], which is the only way the text leaves
+/// this store. Nothing sends it anywhere: it is what an operator reads before
+/// deciding whether the requester should receive anything at all.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketDraft {
+    /// The draft text, exactly as it was recorded.
+    pub text: String,
+    /// When this host recorded it, in the caller-supplied milliseconds of the
+    /// call that did.
+    pub recorded_at_ms: i64,
+    /// The lifecycle the row carries now, which is `answered` unless the ticket
+    /// has since been closed.
+    pub lifecycle: TicketLifecycle,
 }
 
 /// One bounded page of ticket rows, ordered by `ticket_id`.
@@ -883,6 +1017,141 @@ impl SupportTicketStore {
         })
     }
 
+    /// Record the draft answer this host produced for one ticket, and advance
+    /// its lifecycle to [`TicketLifecycle::Answered`].
+    ///
+    /// One call, one immediate transaction, one revision: the draft and the
+    /// lifecycle move together or neither moves, because a row carrying an
+    /// answer that does not say it has been answered — or the reverse — is a row
+    /// no reader could act on. The schema states the same binding, so a second
+    /// writer cannot produce that row either.
+    ///
+    /// # Why this takes no expected revision
+    ///
+    /// Every other mutation here is compare-and-set. This one is not, and the
+    /// reason is the shape of the work: the caller read the ticket, then spent
+    /// minutes running a sandboxed agent against it, and the poller may well
+    /// have re-synced the row in the meantime. A revision from before the run is
+    /// a token about a *fleet field* that has nothing to do with whether the
+    /// answer is still wanted, and refusing on it would throw away a completed
+    /// run because a comment count moved.
+    ///
+    /// What guards this instead is the lattice and the lifecycle it lands on. A
+    /// ticket that has already been answered, or has been closed, has no step
+    /// left to `answered` and is refused — so a second draft can never overwrite
+    /// a first, and a ticket somebody closed during the run does not silently
+    /// acquire an answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SupportTicketError::NotFound`] for an unrecorded fleet issue,
+    /// [`SupportTicketError::IllegalTransition`] when the ticket can no longer
+    /// reach `answered`, [`SupportTicketError::InvalidField`] for a draft that is
+    /// empty, over [`MAX_DRAFT_ANSWER_BYTES`], or carries a control character
+    /// other than newline or tab, for a negative instant, or for one earlier
+    /// than the row's last observation, and [`SupportTicketError::Corrupt`] when
+    /// the stored row is not one this API could have written.
+    pub fn record_draft(
+        &mut self,
+        fleet_issue_id: &str,
+        draft_answer: &str,
+        now_ms: i64,
+    ) -> Ticketed<TicketReceipt> {
+        validate_identifier(fleet_issue_id, "fleet_issue_id", MAX_FLEET_ISSUE_ID_BYTES)?;
+        validate_draft(draft_answer)?;
+        validate_time(now_ms, "now_ms")?;
+
+        let answered = TicketLifecycle::Answered;
+        let sqlite = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = read_by_fleet_id(&sqlite, fleet_issue_id)?
+            .ok_or(SupportTicketError::NotFound("support ticket"))?;
+        if !record.lifecycle.may_reach(answered) {
+            return Err(SupportTicketError::IllegalTransition {
+                from: record.lifecycle,
+                to: answered,
+            });
+        }
+        if now_ms < record.last_synced_ms {
+            return Err(SupportTicketError::InvalidField("now_ms"));
+        }
+        let next_revision = record
+            .revision
+            .checked_add(1)
+            .ok_or(SupportTicketError::InvalidField("revision"))?;
+        let changed = sqlite.execute(
+            "UPDATE support_tickets
+             SET lifecycle = ?3, draft_answer = ?4, draft_answer_at_ms = ?5,
+                 last_synced_ms = ?5, revision = ?6
+             WHERE ticket_id = ?1 AND revision = ?2",
+            params![
+                record.ticket_id,
+                to_db_u64(record.revision, "revision")?,
+                answered.as_str(),
+                draft_answer,
+                now_ms,
+                to_db_u64(next_revision, "revision")?,
+            ],
+        )?;
+        if changed != 1 {
+            // Read inside this immediate transaction, so nothing else moved it.
+            return Err(SupportTicketError::Corrupt("ticket_draft"));
+        }
+        sqlite.commit()?;
+        Ok(TicketReceipt {
+            ticket_id: record.ticket_id,
+            lifecycle: answered,
+            revision: next_revision,
+            inserted: false,
+            changed: true,
+        })
+    }
+
+    /// The draft answer one ticket carries, if it carries one.
+    ///
+    /// `Ok(None)` is a ticket nobody has drafted an answer for.
+    /// [`SupportTicketError::NotFound`] is a ticket nobody recorded at all —
+    /// which is a different fact, and one a caller asking about a reference has
+    /// to be able to tell apart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SupportTicketError::InvalidField`] for a malformed identifier,
+    /// [`SupportTicketError::NotFound`] for an unrecorded fleet issue, and
+    /// [`SupportTicketError::Corrupt`] for a stored draft this API could not
+    /// have written.
+    pub fn draft(&self, fleet_issue_id: &str) -> Ticketed<Option<TicketDraft>> {
+        validate_identifier(fleet_issue_id, "fleet_issue_id", MAX_FLEET_ISSUE_ID_BYTES)?;
+        let row: Option<(Option<String>, Option<i64>, String)> = self
+            .connection
+            .query_row(
+                "SELECT draft_answer, draft_answer_at_ms, lifecycle
+                 FROM support_tickets WHERE fleet_issue_id = ?1",
+                [fleet_issue_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let (text, recorded_at_ms, lifecycle) =
+            row.ok_or(SupportTicketError::NotFound("support ticket"))?;
+        let lifecycle = TicketLifecycle::from_spelling(&lifecycle)
+            .ok_or(SupportTicketError::Corrupt("lifecycle"))?;
+        match (text, recorded_at_ms) {
+            (None, None) => Ok(None),
+            (Some(text), Some(recorded_at_ms)) => {
+                validate_draft(&text).map_err(|_| corrupt("draft_answer"))?;
+                Ok(Some(TicketDraft {
+                    text,
+                    recorded_at_ms: checked_time(recorded_at_ms, "draft_answer_at_ms")?,
+                    lifecycle,
+                }))
+            }
+            // The schema binds the pair, so a half-written draft is a row that
+            // got in around this API.
+            _ => Err(corrupt("draft_answer")),
+        }
+    }
+
     /// The validated row one fleet issue holds, if any.
     ///
     /// # Errors
@@ -1105,11 +1374,19 @@ struct RawRecord {
     last_synced_ms: i64,
     lifecycle: String,
     revision: i64,
+    draft_answer_bytes: Option<i64>,
+    draft_answer_at_ms: Option<i64>,
 }
 
+/// The draft's *size* is selected, never its text.
+///
+/// `CAST(... AS BLOB)` because the ceiling is stated in bytes and `length()` of
+/// TEXT counts characters. `octet_length()` says the same thing and needs a
+/// newer SQLite than this workspace pins.
 const RECORD_COLUMNS: &str = "ticket_id, fleet_issue_id, title, tenant_name, site_label, \
      fleet_status, priority, source, requested_by, comment_count, created_at, updated_at, \
-     first_seen_ms, last_synced_ms, lifecycle, revision";
+     first_seen_ms, last_synced_ms, lifecycle, revision, \
+     length(CAST(draft_answer AS BLOB)), draft_answer_at_ms";
 
 fn raw_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRecord> {
     Ok(RawRecord {
@@ -1129,6 +1406,8 @@ fn raw_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRecord> {
         last_synced_ms: row.get(13)?,
         lifecycle: row.get(14)?,
         revision: row.get(15)?,
+        draft_answer_bytes: row.get(16)?,
+        draft_answer_at_ms: row.get(17)?,
     })
 }
 
@@ -1162,6 +1441,31 @@ fn validated_record(raw: RawRecord) -> Ticketed<TicketRecord> {
             MAX_SITE_LABEL_BYTES,
         )?),
     };
+    // The pair, the ceiling and the lifecycle binding are all schema CHECKs.
+    // They are re-derived here for the same reason every other invariant is: a
+    // constraint protects the table from a second writer, and this protects a
+    // caller from a row that got in anyway.
+    let (draft_answer_bytes, draft_answer_at_ms) =
+        match (raw.draft_answer_bytes, raw.draft_answer_at_ms) {
+            (None, None) => (None, None),
+            (Some(bytes), Some(recorded_at_ms)) => {
+                let bytes = usize::try_from(bytes).map_err(|_| corrupt("draft_answer"))?;
+                if bytes == 0 || bytes > MAX_DRAFT_ANSWER_BYTES {
+                    return Err(corrupt("draft_answer"));
+                }
+                if !matches!(
+                    lifecycle,
+                    TicketLifecycle::Answered | TicketLifecycle::Closed
+                ) {
+                    return Err(corrupt("draft_answer"));
+                }
+                (
+                    Some(bytes),
+                    Some(checked_time(recorded_at_ms, "draft_answer_at_ms")?),
+                )
+            }
+            _ => return Err(corrupt("draft_answer")),
+        };
     Ok(TicketRecord {
         ticket_id: checked_row_id(raw.ticket_id, "ticket_id")?,
         fleet_issue_id: checked_identifier(
@@ -1183,6 +1487,8 @@ fn validated_record(raw: RawRecord) -> Ticketed<TicketRecord> {
         last_synced_ms,
         lifecycle,
         revision,
+        draft_answer_bytes,
+        draft_answer_at_ms,
     })
 }
 
@@ -1218,6 +1524,9 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Ticketed<()> {
     if version == SUPPORT_TICKETS_SCHEMA_VERSION {
         return Ok(());
     }
+    if version == 1 {
+        return migrate_v1_to_v2(connection);
+    }
     if version != 0 {
         return Err(SupportTicketError::SchemaVersion {
             found: version,
@@ -1236,7 +1545,25 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Ticketed<()> {
         });
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(SCHEMA_V1)?;
+    transaction.execute_batch(TABLE_V2)?;
+    transaction.execute_batch(INDEXES_V2)?;
+    transaction.pragma_update(None, "user_version", SUPPORT_TICKETS_SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Rebuild a v1 table as a v2 one, in one immediate transaction.
+///
+/// A crash part-way leaves the v1 database exactly as it was: the rename, the
+/// copy and the version bump are one atomic unit, so there is no state in which
+/// a reader finds `user_version` at 2 and a table without the draft columns, or
+/// a `support_tickets_v1` nobody will ever read again.
+fn migrate_v1_to_v2(connection: &mut Connection) -> Ticketed<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(MIGRATE_V1_RENAME)?;
+    transaction.execute_batch(TABLE_V2)?;
+    transaction.execute_batch(MIGRATE_V1_COPY)?;
+    transaction.execute_batch(INDEXES_V2)?;
     transaction.pragma_update(None, "user_version", SUPPORT_TICKETS_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -1284,6 +1611,27 @@ fn validate_identifier(value: &str, field: &'static str, max_bytes: usize) -> Ti
     validate_text(value, field, max_bytes)?;
     if value.is_empty() {
         return Err(SupportTicketError::InvalidField(field));
+    }
+    Ok(())
+}
+
+/// A bounded, non-empty draft answer.
+///
+/// The one text field here that may hold newlines and tabs, because it is a
+/// written answer rather than one of the fleet's single-line fields. Every other
+/// control character is refused: a draft is read by an operator in a chat and
+/// written back into a support thread, and an escape sequence in either is a
+/// rendering nobody asked for.
+///
+/// The bound is bytes, matching the schema's own `CAST(... AS BLOB)` ceiling.
+fn validate_draft(value: &str) -> Ticketed<()> {
+    if value.is_empty()
+        || value.len() > MAX_DRAFT_ANSWER_BYTES
+        || value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    {
+        return Err(SupportTicketError::InvalidField("draft_answer"));
     }
     Ok(())
 }

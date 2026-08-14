@@ -47,12 +47,13 @@ pub const MAX_COMMAND_NAME_BYTES: usize = 32;
 pub const MAX_BOT_SUFFIX_BYTES: usize = 32;
 /// Longest task text a `/run` may carry.
 pub const MAX_RUN_TASK_BYTES: usize = 1024;
-/// Longest reference a `/cancel`, `/approve`, `/deny` or `/ticket` may name.
+/// Longest reference a `/cancel`, `/approve`, `/deny`, `/ticket` or `/work` may
+/// name.
 pub const MAX_CONTROL_REF_BYTES: usize = 128;
 /// Most Telegram user ids one allowlist may hold.
 pub const MAX_ALLOWED_USERS: usize = 256;
 /// Number of commands in the closed registry.
-pub const COMMAND_COUNT: usize = 9;
+pub const COMMAND_COUNT: usize = 10;
 
 const _: () = assert!(COMMAND_COUNT == CommandKind::ALL.len());
 const _: () = assert!(MAX_COMMAND_NAME_BYTES <= MAX_COMMAND_TEXT_BYTES);
@@ -84,10 +85,11 @@ pub struct CommandSpec {
 /// The closed operator vocabulary.
 ///
 /// Each kind names a capability the control plane already has: a status
-/// snapshot, the Runs read surface, the tracked support tickets, run
-/// submission, cancellation, and the approval lane's two decisions. Nothing
-/// here is aspirational — a kind with no lane behind it would be a command that
-/// refuses at dispatch, which is worse than one that does not exist.
+/// snapshot, the Runs read surface, the tracked support tickets, working one of
+/// them into a draft, run submission, cancellation, and the approval lane's two
+/// decisions. Nothing here is aspirational — a kind with no lane behind it would
+/// be a command that refuses at dispatch, which is worse than one that does not
+/// exist.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CommandKind {
     /// Render the command menu.
@@ -100,6 +102,8 @@ pub enum CommandKind {
     Tickets,
     /// One tracked support ticket.
     Ticket,
+    /// Work one tracked support ticket into a draft answer.
+    Work,
     /// Submit one run.
     Run,
     /// Cancel one run.
@@ -119,6 +123,7 @@ impl CommandKind {
         Self::Runs,
         Self::Tickets,
         Self::Ticket,
+        Self::Work,
         Self::Run,
         Self::Cancel,
         Self::Approve,
@@ -152,6 +157,11 @@ impl CommandKind {
             Self::Ticket => CommandSpec {
                 name: "ticket",
                 description: "Show the tracked support ticket with the given reference",
+                argument: ArgumentShape::Reference,
+            },
+            Self::Work => CommandSpec {
+                name: "work",
+                description: "Draft an answer to the support ticket with the given reference",
                 argument: ArgumentShape::Reference,
             },
             Self::Run => CommandSpec {
@@ -377,6 +387,15 @@ pub enum ControlCommand {
         /// The fleet issue being asked about.
         ticket_ref: ControlRef,
     },
+    /// Work the tracked support ticket this reference names into a draft answer.
+    ///
+    /// The reference is the whole of the operator's input. Everything the work
+    /// is composed *from* is the ticket the daemon already recorded, so this
+    /// value carries no task text that could reach a provider unread.
+    Work {
+        /// The fleet issue to work.
+        ticket_ref: ControlRef,
+    },
     /// Submit one run carrying this task text.
     Run {
         /// The bounded task body.
@@ -412,6 +431,7 @@ impl ControlCommand {
             Self::Runs => CommandKind::Runs,
             Self::Tickets => CommandKind::Tickets,
             Self::Ticket { .. } => CommandKind::Ticket,
+            Self::Work { .. } => CommandKind::Work,
             Self::Run { .. } => CommandKind::Run,
             Self::Cancel { .. } => CommandKind::Cancel,
             Self::Approve { .. } => CommandKind::Approve,
@@ -652,6 +672,9 @@ pub fn parse_command(text: &str) -> Result<ControlCommand, CommandRefusal> {
         CommandKind::Ticket => {
             one_reference(rest).map(|ticket_ref| ControlCommand::Ticket { ticket_ref })
         }
+        CommandKind::Work => {
+            one_reference(rest).map(|ticket_ref| ControlCommand::Work { ticket_ref })
+        }
         CommandKind::Run => RunTask::new(rest).map(|task| ControlCommand::Run { task }),
         CommandKind::Cancel => {
             one_reference(rest).map(|run_ref| ControlCommand::Cancel { run_ref })
@@ -773,6 +796,40 @@ mod tests {
         );
         assert_eq!(CommandKind::from_name("ticket"), Some(CommandKind::Ticket));
         assert_eq!(CommandKind::from_name("ticketss"), None);
+    }
+
+    /// `/work` reads a ticket and `/ticket` reads a ticket, and they are not the
+    /// same command: one of them is an effect. They take the same argument
+    /// shape, so nothing but the name keeps them apart, and this is where that
+    /// is watched.
+    #[test]
+    fn working_a_ticket_is_a_different_command_from_reading_one() {
+        let ticket_ref = ControlRef::new("SUP-1042").expect("reference");
+        assert_eq!(
+            parse_command("/work SUP-1042"),
+            Ok(ControlCommand::Work {
+                ticket_ref: ticket_ref.clone()
+            })
+        );
+        assert_ne!(
+            parse_command("/work SUP-1042"),
+            parse_command("/ticket SUP-1042"),
+            "a read and an effect must not parse to the same value"
+        );
+        assert_eq!(parse_command("/work"), Err(CommandRefusal::MissingArgument));
+        assert_eq!(
+            parse_command("/work SUP-1042 and also this one"),
+            Err(CommandRefusal::UnexpectedArgument),
+            "one reference, so a second cannot be smuggled in"
+        );
+        // The reference grammar is the gate on what a `/work` can name: nothing
+        // with whitespace, quoting or a control character reaches the daemon.
+        assert_eq!(
+            parse_command("/work SUP-1042;rm"),
+            Err(CommandRefusal::ArgumentInvalid)
+        );
+        assert_eq!(CommandKind::from_name("work"), Some(CommandKind::Work));
+        assert_eq!(CommandKind::Work.argument(), ArgumentShape::Reference);
     }
 
     #[test]
