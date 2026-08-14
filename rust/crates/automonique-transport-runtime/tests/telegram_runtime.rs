@@ -579,3 +579,55 @@ fn parser_disposition_contract_remains_closed() {
         TelegramDisposition::IgnoredUnsupported
     );
 }
+
+/// The policy a running poller admits work under can be widened in place — a
+/// host whose operator list changes at runtime must not have to drop its lease
+/// and re-read its offset to add one user — but only in ways that keep the
+/// durable stream coherent.
+#[test]
+fn a_policy_may_be_replaced_in_place_but_never_across_bots_or_an_ambiguous_commit() {
+    let first = br#"{"ok":true,"result":[{"update_id":0,"message":{"chat":{"id":-100},"from":{"id":99},"text":"newcomer"}}]}"#;
+    let second = br#"{"ok":true,"result":[{"update_id":1,"message":{"chat":{"id":-100},"from":{"id":99},"text":"newcomer again"}}]}"#;
+    let (mut poller, _client, sink, _order) = poller([
+        ClientBehavior::Response(response(first)),
+        ClientBehavior::Response(response(second)),
+    ]);
+
+    // Under the configured policy this sender is nobody, and the durable
+    // record says so.
+    poller
+        .poll_once(&lease(), 10, &CancellationToken::new())
+        .expect("poll");
+    assert!(matches!(
+        sink.state.lock().unwrap().committed[0].updates[0].disposition,
+        DurableDisposition::Denied
+    ));
+
+    // A different bot is refused: the identity is bound into every scope this
+    // poller has already committed.
+    let other_bot = TelegramAccessPolicy::new(
+        TelegramBotId::new(8).unwrap(),
+        [TelegramPrincipal::new(-100, 99).unwrap()],
+    )
+    .unwrap();
+    assert!(poller.set_policy(other_bot).is_err());
+
+    // The same bot, one principal wider, is accepted — and the next poll
+    // admits the sender the previous one denied.
+    let widened = TelegramAccessPolicy::new(
+        TelegramBotId::new(7).unwrap(),
+        [
+            TelegramPrincipal::new(-100, 42).unwrap(),
+            TelegramPrincipal::new(-100, 99).unwrap(),
+        ],
+    )
+    .unwrap();
+    poller.set_policy(widened).expect("the same bot, widened");
+    poller
+        .poll_once(&lease(), 20, &CancellationToken::new())
+        .expect("poll");
+    assert!(matches!(
+        sink.state.lock().unwrap().committed[1].updates[0].disposition,
+        DurableDisposition::Admitted { .. }
+    ));
+}

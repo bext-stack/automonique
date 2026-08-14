@@ -26,6 +26,26 @@
 //! four kilobytes of noise — the refusal never reports which, because that
 //! would answer a question an unauthorized sender is not entitled to ask.
 //!
+//! # Two tiers, one table
+//!
+//! Being allowed to command the bot and being allowed to command *this* is not
+//! the same permission. Every registry row carries a [`CommandTier`], and
+//! [`OperatorAuthority`] says which tier a sender carries:
+//!
+//! - [`CommandTier::Allowed`] — the reads. Anyone the host admits may ask what
+//!   this daemon holds.
+//! - [`CommandTier::Admin`] — the effects, and user management. A run costs a
+//!   provider call, a `/work` writes durable state, and `/admin` decides who
+//!   else may be here at all.
+//!
+//! [`authorize_and_parse_tiered`] resolves the command *name* and then checks
+//! the tier, before it parses a single argument. The order matters: a member who
+//! types an admin command is told [`CommandRefusal::NotPermitted`] no matter how
+//! their arguments were spelled, so the refusal cannot be turned into an oracle
+//! for the argument grammar of a command they may not run. The refusal is
+//! deliberately distinct from [`CommandRefusal::Unauthorized`]: a member is a
+//! known operator being told "not that one", not a stranger being told nothing.
+//!
 //! # Bounds
 //!
 //! Every field is bounded before it is stored: the whole message, the run task,
@@ -52,13 +72,20 @@ pub const MAX_RUN_TASK_BYTES: usize = 1024;
 pub const MAX_CONTROL_REF_BYTES: usize = 128;
 /// Most Telegram user ids one allowlist may hold.
 pub const MAX_ALLOWED_USERS: usize = 256;
+/// Longest user id one `/admin` directive may name, in bytes.
+///
+/// A Telegram user id is a positive `i64`, so nothing legitimate is longer than
+/// its decimal spelling. The bound is here so a directive is refused while it is
+/// being read rather than after an allocation.
+pub const MAX_USER_ID_BYTES: usize = 20;
 /// Number of commands in the closed registry.
-pub const COMMAND_COUNT: usize = 10;
+pub const COMMAND_COUNT: usize = 11;
 
 const _: () = assert!(COMMAND_COUNT == CommandKind::ALL.len());
 const _: () = assert!(MAX_COMMAND_NAME_BYTES <= MAX_COMMAND_TEXT_BYTES);
 const _: () = assert!(MAX_RUN_TASK_BYTES < MAX_COMMAND_TEXT_BYTES);
 const _: () = assert!(MAX_CONTROL_REF_BYTES < MAX_RUN_TASK_BYTES);
+const _: () = assert!(MAX_USER_ID_BYTES < MAX_CONTROL_REF_BYTES);
 
 /// What a command takes after its name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,6 +96,39 @@ pub enum ArgumentShape {
     Task,
     /// Exactly one opaque reference token.
     Reference,
+    /// One [`AdminDirective`]: a subcommand and, for two of the three, a user
+    /// id.
+    ///
+    /// The one shape whose grammar is closed on both tokens. `/admin` manages
+    /// who may command this bot, so admitting a free-form argument there and
+    /// letting a dispatcher work out what it meant is exactly the wrong shape
+    /// for the one command that changes the allowlist.
+    Directive,
+}
+
+/// Which tier of operator a command belongs to.
+///
+/// Ordered, and the order is the rule: a sender may run a command when the tier
+/// they carry is at least the tier the command declares. There is no third
+/// value, and adding one would mean deciding what it can do to durable state
+/// before it is written down here.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CommandTier {
+    /// Any user the host admits at all. Every one of these is a read.
+    Allowed,
+    /// An administrator. Effects, spend, and user management.
+    Admin,
+}
+
+impl CommandTier {
+    /// Stable, content-free spelling for logs and help.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Admin => "admin",
+        }
+    }
 }
 
 /// One row of the closed registry.
@@ -80,6 +140,8 @@ pub struct CommandSpec {
     pub description: &'static str,
     /// What the parser accepts after the name.
     pub argument: ArgumentShape,
+    /// The lowest operator tier that may run it.
+    pub tier: CommandTier,
 }
 
 /// The closed operator vocabulary.
@@ -112,6 +174,8 @@ pub enum CommandKind {
     Approve,
     /// Deny one pending decision.
     Deny,
+    /// Manage the non-admin members who may command this bot.
+    Admin,
 }
 
 impl CommandKind {
@@ -128,9 +192,31 @@ impl CommandKind {
         Self::Cancel,
         Self::Approve,
         Self::Deny,
+        Self::Admin,
     ];
 
     /// This kind's registry row.
+    ///
+    /// The `tier` column is the whole authority model of this surface, so it is
+    /// worth reading as a table rather than as ten separate decisions:
+    ///
+    /// | command | tier | why |
+    /// |---|---|---|
+    /// | `/help` | allowed | the vocabulary itself |
+    /// | `/status` | allowed | a read of durable state |
+    /// | `/runs` | allowed | a read of the run index |
+    /// | `/tickets` | allowed | a read of the ticket store |
+    /// | `/ticket` | allowed | a read of one ticket |
+    /// | `/work` | admin | spends a provider call and writes a draft |
+    /// | `/run` | admin | spends a provider call |
+    /// | `/cancel` | admin | ends somebody else's run |
+    /// | `/approve` | admin | a decision with an effect behind it |
+    /// | `/deny` | admin | the same decision, the other way |
+    /// | `/admin` | admin | decides who may be here at all |
+    ///
+    /// The line between the two is *spend and effect*, not sensitivity: a member
+    /// can already read everything the reads report, and the thing an owner
+    /// cannot un-spend is a provider call.
     #[must_use]
     pub const fn spec(self) -> CommandSpec {
         match self {
@@ -138,51 +224,67 @@ impl CommandKind {
                 name: "help",
                 description: "Show the commands this bot accepts",
                 argument: ArgumentShape::None,
+                tier: CommandTier::Allowed,
             },
             Self::Status => CommandSpec {
                 name: "status",
                 description: "Report the daemon status snapshot",
                 argument: ArgumentShape::None,
+                tier: CommandTier::Allowed,
             },
             Self::Runs => CommandSpec {
                 name: "runs",
                 description: "List the most recent runs",
                 argument: ArgumentShape::None,
+                tier: CommandTier::Allowed,
             },
             Self::Tickets => CommandSpec {
                 name: "tickets",
                 description: "List the most recently tracked support tickets",
                 argument: ArgumentShape::None,
+                tier: CommandTier::Allowed,
             },
             Self::Ticket => CommandSpec {
                 name: "ticket",
                 description: "Show the tracked support ticket with the given reference",
                 argument: ArgumentShape::Reference,
+                tier: CommandTier::Allowed,
             },
             Self::Work => CommandSpec {
                 name: "work",
                 description: "Draft an answer to the support ticket with the given reference",
                 argument: ArgumentShape::Reference,
+                tier: CommandTier::Admin,
             },
             Self::Run => CommandSpec {
                 name: "run",
                 description: "Submit a run with the given task text",
                 argument: ArgumentShape::Task,
+                tier: CommandTier::Admin,
             },
             Self::Cancel => CommandSpec {
                 name: "cancel",
                 description: "Cancel the run with the given reference",
                 argument: ArgumentShape::Reference,
+                tier: CommandTier::Admin,
             },
             Self::Approve => CommandSpec {
                 name: "approve",
                 description: "Approve the pending decision with the given reference",
                 argument: ArgumentShape::Reference,
+                tier: CommandTier::Admin,
             },
             Self::Deny => CommandSpec {
                 name: "deny",
                 description: "Deny the pending decision with the given reference",
                 argument: ArgumentShape::Reference,
+                tier: CommandTier::Admin,
+            },
+            Self::Admin => CommandSpec {
+                name: "admin",
+                description: "Manage members: add <user_id>, remove <user_id>, or list",
+                argument: ArgumentShape::Directive,
+                tier: CommandTier::Admin,
             },
         }
     }
@@ -203,6 +305,12 @@ impl CommandKind {
     #[must_use]
     pub const fn argument(self) -> ArgumentShape {
         self.spec().argument
+    }
+
+    /// The lowest operator tier that may run this command.
+    #[must_use]
+    pub const fn tier(self) -> CommandTier {
+        self.spec().tier
     }
 
     /// Look one name up in the closed registry.
@@ -227,6 +335,14 @@ pub struct CommandManifestEntry {
     pub name: &'static str,
     /// The description `setMyCommands` advertises.
     pub description: &'static str,
+    /// The lowest tier that may run it.
+    ///
+    /// Advertised rather than hidden. Telegram publishes one menu per bot and
+    /// this build does not scope it per user, so a member would see the admin
+    /// commands in their client whatever this field said; carrying the tier
+    /// means the help text can say which ones will refuse them, instead of
+    /// letting them find out by being refused.
+    pub tier: CommandTier,
 }
 
 /// The exact menu to publish with `setMyCommands`.
@@ -239,10 +355,20 @@ pub fn command_manifest() -> [CommandManifestEntry; COMMAND_COUNT] {
         kind,
         name: kind.name(),
         description: kind.description(),
+        tier: kind.tier(),
     })
 }
 
+/// What the help marks an admin-only command with.
+pub const ADMIN_HELP_MARK: &str = " [admin]";
+
 /// The operator-facing help body, rendered from the same registry.
+///
+/// One body for both tiers. A member reading it sees the whole vocabulary with
+/// the admin-only half marked, which is the honest rendering of a menu Telegram
+/// publishes to everyone anyway — and it is how a member learns that the thing
+/// to do about `/run` is to ask an administrator, rather than that the bot is
+/// broken.
 #[must_use]
 pub fn help_text() -> String {
     let mut text = String::from("Commands:");
@@ -251,10 +377,15 @@ pub fn help_text() -> String {
             ArgumentShape::None => String::new(),
             ArgumentShape::Task => String::from(" <task>"),
             ArgumentShape::Reference => String::from(" <reference>"),
+            ArgumentShape::Directive => String::from(" <add|remove|list> [user_id]"),
+        };
+        let mark = match entry.tier {
+            CommandTier::Allowed => "",
+            CommandTier::Admin => ADMIN_HELP_MARK,
         };
         text.push_str(&format!(
-            "\n/{}{} — {}",
-            entry.name, usage, entry.description
+            "\n/{}{} — {}{}",
+            entry.name, usage, entry.description, mark
         ));
     }
     text
@@ -366,6 +497,115 @@ impl fmt::Display for ControlRef {
     }
 }
 
+/// One validated Telegram user id, named in an `/admin` directive.
+///
+/// A newtype rather than a bare `i64` because it crosses a boundary where the
+/// difference matters: everything downstream of this value treats it as
+/// somebody who may be given or refused access to a control surface, and an
+/// unvalidated integer that reached that far could name user zero, a negative
+/// id, or a chat.
+///
+/// Validating it here does not mean the id names anybody. Telegram has no
+/// lookup this parser could perform and none it *should* — a directive naming a
+/// user who does not exist adds a row nobody will ever match, which is inert.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct OperatorUserId(i64);
+
+impl OperatorUserId {
+    /// Validate one user id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRefusal::ArgumentInvalid`] for anything that is not a
+    /// positive `i64`, which is what a Telegram user id is.
+    pub const fn new(user_id: i64) -> Result<Self, CommandRefusal> {
+        if user_id <= 0 {
+            return Err(CommandRefusal::ArgumentInvalid);
+        }
+        Ok(Self(user_id))
+    }
+
+    /// Parse one decimal user id token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRefusal::MissingArgument`] when empty,
+    /// [`CommandRefusal::ArgumentTooLong`] beyond [`MAX_USER_ID_BYTES`], and
+    /// [`CommandRefusal::ArgumentInvalid`] for anything that is not a positive
+    /// decimal integer. A leading `+` or `-`, whitespace and separators are all
+    /// refused: there is exactly one spelling of an id.
+    pub fn parse(token: &str) -> Result<Self, CommandRefusal> {
+        if token.is_empty() {
+            return Err(CommandRefusal::MissingArgument);
+        }
+        if token.len() > MAX_USER_ID_BYTES {
+            return Err(CommandRefusal::ArgumentTooLong);
+        }
+        if !token.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(CommandRefusal::ArgumentInvalid);
+        }
+        let parsed = token
+            .parse::<i64>()
+            .map_err(|_| CommandRefusal::ArgumentInvalid)?;
+        Self::new(parsed)
+    }
+
+    /// The validated id.
+    #[must_use]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for OperatorUserId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+/// What one `/admin` asked for.
+///
+/// Closed, and closed at three: adding a member, revoking one, and reading the
+/// roster. There is deliberately no directive that grants administrator — the
+/// admin tier is the configuration file's alone, so a chat cannot promote
+/// anybody, and the absence of the verb is the enforcement.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AdminDirective {
+    /// Add one non-admin member.
+    Add {
+        /// The user being added.
+        user_id: OperatorUserId,
+    },
+    /// Revoke one non-admin member.
+    Remove {
+        /// The user being revoked.
+        user_id: OperatorUserId,
+    },
+    /// Report the administrators and members this host currently admits.
+    List,
+}
+
+impl AdminDirective {
+    /// The subcommand word an operator types.
+    #[must_use]
+    pub const fn verb(self) -> &'static str {
+        match self {
+            Self::Add { .. } => "add",
+            Self::Remove { .. } => "remove",
+            Self::List => "list",
+        }
+    }
+
+    /// The user this directive names, when it names one.
+    #[must_use]
+    pub const fn user_id(self) -> Option<OperatorUserId> {
+        match self {
+            Self::Add { user_id } | Self::Remove { user_id } => Some(user_id),
+            Self::List => None,
+        }
+    }
+}
+
 /// One typed, inert operator intent.
 ///
 /// Holding this value has no effect. It says what an authorized operator asked
@@ -416,6 +656,11 @@ pub enum ControlCommand {
         /// The decision being denied.
         approval_ref: ControlRef,
     },
+    /// Manage the non-admin members of this control surface.
+    Admin {
+        /// What was asked for.
+        directive: AdminDirective,
+    },
 }
 
 impl ControlCommand {
@@ -436,7 +681,17 @@ impl ControlCommand {
             Self::Cancel { .. } => CommandKind::Cancel,
             Self::Approve { .. } => CommandKind::Approve,
             Self::Deny { .. } => CommandKind::Deny,
+            Self::Admin { .. } => CommandKind::Admin,
         }
+    }
+
+    /// The lowest operator tier that may run this command.
+    ///
+    /// Read from the same registry row the parser and the menu read, so a
+    /// dispatcher cannot form a second opinion about who may run what.
+    #[must_use]
+    pub const fn tier(&self) -> CommandTier {
+        self.kind().tier()
     }
 }
 
@@ -448,6 +703,14 @@ impl ControlCommand {
 pub enum CommandRefusal {
     /// The sender is not on the allowlist. Decided before the text is read.
     Unauthorized,
+    /// The sender may command this bot, but not this command.
+    ///
+    /// Decided as soon as the name resolves and before any argument is parsed,
+    /// so it cannot be used to probe the grammar of a command the sender may
+    /// not run. Distinct from [`Self::Unauthorized`] on purpose: this sender is
+    /// a known operator and telling them "not authorized" flat would send them
+    /// looking for a fault in their own access.
+    NotPermitted,
     /// The message is empty or only whitespace.
     Empty,
     /// The message is longer than [`MAX_COMMAND_TEXT_BYTES`].
@@ -472,6 +735,7 @@ impl CommandRefusal {
     pub const fn category(&self) -> &'static str {
         match self {
             Self::Unauthorized => "unauthorized",
+            Self::NotPermitted => "not_permitted",
             Self::Empty => "empty",
             Self::MessageTooLong => "message_too_long",
             Self::NotACommand => "not_a_command",
@@ -491,6 +755,7 @@ impl CommandRefusal {
     pub const fn operator_reply(&self) -> &'static str {
         match self {
             Self::Unauthorized => "Not authorized.",
+            Self::NotPermitted => "Not authorized for that. Ask an administrator.",
             Self::Empty => "Send a command, for example /help.",
             Self::MessageTooLong => "That message is too long to read as a command.",
             Self::NotACommand => "Commands start with a slash. Try /help.",
@@ -525,6 +790,14 @@ pub enum AllowlistError {
     TooMany,
     /// An id is not a positive Telegram user id.
     InvalidUserId,
+    /// An administrator was named who is not in the allowed set.
+    ///
+    /// Refused rather than repaired by widening the allowed set: the two lists
+    /// come from different places — configuration and configuration plus a
+    /// durable roster — and a composition that silently admitted an
+    /// administrator the allowed set never named would mean the two disagreed
+    /// about who the operators are.
+    AdminNotAllowed,
 }
 
 impl AllowlistError {
@@ -535,6 +808,7 @@ impl AllowlistError {
             Self::Empty => "empty",
             Self::TooMany => "too_many",
             Self::InvalidUserId => "invalid_user_id",
+            Self::AdminNotAllowed => "admin_not_allowed",
         }
     }
 }
@@ -609,6 +883,104 @@ impl AllowedUsers {
     }
 }
 
+/// Who may command this bot, and which of them may command all of it.
+///
+/// Two nested sets and one invariant: **every administrator is allowed**, so a
+/// composition where they are not is refused rather than reconciled. That is
+/// the property the whole tier model rests on — an administrator who was not in
+/// the allowed set would be refused at the outer gate and never reach the tier
+/// check at all, which reads as "the owner locked themselves out" and would be
+/// impossible to diagnose from a chat.
+///
+/// The two sets come from different places and change at different rates. The
+/// admin set is written down by the owner in a file the daemon reads at startup
+/// and nothing at runtime can widen. The allowed set is that same file *plus* a
+/// durable roster an administrator edits from a chat, so it is recomposed
+/// whenever the roster moves. Holding them in one value is what keeps a
+/// recomposition from updating one and forgetting the other.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperatorAuthority {
+    allowed: AllowedUsers,
+    admins: AllowedUsers,
+}
+
+impl OperatorAuthority {
+    /// Compose the two sets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AllowlistError::AdminNotAllowed`] when an administrator is not
+    /// in the allowed set.
+    pub fn new(allowed: AllowedUsers, admins: AllowedUsers) -> Result<Self, AllowlistError> {
+        if admins
+            .as_slice()
+            .iter()
+            .any(|admin| !allowed.authorize(*admin))
+        {
+            return Err(AllowlistError::AdminNotAllowed);
+        }
+        Ok(Self { allowed, admins })
+    }
+
+    /// The single-tier composition: everyone allowed is an administrator.
+    ///
+    /// This is what a deployment that never wrote down a second tier means, and
+    /// naming it here is what lets a host express "no tiers configured" without
+    /// building the two lists itself. See the daemon's bot configuration for why
+    /// that is the back-compatible reading of an absent `admin=` line.
+    #[must_use]
+    pub fn single_tier(allowed: AllowedUsers) -> Self {
+        Self {
+            admins: allowed.clone(),
+            allowed,
+        }
+    }
+
+    /// Everyone who may command this bot at all.
+    #[must_use]
+    pub const fn allowed(&self) -> &AllowedUsers {
+        &self.allowed
+    }
+
+    /// The administrators.
+    #[must_use]
+    pub const fn admins(&self) -> &AllowedUsers {
+        &self.admins
+    }
+
+    /// Whether this user may command the bot at all.
+    #[must_use]
+    pub fn authorize(&self, user_id: i64) -> bool {
+        self.allowed.authorize(user_id)
+    }
+
+    /// Whether this user is an administrator.
+    #[must_use]
+    pub fn is_admin(&self, user_id: i64) -> bool {
+        self.admins.authorize(user_id)
+    }
+
+    /// The tier this user carries, or `None` for a user this host does not
+    /// admit at all.
+    #[must_use]
+    pub fn tier_of(&self, user_id: i64) -> Option<CommandTier> {
+        if self.is_admin(user_id) {
+            return Some(CommandTier::Admin);
+        }
+        self.authorize(user_id).then_some(CommandTier::Allowed)
+    }
+
+    /// Whether this user may run this command.
+    ///
+    /// The whole rule, in one comparison: the tier they carry must be at least
+    /// the tier the registry row declares.
+    #[must_use]
+    pub fn may(&self, user_id: i64, kind: CommandKind) -> bool {
+        self.tier_of(user_id)
+            .is_some_and(|tier| tier >= kind.tier())
+    }
+}
+
 /// Gate one message on its sender, then parse it.
 ///
 /// This is the entry point a host should call. The gate runs first and returns
@@ -631,6 +1003,41 @@ pub fn authorize_and_parse(
     parse_command(text)
 }
 
+/// Gate one message on its sender's *tier*, then parse it.
+///
+/// This is the entry point a two-tier host should call, and the order of the
+/// three checks is the design:
+///
+/// 1. **Allowed at all?** A sender outside the allowed set is
+///    [`CommandRefusal::Unauthorized`] without a byte of their text being
+///    inspected, exactly as in [`authorize_and_parse`].
+/// 2. **Which command?** The name is resolved against the closed registry.
+/// 3. **May they run it?** The tier is checked against the registry row, before
+///    any argument is parsed. A member typing `/run` with a perfect task and a
+///    member typing `/run` with a four-kilobyte one receive the same
+///    [`CommandRefusal::NotPermitted`], so the refusal says nothing about the
+///    grammar of a command that is not theirs.
+///
+/// # Errors
+///
+/// Returns [`CommandRefusal::Unauthorized`] for a sender the host does not
+/// admit, [`CommandRefusal::NotPermitted`] for one whose tier is below the
+/// command's, and otherwise whatever the argument grammar refuses.
+pub fn authorize_and_parse_tiered(
+    authority: &OperatorAuthority,
+    user_id: i64,
+    text: &str,
+) -> Result<ControlCommand, CommandRefusal> {
+    let Some(tier) = authority.tier_of(user_id) else {
+        return Err(CommandRefusal::Unauthorized);
+    };
+    let (kind, rest) = split_command(text)?;
+    if tier < kind.tier() {
+        return Err(CommandRefusal::NotPermitted);
+    }
+    parse_arguments(kind, rest)
+}
+
 /// Parse one `/name args` message into a typed command.
 ///
 /// Accepts Telegram's group addressing form (`/status@some_bot`) by dropping a
@@ -644,6 +1051,18 @@ pub fn authorize_and_parse(
 /// Returns the closed [`CommandRefusal`] vocabulary. It never panics and never
 /// unwraps external input.
 pub fn parse_command(text: &str) -> Result<ControlCommand, CommandRefusal> {
+    let (kind, rest) = split_command(text)?;
+    parse_arguments(kind, rest)
+}
+
+/// Resolve one message's command name, returning it and its untouched
+/// remainder.
+///
+/// Split out of [`parse_command`] so a tier check can happen between resolving
+/// the name and parsing what follows it. Nothing here looks at the argument, so
+/// a caller that refuses at the tier has refused before any field of an
+/// untrusted message was validated, bounded or allocated.
+fn split_command(text: &str) -> Result<(CommandKind, &str), CommandRefusal> {
     if text.len() > MAX_COMMAND_TEXT_BYTES {
         return Err(CommandRefusal::MessageTooLong);
     }
@@ -664,6 +1083,15 @@ pub fn parse_command(text: &str) -> Result<ControlCommand, CommandRefusal> {
         return Err(CommandRefusal::UnknownCommand);
     }
     let kind = CommandKind::from_name(name).ok_or(CommandRefusal::UnknownCommand)?;
+    Ok((kind, rest))
+}
+
+/// Parse what follows one resolved command name.
+///
+/// Exhaustive over [`CommandKind`], which is what makes the registry's declared
+/// [`ArgumentShape`] and the grammar the parser actually accepts one thing
+/// rather than two that agree today.
+fn parse_arguments(kind: CommandKind, rest: &str) -> Result<ControlCommand, CommandRefusal> {
     match kind {
         CommandKind::Help => no_argument(rest).map(|()| ControlCommand::Help),
         CommandKind::Status => no_argument(rest).map(|()| ControlCommand::Status),
@@ -684,6 +1112,9 @@ pub fn parse_command(text: &str) -> Result<ControlCommand, CommandRefusal> {
         }
         CommandKind::Deny => {
             one_reference(rest).map(|approval_ref| ControlCommand::Deny { approval_ref })
+        }
+        CommandKind::Admin => {
+            one_directive(rest).map(|directive| ControlCommand::Admin { directive })
         }
     }
 }
@@ -724,6 +1155,42 @@ fn one_reference(rest: &str) -> Result<ControlRef, CommandRefusal> {
         return Err(CommandRefusal::UnexpectedArgument);
     }
     ControlRef::new(first)
+}
+
+/// Accept exactly one `/admin` directive.
+///
+/// The grammar is closed on both tokens and admits no third: `add <user_id>`,
+/// `remove <user_id>`, `list`. An unrecognized verb is
+/// [`CommandRefusal::ArgumentInvalid`] rather than [`CommandRefusal::UnknownCommand`],
+/// because the *command* was recognized — an administrator who typed
+/// `/admin delete 7` should be told their argument is not in an accepted form,
+/// not that `/admin` does not exist.
+///
+/// The verb is matched case-insensitively for the reason command names are: an
+/// operator typing from a phone keyboard that capitalized the first word means
+/// the same thing.
+fn one_directive(rest: &str) -> Result<AdminDirective, CommandRefusal> {
+    let mut tokens = rest.split_whitespace();
+    let verb = tokens.next().ok_or(CommandRefusal::MissingArgument)?;
+    let argument = tokens.next();
+    if tokens.next().is_some() {
+        return Err(CommandRefusal::UnexpectedArgument);
+    }
+    if verb.len() > MAX_COMMAND_NAME_BYTES {
+        return Err(CommandRefusal::ArgumentTooLong);
+    }
+    match (verb.to_ascii_lowercase().as_str(), argument) {
+        ("list", None) => Ok(AdminDirective::List),
+        ("list", Some(_)) => Err(CommandRefusal::UnexpectedArgument),
+        ("add", Some(token)) => {
+            OperatorUserId::parse(token).map(|user_id| AdminDirective::Add { user_id })
+        }
+        ("remove", Some(token)) => {
+            OperatorUserId::parse(token).map(|user_id| AdminDirective::Remove { user_id })
+        }
+        ("add" | "remove", None) => Err(CommandRefusal::MissingArgument),
+        _ => Err(CommandRefusal::ArgumentInvalid),
+    }
 }
 
 #[cfg(test)]
@@ -861,14 +1328,311 @@ mod tests {
                         entry.name
                     );
                 }
+                ArgumentShape::Directive => {
+                    assert_eq!(bare, Err(CommandRefusal::MissingArgument), "{}", entry.name);
+                    // A directive's grammar is closed on the verb too, so the
+                    // token every other shape accepts is refused here.
+                    assert_eq!(
+                        with_argument,
+                        Err(CommandRefusal::ArgumentInvalid),
+                        "{}",
+                        entry.name
+                    );
+                    assert_eq!(
+                        parse_command(&format!("/{} list", entry.name))
+                            .as_ref()
+                            .map(ControlCommand::kind),
+                        Ok(entry.kind),
+                        "{}",
+                        entry.name
+                    );
+                }
             }
         }
+    }
+
+    /// The tier column is the authority model, so it is asserted as a table
+    /// rather than trusted to whatever the registry happens to say today. A
+    /// command moved from one tier to the other fails here.
+    #[test]
+    fn the_tier_of_every_command_is_the_documented_one() {
+        let expected = [
+            (CommandKind::Help, CommandTier::Allowed),
+            (CommandKind::Status, CommandTier::Allowed),
+            (CommandKind::Runs, CommandTier::Allowed),
+            (CommandKind::Tickets, CommandTier::Allowed),
+            (CommandKind::Ticket, CommandTier::Allowed),
+            (CommandKind::Work, CommandTier::Admin),
+            (CommandKind::Run, CommandTier::Admin),
+            (CommandKind::Cancel, CommandTier::Admin),
+            (CommandKind::Approve, CommandTier::Admin),
+            (CommandKind::Deny, CommandTier::Admin),
+            (CommandKind::Admin, CommandTier::Admin),
+        ];
+        assert_eq!(expected.len(), COMMAND_COUNT, "a kind is unaccounted for");
+        for (kind, tier) in expected {
+            assert_eq!(kind.tier(), tier, "/{}", kind.name());
+        }
+        // Every spend or effect is admin-only, and the reads are not. This is
+        // the property the table exists to hold, stated independently of it.
+        for kind in CommandKind::ALL {
+            let effectful = matches!(
+                kind,
+                CommandKind::Run
+                    | CommandKind::Work
+                    | CommandKind::Cancel
+                    | CommandKind::Approve
+                    | CommandKind::Deny
+                    | CommandKind::Admin
+            );
+            assert_eq!(
+                kind.tier() == CommandTier::Admin,
+                effectful,
+                "/{} is on the wrong side of the spend/read line",
+                kind.name()
+            );
+        }
+        assert!(CommandTier::Allowed < CommandTier::Admin);
+    }
+
+    /// The `/admin` grammar, in full. Three verbs, one optional id, nothing
+    /// else — and no verb that grants administrator, because the admin tier is
+    /// the configuration file's alone.
+    #[test]
+    fn the_admin_directive_grammar_is_closed_on_three_verbs() {
+        assert_eq!(
+            parse_command("/admin list"),
+            Ok(ControlCommand::Admin {
+                directive: AdminDirective::List
+            })
+        );
+        assert_eq!(
+            parse_command("/admin add 7654321"),
+            Ok(ControlCommand::Admin {
+                directive: AdminDirective::Add {
+                    user_id: OperatorUserId::new(7_654_321).expect("user id")
+                }
+            })
+        );
+        assert_eq!(
+            parse_command("/Admin REMOVE 7654321"),
+            Ok(ControlCommand::Admin {
+                directive: AdminDirective::Remove {
+                    user_id: OperatorUserId::new(7_654_321).expect("user id")
+                }
+            }),
+            "a phone keyboard that capitalized the words meant the same thing"
+        );
+
+        assert_eq!(
+            parse_command("/admin"),
+            Err(CommandRefusal::MissingArgument)
+        );
+        assert_eq!(
+            parse_command("/admin add"),
+            Err(CommandRefusal::MissingArgument)
+        );
+        assert_eq!(
+            parse_command("/admin list 7"),
+            Err(CommandRefusal::UnexpectedArgument)
+        );
+        assert_eq!(
+            parse_command("/admin add 7 8"),
+            Err(CommandRefusal::UnexpectedArgument)
+        );
+        // No verb promotes anybody, and an unrecognized one is an argument
+        // refusal rather than a claim that /admin does not exist.
+        for text in [
+            "/admin promote 7",
+            "/admin grant 7",
+            "/admin delete 7",
+            "/admin ADDD 7",
+        ] {
+            assert_eq!(
+                parse_command(text),
+                Err(CommandRefusal::ArgumentInvalid),
+                "{text}"
+            );
+        }
+        // One spelling of an id. Nothing signed, padded, separated or negative.
+        for token in ["0", "-7", "+7", "7.0", "7_000", "seven", "0x7"] {
+            assert_eq!(
+                parse_command(&format!("/admin add {token}")),
+                Err(CommandRefusal::ArgumentInvalid),
+                "add {token}"
+            );
+        }
+        assert_eq!(
+            parse_command(&format!("/admin add {}", "9".repeat(MAX_USER_ID_BYTES + 1))),
+            Err(CommandRefusal::ArgumentTooLong)
+        );
+        // An id that is all digits, is inside the byte bound, and still
+        // overflows `i64` is not a user id either — the length bound is not
+        // doing the range check for us.
+        assert_eq!(
+            parse_command("/admin add 99999999999999999999"),
+            Err(CommandRefusal::ArgumentInvalid)
+        );
+        assert_eq!(
+            parse_command("/admin add 9223372036854775808"),
+            Err(CommandRefusal::ArgumentInvalid)
+        );
+
+        assert_eq!(AdminDirective::List.verb(), "list");
+        assert_eq!(AdminDirective::List.user_id(), None);
+        assert_eq!(
+            AdminDirective::Add {
+                user_id: OperatorUserId::new(9).expect("user id")
+            }
+            .user_id()
+            .map(OperatorUserId::get),
+            Some(9)
+        );
+    }
+
+    /// The tier gate, from both sides. A member is refused the admin half and
+    /// keeps the read half; an administrator keeps everything.
+    #[test]
+    fn a_member_is_refused_admin_commands_and_an_administrator_is_not() {
+        const ADMIN: i64 = 111;
+        const MEMBER: i64 = 222;
+        const OUTSIDER: i64 = 333;
+        let authority = OperatorAuthority::new(
+            AllowedUsers::new([ADMIN, MEMBER]).expect("allowlist"),
+            AllowedUsers::new([ADMIN]).expect("admins"),
+        )
+        .expect("authority");
+
+        assert_eq!(authority.tier_of(ADMIN), Some(CommandTier::Admin));
+        assert_eq!(authority.tier_of(MEMBER), Some(CommandTier::Allowed));
+        assert_eq!(authority.tier_of(OUTSIDER), None);
+
+        for kind in CommandKind::ALL {
+            let text = match kind.argument() {
+                ArgumentShape::None => format!("/{}", kind.name()),
+                ArgumentShape::Task => format!("/{} do the thing", kind.name()),
+                ArgumentShape::Reference => format!("/{} SUP-1042", kind.name()),
+                ArgumentShape::Directive => format!("/{} list", kind.name()),
+            };
+            // The administrator's parse is exactly the untiered one.
+            assert_eq!(
+                authorize_and_parse_tiered(&authority, ADMIN, &text),
+                parse_command(&text),
+                "an administrator must reach {text}"
+            );
+            let member = authorize_and_parse_tiered(&authority, MEMBER, &text);
+            match kind.tier() {
+                CommandTier::Allowed => {
+                    assert_eq!(member, parse_command(&text), "a member must reach {text}")
+                }
+                CommandTier::Admin => assert_eq!(
+                    member,
+                    Err(CommandRefusal::NotPermitted),
+                    "a member must be refused {text}"
+                ),
+            }
+            // A stranger learns nothing about any of it, whatever the tier.
+            assert_eq!(
+                authorize_and_parse_tiered(&authority, OUTSIDER, &text),
+                Err(CommandRefusal::Unauthorized),
+                "{text}"
+            );
+        }
+    }
+
+    /// The refusal a member gets must not depend on how they spelled the
+    /// argument, or it becomes an oracle for a grammar that is not theirs.
+    #[test]
+    fn a_members_refusal_is_the_same_however_the_argument_was_spelled() {
+        let authority = OperatorAuthority::new(
+            AllowedUsers::new([111, 222]).expect("allowlist"),
+            AllowedUsers::new([111]).expect("admins"),
+        )
+        .expect("authority");
+        for text in [
+            "/run",
+            "/run a task",
+            &format!("/run {}", "x".repeat(MAX_RUN_TASK_BYTES + 1)),
+            "/work",
+            "/work SUP-1042;rm",
+            "/admin",
+            "/admin add 7654321",
+            "/admin nonsense",
+        ] {
+            assert_eq!(
+                authorize_and_parse_tiered(&authority, 222, text),
+                Err(CommandRefusal::NotPermitted),
+                "{text}"
+            );
+        }
+        // The one thing a member does learn is that the command exists, which
+        // the published menu already tells them. An unknown name still reads as
+        // unknown rather than as forbidden.
+        assert_eq!(
+            authorize_and_parse_tiered(&authority, 222, "/runx"),
+            Err(CommandRefusal::UnknownCommand)
+        );
+        // And a message that is not a command at all is refused before any tier
+        // is considered.
+        assert_eq!(
+            authorize_and_parse_tiered(&authority, 222, "hello"),
+            Err(CommandRefusal::NotACommand)
+        );
+    }
+
+    /// The invariant the tier model rests on: an administrator who is not
+    /// allowed cannot be composed, because they would be refused at the outer
+    /// gate and never reach the tier check.
+    #[test]
+    fn an_administrator_outside_the_allowed_set_is_refused_at_composition() {
+        let refusal = OperatorAuthority::new(
+            AllowedUsers::new([222]).expect("allowlist"),
+            AllowedUsers::new([111]).expect("admins"),
+        )
+        .expect_err("an administrator must be allowed");
+        assert_eq!(refusal, AllowlistError::AdminNotAllowed);
+        assert_eq!(refusal.category(), "admin_not_allowed");
+
+        // The single-tier composition is the one a deployment that never wrote
+        // a second tier means, and it cannot violate the invariant.
+        let single = OperatorAuthority::single_tier(AllowedUsers::new([1, 2, 3]).expect("allowed"));
+        for user_id in [1, 2, 3] {
+            assert_eq!(single.tier_of(user_id), Some(CommandTier::Admin));
+            assert!(single.may(user_id, CommandKind::Run));
+            assert!(single.may(user_id, CommandKind::Admin));
+        }
+        assert_eq!(single.tier_of(4), None);
+        assert!(!single.may(4, CommandKind::Help));
+        assert_eq!(single.allowed().as_slice(), single.admins().as_slice());
+    }
+
+    #[test]
+    fn the_help_marks_exactly_the_admin_commands() {
+        let text = help_text();
+        for entry in command_manifest() {
+            let line = text
+                .lines()
+                .find(|line| {
+                    line.starts_with(&format!("/{} ", entry.name))
+                        || line.starts_with(&format!("/{}\u{a0}", entry.name))
+                        || *line == format!("/{}", entry.name)
+                })
+                .unwrap_or_else(|| panic!("/{} is missing from the help", entry.name));
+            assert_eq!(
+                line.ends_with(ADMIN_HELP_MARK),
+                entry.tier == CommandTier::Admin,
+                "/{} is marked wrong: {line}",
+                entry.name
+            );
+        }
+        assert!(text.contains("/admin <add|remove|list> [user_id]"));
     }
 
     #[test]
     fn refusal_and_allowlist_vocabularies_are_distinct_and_content_free() {
         let categories: Vec<&str> = [
             CommandRefusal::Unauthorized,
+            CommandRefusal::NotPermitted,
             CommandRefusal::Empty,
             CommandRefusal::MessageTooLong,
             CommandRefusal::NotACommand,

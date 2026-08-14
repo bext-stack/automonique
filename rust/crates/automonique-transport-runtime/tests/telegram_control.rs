@@ -339,7 +339,7 @@ fn the_manifest_is_exhaustive_over_the_registry_and_round_trips() {
         manifest.map(|entry| entry.name),
         [
             "help", "status", "runs", "tickets", "ticket", "work", "run", "cancel", "approve",
-            "deny"
+            "deny", "admin"
         ]
     );
     for entry in manifest {
@@ -347,6 +347,7 @@ fn the_manifest_is_exhaustive_over_the_registry_and_round_trips() {
             ArgumentShape::None => format!("/{}", entry.name),
             ArgumentShape::Task => format!("/{} do the thing", entry.name),
             ArgumentShape::Reference => format!("/{} reference-1", entry.name),
+            ArgumentShape::Directive => format!("/{} list", entry.name),
         };
         assert_eq!(
             parse_command(&typed).as_ref().map(ControlCommand::kind),
@@ -355,6 +356,9 @@ fn the_manifest_is_exhaustive_over_the_registry_and_round_trips() {
         );
         assert_eq!(entry.name, entry.kind.name());
         assert_eq!(entry.description, entry.kind.description());
+        // The advertised tier is the registry's, so the menu and the gate
+        // cannot describe two different products.
+        assert_eq!(entry.tier, entry.kind.tier());
     }
 }
 

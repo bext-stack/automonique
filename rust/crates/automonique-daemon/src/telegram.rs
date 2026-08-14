@@ -38,7 +38,8 @@
 //! schema=automonique.telegram-bot/v1
 //! bot_id=123456
 //! token=123456:redacted-example-value
-//! allow=7654321
+//! admin=7654321
+//! allow=1234567
 //! allow=-1001234567890:7654321
 //! end=automonique.telegram-bot/v1
 //! ```
@@ -50,6 +51,29 @@
 //! pair — a user allowed in their own chat is not thereby allowed to command
 //! the bot from a group somebody added it to — while the control gate is keyed
 //! on the user alone.
+//!
+//! # Who is an administrator
+//!
+//! `admin=` may repeat and takes the same two forms as `allow=`. It names the
+//! **administrators**: the operators who may spend a provider call, work a
+//! ticket, and decide who else may be here at all. An administrator is
+//! implicitly allowed, so an `admin=` line alone is enough to make a bot live.
+//!
+//! Administrators exist *only* here. Nothing at runtime can promote anybody:
+//! the `/admin` command adds and removes non-admin **members**, which live in a
+//! durable roster beside this file, and the composition in
+//! [`crate::telegram_bridge::OperatorRoster`] has no path that puts a member in
+//! the admin set. Revoking an administrator means editing this file and
+//! restarting, which is the correct cost for the one authority a compromised
+//! chat must not be able to grant itself.
+//!
+//! **A configuration with no `admin=` line at all treats every allowed user as
+//! an administrator.** That is the back-compatible reading and it is deliberate:
+//! every deployment written before this key existed says `allow=` and means
+//! "these are my operators", and introducing a key whose absence silently
+//! demoted all of them to read-only would break a working host on upgrade with
+//! no diagnostic. An owner who wants two tiers opts in by naming at least one
+//! administrator, and from that moment `allow=` means "allowed, not admin".
 //!
 //! The file must be a private regular file (owner-only permissions, owned by
 //! the daemon's effective user). The token's leading numeric component must
@@ -69,15 +93,17 @@
 //! already had. Nothing in this crate renders, logs or replies with it.
 
 use crate::run_lane::SocketRunLane;
-use crate::telegram_bridge::{BridgeParts, HostFacts, StoreControlSurface, TelegramControlBridge};
+use crate::telegram_bridge::{
+    BridgeParts, HostFacts, OperatorRoster, StoreControlSurface, TelegramControlBridge,
+};
 use automonique_protocol::admin::{ExecutionState, TelegramState};
 use automonique_store::Store;
 use automonique_transport_runtime::{
-    AllowedUsers, CancellationToken, MAX_ALLOWED_USERS, OpaqueBotToken, PollerLease, RuntimeError,
+    CancellationToken, MAX_ALLOWED_USERS, OpaqueBotToken, PollerLease, RuntimeError,
     StoreTelegramDurableSink, SystemClock, TelegramHostState, TelegramHttpsClient,
     TelegramLeaseCoordinator,
 };
-use automonique_transports::{TelegramAccessPolicy, TelegramBotId, TelegramPrincipal};
+use automonique_transports::{TelegramBotId, TelegramPrincipal};
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::MetadataExt as _;
@@ -99,6 +125,13 @@ const MAX_CONFIG_BYTES: u64 = 4_096;
 /// The control gate refuses a longer list anyway; refusing here means a
 /// pathological file is rejected while it is being read rather than after.
 const MAX_ALLOW_ENTRIES: usize = MAX_ALLOWED_USERS;
+/// Most `admin=` entries one configuration may carry.
+///
+/// The same bound, for the same reason. It is a separate constant because the
+/// two lists are separate authorities, and a future decision to bound
+/// administrators more tightly should not have to be argued out of a shared
+/// name.
+const MAX_ADMIN_ENTRIES: usize = MAX_ALLOWED_USERS;
 
 /// Long-poll timeout this host asks Telegram for, in seconds.
 ///
@@ -142,6 +175,13 @@ pub(crate) enum TelegramConfigError {
     /// An `allow=` entry is not a chat/user pair the transport policy and the
     /// control gate both admit, or there are more of them than either accepts.
     AllowlistInvalid,
+    /// An `admin=` entry is not a chat/user pair both admit, or there are more
+    /// of them than either accepts.
+    ///
+    /// Separate from [`Self::AllowlistInvalid`] because the two lines mean
+    /// different things and an operator staring at a refused startup needs to
+    /// know which one they mistyped.
+    AdminlistInvalid,
 }
 
 impl fmt::Display for TelegramConfigError {
@@ -160,6 +200,9 @@ impl fmt::Display for TelegramConfigError {
                 .write_str("telegram bot configuration token is invalid or does not match bot_id"),
             Self::AllowlistInvalid => {
                 formatter.write_str("telegram bot configuration allowlist is invalid")
+            }
+            Self::AdminlistInvalid => {
+                formatter.write_str("telegram bot configuration admin list is invalid")
             }
         }
     }
@@ -195,10 +238,10 @@ pub(crate) enum TelegramEnablement {
 /// borrow-only and zeroed on drop.
 #[derive(Debug)]
 pub(crate) struct LiveControl {
-    /// Which chat/actor pairs the transport admits as work at all.
-    policy: TelegramAccessPolicy,
-    /// Which users the control layer will parse a command from.
-    allowed: AllowedUsers,
+    /// The configured operator roster, from which the transport policy and the
+    /// tiered control gate are both composed — together with whatever the
+    /// durable member roster holds at the time.
+    roster: OperatorRoster,
     /// Credential the long poll spends.
     inbound_token: OpaqueBotToken,
     /// Credential replies and the menu spend.
@@ -245,6 +288,7 @@ impl TelegramBotConfig {
         let mut bot_id: Option<i64> = None;
         let mut token: Option<OpaqueBotToken> = None;
         let mut allow: Vec<(i64, i64)> = Vec::new();
+        let mut admin: Vec<(i64, i64)> = Vec::new();
         let mut terminated = false;
         for line in lines {
             if terminated {
@@ -271,7 +315,7 @@ impl TelegramBotConfig {
                             .map_err(|_| TelegramConfigError::TokenInvalid)?,
                     );
                 }
-                // The only repeatable key. Repetition is the point: an operator
+                // The two repeatable keys. Repetition is the point: an operator
                 // authorizes a second person by adding a line, not by editing
                 // one, and a duplicate is idempotent rather than a refusal.
                 "allow" => {
@@ -280,6 +324,19 @@ impl TelegramBotConfig {
                     }
                     allow.push(parse_allow_entry(value)?);
                 }
+                "admin" => {
+                    if admin.len() >= MAX_ADMIN_ENTRIES {
+                        return Err(TelegramConfigError::AdminlistInvalid);
+                    }
+                    admin.push(
+                        parse_allow_entry(value)
+                            .map_err(|_| TelegramConfigError::AdminlistInvalid)?,
+                    );
+                }
+                // An unknown key still refuses startup. A configuration this
+                // build cannot fully understand may be granting an authority it
+                // would silently drop, and dropping authority quietly is the
+                // failure this whole module is shaped to avoid.
                 _ => return Err(TelegramConfigError::Malformed),
             }
         }
@@ -299,7 +356,9 @@ impl TelegramBotConfig {
         if !token_line.starts_with(&expected_prefix) {
             return Err(TelegramConfigError::TokenInvalid);
         }
-        let enablement = if allow.is_empty() {
+        // An administrator is implicitly allowed, so a configuration that names
+        // only administrators is as live as one that names only allowed users.
+        let enablement = if allow.is_empty() && admin.is_empty() {
             // THE GATE, CLOSED. The token drops here: validated, never
             // retained, best-effort zeroed by its own `Drop`. What follows
             // holds no credential, so what follows cannot reach Telegram.
@@ -307,7 +366,7 @@ impl TelegramBotConfig {
             TelegramEnablement::LeaseOnly
         } else {
             TelegramEnablement::Live(Box::new(LiveControl::new(
-                bot_id, &allow, token, token_line,
+                bot_id, &allow, &admin, token, token_line,
             )?))
         };
         Ok(Some(Self { bot_id, enablement }))
@@ -315,41 +374,62 @@ impl TelegramBotConfig {
 }
 
 impl LiveControl {
-    /// Compose the two authority models one `allow=` list defines.
+    /// Compose the authority models the `admin=` and `allow=` lists define.
     ///
     /// They are separate objects because they answer separate questions, and an
-    /// inbound message must satisfy both: the policy decides whether an update
-    /// becomes durable work at all, and the gate decides whether its text is
-    /// parsed as a command. Deriving both from one list is what keeps them from
-    /// ever disagreeing about who the operators are.
+    /// inbound message must satisfy all of them: the transport policy decides
+    /// whether an update becomes durable work at all, the allowed set decides
+    /// whether its text is parsed as a command, and the admin set decides
+    /// whether *that* command may run. Deriving all three from one roster is
+    /// what keeps them from ever disagreeing about who the operators are.
+    ///
+    /// THE BACK-COMPATIBLE READING, IN ONE LINE. When no `admin=` appears, the
+    /// administrators are every allowed user. See this module's own note on why
+    /// the absence of a key must not demote a deployment that predates it.
     fn new(
         bot_id: i64,
         allow: &[(i64, i64)],
+        admin: &[(i64, i64)],
         inbound_token: OpaqueBotToken,
         token_line: &str,
     ) -> Result<Self, TelegramConfigError> {
-        let mut principals = Vec::with_capacity(allow.len());
-        for (chat_id, actor_id) in allow {
+        let mut principals = Vec::with_capacity(allow.len() + admin.len());
+        for (chat_id, actor_id) in admin.iter().chain(allow) {
             principals.push(
                 TelegramPrincipal::new(*chat_id, *actor_id)
                     .map_err(|_| TelegramConfigError::AllowlistInvalid)?,
             );
         }
-        let policy = TelegramAccessPolicy::new(
+        let configured: Vec<i64> = admin
+            .iter()
+            .chain(allow)
+            .map(|(_, actor_id)| *actor_id)
+            .collect();
+        let admins: Vec<i64> = if admin.is_empty() {
+            configured.clone()
+        } else {
+            admin.iter().map(|(_, actor_id)| *actor_id).collect()
+        };
+        let roster = OperatorRoster::new(
             TelegramBotId::new(bot_id).map_err(|_| TelegramConfigError::BotIdInvalid)?,
             principals,
+            configured,
+            admins,
         )
-        .map_err(|_| TelegramConfigError::AllowlistInvalid)?;
-        let allowed = AllowedUsers::new(allow.iter().map(|(_, actor_id)| *actor_id))
-            .map_err(|_| TelegramConfigError::AllowlistInvalid)?;
+        .map_err(|_| {
+            if admin.is_empty() {
+                TelegramConfigError::AllowlistInvalid
+            } else {
+                TelegramConfigError::AdminlistInvalid
+            }
+        })?;
         // The second copy is the same credential for the outbound transport,
         // rebuilt from the same validated line rather than cloned — the opaque
         // type deliberately offers no `Clone`.
         let outbound_token = OpaqueBotToken::new(token_line.as_bytes().to_vec())
             .map_err(|_| TelegramConfigError::TokenInvalid)?;
         Ok(Self {
-            policy,
-            allowed,
+            roster,
             inbound_token,
             outbound_token,
         })
@@ -404,6 +484,12 @@ pub(crate) struct TelegramHostParams<'a> {
     /// enabled. Nothing here creates it: the intake gate is the only writer, and
     /// [`StoreControlSurface::with_support_tickets`] only remembers the path.
     pub(crate) support_tickets_path: &'a Path,
+    /// The durable roster of members an administrator added from a chat.
+    ///
+    /// Named on every host, created by none of them at startup: the first
+    /// `/admin add` is the only thing that brings the file into existence, and
+    /// a host whose administrators never add anybody never has one.
+    pub(crate) operator_members_path: &'a Path,
     /// This daemon's own admin endpoint, which a `/run` submits and starts
     /// through. See [`crate::run_lane`] for why the poller thread is a client
     /// of the daemon it belongs to.
@@ -570,7 +656,8 @@ impl TelegramHost {
             },
         )
         .map_err(|_| TelegramHostError::SurfaceUnavailable)?
-        .with_support_tickets(params.support_tickets_path);
+        .with_support_tickets(params.support_tickets_path)
+        .with_operator_members(params.operator_members_path);
         let poller_store =
             Store::open(params.database_path).map_err(|_| TelegramHostError::StoreUnavailable)?;
         // The lane opens successfully on a deployment that has not configured
@@ -586,8 +673,7 @@ impl TelegramHost {
             sink: StoreTelegramDurableSink::new(poller_store, SystemClock),
             surface,
             lane,
-            policy: live.policy,
-            allowed: live.allowed,
+            roster: live.roster,
             inbound_token: live.inbound_token,
             outbound_token: live.outbound_token,
             long_poll_seconds: TELEGRAM_LONG_POLL_SECONDS,
@@ -792,6 +878,7 @@ impl TelegramHostError {
             Self::Config(TelegramConfigError::BotIdInvalid) => "telegram_config_bot_id",
             Self::Config(TelegramConfigError::TokenInvalid) => "telegram_config_token",
             Self::Config(TelegramConfigError::AllowlistInvalid) => "telegram_config_allowlist",
+            Self::Config(TelegramConfigError::AdminlistInvalid) => "telegram_config_adminlist",
             Self::StoreUnavailable => "telegram_store_unavailable",
             Self::SurfaceUnavailable => "telegram_surface_unavailable",
             Self::PollerUnavailable => "telegram_poller_unavailable",
@@ -803,6 +890,8 @@ impl TelegramHostError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use automonique_transport_runtime::{CommandKind, CommandTier, OperatorAuthority};
+    use automonique_transports::TelegramAccessPolicy;
     use std::os::unix::fs::PermissionsExt as _;
 
     /// A private state tree with a live generation, ready to open a host from.
@@ -817,6 +906,7 @@ mod tests {
         database_path: PathBuf,
         run_index_path: PathBuf,
         support_tickets_path: PathBuf,
+        operator_members_path: PathBuf,
         admin_socket: PathBuf,
         lease_epoch: u64,
     }
@@ -846,6 +936,10 @@ mod tests {
             // Named and never created: composing a host must not bring a ticket
             // store into existence on a tree whose intake is disabled.
             let support_tickets_path = state_dir.join(crate::SUPPORT_TICKETS_NAME);
+            // Named and never created, for the same reason: composing a host
+            // must not bring a member roster into existence on a tree whose
+            // administrators have never added anybody.
+            let operator_members_path = state_dir.join(crate::OPERATOR_MEMBERS_NAME);
             let admin_socket = state_dir.join("admin.sock");
             let mut store = Store::open(&database_path).expect("store opens");
             let lease = store
@@ -862,6 +956,7 @@ mod tests {
                 database_path,
                 run_index_path,
                 support_tickets_path,
+                operator_members_path,
                 admin_socket,
                 lease_epoch: lease.epoch,
             }
@@ -873,6 +968,7 @@ mod tests {
                 database_path: &self.database_path,
                 run_index_path: &self.run_index_path,
                 support_tickets_path: &self.support_tickets_path,
+                operator_members_path: &self.operator_members_path,
                 admin_socket: &self.admin_socket,
                 generation_id: crate::GENERATION_ID,
                 holder_id: "telegram-host-fixture",
@@ -978,15 +1074,168 @@ mod tests {
 
     /// A configuration with the given `allow=` lines spliced in.
     fn config(allow: &[&str]) -> String {
+        tiered_config(&[], allow)
+    }
+
+    /// A configuration with both key kinds spliced in, in that order.
+    fn tiered_config(admin: &[&str], allow: &[&str]) -> String {
         let mut lines = vec![
             String::from("schema=automonique.telegram-bot/v1"),
             String::from("bot_id=123456"),
             String::from("token=123456:AAExampleExampleExampleExample"),
         ];
+        lines.extend(admin.iter().map(|entry| format!("admin={entry}")));
         lines.extend(allow.iter().map(|entry| format!("allow={entry}")));
         lines.push(String::from("end=automonique.telegram-bot/v1"));
         lines.push(String::new());
         lines.join("\n")
+    }
+
+    /// The live control one configuration composes, or a panic.
+    fn live_control(text: &str) -> LiveControl {
+        let parsed = TelegramBotConfig::parse(text)
+            .expect("valid configuration")
+            .expect("present configuration");
+        match parsed.enablement {
+            TelegramEnablement::Live(live) => *live,
+            TelegramEnablement::LeaseOnly => {
+                panic!("this configuration must enable live control")
+            }
+        }
+    }
+
+    /// The two authority models one configuration composes with no members.
+    fn composed(text: &str) -> (TelegramAccessPolicy, OperatorAuthority) {
+        live_control(text).roster.compose(&[]).expect("composes")
+    }
+
+    /// BACK-COMPAT, THE WHOLE POINT. A configuration written before `admin=`
+    /// existed keeps every authority it had: its allowed users are its
+    /// administrators, so upgrading a single-tier deployment does not silently
+    /// demote everybody who was running it to read-only.
+    #[test]
+    fn a_configuration_with_no_admin_line_treats_every_allowed_user_as_an_admin() {
+        let (_policy, authority) = composed(&config(&["7654321", "1234567"]));
+        assert_eq!(authority.allowed().as_slice(), [1_234_567, 7_654_321]);
+        assert_eq!(
+            authority.admins().as_slice(),
+            [1_234_567, 7_654_321],
+            "with no admin= line, every allowed user is an administrator"
+        );
+        for user_id in [1_234_567, 7_654_321] {
+            assert_eq!(authority.tier_of(user_id), Some(CommandTier::Admin));
+            assert!(authority.may(user_id, CommandKind::Run));
+            assert!(authority.may(user_id, CommandKind::Admin));
+        }
+    }
+
+    /// The opt-in. One `admin=` line splits the configured users into two
+    /// tiers, and the `allow=` half stops being administrators.
+    #[test]
+    fn one_admin_line_demotes_the_allow_list_to_members() {
+        let (composed_policy, authority) = composed(&tiered_config(&["7654321"], &["1234567"]));
+        assert_eq!(authority.allowed().as_slice(), [1_234_567, 7_654_321]);
+        assert_eq!(authority.admins().as_slice(), [7_654_321]);
+        assert!(authority.is_admin(7_654_321));
+        assert!(!authority.is_admin(1_234_567));
+        assert!(
+            authority.authorize(1_234_567),
+            "an allow= user is still allowed; they are simply not an administrator"
+        );
+        // An administrator is implicitly allowed at the transport too: both
+        // lines contribute their principal.
+        assert_eq!(
+            composed_policy,
+            policy(&[(1_234_567, 1_234_567), (7_654_321, 7_654_321)])
+        );
+
+        assert!(authority.may(7_654_321, CommandKind::Run));
+        assert!(!authority.may(1_234_567, CommandKind::Run));
+        assert!(authority.may(1_234_567, CommandKind::Status));
+    }
+
+    /// An administrator alone is a complete configuration: they are implicitly
+    /// allowed, so the gate opens without a single `allow=` line.
+    #[test]
+    fn an_admin_line_alone_enables_live_control() {
+        let (composed_policy, authority) = composed(&tiered_config(&["7654321"], &[]));
+        assert_eq!(authority.allowed().as_slice(), [7_654_321]);
+        assert_eq!(authority.admins().as_slice(), [7_654_321]);
+        assert_eq!(composed_policy, policy(&[(7_654_321, 7_654_321)]));
+    }
+
+    /// The group form works for an administrator too, and still names exactly
+    /// one user in exactly one chat.
+    #[test]
+    fn an_administrator_may_be_named_in_one_group() {
+        let (composed_policy, authority) =
+            composed(&tiered_config(&["-1001234567890:7654321"], &[]));
+        assert_eq!(authority.admins().as_slice(), [7_654_321]);
+        assert_eq!(composed_policy, policy(&[(-1_001_234_567_890, 7_654_321)]));
+        assert_ne!(composed_policy, policy(&[(7_654_321, 7_654_321)]));
+    }
+
+    /// The admin list has the same grammar as the allowlist and its own
+    /// refusal, so an operator who mistyped one is told which.
+    #[test]
+    fn malformed_admin_entries_refuse_the_configuration() {
+        for entry in ["", "0", "-7", "7:0", "seven", "1:2:3", "7:"] {
+            assert!(
+                matches!(
+                    TelegramBotConfig::parse(&tiered_config(&[entry], &[])),
+                    Err(TelegramConfigError::AdminlistInvalid)
+                ),
+                "admin={entry} must be refused as an admin list problem"
+            );
+        }
+    }
+
+    #[test]
+    fn an_oversized_admin_list_is_refused_while_it_is_read() {
+        let entries: Vec<String> = (1..=MAX_ADMIN_ENTRIES + 1)
+            .map(|id| id.to_string())
+            .collect();
+        let borrowed: Vec<&str> = entries.iter().map(String::as_str).collect();
+        assert!(matches!(
+            TelegramBotConfig::parse(&tiered_config(&borrowed, &[])),
+            Err(TelegramConfigError::AdminlistInvalid)
+        ));
+    }
+
+    /// Adding a key did not open the door to others. An unknown key still
+    /// refuses startup, because a configuration this build cannot fully read
+    /// may be granting authority it would silently drop.
+    #[test]
+    fn an_unknown_key_still_refuses_the_configuration() {
+        for line in ["owner=7654321", "admins=7654321", "allowed=7", "admin"] {
+            let text = format!(
+                "schema=automonique.telegram-bot/v1\n\
+                 bot_id=123456\n\
+                 token=123456:AAExampleExampleExampleExample\n\
+                 admin=7654321\n\
+                 {line}\n\
+                 end=automonique.telegram-bot/v1\n"
+            );
+            assert!(
+                matches!(
+                    TelegramBotConfig::parse(&text),
+                    Err(TelegramConfigError::Malformed)
+                ),
+                "{line} must refuse startup"
+            );
+        }
+    }
+
+    /// A duplicate is idempotent across both keys, and a user named on both
+    /// lines is an administrator — the wider authority wins, because the owner
+    /// wrote it down.
+    #[test]
+    fn a_user_named_on_both_lines_is_an_administrator() {
+        let (composed_policy, authority) =
+            composed(&tiered_config(&["7654321"], &["7654321", "7654321"]));
+        assert_eq!(authority.allowed().as_slice(), [7_654_321]);
+        assert_eq!(authority.admins().as_slice(), [7_654_321]);
+        assert_eq!(composed_policy, policy(&[(7_654_321, 7_654_321)]));
     }
 
     /// THE GATE. A configured bot with nobody authorized keeps exactly the
@@ -1005,18 +1254,13 @@ mod tests {
     /// retain the credential and compose both authority models.
     #[test]
     fn one_allowed_user_enables_live_control_for_that_user_only() {
-        let parsed = TelegramBotConfig::parse(&config(&["7654321"]))
-            .expect("valid configuration")
-            .expect("present configuration");
-        let TelegramEnablement::Live(live) = &parsed.enablement else {
-            panic!("an allowlisted configuration must enable live control")
-        };
-        assert_eq!(live.allowed.as_slice(), [7_654_321]);
+        let (composed_policy, authority) = composed(&config(&["7654321"]));
+        assert_eq!(authority.allowed().as_slice(), [7_654_321]);
         // A bare id is that user's private chat, and it authorizes exactly that
         // pair — the policy compares by its whole membership, so an equal policy
         // is the same membership.
-        assert_eq!(live.policy, policy(&[(7_654_321, 7_654_321)]));
-        assert_ne!(live.policy, policy(&[(-1_001, 7_654_321)]));
+        assert_eq!(composed_policy, policy(&[(7_654_321, 7_654_321)]));
+        assert_ne!(composed_policy, policy(&[(-1_001, 7_654_321)]));
     }
 
     /// The policy an `allow=` list should have produced.
@@ -1034,15 +1278,11 @@ mod tests {
     /// control gate still keys on the user.
     #[test]
     fn the_group_form_authorizes_one_pair() {
-        let parsed = TelegramBotConfig::parse(&config(&["-1001234567890:7654321", "7654321"]))
-            .expect("valid configuration")
-            .expect("present configuration");
-        let TelegramEnablement::Live(live) = &parsed.enablement else {
-            panic!("an allowlisted configuration must enable live control")
-        };
-        assert_eq!(live.allowed.as_slice(), [7_654_321]);
+        let (composed_policy, authority) =
+            composed(&config(&["-1001234567890:7654321", "7654321"]));
+        assert_eq!(authority.allowed().as_slice(), [7_654_321]);
         assert_eq!(
-            live.policy,
+            composed_policy,
             policy(&[(-1_001_234_567_890, 7_654_321), (7_654_321, 7_654_321)])
         );
     }

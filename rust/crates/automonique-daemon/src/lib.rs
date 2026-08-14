@@ -204,6 +204,22 @@ pub const RUN_CANCEL_LEDGER_NAME: &str = concat!("run-cancel-ledger", ".sqlite3"
 /// composed, and an unconfigured host composes nothing.
 pub const SUPPORT_TICKETS_NAME: &str = concat!("support-tickets", ".sqlite3");
 
+/// Durable roster of operator members, a sibling of [`DATABASE_NAME`].
+///
+/// One row per non-admin operator an administrator added from the Telegram
+/// control surface. Separate from the bot configuration for the reason every
+/// runtime record is separate from the file that configures it: the
+/// configuration is the owner's, edited by hand and read at startup, while this
+/// is the daemon's, written while it runs.
+///
+/// WHAT THIS FILE DOES NOT DO. It grants no administrative authority and cannot
+/// be made to. Administrators are named in `telegram/bot.conf` and nowhere else,
+/// so a row here can widen who may *read* this daemon's state and can never
+/// widen who may spend a provider call or manage users. It also does not exist
+/// on a host whose administrators never added anybody — the first `/admin add`
+/// creates it, and nothing else does.
+pub const OPERATOR_MEMBERS_NAME: &str = concat!("operator-members", ".sqlite3");
+
 /// Durable append-only record of this generation's hand-offs, a sibling of
 /// [`DATABASE_NAME`].
 ///
@@ -361,6 +377,12 @@ impl DaemonConfig {
     #[must_use]
     pub fn support_tickets_path(&self) -> PathBuf {
         self.state_dir().join(SUPPORT_TICKETS_NAME)
+    }
+
+    /// Durable operator member roster path.
+    #[must_use]
+    pub fn operator_members_path(&self) -> PathBuf {
+        self.state_dir().join(OPERATOR_MEMBERS_NAME)
     }
 
     /// This deployment's brokered-egress destination policy path.
@@ -797,6 +819,7 @@ impl Daemon {
             database_path: &config.database_path(),
             run_index_path: &config.run_index_path(),
             support_tickets_path: &config.support_tickets_path(),
+            operator_members_path: &config.operator_members_path(),
             admin_socket: &config.admin_socket(),
             generation_id: GENERATION_ID,
             holder_id: instance_id.as_str(),

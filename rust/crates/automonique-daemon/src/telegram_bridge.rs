@@ -76,6 +76,7 @@
 //! these counters are observable to tests and to nothing else. That is a real
 //! gap, named here rather than papered over with a `println!`.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -84,20 +85,24 @@ use std::time::Duration;
 
 use automonique_protocol::admin::ExecutionState;
 use automonique_store::Store;
+use automonique_store::operator_members::{
+    MemberDisposition, OperatorMemberError, OperatorMemberStore,
+};
 use automonique_store::run_index::{RunIndex, RunIndexRecord};
 use automonique_store::support_tickets::{
     SupportTicketError, SupportTicketStore, TicketLifecycle, TicketRecord,
 };
 use automonique_transport_runtime::{
-    AllowedUsers, CancellationToken, ControlCommand, HttpFailure, MAX_SEND_MESSAGE_TEXT_UNITS,
-    OpaqueBotToken, PollOutcome, PollerLease, RuntimeError, SendMessageRequest,
-    SetMyCommandsRequest, TelegramBotCommand, TelegramDurableSink, TelegramHttpClient,
-    TelegramHttpPlan, TelegramHttpResponse, TelegramOutbound, TelegramOutboundClient,
-    TelegramOutboundPlan, TelegramPoller, authorize_and_parse, command_manifest, help_text,
+    AdminDirective, AllowedUsers, CancellationToken, ControlCommand, HttpFailure,
+    MAX_ALLOWED_USERS, MAX_SEND_MESSAGE_TEXT_UNITS, OpaqueBotToken, OperatorAuthority, PollOutcome,
+    PollerLease, RuntimeError, SendMessageRequest, SetMyCommandsRequest, TelegramBotCommand,
+    TelegramDurableSink, TelegramHttpClient, TelegramHttpPlan, TelegramHttpResponse,
+    TelegramOutbound, TelegramOutboundClient, TelegramOutboundPlan, TelegramPoller,
+    authorize_and_parse_tiered, command_manifest, help_text,
 };
 use automonique_transports::{
-    TelegramAccessPolicy, TelegramDisposition, TelegramIngress, TelegramInputKind,
-    parse_telegram_updates,
+    TelegramAccessPolicy, TelegramBotId, TelegramDisposition, TelegramIngress, TelegramInputKind,
+    TelegramPrincipal, parse_telegram_updates,
 };
 
 /// How long the worker waits after a refused poll before trying again.
@@ -171,6 +176,230 @@ pub const TICKET_ALREADY_WORKED: &str =
 /// were taken out.
 pub const TICKET_DRAFT_EMPTY: &str =
     "The run completed but wrote nothing that could be stored as a draft.";
+
+/// The configured half of this host's operator list, and how it composes with
+/// the durable half.
+///
+/// Three sets, from two places, and they are kept in one value because a
+/// composition that updated one and forgot another is exactly the bug this type
+/// exists to make impossible:
+///
+/// - **principals** — the exact chat/actor pairs `bot.conf` wrote down. The
+///   transport's own gate, which decides whether an update becomes work at all.
+/// - **configured** — the user ids of those pairs. Allowed by configuration,
+///   and not removable from a chat.
+/// - **admins** — the `admin=` half of them, or *all* of them on a
+///   configuration that names no administrators at all. See
+///   [`crate::telegram`] for why that reading is the back-compatible one.
+///
+/// [`Self::compose`] adds the durable member roster to the first two and leaves
+/// the third alone. That asymmetry is the security property of the whole
+/// feature: **nothing at runtime can widen the admin set.** A member added from
+/// a chat becomes a principal and an allowed user, and can never become an
+/// administrator, because this method has no path that puts them in that list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperatorRoster {
+    bot_id: TelegramBotId,
+    principals: Vec<TelegramPrincipal>,
+    configured: Vec<i64>,
+    admins: Vec<i64>,
+}
+
+/// Why an operator roster could not be built or composed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RosterError {
+    /// No user is configured at all, so nobody could command the bot.
+    Empty,
+    /// The composed operator list is over the control gate's own ceiling.
+    ///
+    /// Raised by [`OperatorRoster::compose`] rather than by a store: the
+    /// durable roster has its own capacity, but the *union* of configuration
+    /// and roster is what the gate must hold, and only this type can see both.
+    TooMany,
+    /// An id is not a positive Telegram user id, or a pair is not a chat.
+    InvalidPrincipal,
+    /// An administrator is not among the configured users.
+    AdminNotConfigured,
+}
+
+impl RosterError {
+    /// Stable, content-free category.
+    #[must_use]
+    pub const fn category(self) -> &'static str {
+        match self {
+            Self::Empty => "roster_empty",
+            Self::TooMany => "roster_too_many",
+            Self::InvalidPrincipal => "roster_invalid_principal",
+            Self::AdminNotConfigured => "roster_admin_not_configured",
+        }
+    }
+}
+
+impl fmt::Display for RosterError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "operator roster refused: {}", self.category())
+    }
+}
+
+impl std::error::Error for RosterError {}
+
+impl OperatorRoster {
+    /// Build the configured roster.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RosterError::Empty`] when no user is configured,
+    /// [`RosterError::InvalidPrincipal`] for an id that is not a positive
+    /// Telegram user id, [`RosterError::TooMany`] beyond the control gate's
+    /// ceiling, and [`RosterError::AdminNotConfigured`] for an administrator
+    /// who is not among the configured users — which would be an owner who had
+    /// locked themselves out.
+    pub fn new(
+        bot_id: TelegramBotId,
+        principals: impl IntoIterator<Item = TelegramPrincipal>,
+        configured: impl IntoIterator<Item = i64>,
+        admins: impl IntoIterator<Item = i64>,
+    ) -> Result<Self, RosterError> {
+        let principals: Vec<TelegramPrincipal> = principals.into_iter().collect();
+        let configured = sorted_ids(configured)?;
+        let admins = sorted_ids(admins)?;
+        if principals.is_empty() || configured.is_empty() {
+            return Err(RosterError::Empty);
+        }
+        if configured.len() > MAX_ALLOWED_USERS {
+            return Err(RosterError::TooMany);
+        }
+        if admins.iter().any(|id| !configured.contains(id)) {
+            return Err(RosterError::AdminNotConfigured);
+        }
+        Ok(Self {
+            bot_id,
+            principals,
+            configured,
+            admins,
+        })
+    }
+
+    /// The users configuration alone admits.
+    #[must_use]
+    pub fn configured(&self) -> &[i64] {
+        &self.configured
+    }
+
+    /// The administrators, which only configuration can name.
+    #[must_use]
+    pub fn admins(&self) -> &[i64] {
+        &self.admins
+    }
+
+    /// Whether configuration names this user as an administrator.
+    #[must_use]
+    pub fn is_admin(&self, user_id: i64) -> bool {
+        self.admins.binary_search(&user_id).is_ok()
+    }
+
+    /// Whether configuration admits this user at all.
+    #[must_use]
+    pub fn is_configured(&self, user_id: i64) -> bool {
+        self.configured.binary_search(&user_id).is_ok()
+    }
+
+    /// Compose the transport policy and the tiered gate for one member set.
+    ///
+    /// A member is given their *private chat* with the bot, which is the pair
+    /// Telegram gives a one-to-one conversation. They are deliberately not
+    /// added to any group chat the configuration named: an administrator adding
+    /// somebody as a member has said they may talk to this bot, not that they
+    /// may talk to it from inside a room they were never in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RosterError::TooMany`] when the union overruns the control
+    /// gate's ceiling or the transport policy's, [`RosterError::InvalidPrincipal`]
+    /// for a member id that is not a positive user id, and
+    /// [`RosterError::AdminNotConfigured`] if the two composed sets could ever
+    /// disagree — which they cannot, and the check stays as the proof.
+    pub fn compose(
+        &self,
+        members: &[i64],
+    ) -> Result<(TelegramAccessPolicy, OperatorAuthority), RosterError> {
+        let mut allowed = self.configured.clone();
+        let mut principals = self.principals.clone();
+        for member in sorted_ids(members.iter().copied())? {
+            if allowed.binary_search(&member).is_ok() {
+                // Already admitted by configuration. The durable roster is
+                // allowed to name somebody the operator later wrote into
+                // `bot.conf`; the union is the answer, not a conflict.
+                continue;
+            }
+            principals.push(
+                TelegramPrincipal::new(member, member)
+                    .map_err(|_| RosterError::InvalidPrincipal)?,
+            );
+            allowed.push(member);
+        }
+        allowed.sort_unstable();
+        allowed.dedup();
+        if allowed.len() > MAX_ALLOWED_USERS {
+            return Err(RosterError::TooMany);
+        }
+        let policy =
+            TelegramAccessPolicy::new(self.bot_id, principals).map_err(|_| RosterError::TooMany)?;
+        let authority = OperatorAuthority::new(
+            AllowedUsers::new(allowed).map_err(|_| RosterError::TooMany)?,
+            AllowedUsers::new(self.admins.iter().copied())
+                .map_err(|_| RosterError::AdminNotConfigured)?,
+        )
+        .map_err(|_| RosterError::AdminNotConfigured)?;
+        Ok((policy, authority))
+    }
+}
+
+/// Sort, de-duplicate and validate one set of user ids.
+fn sorted_ids(ids: impl IntoIterator<Item = i64>) -> Result<Vec<i64>, RosterError> {
+    let mut ids: Vec<i64> = ids.into_iter().collect();
+    if ids.iter().any(|id| *id <= 0) {
+        return Err(RosterError::InvalidPrincipal);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// What one roster mutation did to durable state.
+///
+/// Every variant is a complete answer an administrator can act on, and only two
+/// of them changed a row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemberChange {
+    /// The user is now a member.
+    Added,
+    /// The user already was one. Nothing changed.
+    AlreadyMember,
+    /// The user is no longer a member.
+    Removed,
+    /// The user was not one. Nothing changed.
+    NotAMember,
+    /// The roster is at capacity, so nothing was added and nobody was evicted.
+    RosterFull,
+}
+
+impl MemberChange {
+    /// Whether this change moved a durable row.
+    #[must_use]
+    pub const fn mutated(self) -> bool {
+        matches!(self, Self::Added | Self::Removed)
+    }
+
+    const fn from_disposition(disposition: MemberDisposition) -> Self {
+        match disposition {
+            MemberDisposition::Added => Self::Added,
+            MemberDisposition::AlreadyMember => Self::AlreadyMember,
+            MemberDisposition::Removed => Self::Removed,
+            MemberDisposition::NotAMember => Self::NotAMember,
+        }
+    }
+}
 
 /// Why a read surface could not answer.
 ///
@@ -280,6 +509,40 @@ pub trait ControlSurface {
         ticket_ref: &str,
         draft: &str,
     ) -> Result<DraftOutcome, SurfaceRefusal>;
+
+    /// The user ids of every member an administrator has added at runtime.
+    ///
+    /// A host with no member roster answers with an empty list, which is a fact
+    /// and not a refusal: it has administrators and configured users and nobody
+    /// else. Nothing here creates a roster — reading who is a member must not
+    /// bring a database into existence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SurfaceRefusal::Unavailable`] when a roster this host *does*
+    /// have cannot be opened or read.
+    fn member_ids(&mut self) -> Result<Vec<i64>, SurfaceRefusal>;
+
+    /// Add one non-admin member, durably.
+    ///
+    /// The caller has already refused the ids that configuration owns; this
+    /// records the ones it does not. Adding somebody who is already a member is
+    /// [`MemberChange::AlreadyMember`] rather than an error, and a full roster
+    /// is [`MemberChange::RosterFull`] rather than an eviction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SurfaceRefusal::Unavailable`] when the roster cannot be opened
+    /// or written.
+    fn add_member(&mut self, user_id: i64) -> Result<MemberChange, SurfaceRefusal>;
+
+    /// Revoke one non-admin member, durably.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SurfaceRefusal::Unavailable`] when the roster cannot be opened
+    /// or written.
+    fn remove_member(&mut self, user_id: i64) -> Result<MemberChange, SurfaceRefusal>;
 }
 
 /// What a `/work` found when it looked the ticket up.
@@ -374,6 +637,7 @@ impl Unavailable {
             | ControlCommand::Tickets
             | ControlCommand::Ticket { .. }
             | ControlCommand::Work { .. }
+            | ControlCommand::Admin { .. }
             | ControlCommand::Run { .. } => None,
             ControlCommand::Cancel { .. } => Some(Self::CancelVerb),
             ControlCommand::Approve { .. } | ControlCommand::Deny { .. } => {
@@ -494,6 +758,12 @@ pub struct DispatchReport {
     pub tickets_worked: usize,
     /// `/work` commands that stored nothing, for any reason.
     pub ticket_work_failed: usize,
+    /// `/admin` commands that moved a durable roster row.
+    ///
+    /// Counted apart from [`Self::answered`] because it is the only number here
+    /// that says *who may command this daemon changed*, which is worth being
+    /// able to read on its own.
+    pub member_mutations: usize,
     /// Messages the command layer refused, including an unauthorized sender the
     /// transport policy admitted.
     pub refused: usize,
@@ -522,6 +792,7 @@ impl DispatchReport {
         self.runs_failed += other.runs_failed;
         self.tickets_worked += other.tickets_worked;
         self.ticket_work_failed += other.ticket_work_failed;
+        self.member_mutations += other.member_mutations;
         self.refused += other.refused;
         self.denied_senders += other.denied_senders;
         self.ignored += other.ignored;
@@ -544,6 +815,14 @@ pub struct BridgeTotals {
     /// Committed responses this module could not re-parse. Always zero unless
     /// the transport parser is not a function of its inputs.
     pub reparse_failures: usize,
+    /// Times the operator roster was recomposed from durable state.
+    pub roster_refreshes: usize,
+    /// Times a recomposition was refused and the previous one stayed in force.
+    ///
+    /// Fail-closed in the direction that matters: a refused refresh leaves the
+    /// *narrower* previously-composed list in place, so an unreadable roster
+    /// never widens who may command this daemon.
+    pub roster_refresh_failures: usize,
     /// Whether the advertised command menu was published.
     pub menu_published: bool,
 }
@@ -603,10 +882,10 @@ pub struct BridgeParts<C, O, S, R, L> {
     pub surface: R,
     /// The lane one `/run` is carried out through.
     pub lane: L,
-    /// The transport access policy: which chat/actor pairs create work.
-    pub policy: TelegramAccessPolicy,
-    /// The control gate: which Telegram users may command this bot.
-    pub allowed: AllowedUsers,
+    /// The configured operator roster, from which both authority models — the
+    /// transport's chat/actor policy and the tiered control gate — are composed
+    /// together with whatever the durable member roster holds.
+    pub roster: OperatorRoster,
     /// Credential spent by the inbound transport.
     pub inbound_token: OpaqueBotToken,
     /// Credential spent by the outbound transport.
@@ -623,7 +902,8 @@ pub struct TelegramControlBridge<C, O, S, R, L> {
     surface: R,
     lane: L,
     policy: TelegramAccessPolicy,
-    allowed: AllowedUsers,
+    roster: OperatorRoster,
+    authority: OperatorAuthority,
     bot_id: i64,
     outbound_token: OpaqueBotToken,
     totals: BridgeTotals,
@@ -641,10 +921,20 @@ where
 {
     /// Compose one bridge over its four seams.
     ///
+    /// The composition here is the *configured* one: configuration alone, with
+    /// no member from the durable roster. That is deliberate rather than lazy —
+    /// composing at startup means reading a database, and a bridge that refused
+    /// to exist because a roster file was momentarily unreadable would take a
+    /// daemon's whole control surface down over a list of members it can widen
+    /// on its next breath. [`Self::poll_and_dispatch`] refreshes before it
+    /// polls, so no update is ever answered under the narrow list.
+    ///
     /// # Errors
     ///
     /// Returns whatever [`TelegramPoller::new`] refuses, which is a long-poll
-    /// timeout outside the runtime's bounds.
+    /// timeout outside the runtime's bounds, or
+    /// [`RuntimeError::InvalidConfiguration`] for a roster that cannot compose
+    /// its own configuration.
     pub fn new(parts: BridgeParts<C, O, S, R, L>) -> Result<Self, RuntimeError> {
         let BridgeParts {
             client,
@@ -652,12 +942,14 @@ where
             sink,
             surface,
             lane,
-            policy,
-            allowed,
+            roster,
             inbound_token,
             outbound_token,
             long_poll_seconds,
         } = parts;
+        let (policy, authority) = roster
+            .compose(&[])
+            .map_err(|_| RuntimeError::InvalidConfiguration("operator_roster"))?;
         let bot_id = policy.bot_id().get();
         let (client, captured) = CapturingClient::new(client);
         let poller = TelegramPoller::new(
@@ -674,13 +966,67 @@ where
             surface,
             lane,
             policy,
-            allowed,
+            roster,
+            authority,
             bot_id,
             outbound_token,
             totals: BridgeTotals::default(),
             menu_attempted: false,
             terminal: None,
         })
+    }
+
+    /// Who may command this bot right now, at which tier.
+    #[must_use]
+    pub const fn authority(&self) -> &OperatorAuthority {
+        &self.authority
+    }
+
+    /// Recompose both authority models from the durable member roster.
+    ///
+    /// Called before every poll and again immediately after a mutation, so an
+    /// `/admin add` is in force for the rest of the batch it appeared in and an
+    /// `/admin remove` revokes within the same breath. A daemon is never
+    /// restarted to change who may use it.
+    ///
+    /// One thing does *not* take effect until the next poll, and it cannot: the
+    /// transport policy in force for a batch is the one it was fetched under,
+    /// so a message a brand-new member sent before they were added stays denied.
+    /// Re-parsing an already-committed batch under a wider policy would answer a
+    /// command whose durable disposition says it was refused.
+    ///
+    /// Every refusal leaves the previous composition in force. That is the
+    /// fail-closed direction: the previous list is the narrower one for an
+    /// addition and — deliberately — the wider one for a removal, so a
+    /// revocation that could not be composed is followed by a store that no
+    /// longer holds the member and a next poll that recomposes without them.
+    /// The durable write is what revokes; this is only what publishes it early.
+    ///
+    /// Returns whether the composition changed hands.
+    pub fn refresh_operators(&mut self) -> bool {
+        let Ok(members) = self.surface.member_ids() else {
+            self.totals.roster_refresh_failures += 1;
+            return false;
+        };
+        let Ok((policy, authority)) = self.roster.compose(&members) else {
+            self.totals.roster_refresh_failures += 1;
+            return false;
+        };
+        if policy == self.policy && authority == self.authority {
+            return false;
+        }
+        // The poller's policy and this bridge's must move together or the
+        // re-parse after a commit would disagree with the parse that produced
+        // it. A poller holding an ambiguous commit refuses, and then neither
+        // moves.
+        if self.poller.set_policy(policy.clone()).is_err() {
+            self.totals.roster_refresh_failures += 1;
+            return false;
+        }
+        self.policy = policy;
+        self.authority = authority;
+        self.totals.roster_refreshes += 1;
+        true
     }
 
     /// Everything this bridge has done so far.
@@ -751,6 +1097,10 @@ where
         if let Ok(mut slot) = self.captured.lock() {
             *slot = None;
         }
+        // Before the request, never after: the policy an update is admitted
+        // under has to be the one it was fetched under, and this is the only
+        // point in the cycle where nothing is in flight.
+        self.refresh_operators();
         let outcome = self.poller.poll_once(lease, now_ms, cancellation)?;
         self.totals.polls += 1;
         let report = self.dispatch_committed(&outcome, cancellation);
@@ -869,7 +1219,8 @@ where
                 };
                 // Bound as a statement so the gate's borrow of `self` ends
                 // before a rendered answer needs `self` mutably.
-                let parsed = authorize_and_parse(&self.allowed, principal.actor_id(), text);
+                let parsed =
+                    authorize_and_parse_tiered(&self.authority, principal.actor_id(), text);
                 match parsed {
                     Err(refusal) => Answer::Refused {
                         chat_id: principal.chat_id(),
@@ -901,6 +1252,17 @@ where
                             Err(text) => Answer::TicketWorkFailed { chat_id, text },
                         }
                     }
+                    Ok(ControlCommand::Admin { directive }) => {
+                        let chat_id = principal.chat_id();
+                        // The tier gate above is the whole authorization for
+                        // this: only an administrator's `/admin` reaches here.
+                        let (text, mutated) = self.administer(directive);
+                        Answer::Administered {
+                            chat_id,
+                            text,
+                            mutated,
+                        }
+                    }
                     Ok(command) => match Unavailable::for_command(&command) {
                         Some(unavailable) => Answer::Unavailable {
                             chat_id: principal.chat_id(),
@@ -928,10 +1290,12 @@ where
                 .surface
                 .ticket_text(ticket_ref.as_str())
                 .unwrap_or_else(refused),
-            // `answer_for` carried these out through the run lane before
-            // `render` was reached; answering them here would be a second
-            // dispatch table over commands whose answers are effects.
-            ControlCommand::Run { .. } | ControlCommand::Work { .. } => String::new(),
+            // `answer_for` carried these out before `render` was reached;
+            // answering them here would be a second dispatch table over
+            // commands whose answers are effects.
+            ControlCommand::Run { .. }
+            | ControlCommand::Work { .. }
+            | ControlCommand::Admin { .. } => String::new(),
             // `Unavailable::for_command` decided these before `render` was
             // reached. Answering them here would be a second dispatch table.
             ControlCommand::Cancel { .. }
@@ -941,6 +1305,159 @@ where
                     unavailable.operator_reply().to_owned()
                 }),
         }
+    }
+
+    /// Carry out one `/admin` directive, and say whether it moved a row.
+    ///
+    /// Only an administrator reaches here — the tier gate in
+    /// [`Self::answer_for`] is the whole authorization, decided before the
+    /// directive was parsed. What is left is the *shape* of the roster, and this
+    /// is where the one rule that keeps the tiers apart is enforced: an id that
+    /// configuration owns is never written to the durable roster, in either
+    /// direction. An administrator cannot be added (they already outrank the
+    /// list), cannot be removed (only the file that named them can do that), and
+    /// a configured `allow=` user cannot be revoked from a chat either — the
+    /// owner wrote them down, and a member store that could delete them would be
+    /// a second opinion about a configuration file.
+    fn administer(&mut self, directive: AdminDirective) -> (String, bool) {
+        match directive {
+            AdminDirective::List => self.administer_list(),
+            AdminDirective::Add { user_id } => self.administer_add(user_id.get()),
+            AdminDirective::Remove { user_id } => self.administer_remove(user_id.get()),
+        }
+    }
+
+    fn administer_add(&mut self, target: i64) -> (String, bool) {
+        if self.roster.is_admin(target) {
+            return (
+                format!(
+                    "User {target} is an administrator, set in this host's bot \
+                     configuration. Nothing changed."
+                ),
+                false,
+            );
+        }
+        if self.roster.is_configured(target) {
+            return (
+                format!(
+                    "User {target} is already allowed by this host's bot \
+                     configuration. Nothing changed."
+                ),
+                false,
+            );
+        }
+        let Ok(members) = self.surface.member_ids() else {
+            return (surface_unavailable(), false);
+        };
+        // The union of configuration and roster is what the control gate must
+        // hold, and only this bridge can see both — so the ceiling is checked
+        // *before* a row is written rather than discovered by a recomposition
+        // that fails after one is.
+        if !members.contains(&target) {
+            let mut prospective = members;
+            prospective.push(target);
+            if self.roster.compose(&prospective).is_err() {
+                return (
+                    format!(
+                        "The operator list is full at {MAX_ALLOWED_USERS} users, so user \
+                         {target} was not added and nobody was removed."
+                    ),
+                    false,
+                );
+            }
+        }
+        let Ok(change) = self.surface.add_member(target) else {
+            return (surface_unavailable(), false);
+        };
+        let text = match change {
+            MemberChange::Added => format!(
+                "Added member {target}. They may use the read commands; runs, \
+                 tickets work and user management stay with administrators."
+            ),
+            MemberChange::AlreadyMember => {
+                format!("User {target} is already a member. Nothing changed.")
+            }
+            MemberChange::RosterFull => format!(
+                "The member roster is full, so user {target} was not added and \
+                 nobody was removed."
+            ),
+            // The store answers a removal vocabulary to a removal only.
+            MemberChange::Removed | MemberChange::NotAMember => surface_unavailable(),
+        };
+        self.settle(change, text)
+    }
+
+    fn administer_remove(&mut self, target: i64) -> (String, bool) {
+        if self.roster.is_admin(target) {
+            return (
+                format!(
+                    "User {target} is an administrator. Administrators are set in this \
+                     host's bot configuration and cannot be removed from a chat. \
+                     Nothing changed."
+                ),
+                false,
+            );
+        }
+        if self.roster.is_configured(target) {
+            return (
+                format!(
+                    "User {target} is allowed by this host's bot configuration and \
+                     cannot be removed from a chat. Nothing changed."
+                ),
+                false,
+            );
+        }
+        let Ok(change) = self.surface.remove_member(target) else {
+            return (surface_unavailable(), false);
+        };
+        let text = match change {
+            MemberChange::Removed => {
+                format!("Removed member {target}. They can no longer command this bot.")
+            }
+            MemberChange::NotAMember => {
+                format!("User {target} is not a member. Nothing changed.")
+            }
+            MemberChange::Added | MemberChange::AlreadyMember | MemberChange::RosterFull => {
+                surface_unavailable()
+            }
+        };
+        self.settle(change, text)
+    }
+
+    /// Publish a mutation immediately, so the change is in force for the rest
+    /// of this batch rather than at the next poll.
+    fn settle(&mut self, change: MemberChange, text: String) -> (String, bool) {
+        if change.mutated() {
+            self.refresh_operators();
+        }
+        (text, change.mutated())
+    }
+
+    fn administer_list(&mut self) -> (String, bool) {
+        let Ok(members) = self.surface.member_ids() else {
+            return (surface_unavailable(), false);
+        };
+        // Ids and nothing else. This host knows no names, and a reply that
+        // invented one would be describing a person it has never seen.
+        let configured: Vec<i64> = self
+            .roster
+            .configured()
+            .iter()
+            .copied()
+            .filter(|id| !self.roster.is_admin(*id))
+            .collect();
+        (
+            bounded_text(&format!(
+                "Operators (Telegram user ids)\n\
+                 administrators: {}\n\
+                 allowed by configuration: {}\n\
+                 members added here: {}",
+                id_list(self.roster.admins()),
+                id_list(&configured),
+                id_list(&members),
+            )),
+            false,
+        )
     }
 
     /// Send one decided answer and count what happened to it.
@@ -989,6 +1506,17 @@ where
             Answer::TicketWorkFailed { chat_id, text } => {
                 report.unavailable += 1;
                 report.ticket_work_failed += 1;
+                (chat_id, text)
+            }
+            Answer::Administered {
+                chat_id,
+                text,
+                mutated,
+            } => {
+                report.answered += 1;
+                if mutated {
+                    report.member_mutations += 1;
+                }
                 (chat_id, text)
             }
         };
@@ -1053,6 +1581,31 @@ enum Answer {
     TicketWorked { chat_id: i64, text: String },
     /// A `/work` that stored nothing.
     TicketWorkFailed { chat_id: i64, text: String },
+    /// An `/admin` that was carried out, and whether it moved a roster row.
+    Administered {
+        chat_id: i64,
+        text: String,
+        mutated: bool,
+    },
+}
+
+/// The reply for a durable surface that could not be read or written.
+fn surface_unavailable() -> String {
+    SurfaceRefusal::Unavailable.operator_reply().to_owned()
+}
+
+/// One list of Telegram user ids, or `none`.
+///
+/// `none` rather than an empty line: a roster reply an operator reads to decide
+/// who to revoke has to distinguish "nobody" from "the line is missing".
+fn id_list(ids: &[i64]) -> String {
+    if ids.is_empty() {
+        return String::from("none");
+    }
+    ids.iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Work one ticket: look it up, run the instruction it composes, store the
@@ -1220,7 +1773,24 @@ pub struct StoreControlSurface {
     store: Store,
     run_index: RunIndex,
     tickets: TicketReads,
+    members: MemberRoster,
     facts: HostFacts,
+}
+
+/// This surface's handle on the durable member roster.
+///
+/// Lazy for the same reason [`TicketReads`] is, and asymmetric in one way that
+/// matters: a *read* never creates the database and a *write* does. A host that
+/// has never had a member has no file, and answering "who are the members" must
+/// not conjure one; but the first `/admin add` on that host has to be able to
+/// record one, and there is no other writer that would have created it.
+enum MemberRoster {
+    /// No roster path was attached, so this host manages no members.
+    Detached,
+    /// A path was attached and nothing is open yet.
+    Unopened(PathBuf),
+    /// An open connection to the roster.
+    Open(Box<OperatorMemberStore>),
 }
 
 /// This surface's own read connection to the support ticket store.
@@ -1264,8 +1834,21 @@ impl StoreControlSurface {
             store,
             run_index,
             tickets: TicketReads::Detached,
+            members: MemberRoster::Detached,
             facts,
         })
+    }
+
+    /// Point this surface at the host's durable member roster.
+    ///
+    /// The path is remembered and nothing is opened or created. A surface with
+    /// no roster attached reports no members and refuses to record one, which
+    /// is the right answer for a host that was never given somewhere to put
+    /// them.
+    #[must_use]
+    pub fn with_operator_members(mut self, operator_members_path: &Path) -> Self {
+        self.members = MemberRoster::Unopened(operator_members_path.to_path_buf());
+        self
     }
 
     /// Point this surface at the host's support ticket store.
@@ -1320,6 +1903,41 @@ impl StoreControlSurface {
             TicketReads::Open(store) => Ok(Some(store)),
             // Unreachable: the arm above just replaced every other state.
             TicketReads::Detached | TicketReads::Unopened(_) => Err(SurfaceRefusal::Unavailable),
+        }
+    }
+
+    /// This host's member roster.
+    ///
+    /// `create` is the whole difference between the read path and the write
+    /// path: a read of a host that has never had a member answers `Ok(None)`
+    /// and leaves the filesystem alone, while the first addition brings the
+    /// database into existence. Neither ever invents a member.
+    fn member_store(
+        &mut self,
+        create: bool,
+    ) -> Result<Option<&mut OperatorMemberStore>, SurfaceRefusal> {
+        let path = match &self.members {
+            MemberRoster::Detached => return Ok(None),
+            MemberRoster::Open(store) => store.path().to_path_buf(),
+            MemberRoster::Unopened(path) => path.clone(),
+        };
+        if !path.is_file() {
+            // Removed, or never created. A handle this surface may still hold
+            // is one to a file nobody can reach.
+            self.members = MemberRoster::Unopened(path.clone());
+            if !create {
+                return Ok(None);
+            }
+        }
+        if let MemberRoster::Unopened(path) = &self.members {
+            let opened =
+                OperatorMemberStore::open(path).map_err(|_| SurfaceRefusal::Unavailable)?;
+            self.members = MemberRoster::Open(Box::new(opened));
+        }
+        match &mut self.members {
+            MemberRoster::Open(store) => Ok(Some(store)),
+            // Unreachable: the arm above just replaced every other state.
+            MemberRoster::Detached | MemberRoster::Unopened(_) => Err(SurfaceRefusal::Unavailable),
         }
     }
 }
@@ -1525,6 +2143,44 @@ impl ControlSurface for StoreControlSurface {
                 Ok(DraftOutcome::Refused(TICKET_ALREADY_WORKED))
             }
             Err(SupportTicketError::NotFound(_)) => Ok(DraftOutcome::Refused(TICKET_NOT_FOUND)),
+            Err(_) => Err(SurfaceRefusal::Unavailable),
+        }
+    }
+
+    fn member_ids(&mut self) -> Result<Vec<i64>, SurfaceRefusal> {
+        let Some(store) = self.member_store(false)? else {
+            return Ok(Vec::new());
+        };
+        store.member_ids().map_err(|_| SurfaceRefusal::Unavailable)
+    }
+
+    /// The one write on this surface that changes who may command the daemon.
+    ///
+    /// The instant is this host's clock, read at the point of writing for the
+    /// reason every other durable write in this daemon reads it there.
+    fn add_member(&mut self, user_id: i64) -> Result<MemberChange, SurfaceRefusal> {
+        let now_ms = crate::unix_millis().map_err(|_| SurfaceRefusal::Unavailable)?;
+        let Some(store) = self.member_store(true)? else {
+            return Err(SurfaceRefusal::Unavailable);
+        };
+        match store.add_member(user_id, now_ms) {
+            Ok(disposition) => Ok(MemberChange::from_disposition(disposition)),
+            // A full roster is an answer, not a fault: nothing was added and,
+            // as the store's own contract says, nobody was evicted.
+            Err(OperatorMemberError::RosterFull { .. }) => Ok(MemberChange::RosterFull),
+            Err(_) => Err(SurfaceRefusal::Unavailable),
+        }
+    }
+
+    fn remove_member(&mut self, user_id: i64) -> Result<MemberChange, SurfaceRefusal> {
+        // `create: false`: revoking somebody from a host that has no roster is
+        // already true, and creating a database to record that would be an
+        // effect nobody asked for.
+        let Some(store) = self.member_store(false)? else {
+            return Ok(MemberChange::NotAMember);
+        };
+        match store.remove_member(user_id) {
+            Ok(disposition) => Ok(MemberChange::from_disposition(disposition)),
             Err(_) => Err(SurfaceRefusal::Unavailable),
         }
     }

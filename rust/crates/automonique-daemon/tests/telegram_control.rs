@@ -21,28 +21,35 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use automonique_daemon::telegram_bridge::{
-    BridgeParts, ControlSurface, DispatchReport, HostFacts, NO_TICKETS_RECORDED, RunFailure,
-    RunLane, StoreControlSurface, TICKET_NOT_FOUND, TICKETS_LISTED, TICKETS_NOT_ENABLED,
-    TelegramControlBridge, Unavailable,
+    BridgeParts, ControlSurface, DispatchReport, HostFacts, MemberChange, NO_TICKETS_RECORDED,
+    OperatorRoster, RunFailure, RunLane, StoreControlSurface, TICKET_NOT_FOUND, TICKETS_LISTED,
+    TICKETS_NOT_ENABLED, TelegramControlBridge, Unavailable,
 };
 use automonique_protocol::admin::ExecutionState;
+use automonique_store::operator_members::OperatorMemberStore;
 use automonique_store::run_index::{RunIndex, RunIndexEntry};
 use automonique_store::support_tickets::{
     FleetTicket, SupportTicketStore, TicketLifecycle, TicketTransition,
 };
 use automonique_store::{LeaseRequest, Store};
 use automonique_transport_runtime::{
-    AllowedUsers, CancellationToken, DurableCommitReceipt, DurableTelegramBatch, HttpFailure,
-    OffsetReceipt, OpaqueBotToken, PollerLease, RuntimeError, SinkFailure, TelegramDurableSink,
-    TelegramHttpClient, TelegramHttpPlan, TelegramHttpResponse, TelegramOutboundClient,
-    TelegramOutboundPlan, command_manifest,
+    CancellationToken, CommandTier, DurableCommitReceipt, DurableDisposition, DurableTelegramBatch,
+    HttpFailure, OffsetReceipt, OpaqueBotToken, PollerLease, RuntimeError, SinkFailure,
+    TelegramDurableSink, TelegramHttpClient, TelegramHttpPlan, TelegramHttpResponse,
+    TelegramOutboundClient, TelegramOutboundPlan, command_manifest,
 };
-use automonique_transports::{TelegramAccessPolicy, TelegramBotId, TelegramPrincipal};
+use automonique_transports::{TelegramBotId, TelegramPrincipal};
 
 /// The bot every fixture configures.
 const BOT_ID: i64 = 123_456;
-/// The one operator these fixtures authorize.
+/// The one operator these fixtures authorize, and an administrator in each of
+/// them — `bot.conf` with no `admin=` line makes every allowed user one.
 const OPERATOR: i64 = 7_654_321;
+/// A non-admin member in the tiered fixtures: allowed by configuration, not an
+/// administrator.
+const MEMBER: i64 = 5_550_001;
+/// Somebody an `/admin add` lets in, who starts on no list at all.
+const NEWCOMER: i64 = 4_440_002;
 /// Somebody who is not on any list here.
 const OUTSIDER: i64 = 9_999_999;
 /// The exact credential, so a test can prove no rendering contains it.
@@ -191,6 +198,13 @@ struct SinkState {
     offset: u64,
     commits: usize,
     duplicate: bool,
+    /// The disposition the *poller* committed for each update of each batch.
+    ///
+    /// Kept because it is the only view of what the transport policy decided at
+    /// fetch time. The dispatch that follows re-parses the same bytes, so a
+    /// reply alone cannot tell whether the two agreed — and they must, or the
+    /// bot answers a sender its own durable record says it denied.
+    committed: Vec<Vec<DurableDisposition>>,
 }
 
 impl FakeSink {
@@ -206,6 +220,17 @@ impl FakeSink {
 
     fn commits(&self) -> usize {
         self.state.lock().expect("sink state").commits
+    }
+
+    /// What the poller durably committed for the most recent batch.
+    fn last_committed(&self) -> Vec<DurableDisposition> {
+        self.state
+            .lock()
+            .expect("sink state")
+            .committed
+            .last()
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -235,6 +260,13 @@ impl TelegramDurableSink for FakeSink {
         let mut state = self.state.lock().expect("sink state");
         state.commits += 1;
         state.offset = batch.next_offset;
+        state.committed.push(
+            batch
+                .updates
+                .iter()
+                .map(|update| update.disposition.clone())
+                .collect(),
+        );
         Ok(DurableCommitReceipt {
             bot_id: batch.bot_id,
             lease_epoch: lease.epoch,
@@ -259,6 +291,7 @@ struct Fixture {
     database_path: std::path::PathBuf,
     run_index_path: std::path::PathBuf,
     support_tickets_path: std::path::PathBuf,
+    operator_members_path: std::path::PathBuf,
 }
 
 /// One synthetic support ticket a fixture records.
@@ -311,6 +344,9 @@ impl Fixture {
         // Named and deliberately not created: a fixture that seeds no ticket is
         // a host whose support intake was never configured.
         let support_tickets_path = root.path().join("support-tickets.sqlite3");
+        // Likewise named and not created: a host whose administrators have
+        // never added a member has no roster file at all.
+        let operator_members_path = root.path().join("operator-members.sqlite3");
         let now_ms = real_now_ms();
         let mut store = Store::open(&database_path).expect("store opens");
         let lease = store
@@ -343,6 +379,7 @@ impl Fixture {
             database_path,
             run_index_path,
             support_tickets_path,
+            operator_members_path,
         }
     }
 
@@ -354,6 +391,32 @@ impl Fixture {
         )
         .expect("read surface opens")
         .with_support_tickets(&self.support_tickets_path)
+        .with_operator_members(&self.operator_members_path)
+    }
+
+    /// Record these members in this host's roster, creating it.
+    ///
+    /// This is what an earlier `/admin add` would have left behind, done
+    /// directly so a test can start from a host that already has members.
+    fn seed_members(&self, members: &[i64]) {
+        let mut store =
+            OperatorMemberStore::open(&self.operator_members_path).expect("member roster opens");
+        for member in members {
+            store
+                .add_member(*member, TICKET_OBSERVED_MS)
+                .expect("added");
+        }
+    }
+
+    /// The member ids this host's roster holds, read straight from the file.
+    fn stored_members(&self) -> Vec<i64> {
+        if !self.operator_members_path.is_file() {
+            return Vec::new();
+        }
+        OperatorMemberStore::open(&self.operator_members_path)
+            .expect("member roster opens")
+            .member_ids()
+            .expect("members")
     }
 
     /// Record these tickets in this host's ticket store, creating it.
@@ -417,12 +480,31 @@ fn real_now_ms() -> i64 {
     .expect("time fits")
 }
 
-fn policy() -> TelegramAccessPolicy {
-    TelegramAccessPolicy::new(
+/// The configured roster these fixtures compose from.
+///
+/// `admins` and `allowed` are spliced exactly as `bot.conf`'s `admin=` and
+/// `allow=` lines would be: each user is given their private chat, every
+/// configured user is allowed, and only the first list is administrative.
+fn roster(admins: &[i64], allowed: &[i64]) -> OperatorRoster {
+    let configured: Vec<i64> = admins.iter().chain(allowed).copied().collect();
+    OperatorRoster::new(
         TelegramBotId::new(BOT_ID).expect("bot id"),
-        [TelegramPrincipal::new(OPERATOR, OPERATOR).expect("principal")],
+        configured
+            .iter()
+            .map(|id| TelegramPrincipal::new(*id, *id).expect("principal")),
+        configured.iter().copied(),
+        admins.iter().copied(),
     )
-    .expect("policy")
+    .expect("roster")
+}
+
+/// The single-tier roster: one operator, who is therefore an administrator.
+///
+/// This is what a `bot.conf` carrying only `allow=` composes, so every test
+/// written before the tiers existed still exercises the configuration those
+/// deployments have.
+fn single_tier_roster() -> OperatorRoster {
+    roster(&[OPERATOR], &[])
 }
 
 fn token() -> OpaqueBotToken {
@@ -525,14 +607,24 @@ fn bridge_with_lane(
     sink: FakeSink,
     lane: FakeRunLane,
 ) -> Bridge {
+    bridge_with_roster(fixture, client, outbound, sink, lane, single_tier_roster())
+}
+
+fn bridge_with_roster(
+    fixture: &Fixture,
+    client: FakeClient,
+    outbound: FakeOutbound,
+    sink: FakeSink,
+    lane: FakeRunLane,
+    roster: OperatorRoster,
+) -> Bridge {
     TelegramControlBridge::new(BridgeParts {
         client,
         outbound,
         sink,
         surface: fixture.surface(),
         lane,
-        policy: policy(),
-        allowed: AllowedUsers::new([OPERATOR]).expect("allowlist"),
+        roster,
         inbound_token: token(),
         outbound_token: token(),
         long_poll_seconds: LONG_POLL_SECONDS,
@@ -1609,4 +1701,367 @@ fn a_ticket_detail_reports_a_draft_by_size_and_never_by_text() {
         "a detail view must not carry the draft's text: {:?}",
         messages[2]
     );
+}
+
+// ------------------------------------------------------ two operator tiers
+
+/// A tiered bridge: `OPERATOR` is an administrator, `MEMBER` is allowed by
+/// configuration and is not.
+fn tiered_bridge(
+    fixture: &Fixture,
+    client: FakeClient,
+    outbound: FakeOutbound,
+    sink: FakeSink,
+    lane: FakeRunLane,
+) -> Bridge {
+    bridge_with_roster(
+        fixture,
+        client,
+        outbound,
+        sink,
+        lane,
+        roster(&[OPERATOR], &[MEMBER]),
+    )
+}
+
+/// THE TIER LINE, FROM BOTH SIDES. A member reads everything and spends
+/// nothing; an administrator does both. The lane is the proof that matters —
+/// a refused `/run` must not have reached it, because reaching it is what
+/// costs money.
+#[test]
+fn a_member_reads_but_cannot_spend_or_manage_users() {
+    let fixture = Fixture::new(&[(7, "run-alpha")]);
+    let client = FakeClient::new([
+        updates(&[
+            (1, MEMBER, "/status"),
+            (2, MEMBER, "/runs"),
+            (3, MEMBER, "/help"),
+            (4, MEMBER, "/run summarize the board"),
+            (5, MEMBER, "/work SUP-1042"),
+            (6, MEMBER, "/admin list"),
+            (7, MEMBER, "/admin add 4440002"),
+        ]),
+        updates(&[(8, OPERATOR, "/run summarize the board")]),
+    ]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering("the answer");
+    let mut bridge = tiered_bridge(
+        &fixture,
+        client,
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+
+    let member_report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(member_report.updates, 7);
+    assert_eq!(member_report.answered, 3, "the three reads are answered");
+    assert_eq!(member_report.refused, 4, "the four admin commands are not");
+    assert_eq!(member_report.runs_answered, 0);
+    assert_eq!(member_report.member_mutations, 0);
+    assert_eq!(
+        lane.tasks(),
+        Vec::<String>::new(),
+        "a refused /run must never reach the lane; reaching it is the spend"
+    );
+    assert_eq!(
+        fixture.stored_members(),
+        Vec::<i64>::new(),
+        "a member's /admin add must not write a row"
+    );
+
+    let messages = outbound.messages();
+    assert!(messages[0].contains("Automonique status"));
+    assert!(messages[1].contains("Recent runs"));
+    // The refusal is the tier's, and it is the same one every time — it never
+    // reports which argument was wrong, because the command was not theirs.
+    for message in &messages[3..] {
+        assert!(
+            message.contains("Not authorized for that."),
+            "a member must be told the tier, not the grammar: {message:?}"
+        );
+        assert!(
+            !message.contains("Not available yet"),
+            "a refusal must not read as a missing feature: {message:?}"
+        );
+        assert!(
+            !message.contains("needs an argument"),
+            "a refusal must not leak the grammar: {message:?}"
+        );
+    }
+
+    // The same command, from the administrator, is carried out.
+    let admin_report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(admin_report.runs_answered, 1);
+    assert_eq!(lane.tasks(), vec![String::from("summarize the board")]);
+}
+
+/// The whole point of the feature: an administrator lets somebody in from a
+/// chat, they can immediately use the bot, and a revocation takes it back —
+/// with no restart anywhere in the sequence.
+#[test]
+fn an_admin_add_admits_a_newcomer_and_a_remove_revokes_them() {
+    let fixture = Fixture::new(&[]);
+    let client = FakeClient::new([
+        // The addition, and — in the same batch — a message from the newcomer.
+        updates(&[
+            (1, OPERATOR, "/admin add 4440002"),
+            (2, NEWCOMER, "/status"),
+        ]),
+        // The next poll is the first one fetched under the widened policy.
+        updates(&[(3, NEWCOMER, "/status")]),
+        updates(&[(4, OPERATOR, "/admin remove 4440002")]),
+        updates(&[(5, NEWCOMER, "/status")]),
+    ]);
+    let outbound = FakeOutbound::default();
+    let sink = FakeSink::default();
+    let mut bridge = tiered_bridge(
+        &fixture,
+        client,
+        outbound.clone(),
+        sink.clone(),
+        FakeRunLane::default(),
+    );
+
+    let added = poll(&mut bridge).expect("poll commits");
+    assert_eq!(added.member_mutations, 1);
+    assert_eq!(fixture.stored_members(), vec![NEWCOMER], "durably recorded");
+    assert!(
+        bridge.authority().authorize(NEWCOMER),
+        "the composed gate widens within the batch, without a restart"
+    );
+    assert_eq!(
+        bridge.authority().tier_of(NEWCOMER),
+        Some(CommandTier::Allowed),
+        "a member added from a chat is never an administrator"
+    );
+    assert_eq!(
+        added.denied_senders, 1,
+        "the newcomer's own message in that batch was fetched under the old \
+         policy, and its durable disposition already says denied"
+    );
+
+    let answered = poll(&mut bridge).expect("poll commits");
+    assert_eq!(answered.answered, 1, "the next poll answers them");
+    assert_eq!(answered.denied_senders, 0);
+    // THE TWO GATES AGREE. The reply above came from the dispatch's re-parse;
+    // this is what the *poller* durably committed for the same bytes. They must
+    // match, or the bot has answered a sender its own record says it denied —
+    // which is exactly what happens if the refreshed policy is published to the
+    // bridge and not to the poller.
+    assert!(
+        matches!(
+            sink.last_committed().as_slice(),
+            [DurableDisposition::Admitted { .. }]
+        ),
+        "the poller committed {:?} for a message it answered",
+        sink.last_committed()
+    );
+
+    let removed = poll(&mut bridge).expect("poll commits");
+    assert_eq!(removed.member_mutations, 1);
+    assert_eq!(fixture.stored_members(), Vec::<i64>::new());
+    assert!(!bridge.authority().authorize(NEWCOMER));
+
+    let revoked = poll(&mut bridge).expect("poll commits");
+    assert_eq!(
+        sink.last_committed(),
+        vec![DurableDisposition::Denied],
+        "a revoked member is denied by the poller itself, not merely unanswered"
+    );
+    assert_eq!(
+        revoked.denied_senders, 1,
+        "revocation holds at the transport"
+    );
+    assert_eq!(revoked.answered, 0);
+
+    let messages = outbound.messages();
+    assert!(messages[0].contains(&format!("Added member {NEWCOMER}")));
+    assert!(messages[3].contains(&format!("Removed member {NEWCOMER}")));
+    assert!(
+        messages
+            .last()
+            .expect("a reply")
+            .contains("Not authorized."),
+        "a revoked member is a stranger again: {:?}",
+        messages.last()
+    );
+}
+
+/// The one thing a chat may never do. Administrators come from `bot.conf`, so
+/// `/admin` refuses to touch one in either direction — and refuses to revoke a
+/// configured `allow=` user, who is likewise the owner's to remove.
+#[test]
+fn configuration_owned_users_cannot_be_added_or_removed_from_a_chat() {
+    let fixture = Fixture::new(&[]);
+    let client = FakeClient::new([updates(&[
+        (1, OPERATOR, "/admin add 7654321"),
+        (2, OPERATOR, "/admin remove 7654321"),
+        (3, OPERATOR, "/admin add 5550001"),
+        (4, OPERATOR, "/admin remove 5550001"),
+    ])]);
+    let outbound = FakeOutbound::default();
+    let mut bridge = tiered_bridge(
+        &fixture,
+        client,
+        outbound.clone(),
+        FakeSink::default(),
+        FakeRunLane::default(),
+    );
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.answered, 4, "each is answered, and each is a no-op");
+    assert_eq!(
+        report.member_mutations, 0,
+        "not one configuration-owned id may reach the durable roster"
+    );
+    assert_eq!(fixture.stored_members(), Vec::<i64>::new());
+    assert_eq!(
+        bridge.authority().admins().as_slice(),
+        [OPERATOR],
+        "the admin set is the configuration's, before and after"
+    );
+
+    // The two guards answer differently on purpose, and the difference is
+    // asserted: an administrator must be refused *as an administrator*, not
+    // merely as somebody configuration happens to name. They are protected
+    // twice over, and a test that could not tell the guards apart would let
+    // the inner one be deleted silently.
+    let messages = outbound.messages();
+    assert!(
+        messages[0].contains("is an administrator"),
+        "{}",
+        messages[0]
+    );
+    assert!(
+        messages[1].contains("is an administrator")
+            && messages[1].contains("cannot be removed from a chat"),
+        "{}",
+        messages[1]
+    );
+    assert!(
+        messages[2].contains("already allowed by this host's bot configuration"),
+        "{}",
+        messages[2]
+    );
+    assert!(
+        messages[3].contains(
+            "allowed by this host's bot configuration and \
+             cannot be removed from a chat"
+        ),
+        "{}",
+        messages[3]
+    );
+    assert!(
+        !messages[3].contains("is an administrator"),
+        "a configured member is not an administrator: {}",
+        messages[3]
+    );
+}
+
+/// `/admin list` is a read: it names ids and nothing else, and moves nothing.
+#[test]
+fn the_roster_listing_reports_ids_only_and_changes_nothing() {
+    let fixture = Fixture::new(&[]);
+    fixture.seed_members(&[NEWCOMER]);
+    let client = FakeClient::new([updates(&[(1, OPERATOR, "/admin list")])]);
+    let outbound = FakeOutbound::default();
+    let mut bridge = tiered_bridge(
+        &fixture,
+        client,
+        outbound.clone(),
+        FakeSink::default(),
+        FakeRunLane::default(),
+    );
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.answered, 1);
+    assert_eq!(report.member_mutations, 0);
+    assert_eq!(fixture.stored_members(), vec![NEWCOMER]);
+
+    let listing = &outbound.messages()[0];
+    assert!(
+        listing.contains(&format!("administrators: {OPERATOR}")),
+        "{listing}"
+    );
+    assert!(
+        listing.contains(&format!("allowed by configuration: {MEMBER}")),
+        "{listing}"
+    );
+    assert!(
+        listing.contains(&format!("members added here: {NEWCOMER}")),
+        "{listing}"
+    );
+    // A member seeded before the bridge existed is admitted from the first
+    // poll, because the refresh happens before the request.
+    assert!(bridge.authority().authorize(NEWCOMER));
+}
+
+/// The production surface's own contract: a read never creates the roster
+/// file, and the first write does.
+#[test]
+fn the_surface_creates_the_roster_only_when_a_member_is_recorded() {
+    let fixture = Fixture::new(&[]);
+    let mut surface = fixture.surface();
+
+    assert_eq!(
+        surface.member_ids().expect("no roster is not a fault"),
+        Vec::<i64>::new()
+    );
+    assert_eq!(
+        surface.remove_member(NEWCOMER).expect("revocation"),
+        MemberChange::NotAMember
+    );
+    assert!(
+        !fixture.operator_members_path.is_file(),
+        "reading who the members are must not conjure a database"
+    );
+
+    assert_eq!(
+        surface.add_member(NEWCOMER).expect("addition"),
+        MemberChange::Added
+    );
+    assert!(fixture.operator_members_path.is_file());
+    assert_eq!(
+        surface.add_member(NEWCOMER).expect("re-addition"),
+        MemberChange::AlreadyMember
+    );
+    assert_eq!(surface.member_ids().expect("members"), vec![NEWCOMER]);
+    assert_eq!(
+        surface.remove_member(NEWCOMER).expect("revocation"),
+        MemberChange::Removed
+    );
+    assert_eq!(surface.member_ids().expect("members"), Vec::<i64>::new());
+}
+
+/// BACK-COMPAT, AT THE BRIDGE. A single-tier roster — what a `bot.conf` with
+/// only `allow=` composes — leaves its one operator able to do everything,
+/// including manage members.
+#[test]
+fn a_single_tier_host_keeps_every_authority_it_had() {
+    let fixture = Fixture::new(&[]);
+    let client = FakeClient::new([updates(&[
+        (1, OPERATOR, "/run summarize the board"),
+        (2, OPERATOR, "/admin add 4440002"),
+    ])]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering("the answer");
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        client,
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+
+    assert_eq!(
+        bridge.authority().tier_of(OPERATOR),
+        Some(CommandTier::Admin),
+        "with no admin= line, the allowed user is an administrator"
+    );
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.runs_answered, 1);
+    assert_eq!(report.member_mutations, 1);
+    assert_eq!(lane.tasks(), vec![String::from("summarize the board")]);
+    assert_eq!(fixture.stored_members(), vec![NEWCOMER]);
 }

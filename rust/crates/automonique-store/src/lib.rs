@@ -14,6 +14,7 @@ pub mod batch_registry;
 pub mod cancel_ledger;
 pub mod context_memory;
 pub mod generation_audit;
+pub mod operator_members;
 pub mod provider_journal;
 pub mod run_index;
 pub mod run_submissions;

@@ -34,10 +34,12 @@ pub use slack_sink::{
 };
 pub use store_sink::{Clock, ClockFailure, StoreTelegramDurableSink, SystemClock};
 pub use telegram_control::{
-    AllowedUsers, AllowlistError, ArgumentShape, COMMAND_COUNT, CommandKind, CommandManifestEntry,
-    CommandRefusal, CommandSpec, ControlCommand, ControlRef, MAX_ALLOWED_USERS,
-    MAX_BOT_SUFFIX_BYTES, MAX_COMMAND_NAME_BYTES, MAX_COMMAND_TEXT_BYTES, MAX_CONTROL_REF_BYTES,
-    MAX_RUN_TASK_BYTES, RunTask, authorize_and_parse, command_manifest, help_text, parse_command,
+    ADMIN_HELP_MARK, AdminDirective, AllowedUsers, AllowlistError, ArgumentShape, COMMAND_COUNT,
+    CommandKind, CommandManifestEntry, CommandRefusal, CommandSpec, CommandTier, ControlCommand,
+    ControlRef, MAX_ALLOWED_USERS, MAX_BOT_SUFFIX_BYTES, MAX_COMMAND_NAME_BYTES,
+    MAX_COMMAND_TEXT_BYTES, MAX_CONTROL_REF_BYTES, MAX_RUN_TASK_BYTES, MAX_USER_ID_BYTES,
+    OperatorAuthority, OperatorUserId, RunTask, authorize_and_parse, authorize_and_parse_tiered,
+    command_manifest, help_text, parse_command,
 };
 
 const MAX_LEASE_ID_BYTES: usize = 256;
@@ -669,6 +671,36 @@ where
             long_poll_seconds,
             pending_commit: None,
         })
+    }
+
+    /// Replace the access policy under which further polls admit work.
+    ///
+    /// A host whose operator list can change at runtime — one where an
+    /// administrator adds a member from a chat — has to be able to widen the
+    /// policy without dropping the poller, because rebuilding it would mean
+    /// re-acquiring the bot lease and re-reading the durable offset to add one
+    /// row to an allowlist.
+    ///
+    /// Two things are refused rather than accommodated. **A different bot**:
+    /// the policy's identity is bound into every scope this poller has already
+    /// committed, and changing it would make one durable stream describe two
+    /// bots. **A pending ambiguous commit**: that batch was parsed under the
+    /// policy in force when it was fetched, and resolving it under a different
+    /// one would commit dispositions the parse never produced.
+    ///
+    /// The new policy takes effect on the *next* poll. An update already fetched
+    /// under the old one keeps the disposition it was parsed with, which is the
+    /// only answer that keeps the durable record and the reply consistent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::InvalidConfiguration`] for either refusal.
+    pub fn set_policy(&mut self, policy: TelegramAccessPolicy) -> Result<(), RuntimeError> {
+        if policy.bot_id().get() != self.policy.bot_id().get() || self.pending_commit.is_some() {
+            return Err(RuntimeError::InvalidConfiguration("policy"));
+        }
+        self.policy = policy;
+        Ok(())
     }
 
     /// Restore exact durable ambiguity state before any further HTTP request.
