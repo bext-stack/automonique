@@ -274,9 +274,13 @@ fn the_product_binary_serves_status_and_shutdown_end_to_end() {
         "{human}"
     );
     assert!(
-        human.ends_with("sandbox launch refusals: unavailable\n"),
+        human.contains("sandbox launch refusals: unavailable\n"),
         "{human}"
     );
+    // The durable-state block follows the operational metrics: a fresh daemon
+    // under its first generation has one open tenure at epoch 1 and no runs.
+    assert!(human.contains("runs registered: 0\n"), "{human}");
+    assert!(human.ends_with("open tenure epoch: 1\n"), "{human}");
 
     let json = run(&runtime, &state, &["status", "--json"]);
     assert!(json.status.success());
