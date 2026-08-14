@@ -53,6 +53,12 @@
 //!   supervisor is in. Admission resolves and publishes
 //!   [`AdmittedLaunch::working_directory`] and proves it lies inside the
 //!   resolved workspace root; it cannot prove the supervisor honours it.
+//! - **Admission does not start a broker.** A spec asking for `brokered_named`
+//!   egress is admitted with a [`BrokerRequirement`] naming the destinations
+//!   and a plan that carries *no* network grant at all. The grants appear only
+//!   when a supervisor that has actually started a broker attaches it with
+//!   [`AdmittedLaunch::with_broker`], because the port it grants is that
+//!   broker's own ephemeral port and does not exist until it is bound.
 //! - **A capability is not a kernel boundary.** Provider capabilities,
 //!   prohibited capabilities and execution allowlists are named subjects, not
 //!   paths, and no registry maps a name to a path here, so a spec that carries
@@ -79,6 +85,7 @@ use automonique_protocol::sandbox::{
 };
 use sha2::{Digest as _, Sha256};
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -87,6 +94,27 @@ pub const MAX_OFFERED_FEATURES: usize = 64;
 
 /// Upper bound on a context path, matching the launch surface's own ceiling.
 pub const MAX_CONTEXT_PATH_BYTES: usize = crate::MAX_LAUNCH_ARG_BYTES;
+
+/// Upper bound on the destinations one brokered launch may name.
+///
+/// Deliberately the egress broker's own `MAX_ALLOWLIST_ENTRIES`. A launch that
+/// named more destinations than a broker will hold would be admitted against a
+/// policy no broker could be started with, so the two ceilings are one number
+/// written in two crates that do not depend on each other, and
+/// [`BrokerRequirement`] is what a test pins them together through.
+pub const MAX_BROKERED_DESTINATIONS: usize = 16;
+
+/// Upper bound on a destination host, in bytes — the DNS name limit.
+pub const MAX_DESTINATION_HOST_BYTES: usize = 253;
+
+/// The two variables that point a brokered workload at its broker.
+///
+/// Both are bound to the same URL, which is the pair the egress broker
+/// publishes: a provider's HTTPS and websocket transports tunnel through
+/// `HTTPS_PROXY`, and `HTTP_PROXY` turns a plaintext request — which the broker
+/// answers only with a refusal, since it speaks `CONNECT` alone — into a visible
+/// refusal rather than a direct connection attempt.
+pub const BROKER_PROXY_VARIABLES: [&str; 2] = ["HTTPS_PROXY", "HTTP_PROXY"];
 
 /// Spec fields this bridge deliberately does not consult, and why.
 ///
@@ -199,6 +227,138 @@ impl UnenforcedBudget {
     }
 }
 
+/// Where an allowlisted destination is expected to live.
+///
+/// A mirror of the egress broker's own `AddressScope`, kept in this crate so
+/// admission can name a destination without depending on the broker. It carries
+/// no policy of its own: the broker is what checks a resolved address against
+/// it, and this is the word admission passes along.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum BrokeredScope {
+    /// A public internet endpoint.
+    Public,
+    /// An endpoint on this host.
+    Loopback,
+}
+
+impl BrokeredScope {
+    /// Every scope, for closed coverage.
+    pub const ALL: [Self; 2] = [Self::Public, Self::Loopback];
+
+    /// Stable spelling, matching the broker's own.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Loopback => "loopback",
+        }
+    }
+
+    /// Parse the exact stable spelling.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|scope| scope.as_str() == value)
+    }
+}
+
+impl fmt::Display for BrokeredScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// One destination a brokered launch must be able to reach, and nothing else.
+///
+/// # This type bounds a host; it does not parse one
+///
+/// The egress broker's own `Destination` is the authority on what a destination
+/// *is* — which spellings are a name, which are a literal, and which are
+/// refused. This type exists so an admitted launch can carry the destinations it
+/// was admitted for without this crate acquiring the broker as a dependency, and
+/// it therefore checks only bounds and a byte set. A caller resolves a
+/// destination through the broker's parser first and hands the result here; the
+/// broker parses it again when the allowlist is built, and because both parses
+/// are the same function the second cannot disagree with the first.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BrokeredDestination {
+    host: String,
+    port: u16,
+    scope: BrokeredScope,
+}
+
+impl BrokeredDestination {
+    /// Name one destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmissionRefusal::ContextRejected`] for an empty or over-long
+    /// host, a host carrying a byte outside the letter/digit/hyphen/dot/colon/
+    /// bracket set an allowlist entry can be written with, or port zero — which
+    /// is not a port but a request for one.
+    pub fn new(host: &str, port: u16, scope: BrokeredScope) -> Result<Self, AdmissionRefusal> {
+        let rejected = || AdmissionRefusal::ContextRejected("brokered_destinations");
+        if host.is_empty() || host.len() > MAX_DESTINATION_HOST_BYTES || port == 0 {
+            return Err(rejected());
+        }
+        if !host.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':' | b'[' | b']')
+        }) {
+            return Err(rejected());
+        }
+        Ok(Self {
+            host: host.to_owned(),
+            port,
+            scope,
+        })
+    }
+
+    /// The host as written.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// The port.
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The scope its resolved address must fall in.
+    #[must_use]
+    pub const fn scope(&self) -> BrokeredScope {
+        self.scope
+    }
+}
+
+impl fmt::Display for BrokeredDestination {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.host, self.port)
+    }
+}
+
+/// The destinations an admitted launch needs a broker to permit.
+///
+/// Its presence on an [`AdmittedLaunch`] is the "a broker is required" signal:
+/// a supervisor that finds one must start a broker over exactly these
+/// destinations and attach it with [`AdmittedLaunch::with_broker`] before the
+/// plan is run, and a supervisor that finds none must start no broker at all.
+/// The set is never empty — [`admit`] refuses a brokered spec whose destinations
+/// were not resolved rather than admitting one with an allowlist that permits
+/// nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrokerRequirement {
+    destinations: Vec<BrokeredDestination>,
+}
+
+impl BrokerRequirement {
+    /// The exact destinations, in the order the context named them.
+    #[must_use]
+    pub fn destinations(&self) -> &[BrokeredDestination] {
+        &self.destinations
+    }
+}
+
 /// Why one spec was not admitted, before any plan, cgroup or process exists.
 ///
 /// Every variant is a refusal. None of them means "admitted with less than the
@@ -232,6 +392,15 @@ pub enum AdmissionRefusal {
     /// The host does not offer a feature the sandbox spec requires, or offers
     /// it through a rejected implementation.
     HostFeatureRejected(SandboxError),
+    /// A broker was offered to a launch that requires none. Attaching one would
+    /// give a run whose spec denies egress a TCP socket and a connect port.
+    BrokerNotRequired,
+    /// A broker was offered to a launch that already has one. Two attachments
+    /// would grant two connect ports and bind the proxy variables twice.
+    BrokerAlreadyAttached,
+    /// The offered broker endpoint is not a loopback address, or names port
+    /// zero. A broker off this host is an open relay to the allowlist.
+    BrokerEndpointRejected(SocketAddr),
     /// The launch surface refused the mapped plan; names the spec field whose
     /// mapping was refused.
     Plan {
@@ -285,6 +454,16 @@ impl fmt::Display for AdmissionRefusal {
             Self::HostFeatureRejected(error) => {
                 write!(formatter, "host enforcement negotiation failed: {error}")
             }
+            Self::BrokerNotRequired => {
+                formatter.write_str("this launch requires no broker, so none may be attached")
+            }
+            Self::BrokerAlreadyAttached => {
+                formatter.write_str("this launch already carries a broker")
+            }
+            Self::BrokerEndpointRejected(endpoint) => write!(
+                formatter,
+                "broker endpoint {endpoint} is not a loopback address with a real port"
+            ),
             Self::Plan { field, error } => {
                 write!(formatter, "mapping spec field {field} was refused: {error}")
             }
@@ -421,13 +600,54 @@ pub struct AdmissionContextParts {
     pub prompt: Option<ResolvedPrompt>,
     /// Budgets the caller acknowledges this launch will not enforce.
     pub unenforced_budgets: Vec<UnenforcedBudget>,
+    /// The destinations this deployment resolves `brokered_named` egress to.
+    ///
+    /// A standing host answer, like [`Self::host_features`] beside it: the same
+    /// list is offered to every document, and only a document that asks for
+    /// brokered egress consults it. See [`AdmissionContext`]'s own note for why
+    /// this field exists at all.
+    pub brokered_destinations: Vec<BrokeredDestination>,
 }
 
 /// The validated runtime half of one admission.
 ///
 /// A context supplies resolutions, never grants: there is no field here that
-/// can add a path, a port, a socket, or a variable that the spec did not
-/// already declare.
+/// can add a path, a socket, or a variable that the spec did not already
+/// declare.
+///
+/// # The one field that is nearly an exception, and what bounds it
+///
+/// [`AdmissionContextParts::brokered_destinations`] is the exception's shape,
+/// and it is here because of a gap in the protocol rather than a preference:
+/// `NetworkAccess::BrokeredNamed` is documented as "named destinations through
+/// the egress broker", and **the sandbox spec carries no list of those names**.
+/// There is no destination field anywhere in
+/// [`automonique_protocol::sandbox`] — the only egress-shaped values are the two
+/// access enums and an `EgressPolicyDigest` in the attestation, which is a
+/// digest of a policy no type in the protocol holds. So a document can say
+/// *that* its egress is brokered and cannot say *where to*, and the deployment
+/// running the broker is the only party that can supply the answer.
+///
+/// Three things keep that from being a hole the context can widen a spec
+/// through, and they are the reason it is admissible at all:
+///
+/// - **The spec still decides whether there is any egress.** A document that
+///   denies it is admitted with no [`BrokerRequirement`], no socket grant and no
+///   proxy variable, whatever this list holds — and
+///   [`AdmittedLaunch::with_broker`] then refuses to attach one. The list is a
+///   standing host answer, like the offered host features beside it: every
+///   document is shown the same one, and only a document that asks consults it.
+/// - **A document that asks and gets no answer does not run.** A spec declaring
+///   brokered egress against an empty list is a **refusal**. There is no
+///   default, and an empty allowlist is never admitted as one.
+/// - **What it buys the workload is one loopback port.** Reaching a destination
+///   still requires a broker that holds this same list and is the only party
+///   that resolves or dials anything.
+///
+/// What remains true, and is not papered over: the destinations a run reached
+/// were chosen by the host that ran it, and no reviewer of the document can see
+/// them in the document. Closing that needs a destination list in the sandbox
+/// spec — a wire change, deliberately not made here.
 #[derive(Clone, Debug)]
 pub struct AdmissionContext {
     parts: AdmissionContextParts,
@@ -453,6 +673,20 @@ impl AdmissionContext {
         for (index, budget) in parts.unenforced_budgets.iter().enumerate() {
             if parts.unenforced_budgets[..index].contains(budget) {
                 return Err(AdmissionRefusal::ContextRejected("unenforced_budgets"));
+            }
+        }
+        if parts.brokered_destinations.len() > MAX_BROKERED_DESTINATIONS {
+            return Err(AdmissionRefusal::ContextRejected("brokered_destinations"));
+        }
+        // A host and port named twice has no single meaning, and the broker's
+        // own allowlist refuses the pair, so a launch is never admitted against
+        // a destination set no broker could be started with.
+        for (index, destination) in parts.brokered_destinations.iter().enumerate() {
+            if parts.brokered_destinations[..index]
+                .iter()
+                .any(|held| held.host == destination.host && held.port == destination.port)
+            {
+                return Err(AdmissionRefusal::ContextRejected("brokered_destinations"));
             }
         }
         Ok(Self { parts })
@@ -505,6 +739,12 @@ impl AdmissionContext {
     pub fn unenforced_budgets(&self) -> &[UnenforcedBudget] {
         &self.parts.unenforced_budgets
     }
+
+    /// The destinations this deployment resolves brokered egress to.
+    #[must_use]
+    pub fn brokered_destinations(&self) -> &[BrokeredDestination] {
+        &self.parts.brokered_destinations
+    }
 }
 
 /// One spec, admitted: everything a supervisor needs for exactly one attempt.
@@ -522,6 +762,8 @@ pub struct AdmittedLaunch {
     timeout: Duration,
     spool_budget_bytes: u64,
     unenforced_budgets: Vec<UnenforcedBudget>,
+    broker: Option<BrokerRequirement>,
+    broker_attached: bool,
 }
 
 impl AdmittedLaunch {
@@ -577,10 +819,91 @@ impl AdmittedLaunch {
         &self.unenforced_budgets
     }
 
+    /// The destinations this launch needs a broker for, when it needs one.
+    ///
+    /// `None` is the whole statement that no broker may be started: a run whose
+    /// spec denies egress has no broker, no proxy variable and no socket grant,
+    /// and [`Self::with_broker`] refuses to give it any.
+    #[must_use]
+    pub const fn broker_requirement(&self) -> Option<&BrokerRequirement> {
+        self.broker.as_ref()
+    }
+
+    /// Whether a broker has already been attached to this launch.
+    #[must_use]
+    pub const fn has_broker(&self) -> bool {
+        self.broker_attached
+    }
+
     /// The closed list of spec fields admission did not consult.
     #[must_use]
     pub const fn informational_fields() -> &'static [&'static str] {
         &INFORMATIONAL_FIELDS
+    }
+
+    /// Point this launch at a running broker, and grant it nothing else.
+    ///
+    /// This is the *only* way network reach enters a plan, and it is written
+    /// here rather than at the supervisor so the composition is one reviewed
+    /// list in one place. What it adds, in full:
+    ///
+    /// - [`SocketGrant::Tcp`](crate::SocketGrant::Tcp) — the workload may create TCP sockets;
+    /// - [`LaunchPlan::allow_connect_port`] for the broker's own port;
+    /// - `HTTPS_PROXY` and `HTTP_PROXY`, both bound to `http://<endpoint>`.
+    ///
+    /// And what it deliberately does not add, each of which the pre-broker
+    /// live-provider path had: no `SocketGrant::InetDatagram`, so the workload
+    /// cannot create a UDP socket and cannot do DNS; no `connect` grant for 443
+    /// or any other port a public service listens on; no `bind` port, so it
+    /// cannot listen on the broker's port and impersonate it; and no resolver
+    /// files in the filesystem allowlist, because there is no resolution left to
+    /// do. The CA trust store, wherever the spec granted it, stays and must: the
+    /// broker does not terminate TLS, so the workload validates the
+    /// destination's real certificate itself.
+    ///
+    /// The honest residual, restated from the broker's own documentation: a
+    /// Landlock network rule names a port and not an address, so the grant is
+    /// "port `P`, anywhere" rather than "the broker". What narrows it is that
+    /// `P` is a kernel-assigned ephemeral port on `127.0.0.1`, that the workload
+    /// has no way to resolve a name, and that it may not bind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmissionRefusal::BrokerNotRequired`] when this launch needs no
+    /// broker, [`AdmissionRefusal::BrokerAlreadyAttached`] on a second
+    /// attachment, [`AdmissionRefusal::BrokerEndpointRejected`] for an endpoint
+    /// that is not loopback or names port zero, and
+    /// [`AdmissionRefusal::Plan`] when the launch surface refuses the
+    /// composition — which is what happens when the document bound a proxy
+    /// variable itself, since a plan refuses one name bound twice.
+    pub fn with_broker(mut self, endpoint: SocketAddr) -> Result<Self, AdmissionRefusal> {
+        if self.broker.is_none() {
+            return Err(AdmissionRefusal::BrokerNotRequired);
+        }
+        if self.broker_attached {
+            return Err(AdmissionRefusal::BrokerAlreadyAttached);
+        }
+        if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
+            return Err(AdmissionRefusal::BrokerEndpointRejected(endpoint));
+        }
+        let proxy = format!("http://{endpoint}");
+        let refused = |error: LaunchPlanError| AdmissionRefusal::Plan {
+            field: "sandbox.tool_workload_egress",
+            error,
+        };
+        let mut plan = self
+            .plan
+            .clone()
+            .socket_grant(crate::SocketGrant::Tcp)
+            .map_err(refused)?
+            .allow_connect_port(endpoint.port())
+            .map_err(refused)?;
+        for name in BROKER_PROXY_VARIABLES {
+            plan = plan.environment(name, proxy.as_bytes()).map_err(refused)?;
+        }
+        self.plan = plan;
+        self.broker_attached = true;
+        Ok(self)
     }
 }
 
@@ -632,6 +955,7 @@ pub fn admit(
 
     check_admission_fields(spec)?;
     check_sandbox_fields(spec)?;
+    let broker = check_egress(spec, context)?;
     let limits = map_quotas(spec, context)?;
     let prompt = resolve_prompt(spec, context)?;
     let plan = build_plan(spec, context, prompt)?;
@@ -646,6 +970,8 @@ pub fn admit(
         timeout: spec.timeout(),
         spool_budget_bytes: spec.spool_budget_bytes(),
         unenforced_budgets: context.unenforced_budgets().to_vec(),
+        broker,
+        broker_attached: false,
     })
 }
 
@@ -718,20 +1044,6 @@ fn check_sandbox_fields(spec: &RunSpec) -> Result<(), AdmissionRefusal> {
     if !sandbox.credential_descriptors().is_empty() {
         return Err(AdmissionRefusal::UnmappableField("sandbox.credentials"));
     }
-    if sandbox.provider_control_egress().access() != NetworkAccess::Denied {
-        // The trusted control channel is brokered by a component that does not
-        // exist; the workload this plan starts is the provider process itself,
-        // so granting it would be granting the workload.
-        return Err(AdmissionRefusal::UnmappableField(
-            "sandbox.provider_control_egress",
-        ));
-    }
-    if sandbox.tool_workload_egress().access() != NetworkAccess::Denied {
-        // Brokered egress means "through the broker", not "any TCP port".
-        return Err(AdmissionRefusal::UnmappableField(
-            "sandbox.tool_workload_egress",
-        ));
-    }
     let nested = sandbox.nested_isolation();
     if nested.nested_tools() != IsolationRequirement::HostBoundary {
         // This launch builds exactly one boundary, which every descendant
@@ -752,6 +1064,78 @@ fn check_sandbox_fields(spec: &RunSpec) -> Result<(), AdmissionRefusal> {
         ));
     }
     Ok(())
+}
+
+/// Decide whether this launch needs a broker, or refuse the egress it declares.
+///
+/// # One boundary, so one egress answer
+///
+/// The spec carries two egress policies — a trusted provider-control channel and
+/// model-directed tool traffic — and they are distinct types precisely so tool
+/// traffic cannot inherit control-plane reach. This launch builds **one**
+/// boundary around **one** process tree, exactly as it does for nested
+/// isolation, so the two policies land on the same seccomp filter and the same
+/// Landlock ruleset and there is no mechanism here that could tell one kind of
+/// traffic from the other.
+///
+/// A document whose two axes disagree therefore describes an enforcement this
+/// build cannot perform, and it is refused rather than run under the wider of
+/// the two while a record claims the narrower. The two admissible documents are
+/// the two where the question does not arise: both axes denied, or both axes
+/// `brokered_named`.
+///
+/// `brokered_any` is refused on either axis at any time. "Any destination the
+/// broker permits" is a policy with no allowlist in it, and the broker this
+/// composes has no such mode: its default configuration denies everything and
+/// its entries are exact host-and-port pairs.
+fn check_egress(
+    spec: &RunSpec,
+    context: &AdmissionContext,
+) -> Result<Option<BrokerRequirement>, AdmissionRefusal> {
+    let sandbox = spec.sandbox();
+    let control = sandbox.provider_control_egress().access();
+    let workload = sandbox.tool_workload_egress().access();
+    for (access, field) in [
+        (control, "sandbox.provider_control_egress"),
+        (workload, "sandbox.tool_workload_egress"),
+    ] {
+        if access == NetworkAccess::BrokeredAny {
+            return Err(AdmissionRefusal::UnmappableField(field));
+        }
+    }
+    if control != workload {
+        // Named on the control axis because that is the one a document raises
+        // first when it wants a provider to reach its model endpoint, and the
+        // refusal has to point at the field whose value the author must change.
+        return Err(AdmissionRefusal::UnmappableField(
+            "sandbox.provider_control_egress",
+        ));
+    }
+    let destinations = context.brokered_destinations();
+    match control {
+        // The destination policy is a standing host answer, exactly like the
+        // offered host features beside it: a document that asks nothing of it
+        // is admitted without consulting it, and comes out with no broker
+        // requirement, no socket grant and no proxy variable. The context
+        // cannot make this document reach anything, whatever it carries.
+        NetworkAccess::Denied => Ok(None),
+        NetworkAccess::BrokeredNamed => {
+            if destinations.is_empty() {
+                // No default, and no empty allowlist admitted as one: a
+                // deployment that cannot say where a run may reach cannot run it.
+                return Err(AdmissionRefusal::ContextMissing(
+                    "sandbox.tool_workload_egress",
+                ));
+            }
+            Ok(Some(BrokerRequirement {
+                destinations: destinations.to_vec(),
+            }))
+        }
+        // Refused above, before anything read the context.
+        NetworkAccess::BrokeredAny => Err(AdmissionRefusal::UnmappableField(
+            "sandbox.tool_workload_egress",
+        )),
+    }
 }
 
 /// Map the cgroup quotas, and refuse every declared budget with no mechanism.

@@ -272,6 +272,9 @@ fn context_parts(root: &Path) -> AdmissionContextParts {
             .unwrap(),
         ),
         unenforced_budgets: UnenforcedBudget::ALL.to_vec(),
+        // The mappable spec denies egress on both axes, and a context that
+        // resolved a destination for it would be refused as a contradiction.
+        brokered_destinations: Vec::new(),
     }
 }
 

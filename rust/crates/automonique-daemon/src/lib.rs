@@ -97,6 +97,7 @@ use nix::unistd::geteuid;
 
 pub mod attempt_host;
 pub mod cancel_custody;
+pub mod egress;
 pub mod execute;
 mod synthetic;
 mod telegram;
@@ -199,6 +200,17 @@ pub const RUN_CANCEL_LEDGER_NAME: &str = concat!("run-cancel-ledger", ".sqlite3"
 /// lease's alone, and is taken before this file is opened at all. A tenure row
 /// proves only that a claim was recorded.
 pub const GENERATION_AUDIT_NAME: &str = concat!("generation-audit", ".sqlite3");
+
+/// This deployment's brokered-egress destination policy, a sibling of
+/// [`DATABASE_NAME`].
+///
+/// A text file, not a database, because it is the one input here that an
+/// operator writes and a reviewer reads. It exists because the sandbox spec has
+/// no destination list: a document can declare `brokered_named` egress and
+/// cannot say where to, so the deployment answers. See [`egress`] for the format
+/// and for what this arrangement does and does not buy. An absent file permits
+/// no brokered egress at all.
+pub const EGRESS_DESTINATIONS_NAME: &str = "egress-destinations";
 
 /// Maximum administration payload accepted by the daemon.
 pub const MAX_ADMIN_PAYLOAD_BYTES: usize = MAX_ADMIN_CANONICAL_BYTES;
@@ -325,6 +337,12 @@ impl DaemonConfig {
     #[must_use]
     pub fn generation_audit_path(&self) -> PathBuf {
         self.state_dir().join(GENERATION_AUDIT_NAME)
+    }
+
+    /// This deployment's brokered-egress destination policy path.
+    #[must_use]
+    pub fn egress_destinations_path(&self) -> PathBuf {
+        self.state_dir().join(EGRESS_DESTINATIONS_NAME)
     }
 }
 

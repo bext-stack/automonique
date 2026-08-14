@@ -19,9 +19,8 @@
 //!
 //! The exception is **network egress**, and it is the whole reason this needs a
 //! human to run it rather than living in the test suite. A live provider must
-//! reach its model API; the product's design routes that through an egress
-//! broker that is not built yet, and there is no direct-egress variant in the
-//! sandbox spec. So this example opens exactly two holes and no more:
+//! reach its model API, and there is no direct-egress variant in the sandbox
+//! spec. So this example opens exactly two holes and no more:
 //!
 //! - [`SocketGrant::Tcp`] plus [`LaunchPlan::allow_connect_port`] for `443`, so
 //!   the workload can open a TCP socket and `connect` to an HTTPS endpoint —
@@ -31,9 +30,20 @@
 //!   UDP sockets `getaddrinfo`/musl use for DNS. This is the wider of the two:
 //!   nothing in this crate bounds where a UDP datagram is sent.
 //!
-//! That pair is the entire relaxation. It is what the egress broker will make
-//! unnecessary — at which point this example is rewritten to grant the workload
-//! only an `AF_UNIX` socket to the broker, and the network stays denied.
+//! That pair is the entire relaxation, and **it is now superseded**. The egress
+//! broker exists, and the daemon's execution lane composes it: a document
+//! declaring `brokered_named` egress is admitted to `SocketGrant::Tcp` plus a
+//! `connect` to one loopback ephemeral port, with `HTTPS_PROXY`/`HTTP_PROXY`
+//! naming the broker — no UDP grant, no port 443, and no resolver files. The
+//! composition is one reviewed list in
+//! [`admission::AdmittedLaunch::with_broker`](automonique_runner::admission::AdmittedLaunch::with_broker),
+//! and `automonique-daemon`'s `execute_brokered` test drives it end to end with
+//! a contained workload.
+//!
+//! This example is deliberately left as it was, because it is the *pre-broker*
+//! measurement the broker is compared against, and because rewriting the
+//! owner's live-provider vehicle is a change only a live run can verify. The
+//! live provider round trip through the broker is that run.
 //!
 //! # It is a pure completion, not an agent
 //!

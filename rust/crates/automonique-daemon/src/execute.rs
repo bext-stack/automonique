@@ -27,16 +27,20 @@
 //!    digest it pins;
 //! 6. [`admit`] maps the whole document onto one launch, refusing every field
 //!    this build cannot honour exactly;
-//! 7. the attempt registers on the cancellation host, its spool opens, and its
+//! 7. a document that asked for brokered egress gets its own broker, bound to a
+//!    loopback ephemeral port over its own allowlist, and the plan is completed
+//!    with that port — a broker that cannot bind refuses the request rather
+//!    than running the workload without one;
+//! 8. the attempt registers on the cancellation host, its spool opens, and its
 //!    run cgroup is created with the document's ceilings applied.
 //!
 //! A refusal at any gate has created no cgroup, no spool, no thread and no
 //! directory, and has written nothing — the directory tree is created *after*
 //! admission precisely so a refused document leaves nothing that looks like a
-//! run, and a refusal at gate 7 drops the half-built attempt, whose own guards
-//! release the registration and remove the cgroup.
+//! run, and a refusal at gate 8 drops the half-built attempt, whose own guards
+//! release the registration, stop the broker and remove the cgroup.
 //!
-//! Gate 7 is on this list rather than on the worker for a reason worth stating:
+//! Gate 8 is on this list rather than on the worker for a reason worth stating:
 //! a caller answered `accepted` has been told an attempt started, so everything
 //! that could still say "actually, no" must happen before the answer is
 //! written. A worker that discovered a duplicate registration afterwards would
@@ -101,9 +105,12 @@
 //! # What this lane does **not** establish
 //!
 //! - **It is not provider execution.** It runs the program the document names.
-//!   Nothing here speaks a provider protocol, and no network exists: the
-//!   admitted sandbox denies egress, and a document asking for any is refused
-//!   by [`admit`] rather than approximated.
+//!   Nothing here speaks a provider protocol. A document asking for
+//!   `brokered_named` egress gets exactly that — one loopback `CONNECT` broker
+//!   of its own, an allowlist, a TCP socket and a `connect` to that broker's
+//!   port — and a document asking for anything else is refused by [`admit`]
+//!   rather than approximated. Where those destinations come from, and why the
+//!   deployment rather than the document supplies them, is [`crate::egress`].
 //! - **It is not a scheduler.** One request starts one attempt. There is no
 //!   queue, no retry, no backoff and no fairness; [`ExecuteRefusal::LaneSaturated`]
 //!   is a refusal, not a wait.
@@ -130,6 +137,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use automonique_egress_broker::{BrokerConfig, EgressBroker};
 use automonique_protocol::digest::{ALGORITHM, Sha256};
 use automonique_protocol::execute_api::ExecuteRefusal;
 use automonique_protocol::provider::BinaryProvenance;
@@ -137,7 +145,8 @@ use automonique_protocol::sandbox::{
     Digest, ExecutionBackendId, HostFeature, ImplementationDigest,
 };
 use automonique_runner::admission::{
-    AdmissionContext, AdmissionContextParts, PromptSource, ResolvedPrompt, UnenforcedBudget, admit,
+    AdmissionContext, AdmissionContextParts, AdmittedLaunch, BrokeredDestination, PromptSource,
+    ResolvedPrompt, UnenforcedBudget, admit,
 };
 use automonique_runner::backend::{DirectProcessBackend, PreparedRun};
 use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
@@ -346,6 +355,10 @@ pub struct ExecutionLane {
     /// What this host offers a document's enforcement negotiation, measured
     /// once at open beside the sandbox measurement it is derived from.
     offered: Vec<HostFeature>,
+    /// The destinations this deployment resolves `brokered_named` egress to,
+    /// read once at open. Empty is the ordinary case and refuses every document
+    /// that asks for egress; see [`crate::egress`].
+    egress_destinations: Vec<BrokeredDestination>,
     /// The delegated domain, discovered and prepared at most once.
     ///
     /// `None` until the first request, because [`ContainmentDomain::prepare`]
@@ -368,6 +381,15 @@ impl ExecutionLane {
     /// including one that can never execute anything, because the refusal a
     /// caller gets must be a typed answer on the wire rather than a daemon that
     /// failed to start.
+    ///
+    /// The destination policy is read here, once, from
+    /// [`DaemonConfig::egress_destinations_path`](crate::DaemonConfig::egress_destinations_path)
+    /// — so what a run is admitted against is the policy this daemon started
+    /// with, not whatever the file said at the instant a request arrived. A file
+    /// this daemon cannot read exactly leaves the policy empty, which refuses
+    /// every document that asks for egress: the failure direction is closed, and
+    /// the operator's evidence is that their brokered runs are refused rather
+    /// than quietly permitted against a half-read list.
     #[must_use]
     pub fn open(
         attempt_host: Arc<DaemonAttemptHost>,
@@ -376,6 +398,9 @@ impl ExecutionLane {
         sandbox_enforceable: bool,
     ) -> Self {
         let helper = locate_launch_helper();
+        let egress_destinations =
+            crate::egress::load_destinations(&state_dir.join(crate::EGRESS_DESTINATIONS_NAME))
+                .unwrap_or_default();
         Self {
             attempt_host,
             state_dir,
@@ -383,10 +408,19 @@ impl ExecutionLane {
             helper,
             sandbox_enforceable,
             offered: offered_host_features(),
+            egress_destinations,
             domain: None,
             live: Arc::new(Mutex::new(BTreeSet::new())),
             workers: Vec::new(),
         }
+    }
+
+    /// The brokered destinations this lane was opened with.
+    ///
+    /// Empty means no document asking for egress can run here.
+    #[must_use]
+    pub fn egress_destinations(&self) -> &[BrokeredDestination] {
+        &self.egress_destinations
     }
 
     /// The entry helper this lane would spawn, when one is configured.
@@ -534,10 +568,21 @@ impl ExecutionLane {
             // accounting, and saying so is the only alternative to pretending
             // otherwise.
             unenforced_budgets: UnenforcedBudget::ALL.to_vec(),
+            // The destinations this deployment resolves brokered egress to.
+            // A document that denies egress is refused if this is non-empty and
+            // one that asks for it is refused if this is empty, so the policy
+            // can neither widen a denied document nor be defaulted into one.
+            brokered_destinations: self.egress_destinations.clone(),
         })
         .map_err(|_| ExecuteRefusal::AdmissionRefused)?;
 
         let admitted = admit(spec, &context).map_err(|_| ExecuteRefusal::AdmissionRefused)?;
+        // One broker, this run's, bound before the plan is finished — because
+        // the port the plan grants is the port this broker just bound, and it
+        // does not exist until it is. A run whose document denies egress takes
+        // the other branch and gets no broker, no socket grant and no proxy
+        // variable at all.
+        let (admitted, broker) = self.start_broker(admitted)?;
 
         // Admitted, so the run may now have a place on disk. The workspace is
         // created empty and the spool root beside it, never inside it: the
@@ -603,7 +648,54 @@ impl ExecutionLane {
             cancellation,
             registration,
             prepared,
+            broker,
         })
+    }
+
+    /// Start this run's own broker, or answer that it needs none.
+    ///
+    /// # One broker per run, never a shared one
+    ///
+    /// The broker is started here, per run, and its port is part of the
+    /// security model rather than an implementation detail: the launch grants
+    /// `connect` to a *port*, because a Landlock network rule names nothing
+    /// else, and what keeps that from being a grant to some other service is
+    /// that the port is a kernel-assigned ephemeral one on `127.0.0.1`. A broker
+    /// shared between runs would be a predictable port shared between
+    /// allowlists — one run's grant would reach another run's destinations —
+    /// so there is no sharing and no reuse, and the ephemeral port is never
+    /// pinned.
+    ///
+    /// The allowlist is rebuilt from the *admitted* destinations rather than
+    /// from this lane's own copy of the policy, so the broker a run gets permits
+    /// exactly what that run was admitted against.
+    fn start_broker(
+        &self,
+        admitted: AdmittedLaunch,
+    ) -> Result<(AdmittedLaunch, Option<EgressBroker>), ExecuteRefusal> {
+        let Some(requirement) = admitted.broker_requirement() else {
+            return Ok((admitted, None));
+        };
+        let allowlist = crate::egress::allowlist_for(requirement.destinations())
+            .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
+        // Unreachable — admission refuses an empty destination set — and
+        // checked anyway, because a broker permitting nothing would be a
+        // workload holding a socket grant it can do nothing with, which is a
+        // grant with no purpose rather than a refusal.
+        if allowlist.denies_everything() {
+            return Err(ExecuteRefusal::ExecutionUnavailable);
+        }
+        // A broker that cannot bind its loopback listener is this daemon's own
+        // resource failure, not the caller's document.
+        let broker = EgressBroker::start(BrokerConfig::new(allowlist))
+            .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
+        // Everything from here to the worker either succeeds or drops this
+        // value, and dropping it stops the listener and tears down every
+        // in-flight tunnel.
+        let admitted = admitted
+            .with_broker(broker.local_addr())
+            .map_err(|_| ExecuteRefusal::AdmissionRefused)?;
+        Ok((admitted, Some(broker)))
     }
 
     /// Discover and prepare this process's delegated domain, once.
@@ -821,6 +913,11 @@ struct Attempt {
     /// including a panic — releases the attempt from the host's registry.
     registration: RegistrationHandle,
     prepared: PreparedRun,
+    /// This run's own broker, when its document asked for egress. Owning it
+    /// here is what bounds its lifetime to the run: every path out of this
+    /// worker drops it, including a panic, and its drop stops the listener and
+    /// tears down every tunnel still open.
+    broker: Option<EgressBroker>,
 }
 
 impl Attempt {
@@ -838,10 +935,22 @@ impl Attempt {
             cancellation,
             registration,
             prepared,
+            broker,
             ..
         } = self;
 
         let report = prepared.execute(&cancellation, timeout);
+        // THE BROKER OUTLIVES NO RUN.
+        //
+        // Torn down here, explicitly, on the one path every terminal state
+        // reaches: a completion, a failure, a timeout and a cancellation all
+        // return from `execute` before this line. A panic before it drops the
+        // same value through the unwinding frame, and a worker this daemon
+        // never spawned drops it on the serve thread — so there is no path on
+        // which the listener outlives the workload it was bound for. The
+        // teardown is bounded: it stops the accept loop, shuts down both ends
+        // of every in-flight tunnel, and joins the threads it started.
+        drop(broker);
         // The registration is released before the read model is advanced: an
         // attempt whose row says it ended must not still be cancellable.
         drop(registration);

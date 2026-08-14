@@ -9,6 +9,9 @@ publish.workspace = true
 
 [dependencies]
 automonique-core = { path = "../automonique-core" }
+# The execution lane starts one loopback CONNECT broker per run that needs
+# egress, so the daemon composes the broker rather than merely describing one.
+automonique-egress-broker = { path = "../automonique-egress-broker" }
 automonique-observability = { path = "../automonique-observability" }
 automonique-protocol = { path = "../automonique-protocol" }
 automonique-runner = { path = "../automonique-runner" }

@@ -63,6 +63,7 @@ name = "automonique-daemon"
 version = "0.1.0"
 dependencies = [
  "automonique-core",
+ "automonique-egress-broker",
  "automonique-observability",
  "automonique-protocol",
  "automonique-runner",
