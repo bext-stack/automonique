@@ -151,6 +151,14 @@ fn a_valid_configuration_owns_the_durable_bot_lease() {
         .telegram_poller_epoch()
         .expect("owned lease must report its epoch");
     assert!(epoch >= 1);
+    // The operational poller counts are a durable observation, not a constant:
+    // this daemon owns exactly one bot lease under a live generation, and the
+    // status says so. Worth asserting because the two zeros a reader finds in
+    // the CLI's sources are fake-server test fixtures, and it would be easy to
+    // conclude from them that this number is hard-coded somewhere real.
+    let operational = status.operational().expect("operational projection");
+    assert_eq!(operational.telegram_pollers_live(), 1);
+    assert_eq!(operational.telegram_pollers_expired(), 0);
 
     assert!(matches!(
         call(&config, AdminCommand::Shutdown),
