@@ -16,6 +16,10 @@ automonique-observability = { path = "../automonique-observability" }
 automonique-protocol = { path = "../automonique-protocol" }
 automonique-runner = { path = "../automonique-runner" }
 automonique-store = { path = "../automonique-store" }
+# The ticket intake worker consumes the fleet client and the typed SupportIssue
+# it decodes. It is behind an enablement gate: an unconfigured daemon composes
+# no client and starts no worker. See `ticket_intake`.
+automonique-support-connector = { path = "../automonique-support-connector" }
 automonique-transport-runtime = { path = "../automonique-transport-runtime" }
 # The transport runtime's poller is parameterized by the access policy this
 # crate defines, and does not re-export it: a host cannot construct a poller

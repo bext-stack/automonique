@@ -18,6 +18,7 @@ pub mod provider_journal;
 pub mod run_index;
 pub mod run_submissions;
 pub mod slack_ingress;
+pub mod support_tickets;
 
 use std::error::Error;
 use std::fmt;

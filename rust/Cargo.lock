@@ -68,6 +68,7 @@ dependencies = [
  "automonique-protocol",
  "automonique-runner",
  "automonique-store",
+ "automonique-support-connector",
  "automonique-transport-runtime",
  "automonique-transports",
  "nix",

@@ -104,6 +104,7 @@ pub mod run_lane;
 mod synthetic;
 mod telegram;
 pub mod telegram_bridge;
+pub mod ticket_intake;
 
 use attempt_host::DaemonAttemptHost;
 
@@ -187,6 +188,20 @@ pub const BATCH_REGISTRY_NAME: &str = concat!("batches", ".sqlite3");
 /// single-dispatcher argument work — one state directory admits one daemon, so
 /// one ledger file has one owner. See [`attempt_host`].
 pub const RUN_CANCEL_LEDGER_NAME: &str = concat!("run-cancel-ledger", ".sqlite3");
+
+/// Durable support ticket record, a sibling of [`DATABASE_NAME`].
+///
+/// One row per fleet support issue this host has seen on the board, carrying the
+/// fleet's own fields verbatim beside two instants and one lifecycle this host
+/// owns. Separate for the reason every sibling log is separate — its schema
+/// versions independently — and because a support ticket is not scheduler state.
+///
+/// WHAT THIS FILE DOES NOT DO. It answers nobody: no reply, no note and no email
+/// is sent on account of a row in it, because [`ticket_intake`] reads the board
+/// and writes here and does nothing else. It also does not exist on a daemon
+/// with no fleet configuration — the file is created when the intake host is
+/// composed, and an unconfigured host composes nothing.
+pub const SUPPORT_TICKETS_NAME: &str = concat!("support-tickets", ".sqlite3");
 
 /// Durable append-only record of this generation's hand-offs, a sibling of
 /// [`DATABASE_NAME`].
@@ -341,6 +356,12 @@ impl DaemonConfig {
         self.state_dir().join(GENERATION_AUDIT_NAME)
     }
 
+    /// Durable support ticket record path.
+    #[must_use]
+    pub fn support_tickets_path(&self) -> PathBuf {
+        self.state_dir().join(SUPPORT_TICKETS_NAME)
+    }
+
     /// This deployment's brokered-egress destination policy path.
     #[must_use]
     pub fn egress_destinations_path(&self) -> PathBuf {
@@ -426,6 +447,16 @@ pub enum DaemonError {
     /// No client can cause this and no client is told about it: the audit is
     /// never on a request path.
     GenerationAuditFailed(&'static str),
+    /// The support fleet configuration, the ticket store, or the intake worker
+    /// thread was refused. The payload is the stable category from
+    /// [`ticket_intake`].
+    ///
+    /// Only a daemon whose state directory carries a fleet configuration can
+    /// produce this: an absent one is the disabled state and is never an error.
+    /// Like the Telegram gate, a present-but-wrong configuration refuses startup
+    /// rather than being ignored, because ignoring it would hide an operator
+    /// error behind an honest-looking disabled state.
+    TicketIntakeRefused(&'static str),
 }
 
 impl DaemonError {
@@ -450,6 +481,7 @@ impl DaemonError {
             Self::ApprovalLedgerFailed(category) => category,
             Self::BatchRegistryFailed(category) => category,
             Self::GenerationAuditFailed(category) => category,
+            Self::TicketIntakeRefused(category) => category,
         }
     }
 }
@@ -498,6 +530,9 @@ impl fmt::Display for DaemonError {
             }
             Self::GenerationAuditFailed(category) => {
                 write!(formatter, "generation audit failed: {category}")
+            }
+            Self::TicketIntakeRefused(category) => {
+                write!(formatter, "support ticket intake refused: {category}")
             }
         }
     }
@@ -618,6 +653,20 @@ pub struct Daemon {
     /// a drop could perform. It is `Some` for the whole life of a daemon a
     /// caller can observe.
     execution: Option<execute::ExecutionLane>,
+    /// The support-board intake worker, and the gate that decides whether it
+    /// exists at all.
+    ///
+    /// A plain field: it owns its own disposal, and its `Drop` stops and joins
+    /// whatever thread it started. [`Daemon::serve`] still shuts it down
+    /// explicitly, for the reason it joins the execution lane and the Telegram
+    /// poller — the thread writes to durable state this generation owns, so it
+    /// must end while the generation is still held rather than whenever a field
+    /// happens to drop.
+    ///
+    /// On a daemon with no `support/fleet.conf` this is
+    /// [`ticket_intake::TicketIntakeHost::Disabled`]: no credential was read, no
+    /// client was constructed and no ticket store file was created.
+    ticket_intake: ticket_intake::TicketIntakeHost,
 }
 
 struct SocketCleanup {
@@ -830,6 +879,21 @@ impl Daemon {
                 automonique_protocol::admin::ExecutionState::SandboxEnforceableNoLane
             ),
         );
+
+        // THE SUPPORT INTAKE GATE. An absent `support/fleet.conf` is the
+        // disabled state: no credential is read, no fleet client is
+        // constructed, no ticket store file is created and no thread can start,
+        // so this daemon cannot reach the support API at all. A present file
+        // composes the worker here and dials nothing —
+        // `TicketIntakeHost::start` is what puts it on a thread, and only
+        // `serve` calls that — while a present-but-refused one fails startup for
+        // the reason the Telegram gate does.
+        let ticket_intake =
+            ticket_intake::TicketIntakeHost::open(&ticket_intake::TicketIntakeParams {
+                state_dir: &state_dir,
+                ticket_store_path: &config.support_tickets_path(),
+            })
+            .map_err(|error| DaemonError::TicketIntakeRefused(error.category()))?;
         socket_cleanup.disarm();
 
         Ok(Self {
@@ -853,6 +917,7 @@ impl Daemon {
             tenure_revision: tenure.revision,
             execution_state,
             execution: Some(execution),
+            ticket_intake,
         })
     }
 
@@ -900,8 +965,23 @@ impl Daemon {
         // A failure here still falls through to the shutdown block below rather
         // than returning: this process already holds the generation and has an
         // open tenure row, and both have to be closed under it.
-        let result = match self.telegram.start() {
-            Err(error) => Err(DaemonError::TelegramRefused(error.category())),
+        //
+        // LIVE SUPPORT POLLING BEGINS IN THE SAME PLACE, AND UNDER THE SAME
+        // RULE. A daemon with no `support/fleet.conf` has nothing to start and
+        // this is a no-op; one with a configuration puts its worker on a thread
+        // here and nowhere else, so a process that opened a daemon and never
+        // served has issued no request to the fleet either.
+        let started = self
+            .telegram
+            .start()
+            .map_err(|error| DaemonError::TelegramRefused(error.category()))
+            .and_then(|()| {
+                self.ticket_intake
+                    .start()
+                    .map_err(|error| DaemonError::TicketIntakeRefused(error.category()))
+            });
+        let result = match started {
+            Err(error) => Err(error),
             Ok(()) => loop {
                 if stop.load(Ordering::Acquire) {
                     break Ok(());
@@ -964,6 +1044,13 @@ impl Daemon {
         if let Some(execution) = self.execution.take() {
             execution.shutdown();
         }
+        // Support intake ends beside them, and for the same reason: its worker
+        // writes to a durable sibling database this generation owns, so it must
+        // stop and be joined while the generation is still held. It has no
+        // durable lease of its own to release — it owns no cursor, so there is
+        // nothing a second poller could double-advance — which is why this is a
+        // join and not a lifecycle. See [`ticket_intake`].
+        self.ticket_intake.shutdown();
         // Cancellation dispatch ends next, beneath the still-held generation
         // fence. The lease is what makes "one daemon is one dispatcher" true,
         // so this process stops owning the ledger before it stops owning the
