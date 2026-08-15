@@ -133,6 +133,39 @@ self-verifying. Everything else is blocked behind it, including every `R0`
 discovery ticket, because until the graph is checked in CI a claimed
 dependency set cannot be reviewed.
 
+## Safety property specifications
+
+**Amended 2026-08-15.** Four requirement documents join `requirements/`. They
+are authored here rather than transferred: `reference/feature-parity.md`
+reclassified nineteen rows `replace` on 2026-08-09 for want of any fixture, and
+recorded that four of the nineteen are safety properties which must be
+**deliberately re-specified, not inferred**. These are those four.
+
+| Property | Document | Suite |
+|---|---|---|
+| Deployment notices fail closed to a dedicated route, never to ticket intake | [`requirements/deploy-notifications.md`](requirements/deploy-notifications.md) | `automonique_protocol::safety_conformance::deploy_route` |
+| Every externally visible mutation is preceded by a durable announcement naming the exact target, with a stop-check window | [`requirements/mutation-announcement.md`](requirements/mutation-announcement.md) | `automonique_protocol::safety_conformance::mutation_announcement` |
+| Deletion is a distinct approval class under a separately held credential | [`requirements/deletion-authority.md`](requirements/deletion-authority.md) | `automonique_protocol::safety_conformance::deletion_authority` |
+| Bounded parallelism, per-scope serialization, pause and cancel | [`requirements/scheduler-core.md`](requirements/scheduler-core.md) | `automonique_core::scheduler_conformance` |
+
+Each ships a conformance suite that is generic over a small trait and runs today
+against an in-memory reference model, so the specification is executable before
+the implementation exists. `scheduler-core.md` deliberately also serves as the
+M8 scheduler specification, so those two are one document rather than two
+answers.
+
+Their exact semantics are **owner-confirmable** — `launch-roadmap.md` calls them
+"four decisions that cannot be inferred". They are drafted rather than deferred
+because an unspecified safety property is not a neutral gap: it is a behaviour
+that gets decided by whoever writes the code first, with nobody reviewing the
+decision. Each document marks the constants an owner is expected to weigh in on,
+and changing one means changing a constant and re-running a suite.
+
+Passing a suite proves that an implementation of its trait has the property. It
+proves nothing about the daemon until something binds them, and
+`automonique_protocol::safety_conformance::PENDING_BINDINGS` names the surface
+each property is still waiting for.
+
 ## Reading order
 
 | If you are… | Start at |
@@ -141,4 +174,5 @@ dependency set cannot be reviewed.
 | reviewing an implementation | the contract, then `requirements/` |
 | deciding whether a thing is in scope | Non-goals above, then `requirements/external-capability-ledger.md` |
 | new to the project | `architecture.md`, then `requirements/goals-and-invariants.md` |
+| implementing one of the four safety properties | Safety property specifications above, then its suite |
 | tracing why something is designed this way | `reference/plan-review.md` |

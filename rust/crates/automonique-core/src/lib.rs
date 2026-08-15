@@ -8,6 +8,8 @@
 //! responsible for fencing, idempotency, atomic terminal/effect commit, and
 //! reconciliation evidence.
 
+pub mod scheduler_conformance;
+
 use std::error::Error;
 use std::fmt;
 

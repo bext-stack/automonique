@@ -75,7 +75,7 @@
     {
       "key": "feature-parity",
       "path": "docs/product-plan/reference/feature-parity.md",
-      "sha256": "6b46abdff5f8dcfe1b74437d956ecc06101efcdfa7467a3e529c58a4c9be1502",
+      "sha256": "3d0821ba007ae854aeffe7bee1c79711ed55058d1a95662ca963641ca1c45b0f",
       "sections_cited": [
         "## Execution, companions and operator surfaces",
         "## Intake, conversation and approvals",
@@ -5013,7 +5013,7 @@
       ],
       "ledger_target_owner": "work events + Slack outbox",
       "ledger_fixture": "**none** — replace by decision 2026-08-09",
-      "ledger_evidence": "no fixture; safety-critical stop-check. `tickets.siteUrl`/`serverIp` are columns, not events",
+      "ledger_evidence": "no fixture; safety-critical stop-check. `tickets.siteUrl`/`serverIp` are columns, not events. **Amended 2026-08-15:** specified and tested by [`requirements/mutation-announcement.md`](../requirements/mutation-announcement.md)",
       "legacy_tests": [],
       "coverage": "replace"
     },
@@ -5053,7 +5053,7 @@
       ],
       "ledger_target_owner": "scheduler",
       "ledger_fixture": "**none** — replace by decision 2026-08-09",
-      "ledger_evidence": "no fixture; the scheduler core is entirely unpinned — largest single gap",
+      "ledger_evidence": "no fixture; the scheduler core is entirely unpinned — largest single gap. **Amended 2026-08-15:** specified and tested by [`requirements/scheduler-core.md`](../requirements/scheduler-core.md), which is also the M8 scheduler specification",
       "legacy_tests": [],
       "coverage": "replace"
     },
@@ -5351,7 +5351,7 @@
       ],
       "ledger_target_owner": "typed deploy webhook/outbox",
       "ledger_fixture": "**none** — replace by decision 2026-08-09",
-      "ledger_evidence": "no fixture; fail-closed is a safety property and must be re-specified, not inferred",
+      "ledger_evidence": "no fixture; fail-closed is a safety property and must be re-specified, not inferred. **Amended 2026-08-15:** specified and tested by [`requirements/deploy-notifications.md`](../requirements/deploy-notifications.md)",
       "legacy_tests": [],
       "coverage": "replace"
     },
@@ -5391,7 +5391,7 @@
       ],
       "ledger_target_owner": "critical Slack moderation workflow",
       "ledger_fixture": "**none** — replace by decision 2026-08-09",
-      "ledger_evidence": "no fixture; enforced today by a separate delete credential — preserve that split",
+      "ledger_evidence": "no fixture; enforced today by a separate delete credential — preserve that split. **Amended 2026-08-15:** specified and tested by [`requirements/deletion-authority.md`](../requirements/deletion-authority.md)",
       "legacy_tests": [],
       "coverage": "replace"
     },

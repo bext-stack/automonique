@@ -43,6 +43,24 @@ What this decision costs, stated plainly:
 fixture. The remaining 20 rows keep their `preserve`/`partial` obligation and
 their fixtures are named.
 
+**Amended 2026-08-15.** The four safety properties now have their requirement
+documents, and each of the four rows below cites its own. They are
+[`requirements/deploy-notifications.md`](../requirements/deploy-notifications.md),
+[`requirements/mutation-announcement.md`](../requirements/mutation-announcement.md),
+[`requirements/deletion-authority.md`](../requirements/deletion-authority.md) and
+[`requirements/scheduler-core.md`](../requirements/scheduler-core.md), registered
+in the corpus index at [`../README.md`](../README.md) § Safety property
+specifications.
+
+Each document ships a conformance suite that runs today against an in-memory
+reference model, so the specification is executable before its implementation
+exists. That is not a fixture, and these rows stay unpinned: a fixture would be
+evidence of what the prior system did, and these suites are a statement of what
+the replacement must do. The distinction is the whole reason the 2026-08-09
+decision reclassified them rather than reconstructing them. What has changed is
+that "re-specified deliberately" is now done and reviewable, and a future
+implementation has a gate to fail rather than a paragraph to interpret.
+
 ## Intake, conversation and approvals
 
 | Current capability | Target owner | Decision and acceptance | Fixture | Evidence |
@@ -67,7 +85,7 @@ their fixtures are named.
 | GitHub issue as durable ticket truth | GitHub projection/reconciler | Preserve issue body/state/latest-comment inspection and conflict handling | `manage-sync` (14) | partial: split gates, idempotency, rollback, ack, retry; issue body/state inspection and conflict handling unpinned |
 | Delivery-team completion heuristics and newest-occurrence reopen semantics | reconciliation policy | **Replace** — rebuild to provide with language-neutral fixtures | **none** — replace by decision 2026-08-09 | no fixture; language-dependent behavior, needs language-neutral fixtures if ever restored |
 | Detailed GitHub report plus brief Slack completion/link/mentions | report artifact + outboxes | **Replace** — rebuild to provide separation and idempotent publication | **none** — replace by decision 2026-08-09 | no fixture; idempotent publication separation unproven |
-| Dedicated deployment notifications channel | typed deploy webhook/outbox | **Replace** — rebuild to provide the fail-closed dedicated deploy-channel setting; never fall back to ticket intake | **none** — replace by decision 2026-08-09 | no fixture; fail-closed is a safety property and must be re-specified, not inferred |
+| Dedicated deployment notifications channel | typed deploy webhook/outbox | **Replace** — rebuild to provide the fail-closed dedicated deploy-channel setting; never fall back to ticket intake | **none** — replace by decision 2026-08-09 | no fixture; fail-closed is a safety property and must be re-specified, not inferred. **Amended 2026-08-15:** specified and tested by [`requirements/deploy-notifications.md`](../requirements/deploy-notifications.md) |
 
 ## Memory, sites and operational context
 
@@ -78,7 +96,7 @@ their fixtures are named.
 | Known managed sites and functional site summaries | workspace registry + site service | Preserve deterministic inventory and no-tools/read-only fallbacks | `site-inventory`, `site-conversation` (6) | pinned |
 | Account/access explanations | site/access service | Preserve read-only catalog behavior and reviewed change requests | `access-conversation` (4) | pinned |
 | Learned domain-to-server targets | workspace registry | **Replace** — JSON file with revisioned actor/provenance records | **none** — replace by decision 2026-08-09 | no fixture; currently a JSON file, already slated for revisioned records |
-| Announce target before action and show site/server/IP | work events + Slack outbox | **Replace** — rebuild to provide as a stop-check before workspace mutation | **none** — replace by decision 2026-08-09 | no fixture; safety-critical stop-check. `tickets.siteUrl`/`serverIp` are columns, not events |
+| Announce target before action and show site/server/IP | work events + Slack outbox | **Replace** — rebuild to provide as a stop-check before workspace mutation | **none** — replace by decision 2026-08-09 | no fixture; safety-critical stop-check. `tickets.siteUrl`/`serverIp` are columns, not events. **Amended 2026-08-15:** specified and tested by [`requirements/mutation-announcement.md`](../requirements/mutation-announcement.md) |
 | Persona, job envelope and untrusted-context labels | versioned policy bundle | Preserve and store persona/policy/template hashes on each attempt | `security-hardening` (8) | pinned; prompt-injection hardening |
 | Site-platform knowledge-base files | versioned companion/tool bundle | **Replace** — rebuild to provide exact release hash and workspace applicability metadata | **none** — replace by decision 2026-08-09 | no fixture; ships as a companion bundle |
 
@@ -87,7 +105,7 @@ their fixtures are named.
 | Current capability | Target owner | Decision and acceptance | Fixture | Evidence |
 |---|---|---|---|---|
 | Four selectable agent backends and session-prefixed resume | native adapters/session bindings | Replace prefixes with typed provider coordinates while preserving safe non-cross-provider resume | `codex-backend`, `jcode-backend`, `jcode-integration` (13) | partial: 2 of 4 backends; cross-provider resume safety unpinned |
-| Bounded parallelism, per-thread serialization, pause and cancel | scheduler | **Replace** — rebuild to provide and add admission/fairness policy | **none** — replace by decision 2026-08-09 | no fixture; the scheduler core is entirely unpinned — largest single gap |
+| Bounded parallelism, per-thread serialization, pause and cancel | scheduler | **Replace** — rebuild to provide and add admission/fairness policy | **none** — replace by decision 2026-08-09 | no fixture; the scheduler core is entirely unpinned — largest single gap. **Amended 2026-08-15:** specified and tested by [`requirements/scheduler-core.md`](../requirements/scheduler-core.md), which is also the M8 scheduler specification |
 | Live action, heartbeat, transcript, stderr and telemetry | event journal, runner spools, artifacts | Preserve bounded/redacted views and authoritative completion | `spool-reader`, `spool-store`, `ndjson-lines` (33) | pinned; framing, retention, monotonic reads |
 | `legacy-say` progress announcements | canonical `automonique-say` worker capability + outbox; forwarding alias during migration | **Replace** — rebuild to provide scope/audience binding; no general Slack credential in workers | **none** — replace by decision 2026-08-09 | no fixture; companion helper |
 | Screenshot proof | artifact pipeline | **Replace** — rebuild to provide the current `legacy-shot` outcome under canonical `automonique-shot`; implementation may remain Python initially | **none** — replace by decision 2026-08-09 | no fixture; Python companion |
@@ -98,7 +116,7 @@ their fixtures are named.
 | Live Slack channel feed and legacy “post as the assistant” behavior | transport service rendered as Automonique/Monique | **Replace** — rebuild to provide with read/post capabilities separated and fully audited | **none** — replace by decision 2026-08-09 | no fixture; read/post capability split must be re-specified |
 | Browser desktop notifications | SDK/dashboard notification service | **Replace** — rebuild to provide permission UX and server-side notification state | **none** — replace by decision 2026-08-09 | no fixture |
 | Force ignored message into a ticket | intake/workflow service | **Replace** — rebuild to provide exact original source identity and a fresh approval gate | **none** — replace by decision 2026-08-09 | no fixture; `ignored` table shape known |
-| Delete ignored/user-authored Slack message | critical Slack moderation workflow | **Replace** — rebuild to provide only as explicit separately authorized action; never bundle with ordinary cleanup | **none** — replace by decision 2026-08-09 | no fixture; enforced today by a separate delete credential — preserve that split |
+| Delete ignored/user-authored Slack message | critical Slack moderation workflow | **Replace** — rebuild to provide only as explicit separately authorized action; never bundle with ordinary cleanup | **none** — replace by decision 2026-08-09 | no fixture; enforced today by a separate delete credential — preserve that split. **Amended 2026-08-15:** specified and tested by [`requirements/deletion-authority.md`](../requirements/deletion-authority.md) |
 | Site digest and bounded one-shot assistance | site/restricted-provider services | **Replace** — rebuild to provide bounded no-tools profiles, timeouts and authorization | **none** — replace by decision 2026-08-09 | no fixture |
 | Ops-command proposal classification | command proposal service | Preserve pure proposal behavior; execution remains reviewed elsewhere | `privileged-actions` (3) | pinned; proposal-only boundary |
 
