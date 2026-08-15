@@ -249,6 +249,60 @@ by the owner; separate build/review identities are optional hardening.
 
 Promotion is a typed two-step operation: `prepare_promotion(candidate, expected_revision)` creates a bounded plan; `approve_promotion(plan_revision)` revalidates source, checks, provenance, signatures, compatibility, recovery and current stable before changing an indirection. Unknown outcome is reconciled by action receipt, never blindly retried.
 
+## Shipped self-improvement pipeline — amended 2026-08-15
+
+A self-improvement pipeline ships in the daemon. It is folded in here because
+this document is its specification home; the workflow itself is described in
+[`docs/self-improvement-workflow.md`](../../self-improvement-workflow.md),
+which is an operator how-to and carries no requirements authority.
+
+What it does, in this document's vocabulary: an administrator's explicit
+request on a chat surface becomes a bounded plan pinned to the current public
+source SHA, published as an issue and a plan-only pull request in a private
+planning repository. A first administrator approval, bound by an HMAC challenge
+to the exact actor, chat, state revision and plan digest, merges that plan and
+runs a pinned agent in a git worktree, which builds and verifies a candidate
+and pushes the tested commit. A second, separate administrator approval merges
+the implementation pull request — checking that the merged tree matches the
+tested tree — and activates the release: a skill-only release repoints a
+relative symlink that every run re-verifies, and a code release re-executes the
+binary as a transient unit that repoints the symlink and restarts the systemd
+user unit, rolling back if readiness fails.
+
+### Open deviation: this exceeds the ladder this document defines
+
+Recorded, not resolved. **Do not read this section as authorization.**
+
+- § Self-hosting levels puts release activation at SH6, whose required
+  authority is "external protected-branch, signing and deployment approval".
+  The shipped pipeline activates a release on the strength of two in-band chat
+  approvals from an administrator of the same daemon.
+- § Integration and promotion policy says protected `main`, stable release
+  tags, signing keys and production deployment "remain outside candidate
+  credentials at every ceiling", and defines the highest ceiling as
+  `production_proposal` — prepare a candidate and a promotion plan *for
+  external approval*. The shipped pipeline merges and deploys.
+- [`ai-implementation-harness.md`](ai-implementation-harness.md) states that
+  "Production Automonique never edits or activates its own release merely
+  because an agent proposed a patch." The two human approvals mean the shipped
+  pipeline is not activating *merely* on an agent's proposal, which is the
+  narrowest reading under which it complies; it plainly does not satisfy the
+  two clauses above.
+
+A second, smaller deviation: § Recursive improvement loop specifies the
+proposal sources and the depth, concurrency, token, cost and time limits that
+bound the loop. The shipped pipeline is administrator-initiated rather than
+evidence-initiated, so it does not implement that loop and does not carry those
+limits.
+
+Resolving this is an owner decision with three shapes — raise the ceiling this
+document permits and say under what authority, lower the pipeline to
+`production_proposal` and hand activation to an external step, or record a
+scoped exemption for a single-operator deployment. It is assigned to the
+improvement program's **M4** milestone and is deliberately left open here.
+Until it is decided, treat the pipeline as operating outside this document's
+stated ceiling, with the deviation known and recorded rather than discovered.
+
 ## Recovery and anti-corruption boundary
 
 Retain at least:

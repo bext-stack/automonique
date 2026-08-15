@@ -65,7 +65,35 @@ Entries carry provenance, confidence, sensitivity, visibility, expiry/review dat
 
 SQLite FTS5 provides bounded full-text session search with authorization filters, surrounding-message navigation and exact citations. Optional semantic/vector or external-memory retrieval is an adapter behind the same evidence contract. Any LLM synthesis cites the underlying messages and remains a derived artifact.
 
-## Skills and learning loop
+### Shipped memory subset — amended 2026-08-15
+
+A first, deliberately narrow implementation of this section ships in the
+daemon. It is folded in here so the specification has a home for it; it does
+not amend the target above, which stays the goal.
+
+What exists: one tenant-scoped SQLite store per host, holding immutable
+external-identity bindings for the two live chat channels, bounded conversation
+messages expired on a fixed schedule, revisioned long-term memories carrying
+provenance, confidence, sensitivity, visibility, review date and tombstones,
+and an audit trail for proposal, approval, denial, supersession and forgetting.
+Retrieval is FTS5 only. Operator verbs on the chat surfaces render and review
+memory, propose one, tombstone one, and reset the conversation projection
+without touching long-term memory. Inbound messages are captured through a
+redaction pass, and a heuristic proposes candidate memories at private
+visibility rather than accepting them.
+
+How it differs from the target, deliberately and for now: the typed store split
+above (`user_profile` / `workspace_memory` / `team_memory` / `task_memory` /
+`episodic_index`) is one store, not five; no semantic or external-memory
+adapter exists; and the tenant is a single operator-configured value with no
+migration between tenants — changing it re-keys nothing and makes existing rows
+unaddressable, which is why the operator must set it before an upgrade rather
+than after.
+
+Operator procedure for the shipped subset — configuration file, verbs, backup
+and the legacy import path — is [`docs/memory-operations.md`](../../memory-operations.md).
+That document is a how-to and carries no requirements authority; where it and
+this section disagree, this section governs.
 
 Automonique implements the agentskills.io `SKILL.md` format with progressive disclosure:
 

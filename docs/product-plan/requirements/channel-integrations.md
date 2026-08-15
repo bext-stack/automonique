@@ -242,6 +242,44 @@ Teams and Discord graduate independently. No rollout flag enables both or grants
 
 These are optional expansion tracks. Their SDK contract may be built alongside the core operator platform, but neither connector's production canary blocks the Rust daemon or Automonique identity cutover when that connector is disabled. Once enabled, its installation enters the deployment's compatibility, reconciliation and rollback gates.
 
+## Slack: the shipped in-daemon connector — amended 2026-08-15
+
+This document specifies Teams and Discord as separately deployable TypeScript
+connector services, "over the same durable intake, identity, approval,
+artifact, action-receipt and event contracts as Slack and Telegram". That
+phrasing assumed the Slack contract was already written down somewhere. It was
+not, and a Slack surface has since shipped, so it is recorded here — as
+context for the generic contract, not as a fourth connector specification.
+
+Two differences from the architecture decision above are deliberate and worth
+naming, because a reader would otherwise take this section as a precedent:
+
+1. **Slack runs inside the Rust daemon, not as a connector service.** It is a
+   Socket Mode worker in the daemon process, holding the daemon's own
+   credentials and reading the daemon's own stores. Teams and Discord must not
+   copy this — the separately deployable decision above is what keeps a
+   platform SDK, its dependencies and its credentials out of the control
+   plane, and Slack predates that decision rather than overturning it.
+2. **Its capabilities are enabled one frame at a time.** A v1 configuration
+   file remains readable for rollback and keeps text-only confirmation
+   behaviour; interactive decisions — cards, approvals, modals, App Home — are
+   enabled only by a v2 frame naming them. That is the graduation discipline
+   this document requires of Teams and Discord ("no rollout flag enables both
+   or grants a new permission implicitly"), and it holds here.
+
+The activation contract — configuration file location, ownership and mode, the
+v1/v2 frames, the per-feature enables, and which administrator and member
+identities may command what — is
+[`docs/slack-monique-rollout.md`](../../slack-monique-rollout.md). That
+document is an operator activation how-to and carries no requirements
+authority; where it and this document disagree, this document governs.
+
+The common connector contract above is the standard the Slack surface is
+measured against, not a description of it. Its current gaps against that
+contract — notably the durable-state projections named under "Durable state
+additions", which the in-daemon surface does not all have — are real and are
+not resolved by this amendment.
+
 ## Explicit non-goals
 
 - Pasting model/API keys into the Teams or Discord client.

@@ -30,13 +30,34 @@ CI before any work item can claim an immutable base.
 
 Blocks: everything. No item is selectable while this gate is open.
 
-Closing evidence:
+Closing evidence, **amended 2026-08-15** to the state that is actually
+measurable. The two amended bullets asserted CI wiring that has never existed;
+they are corrected rather than deleted, so the difference between what was
+claimed and what is true stays visible:
 
 - `plan/work-graph.toml` is checked in and regenerable from
   `docs/product-plan/reference/work-breakdown.md`;
-- `python3 plan/check.py --verify` exits zero in CI on every push;
-- drift in either direction fails the build, demonstrated by a deliberately
-  broken commit that CI rejects.
+- ~~`python3 plan/check.py --verify` exits zero in CI on every push~~ —
+  **amended.** No workflow runs `plan/check.py --verify`; `.github/workflows/plan.yml`
+  (workflow name `source-policy`) runs the licence checker and nothing else. It
+  exits zero when run on demand. What *is* wired into CI on every push is the
+  one rule of that checker which is about the published tree rather than plan
+  bookkeeping: `python3 plan/check.py --identifiers`, run by the
+  `development-scrub` job in `.github/workflows/scrub.yml`;
+- ~~drift in either direction fails the build, demonstrated by a deliberately
+  broken commit that CI rejects~~ — **amended.** No CI job rejects such a
+  commit, because no CI job runs the checker. Drift detection is demonstrated
+  instead by `python3 plan/selftest.py`, which breaks a scratch copy of the
+  plan thirteen distinct ways and requires the checker to refuse each one — and
+  which is itself guarded against passing vacuously by a baseline control it
+  runs first. That is a stronger demonstration than one broken commit, and it
+  is also not a build gate: nothing runs it automatically either.
+
+Making the first amended bullet true again is a workflow change, not a plan
+change: add a job running `plan/check.py --verify`. It is deliberately not done
+here, because `--verify` also refuses a stale `plan/ready.md` and warns on the
+25 items recorded as done without gate evidence, and turning that into a push
+gate is a decision about the archived plan's status, not a truth repair.
 
 ---
 
@@ -73,7 +94,8 @@ repository-side work can produce them.
 holds which `GOVERNANCE.md` § Roles role, whether it is `shared` or
 `dedicated`, what it signs with, and which pre-rule commits are excused by
 exact SHA. `.github/identity/check_identity.py` — run by
-`.github/workflows/identity.yml` — refuses:
+`.github/workflows/identity.yml`, which exists as of 2026-08-15; this citation
+was made true by creating it, not by finding it — refuses:
 
 - a `separation_claimed = true` that no dedicated credential backs, and two
   `dedicated` identities sharing one fingerprint or one address;
@@ -91,6 +113,19 @@ exact SHA. `.github/identity/check_identity.py` — run by
 Wiring it into `plan/check.py` is the integrator's follow-up; it is standalone
 and importable so that wiring it needs no rewrite.
 
+**Amended 2026-08-15.** The checker itself currently exits 1 with seven
+unsupported claims: three merge commits made through the GitHub interface have
+an author the register does not list, a committer it does not list, and a
+web-flow signature while every registered identity declares `signing = "none"`.
+The workflow therefore runs against a recorded pending count rather than a
+clean pass — it refuses an eighth failure and refuses a silent drop to six, and
+warns on every run that it is not evidence the register is truthful. Registering
+those identities requires writing a real name and email into a tracked file and
+redistributing the five `GOVERNANCE.md` roles, which is an owner action; the
+options and the exact steps are in
+[`plan/owner-decisions/2026-08-15-identity-register-reconciliation.md`](owner-decisions/2026-08-15-identity-register-reconciliation.md).
+None of this changes the gate's state: steps 3 and 4 below are still the gate.
+
 #### Owner checklist — the external half
 
 Repository administration is an external action under `GOVERNANCE.md`. None of
@@ -106,7 +141,7 @@ repository, so today any credential that can reach the remote can write `main`.
 |---|---|---|---|
 | 1 | Create a dedicated integration credential (machine account or app) with no key material shared with the implementer identity | two labels are two credentials, not one | add it to the register as `dedicated` with its fingerprint; `check_identity.py` refuses the entry if the fingerprint is empty or duplicated |
 | 2 | Publish the trust root (allowed-signers file or key set) and enable signing for the identities that sign | a signature can be traced to a published root rather than asserted | set `signing` and `signing_effective_commit` in the register; `git verify-commit` must accept every commit after it, which `check_identity.py` requires |
-| 3 | Restrict writes to `main` to the integration credential via branch protection or a ruleset, and require the `plan`, `rust`, `scrub` and `identity` checks | only the integration credential can advance the protected branch | `GET /branches/main/protection` returns 200 instead of today's 404, and lists those four required checks |
+| 3 | Restrict writes to `main` to the integration credential via branch protection or a ruleset, and require the `source-policy`, `rust`, `scrub` and `identity` checks | only the integration credential can advance the protected branch | `GET /branches/main/protection` returns 200 instead of today's 404, and lists those four required checks |
 | 4 | Attempt one push to `main` with a non-integration credential and keep the transcript | the boundary is real rather than configured | the push is rejected; the transcript is the closing evidence, because configuration that has never refused anything is a forbidden shortcut for this gate |
 | 5 | Update the register and `PROVENANCE.md` to the achieved state | the claim and the configuration agree | `python3 .github/identity/check_identity.py` exits 0 with `separation_claimed = true` |
 
@@ -158,6 +193,34 @@ those values into the two `scrub-publication` secrets without printing,
 committing or putting one on a command line. Until then
 `python3 tools/scrub/scan.py --require-protected` exits 2, which is this gate
 holding rather than a defect.
+
+**Amended 2026-08-15.** Three changes to what the rows above measure.
+
+The first row is now met more strongly than it reads: `scrub.yml` gained a
+`protected-push-scrub` job that runs on every push and pull request, scanning
+the tracked tree and the pushed commit range, in protected mode when the
+secrets exist and in development mode with a loud warning when they do not. CI
+therefore hardens the moment the owner provisions, with no further edit. The
+`development-scrub` job additionally runs `plan/check.py --identifiers`, which
+needs no secret and refuses the first-party legacy name outside its sanctioned
+homes on every push including a fork's.
+
+The second row's blocker had a second half that is now removed. `provision.py`
+refuses to fingerprint a value still present in the tracked tree — correct in
+general, but it made a *deliberately retained* value unfingerprintable, since
+such a value is by definition still there. The rule schema now carries an
+optional per-rule `homes` list, and `provision.py` a matching `@home`
+annotation, so the legacy name can be fingerprinted while its sanctioned copies
+below are exempt. What remains is the owner action itself.
+
+**The gate blocks making the repository public, and the repository is public.**
+That is a standing conflict, not a new one. The options, the recommendation
+(private until the scrub is green, as the only mitigation that works today),
+and the exact provisioning steps are recorded in
+[`plan/owner-decisions/2026-08-15-repository-visibility-while-scrub-red.md`](owner-decisions/2026-08-15-repository-visibility-while-scrub-red.md).
+Whichever way the owner decides, it is recorded there and this gate should be
+read against it — a gate everyone knows is being operated against teaches
+readers that gates are decorative, which costs more than the decision does.
 
 Retained by decision, and therefore not scan failures:
 
