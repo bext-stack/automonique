@@ -38,6 +38,22 @@ roadmap's own rules · **S2** material risk or large waste · **S3** hygiene.
 - Two commit messages on `main` also carry the real names (`7216c35`,
   `e4f4fd8`); history rewriting is an owner decision, but new commits must
   stop adding occurrences.
+- **Refined enumeration (M1 grounding pass, larger than this audit first
+  estimated — see [`implementation/M1-disclosure-and-truth.md`](implementation/M1-disclosure-and-truth.md)):**
+  the legacy bot name produces **69** identifier-location failures across 10
+  files (`plan/check.py --verify` names each), not the ~45 first estimated;
+  the third-party class is ~50 occurrences of the client product/tenant plus
+  **~29 occurrences of a real client agency org/repo across 5 files** — a
+  class this audit's first pass missed entirely — for ~79 third-party
+  occurrences across 11 files; the owner's personal email appears in
+  `plan/owner-decisions/2026-08-10-candidate-identity-rewrite.md`; and the
+  publication-scrub green state needs a **9-commit** history rewrite (2 in
+  subjects, 7 in bodies), not 2. Crucially, only the *permitted* first-party
+  name has automated coverage today; the *never-permitted* client/agency
+  names have **zero** automated detection, and both public fingerprint
+  mechanisms are plain SHA-256 of a short word — so value-based detection of
+  client names must live in the protected HMAC bundle (M1 #5), never the
+  public tree.
 
 ### F-02 · The self-improvement pipeline's verification gate is weaker than CI
 - `rust/crates/automonique-lab/src/improvement_executor.rs:285-291` verifies

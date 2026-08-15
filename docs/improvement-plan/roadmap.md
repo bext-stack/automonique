@@ -133,7 +133,7 @@ product exists to eliminate.*
     or amend those requirements deliberately. **[owner]**
 25. **Activation via generation handoff** once M8's reload lands: replace
     restart-based activation; until then, document restart as an accepted
-    temporary deviation. (Depends on item 44.)
+    temporary deviation. (Depends on item 43 — generation handoff / issue #46.)
 
 ## M5 — Test depth & CI hardening
 
