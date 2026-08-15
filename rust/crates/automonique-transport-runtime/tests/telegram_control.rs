@@ -392,6 +392,7 @@ fn the_manifest_is_exhaustive_over_the_registry_and_round_trips() {
             "remember",
             "forget",
             "new",
+            "research",
             "github_create",
             "github_reply",
             "github_check",

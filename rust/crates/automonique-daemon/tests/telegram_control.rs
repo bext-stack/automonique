@@ -1915,6 +1915,40 @@ fn prism_and_model_inventory_questions_use_the_fast_lookup_profile() {
     }
 }
 
+#[test]
+fn explicit_research_command_enables_only_one_public_web_question() {
+    let fixture = Fixture::new(&[]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering("researched answer with source");
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        FakeClient::new([updates(&[(
+            1,
+            OPERATOR,
+            "/research who manages example.com?",
+        )])]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+
+    let queued = poll(&mut bridge).expect("research queues");
+    assert_eq!(queued.questions_queued, 1);
+    assert_eq!(await_question_answers(&mut bridge, 1).questions_answered, 1);
+
+    let prompts = lane.tasks();
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains("AUTOMONIQUE_PERMISSIONED_WEB_RESEARCH_V1"));
+    assert!(prompts[0].contains("BEGIN_AUTHORIZED_WEB_QUESTION"));
+    assert!(prompts[0].contains("who manages example.com?"));
+    assert!(!prompts[0].contains("BEGIN_READ_ONLY_FACT_SNAPSHOT"));
+    let messages = outbound.messages();
+    assert!(messages.iter().any(|message| {
+        message.contains("route=permissioned_web_research")
+            && message.contains("harness=codex_exec_web_search")
+    }));
+}
+
 /// The three commands this build performs are answered from the real read
 /// surfaces, and each answer is the one an operator would receive.
 #[test]

@@ -146,12 +146,21 @@ fn decode_manage_profiles(
     if rows.len() > MAX_MANAGE_PROFILES {
         return Err(SiteInventoryFailure::TooManySites);
     }
-    let terms: BTreeSet<String> = question
+    let mut terms: BTreeSet<String> = question
         .to_lowercase()
         .split(|character: char| !character.is_alphanumeric())
         .filter(|term| term.len() >= 3)
         .map(ToOwned::to_owned)
         .collect();
+    // Manage's profile prose is predominantly French while an operator may
+    // ask in English. Expand only narrow domain synonyms locally so retrieval
+    // does not require a model call and "agency" can find "agence web".
+    if terms.contains("agency") || terms.contains("agencies") {
+        terms.insert(String::from("agence"));
+    }
+    if terms.contains("webserver") || terms.contains("webservers") {
+        terms.insert(String::from("serveur"));
+    }
     let mut ecosystem = 0;
     let mut managed = 0;
     let mut company_manager = 0;
@@ -536,6 +545,31 @@ mod tests {
         assert_eq!(inventory.company_manager, 1);
         assert_eq!(inventory.selected[0].reference, "uuid-beta");
         assert_eq!(inventory.selected[0].host.as_deref(), Some("beta.example"));
+    }
+
+    #[test]
+    fn english_agency_query_finds_french_manage_profile() {
+        let rows = serde_json::json!([
+            {
+                "kind": "ecosystem",
+                "ref": "alpha-prism",
+                "label": "Alpha",
+                "context": "Generic application"
+            },
+            {
+                "kind": "ecosystem",
+                "ref": "webdesign29-prism",
+                "label": "Webdesign29",
+                "context": "Site vitrine de l'agence web Webdesign29 à Brest"
+            }
+        ]);
+        let bytes = serde_json::to_vec(&serde_json::json!({ "value": rows })).expect("fixture");
+
+        let inventory =
+            decode_manage_profiles(&bytes, "what agency or agencies manage this webserver?")
+                .expect("profiles");
+
+        assert_eq!(inventory.selected[0].reference, "webdesign29-prism");
     }
 
     #[test]

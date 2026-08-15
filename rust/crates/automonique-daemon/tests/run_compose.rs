@@ -625,6 +625,46 @@ fn read_only_question_profile_lowers_reasoning_without_reading_task_text() {
             .any(|argument| argument == QUESTION_MODEL_CONFIG),
         "operational Q&A must retain the configured intelligent model"
     );
+
+    let research = compose_with_profile(
+        "an explicitly authorized public-web question",
+        &CompositionInputs {
+            state_dir: &state_dir,
+            run_id: "web-research1",
+            provider: &provider,
+            offered_features: &offered,
+            egress_configured: true,
+        },
+        ProviderRunProfile::WebResearch,
+    )
+    .expect("web research profile composes");
+    let research = RunSpec::from_canonical_bytes(research.document()).expect("document decodes");
+    let research_arguments: Vec<_> = research.arguments().iter().collect();
+    assert_eq!(
+        research_arguments
+            .first()
+            .map(|argument| argument.as_os_str()),
+        Some(std::ffi::OsStr::new("--search")),
+        "Codex live search is a global flag and must precede its subcommand"
+    );
+    assert_eq!(
+        research_arguments
+            .get(1)
+            .map(|argument| argument.as_os_str()),
+        Some(std::ffi::OsStr::new("exec")),
+        "the fixed configured exec subcommand must remain directly after the search flag"
+    );
+    assert_eq!(
+        research.sandbox().budgets().cgroup_memory().quantity(),
+        QUESTION_MEMORY_BYTES
+    );
+    assert!(
+        !intelligent
+            .arguments()
+            .iter()
+            .any(|argument| argument == "--search"),
+        "ordinary operational questions must remain no-search"
+    );
 }
 
 /// A deployment that configured nothing composes nothing, and says so.

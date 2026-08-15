@@ -384,6 +384,7 @@ impl RunLane for SocketRunLane {
             QuestionProfile::Conversation => ProviderRunProfile::FastConversation,
             QuestionProfile::OperationalLookup => ProviderRunProfile::FastConversation,
             QuestionProfile::Operational => ProviderRunProfile::IntelligentQuestion,
+            QuestionProfile::WebResearch => ProviderRunProfile::WebResearch,
         };
         self.run_with_profile(task, run_profile)
     }
@@ -445,9 +446,9 @@ impl SocketRunLane {
         };
         let composition = match profile {
             ProviderRunProfile::Standard => compose(&task, &inputs),
-            ProviderRunProfile::FastConversation | ProviderRunProfile::IntelligentQuestion => {
-                compose_with_profile(&task, &inputs, profile)
-            }
+            ProviderRunProfile::FastConversation
+            | ProviderRunProfile::IntelligentQuestion
+            | ProviderRunProfile::WebResearch => compose_with_profile(&task, &inputs, profile),
         }
         .map_err(RunFailure::from_compose)?;
 
