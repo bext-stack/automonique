@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Bounded, refusing decoders for the five support actions.
+//! Bounded, refusing decoders for the seven support and ticket actions.
 //!
 //! Each decoder takes the response bytes and returns either the action's typed
 //! payload, the fleet's own bounded refusal, or a [`FleetFailure`]. Nothing
@@ -26,6 +26,7 @@ use serde_json::{Map, Value};
 
 use std::fmt;
 
+use crate::request::is_github_issue_url;
 use crate::{
     FleetFailure, FleetOutcome, MAX_FLEET_RESPONSE_BYTES, MAX_SUPPORT_ISSUES, ServerMessage,
 };
@@ -50,6 +51,10 @@ pub const MAX_TIMESTAMP_BYTES: usize = 60;
 pub const MAX_THREAD_SUBJECT_BYTES: usize = 160;
 /// Longest thread contact address retained.
 pub const MAX_CONTACT_EMAIL_BYTES: usize = 254;
+/// Longest ticket result returned to an operator.
+pub const MAX_TICKET_RESULT_BYTES: usize = 2_000;
+/// Longest project label in a ticket receipt.
+pub const MAX_PROJECT_LABEL_BYTES: usize = 160;
 
 /// Which slice of the support board a response covers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,6 +148,112 @@ pub struct SupportDelivery {
     /// The idempotency signal: a retried confirmed action reports `duplicate`
     /// rather than sending a second email.
     pub duplicate: bool,
+}
+
+/// Closed Jean job states exposed to Automonique.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TicketJobStatus {
+    PendingApproval,
+    Pending,
+    Claimed,
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+impl TicketJobStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PendingApproval => "pending_approval",
+            Self::Pending => "pending",
+            Self::Claimed => "claimed",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending_approval" => Some(Self::PendingApproval),
+            "pending" => Some(Self::Pending),
+            "claimed" => Some(Self::Claimed),
+            "running" => Some(Self::Running),
+            "done" => Some(Self::Done),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+/// Workspace provenance selected by Manage, never by chat text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TicketWorkspace {
+    SiteProfile,
+    InstanceDefault,
+}
+
+/// Durable receipt for one ticket dispatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketDispatchReceipt {
+    pub issue_id: String,
+    pub issue_url: String,
+    pub issue_title: String,
+    pub project_label: String,
+    pub site_label: Option<String>,
+    pub workspace: TicketWorkspace,
+    pub job_id: String,
+    pub job_status: TicketJobStatus,
+    pub duplicate: bool,
+    pub approved: bool,
+}
+
+/// Terminal administrator choice recorded by Manage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TicketDecisionOutcome {
+    Approved,
+    Rejected,
+}
+
+impl TicketDecisionOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approve",
+            Self::Rejected => "reject",
+        }
+    }
+}
+
+/// Durable receipt for an idempotent ticket decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketDecisionReceipt {
+    pub job_id: String,
+    pub job_status: TicketJobStatus,
+    pub decision: TicketDecisionOutcome,
+    pub duplicate: bool,
+}
+
+/// Current state of one exact dispatched ticket job.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketStatus {
+    pub issue_id: String,
+    pub issue_url: String,
+    pub issue_title: String,
+    pub job_id: String,
+    pub job_status: TicketJobStatus,
+    pub result: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// Decode a `support-issues` response.
@@ -267,6 +378,107 @@ pub fn decode_support_delivery(
     }))
 }
 
+/// Decode an `automonique-ticket-dispatch` receipt.
+pub fn decode_ticket_dispatch(
+    bytes: &[u8],
+) -> Result<FleetOutcome<TicketDispatchReceipt>, FleetFailure> {
+    let envelope = envelope(bytes)?;
+    if !is_accepted(&envelope)? {
+        return Ok(FleetOutcome::Rejected(rejection(&envelope)));
+    }
+    let row = envelope
+        .get("receipt")
+        .ok_or(FleetFailure::MissingField)?
+        .as_object()
+        .ok_or(FleetFailure::InvalidResponse)?;
+    let issue_url = nonempty(row, "issue_url", crate::MAX_TICKET_ISSUE_URL_BYTES)?;
+    if !is_github_issue_url(&issue_url) {
+        return Err(FleetFailure::FieldOutOfBounds);
+    }
+    let site_label = optional_bounded(row, "site_label", MAX_SITE_LABEL_BYTES)?;
+    let workspace = match required_str(row, "workspace")? {
+        "site_profile" => TicketWorkspace::SiteProfile,
+        "instance_default" => TicketWorkspace::InstanceDefault,
+        _ => return Err(FleetFailure::FieldOutOfBounds),
+    };
+    Ok(FleetOutcome::Accepted(TicketDispatchReceipt {
+        issue_id: nonempty(row, "issue_id", MAX_ISSUE_ID_BYTES)?,
+        issue_url,
+        issue_title: nonempty(row, "issue_title", 300)?,
+        project_label: nonempty(row, "project_label", MAX_PROJECT_LABEL_BYTES)?,
+        site_label,
+        workspace,
+        job_id: nonempty(row, "job_id", crate::MAX_FLEET_IDENTIFIER_BYTES)?,
+        job_status: ticket_status(row, "job_status")?,
+        duplicate: boolean(row, "duplicate")?,
+        approved: boolean(row, "approved")?,
+    }))
+}
+
+/// Decode an `automonique-ticket-decision` receipt.
+pub fn decode_ticket_decision(
+    bytes: &[u8],
+) -> Result<FleetOutcome<TicketDecisionReceipt>, FleetFailure> {
+    let envelope = envelope(bytes)?;
+    if !is_accepted(&envelope)? {
+        return Ok(FleetOutcome::Rejected(rejection(&envelope)));
+    }
+    let row = envelope
+        .get("decision")
+        .ok_or(FleetFailure::MissingField)?
+        .as_object()
+        .ok_or(FleetFailure::InvalidResponse)?;
+    let decision = match required_str(row, "value")? {
+        "approve" => TicketDecisionOutcome::Approved,
+        "reject" => TicketDecisionOutcome::Rejected,
+        _ => return Err(FleetFailure::FieldOutOfBounds),
+    };
+    let job_status = ticket_status(row, "job_status")?;
+    if matches!(decision, TicketDecisionOutcome::Rejected)
+        && job_status != TicketJobStatus::Cancelled
+    {
+        return Err(FleetFailure::FieldOutOfBounds);
+    }
+    if matches!(decision, TicketDecisionOutcome::Approved)
+        && job_status == TicketJobStatus::PendingApproval
+    {
+        return Err(FleetFailure::FieldOutOfBounds);
+    }
+    Ok(FleetOutcome::Accepted(TicketDecisionReceipt {
+        job_id: nonempty(row, "job_id", crate::MAX_FLEET_IDENTIFIER_BYTES)?,
+        job_status,
+        decision,
+        duplicate: boolean(row, "duplicate")?,
+    }))
+}
+
+/// Decode an `automonique-ticket-status` response.
+pub fn decode_ticket_status(bytes: &[u8]) -> Result<FleetOutcome<TicketStatus>, FleetFailure> {
+    let envelope = envelope(bytes)?;
+    if !is_accepted(&envelope)? {
+        return Ok(FleetOutcome::Rejected(rejection(&envelope)));
+    }
+    let row = envelope
+        .get("status")
+        .ok_or(FleetFailure::MissingField)?
+        .as_object()
+        .ok_or(FleetFailure::InvalidResponse)?;
+    let issue_url = nonempty(row, "issue_url", crate::MAX_TICKET_ISSUE_URL_BYTES)?;
+    if !is_github_issue_url(&issue_url) {
+        return Err(FleetFailure::FieldOutOfBounds);
+    }
+    Ok(FleetOutcome::Accepted(TicketStatus {
+        issue_id: nonempty(row, "issue_id", MAX_ISSUE_ID_BYTES)?,
+        issue_url,
+        issue_title: nonempty(row, "issue_title", 300)?,
+        job_id: nonempty(row, "job_id", crate::MAX_FLEET_IDENTIFIER_BYTES)?,
+        job_status: ticket_status(row, "job_status")?,
+        result: bounded_multiline(row, "result", MAX_TICKET_RESULT_BYTES)?,
+        created_at: timestamp(row, "created_at")?,
+        updated_at: timestamp(row, "updated_at")?,
+    }))
+}
+
 /// Read one bounded, strictly-parsed JSON object off the wire.
 fn envelope(bytes: &[u8]) -> Result<Map<String, Value>, FleetFailure> {
     if bytes.is_empty() || bytes.len() > MAX_FLEET_RESPONSE_BYTES {
@@ -299,6 +511,50 @@ fn rejection(object: &Map<String, Value>) -> ServerMessage {
         || ServerMessage::sanitized("support refused"),
         ServerMessage::sanitized,
     )
+}
+
+fn boolean(object: &Map<String, Value>, key: &str) -> Result<bool, FleetFailure> {
+    object
+        .get(key)
+        .ok_or(FleetFailure::MissingField)?
+        .as_bool()
+        .ok_or(FleetFailure::FieldOutOfBounds)
+}
+
+fn ticket_status(object: &Map<String, Value>, key: &str) -> Result<TicketJobStatus, FleetFailure> {
+    TicketJobStatus::parse(required_str(object, key)?).ok_or(FleetFailure::FieldOutOfBounds)
+}
+
+fn optional_bounded(
+    object: &Map<String, Value>,
+    key: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, FleetFailure> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value))
+            if value.len() <= max_bytes && !value.chars().any(char::is_control) =>
+        {
+            Ok((!value.is_empty()).then(|| value.to_owned()))
+        }
+        Some(_) => Err(FleetFailure::FieldOutOfBounds),
+    }
+}
+
+fn bounded_multiline(
+    object: &Map<String, Value>,
+    key: &str,
+    max_bytes: usize,
+) -> Result<String, FleetFailure> {
+    let value = required_str(object, key)?;
+    if value.len() > max_bytes
+        || value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(FleetFailure::FieldOutOfBounds);
+    }
+    Ok(value.to_owned())
 }
 
 /// Decode one support issue, requiring every field the contract names.
@@ -854,6 +1110,64 @@ mod tests {
         let body = page(&row.to_string());
         assert_eq!(
             decode_support_issues(body.as_bytes()),
+            Err(FleetFailure::FieldOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn ticket_dispatch_receipt_is_strict_and_typed() {
+        let bytes = br#"{"ok":true,"receipt":{"issue_id":"issue-1","issue_url":"https://github.com/webdesign29/activ/issues/1007","issue_title":"List prism sites","project_id":"ignored","project_label":"Bext platform","site_label":"bext","workspace":"site_profile","job_id":"job-1","job_status":"pending","duplicate":false,"approved":true}}"#;
+        assert_eq!(
+            decode_ticket_dispatch(bytes).expect("decode"),
+            FleetOutcome::Accepted(TicketDispatchReceipt {
+                issue_id: String::from("issue-1"),
+                issue_url: String::from("https://github.com/webdesign29/activ/issues/1007"),
+                issue_title: String::from("List prism sites"),
+                project_label: String::from("Bext platform"),
+                site_label: Some(String::from("bext")),
+                workspace: TicketWorkspace::SiteProfile,
+                job_id: String::from("job-1"),
+                job_status: TicketJobStatus::Pending,
+                duplicate: false,
+                approved: true,
+            })
+        );
+        assert!(TicketJobStatus::Done.is_terminal());
+        assert!(!TicketJobStatus::Running.is_terminal());
+    }
+
+    #[test]
+    fn ticket_status_keeps_multiline_results_but_refuses_unknown_states() {
+        let bytes = br#"{"ok":true,"status":{"issue_id":"issue-1","issue_url":"https://github.com/webdesign29/activ/issues/1007","issue_title":"List prism sites","job_id":"job-1","job_status":"done","result":"Implemented\nVerified live","created_at":"2026-08-14T20:00:00Z","updated_at":"2026-08-14T20:01:00Z"}}"#;
+        let outcome = decode_ticket_status(bytes).expect("decode");
+        let status = outcome.accepted().expect("accepted");
+        assert_eq!(status.job_status, TicketJobStatus::Done);
+        assert_eq!(status.result, "Implemented\nVerified live");
+
+        let unknown = String::from_utf8(bytes.to_vec())
+            .expect("utf8")
+            .replace("\"done\"", "\"almost_done\"");
+        assert_eq!(
+            decode_ticket_status(unknown.as_bytes()),
+            Err(FleetFailure::FieldOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn ticket_decision_receipt_enforces_terminal_rejection() {
+        let rejected = br#"{"ok":true,"decision":{"job_id":"job-1","job_status":"cancelled","value":"reject","duplicate":false}}"#;
+        assert_eq!(
+            decode_ticket_decision(rejected).expect("decode"),
+            FleetOutcome::Accepted(TicketDecisionReceipt {
+                job_id: String::from("job-1"),
+                job_status: TicketJobStatus::Cancelled,
+                decision: TicketDecisionOutcome::Rejected,
+                duplicate: false,
+            })
+        );
+        let unsafe_rejection = br#"{"ok":true,"decision":{"job_id":"job-1","job_status":"pending","value":"reject","duplicate":false}}"#;
+        assert_eq!(
+            decode_ticket_decision(unsafe_rejection),
             Err(FleetFailure::FieldOutOfBounds)
         );
     }

@@ -53,6 +53,14 @@ const CONVERSATIONS_INFO: &str = "conversations.info";
 const CONVERSATIONS_HISTORY: &str = "conversations.history";
 const USERS_INFO: &str = "users.info";
 const CHAT_POST_MESSAGE: &str = "chat.postMessage";
+const CHAT_UPDATE: &str = "chat.update";
+const VIEWS_OPEN: &str = "views.open";
+const VIEWS_PUBLISH: &str = "views.publish";
+
+/// Largest serialized Block Kit document this connector will send.
+pub const MAX_BLOCK_KIT_BYTES: usize = 32 * 1024;
+/// Slack's documented maximum blocks in a message.
+pub const MAX_MESSAGE_BLOCKS: usize = 50;
 
 /// The closed set of Web API methods this connector can address.
 ///
@@ -73,6 +81,12 @@ pub enum SlackMethod {
     UsersInfo,
     /// `chat.postMessage` — post one message. The one external effect.
     ChatPostMessage,
+    /// `chat.update` — replace one existing bot message.
+    ChatUpdate,
+    /// `views.open` — open one modal for an interaction trigger.
+    ViewsOpen,
+    /// `views.publish` — publish one App Home view.
+    ViewsPublish,
 }
 
 impl SlackMethod {
@@ -86,6 +100,9 @@ impl SlackMethod {
             Self::ConversationsHistory => CONVERSATIONS_HISTORY,
             Self::UsersInfo => USERS_INFO,
             Self::ChatPostMessage => CHAT_POST_MESSAGE,
+            Self::ChatUpdate => CHAT_UPDATE,
+            Self::ViewsOpen => VIEWS_OPEN,
+            Self::ViewsPublish => VIEWS_PUBLISH,
         }
     }
 
@@ -93,6 +110,118 @@ impl SlackMethod {
     #[must_use]
     pub fn path(self) -> String {
         format!("{API_PREFIX}/{}", self.as_str())
+    }
+}
+
+/// One bounded Slack interaction trigger id.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TriggerId(String);
+
+impl TriggerId {
+    pub fn new(value: &str) -> Result<Self, SlackRefusal> {
+        if value.is_empty()
+            || value.len() > 256
+            || !value.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(SlackRefusal::TriggerId);
+        }
+        Ok(Self(value.to_owned()))
+    }
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One validated Slack modal view JSON object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModalView(String);
+
+impl ModalView {
+    pub fn new(json: &str) -> Result<Self, SlackRefusal> {
+        if json.is_empty() || json.len() > MAX_BLOCK_KIT_BYTES {
+            return Err(SlackRefusal::View);
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(json).map_err(|_| SlackRefusal::View)?;
+        let object = value.as_object().ok_or(SlackRefusal::View)?;
+        if object.get("type").and_then(serde_json::Value::as_str) != Some("modal")
+            || !object
+                .get("blocks")
+                .is_some_and(serde_json::Value::is_array)
+        {
+            return Err(SlackRefusal::View);
+        }
+        Ok(Self(json.to_owned()))
+    }
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One validated Slack App Home view JSON object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HomeView(String);
+
+impl HomeView {
+    pub fn new(json: &str) -> Result<Self, SlackRefusal> {
+        if json.is_empty() || json.len() > MAX_BLOCK_KIT_BYTES {
+            return Err(SlackRefusal::View);
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(json).map_err(|_| SlackRefusal::View)?;
+        let object = value.as_object().ok_or(SlackRefusal::View)?;
+        if object.get("type").and_then(serde_json::Value::as_str) != Some("home")
+            || !object
+                .get("blocks")
+                .is_some_and(serde_json::Value::is_array)
+        {
+            return Err(SlackRefusal::View);
+        }
+        Ok(Self(json.to_owned()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A validated JSON array of Slack Block Kit message blocks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageBlocks(String);
+
+impl MessageBlocks {
+    pub fn new(json: &str) -> Result<Self, SlackRefusal> {
+        if json.is_empty() || json.len() > MAX_BLOCK_KIT_BYTES {
+            return Err(SlackRefusal::Blocks);
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(json).map_err(|_| SlackRefusal::Blocks)?;
+        let blocks = value.as_array().ok_or(SlackRefusal::Blocks)?;
+        if blocks.is_empty() || blocks.len() > MAX_MESSAGE_BLOCKS {
+            return Err(SlackRefusal::Blocks);
+        }
+        for block in blocks {
+            let kind = block
+                .as_object()
+                .and_then(|row| row.get("type"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or(SlackRefusal::Blocks)?;
+            if !matches!(
+                kind,
+                "section" | "context" | "actions" | "header" | "divider"
+            ) {
+                return Err(SlackRefusal::Blocks);
+            }
+        }
+        Ok(Self(json.to_owned()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -370,6 +499,7 @@ pub struct PostMessageRequest {
     channel: ChannelId,
     text: MessageText,
     thread_ts: Option<MessageTs>,
+    blocks: Option<MessageBlocks>,
 }
 
 impl PostMessageRequest {
@@ -380,6 +510,7 @@ impl PostMessageRequest {
             channel,
             text,
             thread_ts: None,
+            blocks: None,
         }
     }
 
@@ -391,6 +522,13 @@ impl PostMessageRequest {
     #[must_use]
     pub fn in_thread(mut self, parent: MessageTs) -> Self {
         self.thread_ts = Some(parent);
+        self
+    }
+
+    /// Attach validated Block Kit while retaining `text` as the accessibility fallback.
+    #[must_use]
+    pub fn with_blocks(mut self, blocks: MessageBlocks) -> Self {
+        self.blocks = Some(blocks);
         self
     }
 
@@ -411,6 +549,99 @@ impl PostMessageRequest {
     pub const fn thread_ts(&self) -> Option<&MessageTs> {
         self.thread_ts.as_ref()
     }
+
+    #[must_use]
+    pub const fn blocks(&self) -> Option<&MessageBlocks> {
+        self.blocks.as_ref()
+    }
+}
+
+/// Replace one exact bot message with new accessible text and optional blocks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateMessageRequest {
+    channel: ChannelId,
+    ts: MessageTs,
+    text: MessageText,
+    blocks: Option<MessageBlocks>,
+}
+
+/// Open a modal in response to one short-lived Slack interaction trigger.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenViewRequest {
+    trigger_id: TriggerId,
+    view: ModalView,
+}
+
+impl OpenViewRequest {
+    #[must_use]
+    pub const fn new(trigger_id: TriggerId, view: ModalView) -> Self {
+        Self { trigger_id, view }
+    }
+    #[must_use]
+    pub const fn trigger_id(&self) -> &TriggerId {
+        &self.trigger_id
+    }
+    #[must_use]
+    pub const fn view(&self) -> &ModalView {
+        &self.view
+    }
+}
+
+/// Publish one user's App Home.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishViewRequest {
+    user_id: UserId,
+    view: HomeView,
+}
+
+impl PublishViewRequest {
+    #[must_use]
+    pub const fn new(user_id: UserId, view: HomeView) -> Self {
+        Self { user_id, view }
+    }
+    #[must_use]
+    pub const fn user_id(&self) -> &UserId {
+        &self.user_id
+    }
+    #[must_use]
+    pub const fn view(&self) -> &HomeView {
+        &self.view
+    }
+}
+
+impl UpdateMessageRequest {
+    #[must_use]
+    pub const fn new(channel: ChannelId, ts: MessageTs, text: MessageText) -> Self {
+        Self {
+            channel,
+            ts,
+            text,
+            blocks: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_blocks(mut self, blocks: MessageBlocks) -> Self {
+        self.blocks = Some(blocks);
+        self
+    }
+
+    #[must_use]
+    pub const fn channel(&self) -> &ChannelId {
+        &self.channel
+    }
+    #[must_use]
+    pub const fn ts(&self) -> &MessageTs {
+        &self.ts
+    }
+    #[must_use]
+    pub const fn text(&self) -> &MessageText {
+        &self.text
+    }
+    #[must_use]
+    pub const fn blocks(&self) -> Option<&MessageBlocks> {
+        self.blocks.as_ref()
+    }
 }
 
 /// One validated call, ready to be rendered onto the wire.
@@ -428,6 +659,12 @@ pub enum SlackOperation {
     UsersInfo(UsersInfoRequest),
     /// `chat.postMessage`
     ChatPostMessage(PostMessageRequest),
+    /// `chat.update`
+    ChatUpdate(UpdateMessageRequest),
+    /// `views.open`
+    ViewsOpen(OpenViewRequest),
+    /// `views.publish`
+    ViewsPublish(PublishViewRequest),
 }
 
 impl SlackOperation {
@@ -441,6 +678,9 @@ impl SlackOperation {
             Self::ConversationsHistory(_) => SlackMethod::ConversationsHistory,
             Self::UsersInfo(_) => SlackMethod::UsersInfo,
             Self::ChatPostMessage(_) => SlackMethod::ChatPostMessage,
+            Self::ChatUpdate(_) => SlackMethod::ChatUpdate,
+            Self::ViewsOpen(_) => SlackMethod::ViewsOpen,
+            Self::ViewsPublish(_) => SlackMethod::ViewsPublish,
         }
     }
 
@@ -451,7 +691,13 @@ impl SlackOperation {
     /// exactly one of them puts a message in front of a human.
     #[must_use]
     pub const fn is_external_effect(&self) -> bool {
-        matches!(self, Self::ChatPostMessage(_))
+        matches!(
+            self,
+            Self::ChatPostMessage(_)
+                | Self::ChatUpdate(_)
+                | Self::ViewsOpen(_)
+                | Self::ViewsPublish(_)
+        )
     }
 
     /// The exact form-encoded body, in the documented field order.
@@ -493,6 +739,25 @@ impl SlackOperation {
                 if let Some(thread) = request.thread_ts() {
                     push_form_field(&mut body, "thread_ts", thread.as_str());
                 }
+                if let Some(blocks) = request.blocks() {
+                    push_form_field(&mut body, "blocks", blocks.as_str());
+                }
+            }
+            Self::ChatUpdate(request) => {
+                push_form_field(&mut body, "channel", request.channel().as_str());
+                push_form_field(&mut body, "ts", request.ts().as_str());
+                push_form_field(&mut body, "text", request.text().as_str());
+                if let Some(blocks) = request.blocks() {
+                    push_form_field(&mut body, "blocks", blocks.as_str());
+                }
+            }
+            Self::ViewsOpen(request) => {
+                push_form_field(&mut body, "trigger_id", request.trigger_id().as_str());
+                push_form_field(&mut body, "view", request.view().as_str());
+            }
+            Self::ViewsPublish(request) => {
+                push_form_field(&mut body, "user_id", request.user_id().as_str());
+                push_form_field(&mut body, "view", request.view().as_str());
             }
         }
         body
@@ -526,6 +791,9 @@ mod tests {
             ),
             (SlackMethod::UsersInfo, "/api/users.info"),
             (SlackMethod::ChatPostMessage, "/api/chat.postMessage"),
+            (SlackMethod::ChatUpdate, "/api/chat.update"),
+            (SlackMethod::ViewsOpen, "/api/views.open"),
+            (SlackMethod::ViewsPublish, "/api/views.publish"),
         ] {
             assert_eq!(method.path(), path);
             assert_eq!(format!("{API_PREFIX}/{}", method.as_str()), path);
@@ -593,6 +861,39 @@ mod tests {
             reply.body(),
             "channel=C0RESERVED&text=suite&thread_ts=1723542000.000100"
         );
+
+        let blocks = MessageBlocks::new(
+            r#"[{"type":"section","text":{"type":"mrkdwn","text":"Approve?"}},{"type":"actions","elements":[]}]"#,
+        )
+        .expect("blocks");
+        let update = SlackOperation::ChatUpdate(
+            UpdateMessageRequest::new(
+                channel(),
+                MessageTs::new("1723542000.000100").expect("ts"),
+                MessageText::new("Approval required").expect("text"),
+            )
+            .with_blocks(blocks),
+        );
+        assert!(update.body().starts_with(
+            "channel=C0RESERVED&ts=1723542000.000100&text=Approval%20required&blocks="
+        ));
+
+        let modal = ModalView::new(
+            r#"{"type":"modal","title":{"type":"plain_text","text":"Reject"},"blocks":[]}"#,
+        )
+        .expect("modal");
+        let open = SlackOperation::ViewsOpen(OpenViewRequest::new(
+            TriggerId::new("1337.abc").expect("trigger"),
+            modal,
+        ));
+        assert!(open.body().starts_with("trigger_id=1337.abc&view=%7B"));
+
+        let home = HomeView::new(r#"{"type":"home","blocks":[]}"#).expect("home");
+        let publish = SlackOperation::ViewsPublish(PublishViewRequest::new(
+            UserId::new(USER).expect("user"),
+            home,
+        ));
+        assert!(publish.body().starts_with("user_id=U0RESERVED&view=%7B"));
     }
 
     #[test]

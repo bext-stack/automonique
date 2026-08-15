@@ -226,15 +226,23 @@ fn store_update(
 ) -> Result<TelegramStoreUpdate<'_>, SinkFailure> {
     let disposition = match (&update.kind, &update.disposition) {
         (
-            TelegramInputKind::Message | TelegramInputKind::Callback,
+            TelegramInputKind::Message
+            | TelegramInputKind::EditedMessage
+            | TelegramInputKind::Attachment
+            | TelegramInputKind::Callback,
             DurableDisposition::Admitted { content },
         ) if !content.is_empty() => TelegramStoreDisposition::Admitted { content },
-        (TelegramInputKind::Message | TelegramInputKind::Callback, DurableDisposition::Denied) => {
-            TelegramStoreDisposition::Denied
-        }
-        (TelegramInputKind::Unsupported, DurableDisposition::IgnoredUnsupported) => {
-            TelegramStoreDisposition::IgnoredUnsupported
-        }
+        (
+            TelegramInputKind::Message
+            | TelegramInputKind::EditedMessage
+            | TelegramInputKind::Attachment
+            | TelegramInputKind::Callback,
+            DurableDisposition::Denied,
+        ) => TelegramStoreDisposition::Denied,
+        (
+            TelegramInputKind::Unsupported | TelegramInputKind::DeletedMessage,
+            DurableDisposition::IgnoredUnsupported,
+        ) => TelegramStoreDisposition::IgnoredUnsupported,
         _ => return Err(SinkFailure::Conflict),
     };
     Ok(TelegramStoreUpdate {

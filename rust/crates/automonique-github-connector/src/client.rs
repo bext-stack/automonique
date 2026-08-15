@@ -2,7 +2,7 @@
 
 //! The synchronous GitHub client.
 //!
-//! One origin, nine operations. The client is the composition of
+//! One origin, thirteen operations. The client is the composition of
 //! [`GitHubOperation`]'s rendering and the `decode_*` functions around a single
 //! bounded HTTP call — it adds no field to a request and repairs no field in a
 //! response, so everything it can send or accept is already provable without a
@@ -29,14 +29,17 @@ use ureq::tls::{RootCerts, TlsConfig};
 use crate::request::HttpMethod;
 use crate::response::{
     CommentRef, GitHubComment, GitHubIssue, GitHubReply, IssueListPage, IssueSearchPage, Viewer,
-    decode_comment_ref, decode_comments, decode_error_message, decode_issue, decode_issue_list,
-    decode_issue_ref, decode_labels, decode_search, decode_viewer,
+    decode_comment, decode_comment_ref, decode_comments, decode_error_message, decode_issue,
+    decode_issue_list, decode_issue_ref, decode_labels, decode_repository_labels, decode_search,
+    decode_viewer,
 };
 use crate::{
-    CommentRequest, CreateIssueRequest, GITHUB_REQUEST_TIMEOUT_SECONDS, GetCommentsRequest,
-    GetIssueRequest, GitHubBase, GitHubFailure, GitHubOperation, GitHubOutcome, GitHubRejection,
-    GitHubToken, ListIssuesRequest, MAX_GITHUB_RESPONSE_BYTES, RateLimit, ReplaceLabelsRequest,
-    SearchIssuesRequest, SetStateRequest,
+    CommentRequest, CreateIssueRequest, EntityTag, GITHUB_REQUEST_TIMEOUT_SECONDS,
+    GetCommentsRequest, GetIssueCommentRequest, GetIssueRequest, GitHubBase, GitHubFailure,
+    GitHubOperation, GitHubOutcome, GitHubRejection, GitHubToken, ListIssuesRequest,
+    ListLabelsRequest, MAX_GITHUB_RESPONSE_BYTES, ManagementReceipt, ManagementRequest, RateLimit,
+    ReplaceLabelsRequest, SearchIssuesRequest, SetStateRequest, UpdateIssueBodyRequest,
+    UpdateIssueCommentRequest, Versioned,
 };
 
 /// The API version every request pins.
@@ -44,7 +47,7 @@ use crate::{
 /// GitHub versions its REST API by date and reserves the right to change
 /// behaviour for a client that does not pin one. This is the version the
 /// contract was read against.
-pub const GITHUB_API_VERSION: &str = "2022-11-28";
+pub const GITHUB_API_VERSION: &str = "2026-03-10";
 
 /// The media type every request asks for.
 pub const GITHUB_ACCEPT: &str = "application/vnd.github+json";
@@ -209,6 +212,20 @@ impl GitHubClient {
         self.call(&GitHubOperation::GetIssue(request.clone()), decode_issue)
     }
 
+    /// Read one issue and retain its entity tag for a conditional body update.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::get_issue`], plus [`GitHubFailure::MissingField`] if
+    /// an accepted response has no `ETag`, or
+    /// [`GitHubFailure::FieldOutOfBounds`] if that header is malformed.
+    pub fn get_issue_versioned(
+        &self,
+        request: &GetIssueRequest,
+    ) -> Result<GitHubReply<Versioned<GitHubIssue>>, GitHubFailure> {
+        self.call_versioned(&GitHubOperation::GetIssue(request.clone()), decode_issue)
+    }
+
     /// Read one page of an issue's comments.
     ///
     /// # Errors
@@ -221,6 +238,70 @@ impl GitHubClient {
         let per_page = request.page().per_page();
         self.call(&GitHubOperation::GetComments(request.clone()), |bytes| {
             decode_comments(bytes, per_page)
+        })
+    }
+
+    /// Read one issue comment and retain its entity tag for a conditional edit.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::get_issue_versioned`].
+    pub fn get_issue_comment(
+        &self,
+        request: &GetIssueCommentRequest,
+    ) -> Result<GitHubReply<Versioned<GitHubComment>>, GitHubFailure> {
+        self.call_versioned(
+            &GitHubOperation::GetIssueComment(request.clone()),
+            decode_comment,
+        )
+    }
+
+    /// Replace one issue body only if its entity tag still matches.
+    ///
+    /// A `412 Precondition Failed` is returned as a rejected reply, allowing
+    /// the caller to re-read and reconcile rather than overwriting a concurrent
+    /// human edit.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::get_issue_versioned`].
+    pub fn update_issue_body(
+        &self,
+        request: &UpdateIssueBodyRequest,
+    ) -> Result<GitHubReply<Versioned<GitHubIssue>>, GitHubFailure> {
+        self.call_versioned(
+            &GitHubOperation::UpdateIssueBody(request.clone()),
+            decode_issue,
+        )
+    }
+
+    /// Replace one issue-comment body only if its entity tag still matches.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::update_issue_body`].
+    pub fn update_issue_comment(
+        &self,
+        request: &UpdateIssueCommentRequest,
+    ) -> Result<GitHubReply<Versioned<GitHubComment>>, GitHubFailure> {
+        self.call_versioned(
+            &GitHubOperation::UpdateIssueComment(request.clone()),
+            decode_comment,
+        )
+    }
+
+    /// Read one page of labels configured on a repository.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::get_comments`].
+    pub fn list_labels(
+        &self,
+        request: &ListLabelsRequest,
+    ) -> Result<GitHubReply<Vec<String>>, GitHubFailure> {
+        let per_page = request.page().per_page();
+        self.call(&GitHubOperation::ListLabels(request.clone()), |bytes| {
+            decode_repository_labels(bytes, per_page)
         })
     }
 
@@ -266,6 +347,58 @@ impl GitHubClient {
         self.call(&GitHubOperation::Whoami, decode_viewer)
     }
 
+    /// Execute one closed work-management request.
+    ///
+    /// Accepted empty responses (notably `204`) are represented by an empty
+    /// [`ManagementReceipt`]; JSON responses retain their bounded document.
+    pub fn manage(
+        &self,
+        request: &ManagementRequest,
+    ) -> Result<GitHubReply<ManagementReceipt>, GitHubFailure> {
+        let answer = self.send_parts(
+            request.method(),
+            request.path(),
+            request.body(),
+            request.if_match().map(EntityTag::as_str),
+        )?;
+        if (300..400).contains(&answer.status) {
+            return Err(GitHubFailure::Redirected);
+        }
+        if !(200..300).contains(&answer.status) {
+            let message = decode_error_message(&answer.body, answer.status);
+            return Ok(GitHubReply::new(
+                answer.rate,
+                GitHubOutcome::Rejected(GitHubRejection::new(
+                    answer.status,
+                    message,
+                    &answer.rate,
+                    answer.retry_after_seconds,
+                )),
+            ));
+        }
+        let receipt = if answer.body.is_empty() {
+            ManagementReceipt::empty()
+        } else {
+            if !answer.json {
+                return Err(GitHubFailure::UnexpectedContentType);
+            }
+            let value: serde_json::Value =
+                serde_json::from_slice(&answer.body).map_err(|_| GitHubFailure::InvalidResponse)?;
+            if request.path() == "/graphql"
+                && value
+                    .get("errors")
+                    .is_some_and(|errors| errors.as_array().is_none_or(|items| !items.is_empty()))
+            {
+                return Err(GitHubFailure::InvalidResponse);
+            }
+            ManagementReceipt::document(value)
+        };
+        Ok(GitHubReply::new(
+            answer.rate,
+            GitHubOutcome::Accepted(receipt),
+        ))
+    }
+
     /// Issue one operation and decode its answer.
     fn call<T>(
         &self,
@@ -299,30 +432,85 @@ impl GitHubClient {
         ))
     }
 
+    /// Issue one operation whose accepted response must carry an entity tag.
+    fn call_versioned<T>(
+        &self,
+        operation: &GitHubOperation,
+        decode: impl FnOnce(&[u8]) -> Result<T, GitHubFailure>,
+    ) -> Result<GitHubReply<Versioned<T>>, GitHubFailure> {
+        let answer = self.send(operation)?;
+        if (300..400).contains(&answer.status) {
+            return Err(GitHubFailure::Redirected);
+        }
+        if !(200..300).contains(&answer.status) {
+            let message = decode_error_message(&answer.body, answer.status);
+            return Ok(GitHubReply::new(
+                answer.rate,
+                GitHubOutcome::Rejected(GitHubRejection::new(
+                    answer.status,
+                    message,
+                    &answer.rate,
+                    answer.retry_after_seconds,
+                )),
+            ));
+        }
+        if !answer.json {
+            return Err(GitHubFailure::UnexpectedContentType);
+        }
+        let etag = answer.etag.ok_or(GitHubFailure::MissingField)?;
+        let etag = EntityTag::new(&etag).map_err(|_| GitHubFailure::FieldOutOfBounds)?;
+        Ok(GitHubReply::new(
+            answer.rate,
+            GitHubOutcome::Accepted(Versioned::new(decode(&answer.body)?, etag)),
+        ))
+    }
+
     /// Issue one request and return its status, window and bounded body.
     ///
     /// The credential is rendered into an `Authorization` header inside the
     /// callback and dropped when it returns; it is never stored on the request
     /// builder beyond that, never logged, and never named in a failure.
     fn send(&self, operation: &GitHubOperation) -> Result<Answer, GitHubFailure> {
-        let url = self.endpoint(operation);
-        let body = operation.body().unwrap_or_default();
+        self.send_parts(
+            operation.method(),
+            &operation.path(),
+            operation.body().as_deref(),
+            operation.if_match().map(EntityTag::as_str),
+        )
+    }
+
+    fn send_parts(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        body: Option<&str>,
+        if_match: Option<&str>,
+    ) -> Result<Answer, GitHubFailure> {
+        let url = format!("{}{}", self.base.origin(), path);
+        let body = body.unwrap_or_default();
         let mut response = self
             .token
             .authorization()
-            .with_header_value(|authorization| match operation.method() {
+            .with_header_value(|authorization| match method {
                 HttpMethod::Get => self
-                    .prepared(self.agent.get(&url), authorization, false)
+                    .prepared(self.agent.get(&url), authorization, false, if_match)
                     .call(),
                 HttpMethod::Post => self
-                    .prepared(self.agent.post(&url), authorization, true)
-                    .send(&body),
+                    .prepared(self.agent.post(&url), authorization, true, if_match)
+                    .send(body),
                 HttpMethod::Patch => self
-                    .prepared(self.agent.patch(&url), authorization, true)
-                    .send(&body),
+                    .prepared(self.agent.patch(&url), authorization, true, if_match)
+                    .send(body),
                 HttpMethod::Put => self
-                    .prepared(self.agent.put(&url), authorization, true)
-                    .send(&body),
+                    .prepared(self.agent.put(&url), authorization, true, if_match)
+                    .send(body),
+                HttpMethod::Delete if body.is_empty() => self
+                    .prepared(self.agent.delete(&url), authorization, false, if_match)
+                    .call(),
+                HttpMethod::Delete => self
+                    .prepared(self.agent.delete(&url), authorization, true, if_match)
+                    .force_send_body()
+                    .send(body),
             })
             .map_err(map_ureq_error)?;
 
@@ -341,6 +529,7 @@ impl GitHubClient {
         );
         let retry_after_seconds = header("retry-after").and_then(|value| value.parse().ok());
         let json = header("content-type").is_some_and(|value| is_github_json(&value));
+        let etag = header("etag");
 
         let reader = response
             .body_mut()
@@ -352,6 +541,7 @@ impl GitHubClient {
             rate,
             retry_after_seconds,
             json,
+            etag,
             body: read_bounded_body(reader)?,
         })
     }
@@ -365,6 +555,7 @@ impl GitHubClient {
         builder: ureq::RequestBuilder<Any>,
         authorization: &str,
         has_body: bool,
+        if_match: Option<&str>,
     ) -> ureq::RequestBuilder<Any> {
         let builder = builder
             .header("authorization", authorization)
@@ -373,6 +564,11 @@ impl GitHubClient {
             .header("user-agent", GITHUB_USER_AGENT);
         let builder = if has_body {
             builder.header("content-type", "application/json")
+        } else {
+            builder
+        };
+        let builder = if let Some(if_match) = if_match {
+            builder.header("if-match", if_match)
         } else {
             builder
         };
@@ -386,6 +582,7 @@ struct Answer {
     rate: RateLimit,
     retry_after_seconds: Option<u32>,
     json: bool,
+    etag: Option<String>,
     body: Vec<u8>,
 }
 
@@ -591,7 +788,24 @@ mod tests {
                 ReplaceLabelsRequest::new(target.clone(), number, Vec::new()).expect("labels"),
             ),
             GitHubOperation::GetIssue(GetIssueRequest::new(target.clone(), number)),
+            GitHubOperation::UpdateIssueBody(UpdateIssueBodyRequest::new(
+                target.clone(),
+                number,
+                IssueBodyText::new("nouveau corps").expect("body"),
+                EntityTag::new("\"issue-v1\"").expect("etag"),
+            )),
             GitHubOperation::GetComments(GetCommentsRequest::new(target.clone(), number, page)),
+            GitHubOperation::GetIssueComment(GetIssueCommentRequest::new(
+                target.clone(),
+                crate::CommentId::new(9_001).expect("comment id"),
+            )),
+            GitHubOperation::UpdateIssueComment(UpdateIssueCommentRequest::new(
+                target.clone(),
+                crate::CommentId::new(9_001).expect("comment id"),
+                IssueBodyText::new("fait").expect("body"),
+                EntityTag::new("\"comment-v1\"").expect("etag"),
+            )),
+            GitHubOperation::ListLabels(ListLabelsRequest::new(target.clone(), page)),
             GitHubOperation::ListIssues(ListIssuesRequest::new(
                 target,
                 crate::IssueFilter::default(),

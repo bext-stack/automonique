@@ -2,13 +2,19 @@
 
 //! Typed client for the Slack Web API surface Automonique reads and speaks on.
 //!
-//! Six methods are spelled, and nothing else can be: identify the credential,
-//! list the conversations it can see, read one conversation, read a
-//! conversation's recent messages, resolve one user, and post one message. Five
-//! are reads. The sixth — [`SlackClient::post_message`] — is the only
+//! Six bot-token Web API methods are spelled: identify the credential, list the
+//! conversations it can see, read one conversation, read one conversation's
+//! recent messages, resolve one user, and post one message. Five are reads. The
+//! sixth — [`SlackClient::post_message`] — is the only
 //! externally visible effect this crate can produce, and it is marked as one by
 //! [`SlackOperation::is_external_effect`] so an approval layer never has to
 //! re-derive it from a verb.
+//!
+//! Socket Mode bootstrap is kept apart because it has a different credential
+//! audience and transport: [`AppsConnectionsOpenClient`] spends only an
+//! app-level token on the fixed `apps.connections.open` endpoint, then returns
+//! a redacted [`SlackSocketUrl`] for either an injected synchronous websocket
+//! or the target-locked Rustls production adapter.
 //!
 //! # Target lock
 //!
@@ -71,8 +77,10 @@
 //! refinement that belongs beside a block model, not inside a text field.
 
 mod client;
+mod connections;
 mod request;
 mod response;
+mod socket_mode;
 mod target;
 mod token;
 
@@ -80,22 +88,36 @@ use std::error::Error;
 use std::fmt;
 
 pub use client::{SLACK_ACCEPT, SLACK_CONTENT_TYPE, SLACK_USER_AGENT, SlackClient};
+pub use connections::{
+    APPS_CONNECTIONS_OPEN_ENDPOINT, AppsConnectionsOpenClient, ConnectionsOpenHttpRequest,
+    ConnectionsOpenHttpResponse, ConnectionsOpenTransport, SlackConnectionsOpenTransport,
+};
 pub use request::{
     ConversationTypes, ConversationsHistoryRequest, ConversationsInfoRequest,
-    ConversationsListRequest, MessageText, PostMessageRequest, SlackMethod, SlackOperation,
-    UsersInfoRequest,
+    ConversationsListRequest, HomeView, MAX_BLOCK_KIT_BYTES, MAX_MESSAGE_BLOCKS, MessageBlocks,
+    MessageText, ModalView, OpenViewRequest, PostMessageRequest, PublishViewRequest, SlackMethod,
+    SlackOperation, TriggerId, UpdateMessageRequest, UsersInfoRequest,
 };
 pub use response::{
     AuthIdentity, ChannelPage, MAX_REPLY_COUNT, MessagePage, PostedMessage, SlackChannel,
-    SlackMessage, SlackUser, decode_auth_test, decode_conversations_history,
-    decode_conversations_info, decode_conversations_list, decode_error_code, decode_post_message,
-    decode_users_info,
+    SlackMessage, SlackUser, decode_ack, decode_apps_connections_open, decode_auth_test,
+    decode_conversations_history, decode_conversations_info, decode_conversations_list,
+    decode_error_code, decode_post_message, decode_users_info,
+};
+pub use socket_mode::{
+    MAX_SOCKET_MODE_ENVELOPE_BYTES, MAX_SOCKET_MODE_URL_BYTES, ProductionSocketModeSocket,
+    SOCKET_MODE_IO_TIMEOUT_SECONDS, SlackSocketModeConnector, SlackSocketUrl, SocketFrame,
+    SocketIoFailure, SocketModeAcknowledgement, SocketModeConnection, SocketModeEnvelope,
+    SocketModeFailure, SynchronousWebSocket,
 };
 pub use target::{
     ChannelId, Cursor, MAX_CHANNEL_ID_BYTES, MAX_CURSOR_BYTES, MAX_TEAM_ID_BYTES,
     MAX_TIMESTAMP_BYTES, MAX_USER_ID_BYTES, MessageTs, SLACK_API_ORIGIN, SlackBase, TeamId, UserId,
 };
-pub use token::{MAX_SLACK_TOKEN_BYTES, SLACK_BOT_TOKEN_PREFIX, SlackAuthorization, SlackToken};
+pub use token::{
+    MAX_SLACK_TOKEN_BYTES, SLACK_APP_TOKEN_PREFIX, SLACK_BOT_TOKEN_PREFIX, SlackAppToken,
+    SlackAuthorization, SlackToken,
+};
 
 /// Longest response body accepted, before any field is read.
 ///
@@ -159,6 +181,8 @@ pub enum SlackRefusal {
     /// The token is empty, over-long, outside the bearer-credential character
     /// set, or not a bot token.
     Token,
+    /// The token is not a bounded header-safe `xapp-` app-level token.
+    AppToken,
     /// The channel id is empty, over-long, or outside Slack's grammar.
     ChannelId,
     /// The user id is empty, over-long, or outside Slack's grammar.
@@ -174,6 +198,12 @@ pub enum SlackRefusal {
     Text,
     /// No conversation type was selected, so the listing would name nothing.
     ConversationTypes,
+    /// Block Kit JSON is malformed, empty, over its bound, or contains an unsupported block.
+    Blocks,
+    /// An interaction trigger id was empty, over-long, or control-bearing.
+    TriggerId,
+    /// A modal view was malformed or outside its bound.
+    View,
 }
 
 impl SlackRefusal {
@@ -183,6 +213,7 @@ impl SlackRefusal {
         match self {
             Self::Base => "base",
             Self::Token => "token",
+            Self::AppToken => "app_token",
             Self::ChannelId => "channel_id",
             Self::UserId => "user_id",
             Self::Timestamp => "timestamp",
@@ -190,6 +221,9 @@ impl SlackRefusal {
             Self::Limit => "limit",
             Self::Text => "text",
             Self::ConversationTypes => "conversation_types",
+            Self::Blocks => "blocks",
+            Self::TriggerId => "trigger_id",
+            Self::View => "view",
         }
     }
 }

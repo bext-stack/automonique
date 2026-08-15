@@ -5,6 +5,7 @@ members = [
     "crates/automonique-agents",
     "crates/automonique",
     "crates/automonique-cli",
+    "crates/automonique-chat-provider",
     "crates/automonique-core",
     "crates/automonique-daemon",
     "crates/automonique-egress-broker",
@@ -39,6 +40,7 @@ serde = "=1.0.229"
 serde_json = "=1.0.149"
 sha2 = "=0.10.9"
 tempfile = "=3.24.0"
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 ureq = { version = "=3.3.0", default-features = false, features = ["rustls"] }
 
 [workspace.lints.rust]
@@ -48,3 +50,9 @@ unsafe_code = "forbid"
 dbg_macro = "forbid"
 todo = "forbid"
 unimplemented = "forbid"
+
+# Provider executables are hashed before composition and again before launch.
+# Keep the RustCrypto implementation fast in the development daemon so those
+# large-file checks complete well inside the short transport lease.
+[profile.dev.package.sha2]
+opt-level = 3

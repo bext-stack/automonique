@@ -86,6 +86,14 @@ pub const MAX_CHANNEL_NAME_BYTES: usize = 80;
 /// somebody wrote, to a channel other people read, is the worst available
 /// answer.
 pub const MAX_SAY_TEXT_BYTES: usize = 900;
+/// Longest configured GitHub repository alias accepted by `/github_create`.
+pub const MAX_GITHUB_REPO_ALIAS_BYTES: usize = 32;
+/// Longest canonical GitHub issue URL accepted by an issue action command.
+pub const MAX_GITHUB_ISSUE_URL_BYTES: usize = 512;
+/// Longest natural-language request carried by a GitHub create or reply command.
+pub const MAX_GITHUB_REQUEST_BYTES: usize = 3_000;
+/// Longest checklist item text carried by a GitHub check or uncheck command.
+pub const MAX_GITHUB_CHECKLIST_ITEM_BYTES: usize = 1_024;
 /// Most Telegram user ids one allowlist may hold.
 pub const MAX_ALLOWED_USERS: usize = 256;
 /// Longest user id one `/admin` directive may name, in bytes.
@@ -95,7 +103,7 @@ pub const MAX_ALLOWED_USERS: usize = 256;
 /// being read rather than after an allocation.
 pub const MAX_USER_ID_BYTES: usize = 20;
 /// Number of commands in the closed registry.
-pub const COMMAND_COUNT: usize = 13;
+pub const COMMAND_COUNT: usize = 26;
 
 const _: () = assert!(COMMAND_COUNT == CommandKind::ALL.len());
 const _: () = assert!(MAX_COMMAND_NAME_BYTES <= MAX_COMMAND_TEXT_BYTES);
@@ -103,6 +111,9 @@ const _: () = assert!(MAX_RUN_TASK_BYTES < MAX_COMMAND_TEXT_BYTES);
 const _: () = assert!(MAX_CONTROL_REF_BYTES < MAX_RUN_TASK_BYTES);
 const _: () = assert!(MAX_USER_ID_BYTES < MAX_CONTROL_REF_BYTES);
 const _: () = assert!(MAX_CHANNEL_NAME_BYTES < MAX_CONTROL_REF_BYTES);
+const _: () = assert!(MAX_GITHUB_REPO_ALIAS_BYTES < MAX_GITHUB_ISSUE_URL_BYTES);
+const _: () = assert!(MAX_GITHUB_ISSUE_URL_BYTES < MAX_GITHUB_REQUEST_BYTES);
+const _: () = assert!(MAX_GITHUB_CHECKLIST_ITEM_BYTES < MAX_GITHUB_REQUEST_BYTES);
 // A `/say` is one Telegram message carrying one channel name and one body, so
 // the two together have to fit inside the message this parser will look at.
 const _: () = assert!(MAX_SAY_TEXT_BYTES + MAX_CHANNEL_NAME_BYTES < MAX_COMMAND_TEXT_BYTES);
@@ -137,6 +148,12 @@ pub enum ArgumentShape {
     /// The only shape with two fields, and the only one whose second field is
     /// free text an operator wrote to be read by people outside this system.
     ChannelMessage,
+    /// A closed memory subcommand with an optional bounded query.
+    MemoryDirective,
+    /// One configured GitHub repository alias and a bounded free-text request.
+    GitHubRepositoryRequest,
+    /// One exact GitHub issue URL and a bounded reply or checklist item.
+    GitHubIssueRequest,
 }
 
 /// Which tier of operator a command belongs to.
@@ -213,6 +230,32 @@ pub enum CommandKind {
     Slack,
     /// Post one message to a configured Slack channel.
     Say,
+    /// Inspect, search and review durable memories.
+    Memory,
+    /// Record one actor-supplied durable memory.
+    Remember,
+    /// Tombstone one durable memory by reference.
+    Forget,
+    /// Start a fresh conversation while preserving long-term memory.
+    New,
+    /// Create one GitHub issue in a configured repository.
+    GitHubCreate,
+    /// Reply to one exact GitHub issue.
+    GitHubReply,
+    /// Check one checklist item on an exact GitHub issue.
+    GitHubCheck,
+    /// Uncheck one checklist item on an exact GitHub issue.
+    GitHubUncheck,
+    /// Manage issue and pull-request metadata without entering `/ticket`.
+    GitHubIssue,
+    /// Manage repository label definitions or assignments.
+    GitHubLabel,
+    /// Manage repository milestone definitions or assignments.
+    GitHubMilestone,
+    /// Manage native parent, sub-issue, and dependency relationships.
+    GitHubEpic,
+    /// Manage GitHub Projects, fields, views, and items.
+    GitHubProject,
 }
 
 impl CommandKind {
@@ -225,6 +268,19 @@ impl CommandKind {
         Self::Tickets,
         Self::Ticket,
         Self::Slack,
+        Self::Memory,
+        Self::Remember,
+        Self::Forget,
+        Self::New,
+        Self::GitHubCreate,
+        Self::GitHubReply,
+        Self::GitHubCheck,
+        Self::GitHubUncheck,
+        Self::GitHubIssue,
+        Self::GitHubLabel,
+        Self::GitHubMilestone,
+        Self::GitHubEpic,
+        Self::GitHubProject,
         Self::Work,
         Self::Run,
         Self::Say,
@@ -299,7 +355,7 @@ impl CommandKind {
             },
             Self::Slack => CommandSpec {
                 name: "slack",
-                description: "Show the recent messages in the named Slack channel",
+                description: "Read a Slack channel or list configured channels",
                 argument: ArgumentShape::Channel,
                 tier: CommandTier::Allowed,
             },
@@ -309,6 +365,67 @@ impl CommandKind {
                 argument: ArgumentShape::ChannelMessage,
                 tier: CommandTier::Admin,
             },
+            Self::Memory => CommandSpec {
+                name: "memory",
+                description: "Inspect, search or review durable memories",
+                argument: ArgumentShape::MemoryDirective,
+                tier: CommandTier::Admin,
+            },
+            Self::Remember => CommandSpec {
+                name: "remember",
+                description: "Record one explicit personal memory",
+                argument: ArgumentShape::Task,
+                tier: CommandTier::Admin,
+            },
+            Self::Forget => CommandSpec {
+                name: "forget",
+                description: "Forget the memory with the given reference",
+                argument: ArgumentShape::Reference,
+                tier: CommandTier::Admin,
+            },
+            Self::New => CommandSpec {
+                name: "new",
+                description: "Start a new conversation",
+                argument: ArgumentShape::None,
+                tier: CommandTier::Admin,
+            },
+            Self::GitHubCreate => CommandSpec {
+                name: "github_create",
+                description: "Create an issue in a configured GitHub repository",
+                argument: ArgumentShape::GitHubRepositoryRequest,
+                tier: CommandTier::Admin,
+            },
+            Self::GitHubReply => CommandSpec {
+                name: "github_reply",
+                description: "Reply to an exact GitHub issue URL",
+                argument: ArgumentShape::GitHubIssueRequest,
+                tier: CommandTier::Admin,
+            },
+            Self::GitHubCheck => CommandSpec {
+                name: "github_check",
+                description: "Check one item on an exact GitHub issue",
+                argument: ArgumentShape::GitHubIssueRequest,
+                tier: CommandTier::Admin,
+            },
+            Self::GitHubUncheck => CommandSpec {
+                name: "github_uncheck",
+                description: "Uncheck one item on an exact GitHub issue",
+                argument: ArgumentShape::GitHubIssueRequest,
+                tier: CommandTier::Admin,
+            },
+            Self::GitHubIssue => {
+                github_management_spec("github_issue", "Manage GitHub issues or pull requests")
+            }
+            Self::GitHubLabel => github_management_spec("github_label", "Manage GitHub labels"),
+            Self::GitHubMilestone => {
+                github_management_spec("github_milestone", "Manage GitHub milestones")
+            }
+            Self::GitHubEpic => {
+                github_management_spec("github_epic", "Manage GitHub native epics and dependencies")
+            }
+            Self::GitHubProject => {
+                github_management_spec("github_project", "Manage GitHub Projects")
+            }
             Self::Work => CommandSpec {
                 name: "work",
                 description: "Draft an answer to the support ticket with the given reference",
@@ -385,6 +502,15 @@ impl CommandKind {
     }
 }
 
+const fn github_management_spec(name: &'static str, description: &'static str) -> CommandSpec {
+    CommandSpec {
+        name,
+        description,
+        argument: ArgumentShape::Task,
+        tier: CommandTier::Admin,
+    }
+}
+
 /// One entry of the advertised command menu.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandManifestEntry {
@@ -437,8 +563,22 @@ pub fn help_text() -> String {
             ArgumentShape::Task => String::from(" <task>"),
             ArgumentShape::Reference => String::from(" <reference>"),
             ArgumentShape::Directive => String::from(" <add|remove|list> [user_id]"),
+            ArgumentShape::Channel if entry.kind == CommandKind::Slack => {
+                String::from(" <channel|list>")
+            }
             ArgumentShape::Channel => String::from(" <channel>"),
             ArgumentShape::ChannelMessage => String::from(" <channel> <message>"),
+            ArgumentShape::MemoryDirective => String::from(
+                " [search <query>|show <id>|proposals|approve <id>|deny <id>|sources <id>|link]",
+            ),
+            ArgumentShape::GitHubRepositoryRequest => String::from(" <repository> <request>"),
+            ArgumentShape::GitHubIssueRequest => match entry.kind {
+                CommandKind::GitHubReply => String::from(" <issue-url> <reply>"),
+                CommandKind::GitHubCheck | CommandKind::GitHubUncheck => {
+                    String::from(" <issue-url> <item>")
+                }
+                _ => String::from(" <issue-url> <request>"),
+            },
         };
         let mark = match entry.tier {
             CommandTier::Allowed => "",
@@ -449,6 +589,9 @@ pub fn help_text() -> String {
             entry.name, usage, entry.description, mark
         ));
     }
+    text.push_str(
+        "\n\nAdministrators can also ask read-only questions in ordinary language. Answers use the daemon's current ticket and status snapshot; actions still require an explicit command.",
+    );
     text
 }
 
@@ -489,6 +632,19 @@ impl RunTask {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// One closed `/memory` operation.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum MemoryDirective {
+    Summary,
+    Search { query: RunTask },
+    Show { memory_ref: ControlRef },
+    Proposals,
+    Approve { memory_ref: ControlRef },
+    Deny { memory_ref: ControlRef },
+    Sources { memory_ref: ControlRef },
+    Link,
 }
 
 impl fmt::Debug for RunTask {
@@ -673,6 +829,225 @@ impl fmt::Debug for SayText {
     }
 }
 
+/// A bounded friendly alias for one repository configured by the host.
+///
+/// This is deliberately not an `owner/repo` pair. The daemon must resolve the
+/// alias through owner-managed configuration before an action can address a
+/// repository, keeping raw chat input away from repository selection.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GitHubRepoAlias(String);
+
+impl GitHubRepoAlias {
+    /// Validate and normalize one configured repository alias.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRefusal::MissingArgument`] when empty,
+    /// [`CommandRefusal::ArgumentTooLong`] beyond
+    /// [`MAX_GITHUB_REPO_ALIAS_BYTES`], and
+    /// [`CommandRefusal::ArgumentInvalid`] outside ASCII letters, digits,
+    /// hyphen and underscore.
+    pub fn new(value: impl AsRef<str>) -> Result<Self, CommandRefusal> {
+        let value = value.as_ref();
+        if value.is_empty() {
+            return Err(CommandRefusal::MissingArgument);
+        }
+        if value.len() > MAX_GITHUB_REPO_ALIAS_BYTES {
+            return Err(CommandRefusal::ArgumentTooLong);
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(CommandRefusal::ArgumentInvalid);
+        }
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+
+    /// The normalized alias to resolve in host configuration.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for GitHubRepoAlias {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "GitHubRepoAlias({})", self.0)
+    }
+}
+
+impl fmt::Display for GitHubRepoAlias {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// One bounded canonical URL naming exactly one GitHub issue.
+///
+/// The accepted path is exactly
+/// `https://github.com/<owner>/<repo>/issues/<positive-number>`. Query strings,
+/// fragments, trailing slashes and alternate hosts are refused here. Repository
+/// authorization and full repository-name parsing remain the daemon's job.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GitHubIssueUrl(String);
+
+impl GitHubIssueUrl {
+    /// Validate one exact public GitHub issue URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRefusal::MissingArgument`] when empty,
+    /// [`CommandRefusal::ArgumentTooLong`] beyond
+    /// [`MAX_GITHUB_ISSUE_URL_BYTES`], and
+    /// [`CommandRefusal::ArgumentInvalid`] for any other URL shape.
+    pub fn new(value: impl AsRef<str>) -> Result<Self, CommandRefusal> {
+        let value = value.as_ref();
+        if value.is_empty() {
+            return Err(CommandRefusal::MissingArgument);
+        }
+        if value.len() > MAX_GITHUB_ISSUE_URL_BYTES {
+            return Err(CommandRefusal::ArgumentTooLong);
+        }
+        let Some(path) = value.strip_prefix("https://github.com/") else {
+            return Err(CommandRefusal::ArgumentInvalid);
+        };
+        let mut segments = path.split('/');
+        let (Some(owner), Some(repo), Some("issues"), Some(issue_number), None) = (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ) else {
+            return Err(CommandRefusal::ArgumentInvalid);
+        };
+        if !valid_github_path_segment(owner)
+            || !valid_github_path_segment(repo)
+            || issue_number.is_empty()
+            || !issue_number.bytes().all(|byte| byte.is_ascii_digit())
+            || issue_number
+                .parse::<u64>()
+                .ok()
+                .filter(|number| *number > 0)
+                .is_none()
+        {
+            return Err(CommandRefusal::ArgumentInvalid);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// The exact validated issue URL.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn valid_github_path_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+impl fmt::Debug for GitHubIssueUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "GitHubIssueUrl(<redacted:{} bytes>)",
+            self.0.len()
+        )
+    }
+}
+
+impl fmt::Display for GitHubIssueUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Bounded natural-language instructions for creating or replying to an issue.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GitHubRequest(String);
+
+impl GitHubRequest {
+    /// Validate one request body.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same content-free refusals as [`RunTask::new`], using
+    /// [`MAX_GITHUB_REQUEST_BYTES`] as the length ceiling.
+    pub fn new(text: impl AsRef<str>) -> Result<Self, CommandRefusal> {
+        bounded_github_text(text.as_ref(), MAX_GITHUB_REQUEST_BYTES).map(Self)
+    }
+
+    /// The validated request text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for GitHubRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "GitHubRequest(<redacted:{} bytes>)",
+            self.0.len()
+        )
+    }
+}
+
+/// Bounded text identifying one checklist item in an issue or comment.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GitHubChecklistItem(String);
+
+impl GitHubChecklistItem {
+    /// Validate one checklist item label.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same content-free refusals as [`RunTask::new`], using
+    /// [`MAX_GITHUB_CHECKLIST_ITEM_BYTES`] as the length ceiling.
+    pub fn new(text: impl AsRef<str>) -> Result<Self, CommandRefusal> {
+        bounded_github_text(text.as_ref(), MAX_GITHUB_CHECKLIST_ITEM_BYTES).map(Self)
+    }
+
+    /// The exact validated checklist label.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for GitHubChecklistItem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "GitHubChecklistItem(<redacted:{} bytes>)",
+            self.0.len()
+        )
+    }
+}
+
+fn bounded_github_text(text: &str, max_bytes: usize) -> Result<String, CommandRefusal> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(CommandRefusal::MissingArgument);
+    }
+    if text.len() > max_bytes {
+        return Err(CommandRefusal::ArgumentTooLong);
+    }
+    if text
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    {
+        return Err(CommandRefusal::ArgumentInvalid);
+    }
+    Ok(text.to_owned())
+}
+
 /// One validated Telegram user id, named in an `/admin` directive.
 ///
 /// A newtype rather than a bare `i64` because it crosses a boundary where the
@@ -808,6 +1183,54 @@ pub enum ControlCommand {
         /// The configured channel being read.
         channel: ChannelName,
     },
+    /// List the configured Slack channel labels without contacting Slack.
+    SlackList,
+    /// Inspect or review the current actor's durable memory.
+    Memory { directive: MemoryDirective },
+    /// Record one explicit actor-supplied fact.
+    Remember { fact: RunTask },
+    /// Tombstone one memory.
+    Forget { memory_ref: ControlRef },
+    /// Reset the active conversation projection, not long-term memory.
+    New,
+    /// Create one issue in the configured repository this alias resolves to.
+    GitHubCreate {
+        /// The owner-configured repository alias.
+        repo_alias: GitHubRepoAlias,
+        /// Natural-language instructions for the new issue.
+        request: GitHubRequest,
+    },
+    /// Publish one reply on the exact GitHub issue URL.
+    GitHubReply {
+        /// The exact GitHub issue being replied to.
+        issue_url: GitHubIssueUrl,
+        /// Natural-language instructions for the reply.
+        request: GitHubRequest,
+    },
+    /// Check one uniquely matching checklist item on a GitHub issue.
+    GitHubCheck {
+        /// The exact GitHub issue containing the item.
+        issue_url: GitHubIssueUrl,
+        /// The exact checklist item text to match.
+        item: GitHubChecklistItem,
+    },
+    /// Uncheck one uniquely matching checklist item on a GitHub issue.
+    GitHubUncheck {
+        /// The exact GitHub issue containing the item.
+        issue_url: GitHubIssueUrl,
+        /// The exact checklist item text to match.
+        item: GitHubChecklistItem,
+    },
+    /// Apply one issue or pull-request management instruction.
+    GitHubIssue { request: GitHubRequest },
+    /// Apply one label management instruction.
+    GitHubLabel { request: GitHubRequest },
+    /// Apply one milestone management instruction.
+    GitHubMilestone { request: GitHubRequest },
+    /// Apply one native hierarchy/dependency instruction.
+    GitHubEpic { request: GitHubRequest },
+    /// Apply one Projects management instruction.
+    GitHubProject { request: GitHubRequest },
     /// Post one message to the Slack channel this name resolves to.
     ///
     /// The only command in this vocabulary whose effect is visible outside the
@@ -869,7 +1292,20 @@ impl ControlCommand {
             Self::Runs => CommandKind::Runs,
             Self::Tickets => CommandKind::Tickets,
             Self::Ticket { .. } => CommandKind::Ticket,
-            Self::Slack { .. } => CommandKind::Slack,
+            Self::Slack { .. } | Self::SlackList => CommandKind::Slack,
+            Self::Memory { .. } => CommandKind::Memory,
+            Self::Remember { .. } => CommandKind::Remember,
+            Self::Forget { .. } => CommandKind::Forget,
+            Self::New => CommandKind::New,
+            Self::GitHubCreate { .. } => CommandKind::GitHubCreate,
+            Self::GitHubReply { .. } => CommandKind::GitHubReply,
+            Self::GitHubCheck { .. } => CommandKind::GitHubCheck,
+            Self::GitHubUncheck { .. } => CommandKind::GitHubUncheck,
+            Self::GitHubIssue { .. } => CommandKind::GitHubIssue,
+            Self::GitHubLabel { .. } => CommandKind::GitHubLabel,
+            Self::GitHubMilestone { .. } => CommandKind::GitHubMilestone,
+            Self::GitHubEpic { .. } => CommandKind::GitHubEpic,
+            Self::GitHubProject { .. } => CommandKind::GitHubProject,
             Self::Say { .. } => CommandKind::Say,
             Self::Work { .. } => CommandKind::Work,
             Self::Run { .. } => CommandKind::Run,
@@ -970,6 +1406,147 @@ impl fmt::Display for CommandRefusal {
 }
 
 impl Error for CommandRefusal {}
+
+/// Render a refusal in the context of the command the operator typed.
+///
+/// Authorization refusals return before the text is inspected, preserving the
+/// tier gate's non-oracle property. For an admitted operator whose command name
+/// resolved, the reply names the missing or extra field and includes the exact
+/// usage instead of sending them to the whole help page.
+#[must_use]
+pub fn command_refusal_text(text: &str, refusal: CommandRefusal) -> String {
+    if matches!(
+        refusal,
+        CommandRefusal::Unauthorized | CommandRefusal::NotPermitted
+    ) {
+        return refusal.operator_reply().to_owned();
+    }
+    let Ok((kind, rest)) = split_command(text) else {
+        return refusal.operator_reply().to_owned();
+    };
+    match refusal {
+        CommandRefusal::MissingArgument => match kind {
+            CommandKind::Say => String::from(
+                "Missing the message to post. Usage: /say <channel> <message>. Example: /say jean yo",
+            ),
+            CommandKind::Slack => {
+                String::from("Missing the channel label. Usage: /slack <channel|list>.")
+            }
+            CommandKind::Run => String::from("Missing the task. Usage: /run <task>."),
+            CommandKind::Admin => {
+                String::from("Missing the admin action. Usage: /admin <add|remove|list> [user_id].")
+            }
+            CommandKind::Remember => String::from("Missing the fact. Usage: /remember <fact>."),
+            CommandKind::Forget => String::from("Missing the memory id. Usage: /forget <id>."),
+            CommandKind::GitHubCreate => String::from(
+                "Missing the repository alias or request. Usage: /github_create <repository> <request>.",
+            ),
+            CommandKind::GitHubReply => String::from(
+                "Missing the issue URL or reply. Usage: /github_reply <issue-url> <reply>.",
+            ),
+            CommandKind::GitHubCheck => String::from(
+                "Missing the issue URL or checklist item. Usage: /github_check <issue-url> <item>.",
+            ),
+            CommandKind::GitHubUncheck => String::from(
+                "Missing the issue URL or checklist item. Usage: /github_uncheck <issue-url> <item>.",
+            ),
+            CommandKind::GitHubIssue
+            | CommandKind::GitHubLabel
+            | CommandKind::GitHubMilestone
+            | CommandKind::GitHubEpic
+            | CommandKind::GitHubProject => format!(
+                "Missing the GitHub management request. Usage: {}.",
+                command_usage(kind)
+            ),
+            _ => format!("Missing the reference. Usage: {}.", command_usage(kind)),
+        },
+        CommandRefusal::UnexpectedArgument => match kind {
+            CommandKind::Slack => String::from(
+                "/slack reads one channel and accepts only its label (or list). Read: /slack <channel>. Post: /say <channel> <message>. Do not type the < > placeholders.",
+            ),
+            CommandKind::Help
+            | CommandKind::Status
+            | CommandKind::Runs
+            | CommandKind::Tickets
+            | CommandKind::New => {
+                format!(
+                    "/{} takes no arguments. Usage: {}.",
+                    kind.name(),
+                    command_usage(kind)
+                )
+            }
+            _ => format!(
+                "/{} received too many fields. Usage: {}.",
+                kind.name(),
+                command_usage(kind)
+            ),
+        },
+        CommandRefusal::ArgumentInvalid => {
+            if matches!(kind, CommandKind::Slack | CommandKind::Say)
+                && say_channel_is_invalid(kind, rest)
+            {
+                format!(
+                    "Invalid channel label. Use letters, numbers, - or _, without < > or quotes. Usage: {}.",
+                    command_usage(kind)
+                )
+            } else {
+                format!(
+                    "Invalid argument for /{}. Usage: {}.",
+                    kind.name(),
+                    command_usage(kind)
+                )
+            }
+        }
+        CommandRefusal::ArgumentTooLong => format!(
+            "An argument for /{} is too long. Usage: {}.",
+            kind.name(),
+            command_usage(kind)
+        ),
+        _ => refusal.operator_reply().to_owned(),
+    }
+}
+
+const fn command_usage(kind: CommandKind) -> &'static str {
+    match kind {
+        CommandKind::Help => "/help",
+        CommandKind::Status => "/status",
+        CommandKind::Runs => "/runs",
+        CommandKind::Tickets => "/tickets",
+        CommandKind::Ticket => "/ticket <reference>",
+        CommandKind::Slack => "/slack <channel|list>",
+        CommandKind::Memory => {
+            "/memory [search <query>|show <id>|proposals|approve <id>|deny <id>|sources <id>|link]"
+        }
+        CommandKind::Remember => "/remember <fact>",
+        CommandKind::Forget => "/forget <id>",
+        CommandKind::New => "/new",
+        CommandKind::GitHubCreate => "/github_create <repository> <request>",
+        CommandKind::GitHubReply => "/github_reply <issue-url> <reply>",
+        CommandKind::GitHubCheck => "/github_check <issue-url> <item>",
+        CommandKind::GitHubUncheck => "/github_uncheck <issue-url> <item>",
+        CommandKind::GitHubIssue => "/github_issue <request>",
+        CommandKind::GitHubLabel => "/github_label <request>",
+        CommandKind::GitHubMilestone => "/github_milestone <request>",
+        CommandKind::GitHubEpic => "/github_epic <request>",
+        CommandKind::GitHubProject => "/github_project <request>",
+        CommandKind::Work => "/work <reference>",
+        CommandKind::Run => "/run <task>",
+        CommandKind::Say => "/say <channel> <message>",
+        CommandKind::Cancel => "/cancel <reference>",
+        CommandKind::Approve => "/approve <reference>",
+        CommandKind::Deny => "/deny <reference>",
+        CommandKind::Admin => "/admin <add|remove|list> [user_id]",
+    }
+}
+
+fn say_channel_is_invalid(kind: CommandKind, rest: &str) -> bool {
+    if kind == CommandKind::Slack {
+        return true;
+    }
+    rest.split_whitespace()
+        .next()
+        .is_none_or(|channel| ChannelName::new(channel).is_err())
+}
 
 /// Refusals from building an allowlist, which is configuration rather than
 /// traffic and so cannot be answered with a reply.
@@ -1295,7 +1872,59 @@ fn parse_arguments(kind: CommandKind, rest: &str) -> Result<ControlCommand, Comm
         CommandKind::Ticket => {
             one_reference(rest).map(|ticket_ref| ControlCommand::Ticket { ticket_ref })
         }
-        CommandKind::Slack => one_channel(rest).map(|channel| ControlCommand::Slack { channel }),
+        CommandKind::Slack => one_channel(rest).map(|channel| {
+            if channel.as_str() == "list" {
+                ControlCommand::SlackList
+            } else {
+                ControlCommand::Slack { channel }
+            }
+        }),
+        CommandKind::Memory => {
+            one_memory_directive(rest).map(|directive| ControlCommand::Memory { directive })
+        }
+        CommandKind::Remember => RunTask::new(rest).map(|fact| ControlCommand::Remember { fact }),
+        CommandKind::Forget => {
+            one_reference(rest).map(|memory_ref| ControlCommand::Forget { memory_ref })
+        }
+        CommandKind::New => no_argument(rest).map(|()| ControlCommand::New),
+        CommandKind::GitHubCreate => {
+            one_github_repository_request(rest).map(|(repo_alias, request)| {
+                ControlCommand::GitHubCreate {
+                    repo_alias,
+                    request,
+                }
+            })
+        }
+        CommandKind::GitHubReply => {
+            let (issue_url, request) = one_github_issue_and_text(rest)?;
+            GitHubRequest::new(request)
+                .map(|request| ControlCommand::GitHubReply { issue_url, request })
+        }
+        CommandKind::GitHubCheck => {
+            let (issue_url, item) = one_github_issue_and_text(rest)?;
+            GitHubChecklistItem::new(item)
+                .map(|item| ControlCommand::GitHubCheck { issue_url, item })
+        }
+        CommandKind::GitHubUncheck => {
+            let (issue_url, item) = one_github_issue_and_text(rest)?;
+            GitHubChecklistItem::new(item)
+                .map(|item| ControlCommand::GitHubUncheck { issue_url, item })
+        }
+        CommandKind::GitHubIssue => {
+            GitHubRequest::new(rest).map(|request| ControlCommand::GitHubIssue { request })
+        }
+        CommandKind::GitHubLabel => {
+            GitHubRequest::new(rest).map(|request| ControlCommand::GitHubLabel { request })
+        }
+        CommandKind::GitHubMilestone => {
+            GitHubRequest::new(rest).map(|request| ControlCommand::GitHubMilestone { request })
+        }
+        CommandKind::GitHubEpic => {
+            GitHubRequest::new(rest).map(|request| ControlCommand::GitHubEpic { request })
+        }
+        CommandKind::GitHubProject => {
+            GitHubRequest::new(rest).map(|request| ControlCommand::GitHubProject { request })
+        }
         CommandKind::Say => {
             one_channel_message(rest).map(|(channel, text)| ControlCommand::Say { channel, text })
         }
@@ -1316,6 +1945,68 @@ fn parse_arguments(kind: CommandKind, rest: &str) -> Result<ControlCommand, Comm
             one_directive(rest).map(|directive| ControlCommand::Admin { directive })
         }
     }
+}
+
+fn one_memory_directive(rest: &str) -> Result<MemoryDirective, CommandRefusal> {
+    let rest = rest.trim();
+    if rest.is_empty() || rest.eq_ignore_ascii_case("summary") || rest.eq_ignore_ascii_case("list")
+    {
+        return Ok(MemoryDirective::Summary);
+    }
+    if rest.eq_ignore_ascii_case("proposals") {
+        return Ok(MemoryDirective::Proposals);
+    }
+    if rest.eq_ignore_ascii_case("link") {
+        return Ok(MemoryDirective::Link);
+    }
+    let (verb, argument) = rest
+        .split_once(char::is_whitespace)
+        .ok_or(CommandRefusal::ArgumentInvalid)?;
+    let argument = argument.trim();
+    if verb.eq_ignore_ascii_case("search") {
+        return RunTask::new(argument).map(|query| MemoryDirective::Search { query });
+    }
+    let memory_ref = one_reference(argument)?;
+    if verb.eq_ignore_ascii_case("show") {
+        Ok(MemoryDirective::Show { memory_ref })
+    } else if verb.eq_ignore_ascii_case("approve") {
+        Ok(MemoryDirective::Approve { memory_ref })
+    } else if verb.eq_ignore_ascii_case("deny") {
+        Ok(MemoryDirective::Deny { memory_ref })
+    } else if verb.eq_ignore_ascii_case("sources") {
+        Ok(MemoryDirective::Sources { memory_ref })
+    } else {
+        Err(CommandRefusal::ArgumentInvalid)
+    }
+}
+
+fn split_github_target_and_text(rest: &str) -> Result<(&str, &str), CommandRefusal> {
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return Err(CommandRefusal::MissingArgument);
+    }
+    let Some(boundary) = rest.find(char::is_whitespace) else {
+        return Err(CommandRefusal::MissingArgument);
+    };
+    let (target, text) = rest.split_at(boundary);
+    if text.trim().is_empty() {
+        return Err(CommandRefusal::MissingArgument);
+    }
+    Ok((target, text))
+}
+
+fn one_github_repository_request(
+    rest: &str,
+) -> Result<(GitHubRepoAlias, GitHubRequest), CommandRefusal> {
+    let (alias, request) = split_github_target_and_text(rest)?;
+    let alias = GitHubRepoAlias::new(alias)?;
+    GitHubRequest::new(request).map(|request| (alias, request))
+}
+
+fn one_github_issue_and_text(rest: &str) -> Result<(GitHubIssueUrl, &str), CommandRefusal> {
+    let (url, text) = split_github_target_and_text(rest)?;
+    let url = GitHubIssueUrl::new(url)?;
+    Ok((url, text))
 }
 
 /// Drop a bounded `@bot` suffix, refusing a malformed one.
@@ -1458,14 +2149,20 @@ mod tests {
             assert!(text.contains(entry.description), "{}", entry.name);
         }
         assert!(text.contains("/run <task>"));
-        assert!(text.contains("/slack <channel>"));
+        assert!(text.contains("/slack <channel|list>"));
         assert!(text.contains("/say <channel> <message>"));
         assert!(text.contains("/cancel <reference>"));
         assert!(text.contains("/ticket <reference>"));
+        assert!(text.contains("/github_create <repository> <request>"));
+        assert!(text.contains("/github_reply <issue-url> <reply>"));
+        assert!(text.contains("/github_check <issue-url> <item>"));
+        assert!(text.contains("/github_uncheck <issue-url> <item>"));
         assert!(!text.contains("/status <"));
         // The two ticket commands differ by one character and by their argument
         // shape, so the help an operator reads has to keep them apart.
         assert!(text.contains("/tickets — "));
+        assert!(text.contains("ask read-only questions in ordinary language"));
+        assert!(text.contains("actions still require an explicit command"));
     }
 
     #[test]
@@ -1494,6 +2191,223 @@ mod tests {
         );
         assert_eq!(CommandKind::from_name("ticket"), Some(CommandKind::Ticket));
         assert_eq!(CommandKind::from_name("ticketss"), None);
+    }
+
+    #[test]
+    fn memory_commands_have_a_closed_reviewable_grammar() {
+        assert_eq!(
+            parse_command("/memory"),
+            Ok(ControlCommand::Memory {
+                directive: MemoryDirective::Summary
+            })
+        );
+        assert_eq!(
+            parse_command("/memory search concise french replies"),
+            Ok(ControlCommand::Memory {
+                directive: MemoryDirective::Search {
+                    query: RunTask::new("concise french replies").expect("query")
+                }
+            })
+        );
+        for (verb, directive) in [
+            (
+                "show",
+                MemoryDirective::Show {
+                    memory_ref: ControlRef::new("M-42").expect("reference"),
+                },
+            ),
+            (
+                "approve",
+                MemoryDirective::Approve {
+                    memory_ref: ControlRef::new("M-42").expect("reference"),
+                },
+            ),
+            (
+                "deny",
+                MemoryDirective::Deny {
+                    memory_ref: ControlRef::new("M-42").expect("reference"),
+                },
+            ),
+            (
+                "sources",
+                MemoryDirective::Sources {
+                    memory_ref: ControlRef::new("M-42").expect("reference"),
+                },
+            ),
+        ] {
+            assert_eq!(
+                parse_command(&format!("/memory {verb} M-42")),
+                Ok(ControlCommand::Memory { directive })
+            );
+        }
+        assert_eq!(
+            parse_command("/remember replies should be concise"),
+            Ok(ControlCommand::Remember {
+                fact: RunTask::new("replies should be concise").expect("fact")
+            })
+        );
+        assert_eq!(
+            parse_command("/forget M-42"),
+            Ok(ControlCommand::Forget {
+                memory_ref: ControlRef::new("M-42").expect("reference")
+            })
+        );
+        assert_eq!(parse_command("/new"), Ok(ControlCommand::New));
+        assert_eq!(
+            parse_command("/memory erase M-42"),
+            Err(CommandRefusal::ArgumentInvalid)
+        );
+        assert_eq!(
+            parse_command("/new now"),
+            Err(CommandRefusal::UnexpectedArgument)
+        );
+        assert_eq!(CommandKind::Memory.tier(), CommandTier::Admin);
+        assert_eq!(CommandKind::Remember.tier(), CommandTier::Admin);
+        assert_eq!(CommandKind::Forget.tier(), CommandTier::Admin);
+        assert_eq!(CommandKind::New.tier(), CommandTier::Admin);
+    }
+
+    #[test]
+    fn github_commands_are_typed_bounded_and_distinct_from_support_tickets() {
+        let issue_url =
+            GitHubIssueUrl::new("https://github.com/acme/widgets/issues/42").expect("issue URL");
+        assert_eq!(
+            parse_command("/github_create Automonique corriger le menu mobile"),
+            Ok(ControlCommand::GitHubCreate {
+                repo_alias: GitHubRepoAlias::new("automonique").expect("alias"),
+                request: GitHubRequest::new("corriger le menu mobile").expect("request"),
+            })
+        );
+        assert_eq!(
+            parse_command("/github_reply https://github.com/acme/widgets/issues/42 réponse prête"),
+            Ok(ControlCommand::GitHubReply {
+                issue_url: issue_url.clone(),
+                request: GitHubRequest::new("réponse prête").expect("request"),
+            })
+        );
+        assert_eq!(
+            parse_command("/github_check https://github.com/acme/widgets/issues/42 tests validés"),
+            Ok(ControlCommand::GitHubCheck {
+                issue_url: issue_url.clone(),
+                item: GitHubChecklistItem::new("tests validés").expect("item"),
+            })
+        );
+        assert_eq!(
+            parse_command(
+                "/github_uncheck https://github.com/acme/widgets/issues/42 tests validés"
+            ),
+            Ok(ControlCommand::GitHubUncheck {
+                issue_url,
+                item: GitHubChecklistItem::new("tests validés").expect("item"),
+            })
+        );
+
+        for command in [
+            "/github_create",
+            "/github_create automonique",
+            "/github_reply",
+            "/github_reply https://github.com/acme/widgets/issues/42",
+            "/github_check https://github.com/acme/widgets/issues/42",
+            "/github_uncheck https://github.com/acme/widgets/issues/42",
+        ] {
+            assert_eq!(
+                parse_command(command),
+                Err(CommandRefusal::MissingArgument),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            parse_command("/ticket https://github.com/acme/widgets/issues/42"),
+            Err(CommandRefusal::ArgumentInvalid),
+            "a GitHub URL must not become an internal support-ticket reference"
+        );
+        assert_ne!(
+            parse_command("/github_check https://github.com/acme/widgets/issues/42 tests validés"),
+            parse_command(
+                "/github_uncheck https://github.com/acme/widgets/issues/42 tests validés"
+            )
+        );
+
+        for (command, kind) in [
+            (
+                "/github_issue ferme https://github.com/acme/widgets/issues/42",
+                CommandKind::GitHubIssue,
+            ),
+            (
+                "/github_label crée le label bug dans widgets",
+                CommandKind::GitHubLabel,
+            ),
+            (
+                "/github_milestone crée le jalon v2 dans widgets",
+                CommandKind::GitHubMilestone,
+            ),
+            (
+                "/github_epic ajoute 42 comme sous-ticket de 10",
+                CommandKind::GitHubEpic,
+            ),
+            (
+                "/github_project crée un projet privé roadmap",
+                CommandKind::GitHubProject,
+            ),
+        ] {
+            assert_eq!(
+                parse_command(command).as_ref().map(ControlCommand::kind),
+                Ok(kind)
+            );
+            assert_ne!(kind, CommandKind::Ticket);
+            assert_eq!(kind.tier(), CommandTier::Admin);
+        }
+    }
+
+    #[test]
+    fn github_issue_urls_and_action_text_have_closed_bounds() {
+        for invalid in [
+            "http://github.com/acme/widgets/issues/42",
+            "https://www.github.com/acme/widgets/issues/42",
+            "https://github.com/acme/widgets/pull/42",
+            "https://github.com/acme/widgets/issues/0",
+            "https://github.com/acme/widgets/issues/not-a-number",
+            "https://github.com/acme/widgets/issues/42/",
+            "https://github.com/acme/widgets/issues/42?view=1",
+            "https://github.com/acme/widgets/issues/42#comment",
+        ] {
+            assert_eq!(
+                GitHubIssueUrl::new(invalid),
+                Err(CommandRefusal::ArgumentInvalid),
+                "{invalid}"
+            );
+            assert_eq!(
+                parse_command(&format!("/github_reply {invalid} reply")),
+                Err(CommandRefusal::ArgumentInvalid),
+                "{invalid}"
+            );
+        }
+        assert_eq!(
+            GitHubRepoAlias::new("bad/alias"),
+            Err(CommandRefusal::ArgumentInvalid)
+        );
+        assert_eq!(
+            GitHubRepoAlias::new("a".repeat(MAX_GITHUB_REPO_ALIAS_BYTES + 1)),
+            Err(CommandRefusal::ArgumentTooLong)
+        );
+        assert_eq!(
+            parse_command(&format!(
+                "/github_reply https://github.com/acme/widgets/issues/42 {}",
+                "r".repeat(MAX_GITHUB_REQUEST_BYTES + 1)
+            )),
+            Err(CommandRefusal::ArgumentTooLong)
+        );
+        assert_eq!(
+            parse_command(&format!(
+                "/github_check https://github.com/acme/widgets/issues/42 {}",
+                "i".repeat(MAX_GITHUB_CHECKLIST_ITEM_BYTES + 1)
+            )),
+            Err(CommandRefusal::ArgumentTooLong)
+        );
+        assert_eq!(
+            parse_command("/github_create automonique bell\u{7}"),
+            Err(CommandRefusal::ArgumentInvalid)
+        );
     }
 
     /// `/work` reads a ticket and `/ticket` reads a ticket, and they are not the
@@ -1542,6 +2456,7 @@ mod tests {
                 channel: channel.clone()
             })
         );
+        assert_eq!(parse_command("/slack list"), Ok(ControlCommand::SlackList));
         assert_eq!(
             parse_command("/say ops bonjour"),
             Ok(ControlCommand::Say {
@@ -1647,6 +2562,30 @@ mod tests {
     }
 
     #[test]
+    fn refusal_text_explains_the_specific_command_shape() {
+        assert_eq!(
+            command_refusal_text("/say jean", CommandRefusal::MissingArgument),
+            "Missing the message to post. Usage: /say <channel> <message>. Example: /say jean yo"
+        );
+        assert_eq!(
+            command_refusal_text("/slack <jean> \"yo\"", CommandRefusal::UnexpectedArgument),
+            "/slack reads one channel and accepts only its label (or list). Read: /slack <channel>. Post: /say <channel> <message>. Do not type the < > placeholders."
+        );
+        assert_eq!(
+            command_refusal_text("/status now", CommandRefusal::UnexpectedArgument),
+            "/status takes no arguments. Usage: /status."
+        );
+        assert_eq!(
+            command_refusal_text(
+                "/say jean secret-looking text",
+                CommandRefusal::NotPermitted
+            ),
+            CommandRefusal::NotPermitted.operator_reply(),
+            "authorization refusals remain independent of command contents"
+        );
+    }
+
+    #[test]
     fn every_declared_argument_shape_matches_what_the_parser_accepts() {
         for entry in command_manifest() {
             let bare = parse_command(&format!("/{}", entry.name));
@@ -1732,6 +2671,68 @@ mod tests {
                         entry.name
                     );
                 }
+                ArgumentShape::MemoryDirective => {
+                    assert_eq!(
+                        bare.as_ref().map(ControlCommand::kind),
+                        Ok(entry.kind),
+                        "{}",
+                        entry.name
+                    );
+                    assert_eq!(
+                        with_argument,
+                        Err(CommandRefusal::ArgumentInvalid),
+                        "{}",
+                        entry.name
+                    );
+                    assert_eq!(
+                        parse_command(&format!("/{} proposals", entry.name))
+                            .as_ref()
+                            .map(ControlCommand::kind),
+                        Ok(entry.kind),
+                        "{}",
+                        entry.name
+                    );
+                }
+                ArgumentShape::GitHubRepositoryRequest => {
+                    assert_eq!(bare, Err(CommandRefusal::MissingArgument), "{}", entry.name);
+                    assert_eq!(
+                        with_argument,
+                        Err(CommandRefusal::MissingArgument),
+                        "{}",
+                        entry.name
+                    );
+                    assert_eq!(
+                        parse_command(&format!(
+                            "/{} automonique create a concise issue",
+                            entry.name
+                        ))
+                        .as_ref()
+                        .map(ControlCommand::kind),
+                        Ok(entry.kind),
+                        "{}",
+                        entry.name
+                    );
+                }
+                ArgumentShape::GitHubIssueRequest => {
+                    assert_eq!(bare, Err(CommandRefusal::MissingArgument), "{}", entry.name);
+                    assert_eq!(
+                        with_argument,
+                        Err(CommandRefusal::MissingArgument),
+                        "{}",
+                        entry.name
+                    );
+                    assert_eq!(
+                        parse_command(&format!(
+                            "/{} https://github.com/acme/widgets/issues/42 do the thing",
+                            entry.name
+                        ))
+                        .as_ref()
+                        .map(ControlCommand::kind),
+                        Ok(entry.kind),
+                        "{}",
+                        entry.name
+                    );
+                }
             }
         }
     }
@@ -1748,6 +2749,19 @@ mod tests {
             (CommandKind::Tickets, CommandTier::Allowed),
             (CommandKind::Ticket, CommandTier::Allowed),
             (CommandKind::Slack, CommandTier::Allowed),
+            (CommandKind::Memory, CommandTier::Admin),
+            (CommandKind::Remember, CommandTier::Admin),
+            (CommandKind::Forget, CommandTier::Admin),
+            (CommandKind::New, CommandTier::Admin),
+            (CommandKind::GitHubCreate, CommandTier::Admin),
+            (CommandKind::GitHubReply, CommandTier::Admin),
+            (CommandKind::GitHubCheck, CommandTier::Admin),
+            (CommandKind::GitHubUncheck, CommandTier::Admin),
+            (CommandKind::GitHubIssue, CommandTier::Admin),
+            (CommandKind::GitHubLabel, CommandTier::Admin),
+            (CommandKind::GitHubMilestone, CommandTier::Admin),
+            (CommandKind::GitHubEpic, CommandTier::Admin),
+            (CommandKind::GitHubProject, CommandTier::Admin),
             (CommandKind::Work, CommandTier::Admin),
             (CommandKind::Run, CommandTier::Admin),
             (CommandKind::Say, CommandTier::Admin),
@@ -1766,6 +2780,19 @@ mod tests {
             let effectful = matches!(
                 kind,
                 CommandKind::Run
+                    | CommandKind::Memory
+                    | CommandKind::Remember
+                    | CommandKind::Forget
+                    | CommandKind::New
+                    | CommandKind::GitHubCreate
+                    | CommandKind::GitHubReply
+                    | CommandKind::GitHubCheck
+                    | CommandKind::GitHubUncheck
+                    | CommandKind::GitHubIssue
+                    | CommandKind::GitHubLabel
+                    | CommandKind::GitHubMilestone
+                    | CommandKind::GitHubEpic
+                    | CommandKind::GitHubProject
                     | CommandKind::Work
                     | CommandKind::Say
                     | CommandKind::Cancel
@@ -1901,8 +2928,16 @@ mod tests {
                 ArgumentShape::Task => format!("/{} do the thing", kind.name()),
                 ArgumentShape::Reference => format!("/{} SUP-1042", kind.name()),
                 ArgumentShape::Directive => format!("/{} list", kind.name()),
+                ArgumentShape::MemoryDirective => format!("/{} proposals", kind.name()),
                 ArgumentShape::Channel => format!("/{} ops", kind.name()),
                 ArgumentShape::ChannelMessage => format!("/{} ops bonjour", kind.name()),
+                ArgumentShape::GitHubRepositoryRequest => {
+                    format!("/{} automonique create a concise issue", kind.name())
+                }
+                ArgumentShape::GitHubIssueRequest => format!(
+                    "/{} https://github.com/acme/widgets/issues/42 do the thing",
+                    kind.name()
+                ),
             };
             // The administrator's parse is exactly the untiered one.
             assert_eq!(

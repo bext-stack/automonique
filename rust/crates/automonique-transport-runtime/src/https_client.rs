@@ -8,7 +8,7 @@
 //!
 //! No caller supplies a URL, a host, or a method name. The inbound plan names
 //! its single method through [`TelegramTarget`], the outbound plan names its
-//! closed pair through [`TelegramOutbound`], and both funnel into one private
+//! closed set through [`TelegramOutbound`], and all funnel into one private
 //! [`WireMethod`] enum that is the only thing a request path is ever rendered
 //! from. A control layer that is talked into asking for something else cannot
 //! spell it: there is no variant for it, and no string from a message ever
@@ -40,6 +40,7 @@ use crate::{
 const TELEGRAM_ORIGIN: &str = "https://api.telegram.org";
 const HTTP_TRANSPORT_ALLOWANCE_SECONDS: u64 = 3;
 const MAX_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
+const MAX_RETRY_AFTER_SECONDS: u64 = 300;
 const _: () = assert!((log::STATIC_MAX_LEVEL as usize) <= (log::LevelFilter::Debug as usize));
 
 /// Whole-request budget for an outbound call, which never long-polls.
@@ -137,11 +138,21 @@ impl TelegramHttpsClient {
         if cancellation.is_cancelled() {
             return Err(HttpFailure::Cancelled);
         }
+        let status = response.status().as_u16();
+        if status == 429 {
+            let retry_after_ms = retry_after_millis(
+                response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok()),
+            );
+            return Err(HttpFailure::RateLimited { retry_after_ms });
+        }
         let content_type = response
             .headers()
             .get("content-type")
             .and_then(|value| value.to_str().ok());
-        validate_response_metadata(response.status().as_u16(), content_type)?;
+        validate_response_metadata(status, content_type)?;
 
         let reader = response
             .body_mut()
@@ -203,6 +214,7 @@ impl TelegramOutboundClient for TelegramHttpsClient {
 enum WireMethod {
     GetUpdates,
     SendMessage,
+    SetMessageReaction,
     SetMyCommands,
 }
 
@@ -211,6 +223,7 @@ impl WireMethod {
         match self {
             Self::GetUpdates => "getUpdates",
             Self::SendMessage => "sendMessage",
+            Self::SetMessageReaction => "setMessageReaction",
             Self::SetMyCommands => "setMyCommands",
         }
     }
@@ -301,6 +314,8 @@ pub enum OutboundRefusal {
     Text,
     /// A reply target was named but is not a positive message id.
     ReplyTarget,
+    /// A reaction target is not a positive message id.
+    MessageId,
     /// A command name is empty, over-long, repeated, or outside Telegram's
     /// lowercase `a-z0-9_` grammar.
     CommandName,
@@ -308,6 +323,9 @@ pub enum OutboundRefusal {
     CommandDescription,
     /// The command list is empty or over Telegram's ceiling.
     CommandCount,
+    /// An inline approval callback is empty, over Telegram's 64-byte limit, or
+    /// control-bearing.
+    CallbackData,
 }
 
 impl OutboundRefusal {
@@ -319,9 +337,11 @@ impl OutboundRefusal {
             Self::ChatId => "chat_id",
             Self::Text => "text",
             Self::ReplyTarget => "reply_target",
+            Self::MessageId => "message_id",
             Self::CommandName => "command_name",
             Self::CommandDescription => "command_description",
             Self::CommandCount => "command_count",
+            Self::CallbackData => "callback_data",
         }
     }
 }
@@ -342,7 +362,68 @@ impl Error for OutboundRefusal {}
 pub struct SendMessageRequest {
     chat_id: i64,
     text: String,
+    style: TelegramTextStyle,
     reply_to_message_id: Option<i64>,
+    approval_keyboard: Option<ApprovalKeyboard>,
+}
+
+/// A fixed two-choice inline keyboard for an exact durable approval challenge.
+///
+/// Labels are product vocabulary rather than model output. Only the opaque,
+/// single-use callback coordinates vary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalKeyboard {
+    approve_callback: String,
+    revise_callback: String,
+}
+
+impl ApprovalKeyboard {
+    /// Bind the two fixed buttons to bounded opaque callback values.
+    pub fn new(
+        approve_callback: impl Into<String>,
+        revise_callback: impl Into<String>,
+    ) -> Result<Self, OutboundRefusal> {
+        let approve_callback = approve_callback.into();
+        let revise_callback = revise_callback.into();
+        for callback in [&approve_callback, &revise_callback] {
+            if callback.is_empty() || callback.len() > 64 || callback.chars().any(char::is_control)
+            {
+                return Err(OutboundRefusal::CallbackData);
+            }
+        }
+        if approve_callback == revise_callback {
+            return Err(OutboundRefusal::CallbackData);
+        }
+        Ok(Self {
+            approve_callback,
+            revise_callback,
+        })
+    }
+
+    /// Opaque callback bound to the affirmative choice.
+    #[must_use]
+    pub fn approve_callback(&self) -> &str {
+        &self.approve_callback
+    }
+
+    /// Opaque callback bound to the request-changes choice.
+    #[must_use]
+    pub fn revise_callback(&self) -> &str {
+        &self.revise_callback
+    }
+}
+
+/// How Telegram should present a `sendMessage` text.
+///
+/// The preformatted form is rendered with an explicit `pre` message entity,
+/// not a parse mode. That keeps the caller's text unchanged and avoids giving
+/// arbitrary output any markup semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TelegramTextStyle {
+    /// Ordinary Telegram message text.
+    Plain,
+    /// One monospaced, preformatted block spanning the complete text.
+    Preformatted,
 }
 
 impl SendMessageRequest {
@@ -361,10 +442,45 @@ impl SendMessageRequest {
         text: impl Into<String>,
         reply_to_message_id: Option<i64>,
     ) -> Result<Self, OutboundRefusal> {
+        Self::with_style(
+            chat_id,
+            text.into(),
+            TelegramTextStyle::Plain,
+            reply_to_message_id,
+        )
+    }
+
+    /// Validate output that Telegram should display as one preformatted block.
+    ///
+    /// The eventual wire body carries an explicit `pre` entity over the whole
+    /// text. The text itself is not escaped or interpreted, so provider and
+    /// command output containing Telegram markup characters remains exact.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same closed refusals as [`Self::new`].
+    pub fn new_preformatted(
+        chat_id: i64,
+        text: impl Into<String>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<Self, OutboundRefusal> {
+        Self::with_style(
+            chat_id,
+            text.into(),
+            TelegramTextStyle::Preformatted,
+            reply_to_message_id,
+        )
+    }
+
+    fn with_style(
+        chat_id: i64,
+        text: String,
+        style: TelegramTextStyle,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<Self, OutboundRefusal> {
         if chat_id == 0 {
             return Err(OutboundRefusal::ChatId);
         }
-        let text = text.into();
         if !is_sendable_text(&text) {
             return Err(OutboundRefusal::Text);
         }
@@ -374,8 +490,23 @@ impl SendMessageRequest {
         Ok(Self {
             chat_id,
             text,
+            style,
             reply_to_message_id,
+            approval_keyboard: None,
         })
+    }
+
+    /// Attach the fixed approval/request-changes keyboard.
+    #[must_use]
+    pub fn with_approval_keyboard(mut self, keyboard: ApprovalKeyboard) -> Self {
+        self.approval_keyboard = Some(keyboard);
+        self
+    }
+
+    /// Inline approval controls, when this message presents a gate.
+    #[must_use]
+    pub const fn approval_keyboard(&self) -> Option<&ApprovalKeyboard> {
+        self.approval_keyboard.as_ref()
     }
 
     /// Chat this message is addressed to.
@@ -388,6 +519,12 @@ impl SendMessageRequest {
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// The presentation attached to this message text.
+    #[must_use]
+    pub const fn style(&self) -> TelegramTextStyle {
+        self.style
     }
 
     /// The message this reply is threaded under, if any.
@@ -410,7 +547,52 @@ impl fmt::Debug for SendMessageRequest {
                 "text",
                 &format_args!("<redacted:{} bytes>", self.text.len()),
             )
+            .field("style", &self.style)
+            .field("approval_keyboard", &self.approval_keyboard.is_some())
             .finish()
+    }
+}
+
+/// A validated fixed 👀 acknowledgement for one Telegram message.
+///
+/// The emoji is deliberately not caller-selected: this surface needs one
+/// closed acknowledgement and no general reaction vocabulary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetMessageReactionRequest {
+    chat_id: i64,
+    message_id: i64,
+}
+
+impl SetMessageReactionRequest {
+    /// Validate the exact chat and message coordinates to acknowledge.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboundRefusal::ChatId`] for a zero chat and
+    /// [`OutboundRefusal::MessageId`] for a non-positive message id.
+    pub fn looking(chat_id: i64, message_id: i64) -> Result<Self, OutboundRefusal> {
+        if chat_id == 0 {
+            return Err(OutboundRefusal::ChatId);
+        }
+        if message_id <= 0 {
+            return Err(OutboundRefusal::MessageId);
+        }
+        Ok(Self {
+            chat_id,
+            message_id,
+        })
+    }
+
+    /// Chat containing the acknowledged message.
+    #[must_use]
+    pub const fn chat_id(&self) -> i64 {
+        self.chat_id
+    }
+
+    /// Message receiving the acknowledgement.
+    #[must_use]
+    pub const fn message_id(&self) -> i64 {
+        self.message_id
     }
 }
 
@@ -520,6 +702,8 @@ impl SetMyCommandsRequest {
 pub enum TelegramOutbound {
     /// Deliver one message to one chat.
     SendMessage(SendMessageRequest),
+    /// Acknowledge one message with the fixed 👀 reaction.
+    SetMessageReaction(SetMessageReactionRequest),
     /// Replace the advertised command menu.
     SetMyCommands(SetMyCommandsRequest),
 }
@@ -528,6 +712,7 @@ impl TelegramOutbound {
     const fn wire_method(&self) -> WireMethod {
         match self {
             Self::SendMessage(_) => WireMethod::SendMessage,
+            Self::SetMessageReaction(_) => WireMethod::SetMessageReaction,
             Self::SetMyCommands(_) => WireMethod::SetMyCommands,
         }
     }
@@ -551,11 +736,30 @@ impl TelegramOutbound {
                 body.push_str(&request.chat_id.to_string());
                 body.push_str(",\"text\":");
                 push_json_string(&mut body, &request.text);
+                if request.style == TelegramTextStyle::Preformatted {
+                    body.push_str(",\"entities\":[{\"type\":\"pre\",\"offset\":0,\"length\":");
+                    body.push_str(&utf16_units(&request.text).to_string());
+                    body.push_str("}]");
+                }
                 if let Some(reply_to) = request.reply_to_message_id {
                     body.push_str(",\"reply_to_message_id\":");
                     body.push_str(&reply_to.to_string());
                 }
+                if let Some(keyboard) = &request.approval_keyboard {
+                    body.push_str(",\"reply_markup\":{\"inline_keyboard\":[[{\"text\":\"Approve\",\"callback_data\":");
+                    push_json_string(&mut body, &keyboard.approve_callback);
+                    body.push_str("},{\"text\":\"Request changes\",\"callback_data\":");
+                    push_json_string(&mut body, &keyboard.revise_callback);
+                    body.push_str("}]]}");
+                }
                 body.push('}');
+            }
+            Self::SetMessageReaction(request) => {
+                body.push_str("{\"chat_id\":");
+                body.push_str(&request.chat_id.to_string());
+                body.push_str(",\"message_id\":");
+                body.push_str(&request.message_id.to_string());
+                body.push_str(",\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👀\"}]}");
             }
             Self::SetMyCommands(request) => {
                 body.push_str("{\"commands\":[");
@@ -707,6 +911,10 @@ fn is_sendable_text(text: &str) -> bool {
     true
 }
 
+fn utf16_units(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
+}
+
 /// Append one JSON string literal, escaping every character JSON requires.
 ///
 /// Written out rather than delegated because this crate carries no JSON
@@ -762,6 +970,14 @@ fn validate_response_metadata(status: u16, content_type: Option<&str>) -> Result
         return Err(HttpFailure::UnexpectedContentType);
     }
     Ok(())
+}
+
+fn retry_after_millis(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(1)
+        .clamp(1, MAX_RETRY_AFTER_SECONDS)
+        .saturating_mul(1_000)
 }
 
 fn read_bounded_body(mut reader: impl Read) -> Result<Vec<u8>, HttpFailure> {
@@ -887,6 +1103,15 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_is_bounded_and_never_becomes_a_busy_loop() {
+        assert_eq!(retry_after_millis(None), 1_000);
+        assert_eq!(retry_after_millis(Some("0")), 1_000);
+        assert_eq!(retry_after_millis(Some(" 12 ")), 12_000);
+        assert_eq!(retry_after_millis(Some("999999")), 300_000);
+        assert_eq!(retry_after_millis(Some("not-a-number")), 1_000);
+    }
+
+    #[test]
     fn response_body_cap_accepts_boundary_and_refuses_one_over() {
         let at_limit = vec![0_u8; MAX_TELEGRAM_RESPONSE_BYTES];
         assert_eq!(
@@ -933,13 +1158,45 @@ mod tests {
     }
 
     #[test]
-    fn outbound_urls_are_exact_and_reach_only_the_two_permitted_methods() {
+    fn approval_buttons_render_as_fixed_labels_and_opaque_callbacks() {
+        let keyboard = ApprovalKeyboard::new("imp:a:plan:opaque-nonce", "imp:r:plan:opaque-nonce")
+            .expect("keyboard");
+        let outbound = TelegramOutbound::SendMessage(
+            SendMessageRequest::new(7, "Plan ready", None)
+                .expect("message")
+                .with_approval_keyboard(keyboard),
+        );
+        assert_eq!(
+            outbound.canonical_body(),
+            r#"{"chat_id":7,"text":"Plan ready","reply_markup":{"inline_keyboard":[[{"text":"Approve","callback_data":"imp:a:plan:opaque-nonce"},{"text":"Request changes","callback_data":"imp:r:plan:opaque-nonce"}]]}}"#
+        );
+        assert_eq!(
+            ApprovalKeyboard::new("same", "same").err(),
+            Some(OutboundRefusal::CallbackData)
+        );
+        assert_eq!(
+            ApprovalKeyboard::new("x".repeat(65), "different").err(),
+            Some(OutboundRefusal::CallbackData)
+        );
+    }
+
+    #[test]
+    fn outbound_urls_are_exact_and_reach_only_the_permitted_methods() {
         let token = OpaqueBotToken::new(b"42:fixture-token".to_vec()).expect("token");
         let sending = PreparedRequest::from_outbound(&outbound_plan(&token, send_message("hi")))
             .expect("prepare send");
         assert_eq!(
             sending.url,
             "https://api.telegram.org/bot42:fixture-token/sendMessage"
+        );
+        let reacting = TelegramOutbound::SetMessageReaction(
+            SetMessageReactionRequest::looking(-1_001, 17).expect("reaction"),
+        );
+        let reacting = PreparedRequest::from_outbound(&outbound_plan(&token, reacting))
+            .expect("prepare reaction");
+        assert_eq!(
+            reacting.url,
+            "https://api.telegram.org/bot42:fixture-token/setMessageReaction"
         );
         let menu = TelegramOutbound::SetMyCommands(
             SetMyCommandsRequest::new([TelegramBotCommand::new(
@@ -956,10 +1213,14 @@ mod tests {
             "https://api.telegram.org/bot42:fixture-token/setMyCommands"
         );
 
-        // The lock is the enum: these three renderings are the complete set of
+        // The lock is the enum: these renderings are the complete set of
         // request paths this module can produce.
         assert_eq!(WireMethod::GetUpdates.as_str(), "getUpdates");
         assert_eq!(WireMethod::SendMessage.as_str(), "sendMessage");
+        assert_eq!(
+            WireMethod::SetMessageReaction.as_str(),
+            "setMessageReaction"
+        );
         assert_eq!(WireMethod::SetMyCommands.as_str(), "setMyCommands");
     }
 
@@ -1033,6 +1294,30 @@ mod tests {
         assert_eq!(
             hostile.canonical_body(),
             r#"{"chat_id":7,"text":"quote\" slash\\ line\n tab\t"}"#
+        );
+    }
+
+    #[test]
+    fn eyes_reaction_body_and_bounds_are_exact() {
+        let reaction = TelegramOutbound::SetMessageReaction(
+            SetMessageReactionRequest::looking(-1_001, 31).expect("reaction"),
+        );
+        assert_eq!(reaction.method_name(), "setMessageReaction");
+        assert_eq!(
+            reaction.canonical_body(),
+            r#"{"chat_id":-1001,"message_id":31,"reaction":[{"type":"emoji","emoji":"👀"}]}"#
+        );
+        assert_eq!(
+            SetMessageReactionRequest::looking(0, 31).err(),
+            Some(OutboundRefusal::ChatId)
+        );
+        assert_eq!(
+            SetMessageReactionRequest::looking(7, 0).err(),
+            Some(OutboundRefusal::MessageId)
+        );
+        assert_eq!(
+            SetMessageReactionRequest::looking(7, -1).err(),
+            Some(OutboundRefusal::MessageId)
         );
     }
 

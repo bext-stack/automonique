@@ -25,14 +25,16 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use automonique_github_connector::{
-    Attribution, ChecklistItem, CommentRequest, CreateIssueRequest, GITHUB_ACCEPT,
-    GITHUB_API_VERSION, GITHUB_USER_AGENT, GetCommentsRequest, GetIssueRequest, GitHubBase,
-    GitHubClient, GitHubFailure, GitHubOperation, GitHubToken, IssueBodyText, IssueFilter,
-    IssueListState, IssueNumber, IssuePriority, IssueSource, IssueState, IssueStatus, IssueTitle,
-    Label, ListIssuesRequest, MAX_GITHUB_RESPONSE_BYTES, Page, RejectionKind, ReplaceLabelsRequest,
-    RepoMap, RepoRule, RepoTarget, SearchIssuesRequest, SetStateRequest, Since, SiteId, TenantId,
-    TenantIssue, ThreadId, TicketDraft, TicketExchange, body_carries_marker, marker_thread_id,
-    ticket_labels,
+    Attribution, ChecklistItem, CommentId, CommentRequest, CreateIssueRequest, EntityTag,
+    GITHUB_ACCEPT, GITHUB_API_VERSION, GITHUB_USER_AGENT, GetCommentsRequest,
+    GetIssueCommentRequest, GetIssueRequest, GitHubBase, GitHubClient, GitHubFailure,
+    GitHubOperation, GitHubToken, IssueBodyText, IssueFilter, IssueListState, IssueNumber,
+    IssuePriority, IssueSource, IssueState, IssueStatus, IssueTitle, Label, LabelColor,
+    ListIssuesRequest, ListLabelsRequest, MAX_GITHUB_RESPONSE_BYTES, ManagementName,
+    ManagementRequest, Page, RejectionKind, ReplaceLabelsRequest, RepoMap, RepoRule, RepoTarget,
+    SearchIssuesRequest, SetStateRequest, Since, SiteId, TenantId, TenantIssue, ThreadId,
+    TicketDraft, TicketExchange, UpdateIssueBodyRequest, UpdateIssueCommentRequest,
+    body_carries_marker, marker_thread_id, ticket_labels,
 };
 
 /// Bound on every server-side wait. A test that would otherwise hang fails here.
@@ -302,6 +304,15 @@ fn issue_json() -> String {
     )
 }
 
+fn comment_json(body: &str) -> String {
+    format!(
+        "{{\"id\":9001,\"user\":{{\"login\":\"octocat\"}},\"body\":{},\
+         \"created_at\":\"2026-08-13T17:04:11Z\",\
+         \"updated_at\":\"2026-08-13T17:05:11Z\"}}",
+        serde_json::to_string(body).expect("fixture body")
+    )
+}
+
 /// Every request must be one this connector is allowed to make.
 fn assert_wire_shape(captured: &Captured, method: &str, path: &str) {
     assert_eq!(
@@ -360,6 +371,43 @@ fn the_create_issue_operation_sends_its_exact_request_and_parses_the_issue_back(
     assert_eq!(issue.updated_at, "2026-08-13T17:04:11Z");
     assert_eq!(issue.closed_at, None);
     assert_eq!(issue.body, "corps");
+}
+
+#[test]
+fn a_typed_management_delete_accepts_an_empty_204_response() {
+    let fake = FakeGitHub::spawn(vec![Canned::status(204, "")]);
+    let client = github_client(&fake);
+    let request = ManagementRequest::delete_label(
+        target(),
+        ManagementName::new("needs docs").expect("label name"),
+    );
+    let reply = client.manage(&request).expect("management reply");
+    assert!(reply.accepted().expect("accepted").value().is_none());
+    let captured = fake.only_request();
+    assert_wire_shape(
+        &captured,
+        "DELETE",
+        "/repos/example-org/example-repo/labels/needs%20docs",
+    );
+    assert!(captured.body.is_empty());
+}
+
+#[test]
+fn a_typed_management_create_serializes_json_without_interpolation() {
+    let fake = FakeGitHub::spawn(vec![Canned::status(201, "{\"id\":1}")]);
+    let client = github_client(&fake);
+    let request = ManagementRequest::create_label(
+        target(),
+        ManagementName::new("bug").expect("name"),
+        LabelColor::new("#ff00aa").expect("color"),
+        None,
+    );
+    client.manage(&request).expect("management reply");
+    let captured = fake.only_request();
+    assert_wire_shape(&captured, "POST", "/repos/example-org/example-repo/labels");
+    let body: serde_json::Value = serde_json::from_str(&captured.body).expect("json body");
+    assert_eq!(body["name"], "bug");
+    assert_eq!(body["color"], "ff00aa");
 }
 
 #[test]
@@ -459,6 +507,187 @@ fn the_replace_labels_operation_puts_the_complete_set_and_reads_it_back() {
         reply.accepted().expect("accepted labels"),
         &vec!["prio:urgent".to_owned(), "tenant:Milo".to_owned()]
     );
+}
+
+#[test]
+fn a_versioned_issue_read_retains_the_exact_etag() {
+    let fake = FakeGitHub::spawn(vec![
+        Canned::json(&issue_json()).with_header("etag", "W/\"issue-v1\""),
+    ]);
+    let client = github_client(&fake);
+
+    let reply = client
+        .get_issue_versioned(&GetIssueRequest::new(target(), number()))
+        .expect("call");
+
+    let captured = fake.only_request();
+    assert_wire_shape(
+        &captured,
+        "GET",
+        "/repos/example-org/example-repo/issues/42",
+    );
+    assert_eq!(captured.header("if-match"), None);
+    let versioned = reply.accepted().expect("accepted issue");
+    assert_eq!(versioned.value().number.get(), 42);
+    assert_eq!(versioned.etag().as_str(), "W/\"issue-v1\"");
+}
+
+#[test]
+fn an_issue_body_update_sends_if_match_and_returns_the_new_version() {
+    let changed = issue_json().replace("\"body\":\"corps\"", "\"body\":\"corps modifie\"");
+    let fake = FakeGitHub::spawn(vec![
+        Canned::json(&changed).with_header("etag", "\"issue-v2\""),
+    ]);
+    let client = github_client(&fake);
+    let request = UpdateIssueBodyRequest::new(
+        target(),
+        number(),
+        IssueBodyText::new("corps modifie").expect("body"),
+        EntityTag::new("W/\"issue-v1\"").expect("etag"),
+    );
+
+    let reply = client.update_issue_body(&request).expect("call");
+
+    let captured = fake.only_request();
+    assert_wire_shape(
+        &captured,
+        "PATCH",
+        "/repos/example-org/example-repo/issues/42",
+    );
+    assert_eq!(captured.header("if-match"), Some("W/\"issue-v1\""));
+    assert_eq!(captured.header("content-type"), Some("application/json"));
+    assert_eq!(captured.body, "{\"body\":\"corps modifie\"}");
+    let changed = reply.accepted().expect("accepted update");
+    assert_eq!(changed.value().body, "corps modifie");
+    assert_eq!(changed.etag().as_str(), "\"issue-v2\"");
+}
+
+#[test]
+fn a_comment_can_be_read_and_conditionally_updated_by_its_typed_id() {
+    let fake = FakeGitHub::spawn(vec![
+        Canned::json(&comment_json("a faire")).with_header("etag", "\"comment-v1\""),
+        Canned::json(&comment_json("fait")).with_header("etag", "\"comment-v2\""),
+    ]);
+    let client = github_client(&fake);
+    let comment_id = CommentId::new(9_001).expect("comment id");
+
+    let read = client
+        .get_issue_comment(&GetIssueCommentRequest::new(target(), comment_id))
+        .expect("read")
+        .into_outcome()
+        .accepted()
+        .cloned()
+        .expect("accepted read");
+    assert_eq!(read.value().body, "a faire");
+    let update = UpdateIssueCommentRequest::new(
+        target(),
+        comment_id,
+        IssueBodyText::new("fait").expect("body"),
+        read.etag().clone(),
+    );
+    let changed = client
+        .update_issue_comment(&update)
+        .expect("update")
+        .into_outcome()
+        .accepted()
+        .cloned()
+        .expect("accepted update");
+
+    let captured = fake.captured();
+    assert_eq!(captured.len(), 2);
+    assert_wire_shape(
+        &captured[0],
+        "GET",
+        "/repos/example-org/example-repo/issues/comments/9001",
+    );
+    assert_wire_shape(
+        &captured[1],
+        "PATCH",
+        "/repos/example-org/example-repo/issues/comments/9001",
+    );
+    assert_eq!(captured[1].header("if-match"), Some("\"comment-v1\""));
+    assert_eq!(captured[1].body, "{\"body\":\"fait\"}");
+    assert_eq!(changed.value().body, "fait");
+    assert_eq!(changed.etag().as_str(), "\"comment-v2\"");
+}
+
+#[test]
+fn a_precondition_failure_is_a_rejected_reply_and_is_never_decoded_as_success() {
+    let fake = FakeGitHub::spawn(vec![Canned::status(
+        412,
+        "{\"message\":\"ETag no longer matches\"}",
+    )]);
+    let client = github_client(&fake);
+    let request = UpdateIssueBodyRequest::new(
+        target(),
+        number(),
+        IssueBodyText::new("nouveau corps").expect("body"),
+        EntityTag::new("\"stale\"").expect("etag"),
+    );
+
+    let reply = client.update_issue_body(&request).expect("call");
+
+    let captured = fake.only_request();
+    assert_eq!(captured.header("if-match"), Some("\"stale\""));
+    let rejection = reply.rejected().expect("rejected");
+    assert_eq!(rejection.status(), 412);
+    assert_eq!(rejection.kind(), RejectionKind::Other);
+    assert_eq!(rejection.message().as_str(), "ETag no longer matches");
+}
+
+#[test]
+fn repository_labels_are_paged_and_bounded_by_the_requested_size() {
+    let fake = FakeGitHub::spawn(vec![Canned::json(
+        "[{\"name\":\"bug\"},{\"name\":\"needs, triage\"}]",
+    )]);
+    let client = github_client(&fake);
+    let reply = client
+        .list_labels(&ListLabelsRequest::new(
+            target(),
+            Page::new(2, 100).expect("page"),
+        ))
+        .expect("call");
+    assert_wire_shape(
+        &fake.only_request(),
+        "GET",
+        "/repos/example-org/example-repo/labels?per_page=100&page=2",
+    );
+    assert_eq!(
+        reply.accepted().expect("labels"),
+        &vec!["bug".to_owned(), "needs, triage".to_owned()]
+    );
+
+    let fake = FakeGitHub::spawn(vec![Canned::json(
+        "[{\"name\":\"one\"},{\"name\":\"two\"}]",
+    )]);
+    let client = github_client(&fake);
+    assert_eq!(
+        client
+            .list_labels(&ListLabelsRequest::new(
+                target(),
+                Page::new(1, 1).expect("page"),
+            ))
+            .err(),
+        Some(GitHubFailure::TooManyItems)
+    );
+}
+
+#[test]
+fn a_versioned_success_requires_one_bounded_valid_etag() {
+    for canned in [
+        Canned::json(&issue_json()),
+        Canned::json(&issue_json()).with_header("etag", "not-quoted"),
+    ] {
+        let fake = FakeGitHub::spawn(vec![canned]);
+        let client = github_client(&fake);
+        let failure = client
+            .get_issue_versioned(&GetIssueRequest::new(target(), number()))
+            .expect_err("must refuse invalid version");
+        assert!(matches!(
+            failure,
+            GitHubFailure::MissingField | GitHubFailure::FieldOutOfBounds
+        ));
+    }
 }
 
 #[test]

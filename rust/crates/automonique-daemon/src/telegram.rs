@@ -233,9 +233,11 @@ pub(crate) enum TelegramEnablement {
 
 /// Everything live control needs, and nothing that does not belong to it.
 ///
-/// Two tokens because the inbound and outbound transports each own one for
-/// their own lifetime; both are the same credential, and both are redacted,
-/// borrow-only and zeroed on drop.
+/// Three tokens because inbound polling, immediate outbound control, and
+/// background question answers each own one for their own lifetime. All are
+/// the same credential, independently constructed because the opaque type is
+/// deliberately not cloneable, and all are redacted, borrow-only and zeroed on
+/// drop.
 #[derive(Debug)]
 pub(crate) struct LiveControl {
     /// The configured operator roster, from which the transport policy and the
@@ -246,6 +248,8 @@ pub(crate) struct LiveControl {
     inbound_token: OpaqueBotToken,
     /// Credential replies and the menu spend.
     outbound_token: OpaqueBotToken,
+    /// Credential background question answers spend.
+    question_outbound_token: OpaqueBotToken,
 }
 
 impl TelegramBotConfig {
@@ -428,10 +432,13 @@ impl LiveControl {
         // type deliberately offers no `Clone`.
         let outbound_token = OpaqueBotToken::new(token_line.as_bytes().to_vec())
             .map_err(|_| TelegramConfigError::TokenInvalid)?;
+        let question_outbound_token = OpaqueBotToken::new(token_line.as_bytes().to_vec())
+            .map_err(|_| TelegramConfigError::TokenInvalid)?;
         Ok(Self {
             roster,
             inbound_token,
             outbound_token,
+            question_outbound_token,
         })
     }
 }
@@ -607,9 +614,24 @@ impl TelegramHost {
     /// host with no Telegram configuration drops it here, which is exactly
     /// right: nothing would ever have called it, and the credential should not
     /// outlive the surface that could.
+    #[cfg(test)]
     pub(crate) fn open(
         params: &TelegramHostParams<'_>,
         slack: crate::slack::SlackHost,
+    ) -> Result<Self, TelegramHostError> {
+        Self::open_with_ticket_gates(
+            params,
+            slack,
+            Arc::new(Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+        )
+    }
+
+    pub(crate) fn open_with_ticket_gates(
+        params: &TelegramHostParams<'_>,
+        slack: crate::slack::SlackHost,
+        ticket_gates: Arc<Mutex<crate::telegram_bridge::TicketGateRegistry>>,
     ) -> Result<Self, TelegramHostError> {
         let Some(config) =
             TelegramBotConfig::load(params.state_dir).map_err(TelegramHostError::Config)?
@@ -634,7 +656,7 @@ impl TelegramHost {
         else {
             return Ok(Self::LeaseOwned { coordinator });
         };
-        let bridge = Self::compose(params, bot_id, *live, slack)?;
+        let bridge = Self::compose(params, bot_id, *live, slack, ticket_gates)?;
         Ok(Self::Live {
             coordinator,
             control: Box::new(PollerControl {
@@ -653,6 +675,7 @@ impl TelegramHost {
         bot_id: i64,
         live: LiveControl,
         slack: crate::slack::SlackHost,
+        ticket_gates: Arc<Mutex<crate::telegram_bridge::TicketGateRegistry>>,
     ) -> Result<LiveBridge, TelegramHostError> {
         let surface = StoreControlSurface::open(
             params.database_path,
@@ -667,7 +690,10 @@ impl TelegramHost {
         )
         .map_err(|_| TelegramHostError::SurfaceUnavailable)?
         .with_support_tickets(params.support_tickets_path)
-        .with_operator_members(params.operator_members_path);
+        .with_operator_members(params.operator_members_path)
+        .with_prism_sites(Path::new(crate::site_inventory::NGINX_SITES_ENABLED))
+        .with_manage_profiles()
+        .with_provider_state(params.state_dir);
         let poller_store =
             Store::open(params.database_path).map_err(|_| TelegramHostError::StoreUnavailable)?;
         // The lane opens successfully on a deployment that has not configured
@@ -677,22 +703,81 @@ impl TelegramHost {
         let lane =
             SocketRunLane::open(params.state_dir, params.admin_socket, params.run_index_path)
                 .map_err(|_| TelegramHostError::SurfaceUnavailable)?;
-        TelegramControlBridge::new(BridgeParts {
-            client: TelegramHttpsClient::new(),
-            outbound: TelegramHttpsClient::new(),
-            sink: StoreTelegramDurableSink::new(poller_store, SystemClock),
-            surface,
-            lane,
-            // `None` on a host with no `slack.conf`, which is what makes
-            // `/slack` and `/say` answer that Slack is not configured rather
-            // than fail. A refused configuration never reaches here: it failed
-            // startup before this host was opened.
-            slack: slack.into_surface(),
-            roster: live.roster,
-            inbound_token: live.inbound_token,
-            outbound_token: live.outbound_token,
-            long_poll_seconds: TELEGRAM_LONG_POLL_SECONDS,
-        })
+        let ticket_actions = crate::ticket_intake::FleetConfig::load(params.state_dir)
+            .map_err(|_| TelegramHostError::SurfaceUnavailable)?
+            .map(|config| {
+                Box::new(config.into_action_client())
+                    as Box<dyn crate::telegram_bridge::TicketActionSurface + Send>
+            });
+        let email_actions = crate::ticket_intake::FleetConfig::load(params.state_dir)
+            .map_err(|_| TelegramHostError::SurfaceUnavailable)?
+            .map(|config| {
+                Box::new(config.into_action_client())
+                    as Box<dyn crate::telegram_bridge::EmailActionSurface + Send>
+            });
+        let github = crate::github::GitHubHost::load(params.state_dir)
+            .map_err(TelegramHostError::GitHubConfig)?
+            .into_surface();
+        let github_actions = crate::github::GitHubHost::load(params.state_dir)
+            .map_err(TelegramHostError::GitHubConfig)?
+            .into_action_surface();
+        let improvements = Some(
+            crate::improvements::ImprovementCoordinator::open_default(params.state_dir)
+                .map_err(|_| TelegramHostError::SurfaceUnavailable)?,
+        );
+        let planning_repo =
+            automonique_github_connector::RepoTarget::parse("bext-stack", "automonique-plans")
+                .expect("fixed planning repository");
+        let source_repo =
+            automonique_github_connector::RepoTarget::parse("bext-stack", "automonique")
+                .expect("fixed source repository");
+        let improvement_github = Some(
+            crate::improvement_github::ImprovementGitHubBroker::production(
+                planning_repo,
+                source_repo,
+                "main",
+                "main",
+            )
+            .map_err(|_| TelegramHostError::SurfaceUnavailable)?,
+        );
+        let improvement_worker =
+            crate::improvement_worker::ImprovementWorker::load(params.state_dir)
+                .map_err(|_| TelegramHostError::SurfaceUnavailable)?;
+        TelegramControlBridge::new_with_ticket_gates(
+            BridgeParts {
+                client: TelegramHttpsClient::new(),
+                outbound: TelegramHttpsClient::new(),
+                question_outbound: TelegramHttpsClient::new(),
+                sink: StoreTelegramDurableSink::new(poller_store, SystemClock),
+                surface,
+                lane,
+                // `None` on a host with no `slack.conf`, which is what makes
+                // `/slack` and `/say` answer that Slack is not configured rather
+                // than fail. A refused configuration never reaches here: it failed
+                // startup before this host was opened.
+                slack: slack.into_surface(),
+                github,
+                github_actions,
+                improvements,
+                improvement_github,
+                improvement_worker,
+                ticket_actions,
+                email_actions,
+                memory: Some(Box::new(
+                    crate::telegram_bridge::StoreMemorySurface::open(
+                        &params.state_dir.join("agent-memory.sqlite3"),
+                        bot_id,
+                    )
+                    .map_err(|_| TelegramHostError::SurfaceUnavailable)?,
+                )),
+                roster: live.roster,
+                inbound_token: live.inbound_token,
+                outbound_token: live.outbound_token,
+                question_outbound_token: live.question_outbound_token,
+                long_poll_seconds: TELEGRAM_LONG_POLL_SECONDS,
+            },
+            ticket_gates,
+        )
         .map_err(TelegramHostError::Runtime)
     }
 
@@ -853,6 +938,8 @@ impl TelegramHost {
 pub(crate) enum TelegramHostError {
     /// The configuration file is present but refused.
     Config(TelegramConfigError),
+    /// A present GitHub read configuration was refused.
+    GitHubConfig(crate::github::GitHubConfigError),
     /// The second store connection could not be opened.
     StoreUnavailable,
     /// The poller's read surface could not open its own durable handles.
@@ -867,6 +954,7 @@ impl fmt::Display for TelegramHostError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Config(error) => write!(formatter, "telegram configuration refused: {error}"),
+            Self::GitHubConfig(error) => write!(formatter, "{error}"),
             Self::StoreUnavailable => {
                 formatter.write_str("telegram lease store connection unavailable")
             }
@@ -894,6 +982,7 @@ impl TelegramHostError {
             Self::Config(TelegramConfigError::TokenInvalid) => "telegram_config_token",
             Self::Config(TelegramConfigError::AllowlistInvalid) => "telegram_config_allowlist",
             Self::Config(TelegramConfigError::AdminlistInvalid) => "telegram_config_adminlist",
+            Self::GitHubConfig(error) => error.category(),
             Self::StoreUnavailable => "telegram_store_unavailable",
             Self::SurfaceUnavailable => "telegram_surface_unavailable",
             Self::PollerUnavailable => "telegram_poller_unavailable",

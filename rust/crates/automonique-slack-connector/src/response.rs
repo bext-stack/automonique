@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Bounded, refusing decoders for the six methods.
+//! Bounded, refusing decoders for the six bot-token methods and Socket Mode
+//! bootstrap.
 //!
 //! Each decoder takes the accepted response bytes and returns either the
 //! method's typed payload, Slack's own classified refusal, or a
@@ -49,7 +50,7 @@ use crate::target::{ChannelId, Cursor, MessageTs, TeamId, UserId, is_workspace_u
 use crate::{
     MAX_INBOUND_TEXT_BYTES, MAX_NAME_BYTES, MAX_OPAQUE_BYTES, MAX_PAGE_LIMIT,
     MAX_SLACK_RESPONSE_BYTES, MAX_URL_BYTES, SlackErrorCode, SlackFailure, SlackOutcome,
-    SlackRejection,
+    SlackRejection, SlackSocketUrl,
 };
 
 /// Highest thread reply count retained.
@@ -254,6 +255,29 @@ pub fn decode_auth_test(bytes: &[u8]) -> Result<SlackOutcome<AuthIdentity>, Slac
     }))
 }
 
+/// Decode `apps.connections.open` into one credential-like websocket URL.
+///
+/// The shared Slack `ok` envelope is decoded exactly as the existing Web API
+/// methods. A successful answer must contain one URL accepted by
+/// [`SlackSocketUrl`]; HTTP, `ws`, non-Slack hosts, ports and missing tickets
+/// are all [`SlackFailure::FieldOutOfBounds`].
+pub fn decode_apps_connections_open(
+    bytes: &[u8],
+) -> Result<SlackOutcome<SlackSocketUrl>, SlackFailure> {
+    let object = match envelope(bytes)? {
+        Envelope::Accepted(object) => object,
+        Envelope::Rejected(rejection) => return Ok(SlackOutcome::Rejected(rejection)),
+    };
+    let url = nonempty(
+        &object,
+        "url",
+        crate::socket_mode::MAX_SOCKET_MODE_URL_BYTES,
+    )?;
+    SlackSocketUrl::new(&url)
+        .map(SlackOutcome::Accepted)
+        .map_err(|_| SlackFailure::FieldOutOfBounds)
+}
+
 /// Decode `conversations.list`.
 ///
 /// # Errors
@@ -380,6 +404,14 @@ pub fn decode_post_message(bytes: &[u8]) -> Result<SlackOutcome<PostedMessage>, 
         ts: timestamp(&object, "ts")?,
         message: message(row)?,
     }))
+}
+
+/// Decode a method whose accepted response needs no returned fields.
+pub fn decode_ack(bytes: &[u8]) -> Result<SlackOutcome<()>, SlackFailure> {
+    Ok(match envelope(bytes)? {
+        Envelope::Accepted(_) => SlackOutcome::Accepted(()),
+        Envelope::Rejected(rejection) => SlackOutcome::Rejected(rejection),
+    })
 }
 
 /// Read the `error` code off a refusal document, or name the fallback.

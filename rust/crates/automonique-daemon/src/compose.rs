@@ -114,7 +114,9 @@ use automonique_runner::{
     WorkspaceReservation,
 };
 
-use crate::execute::{DAEMON_BACKEND_ID, DAEMON_WORKSPACE_REGISTRY, run_workspace};
+use crate::execute::{
+    DAEMON_BACKEND_ID, DAEMON_WORKSPACE_REGISTRY, is_within_byte_limit, run_workspace,
+};
 
 /// The provider this deployment runs, a sibling of [`crate::DATABASE_NAME`].
 ///
@@ -171,6 +173,30 @@ pub const DEFAULT_ARGV: [&str; 12] = [
     ANSWER_PLACEHOLDER,
 ];
 
+/// Provider execution shape selected by a trusted caller.
+///
+/// This is deliberately typed rather than inferred from prompt text: an
+/// administrator's `/run` task cannot lower its own execution profile by
+/// imitating the internal Q&A prompt marker.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProviderRunProfile {
+    /// The configured invocation exactly as reviewed by the owner.
+    #[default]
+    Standard,
+    /// Latency-oriented reasoning for bounded, read-only conversational Q&A.
+    FastConversation,
+    /// Full configured model for a complex but still read-only question.
+    IntelligentQuestion,
+}
+
+/// Codex's per-invocation override for latency-sensitive read-only Q&A.
+pub const QUESTION_REASONING_CONFIG: &str = "model_reasoning_effort=\"none\"";
+
+/// Current-family lightweight model selected by the trusted conversational
+/// profile. The older GPT-5.4 nano API model was rejected by this Codex
+/// harness, while operational work retains the configured Sol model.
+pub const QUESTION_MODEL_CONFIG: &str = "model=\"gpt-5.6-luna\"";
+
 /// Largest answer this daemon reads back out of a workspace.
 ///
 /// A reply is bounded far below this by the chat transport; the bound here is
@@ -217,6 +243,12 @@ pub const COMPOSE_ACTOR: &str = "telegram-control";
 
 /// Memory ceiling one composed run's cgroup carries.
 pub const COMPOSE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Memory ceiling for conversational Q&A provider processes.
+///
+/// The measured live high-water mark is below 300 MiB. This leaves bounded
+/// headroom while preventing a chat turn from reserving the 2 GiB allowed to
+/// explicitly requested complex work.
+pub const QUESTION_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 /// Process ceiling one composed run's cgroup carries.
 pub const COMPOSE_PROCESSES: u64 = 256;
 /// Wall-clock budget one composed run gets, which is also the deadline the
@@ -570,6 +602,17 @@ pub struct CompositionInputs<'a> {
 /// [`ComposeRefusal::DocumentRejected`] when the composed parts are refused by
 /// the RunSpec constructor.
 pub fn compose(task: &str, inputs: &CompositionInputs<'_>) -> Result<Composition, ComposeRefusal> {
+    compose_with_profile(task, inputs, ProviderRunProfile::Standard)
+}
+
+/// Compose one contained completion under an explicit trusted run profile.
+///
+/// Only the caller selects `profile`; task text is never inspected for it.
+pub fn compose_with_profile(
+    task: &str,
+    inputs: &CompositionInputs<'_>,
+    profile: ProviderRunProfile,
+) -> Result<Composition, ComposeRefusal> {
     if !inputs.egress_configured {
         return Err(ComposeRefusal::NotConfigured);
     }
@@ -607,6 +650,7 @@ pub fn compose(task: &str, inputs: &CompositionInputs<'_>) -> Result<Composition
         offered_features: inputs.offered_features,
         workspace: workspace_text,
         answer: answer_text,
+        profile,
     })?;
 
     Ok(Composition {
@@ -661,17 +705,20 @@ fn observe_provider_binary(provider: &ProviderConfig) -> Result<BinaryProvenance
     let metadata = file
         .metadata()
         .map_err(|_| ComposeRefusal::ProviderUnreadable)?;
-    if !metadata.is_file() || metadata.len() > MAX_PROVIDER_BINARY_BYTES {
+    if !metadata.is_file() || !is_within_byte_limit(metadata.len(), MAX_PROVIDER_BINARY_BYTES) {
         return Err(ComposeRefusal::ProviderUnreadable);
     }
     let mut bytes = Vec::new();
     file.take(MAX_PROVIDER_BINARY_BYTES.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|_| ComposeRefusal::ProviderUnreadable)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PROVIDER_BINARY_BYTES {
+    if !is_within_byte_limit(
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        MAX_PROVIDER_BINARY_BYTES,
+    ) {
         return Err(ComposeRefusal::ProviderUnreadable);
     }
-    let observed = format!("{ALGORITHM}:{}", Sha256::digest(&bytes).to_hex());
+    let observed = crate::execute::provider_binary_digest(&bytes);
     BinaryProvenance::new(provider.version(), &observed, None)
         .map_err(|_| ComposeRefusal::ProviderUnreadable)
 }
@@ -685,6 +732,7 @@ struct DocumentParts<'a> {
     offered_features: &'a [HostFeature],
     workspace: &'a str,
     answer: &'a str,
+    profile: ProviderRunProfile,
 }
 
 /// Every constructor in this module refuses the same way.
@@ -716,7 +764,12 @@ fn document(parts: &DocumentParts<'_>) -> Result<Vec<u8>, ComposeRefusal> {
             ExecutionBackendId::new(DAEMON_BACKEND_ID).map_err(rejected)?,
         ),
         executable: parts.provider.binary().to_path_buf(),
-        arguments: argv(parts.provider.argv(), parts.workspace, parts.answer),
+        arguments: argv(
+            parts.provider.argv(),
+            parts.workspace,
+            parts.answer,
+            parts.profile,
+        ),
         // Opaque by construction: the resolution is the workspace registry's,
         // and this daemon is the registry. What it resolves to is
         // `run_workspace`, which is what the argv above already names.
@@ -756,8 +809,13 @@ fn document(parts: &DocumentParts<'_>) -> Result<Vec<u8>, ComposeRefusal> {
 /// path it names, and nothing else in an argument is touched. The task text is
 /// deliberately not among the things that can be substituted — it reaches the
 /// provider on stdin and never becomes an argument.
-fn argv(configured: &[String], workspace: &str, answer: &str) -> Vec<OsString> {
-    configured
+fn argv(
+    configured: &[String],
+    workspace: &str,
+    answer: &str,
+    profile: ProviderRunProfile,
+) -> Vec<OsString> {
+    let mut arguments: Vec<OsString> = configured
         .iter()
         .map(|argument| {
             OsString::from(
@@ -766,7 +824,24 @@ fn argv(configured: &[String], workspace: &str, answer: &str) -> Vec<OsString> {
                     .replace(ANSWER_PLACEHOLDER, answer),
             )
         })
-        .collect()
+        .collect();
+    if profile == ProviderRunProfile::FastConversation
+        && arguments.first().is_some_and(|arg| arg == "exec")
+    {
+        // `-c` is a Codex global option. Place it directly after the `exec`
+        // subcommand so the prompt marker and all operator text remain stdin
+        // data, never arguments capable of selecting this profile.
+        arguments.splice(
+            1..1,
+            [
+                OsString::from("-c"),
+                OsString::from(QUESTION_MODEL_CONFIG),
+                OsString::from("-c"),
+                OsString::from(QUESTION_REASONING_CONFIG),
+            ],
+        );
+    }
+    arguments
 }
 
 /// Every variable the workload gets, and nothing else: the launch inherits none.
@@ -778,6 +853,13 @@ fn argv(configured: &[String], workspace: &str, answer: &str) -> Vec<OsString> {
 fn environment(home: &str, workspace: &str) -> Vec<(OsString, OsString)> {
     vec![
         (OsString::from("CODEX_HOME"), OsString::from(home)),
+        // Provider-neutral coordinate used by small contained adapters. The
+        // credential remains a file below this already-granted home; no secret
+        // is copied into the environment or the run document.
+        (
+            OsString::from("AUTOMONIQUE_PROVIDER_HOME"),
+            OsString::from(home),
+        ),
         // The provider's home directory, pointed at the run's own workspace so
         // a provider that writes dotfiles writes them inside the boundary.
         (OsString::from("HOME"), OsString::from(workspace)),
@@ -828,7 +910,12 @@ fn sandbox(parts: &DocumentParts<'_>, home: &str) -> Result<SandboxSpec, Compose
         // never by a variable that would land in `/proc/<pid>/environ`.
         credentials: CredentialDescriptors::declare(&[]).map_err(rejected)?,
         budgets: Budgets::declare(BudgetQuantities {
-            cgroup_memory_bytes: COMPOSE_MEMORY_BYTES,
+            cgroup_memory_bytes: match parts.profile {
+                ProviderRunProfile::Standard => COMPOSE_MEMORY_BYTES,
+                ProviderRunProfile::FastConversation | ProviderRunProfile::IntelligentQuestion => {
+                    QUESTION_MEMORY_BYTES
+                }
+            },
             cgroup_cpu_millicores: 4_000,
             rlimit_processes: COMPOSE_PROCESSES,
             rlimit_descriptors: 1_024,

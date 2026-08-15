@@ -22,12 +22,14 @@ use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::response::{
     decode_support_delivery, decode_support_issues, decode_support_note, decode_support_thread,
+    decode_ticket_decision, decode_ticket_dispatch, decode_ticket_status,
 };
 use crate::{
     FLEET_REQUEST_TIMEOUT_SECONDS, FleetBase, FleetFailure, FleetInstanceId, FleetOutcome,
     FleetRequest, FleetToken, MAX_FLEET_RESPONSE_BYTES, SupportDelivery, SupportEmailRequest,
     SupportIssues, SupportIssuesRequest, SupportReplyRequest, SupportThreadNoteRequest,
-    SupportThreadRef, SupportThreadResolveRequest,
+    SupportThreadRef, SupportThreadResolveRequest, TicketDecisionReceipt, TicketDecisionRequest,
+    TicketDispatchReceipt, TicketDispatchRequest, TicketStatus, TicketStatusRequest,
 };
 
 /// The one request path this connector can address.
@@ -213,6 +215,34 @@ impl FleetClient {
         let body = self.send(&FleetRequest::SupportEmail(request.clone()))?;
         // The email contract demands `ok` and `queued` both.
         decode_support_delivery(&body, true)
+    }
+
+    /// Dispatch one exact GitHub issue through Manage's project/profile and
+    /// Jean approval machinery.
+    pub fn dispatch_ticket(
+        &self,
+        request: &TicketDispatchRequest,
+    ) -> Result<FleetOutcome<TicketDispatchReceipt>, FleetFailure> {
+        let body = self.send(&FleetRequest::TicketDispatch(request.clone()))?;
+        decode_ticket_dispatch(&body)
+    }
+
+    /// Approve or reject one exact pending job using a stable decision key.
+    pub fn decide_ticket(
+        &self,
+        request: &TicketDecisionRequest,
+    ) -> Result<FleetOutcome<TicketDecisionReceipt>, FleetFailure> {
+        let body = self.send(&FleetRequest::TicketDecision(request.clone()))?;
+        decode_ticket_decision(&body)
+    }
+
+    /// Read one exact job created for this configured fleet instance.
+    pub fn ticket_status(
+        &self,
+        request: &TicketStatusRequest,
+    ) -> Result<FleetOutcome<TicketStatus>, FleetFailure> {
+        let body = self.send(&FleetRequest::TicketStatus(request.clone()))?;
+        decode_ticket_status(&body)
     }
 
     /// Issue one request and return its bounded response body.

@@ -27,6 +27,12 @@ pub const MAX_EMAIL_SUBJECT_BYTES: usize = 512;
 pub const MAX_EMAIL_BODY_BYTES: usize = 64 * 1024;
 /// Longest recipient address accepted, per RFC 5321's path limit.
 pub const MAX_RECIPIENT_BYTES: usize = 254;
+/// Longest stable transport key retained for one ticket action.
+pub const MAX_TICKET_SOURCE_KEY_BYTES: usize = 180;
+/// Longest canonical GitHub issue URL accepted.
+pub const MAX_TICKET_ISSUE_URL_BYTES: usize = 240;
+/// Longest human reason accepted for rejecting a pending ticket.
+pub const MAX_TICKET_DECISION_REASON_BYTES: usize = 500;
 
 /// The complete set of `action` strings this connector can render.
 ///
@@ -40,6 +46,9 @@ enum WireAction {
     ThreadNote,
     ThreadReply,
     Email,
+    TicketDispatch,
+    TicketDecision,
+    TicketStatus,
 }
 
 impl WireAction {
@@ -50,7 +59,209 @@ impl WireAction {
             Self::ThreadNote => "support-thread-note",
             Self::ThreadReply => "support-thread-reply",
             Self::Email => "support-email",
+            Self::TicketDispatch => "automonique-ticket-dispatch",
+            Self::TicketDecision => "automonique-ticket-decision",
+            Self::TicketStatus => "automonique-ticket-status",
         }
+    }
+}
+
+/// The administrator's terminal decision for one pending ticket gate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TicketDecision {
+    /// Release the already-created job for execution.
+    Approve,
+    /// Cancel the pending job without ever releasing work.
+    Reject { reason: String },
+}
+
+impl TicketDecision {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Reject { .. } => "reject",
+        }
+    }
+
+    /// Build a rejection with a required, bounded, display-safe reason.
+    pub fn reject(reason: &str) -> Result<Self, FleetRefusal> {
+        let reason = reason.trim();
+        if !is_body_text(reason, MAX_TICKET_DECISION_REASON_BYTES) {
+            return Err(FleetRefusal::DecisionReason);
+        }
+        Ok(Self::Reject {
+            reason: reason.to_owned(),
+        })
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Approve => None,
+            Self::Reject { reason } => Some(reason),
+        }
+    }
+}
+
+/// Apply one idempotent administrator decision to one exact pending job.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketDecisionRequest {
+    job_id: String,
+    source_key: String,
+    decision_key: String,
+    actor_key: String,
+    decision: TicketDecision,
+}
+
+impl TicketDecisionRequest {
+    pub fn new(
+        job_id: &str,
+        source_key: &str,
+        decision_key: &str,
+        actor_key: &str,
+        decision: TicketDecision,
+    ) -> Result<Self, FleetRefusal> {
+        if !is_opaque_identifier(job_id) {
+            return Err(FleetRefusal::JobId);
+        }
+        if !is_ticket_key(source_key, MAX_TICKET_SOURCE_KEY_BYTES) {
+            return Err(FleetRefusal::SourceKey);
+        }
+        if !is_ticket_key(decision_key, MAX_TICKET_SOURCE_KEY_BYTES) {
+            return Err(FleetRefusal::DecisionKey);
+        }
+        if !is_ticket_key(actor_key, MAX_TICKET_SOURCE_KEY_BYTES) {
+            return Err(FleetRefusal::ActorKey);
+        }
+        Ok(Self {
+            job_id: job_id.to_owned(),
+            source_key: source_key.to_owned(),
+            decision_key: decision_key.to_owned(),
+            actor_key: actor_key.to_owned(),
+            decision,
+        })
+    }
+
+    #[must_use]
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+    #[must_use]
+    pub fn source_key(&self) -> &str {
+        &self.source_key
+    }
+    #[must_use]
+    pub fn decision_key(&self) -> &str {
+        &self.decision_key
+    }
+    #[must_use]
+    pub fn actor_key(&self) -> &str {
+        &self.actor_key
+    }
+    #[must_use]
+    pub const fn decision(&self) -> &TicketDecision {
+        &self.decision
+    }
+}
+
+/// Whether one ticket dispatch opens a gate or consumes an administrator's
+/// confirmation of that exact gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TicketDispatchMode {
+    /// Create or recover the pending confirmation request. This never releases
+    /// work to Jean.
+    RequestApproval,
+    /// Release the exact request after an eligible administrator confirmed it.
+    Confirmed,
+}
+
+impl TicketDispatchMode {
+    const fn confirmed(self) -> bool {
+        matches!(self, Self::Confirmed)
+    }
+}
+
+/// Dispatch one exact GitHub issue through Manage's durable approval gate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketDispatchRequest {
+    issue_url: String,
+    source_key: String,
+    mode: TicketDispatchMode,
+}
+
+impl TicketDispatchRequest {
+    /// Bind a canonical GitHub issue URL to one durable transport source key
+    /// and request administrator confirmation.
+    ///
+    /// The wire shape carries `confirmed:false`. Replaying it recovers the same
+    /// pending Manage job; it never upgrades itself into permission to work.
+    pub fn new(issue_url: &str, source_key: &str) -> Result<Self, FleetRefusal> {
+        Self::with_mode(issue_url, source_key, TicketDispatchMode::RequestApproval)
+    }
+
+    /// Bind an eligible administrator's confirmation to the exact issue and
+    /// source key that created the pending gate.
+    ///
+    /// Callers must obtain both coordinates from trusted pending-gate state;
+    /// user text alone must never select this constructor.
+    pub fn confirmed(issue_url: &str, source_key: &str) -> Result<Self, FleetRefusal> {
+        Self::with_mode(issue_url, source_key, TicketDispatchMode::Confirmed)
+    }
+
+    fn with_mode(
+        issue_url: &str,
+        source_key: &str,
+        mode: TicketDispatchMode,
+    ) -> Result<Self, FleetRefusal> {
+        if !is_github_issue_url(issue_url) {
+            return Err(FleetRefusal::IssueUrl);
+        }
+        if !is_ticket_key(source_key, MAX_TICKET_SOURCE_KEY_BYTES) {
+            return Err(FleetRefusal::SourceKey);
+        }
+        Ok(Self {
+            issue_url: issue_url.to_owned(),
+            source_key: source_key.to_owned(),
+            mode,
+        })
+    }
+
+    #[must_use]
+    pub fn issue_url(&self) -> &str {
+        &self.issue_url
+    }
+
+    #[must_use]
+    pub fn source_key(&self) -> &str {
+        &self.source_key
+    }
+
+    /// Whether this request carries a separately established confirmation.
+    #[must_use]
+    pub const fn mode(&self) -> TicketDispatchMode {
+        self.mode
+    }
+}
+
+/// Read one exact job created by this connector's configured fleet instance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketStatusRequest {
+    job_id: String,
+}
+
+impl TicketStatusRequest {
+    pub fn new(job_id: &str) -> Result<Self, FleetRefusal> {
+        if !is_opaque_identifier(job_id) {
+            return Err(FleetRefusal::JobId);
+        }
+        Ok(Self {
+            job_id: job_id.to_owned(),
+        })
+    }
+
+    #[must_use]
+    pub fn job_id(&self) -> &str {
+        &self.job_id
     }
 }
 
@@ -297,6 +508,12 @@ pub enum FleetRequest {
     SupportThreadReply(SupportReplyRequest),
     /// Send a support email.
     SupportEmail(SupportEmailRequest),
+    /// Dispatch one exact, confirmed GitHub ticket.
+    TicketDispatch(TicketDispatchRequest),
+    /// Approve or reject one exact pending ticket gate.
+    TicketDecision(TicketDecisionRequest),
+    /// Read the resulting exact job.
+    TicketStatus(TicketStatusRequest),
 }
 
 impl FleetRequest {
@@ -307,6 +524,9 @@ impl FleetRequest {
             Self::SupportThreadNote(_) => WireAction::ThreadNote,
             Self::SupportThreadReply(_) => WireAction::ThreadReply,
             Self::SupportEmail(_) => WireAction::Email,
+            Self::TicketDispatch(_) => WireAction::TicketDispatch,
+            Self::TicketDecision(_) => WireAction::TicketDecision,
+            Self::TicketStatus(_) => WireAction::TicketStatus,
         }
     }
 
@@ -323,7 +543,13 @@ impl FleetRequest {
     /// re-deriving it from the action name.
     #[must_use]
     pub const fn is_external_effect(&self) -> bool {
-        matches!(self, Self::SupportThreadReply(_) | Self::SupportEmail(_))
+        matches!(
+            self,
+            Self::SupportThreadReply(_)
+                | Self::SupportEmail(_)
+                | Self::TicketDispatch(_)
+                | Self::TicketDecision(_)
+        )
     }
 
     /// The exact JSON body that will be sent, in the documented field order.
@@ -370,10 +596,79 @@ impl FleetRequest {
                 body.push_str(",\"text\":");
                 push_json_string(&mut body, &request.text);
             }
+            Self::TicketDispatch(request) => {
+                body.push_str(",\"issue_url\":");
+                push_json_string(&mut body, &request.issue_url);
+                body.push_str(",\"source_key\":");
+                push_json_string(&mut body, &request.source_key);
+                body.push_str(",\"confirmed\":");
+                body.push_str(if request.mode.confirmed() {
+                    "true"
+                } else {
+                    "false"
+                });
+            }
+            Self::TicketDecision(request) => {
+                body.push_str(",\"job_id\":");
+                push_json_string(&mut body, &request.job_id);
+                body.push_str(",\"source_key\":");
+                push_json_string(&mut body, &request.source_key);
+                body.push_str(",\"decision_key\":");
+                push_json_string(&mut body, &request.decision_key);
+                body.push_str(",\"actor_key\":");
+                push_json_string(&mut body, &request.actor_key);
+                body.push_str(",\"decision\":");
+                push_json_string(&mut body, request.decision.as_str());
+                if let Some(reason) = request.decision.reason() {
+                    body.push_str(",\"reason\":");
+                    push_json_string(&mut body, reason);
+                }
+            }
+            Self::TicketStatus(request) => {
+                body.push_str(",\"job_id\":");
+                push_json_string(&mut body, &request.job_id);
+            }
         }
         body.push('}');
         body
     }
+}
+
+fn is_ticket_key(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'.' | b'_' | b'-'))
+}
+
+pub(crate) fn is_github_issue_url(value: &str) -> bool {
+    if value.is_empty() || value.len() > MAX_TICKET_ISSUE_URL_BYTES || !value.is_ascii() {
+        return false;
+    }
+    let Some(rest) = value.strip_prefix("https://github.com/") else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    let (Some(owner), Some(repo), Some(kind), Some(number), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return false;
+    };
+    !owner.is_empty()
+        && !repo.is_empty()
+        && kind == "issues"
+        && number.parse::<u32>().is_ok_and(|value| value > 0)
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && repo
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 /// The fleet's mail message grammar: 20 to 120 hexadecimal characters and
@@ -435,12 +730,24 @@ mod tests {
     }
 
     #[test]
-    fn the_action_vocabulary_is_exactly_the_five_support_actions() {
+    fn the_action_vocabulary_is_exactly_the_support_and_ticket_actions() {
         assert_eq!(WireAction::Issues.as_str(), "support-issues");
         assert_eq!(WireAction::ThreadResolve.as_str(), "support-thread-resolve");
         assert_eq!(WireAction::ThreadNote.as_str(), "support-thread-note");
         assert_eq!(WireAction::ThreadReply.as_str(), "support-thread-reply");
         assert_eq!(WireAction::Email.as_str(), "support-email");
+        assert_eq!(
+            WireAction::TicketDispatch.as_str(),
+            "automonique-ticket-dispatch"
+        );
+        assert_eq!(
+            WireAction::TicketDecision.as_str(),
+            "automonique-ticket-decision"
+        );
+        assert_eq!(
+            WireAction::TicketStatus.as_str(),
+            "automonique-ticket-status"
+        );
     }
 
     #[test]
@@ -498,6 +805,57 @@ mod tests {
              \"to\":\"client@exemple.invalid\",\"subject\":\"Votre demande\",\
              \"text\":\"Bonjour,\\nc'est regle.\"}"
         );
+
+        let ticket = FleetRequest::TicketDispatch(
+            TicketDispatchRequest::new(
+                "https://github.com/webdesign29/activ/issues/1007",
+                "telegram:8784297904:update:123",
+            )
+            .expect("ticket"),
+        );
+        assert_eq!(
+            ticket.canonical_body(&instance),
+            "{\"action\":\"automonique-ticket-dispatch\",\"id\":\"sd-instance-01\",\
+             \"issue_url\":\"https://github.com/webdesign29/activ/issues/1007\",\
+             \"source_key\":\"telegram:8784297904:update:123\",\"confirmed\":false}"
+        );
+        let confirmed = FleetRequest::TicketDispatch(
+            TicketDispatchRequest::confirmed(
+                "https://github.com/webdesign29/activ/issues/1007",
+                "telegram:8784297904:update:123",
+            )
+            .expect("confirmed ticket"),
+        );
+        assert_eq!(
+            confirmed.canonical_body(&instance),
+            "{\"action\":\"automonique-ticket-dispatch\",\"id\":\"sd-instance-01\",\
+             \"issue_url\":\"https://github.com/webdesign29/activ/issues/1007\",\
+             \"source_key\":\"telegram:8784297904:update:123\",\"confirmed\":true}"
+        );
+        let rejected = FleetRequest::TicketDecision(
+            TicketDecisionRequest::new(
+                "job-123",
+                "slack:A1:T1:C1:123.456",
+                "slack-decision:A1:T1:C1:123.456:reject:U1",
+                "slack:U1",
+                TicketDecision::reject("Not authorized for this release").expect("reason"),
+            )
+            .expect("decision"),
+        );
+        assert_eq!(
+            rejected.canonical_body(&instance),
+            "{\"action\":\"automonique-ticket-decision\",\"id\":\"sd-instance-01\",\
+             \"job_id\":\"job-123\",\"source_key\":\"slack:A1:T1:C1:123.456\",\
+             \"decision_key\":\"slack-decision:A1:T1:C1:123.456:reject:U1\",\
+             \"actor_key\":\"slack:U1\",\"decision\":\"reject\",\
+             \"reason\":\"Not authorized for this release\"}"
+        );
+        let status =
+            FleetRequest::TicketStatus(TicketStatusRequest::new("job-123").expect("status"));
+        assert_eq!(
+            status.canonical_body(&instance),
+            r#"{"action":"automonique-ticket-status","id":"sd-instance-01","job_id":"job-123"}"#
+        );
     }
 
     #[test]
@@ -528,10 +886,55 @@ mod tests {
         let email = FleetRequest::SupportEmail(
             SupportEmailRequest::new("a", "c@exemple.invalid", "sujet", "texte").expect("email"),
         );
+        let ticket = FleetRequest::TicketDispatch(
+            TicketDispatchRequest::new(
+                "https://github.com/webdesign29/activ/issues/1007",
+                "telegram:bot:update:1",
+            )
+            .expect("ticket"),
+        );
+        let status =
+            FleetRequest::TicketStatus(TicketStatusRequest::new("job-123").expect("status"));
         assert!(!read.is_external_effect());
         assert!(!note.is_external_effect());
         assert!(reply.is_external_effect());
         assert!(email.is_external_effect());
+        assert!(ticket.is_external_effect());
+        assert!(!status.is_external_effect());
+    }
+
+    #[test]
+    fn ticket_dispatch_accepts_only_canonical_urls_and_stable_keys() {
+        let url = "https://github.com/webdesign29/activ/issues/1007";
+        let request = TicketDispatchRequest::new(url, "telegram:bot:update:1").expect("request");
+        assert_eq!(request.issue_url(), url);
+        assert_eq!(request.source_key(), "telegram:bot:update:1");
+        assert_eq!(request.mode(), TicketDispatchMode::RequestApproval);
+        assert_eq!(
+            TicketDispatchRequest::confirmed(url, "telegram:bot:update:1")
+                .expect("confirmed")
+                .mode(),
+            TicketDispatchMode::Confirmed
+        );
+        for refused in [
+            "http://github.com/webdesign29/activ/issues/1007",
+            "https://github.com/webdesign29/activ/pull/1007",
+            "https://github.com/webdesign29/activ/issues/0",
+            "https://example.test/webdesign29/activ/issues/1007",
+            "https://github.com/webdesign29/activ/issues/1007?x=1",
+        ] {
+            assert_eq!(
+                TicketDispatchRequest::new(refused, "telegram:bot:update:1").err(),
+                Some(FleetRefusal::IssueUrl),
+                "must refuse {refused}"
+            );
+        }
+        for refused in ["", "telegram update 1", "telegram:\nupdate:1"] {
+            assert_eq!(
+                TicketDispatchRequest::new(url, refused).err(),
+                Some(FleetRefusal::SourceKey)
+            );
+        }
     }
 
     #[test]

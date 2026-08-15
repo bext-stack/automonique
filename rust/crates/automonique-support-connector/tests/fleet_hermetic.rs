@@ -25,7 +25,8 @@ use automonique_support_connector::{
     FleetBase, FleetClient, FleetFailure, FleetInstanceId, FleetOutcome, FleetRequest, FleetToken,
     MAX_FLEET_RESPONSE_BYTES, MAX_SUPPORT_ISSUES, ServerMessage, SupportDelivery,
     SupportEmailRequest, SupportIssuesRequest, SupportReplyRequest, SupportScope,
-    SupportThreadNoteRequest, SupportThreadResolveRequest,
+    SupportThreadNoteRequest, SupportThreadResolveRequest, TicketDecision, TicketDecisionOutcome,
+    TicketDecisionReceipt, TicketDecisionRequest, TicketJobStatus,
 };
 
 /// Bound on every server-side wait. A test that would otherwise hang fails here.
@@ -719,4 +720,34 @@ fn hostile_ticket_content_survives_one_round_trip_byte_exactly() {
     let body: serde_json::Value = serde_json::from_str(&captured.body).expect("body is JSON");
     assert_eq!(body["action"], "support-thread-note");
     assert_eq!(body["text"], hostile);
+}
+
+#[test]
+fn ticket_rejection_is_one_exact_idempotent_decision_call() {
+    let fake = FakeFleet::spawn(vec![Canned::json(
+        r#"{"ok":true,"decision":{"job_id":"job-1","job_status":"cancelled","value":"reject","duplicate":false}}"#,
+    )]);
+    let client = fleet_client(&fake);
+    let request = TicketDecisionRequest::new(
+        "job-1",
+        "slack:A1:T1:C1:123.4",
+        "slack-action:T1:C1:124.5:U1:reject",
+        "slack:T1:U1",
+        TicketDecision::reject("Not approved for release").expect("reason"),
+    )
+    .expect("request");
+    assert_eq!(
+        client.decide_ticket(&request).expect("decision"),
+        FleetOutcome::Accepted(TicketDecisionReceipt {
+            job_id: String::from("job-1"),
+            job_status: TicketJobStatus::Cancelled,
+            decision: TicketDecisionOutcome::Rejected,
+            duplicate: false,
+        })
+    );
+    let body: serde_json::Value = serde_json::from_str(&fake.only_request().body).expect("body");
+    assert_eq!(body["action"], "automonique-ticket-decision");
+    assert_eq!(body["decision"], "reject");
+    assert_eq!(body["reason"], "Not approved for release");
+    assert_eq!(body["decision_key"], "slack-action:T1:C1:124.5:U1:reject");
 }

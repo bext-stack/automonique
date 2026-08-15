@@ -78,9 +78,17 @@ use automonique_protocol::tools::RunId;
 use automonique_store::run_index::{RunIndex, RunSpoolState};
 
 use crate::compose::{
-    ComposeRefusal, Composition, CompositionInputs, ProviderConfig, compose, read_answer,
+    ComposeRefusal, Composition, CompositionInputs, ProviderConfig, ProviderRunProfile, compose,
+    compose_with_profile, read_answer,
 };
-use crate::telegram_bridge::{RunFailure, RunLane};
+use crate::telegram_bridge::{QuestionProfile, QuestionRuntime, RunFailure, RunLane};
+
+/// Optional provider configuration used only for ordinary conversation.
+///
+/// Absence is a deliberate fallback to the primary Codex provider. A malformed
+/// present file is also refused and falls back, matching the primary config's
+/// current fail-closed load behavior without taking `/status` down.
+pub const CONVERSATION_PROVIDER_CONFIG_NAME: &str = "conversation-provider";
 
 /// How long one `/run` waits for its run to reach a terminal state.
 ///
@@ -93,7 +101,7 @@ use crate::telegram_bridge::{RunFailure, RunLane};
 pub const RUN_DEADLINE: Duration = Duration::from_secs(360);
 
 /// How often the run's read-model row is re-read while waiting.
-pub const POLL_INTERVAL: Duration = Duration::from_millis(200);
+pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Read deadline on one admin exchange.
 ///
@@ -141,6 +149,11 @@ pub struct SocketRunLane {
     /// The configured provider, or `None` for a deployment that has not been
     /// configured for `/run` at all.
     provider: Option<ProviderConfig>,
+    /// Smaller no-tools provider preferred only for ordinary conversation.
+    conversation_provider: Option<ProviderConfig>,
+    /// A present but malformed conversation configuration fails closed instead
+    /// of silently spending the primary provider.
+    conversation_provider_refused: bool,
     /// Whether this deployment resolves any brokered destination. A composed
     /// document declares `brokered_named`, so without one it cannot be admitted.
     egress_configured: bool,
@@ -173,6 +186,10 @@ impl SocketRunLane {
         // an absent one, which is that `/run` is not configured here.
         let provider = ProviderConfig::load(&state_dir.join(crate::compose::PROVIDER_CONFIG_NAME))
             .unwrap_or_default();
+        let conversation_provider =
+            ProviderConfig::load(&state_dir.join(CONVERSATION_PROVIDER_CONFIG_NAME));
+        let conversation_provider_refused = conversation_provider.is_err();
+        let conversation_provider = conversation_provider.unwrap_or_default();
         let egress_configured =
             !crate::egress::load_destinations(&state_dir.join(crate::EGRESS_DESTINATIONS_NAME))
                 .unwrap_or_default()
@@ -182,6 +199,8 @@ impl SocketRunLane {
             admin_socket: admin_socket.to_path_buf(),
             run_index,
             provider,
+            conversation_provider,
+            conversation_provider_refused,
             egress_configured,
             offered: crate::execute::offered_host_features(),
             sequence: 0,
@@ -357,20 +376,79 @@ fn unavailable<E>(_error: E) -> RunFailure {
 
 impl RunLane for SocketRunLane {
     fn run(&mut self, task: &str) -> Result<String, RunFailure> {
-        let Some(provider) = self.provider.clone() else {
+        self.run_with_profile(task, ProviderRunProfile::Standard)
+    }
+
+    fn run_question(&mut self, task: &str, profile: QuestionProfile) -> Result<String, RunFailure> {
+        let run_profile = match profile {
+            QuestionProfile::Conversation => ProviderRunProfile::FastConversation,
+            QuestionProfile::OperationalLookup => ProviderRunProfile::FastConversation,
+            QuestionProfile::Operational => ProviderRunProfile::IntelligentQuestion,
+        };
+        self.run_with_profile(task, run_profile)
+    }
+
+    fn question_runtime(&self, profile: QuestionProfile) -> QuestionRuntime {
+        if matches!(
+            profile,
+            QuestionProfile::Conversation | QuestionProfile::OperationalLookup
+        ) {
+            if self.conversation_provider_refused {
+                return QuestionRuntime::conversation_provider_refused();
+            }
+            if self.conversation_provider.is_some() {
+                return QuestionRuntime::deepseek_flash(profile);
+            }
+        }
+        QuestionRuntime::codex(profile)
+    }
+}
+
+impl SocketRunLane {
+    fn run_with_profile(
+        &mut self,
+        task: &str,
+        profile: ProviderRunProfile,
+    ) -> Result<String, RunFailure> {
+        if profile == ProviderRunProfile::FastConversation && self.conversation_provider_refused {
+            return Err(RunFailure::NotConfigured);
+        }
+        let selected = if profile == ProviderRunProfile::FastConversation {
+            self.conversation_provider
+                .as_ref()
+                .or(self.provider.as_ref())
+        } else {
+            self.provider.as_ref()
+        };
+        let Some(provider) = selected.cloned() else {
             return Err(RunFailure::NotConfigured);
         };
         let run_id = self.next_run_id()?;
-        let composition = compose(
-            task,
-            &CompositionInputs {
-                state_dir: &self.state_dir,
-                run_id: &run_id,
-                provider: &provider,
-                offered_features: &self.offered,
-                egress_configured: self.egress_configured,
-            },
-        )
+        let inputs = CompositionInputs {
+            state_dir: &self.state_dir,
+            run_id: &run_id,
+            provider: &provider,
+            offered_features: &self.offered,
+            egress_configured: self.egress_configured,
+        };
+        // Skill-only releases hot-reload by moving one verified `current`
+        // symlink. Reopening it for every run means an already-running daemon
+        // sees the new approved instructions on its next task, while a damaged
+        // bundle fails closed instead of silently dropping behavior.
+        let task = match crate::skill_runtime::load_active(&self.state_dir) {
+            Ok(Some(skills)) => format!(
+                "[approved_skills manifest={}]{}\n[/approved_skills]\n\n[user_task]\n{}\n[/user_task]",
+                skills.manifest_digest, skills.instructions, task
+            ),
+            Ok(None) => task.to_owned(),
+            Err(_) => return Err(RunFailure::Unavailable),
+        };
+        let composition = match profile {
+            ProviderRunProfile::Standard => compose(&task, &inputs),
+            ProviderRunProfile::FastConversation | ProviderRunProfile::IntelligentQuestion => {
+                compose_with_profile(&task, &inputs, profile)
+            }
+        }
         .map_err(RunFailure::from_compose)?;
 
         // The slot exists before the document that names it is submitted, so

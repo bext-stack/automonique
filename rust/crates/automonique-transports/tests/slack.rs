@@ -39,6 +39,27 @@ fn keyed_event(event: &str) -> String {
     )
 }
 
+/// A Socket Mode slash-command frame with exact Slack payload coordinates.
+fn slash_command(
+    envelope_id: &str,
+    command: &str,
+    text: &str,
+    team: &str,
+    channel: &str,
+    user: &str,
+    trigger_id: &str,
+) -> String {
+    format!(
+        r#"{{"accepts_response_payload":true,"envelope_id":"{envelope_id}","payload":{{"channel_id":{},"command":{},"team_id":{},"text":{},"trigger_id":{},"user_id":{}}},"type":"slash_commands"}}"#,
+        json(channel),
+        json(command),
+        json(team),
+        json(text),
+        json(trigger_id),
+        json(user),
+    )
+}
+
 /// A string carrying an embedded NUL, JSON-escaped by `serde_json`.
 ///
 /// Built from bytes so the source file itself stays free of control characters:
@@ -307,20 +328,182 @@ fn unknown_envelope_type_without_a_key_plans_nothing_at_all() {
 }
 
 #[test]
-fn recognised_non_event_envelopes_are_acknowledged_content_free() {
-    for wire_type in ["slash_commands", "interactive"] {
-        let frame = format!(
-            r#"{{"accepts_response_payload":true,"envelope_id":"{FIRST_KEY}","payload":{{"command":"/deploy"}},"type":"{wire_type}"}}"#
+fn recognised_interactive_envelopes_are_acknowledged_content_free() {
+    let frame = format!(
+        r#"{{"accepts_response_payload":true,"envelope_id":"{FIRST_KEY}","payload":{{"command":"/deploy"}},"type":"interactive"}}"#
+    );
+    let envelope = parse_slack_envelope(frame.as_bytes(), &policy()).expect("envelope");
+    assert_eq!(envelope.disposition(), SlackDisposition::IgnoredUnsupported);
+    assert!(envelope.ingress().is_none());
+    assert!(envelope.accepts_response_payload());
+    assert_eq!(planned_ack(envelope.ack()), Some(FIRST_KEY));
+}
+
+#[test]
+fn github_slash_commands_are_typed_bounded_and_acknowledged_after_record() {
+    for (command, kind) in [
+        ("/github_create", SlackInputKind::GitHubCreate),
+        ("/github_reply", SlackInputKind::GitHubReply),
+        ("/github_check", SlackInputKind::GitHubCheck),
+        ("/github_uncheck", SlackInputKind::GitHubUncheck),
+        ("/github_issue", SlackInputKind::GitHubIssue),
+        ("/github_label", SlackInputKind::GitHubLabel),
+        ("/github_milestone", SlackInputKind::GitHubMilestone),
+        ("/github_epic", SlackInputKind::GitHubEpic),
+        ("/github_project", SlackInputKind::GitHubProject),
+    ] {
+        let frame = slash_command(
+            FIRST_KEY,
+            command,
+            "example/project #42 ship it",
+            "T01TEAM",
+            "C01CHAN",
+            "U01USER",
+            "13345224609.738474920.abc123",
         );
-        let envelope = parse_slack_envelope(frame.as_bytes(), &policy()).expect("envelope");
+        let envelope = parse_slack_envelope(frame.as_bytes(), &policy()).expect(command);
         assert_eq!(
             envelope.disposition(),
-            SlackDisposition::IgnoredUnsupported,
-            "{wire_type}"
+            SlackDisposition::Admitted,
+            "{command}"
         );
-        assert!(envelope.ingress().is_none(), "{wire_type}");
-        assert!(envelope.accepts_response_payload(), "{wire_type}");
-        assert_eq!(planned_ack(envelope.ack()), Some(FIRST_KEY), "{wire_type}");
+        assert!(envelope.accepts_response_payload(), "{command}");
+        assert_eq!(planned_ack(envelope.ack()), Some(FIRST_KEY), "{command}");
+
+        let ingress = envelope.ingress().expect(command);
+        assert_eq!(ingress.kind(), kind, "{command}");
+        assert_eq!(ingress.command(), Some(command), "{command}");
+        assert_eq!(
+            ingress.content(),
+            Some("example/project #42 ship it"),
+            "{command}"
+        );
+        assert_eq!(ingress.principal().team(), "T01TEAM", "{command}");
+        assert_eq!(ingress.principal().channel(), "C01CHAN", "{command}");
+        assert_eq!(ingress.principal().user(), "U01USER", "{command}");
+        assert_eq!(
+            ingress.source_key(),
+            "slack:A0FIRST:T01TEAM:C01CHAN:command:13345224609.738474920.abc123",
+            "{command}"
+        );
+        assert_eq!(
+            ingress.scope(),
+            "slack:A0FIRST:T01TEAM:C01CHAN",
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn denied_github_slash_command_is_content_free_and_still_acknowledged() {
+    let frame = slash_command(
+        FIRST_KEY,
+        "/github_reply",
+        "secret reply",
+        "T01TEAM",
+        "C01CHAN",
+        "U09OTHER",
+        "13345224609.738474920.denied",
+    );
+    let envelope = parse_slack_envelope(frame.as_bytes(), &policy()).expect("denied command");
+    assert_eq!(envelope.disposition(), SlackDisposition::Denied);
+    assert_eq!(planned_ack(envelope.ack()), Some(FIRST_KEY));
+    let ingress = envelope.ingress().expect("durable denial");
+    assert_eq!(ingress.kind(), SlackInputKind::GitHubReply);
+    assert_eq!(ingress.command(), Some("/github_reply"));
+    assert_eq!(ingress.content(), None);
+
+    let rendered = format!("{envelope:?}");
+    assert!(!rendered.contains("secret reply"), "{rendered}");
+    assert!(!rendered.contains("U09OTHER"), "{rendered}");
+}
+
+#[test]
+fn unknown_slash_commands_remain_ignored_and_are_acknowledged() {
+    let frame = r#"{"accepts_response_payload":true,"envelope_id":"E1","payload":{"command":"/deploy"},"type":"slash_commands"}"#;
+    let envelope = parse_slack_envelope(frame.as_bytes(), &policy()).expect("unknown command");
+    assert_eq!(envelope.disposition(), SlackDisposition::IgnoredUnsupported);
+    assert!(envelope.ingress().is_none());
+    assert_eq!(planned_ack(envelope.ack()), Some("E1"));
+}
+
+#[test]
+fn github_slash_command_text_bound_is_exact_and_nul_refuses() {
+    let at_limit = "x".repeat(MAX_SLACK_TEXT_BYTES);
+    let admitted = slash_command(
+        FIRST_KEY,
+        "/github_create",
+        &at_limit,
+        "T01TEAM",
+        "C01CHAN",
+        "U01USER",
+        "T0.at-limit",
+    );
+    let envelope = parse_slack_envelope(admitted.as_bytes(), &policy()).expect("at limit");
+    assert_eq!(envelope.disposition(), SlackDisposition::Admitted);
+    assert_eq!(
+        envelope
+            .ingress()
+            .and_then(SlackIngress::content)
+            .map(str::len),
+        Some(MAX_SLACK_TEXT_BYTES)
+    );
+
+    for text in ["x".repeat(MAX_SLACK_TEXT_BYTES + 1), nul_string()] {
+        let frame = slash_command(
+            FIRST_KEY,
+            "/github_create",
+            &text,
+            "T01TEAM",
+            "C01CHAN",
+            "U01USER",
+            "T0.refused",
+        );
+        let envelope = parse_slack_envelope(frame.as_bytes(), &policy()).expect("refusal");
+        assert_eq!(
+            envelope.disposition(),
+            SlackDisposition::Refused(SlackRefusal::InvalidField("text"))
+        );
+        assert!(envelope.ingress().is_none());
+        assert_eq!(ack_key(envelope.ack()), Some(FIRST_KEY));
+        assert_eq!(planned_ack(envelope.ack()), None);
+    }
+}
+
+#[test]
+fn malformed_github_slash_commands_refuse_with_their_ack_key() {
+    let cases = [
+        (
+            r#"{"envelope_id":"E1","payload":{"command":"/github_create"},"type":"slash_commands"}"#,
+            SlackRefusal::InvalidField("team_id"),
+        ),
+        (
+            r#"{"envelope_id":"E1","payload":{"channel_id":"C01CHAN","command":"/github_create","team_id":"T01TEAM","text":"x","trigger_id":"T0","user_id":7},"type":"slash_commands"}"#,
+            SlackRefusal::InvalidField("user_id"),
+        ),
+        (
+            r#"{"envelope_id":"E1","payload":{"channel_id":"C01:CHAN","command":"/github_create","team_id":"T01TEAM","text":"x","trigger_id":"T0","user_id":"U01USER"},"type":"slash_commands"}"#,
+            SlackRefusal::InvalidField("channel_id"),
+        ),
+        (
+            r#"{"envelope_id":"E1","payload":{"channel_id":"C01CHAN","command":"/github_create","team_id":"T01TEAM","text":"x","trigger_id":"has:colon","user_id":"U01USER"},"type":"slash_commands"}"#,
+            SlackRefusal::InvalidField("trigger_id"),
+        ),
+        (
+            r#"{"envelope_id":"E1","payload":{"channel_id":"C01CHAN","command":"/github_create","team_id":"T01TEAM","text":7,"trigger_id":"T0","user_id":"U01USER"},"type":"slash_commands"}"#,
+            SlackRefusal::InvalidField("text"),
+        ),
+    ];
+    for (frame, expected) in cases {
+        let envelope = parse_slack_envelope(frame.as_bytes(), &policy()).expect("refusal");
+        assert_eq!(
+            envelope.disposition(),
+            SlackDisposition::Refused(expected),
+            "{frame}"
+        );
+        assert!(envelope.ingress().is_none(), "{frame}");
+        assert_eq!(ack_key(envelope.ack()), Some("E1"), "{frame}");
+        assert_eq!(planned_ack(envelope.ack()), None, "{frame}");
     }
 }
 

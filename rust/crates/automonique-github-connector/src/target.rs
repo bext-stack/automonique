@@ -342,6 +342,36 @@ impl IssueNumber {
     }
 }
 
+/// One positive GitHub issue-comment identifier.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CommentId(u64);
+
+impl CommentId {
+    /// Validate one issue-comment id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GitHubRefusal::CommentId`] for zero.
+    pub const fn new(value: u64) -> Result<Self, GitHubRefusal> {
+        if value == 0 {
+            return Err(GitHubRefusal::CommentId);
+        }
+        Ok(Self(value))
+    }
+
+    /// The numeric id.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for CommentId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 impl fmt::Display for IssueNumber {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}", self.0)
@@ -627,6 +657,14 @@ mod tests {
             IssueNumber::new(MAX_ISSUE_NUMBER + 1).err(),
             Some(GitHubRefusal::IssueNumber)
         );
+    }
+
+    #[test]
+    fn a_comment_id_is_positive_and_kept_exactly() {
+        assert_eq!(CommentId::new(0).err(), Some(GitHubRefusal::CommentId));
+        let id = CommentId::new(u64::MAX).expect("comment id");
+        assert_eq!(id.get(), u64::MAX);
+        assert_eq!(id.to_string(), u64::MAX.to_string());
     }
 
     #[test]

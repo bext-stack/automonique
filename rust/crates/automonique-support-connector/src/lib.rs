@@ -3,7 +3,7 @@
 //! Typed client for the Inklura Support fleet API.
 //!
 //! One product surface is reachable here: the support board behind the fleet
-//! endpoint `POST <base>/api/manage/shelldeck/fleet`. Five actions are spelled,
+//! endpoint `POST <base>/api/manage/shelldeck/fleet`. Seven actions are spelled,
 //! and nothing else can be: reading the support queue, resolving a mail message
 //! to its thread, adding an internal note, replying on a thread, and sending a
 //! support email.
@@ -58,12 +58,17 @@ pub use base::{FleetBase, FleetInstanceId, MAX_FLEET_IDENTIFIER_BYTES};
 pub use client::FleetClient;
 pub use request::{
     FleetRequest, MAX_EMAIL_BODY_BYTES, MAX_EMAIL_SUBJECT_BYTES, MAX_RECIPIENT_BYTES,
-    MAX_THREAD_TEXT_BYTES, SupportEmailRequest, SupportIssuesRequest, SupportReplyRequest,
-    SupportThreadNoteRequest, SupportThreadResolveRequest,
+    MAX_THREAD_TEXT_BYTES, MAX_TICKET_DECISION_REASON_BYTES, MAX_TICKET_ISSUE_URL_BYTES,
+    MAX_TICKET_SOURCE_KEY_BYTES, SupportEmailRequest, SupportIssuesRequest, SupportReplyRequest,
+    SupportThreadNoteRequest, SupportThreadResolveRequest, TicketDecision, TicketDecisionRequest,
+    TicketDispatchMode, TicketDispatchRequest, TicketStatusRequest,
 };
 pub use response::{
     SupportDelivery, SupportIssue, SupportIssues, SupportScope, SupportThreadRef,
-    decode_support_delivery, decode_support_issues, decode_support_note, decode_support_thread,
+    TicketDecisionOutcome, TicketDecisionReceipt, TicketDispatchReceipt, TicketJobStatus,
+    TicketStatus, TicketWorkspace, decode_support_delivery, decode_support_issues,
+    decode_support_note, decode_support_thread, decode_ticket_decision, decode_ticket_dispatch,
+    decode_ticket_status,
 };
 pub use token::{FleetAuthorization, FleetToken, MAX_FLEET_TOKEN_BYTES};
 
@@ -118,6 +123,18 @@ pub enum FleetRefusal {
     Recipient,
     /// The subject is empty, over its ceiling, or control-bearing.
     Subject,
+    /// The value was not one canonical github.com issue URL.
+    IssueUrl,
+    /// The stable transport key was absent or outside its closed grammar.
+    SourceKey,
+    /// The exact fleet job id was outside the opaque-id grammar.
+    JobId,
+    /// The stable idempotency key for a ticket decision was invalid.
+    DecisionKey,
+    /// The administrator identity key for a ticket decision was invalid.
+    ActorKey,
+    /// A rejection reason was absent or outside its text bound.
+    DecisionReason,
 }
 
 impl FleetRefusal {
@@ -135,6 +152,12 @@ impl FleetRefusal {
             Self::Text => "text",
             Self::Recipient => "recipient",
             Self::Subject => "subject",
+            Self::IssueUrl => "issue_url",
+            Self::SourceKey => "source_key",
+            Self::JobId => "job_id",
+            Self::DecisionKey => "decision_key",
+            Self::ActorKey => "actor_key",
+            Self::DecisionReason => "decision_reason",
         }
     }
 }
