@@ -47,10 +47,40 @@ def scratch(tmp: pathlib.Path) -> pathlib.Path:
     return work
 
 
-def run_check(work: pathlib.Path) -> tuple[int, str]:
-    r = subprocess.run([sys.executable, "plan/check.py", "--verify"],
+def run_check(work: pathlib.Path, *flags: str) -> tuple[int, str]:
+    r = subprocess.run([sys.executable, "plan/check.py", *(flags or ("--verify",))],
                        cwd=work, capture_output=True, text=True)
     return r.returncode, (r.stdout + r.stderr)
+
+
+def legacy_identifier() -> str:
+    """The identifier the location rule is about, read rather than written.
+
+    Spelling it here would put it in a file that is not one of its sanctioned
+    homes, which is the exact condition this rule refuses — the self-test would
+    fail the checker it exists to test. So it is recovered from the sanctioned
+    inventory by matching the same fingerprint `check.py` matches.
+    """
+    import hashlib
+    import re
+
+    inventory = (ROOT / "docs/product-plan/reference/legacy-inventory.md").read_text()
+    wanted = {(rule["length"], rule["digest"])
+              for rule in _fingerprints()}
+    for word in re.findall(r"[A-Za-z][A-Za-z0-9]*", inventory):
+        digest = hashlib.sha256(word.lower().encode()).hexdigest()
+        if (len(word), digest) in wanted:
+            return word
+    raise SystemExit("the sanctioned inventory no longer contains the identifier "
+                     "the location rule fingerprints; the rule or the inventory "
+                     "has rotted")
+
+
+def _fingerprints() -> tuple[dict, ...]:
+    sys.path.insert(0, str(ROOT / "plan"))
+    import check  # noqa: PLC0415 — imported here so this file has no import cycle
+
+    return check.LEGACY_TOKEN_FINGERPRINTS
 
 
 # -- mutations -------------------------------------------------------------
@@ -159,6 +189,19 @@ def block_on_licence_advisory(work: pathlib.Path) -> None:
     p.write_text(t[:j] + 'blocked_by_gates = ["GATE-LICENCE"]\n' + t[j:])
 
 
+def reintroduce_legacy_identifier(work: pathlib.Path) -> None:
+    """The identifier reappears in a file that is not one of its homes.
+
+    The rule this exercises is the one CI gates every push on, through
+    `plan/check.py --identifiers`. Without this case the rule's only coverage
+    was its two anti-vacuity controls, which prove it still *matches* something
+    — not that it still *refuses* anything.
+    """
+    p = work / "docs/product-plan/reference/work-breakdown.md"
+    p.write_text(p.read_text()
+                 + f"\nA stray sentence naming {legacy_identifier()} in prose.\n")
+
+
 CASES = [
     ("drift, forward  (ticket removed from breakdown)", drop_ticket,        "R5-08"),
     ("drift, reverse  (node invented in graph)",        invent_node,        "R99-01"),
@@ -176,6 +219,8 @@ CASES = [
      "blocked by advisory GATE-IDENTITY"),
     ("licence readiness used as development blocker",   block_on_licence_advisory,
      "blocked by advisory GATE-LICENCE"),
+    ("legacy identifier outside its sanctioned homes",  reintroduce_legacy_identifier,
+     "names a legacy identifier"),
 ]
 
 
@@ -213,6 +258,28 @@ def main() -> int:
                 failures += 1
             else:
                 print(f"ok    {name}")
+
+    # `--identifiers` is what the scrub workflow runs on every push, and it is
+    # a different code path from `--verify`: it must refuse the same
+    # reintroduction, and it must pass on a clean tree without the plan graph
+    # having to be self-consistent. A narrow gate that cannot fail is worth as
+    # little as a wide one that cannot.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = scratch(pathlib.Path(tmp))
+        code, out = run_check(work, "--identifiers")
+        if code != 0:
+            print("FAIL  --identifiers: an unmodified copy does not pass\n" + out,
+                  file=sys.stderr)
+            failures += 1
+        else:
+            reintroduce_legacy_identifier(work)
+            code, out = run_check(work, "--identifiers")
+            if code == 0 or "names a legacy identifier" not in out:
+                print("FAIL  --identifiers: a reintroduction is not refused\n" + out,
+                      file=sys.stderr)
+                failures += 1
+            else:
+                print("ok    --identifiers refuses what --verify refuses")
 
     after = (ROOT / "plan/work-graph.toml").read_bytes()
     if before != after:

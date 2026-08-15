@@ -28,10 +28,118 @@ jobs:
       - name: Scan the complete candidate without protected material
         run: python3 tools/scrub/scan.py
 
+      # The one enforcement of the first-party legacy name that needs no
+      # protected bundle: its fingerprint is public by design, so this runs on
+      # every push including a fork's, where no secret is available. Third-party
+      # names are never covered here — see plan/gates.md#gate-scrub for why
+      # value-based detection of those belongs only in the protected rules.
+      - name: Refuse a legacy identifier outside its sanctioned homes
+        run: python3 plan/check.py --identifiers
+
+  protected-push-scrub:
+    # The push-time half of GATE-SCRUB. `publication-scrub` below stays the
+    # release credential and keeps answering the reachability question over the
+    # whole history; this job answers the cheaper question every push actually
+    # raises — does the state a reviewer is about to read contain a private
+    # value — and adds the commit messages this push introduced.
+    #
+    # HAZARD: this job names the `scrub-publication` environment so it can read
+    # its two secrets. That environment must not gain a required-reviewer or
+    # wait-timer protection rule, or every push will queue behind a human. If
+    # such a rule is ever wanted for publication, mirror the two secrets at
+    # repository level and drop the `environment:` key here instead.
+    runs-on: ubuntu-latest
+    environment: scrub-publication
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # A fork's pull request gets no secrets, and neither does this repository
+      # until the owner provisions. Decide once, here, so the two run steps
+      # below stay simple and neither can silently become the other.
+      - name: Decide whether protected rules are available
+        id: mode
+        env:
+          AUTOMONIQUE_SCRUB_PROTECTED_RULES_B64: ${{ secrets.AUTOMONIQUE_SCRUB_PROTECTED_RULES_B64 }}
+          AUTOMONIQUE_SCRUB_HMAC_KEY_B64: ${{ secrets.AUTOMONIQUE_SCRUB_HMAC_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -n "${AUTOMONIQUE_SCRUB_PROTECTED_RULES_B64:-}" ] \
+             && [ -n "${AUTOMONIQUE_SCRUB_HMAC_KEY_B64:-}" ]; then
+            echo "protected=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "protected=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The range this event introduced. A force push or a new branch leaves
+      # `before` unreachable, and a range git cannot resolve must not be passed
+      # off as one it did: say so and scan the tree only.
+      - name: Resolve the pushed commit range
+        id: range
+        run: |
+          set -euo pipefail
+          before='${{ github.event.before }}'
+          case "${{ github.event_name }}" in
+            pull_request)
+              before='${{ github.event.pull_request.base.sha }}'
+              head='${{ github.event.pull_request.head.sha }}'
+              ;;
+            *)
+              head='${{ github.sha }}'
+              ;;
+          esac
+          if [ -n "$before" ] \
+             && [ "$before" != "0000000000000000000000000000000000000000" ] \
+             && git cat-file -e "$before^{commit}" 2>/dev/null; then
+            echo "commits=$before..$head" >> "$GITHUB_OUTPUT"
+          else
+            echo "commits=" >> "$GITHUB_OUTPUT"
+            echo "::warning::No resolvable commit range for this event (new branch, force push, or an unavailable base). Commit messages were not scanned; the dispatch-only publication-scrub job remains the backstop."
+          fi
+
+      - name: Scan the pushed tree with protected fingerprints
+        if: steps.mode.outputs.protected == 'true'
+        env:
+          AUTOMONIQUE_SCRUB_PROTECTED_RULES_B64: ${{ secrets.AUTOMONIQUE_SCRUB_PROTECTED_RULES_B64 }}
+          AUTOMONIQUE_SCRUB_HMAC_KEY_B64: ${{ secrets.AUTOMONIQUE_SCRUB_HMAC_KEY_B64 }}
+          COMMITS: ${{ steps.range.outputs.commits }}
+        run: |
+          set -euo pipefail
+          if [ -n "$COMMITS" ]; then
+            python3 tools/scrub/scan.py --require-protected --scope tree --commits "$COMMITS"
+          else
+            python3 tools/scrub/scan.py --require-protected --scope tree
+          fi
+
+      # Not provisioned yet, or a fork. Run what can run and say plainly that
+      # this is not the gate: a green tick here must never be read as evidence
+      # that a private value is absent. The moment the owner provisions, the
+      # step above takes over with no further edit.
+      - name: Scan the pushed tree without protected material
+        if: steps.mode.outputs.protected != 'true'
+        env:
+          COMMITS: ${{ steps.range.outputs.commits }}
+        run: |
+          set -euo pipefail
+          echo "::warning::Protected scrub rules are not available to this run, so this push was checked against the four public synthetic values only. It is evidence that the scanner works, not that private identifiers are absent. See plan/gates.md#gate-scrub."
+          if [ -n "$COMMITS" ]; then
+            python3 tools/scrub/scan.py --scope tree --commits "$COMMITS"
+          else
+            python3 tools/scrub/scan.py --scope tree
+          fi
+
   publication-scrub:
     # Protected fingerprints are publication credentials, not ordinary
     # development prerequisites. Run this explicitly before a release, package
     # publication, or transition of a non-public repository/artifact to public.
+    # Unlike `protected-push-scrub` this reads every historical blob and every
+    # reachable commit message, which is the only scope that can support a
+    # claim about what a clone of this repository still exposes.
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: scrub-publication

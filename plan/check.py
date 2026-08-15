@@ -612,7 +612,28 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--verify", action="store_true",
                     help="verify only; refuse if ready.md is stale, rewrite nothing")
+    ap.add_argument("--identifiers", action="store_true",
+                    help="run only the legacy-identifier location rule and exit; "
+                         "needs no plan graph and no secrets, so CI can gate every "
+                         "push on it")
     args = ap.parse_args()
+
+    if args.identifiers:
+        # The narrow entry point exists because this one rule is the only part
+        # of this file that is about the *published* tree rather than about
+        # plan bookkeeping, and it is the only enforcement the first-party
+        # legacy name has that needs no protected fingerprint bundle. Running
+        # the whole checker to get it would make a push gate depend on the
+        # roadmap being self-consistent, which is a different question with a
+        # different owner.
+        check_legacy_identifier_location()
+        for e in errors:
+            print(f"FAIL: {e}", file=sys.stderr)
+        if errors:
+            print(f"\n{len(errors)} identifier-location failure(s)", file=sys.stderr)
+            return 1
+        print("ok — no legacy identifier outside its sanctioned homes")
+        return 0
 
     if not GRAPH.exists():
         print("plan/work-graph.toml is missing — run plan/generate.py", file=sys.stderr)
