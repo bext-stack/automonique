@@ -54,8 +54,15 @@ both need and should land first.
    shadow-utils route is closed.
 2. **Dependency policy:** widen the nix pin's features to add `time`
    (CLOCK_BOOTTIME, timerfd) — feature widening of an existing exact-pinned dep,
-   not a new dep. Plus a shared decision with M5 #29: `proptest` (dev-dependency
-   only, exact-pinned) — #45 wants property tests and M5 wants the same dep.
+   not a new dep. Confirmed present in the pinned crate:
+   `nix::time::clock_gettime` (`nix-0.29.0/src/time.rs:191`) and
+   `ClockId::CLOCK_BOOTTIME` (`:62`), both behind the `time` feature, which no
+   crate currently enables (`rust/Cargo.toml:37` lists
+   `fs, process, resource, signal, socket, user`). Note the runner's own nix
+   entry (`automonique-runner/Cargo.toml:14`) omits `resource`, so #47a's
+   `setrlimit` needs the same kind of feature edit there. Plus a shared decision
+   with M5 #29: `proptest` (dev-dependency only, exact-pinned) — #45 wants
+   property tests and M5 wants the same dep.
 3. **#45:** cron timezone scope for v1 — recommend Once/Every/UTC-cron computed
    exactly, non-UTC cron **refused** at registration with a typed error
    (refusal-first); a bounded TZif reader as follow-up.
@@ -176,6 +183,36 @@ already enabled). Refuse on any failure — no path-exec fallback. Honest residu
 stated in docs: the ELF interpreter and libraries remain path-resolved under
 Landlock grants (same class as the existing LD_PRELOAD note); the digest recorded
 in the session binding is now the digest of the bytes that ran.
+
+Four implementation details verified against the pinned crates and this host,
+each of which turns a plausible variant into a broken one:
+
+- **`execveat`, not `fexecve`.** Both exist in `nix = "=0.29.0"` under the
+  already-enabled `process` feature (`nix-0.29.0/src/unistd.rs:913` and `:938`),
+  and the `unsafe` lives inside `nix`, so `forbid(unsafe_code)` is untouched.
+  Prefer `execveat` with `AT_EMPTY_PATH`: glibc's `fexecve` can fall back to
+  `/proc/self/fd/N`, and by this point in the sequence Landlock denies `/proc`.
+- **The descriptor allowlist must widen by exactly one.**
+  `close_all_except(&DescriptorAllowlist::standard_streams())` followed by
+  `verify_only_allowlist_open` (`launch.rs:812-814`) would close the program fd
+  and then prove the wrong thing. Admit the program fd by name so the
+  verification still proves an exact four-entry fd table.
+- **The sealed-memfd stage has an unstated host dependency.** The pinned `nix`
+  exposes neither `MFD_EXEC` nor `MFD_NOEXEC_SEAL`
+  (`nix-0.29.0/src/sys/memfd.rs:25-74`), so exec-from-memfd works only while
+  `vm.memfd_noexec` is `0` (it is `0` on this host, checked). Either add a
+  doctor check for that sysctl (M7 #55's silent-no-op sweep is the natural
+  home), or `execveat` the verified `O_RDONLY` fd directly — which needs no
+  sysctl, and closes the rename/replace TOCTOU completely. The memfd variant's
+  extra value is narrow: it additionally survives an *in-place rewrite of the
+  same inode*, which `ExecutableInspection` already makes hard by refusing
+  group- or world-writable files. Recommend fd-direct as shipped behaviour and
+  memfd as a documented follow-up rather than a hidden sysctl dependency.
+- **`AT_EMPTY_PATH` changes why the grant list is what it is.** With no path
+  resolution for the program, the Landlock read-execute grant on the program's
+  own path stops being what admits the exec. The grant must **not** be dropped —
+  the loader and libraries still need it (`spawn_plan.rs:51-57`) — but a reader
+  who does not know the reason changed will delete it. Say so in the module doc.
 
 **Testing.** swap-the-binary test in both orders: swap before helper read →
 refusal (mismatch); swap after read → original bytes still execute and the
