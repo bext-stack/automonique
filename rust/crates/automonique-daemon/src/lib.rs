@@ -69,6 +69,7 @@ use automonique_protocol::approval_api::{
     ApprovalRefusal, ApprovalRequest, ApprovalResponse, ApprovalSubject, ApprovalsBySubject,
     Decider, ListApprovals, RecordApproval, RecordedApproval,
 };
+use automonique_protocol::audit::{AuditCategory, AuditEvent, AuditOutcome, AuditRecord};
 use automonique_protocol::automation::{AutomationActor, EnablementState};
 use automonique_protocol::automation_api::{
     AutomationContinuation, AutomationCursor, AutomationId, AutomationListPage,
@@ -86,7 +87,9 @@ use automonique_protocol::batch_runner::{
 };
 use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, RequestId, decode_frame, encode_frame};
 use automonique_protocol::digest::{ALGORITHM, Sha256, Sha256Digest};
-use automonique_protocol::execute_api::{ExecuteRefusal, ExecuteRequest, ExecuteResponse};
+use automonique_protocol::execute_api::{
+    CancelRunOutcome, ExecuteRefusal, ExecuteRequest, ExecuteResponse,
+};
 use automonique_protocol::journal::{CursorResume, RetainedRange};
 use automonique_protocol::runs_api::{
     Continuation, LifecycleCoverage, ListRuns, MAX_LIFECYCLE_EVENTS, RunCursor, RunDetailView,
@@ -94,12 +97,14 @@ use automonique_protocol::runs_api::{
     SpoolEventKind, SubmissionState,
 };
 use automonique_protocol::tools::RunId;
+use automonique_runner::dispatch::DispatchOutcome;
 use automonique_runner::{RunSpec, RunSpecDecodeError, Spool};
 use automonique_store::approval_ledger::{
     ApprovalDecision as StoreApprovalDecision, ApprovalDecisionRecord,
     ApprovalDisposition as StoreApprovalDisposition, ApprovalEntry, ApprovalLedger,
     ApprovalLedgerError,
 };
+use automonique_store::audit_chain::{AuditAppend, AuditChain, GENESIS_PREV_HASH};
 use automonique_store::automation_store::{
     AutomationRecord, AutomationRegistration, AutomationStore, AutomationStoreError,
     EnablementState as StoreEnablementState, EnablementTransition,
@@ -499,6 +504,13 @@ pub enum DaemonError {
     /// reports a lost document: it reports a read model that could not be
     /// extended or could not be believed.
     RunIndexFailed(&'static str),
+    /// The durable audit chain could not be opened. The payload is the stable
+    /// category from `automonique_store::audit_chain`.
+    ///
+    /// Fail-closed at startup rather than on the first record: a daemon that
+    /// cannot write down what it was asked to do must not publish an endpoint
+    /// that accepts requests.
+    AuditChainFailed(&'static str),
     /// The host-wide cancellation host could not be opened or could not be
     /// disposed cleanly. The payload is the stable category from
     /// [`attempt_host`].
@@ -580,6 +592,7 @@ impl DaemonError {
             Self::TelegramRefused(category) => category,
             Self::RunSubmissionFailed(category) => category,
             Self::RunIndexFailed(category) => category,
+            Self::AuditChainFailed(category) => category,
             Self::AttemptHostFailed(category) => category,
             Self::AutomationStoreFailed(category) => category,
             Self::ApprovalLedgerFailed(category) => category,
@@ -620,6 +633,9 @@ impl fmt::Display for DaemonError {
             }
             Self::RunIndexFailed(category) => {
                 write!(formatter, "run index failed: {category}")
+            }
+            Self::AuditChainFailed(category) => {
+                write!(formatter, "audit chain failed: {category}")
             }
             Self::AttemptHostFailed(category) => {
                 write!(formatter, "attempt host refused: {category}")
@@ -693,6 +709,18 @@ pub struct Daemon {
     /// for the reason custody storage is — a daemon that cannot record what it
     /// accepted must not publish an endpoint that accepts.
     run_index: RunIndex,
+    /// The hash-chained audit record of what this daemon was asked to do.
+    ///
+    /// A plain field for the reason [`Daemon::run_index`] is one: it owns no
+    /// dispatcher and needs no ordered disposal, because it is a database and
+    /// dropping it closes it.
+    ///
+    /// Append-only and never read on the request path. A record is written
+    /// *after* the thing it describes has already happened, so a failure to
+    /// append never blocks or reverses an action — see
+    /// [`Daemon::record_cancellation_audit`], which states what that trade
+    /// buys.
+    audit_chain: AuditChain,
     /// The durable record of which automations an operator has in service.
     ///
     /// A plain field for the same reason [`Daemon::run_index`] is: it owns no
@@ -958,6 +986,16 @@ impl Daemon {
         let run_index = RunIndex::open(config.run_index_path())
             .map_err(|error| DaemonError::RunIndexFailed(error.category()))?;
 
+        // The audit chain opens under the same fence and before the socket
+        // guard is disarmed, for the reason every durable sibling does: a
+        // daemon that cannot record what it was asked to do must not publish
+        // an endpoint that accepts requests. Opening it lazily on the first
+        // record would put the one failure mode that matters — a chain that
+        // cannot be written — at the exact moment there is already something
+        // to write, which is the worst time to discover it.
+        let audit_chain = AuditChain::open(config.audit_chain_path())
+            .map_err(|error| DaemonError::AuditChainFailed(error.category()))?;
+
         // The automation registry opens under the same fence and before the
         // socket guard is disarmed, for the reason custody storage does: a
         // daemon that cannot durably record an operator's decision to pause an
@@ -1050,6 +1088,7 @@ impl Daemon {
             slack_tickets,
             run_submissions,
             run_index,
+            audit_chain,
             automations,
             approvals,
             batches,
@@ -1078,9 +1117,14 @@ impl Daemon {
     ///
     /// [`execute::ExecutionLane`] registers every attempt it starts against
     /// this host, so a daemon with a live attempt has a non-empty registry and
-    /// a cancellation delivered here reaches that attempt's process tree. No
-    /// administration command routes a cancel, so the registry is still empty
-    /// on a daemon that has been asked to run nothing.
+    /// a cancellation delivered here reaches that attempt's process tree. A
+    /// daemon that has been asked to run nothing has an empty one.
+    ///
+    /// The Execute lane's `cancel_run` verb routes here through
+    /// [`Daemon::cancel_run`], which is the only caller that delivers. This
+    /// accessor is for composition proofs, not for a second delivery path:
+    /// cancelling through it directly skips the fence and the run-to-attempt
+    /// resolution that make the operator surfaces equal in authority.
     #[must_use]
     pub fn attempt_host(&self) -> Option<&DaemonAttemptHost> {
         self.attempt_host.as_deref()
@@ -2340,7 +2384,7 @@ impl Daemon {
         Ok(low)
     }
 
-    /// Start one run already in custody.
+    /// Start one run already in custody, or stop one that is running.
     ///
     /// # This is the lane that acts
     ///
@@ -2360,12 +2404,27 @@ impl Daemon {
     ///   work beginning, and a submission already in custody is still new work
     ///   the moment somebody asks for it to run.
     ///
+    /// # Cancellation takes the fence and not the intake gates
+    ///
+    /// `cancel_run` is fenced identically — a daemon that lost its generation
+    /// must not reach into another generation's work — but it is **not** gated
+    /// on `paused` or `degraded`, and the reason is the same one that leaves
+    /// the read and control lanes open. An operator who closed intake, or whose
+    /// generation is awaiting reconciliation, still needs to stop what is
+    /// already running; that is precisely the repair the pause was taken for.
+    /// Refusing a cancel because intake is closed would make the pause a
+    /// hazard.
+    ///
     /// # What an accepted answer means
     ///
     /// One attempt was started. It is running when the answer is written, so
     /// the answer carries no outcome — [`Daemon::handle_runs`] is where one is
     /// observed, once the worker has advanced the read model. A refusal means
     /// nothing was started and nothing was written.
+    ///
+    /// A `cancel_result` means one cancellation request reached the durable
+    /// ledger. It does not mean a process exited; see
+    /// [`Daemon::cancel_run`].
     fn handle_execute(
         &mut self,
         stream: &mut UnixStream,
@@ -2385,15 +2444,34 @@ impl Daemon {
             self.reconciliation_run_id.is_some() || snapshot_requires_reconciliation(&snapshot);
         let paused = self.store.intake_paused(GENERATION_ID, now_ms)?.is_some();
 
-        let ExecuteRequest::ExecuteRun { request_id, run_id } = request;
-        let response = match self.start_run(run_id, degraded, paused) {
-            Ok(submission_id) => {
-                ExecuteResponse::accepted(request_id.clone(), run_id.clone(), submission_id)
-                    .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
+        let response = match request {
+            ExecuteRequest::ExecuteRun { request_id, run_id } => {
+                match self.start_run(run_id, degraded, paused) {
+                    Ok(submission_id) => {
+                        ExecuteResponse::accepted(request_id.clone(), run_id.clone(), submission_id)
+                            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
+                    }
+                    Err(refusal) => ExecuteResponse::Refused {
+                        request_id: request_id.clone(),
+                        refusal,
+                    },
+                }
             }
-            Err(refusal) => ExecuteResponse::Refused {
-                request_id: request_id.clone(),
-                refusal,
+            ExecuteRequest::CancelRun {
+                request_id,
+                run_id,
+                request_ref,
+                observed_sequence,
+            } => match self.cancel_run(run_id, request_ref.as_str(), *observed_sequence, now_ms) {
+                Ok(outcome) => ExecuteResponse::Cancelled {
+                    request_id: request_id.clone(),
+                    run_id: run_id.clone(),
+                    outcome,
+                },
+                Err(refusal) => ExecuteResponse::Refused {
+                    request_id: request_id.clone(),
+                    refusal,
+                },
             },
         };
         let response = response
@@ -2460,6 +2538,196 @@ impl Daemon {
             .ok_or(ExecuteRefusal::ExecutionUnavailable)?
             .start(&entry.document, record.submission_id, record.revision)?;
         Ok(submission_id)
+    }
+
+    /// Deliver one cancellation request to the live attempt a run has.
+    ///
+    /// This is the *only* function that cancels a run, and every surface routes
+    /// through it: the admin socket's `cancel_run`, the CLI's `cancel` verb, and
+    /// the Telegram bridge's `/cancel`. That is the whole of what makes the
+    /// three equal in authority — same fence, same resolution, same ledger,
+    /// same answers — rather than three implementations that agree today.
+    ///
+    /// # Resolving a run to an attempt
+    ///
+    /// The dispatcher keys on `attempt_id` and an operator types a run
+    /// reference, so the identity is resolved through the same walk
+    /// [`Daemon::start_run`] performs — index row, custody row, then
+    /// [`RunSpec::from_canonical_bytes`] for the document's own `attempt_id`.
+    ///
+    /// The document is **decoded**, never derived. This daemon's own composer
+    /// mints an attempt identifier as a function of the run identifier, so
+    /// deriving one would work for every run this daemon composed and silently
+    /// cancel the wrong thing — or nothing — for a document submitted from
+    /// outside. The identity an attempt was registered under is the one written
+    /// in the document it was started from, and that is the one read here.
+    ///
+    /// # What the answer means
+    ///
+    /// [`CancelRunOutcome::Delivered`] says the request reached the registered
+    /// sink exactly once and custody now holds it. It does **not** say the
+    /// process exited, that its descendants were reaped, or that the run
+    /// reached a terminal state — those are the Runs lane's to report, and the
+    /// dispatcher's own documentation is explicit that a delivery is delivery
+    /// evidence and not exit evidence.
+    ///
+    /// A run with no live attempt is [`ExecuteRefusal::NoLiveAttempt`] rather
+    /// than a success. A cancellation that stopped nothing must never read as
+    /// one that stopped something.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ExecuteRefusal`] the caller is owed. `now_ms` is accepted
+    /// and currently unused by the delivery itself; it is threaded through so
+    /// the audit record this appends carries the same instant the rest of the
+    /// request was judged against rather than a second reading of the clock.
+    fn cancel_run(
+        &mut self,
+        run_id: &RunId,
+        request_ref: &str,
+        observed_sequence: u64,
+        now_ms: i64,
+    ) -> Result<CancelRunOutcome, ExecuteRefusal> {
+        let attempt_id = self.attempt_id_for(run_id)?;
+        let host = self
+            .attempt_host
+            .as_ref()
+            .ok_or(ExecuteRefusal::ExecutionUnavailable)?;
+        let outcome = match host.cancel(&attempt_id, request_ref, observed_sequence) {
+            DispatchOutcome::Delivered => CancelRunOutcome::Delivered,
+            DispatchOutcome::AlreadyDelivered => CancelRunOutcome::AlreadyDelivered,
+            DispatchOutcome::Conflict => CancelRunOutcome::Conflict,
+            // No registration holds this attempt: it finished, or never
+            // started. Custody was not consulted and nothing was written.
+            DispatchOutcome::UnknownAttempt => return Err(ExecuteRefusal::NoLiveAttempt),
+            DispatchOutcome::SinkUnavailable => return Err(ExecuteRefusal::CancelNotDelivered),
+            DispatchOutcome::CustodyFull => return Err(ExecuteRefusal::LaneSaturated),
+            DispatchOutcome::CustodyUnavailable => {
+                return Err(ExecuteRefusal::ExecutionUnavailable);
+            }
+            // The direct API is reachable by callers that never parsed a wire
+            // line, so the dispatcher checks spelling itself. A frame that got
+            // here was already admitted, so this is a caller inside this
+            // process presenting something the protocol would have refused.
+            DispatchOutcome::FieldInvalid => return Err(ExecuteRefusal::AdmissionRefused),
+        };
+        self.record_cancellation_audit(run_id, outcome, now_ms);
+        Ok(outcome)
+    }
+
+    /// Append one `cancellation` record to the hash-chained audit log.
+    ///
+    /// # The write order, and the failure it buys
+    ///
+    /// The cancellation is delivered first and recorded second, which is the
+    /// order `automonique_store::audit_chain`'s header requires and for the
+    /// reason it gives: a crash between the two leaves a delivery with no audit
+    /// record, which is a *detectable gap* — the chain is contiguous by `seq`,
+    /// so reconciling the cancel ledger against it finds one. The other order
+    /// would leave a record of a cancellation that never happened, and nothing
+    /// can detect that, because a record of a thing that did not happen is
+    /// exactly what a record of a thing that did looks like.
+    ///
+    /// # Why this returns nothing
+    ///
+    /// A failure to append is deliberately **not** propagated. The cancellation
+    /// has already been delivered and durably recorded in the cancel ledger by
+    /// the time this runs; turning an audit failure into a refusal would tell
+    /// the caller their cancellation did not happen when it did, which is a
+    /// worse lie than a missing audit record. The gap is detectable and this is
+    /// not.
+    ///
+    /// The record is built against the chain's current head. A concurrent
+    /// append would move that head, but this daemon holds the generation lease
+    /// and is the single writer, so the read and the append cannot be
+    /// interleaved by another writer — and if one somehow were, the chain
+    /// refuses the stale link rather than forking.
+    ///
+    /// `request_ref` is deliberately not a field of the record. It is the
+    /// cancel ledger's idempotency key and that ledger holds it; carrying it
+    /// here would put one caller-chosen value in two databases no transaction
+    /// spans, for no reader. The audit chain's subject is the run.
+    fn record_cancellation_audit(
+        &mut self,
+        run_id: &RunId,
+        outcome: CancelRunOutcome,
+        now_ms: i64,
+    ) {
+        let (Ok(head), Some(recorded_at)) = (
+            self.audit_chain.head(),
+            telegram_bridge::utc_rfc3339_from_unix_millis(now_ms),
+        ) else {
+            return;
+        };
+        let (seq, prev_hash) = head.map_or_else(
+            || (1, GENESIS_PREV_HASH.to_owned()),
+            |head| (head.seq.saturating_add(1), head.record_hash),
+        );
+        // The actor is the socket's peer, which this lane models as the local
+        // operator and nothing finer: no lane on this socket carries an actor,
+        // so claiming a name here would be inventing one.
+        let record = AuditRecord::link(
+            seq,
+            &prev_hash,
+            AuditEvent {
+                recorded_at: &recorded_at,
+                actor: "local-peer",
+                surface: "automonique.execute",
+                category: AuditCategory::Cancellation,
+                subject: run_id.as_str(),
+                outcome: match outcome {
+                    CancelRunOutcome::Delivered | CancelRunOutcome::AlreadyDelivered => {
+                        AuditOutcome::Success
+                    }
+                    CancelRunOutcome::Conflict => AuditOutcome::Denied,
+                },
+            },
+        );
+        let Ok(record) = record else {
+            return;
+        };
+        let record_id = record.record_id();
+        let body = record.to_canonical_bytes();
+        let record_hash = record.record_hash();
+        let _ = self.audit_chain.append(AuditAppend {
+            record_id: &record_id,
+            recorded_at: record.recorded_at(),
+            actor: record.actor(),
+            surface: record.surface(),
+            category: record.category().as_str(),
+            subject: record.subject(),
+            outcome: record.outcome().as_str(),
+            body: &body,
+            prev_hash: record.prev_hash(),
+            record_hash: &record_hash,
+        });
+    }
+
+    /// Read the attempt identifier the document one run is custodied under
+    /// declares.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecuteRefusal::UnknownRun`] when nothing is held under that identity,
+    /// and [`ExecuteRefusal::ExecutionUnavailable`] when this daemon's own
+    /// state would not answer — the same mapping [`Daemon::start_run`] uses,
+    /// and for the same reason.
+    fn attempt_id_for(&self, run_id: &RunId) -> Result<String, ExecuteRefusal> {
+        let records = self
+            .run_index
+            .by_run_id(run_id.as_str())
+            .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
+        let record = records.last().ok_or(ExecuteRefusal::UnknownRun)?;
+        let entry = self
+            .run_submissions
+            .run_submissions(&record.run_id)
+            .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?
+            .into_iter()
+            .find(|entry| entry.submission_id == record.submission_id)
+            .ok_or(ExecuteRefusal::ExecutionUnavailable)?;
+        let spec = RunSpec::from_canonical_bytes(&entry.document)
+            .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
+        Ok(spec.attempt_id().as_str().to_owned())
     }
 
     /// Answer one operation on the native Automation control API.

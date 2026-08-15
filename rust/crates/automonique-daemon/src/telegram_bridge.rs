@@ -108,6 +108,7 @@ use std::time::{Duration, Instant};
 use automonique_github_connector::IssueLocator;
 use automonique_protocol::admin::ExecutionState;
 use automonique_protocol::digest::Sha256;
+use automonique_protocol::execute_api::CancelRunOutcome;
 use automonique_store::agent_memory::{
     AgentMemoryError, AgentMemoryStore, ExternalIdentity, MemoryInput, MemoryKind, MemoryRecord,
     MemorySensitivity, MemoryStatus, MemorySupersession, MemoryVisibility, MessageInput,
@@ -815,9 +816,6 @@ pub enum DraftOutcome {
 /// this enum is the whole outcome of the command that produced it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Unavailable {
-    /// `/cancel`: the admin protocol has no cancel verb to route to the
-    /// host-wide dispatcher this daemon already owns.
-    CancelVerb,
     /// `/deny`: Manage rejection is not yet exposed by the typed connector.
     ApprovalWiring,
     /// The extended GitHub planning vocabulary is parsed but its typed action
@@ -830,7 +828,6 @@ impl Unavailable {
     #[must_use]
     pub const fn category(self) -> &'static str {
         match self {
-            Self::CancelVerb => "cancel_verb_absent",
             Self::ApprovalWiring => "approval_wiring_absent",
             Self::GitHubManagementWiring => "github_management_wiring_absent",
         }
@@ -843,9 +840,6 @@ impl Unavailable {
     #[must_use]
     pub const fn operator_reply(self) -> &'static str {
         match self {
-            Self::CancelVerb => {
-                "Not available yet. This build has no cancel command on the admin protocol, so nothing was cancelled."
-            }
             Self::ApprovalWiring => {
                 "Not available yet. Denying a pending Manage ticket is not exposed by this connector, so nothing was decided."
             }
@@ -888,9 +882,9 @@ impl Unavailable {
             | ControlCommand::GitHubLabel { .. }
             | ControlCommand::GitHubMilestone { .. }
             | ControlCommand::GitHubEpic { .. }
-            | ControlCommand::GitHubProject { .. } => None,
-            ControlCommand::Cancel { .. } => Some(Self::CancelVerb),
-            ControlCommand::Approve { .. } => None,
+            | ControlCommand::GitHubProject { .. }
+            | ControlCommand::Cancel { .. }
+            | ControlCommand::Approve { .. } => None,
             ControlCommand::Deny { .. } => Some(Self::ApprovalWiring),
         }
     }
@@ -1728,6 +1722,33 @@ pub trait RunLane {
     /// a complete answer: a refusal started nothing, and a failure is a run
     /// whose record exists.
     fn run(&mut self, task: &str) -> Result<String, RunFailure>;
+
+    /// Deliver one cancellation request for a run's live attempt.
+    ///
+    /// `request_ref` is the idempotency key: the same reference presented twice
+    /// is one cancellation delivered once, so a caller must derive it from
+    /// coordinates that are stable across its own retries. The bridge uses the
+    /// message's own, which makes a redelivered Telegram update a replay rather
+    /// than a second cancellation.
+    ///
+    /// The default refuses. A lane that cannot reach a daemon cannot cancel
+    /// anything, and answering anything else would be claiming an effect no
+    /// test lane has — this is the one method whose wrong default is a lie
+    /// about a destructive action rather than about a read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunFailure::Refused`] when the run is unknown,
+    /// [`RunFailure::Failed`] when it has no live attempt to cancel, and
+    /// [`RunFailure::Unavailable`] when this lane could not carry the request.
+    fn cancel_run(
+        &mut self,
+        run_ref: &str,
+        request_ref: &str,
+    ) -> Result<CancelRunOutcome, RunFailure> {
+        let _ = (run_ref, request_ref);
+        Err(RunFailure::Unavailable)
+    }
 
     /// Run one bounded, read-only conversational question.
     ///
@@ -3952,6 +3973,32 @@ where
                         message_id: update.message_id(),
                         approval_ref: approval_ref.as_str().to_owned(),
                     },
+                    // `/cancel` is admin-tier and the tier gate above already
+                    // ran, so an operator who reaches here is authorized.
+                    // Answered synchronously rather than queued to a worker,
+                    // unlike `/approve`: a cancellation is one local socket
+                    // exchange, the same cost class as `/status`, where an
+                    // approval makes a network call to a ticket connector.
+                    Ok(ControlCommand::Cancel { run_ref }) => {
+                        let request_ref = cancel_request_ref(update, principal.chat_id());
+                        let run_ref = run_ref.as_str().to_owned();
+                        let outcome = self
+                            .lane
+                            .lock()
+                            .map_err(|_| RunFailure::Unavailable)
+                            .and_then(|mut lane| lane.cancel_run(&run_ref, &request_ref));
+                        match outcome {
+                            Ok(outcome) => Answer::Answered {
+                                chat_id: principal.chat_id(),
+                                text: String::from(cancel_reply(outcome)),
+                                preformatted: false,
+                            },
+                            Err(failure) => Answer::RunFailed {
+                                chat_id: principal.chat_id(),
+                                text: String::from(cancel_failure_reply(failure)),
+                            },
+                        }
+                    }
                     Ok(command) => match Unavailable::for_command(&command) {
                         Some(unavailable) => Answer::Unavailable {
                             chat_id: principal.chat_id(),
@@ -5006,11 +5053,12 @@ where
             | ControlCommand::New
             | ControlCommand::Say { .. }
             | ControlCommand::Admin { .. }
-            | ControlCommand::Approve { .. } => String::new(),
+            | ControlCommand::Approve { .. }
+            // Answered by its own dispatch arm, like `/approve` and `/run`.
+            | ControlCommand::Cancel { .. } => String::new(),
             // `Unavailable::for_command` decided these before `render` was
             // reached. Answering them here would be a second dispatch table.
-            ControlCommand::Cancel { .. }
-            | ControlCommand::Deny { .. }
+            ControlCommand::Deny { .. }
             | ControlCommand::GitHubCreate { .. }
             | ControlCommand::GitHubReply { .. }
             | ControlCommand::GitHubCheck { .. }
@@ -6978,7 +7026,66 @@ fn question_prompt(question: &str, context: &str, profile: QuestionProfile) -> O
 /// The daemon clock already produces a non-negative Unix instant in normal
 /// operation. An unavailable or pre-epoch clock is omitted rather than
 /// repaired into a plausible-looking timestamp.
-fn utc_rfc3339_from_unix_millis(unix_ms: i64) -> Option<String> {
+/// Mint the idempotency key for one `/cancel`, from the message's own
+/// coordinates.
+///
+/// Deterministic on purpose. Telegram redelivers an update whose offset was not
+/// committed, and a reference minted from a clock or a counter would make each
+/// redelivery a *second* cancellation request. Derived from the coordinates,
+/// a redelivery presents the reference the first delivery already recorded, and
+/// the durable ledger answers `already_delivered` — one cancellation delivered
+/// once, no matter how many times the update arrives.
+///
+/// `update_id` is the fallback when a message carries no identifier, because it
+/// is the coordinate Telegram itself uses to deduplicate and is present on
+/// every update. The two are distinguished by their prefix so a message and an
+/// update with the same number cannot collide.
+fn cancel_request_ref(update: &TelegramIngress, chat_id: i64) -> String {
+    update.message_id().map_or_else(
+        || format!("tg:u:{}", update.update_id()),
+        |message_id| format!("tg:{chat_id}:{message_id}"),
+    )
+}
+
+/// The operator's reply for one cancellation the ledger answered.
+///
+/// Every string says what happened to *their* command and stops there. In
+/// particular none of them claims the process exited: a delivered cancellation
+/// is delivery evidence, and whether the run reached a terminal state is what
+/// `/runs` reports.
+const fn cancel_reply(outcome: CancelRunOutcome) -> &'static str {
+    match outcome {
+        CancelRunOutcome::Delivered => {
+            "Cancellation sent. The run is being stopped; check /runs for its final state."
+        }
+        CancelRunOutcome::AlreadyDelivered => {
+            "Already cancelled by this same request. Nothing changed; check /runs for its final state."
+        }
+        CancelRunOutcome::Conflict => {
+            "Not cancelled. That request reference is already bound to a different run, so nothing was sent."
+        }
+    }
+}
+
+/// The operator's reply for one cancellation that never reached the ledger.
+///
+/// [`RunFailure::Failed`] is the run-with-no-live-attempt case and is separated
+/// from the rest deliberately: "it already stopped" and "something went wrong"
+/// are different facts, and only one of them means the operator should do
+/// anything.
+const fn cancel_failure_reply(failure: RunFailure) -> &'static str {
+    match failure {
+        RunFailure::Refused => {
+            "No run with that reference. Nothing was cancelled; check /runs for the identity."
+        }
+        RunFailure::Failed => {
+            "That run has no attempt running, so nothing was cancelled. Check /runs for how it ended."
+        }
+        _ => "Could not reach the execution lane, so nothing was cancelled. Try again.",
+    }
+}
+
+pub(crate) fn utc_rfc3339_from_unix_millis(unix_ms: i64) -> Option<String> {
     let unix_ms = u64::try_from(unix_ms).ok()?;
     let unix_seconds = unix_ms / 1_000;
     let milliseconds = unix_ms % 1_000;

@@ -60,18 +60,24 @@
 //! degrades to exactly what it documents — a `record` that returns
 //! [`DispatchOutcome::Conflict`] after a delivery that did happen.
 //!
+//! # Who reaches this host
+//!
+//! - **The execution lane registers every attempt it starts**, before it opens
+//!   the spool and before it creates the run cgroup, so no containment can
+//!   exist for an attempt cancellation cannot reach. A live daemon's registry
+//!   is non-empty exactly when it is running something.
+//! - **`Daemon::cancel_run` is the one caller that delivers**, and every
+//!   operator surface routes through it: the Execute lane's `cancel_run` verb,
+//!   the CLI's `cancel`, and the Telegram bridge's `/cancel`. One function, one
+//!   fence, one ledger — which is what makes those three equal in authority
+//!   rather than three implementations that agree today.
+//!
 //! # What this does not do
 //!
-//! - **No administration command routes a cancel here.** There is no `Cancel`
-//!   variant on the admin protocol and no handler arm for one; adding both is a
-//!   separate protocol-and-handler slice. This module constructs the owner and
-//!   its durable custody. Its exercised tests drive it directly and through a
-//!   real [`ControlServer`](automonique_runner::control::ControlServer) seat,
-//!   which is the whole of what is proved.
-//! - **Nothing registers an attempt in a running daemon.** No execution lane
-//!   exists in this build, so a live daemon's registry is empty by
-//!   construction. The registration API is here because the host is the thing
-//!   an execution lane would register against.
+//! - **It does not resolve a run to an attempt.** This host keys on
+//!   `attempt_id`, and an operator names a run; the walk between them is the
+//!   daemon's, through the run index and custody to the document's own declared
+//!   identity.
 //! - **It is not exit evidence, and it is not authorization.** Both limits are
 //!   the dispatcher's and are unchanged by owning one: a delivery says a
 //!   request reached a sink once, and anyone holding the host may cancel any

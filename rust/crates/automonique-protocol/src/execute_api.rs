@@ -10,8 +10,38 @@
 //! closed, and the Runs lane is documented as a read surface with "no mutation
 //! in this module and no field through which one could be requested".
 //!
-//! This is that missing verb, and it is deliberately the *whole* of it: one
-//! request naming one run already in custody, and one of two answers.
+//! This is that missing verb — and, since version two, its inverse.
+//!
+//! # Two versions, and what separates them
+//!
+//! Version one is `execute_run`: one request naming one run already in custody,
+//! and one of two answers. Version two adds `cancel_run`, which stops an
+//! attempt this daemon started.
+//!
+//! The lane admits **1..=2** and writes each kind at the version that
+//! introduced it: `execute_run` and `execute_accepted` stay at version one, so
+//! a version-one peer's bytes are unchanged and this build still admits them;
+//! `cancel_run` and `cancel_result` are written at version two, so a
+//! version-one peer refuses them with [`CodecError::UnsupportedVersion`] rather
+//! than reading a message it has no arm for. `refused` stays at version one
+//! because its body shape is the same in both and a version-one peer must be
+//! able to read a refusal to the request it sent — a refusal spelling it does
+//! not define still fails closed on [`decode_security_enum`], which is the
+//! behaviour that matters.
+//!
+//! # Why cancellation is on this lane
+//!
+//! Cancellation is the inverse of starting, its refusals are the ones already
+//! spelled here, and the alternative — an eleventh
+//! [`AdminCommand`](crate::admin::AdminCommand) — would force an entry in the
+//! closed admin command registry with an approval-policy annotation for an
+//! operation whose authority is the socket's peer authentication, exactly as
+//! `execute_run`'s is.
+//!
+//! What this lane still does not do is *own* cancellation. It carries the
+//! request; the attempt host owns the one dispatcher over the one durable
+//! ledger, and the answers here are that ledger's vocabulary rather than a
+//! second one. See [`CancelRunOutcome`].
 //!
 //! # Why a sixth lane rather than a widened one
 //!
@@ -53,8 +83,11 @@
 //!   comes from the custodied RunSpec and from the daemon's own resolution of
 //!   it. A field here through which a caller could widen a launch would make
 //!   this lane an authority over the sandbox, which it is not.
-//! - **No cancel.** Cancellation is the attempt host's, not this lane's; a
-//!   `cancel` verb here would be a second authority over one durable ledger.
+//! - **No second cancellation authority.** `cancel_run` carries a request to
+//!   the attempt host's one dispatcher over its one durable ledger. It does not
+//!   decide anything: the disposition it reports is the ledger's, and a
+//!   `request_ref` presented twice is answered `already_delivered` by that
+//!   ledger rather than by anything in this module.
 //! - **No actor, and therefore no authorization refusal.** Like
 //!   [`crate::runs_api`], this module models no actor, so [`ExecuteRefusal`]
 //!   has no `not_authorized` variant: a refusal this slice cannot decide is a
@@ -79,6 +112,32 @@ pub const EXECUTE_PROTOCOL: &str = "automonique.execute";
 /// Stable schema identifier for the version-one surface.
 pub const EXECUTE_API_SCHEMA_V1: &str = "automonique.execute/v1";
 
+/// Stable schema identifier for the version-two surface.
+pub const EXECUTE_API_SCHEMA_V2: &str = "automonique.execute/v2";
+
+/// The protocol version that introduced cancellation, and this build's highest.
+///
+/// Written as a `match` on the fallible constructor because it is the only
+/// `const fn` route to a non-zero version; the `Err` arm is unreachable for a
+/// literal 2 and falls back to the first version rather than panicking, since a
+/// `const` panic here would be a build failure for an unreachable case.
+pub const EXECUTE_CANCEL_VERSION: MajorVersion = match MajorVersion::new(2) {
+    Ok(version) => version,
+    Err(_) => MajorVersion::FIRST,
+};
+
+const _: () = assert!(
+    EXECUTE_CANCEL_VERSION.get() == 2,
+    "the cancel verb must be written at version two"
+);
+
+/// Maximum UTF-8 byte length of a cancellation `request_ref`.
+///
+/// Well inside the durable ledger's own 256-byte bound, so a reference this
+/// protocol admits is one that ledger will store rather than one it will refuse
+/// after the frame was already accepted.
+pub const MAX_CANCEL_REQUEST_REF_BYTES: usize = 128;
+
 /// Maximum canonical message bytes this protocol will assemble or admit.
 ///
 /// Deliberately small. Every message here carries one bounded identifier and at
@@ -89,6 +148,13 @@ pub const MAX_EXECUTE_CANONICAL_BYTES: usize = 4 * 1024;
 /// A run identifier costs at most two canonical bytes per source byte, because
 /// a quote or a backslash escapes to two.
 const RUN_ID_ENCODED_BYTES: usize = 2 * MAX_TOOL_FIELD_BYTES;
+
+/// A cancellation reference costs at most two canonical bytes per source byte,
+/// by the same rule.
+const REQUEST_REF_ENCODED_BYTES: usize = 2 * MAX_CANCEL_REQUEST_REF_BYTES;
+
+/// Worst-case canonical bytes of one `u64` rendered as a decimal integer.
+const SEQUENCE_ENCODED_BYTES: usize = 20;
 
 /// Worst-case canonical bytes of the envelope wrapped around one body.
 ///
@@ -103,6 +169,18 @@ const _: () = assert!(
     RUN_ID_ENCODED_BYTES + BODY_SCAFFOLD_BYTES + ENVELOPE_OVERHEAD_BYTES
         <= MAX_EXECUTE_CANONICAL_BYTES,
     "a maximal execute message must fit one execute frame"
+);
+
+/// `cancel_run` is the widest body this lane assembles: a run identifier, a
+/// cancellation reference and one sequence.
+const _: () = assert!(
+    RUN_ID_ENCODED_BYTES
+        + REQUEST_REF_ENCODED_BYTES
+        + SEQUENCE_ENCODED_BYTES
+        + BODY_SCAFFOLD_BYTES
+        + ENVELOPE_OVERHEAD_BYTES
+        <= MAX_EXECUTE_CANONICAL_BYTES,
+    "a maximal cancel message must fit one execute frame"
 );
 
 /// The three outcomes a request on this protocol can never report.
@@ -148,6 +226,20 @@ pub enum ExecuteApiError {
         /// Field that claimed the unwritten identity.
         field: &'static str,
     },
+    /// A message kind arrived at a protocol version other than the one that
+    /// introduced it.
+    ///
+    /// Distinct from [`CodecError::UnsupportedVersion`], which means the
+    /// version is outside this build's range entirely. This one means the
+    /// version is admissible and the kind does not belong to it.
+    KindVersion {
+        /// Kind that was carried at the wrong version.
+        kind: &'static str,
+        /// Version this kind is written at.
+        expected: u32,
+        /// Version the message declared.
+        offered: u32,
+    },
 }
 
 impl ExecuteApiError {
@@ -161,6 +253,7 @@ impl ExecuteApiError {
             Self::CounterOutOfRange { .. } => "execute_counter_out_of_range",
             Self::Field { .. } => "execute_invalid_field",
             Self::UnwrittenRow { .. } => "execute_unwritten_row",
+            Self::KindVersion { .. } => "execute_kind_version",
         }
     }
 }
@@ -181,6 +274,14 @@ impl fmt::Display for ExecuteApiError {
             Self::UnwrittenRow { field } => {
                 write!(formatter, "{field} is zero, which names an unwritten row")
             }
+            Self::KindVersion {
+                kind,
+                expected,
+                offered,
+            } => write!(
+                formatter,
+                "execute kind {kind} is written at version {expected}, not {offered}"
+            ),
         }
     }
 }
@@ -235,11 +336,28 @@ pub enum ExecuteRefusal {
     /// The daemon's own durable state or filesystem preparation failed. Nothing
     /// was started, and no part of the refusal is the caller's to fix.
     ExecutionUnavailable,
+    /// The run is in custody but no attempt for it is live on this daemon, so
+    /// there is nothing to cancel.
+    ///
+    /// **This is a terminal answer, not a silent success.** The run finished,
+    /// timed out, was already cancelled, or was never started; in every one of
+    /// those the cancellation was not delivered, and answering `delivered`
+    /// would tell an operator their command stopped something when it stopped
+    /// nothing. Which terminal state it reached is the Runs lane's to report.
+    NoLiveAttempt,
+    /// A live attempt was found and its cancellation sink accepted no signal.
+    ///
+    /// Nothing was recorded, so presenting the same `request_ref` again is a
+    /// real second attempt rather than a replay. Distinct from
+    /// [`ExecuteRefusal::ExecutionUnavailable`] because that one says the
+    /// daemon could not consult its own state, and this one says it did and the
+    /// delivery failed.
+    CancelNotDelivered,
 }
 
 impl ExecuteRefusal {
     /// Every refusal, in canonical order.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::UnknownRun,
         Self::RunNotReady,
         Self::AlreadyExecuting,
@@ -253,6 +371,8 @@ impl ExecuteRefusal {
         Self::IntakePaused,
         Self::GenerationDegraded,
         Self::ExecutionUnavailable,
+        Self::NoLiveAttempt,
+        Self::CancelNotDelivered,
     ];
 
     /// Stable lowercase wire spelling.
@@ -272,6 +392,8 @@ impl ExecuteRefusal {
             Self::IntakePaused => "intake_paused",
             Self::GenerationDegraded => "generation_degraded",
             Self::ExecutionUnavailable => "execution_unavailable",
+            Self::NoLiveAttempt => "no_live_attempt",
+            Self::CancelNotDelivered => "cancel_not_delivered",
         }
     }
 
@@ -315,6 +437,144 @@ impl SecuritySensitiveEnum for ExecuteRefusal {
     }
 }
 
+/// Opaque, caller-chosen reference identifying one cancellation request.
+///
+/// This is the idempotency key the durable cancel ledger records: presenting
+/// the same reference twice is one cancellation delivered once, and presenting
+/// it against a different attempt or a different observed sequence is a
+/// conflict. It is therefore the caller's job to mint one that is *stable
+/// across its own retries* — a Telegram bridge derives it from the message
+/// coordinates so a redelivered update replays, and an operator on the command
+/// line supplies one.
+///
+/// The grammar is the durable ledger's own — non-empty, bounded, no control
+/// characters — rather than a stricter one invented here. A reference this
+/// protocol admits is therefore one that ledger stores, so a caller cannot get
+/// a frame accepted and a write refused for the same value.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CancelRequestRef(String);
+
+impl CancelRequestRef {
+    /// Maximum accepted UTF-8 byte length.
+    pub const MAX_BYTES: usize = MAX_CANCEL_REQUEST_REF_BYTES;
+
+    /// Validate and construct the reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValueError::Empty`] for an empty value, [`ValueError::TooLong`]
+    /// past [`CancelRequestRef::MAX_BYTES`], and
+    /// [`ValueError::ControlCharacter`] for a control-bearing one.
+    pub fn new(value: impl Into<String>) -> Result<Self, ValueError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ValueError::Empty);
+        }
+        if value.len() > Self::MAX_BYTES {
+            return Err(ValueError::TooLong {
+                max_bytes: Self::MAX_BYTES,
+                actual_bytes: value.len(),
+            });
+        }
+        if value.chars().any(char::is_control) {
+            return Err(ValueError::ControlCharacter);
+        }
+        Ok(Self(value))
+    }
+
+    /// Return the validated spelling.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for CancelRequestRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// What one cancellation request did.
+///
+/// This is the durable cancel ledger's vocabulary, carried rather than
+/// reinterpreted. Two of its three answers are successes and the difference
+/// between them matters to an operator: `delivered` means this request stopped
+/// something, `already_delivered` means an earlier request with the same
+/// reference did and this one changed nothing.
+///
+/// The ledger's fourth and fifth dispositions are not here, because they are
+/// not outcomes of a cancellation — an unregistered attempt and a sink that
+/// accepted nothing are [`ExecuteRefusal::NoLiveAttempt`] and
+/// [`ExecuteRefusal::CancelNotDelivered`]. Keeping them out means every value
+/// of this enum is a request that reached the ledger.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CancelRunOutcome {
+    /// The registered sink accepted this reference and custody now holds it.
+    ///
+    /// Delivery evidence only. Nothing here claims a process exited, that
+    /// descendants were reaped, or that the run reached a terminal state; the
+    /// Runs lane is where those are observed.
+    Delivered,
+    /// Custody already held this exact reference. The sink was not called and
+    /// nothing was written.
+    AlreadyDelivered,
+    /// Custody binds this reference to a different attempt or a different
+    /// observed sequence. The sink was not called and nothing was written.
+    ///
+    /// A refusal in substance, but reported as an outcome because it is the
+    /// ledger's answer about a reference rather than a refusal to consult it,
+    /// and a caller needs to tell "your reference is already spoken for" from
+    /// "there was nothing to cancel".
+    Conflict,
+}
+
+impl CancelRunOutcome {
+    /// Every outcome, in canonical order.
+    pub const ALL: [Self; 3] = [Self::Delivered, Self::AlreadyDelivered, Self::Conflict];
+
+    /// Stable lowercase wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::AlreadyDelivered => "already_delivered",
+            Self::Conflict => "conflict",
+        }
+    }
+
+    /// Parse the exact stable spelling, or nothing.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|outcome| outcome.as_str() == value)
+    }
+
+    /// Whether this cancellation is now durably recorded.
+    ///
+    /// True for both successes: a replay is recorded precisely because the
+    /// first delivery recorded it.
+    #[must_use]
+    pub const fn is_recorded(self) -> bool {
+        matches!(self, Self::Delivered | Self::AlreadyDelivered)
+    }
+}
+
+impl fmt::Display for CancelRunOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl SecuritySensitiveEnum for CancelRunOutcome {
+    const FIELD: &'static str = "outcome";
+
+    fn from_wire(value: &str) -> Option<Self> {
+        Self::from_spelling(value)
+    }
+}
+
 /// A correlated request on the Execute API.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecuteRequest {
@@ -326,6 +586,22 @@ pub enum ExecuteRequest {
         /// document.
         run_id: RunId,
     },
+    /// Stop the live attempt one run has. Version two.
+    CancelRun {
+        /// Correlation identifier.
+        request_id: RequestId,
+        /// Run whose live attempt is to be cancelled.
+        run_id: RunId,
+        /// Idempotency key for this cancellation. See [`CancelRequestRef`].
+        request_ref: CancelRequestRef,
+        /// The event sequence the requester had observed when it asked.
+        ///
+        /// The ledger's own documentation is explicit that this is *the
+        /// requester's claim*: it is stored and compared on replay, and never
+        /// checked against a spool. A caller that has watched no events sends
+        /// zero, which is the truthful claim rather than a placeholder.
+        observed_sequence: u64,
+    },
 }
 
 impl ExecuteRequest {
@@ -333,7 +609,7 @@ impl ExecuteRequest {
     #[must_use]
     pub const fn request_id(&self) -> &RequestId {
         match self {
-            Self::ExecuteRun { request_id, .. } => request_id,
+            Self::ExecuteRun { request_id, .. } | Self::CancelRun { request_id, .. } => request_id,
         }
     }
 
@@ -341,7 +617,16 @@ impl ExecuteRequest {
     #[must_use]
     pub const fn run_id(&self) -> &RunId {
         match self {
-            Self::ExecuteRun { run_id, .. } => run_id,
+            Self::ExecuteRun { run_id, .. } | Self::CancelRun { run_id, .. } => run_id,
+        }
+    }
+
+    /// The protocol version this request is written at.
+    #[must_use]
+    pub const fn version(&self) -> MajorVersion {
+        match self {
+            Self::ExecuteRun { .. } => MajorVersion::FIRST,
+            Self::CancelRun { .. } => EXECUTE_CANCEL_VERSION,
         }
     }
 
@@ -354,34 +639,80 @@ impl ExecuteRequest {
     pub fn to_message(&self) -> Result<Message, ExecuteApiError> {
         match self {
             Self::ExecuteRun { request_id, run_id } => Ok(Message::new(
-                envelope(request_id.clone(), "execute_run")?,
+                envelope(request_id.clone(), "execute_run", MajorVersion::FIRST)?,
                 JsonValue::Object(vec![(
                     "run_id".to_owned(),
                     JsonValue::String(run_id.as_str().to_owned()),
                 )]),
             )),
+            Self::CancelRun {
+                request_id,
+                run_id,
+                request_ref,
+                observed_sequence,
+            } => Ok(Message::new(
+                envelope(request_id.clone(), "cancel_run", EXECUTE_CANCEL_VERSION)?,
+                JsonValue::Object(vec![
+                    (
+                        "observed_sequence".to_owned(),
+                        integer("observed_sequence", *observed_sequence)?,
+                    ),
+                    (
+                        "request_ref".to_owned(),
+                        JsonValue::String(request_ref.as_str().to_owned()),
+                    ),
+                    (
+                        "run_id".to_owned(),
+                        JsonValue::String(run_id.as_str().to_owned()),
+                    ),
+                ]),
+            )),
         }
     }
 
-    /// Decode and admit a request against the exact first protocol version.
+    /// Decode and admit a request against this build's supported version range.
+    ///
+    /// Admission is by range, but each kind is still pinned to the version that
+    /// introduced it: a `cancel_run` arriving at version one is refused as
+    /// [`ExecuteApiError::KindVersion`] rather than admitted, because a peer
+    /// that wrote it at version one is not speaking this protocol and letting
+    /// it through would make the version a decoration.
     ///
     /// # Errors
     ///
-    /// Refuses unknown kinds and bodies that are not exact.
+    /// Refuses unknown kinds, kinds at the wrong version, and bodies that are
+    /// not exact.
     pub fn from_canonical_bytes(payload: &[u8]) -> Result<Self, ExecuteApiError> {
         let message = Message::from_canonical_bytes_admitted(payload, &[supported_protocol()?])?;
         let request_id = message.envelope().request_id().clone();
+        let version = message.envelope().version();
         match message.envelope().kind().as_str() {
             "execute_run" => {
+                admit_kind_version("execute_run", version, MajorVersion::FIRST)?;
                 exact_fields(message.body(), &["run_id"])?;
                 Ok(Self::ExecuteRun {
                     request_id,
-                    run_id: RunId::new(required_string(message.body(), "run_id")?).map_err(
-                        |error| ExecuteApiError::Field {
-                            field: "run_id",
-                            error,
-                        },
-                    )?,
+                    run_id: run_id(message.body())?,
+                })
+            }
+            "cancel_run" => {
+                admit_kind_version("cancel_run", version, EXECUTE_CANCEL_VERSION)?;
+                exact_fields(
+                    message.body(),
+                    &["observed_sequence", "request_ref", "run_id"],
+                )?;
+                Ok(Self::CancelRun {
+                    request_id,
+                    run_id: run_id(message.body())?,
+                    request_ref: CancelRequestRef::new(required_string(
+                        message.body(),
+                        "request_ref",
+                    )?)
+                    .map_err(|error| ExecuteApiError::Field {
+                        field: "request_ref",
+                        error,
+                    })?,
+                    observed_sequence: unsigned(message.body(), "observed_sequence")?,
                 })
             }
             _ => Err(ExecuteApiError::UnknownKind),
@@ -407,7 +738,19 @@ pub enum ExecuteResponse {
         /// so the answer says exactly which document is running.
         submission_id: u64,
     },
-    /// Nothing was started. No attempt exists and no record was written.
+    /// One cancellation request reached the durable ledger. Version two.
+    ///
+    /// The `outcome` says what the ledger did with it, which is not the same as
+    /// what the attempt did: see [`CancelRunOutcome::Delivered`].
+    Cancelled {
+        /// Correlation identifier from the request.
+        request_id: RequestId,
+        /// Run whose attempt the request named.
+        run_id: RunId,
+        /// What the durable cancel ledger answered.
+        outcome: CancelRunOutcome,
+    },
+    /// Nothing was started or cancelled. No record was written.
     Refused {
         /// Correlation identifier from the request.
         request_id: RequestId,
@@ -421,7 +764,9 @@ impl ExecuteResponse {
     #[must_use]
     pub const fn request_id(&self) -> &RequestId {
         match self {
-            Self::Accepted { request_id, .. } | Self::Refused { request_id, .. } => request_id,
+            Self::Accepted { request_id, .. }
+            | Self::Cancelled { request_id, .. }
+            | Self::Refused { request_id, .. } => request_id,
         }
     }
 
@@ -429,10 +774,22 @@ impl ExecuteResponse {
     ///
     /// A started attempt is `accepted`, never `completed`: a completion follows
     /// it and is read elsewhere. See [`OUTCOMES_THIS_LANE_NEVER_PRODUCES`].
+    ///
+    /// A cancellation is `accepted` for the same reason and one more: the
+    /// request reached the sink, and whether the process died is a later
+    /// observation. A ledger [`CancelRunOutcome::Conflict`] is `rejected`,
+    /// because nothing was delivered.
     #[must_use]
     pub const fn outcome(&self) -> ActionOutcome {
         match self {
             Self::Accepted { .. } => ActionOutcome::Accepted,
+            Self::Cancelled { outcome, .. } => {
+                if outcome.is_recorded() {
+                    ActionOutcome::Accepted
+                } else {
+                    ActionOutcome::Rejected
+                }
+            }
             Self::Refused { .. } => ActionOutcome::Rejected,
         }
     }
@@ -473,7 +830,7 @@ impl ExecuteResponse {
                 run_id,
                 submission_id,
             } => Ok(Message::new(
-                envelope(request_id.clone(), "execute_accepted")?,
+                envelope(request_id.clone(), "execute_accepted", MajorVersion::FIRST)?,
                 JsonValue::Object(vec![
                     (
                         "run_id".to_owned(),
@@ -485,11 +842,28 @@ impl ExecuteResponse {
                     ),
                 ]),
             )),
+            Self::Cancelled {
+                request_id,
+                run_id,
+                outcome,
+            } => Ok(Message::new(
+                envelope(request_id.clone(), "cancel_result", EXECUTE_CANCEL_VERSION)?,
+                JsonValue::Object(vec![
+                    (
+                        "outcome".to_owned(),
+                        JsonValue::String(outcome.as_str().to_owned()),
+                    ),
+                    (
+                        "run_id".to_owned(),
+                        JsonValue::String(run_id.as_str().to_owned()),
+                    ),
+                ]),
+            )),
             Self::Refused {
                 request_id,
                 refusal,
             } => Ok(Message::new(
-                envelope(request_id.clone(), "refused")?,
+                envelope(request_id.clone(), "refused", MajorVersion::FIRST)?,
                 JsonValue::Object(vec![(
                     "refusal".to_owned(),
                     JsonValue::String(refusal.as_str().to_owned()),
@@ -498,29 +872,40 @@ impl ExecuteResponse {
         }
     }
 
-    /// Decode and admit a response against the exact first protocol version.
+    /// Decode and admit a response against this build's supported version range.
     ///
     /// # Errors
     ///
-    /// Refuses unknown kinds and bodies that are not exact.
+    /// Refuses unknown kinds, kinds at the wrong version, and bodies that are
+    /// not exact.
     pub fn from_canonical_bytes(payload: &[u8]) -> Result<Self, ExecuteApiError> {
         let message = Message::from_canonical_bytes_admitted(payload, &[supported_protocol()?])?;
         let request_id = message.envelope().request_id().clone();
+        let version = message.envelope().version();
         match message.envelope().kind().as_str() {
             "execute_accepted" => {
+                admit_kind_version("execute_accepted", version, MajorVersion::FIRST)?;
                 exact_fields(message.body(), &["run_id", "submission_id"])?;
                 Self::accepted(
                     request_id,
-                    RunId::new(required_string(message.body(), "run_id")?).map_err(|error| {
-                        ExecuteApiError::Field {
-                            field: "run_id",
-                            error,
-                        }
-                    })?,
+                    run_id(message.body())?,
                     unsigned(message.body(), "submission_id")?,
                 )
             }
+            "cancel_result" => {
+                admit_kind_version("cancel_result", version, EXECUTE_CANCEL_VERSION)?;
+                exact_fields(message.body(), &["outcome", "run_id"])?;
+                Ok(Self::Cancelled {
+                    request_id,
+                    run_id: run_id(message.body())?,
+                    outcome: decode_security_enum::<CancelRunOutcome>(&required_string(
+                        message.body(),
+                        "outcome",
+                    )?)?,
+                })
+            }
             "refused" => {
+                admit_kind_version("refused", version, MajorVersion::FIRST)?;
                 exact_fields(message.body(), &["refusal"])?;
                 Ok(Self::Refused {
                     request_id,
@@ -535,10 +920,14 @@ impl ExecuteResponse {
     }
 }
 
-fn envelope(request_id: RequestId, kind: &str) -> Result<Envelope, ExecuteApiError> {
+fn envelope(
+    request_id: RequestId,
+    kind: &str,
+    version: MajorVersion,
+) -> Result<Envelope, ExecuteApiError> {
     Ok(Envelope::new(
         ProtocolName::new(EXECUTE_PROTOCOL)?,
-        MajorVersion::FIRST,
+        version,
         request_id,
         MessageKind::new(kind)?,
     ))
@@ -547,8 +936,36 @@ fn envelope(request_id: RequestId, kind: &str) -> Result<Envelope, ExecuteApiErr
 fn supported_protocol() -> Result<SupportedProtocol, ExecuteApiError> {
     Ok(SupportedProtocol::new(
         ProtocolName::new(EXECUTE_PROTOCOL)?,
-        VersionRange::new(MajorVersion::FIRST, MajorVersion::FIRST)?,
+        VersionRange::new(MajorVersion::FIRST, EXECUTE_CANCEL_VERSION)?,
     ))
+}
+
+/// Refuse a kind carried at a version other than the one that introduced it.
+///
+/// Range admission alone would let a peer write `cancel_run` at version one and
+/// have it accepted, which would make the version a decoration rather than a
+/// statement. Each kind is pinned, so the envelope's version and its kind agree
+/// or the message is refused.
+const fn admit_kind_version(
+    kind: &'static str,
+    offered: MajorVersion,
+    expected: MajorVersion,
+) -> Result<(), ExecuteApiError> {
+    if offered.get() == expected.get() {
+        return Ok(());
+    }
+    Err(ExecuteApiError::KindVersion {
+        kind,
+        expected: expected.get(),
+        offered: offered.get(),
+    })
+}
+
+fn run_id(body: &JsonValue) -> Result<RunId, ExecuteApiError> {
+    RunId::new(required_string(body, "run_id")?).map_err(|error| ExecuteApiError::Field {
+        field: "run_id",
+        error,
+    })
 }
 
 fn integer(field: &'static str, value: u64) -> Result<JsonValue, ExecuteApiError> {

@@ -73,7 +73,9 @@ use std::time::{Duration, Instant};
 
 use automonique_protocol::admin::{AdminRequest, AdminResponse, SubmittedRunSpec};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
-use automonique_protocol::execute_api::{ExecuteRequest, ExecuteResponse};
+use automonique_protocol::execute_api::{
+    CancelRequestRef, CancelRunOutcome, ExecuteRefusal, ExecuteRequest, ExecuteResponse,
+};
 use automonique_protocol::tools::RunId;
 use automonique_store::run_index::{RunIndex, RunSpoolState};
 
@@ -307,6 +309,49 @@ impl SocketRunLane {
             // the sandbox" from "the lane is saturated" would be telling an
             // operator something the admin socket answers properly.
             ExecuteResponse::Refused { .. } => Err(RunFailure::Refused),
+            // A start request cannot be answered with a cancellation result.
+            // The correlation identifier already matched, so this is a peer
+            // answering a different question, not a stale reply.
+            ExecuteResponse::Cancelled { .. } => Err(RunFailure::Unavailable),
+        }
+    }
+
+    /// Ask the execute lane to cancel one run's live attempt.
+    ///
+    /// Over the same socket the bridge already starts runs on, and therefore
+    /// through the same `Daemon::cancel_run` the CLI reaches: one function, one
+    /// fence, one ledger. The bridge holds no handle to the daemon or its
+    /// attempt host — it runs on the poller thread and shares nothing with the
+    /// serve loop — so this round-trip *is* the in-process call, made the only
+    /// way this seam allows.
+    fn cancel(&self, run_ref: &str, request_ref: &str) -> Result<CancelRunOutcome, RunFailure> {
+        let request = ExecuteRequest::CancelRun {
+            request_id: RequestId::new(request_ref).map_err(|_| RunFailure::Unavailable)?,
+            run_id: RunId::new(run_ref).map_err(|_| RunFailure::Refused)?,
+            request_ref: CancelRequestRef::new(request_ref).map_err(|_| RunFailure::Unavailable)?,
+            // This surface watches no events, so the truthful claim about what
+            // it had observed is none. See `ExecuteRequest::CancelRun`.
+            observed_sequence: 0,
+        };
+        let payload = request
+            .to_message()
+            .map_err(|_| RunFailure::Unavailable)?
+            .to_canonical_bytes();
+        let response = ExecuteResponse::from_canonical_bytes(&self.exchange(&payload)?)
+            .map_err(|_| RunFailure::Unavailable)?;
+        match response {
+            ExecuteResponse::Cancelled { outcome, .. } => Ok(outcome),
+            // Unlike `start`, the refusals are *not* collapsed to one word
+            // here: the two an operator can act on — the run is unknown, and
+            // it has no live attempt — are different facts about their own
+            // request, and telling them apart is the difference between "check
+            // the reference" and "it already stopped".
+            ExecuteResponse::Refused { refusal, .. } => Err(match refusal {
+                ExecuteRefusal::UnknownRun => RunFailure::Refused,
+                ExecuteRefusal::NoLiveAttempt => RunFailure::Failed,
+                _ => RunFailure::Unavailable,
+            }),
+            ExecuteResponse::Accepted { .. } => Err(RunFailure::Unavailable),
         }
     }
 
@@ -377,6 +422,14 @@ fn unavailable<E>(_error: E) -> RunFailure {
 impl RunLane for SocketRunLane {
     fn run(&mut self, task: &str) -> Result<String, RunFailure> {
         self.run_with_profile(task, ProviderRunProfile::Standard)
+    }
+
+    fn cancel_run(
+        &mut self,
+        run_ref: &str,
+        request_ref: &str,
+    ) -> Result<CancelRunOutcome, RunFailure> {
+        self.cancel(run_ref, request_ref)
     }
 
     fn run_question(&mut self, task: &str, profile: QuestionProfile) -> Result<String, RunFailure> {

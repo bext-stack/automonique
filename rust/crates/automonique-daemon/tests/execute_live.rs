@@ -70,17 +70,20 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use automonique_daemon::execute::{
     DAEMON_WORKSPACE_REGISTRY, locate_launch_helper, offered_host_features,
 };
 use automonique_daemon::{Daemon, DaemonConfig};
-use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse, SubmittedRunSpec};
+use automonique_protocol::admin::{
+    AdminCommand, AdminRequest, AdminResponse, IntakePause, SubmittedRunSpec,
+};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_protocol::context::{ContextManifest, TokenBudget};
 use automonique_protocol::digest::Sha256;
+use automonique_protocol::execute_api::{CancelRequestRef, CancelRunOutcome};
 use automonique_protocol::execute_api::{ExecuteRefusal, ExecuteRequest, ExecuteResponse};
 use automonique_protocol::host::{AttemptId, HostId, HostLifetime, WorkId};
 use automonique_protocol::identity::Actor;
@@ -100,6 +103,8 @@ use automonique_protocol::sandbox::{
 use automonique_protocol::tools::RunId;
 use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
 use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
+use automonique_runner::control::{CancelSink, CancelUnavailable};
+use automonique_runner::dispatch::RegistrationHandle;
 use automonique_runner::{
     AdmissionFields, AdmissionFieldsParts, ArtifactGrantBindings, Authority, ContainmentDomain,
     CwdToken, EventKind, ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility,
@@ -109,6 +114,7 @@ use automonique_runner::{
     SchedulerDecisionDigest, SchedulerReservationBinding, SchedulerReservationId, SkillsetDigest,
     Spool, ToolsetDigest, WorkspaceRegistryId, WorkspaceReservation,
 };
+use automonique_store::cancel_ledger::CancelLedger;
 
 const BUSYBOX: &str = "/usr/bin/busybox";
 const REQUIRE_ENFORCED_ENV: &str = "AUTOMONIQUE_REQUIRE_ENFORCED_CONTAINMENT";
@@ -832,5 +838,312 @@ fn a_host_that_cannot_contain_refuses_and_executes_nothing() {
     );
     assert!(!witness.exists(), "a refused request must run no workload");
 
+    serving.shutdown(&config);
+}
+
+// --- the cancel verb ------------------------------------------------------
+//
+// These proofs are **not** host-gated, unlike the two above, and that is the
+// point of how they are built. `Daemon::cancel_run` resolves a run to the
+// attempt its custodied document declares and hands the request to the host's
+// one dispatcher; none of that needs a delegated cgroup domain, a sandbox, or a
+// workload. So the attempt is registered directly against the daemon's own
+// attempt host before the daemon starts serving — the same host
+// `execute::ExecutionLane` registers against — and every one of these tests
+// runs on every host.
+//
+// What that costs is stated rather than hidden: these prove the *lane*, not the
+// kill. That a delivered cancellation reaches a real process tree is
+// `automonique-runner`'s containment proof, and that the run then reaches a
+// terminal state is `an_executed_run_reaches_a_terminal_state_the_runs_lane_reports`.
+
+/// A cancellation sink that counts what reached it.
+struct CountingSink {
+    attempt_id: String,
+    deliveries: Arc<AtomicUsize>,
+}
+
+impl CancelSink for CountingSink {
+    fn deliver(&self, attempt_id: &str, _request_ref: &str) -> Result<(), CancelUnavailable> {
+        assert_eq!(
+            attempt_id, self.attempt_id,
+            "a dispatch must only ever reach its own registration's sink"
+        );
+        self.deliveries.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+}
+
+/// Serve a daemon with one attempt already registered on its host.
+///
+/// The registration is taken before the daemon is moved onto the serve thread,
+/// which is possible because a `RegistrationHandle` holds the dispatcher weakly
+/// rather than borrowing the host. Dropping the handle unregisters, so the
+/// caller keeps it for as long as the attempt is meant to be live.
+fn serve_with_attempt(
+    config: &DaemonConfig,
+    attempt_id: &str,
+) -> (Serving, Arc<AtomicUsize>, RegistrationHandle) {
+    let daemon = Daemon::open(config).expect("daemon opens");
+    let deliveries = Arc::new(AtomicUsize::new(0));
+    let registration = daemon
+        .attempt_host()
+        .expect("an opened daemon owns its attempt host")
+        .register(
+            attempt_id,
+            Box::new(CountingSink {
+                attempt_id: attempt_id.to_owned(),
+                deliveries: Arc::clone(&deliveries),
+            }),
+        )
+        .expect("register the attempt");
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let thread = std::thread::spawn(move || daemon.serve(&thread_stop));
+    wait_for_socket(config);
+    (
+        Serving {
+            stop,
+            thread: Some(thread),
+        },
+        deliveries,
+        registration,
+    )
+}
+
+/// Ask the Execute lane to cancel one run, over the same socket.
+fn cancel(
+    config: &DaemonConfig,
+    label: &str,
+    run: &str,
+    request_ref: &str,
+    observed_sequence: u64,
+) -> ExecuteResponse {
+    let request = ExecuteRequest::CancelRun {
+        request_id: RequestId::new(label).expect("request ID"),
+        run_id: RunId::new(run).expect("run identity"),
+        request_ref: CancelRequestRef::new(request_ref).expect("reference"),
+        observed_sequence,
+    };
+    let payload = request
+        .to_message()
+        .expect("encode cancel request")
+        .to_canonical_bytes();
+    let response = exchange(config, &payload).expect("the execute lane answered");
+    let response =
+        ExecuteResponse::from_canonical_bytes(&response).expect("admitted execute response");
+    assert_eq!(
+        response.request_id().as_str(),
+        request.request_id().as_str(),
+        "the answer was not correlated to the question",
+    );
+    response
+}
+
+/// The outcome of a cancellation that must have reached the ledger.
+fn delivered(response: ExecuteResponse) -> CancelRunOutcome {
+    match response {
+        ExecuteResponse::Cancelled { outcome, .. } => outcome,
+        other => panic!("expected a cancellation result, got {other:?}"),
+    }
+}
+
+/// The refusal of a cancellation that must not have reached the ledger.
+fn refusal(response: ExecuteResponse) -> ExecuteRefusal {
+    match response {
+        ExecuteResponse::Refused { refusal, .. } => refusal,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// Every recorded reference for one attempt, read from the durable ledger with
+/// the daemon stopped.
+fn recorded(config: &DaemonConfig, attempt_id: &str) -> Vec<(String, u64)> {
+    let ledger = CancelLedger::open(config.run_cancel_ledger_path()).expect("open ledger");
+    ledger
+        .attempt_requests(attempt_id)
+        .expect("read")
+        .into_iter()
+        .map(|entry| (entry.request_ref, entry.observed_sequence))
+        .collect()
+}
+
+/// A cancellation is delivered once, and every replay of its reference is
+/// answered without a second delivery.
+///
+/// The three answers are asserted from both sides: what the lane said, and what
+/// the sink and the durable ledger hold afterwards. An implementation that
+/// answered `already_delivered` while calling the sink again would satisfy only
+/// the first half.
+#[test]
+fn a_cancellation_is_delivered_once_and_its_replays_deliver_nothing() {
+    let (_root, config) = fixture();
+    let run = "run-cancel-once";
+    let attempt = format!("{run}-attempt-1");
+    let spec = run_spec(run, "true");
+
+    let (serving, deliveries, registration) = serve_with_attempt(&config, &attempt);
+    submit(&config, &spec, "cancel-once");
+
+    let first = delivered(cancel(&config, "cancel-1", run, "ref-a", 3));
+    assert_eq!(first, CancelRunOutcome::Delivered);
+    assert_eq!(deliveries.load(Ordering::Acquire), 1);
+
+    // An exact retry: same reference, same claimed sequence.
+    let replay = delivered(cancel(&config, "cancel-2", run, "ref-a", 3));
+    assert_eq!(replay, CancelRunOutcome::AlreadyDelivered);
+    assert_eq!(
+        deliveries.load(Ordering::Acquire),
+        1,
+        "a replay must not reach the sink a second time"
+    );
+
+    // The same reference against a different claimed sequence is a conflict.
+    // Nothing is delivered and nothing is rewritten.
+    let conflict = delivered(cancel(&config, "cancel-3", run, "ref-a", 9));
+    assert_eq!(conflict, CancelRunOutcome::Conflict);
+    assert_eq!(deliveries.load(Ordering::Acquire), 1);
+
+    drop(registration);
+    serving.shutdown(&config);
+
+    assert_eq!(
+        recorded(&config, &attempt),
+        vec![("ref-a".to_owned(), 3)],
+        "one reference, recorded once, at the sequence the first delivery claimed"
+    );
+}
+
+/// A replay presented to a daemon that restarted in between is still a replay.
+///
+/// This is the property an in-memory custody cannot have, and the whole reason
+/// the cancel ledger is durable. The second daemon shares nothing with the
+/// first but the file.
+#[test]
+fn a_replay_across_a_daemon_restart_is_still_already_delivered() {
+    let (_root, config) = fixture();
+    let run = "run-cancel-restart";
+    let attempt = format!("{run}-attempt-1");
+    let spec = run_spec(run, "true");
+
+    {
+        let (serving, deliveries, registration) = serve_with_attempt(&config, &attempt);
+        submit(&config, &spec, "cancel-restart");
+        assert_eq!(
+            delivered(cancel(&config, "cancel-1", run, "ref-b", 5)),
+            CancelRunOutcome::Delivered
+        );
+        assert_eq!(deliveries.load(Ordering::Acquire), 1);
+        drop(registration);
+        serving.shutdown(&config);
+    }
+
+    // A second daemon, a second dispatcher, a second registration — and the
+    // same ledger file.
+    let (serving, deliveries, registration) = serve_with_attempt(&config, &attempt);
+    assert_eq!(
+        delivered(cancel(&config, "cancel-2", run, "ref-b", 5)),
+        CancelRunOutcome::AlreadyDelivered
+    );
+    assert_eq!(
+        deliveries.load(Ordering::Acquire),
+        0,
+        "the replay must not have reached the restarted daemon's sink at all"
+    );
+    drop(registration);
+    serving.shutdown(&config);
+
+    assert_eq!(recorded(&config, &attempt), vec![("ref-b".to_owned(), 5)]);
+}
+
+/// A run with no live attempt is a typed refusal, and records nothing.
+///
+/// This is the case an operator hits after a run has finished, and it must not
+/// read as a cancellation that worked. Custody is never consulted for an
+/// attempt no registration holds, so a reference spent here is still available
+/// afterwards — asserted, because a ledger row written for an undelivered
+/// cancellation would make the reference unusable for a real one.
+#[test]
+fn cancelling_a_run_with_no_live_attempt_refuses_and_records_nothing() {
+    let (_root, config) = fixture();
+    let run = "run-cancel-finished";
+    let attempt = format!("{run}-attempt-1");
+    let spec = run_spec(run, "true");
+
+    let serving = serve(&config);
+    submit(&config, &spec, "cancel-finished");
+
+    assert_eq!(
+        refusal(cancel(&config, "cancel-1", run, "ref-c", 0)),
+        ExecuteRefusal::NoLiveAttempt
+    );
+    serving.shutdown(&config);
+
+    assert!(
+        recorded(&config, &attempt).is_empty(),
+        "an undelivered cancellation must not spend its reference"
+    );
+}
+
+/// A run this daemon has never held is `unknown_run`, not `no_live_attempt`.
+///
+/// The two are different repairs — check the reference, versus check whether it
+/// already ended — so they are different answers.
+#[test]
+fn cancelling_an_unknown_run_names_that_exact_refusal() {
+    let (_root, config) = fixture();
+    let serving = serve(&config);
+
+    assert_eq!(
+        refusal(cancel(&config, "cancel-1", "run-never-held", "ref-d", 0)),
+        ExecuteRefusal::UnknownRun
+    );
+    serving.shutdown(&config);
+}
+
+/// The cancel verb answers while intake is paused.
+///
+/// Deliberately the opposite gate from `execute_run`. An operator who closed
+/// intake still needs to stop what is running — that is usually *why* they
+/// closed it — so a cancel that refused with `intake_paused` would make the
+/// pause a hazard rather than a repair.
+#[test]
+fn a_cancellation_is_answered_while_intake_is_paused() {
+    let (_root, config) = fixture();
+    let run = "run-cancel-paused";
+    let attempt = format!("{run}-attempt-1");
+    let spec = run_spec(run, "true");
+
+    let (serving, deliveries, registration) = serve_with_attempt(&config, &attempt);
+    submit(&config, &spec, "cancel-paused");
+
+    let paused = admin(
+        &config,
+        AdminRequest::pause_intake(
+            RequestId::new("pause-1").expect("request ID"),
+            IntakePause::new("operator:ada", "stopping a runaway run").expect("pause body"),
+        ),
+    );
+    assert!(
+        matches!(paused, AdminResponse::IntakePaused { .. }),
+        "expected the pause to be accepted, got {paused:?}"
+    );
+
+    // Starting is refused while paused; cancelling is not. Both assertions
+    // matter: the first shows the pause is really in force.
+    assert!(matches!(
+        execute(&config, "start-while-paused", run),
+        ExecuteResponse::Refused {
+            refusal: ExecuteRefusal::IntakePaused,
+            ..
+        }
+    ));
+    assert_eq!(
+        delivered(cancel(&config, "cancel-1", run, "ref-e", 0)),
+        CancelRunOutcome::Delivered
+    );
+    assert_eq!(deliveries.load(Ordering::Acquire), 1);
+
+    drop(registration);
     serving.shutdown(&config);
 }

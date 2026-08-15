@@ -786,8 +786,8 @@ fn daemon_open_constructs_one_attempt_host_over_its_own_ledger() {
         "opening the host must create its durable ledger"
     );
     assert_eq!(host.registration_capacity(), MAX_ATTEMPT_REGISTRATIONS);
-    // Nothing in this build registers an attempt: no admin command routes a
-    // cancel here yet.
+    // A daemon that has been asked to run nothing has registered nothing, so
+    // the registry is empty here. The execution lane is what fills it.
     assert_eq!(host.registration_count().expect("count"), 0);
     assert_eq!(
         host.cancel("attempt-absent", "ref-a", 0),

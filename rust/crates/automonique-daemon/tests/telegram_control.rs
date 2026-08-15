@@ -14,7 +14,7 @@
 //! the one configuration that makes a daemon dial `api.telegram.org`, and the
 //! gate is proved here and in the daemon's own unit tests instead.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -36,6 +36,7 @@ use automonique_daemon::telegram_bridge::{
 };
 use automonique_github_connector::IssueLocator;
 use automonique_protocol::admin::ExecutionState;
+use automonique_protocol::execute_api::CancelRunOutcome;
 use automonique_store::agent_memory::{
     AgentMemoryStore, MemoryInput, MemoryKind, MemorySensitivity, MemoryStatus, MemoryVisibility,
 };
@@ -690,6 +691,12 @@ struct FakeRunLaneState {
     answer: Option<String>,
     failure: Option<RunFailure>,
     gate: Option<Arc<RunGate>>,
+    /// Every `(run_ref, request_ref)` the bridge presented, in order.
+    cancels: Vec<(String, String)>,
+    /// References this lane has already answered, so a replayed reference is
+    /// answered the way the durable ledger answers one.
+    delivered: BTreeSet<String>,
+    cancel_failure: Option<RunFailure>,
 }
 
 #[derive(Default)]
@@ -715,6 +722,17 @@ impl FakeRunLane {
         let lane = Self::default();
         lane.state.lock().expect("lane state").failure = Some(failure);
         lane
+    }
+
+    /// A lane whose cancellations never reach a ledger.
+    fn refusing_cancels(failure: RunFailure) -> Self {
+        let lane = Self::default();
+        lane.state.lock().expect("lane state").cancel_failure = Some(failure);
+        lane
+    }
+
+    fn cancels(&self) -> Vec<(String, String)> {
+        self.state.lock().expect("lane state").cancels.clone()
     }
 
     fn blocking(answer: &str) -> Self {
@@ -775,6 +793,28 @@ impl RunLane for FakeRunLane {
             (Some(answer), _) => Ok(answer),
             (None, Some(failure)) => Err(failure),
             (None, None) => Err(RunFailure::NotConfigured),
+        }
+    }
+
+    /// Answer a cancellation the way the durable ledger does: the first
+    /// delivery of a reference is `delivered` and every later one is
+    /// `already_delivered`, without a second effect.
+    fn cancel_run(
+        &mut self,
+        run_ref: &str,
+        request_ref: &str,
+    ) -> Result<CancelRunOutcome, RunFailure> {
+        let mut state = self.state.lock().expect("lane state");
+        state
+            .cancels
+            .push((run_ref.to_owned(), request_ref.to_owned()));
+        if let Some(failure) = state.cancel_failure {
+            return Err(failure);
+        }
+        if state.delivered.insert(request_ref.to_owned()) {
+            Ok(CancelRunOutcome::Delivered)
+        } else {
+            Ok(CancelRunOutcome::AlreadyDelivered)
         }
     }
 }
@@ -2583,13 +2623,14 @@ fn a_question_provider_failure_is_reported_without_command_dispatch() {
 
 /// Every command with no surface behind it says so, and does nothing.
 ///
-/// `/run` is deliberately absent: it has a surface now, and
-/// [`a_run_reaches_the_lane_and_its_answer_is_the_reply`] is where it is proved.
+/// `/run` and `/cancel` are deliberately absent: both have a surface now, and
+/// [`a_run_reaches_the_lane_and_its_answer_is_the_reply`] and
+/// [`a_cancel_reaches_the_lane_and_a_telegram_retry_cancels_nothing_twice`] are
+/// where they are proved.
 #[test]
 fn commands_without_a_surface_say_nothing_happened() {
     let fixture = Fixture::new(&[]);
     let client = FakeClient::new([updates(&[
-        (2, OPERATOR, "/cancel run-alpha"),
         (3, OPERATOR, "/approve approval-1"),
         (4, OPERATOR, "/deny approval-1"),
     ])]);
@@ -2602,26 +2643,158 @@ fn commands_without_a_surface_say_nothing_happened() {
     );
 
     let report = poll(&mut bridge).expect("poll commits");
-    assert_eq!(report.unavailable, 3);
+    assert_eq!(report.unavailable, 2);
     assert_eq!(report.answered, 0);
-    assert_eq!(report.sent, 3);
+    assert_eq!(report.sent, 2);
 
     let messages = outbound.messages();
-    assert!(messages[0].contains(Unavailable::CancelVerb.operator_reply()));
-    assert!(messages[1].contains(TICKET_ACTION_UNAVAILABLE));
-    assert!(messages[2].contains(Unavailable::ApprovalWiring.operator_reply()));
-    for message in [&messages[0], &messages[2]] {
-        assert!(
-            message.contains("Not available yet."),
-            "an unavailable command must not read as an accepted one"
-        );
-    }
+    assert!(messages[0].contains(TICKET_ACTION_UNAVAILABLE));
+    assert!(messages[1].contains(Unavailable::ApprovalWiring.operator_reply()));
+    assert!(
+        messages[1].contains("Not available yet."),
+        "an unavailable command must not read as an accepted one"
+    );
     // Nothing was submitted: the run index is still empty.
     let mut surface = fixture.surface();
     assert_eq!(
         surface.runs_text().expect("runs render"),
         "No runs recorded."
     );
+}
+
+/// `/cancel` reaches the lane, and a redelivered update cancels nothing twice.
+///
+/// Telegram redelivers an update whose offset was not committed, and this
+/// product answers that in two layers.
+///
+/// The first is the poll offset, and it is what this test observes: the offset
+/// is committed before dispatch, so a redelivered update below it is never
+/// returned to the dispatch table at all and the lane sees one cancellation.
+///
+/// The second is the reference itself, which is a function of the message's
+/// coordinates rather than of a clock or a counter. A delivery that *did* get
+/// past the offset — a restart against a provider that redelivered anyway —
+/// would present the reference the first one recorded, and the durable ledger
+/// would answer `already_delivered` rather than cancelling a second time. That
+/// half is proved in `cancel_live.rs`; this test proves the offset half and
+/// that the reference carries the coordinates it must.
+#[test]
+fn a_cancel_reaches_the_lane_and_a_telegram_retry_cancels_nothing_twice() {
+    let fixture = Fixture::new(&[]);
+    let lane = FakeRunLane::default();
+    let outbound = FakeOutbound::default();
+    // The same message identifier twice: one operator command, delivered twice.
+    let client = FakeClient::new([
+        updates(&[(7, OPERATOR, "/cancel run-alpha")]),
+        updates(&[(7, OPERATOR, "/cancel run-alpha")]),
+    ]);
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        client.clone(),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+
+    let first = poll(&mut bridge).expect("poll commits");
+    assert_eq!(first.answered, 1);
+    assert_eq!(first.unavailable, 0, "a wired command is not unavailable");
+    let second = poll(&mut bridge).expect("poll commits");
+    assert_eq!(
+        second.updates, 0,
+        "an update below the committed offset must not reach dispatch"
+    );
+
+    // One command reached the lane, carrying the run reference verbatim and a
+    // cancellation reference derived from the message's own coordinates.
+    let cancels = lane.cancels();
+    assert_eq!(
+        cancels.len(),
+        1,
+        "a redelivered update must not present a second cancellation"
+    );
+    assert_eq!(cancels[0].0, "run-alpha");
+    assert!(cancels[0].1.starts_with("tg:"), "{:?}", cancels);
+    assert!(cancels[0].1.ends_with(":7"), "{:?}", cancels);
+
+    let messages = outbound.messages();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].contains("Cancellation sent."), "{:?}", messages);
+    assert!(
+        !messages[0].contains("Not available yet."),
+        "the cancel verb has a surface now"
+    );
+}
+
+/// Two different messages mint two different cancellation references.
+///
+/// The other half of the reference contract. A reference that were constant
+/// would make the first cancellation's record answer every later one
+/// `already_delivered`, so a second, genuinely different cancellation would
+/// silently do nothing.
+#[test]
+fn two_cancel_commands_mint_two_distinct_references() {
+    let fixture = Fixture::new(&[]);
+    let lane = FakeRunLane::default();
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        FakeClient::new([updates(&[
+            (11, OPERATOR, "/cancel run-alpha"),
+            (12, OPERATOR, "/cancel run-beta"),
+        ])]),
+        FakeOutbound::default(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+
+    poll(&mut bridge).expect("poll commits");
+    let cancels = lane.cancels();
+    assert_eq!(cancels.len(), 2);
+    assert_ne!(
+        cancels[0].1, cancels[1].1,
+        "two commands must not share one idempotency key"
+    );
+    assert_eq!(cancels[0].0, "run-alpha");
+    assert_eq!(cancels[1].0, "run-beta");
+}
+
+/// A cancellation the lane could not deliver says so, and says which.
+///
+/// "There is no such run" and "that run already stopped" are different facts,
+/// and only one of them means the operator should look at their reference.
+#[test]
+fn a_cancel_that_reaches_no_attempt_names_which_refusal_it_was() {
+    for (failure, expected) in [
+        (RunFailure::Refused, "No run with that reference."),
+        (RunFailure::Failed, "has no attempt running"),
+        (
+            RunFailure::Unavailable,
+            "Could not reach the execution lane",
+        ),
+    ] {
+        let fixture = Fixture::new(&[]);
+        let outbound = FakeOutbound::default();
+        let mut bridge = bridge_with_lane(
+            &fixture,
+            FakeClient::new([updates(&[(9, OPERATOR, "/cancel run-gone")])]),
+            outbound.clone(),
+            FakeSink::default(),
+            FakeRunLane::refusing_cancels(failure),
+        );
+
+        poll(&mut bridge).expect("poll commits");
+        let messages = outbound.messages();
+        assert!(
+            messages[0].contains(expected),
+            "{failure:?} rendered as {:?}",
+            messages
+        );
+        assert!(
+            messages[0].contains("othing was cancelled") || messages[0].contains("Try again"),
+            "a failed cancellation must not read as a successful one: {:?}",
+            messages
+        );
+    }
 }
 
 // ------------------------------------------------------------------- slack
