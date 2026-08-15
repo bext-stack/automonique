@@ -57,6 +57,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use automonique_observability::{MetricName, MetricValue, StoreProjection};
+use automonique_policy::approval::{
+    ApprovalEvidence, ApprovalGate, ApprovalPolicyRefusal, ApprovalRequirement, ApprovalSources,
+    OperatorSurfaces,
+};
+use automonique_policy::peer::{Admission, PeerCredential, PeerPolicy};
 use automonique_protocol::admin::{
     AdminInstanceId, AdminOutboxEvidence, AdminOutboxEvidenceParts, AdminReconciliationEvidence,
     AdminRefusalCategory, AdminRequest, AdminResponse, DaemonState, DaemonStatus,
@@ -135,6 +140,7 @@ use nix::sys::socket::{getsockopt, sockopt};
 use nix::unistd::geteuid;
 
 mod agent_activity;
+pub mod approval_policy;
 pub mod attempt_host;
 pub mod cancel_custody;
 pub mod codex_usage;
@@ -573,6 +579,14 @@ pub enum DaemonError {
     /// ignored a malformed channel map would be a host whose reachable set is
     /// not the one the owner wrote down.
     SlackRefused(&'static str),
+    /// The standing approval configuration is present and unusable. The payload
+    /// is the stable category from [`approval_policy`].
+    ///
+    /// Refused at startup for the reason the credential gates are, and one
+    /// more: this file is one of the three inputs to the requirement every
+    /// launch is composed against, and a daemon that ignored a malformed one
+    /// would compose against a policy nobody wrote.
+    ApprovalPolicyRefused(&'static str),
 }
 
 impl DaemonError {
@@ -600,6 +614,7 @@ impl DaemonError {
             Self::GenerationAuditFailed(category) => category,
             Self::TicketIntakeRefused(category) => category,
             Self::SlackRefused(category) => category,
+            Self::ApprovalPolicyRefused(category) => category,
         }
     }
 }
@@ -657,6 +672,9 @@ impl fmt::Display for DaemonError {
             }
             Self::SlackRefused(category) => {
                 write!(formatter, "slack configuration refused: {category}")
+            }
+            Self::ApprovalPolicyRefused(category) => {
+                write!(formatter, "approval configuration refused: {category}")
             }
         }
     }
@@ -777,6 +795,23 @@ pub struct Daemon {
     /// crate asserting a fact about another crate's schema.
     tenure_revision: u64,
     execution_state: automonique_protocol::admin::ExecutionState,
+    /// Proof that an administrator is connected *right now*, for the length of
+    /// one request and no longer.
+    ///
+    /// This is the third operator decision surface, beside the Telegram poller
+    /// and Slack, and it is the one whose liveness is exactly a call frame. It
+    /// holds an [`Admission`] rather than a boolean so the claim cannot be
+    /// asserted by code that never admitted anybody: the type is reachable only
+    /// from `PeerPolicy::evaluate`.
+    admitted_peer: Option<Admission>,
+    /// The one settable input to the approval requirement every launch is
+    /// composed against.
+    ///
+    /// Read once at open, like the other configuration gates, because it is a
+    /// property of the installation rather than of a request. The other two
+    /// inputs are not settable: the host's is measured, and the call's arrives
+    /// with the call.
+    configured_approval_requirement: ApprovalRequirement,
     /// The lane that starts contained attempts for custodied documents.
     ///
     /// Opened on every host, including one that can never execute anything:
@@ -1072,6 +1107,13 @@ impl Daemon {
                 ticket_store_path: &config.support_tickets_path(),
             })
             .map_err(|error| DaemonError::TicketIntakeRefused(error.category()))?;
+        // The standing approval requirement is the one configured input to the
+        // gate every launch takes. It is read here, beside the other startup
+        // gates, so a malformed file refuses a daemon rather than the first
+        // launch that reaches the gate.
+        let configured_approval_requirement =
+            approval_policy::ApprovalPolicyConfig::requirement_or_default(&state_dir)
+                .map_err(|error| DaemonError::ApprovalPolicyRefused(error.category()))?;
         socket_cleanup.disarm();
 
         Ok(Self {
@@ -1096,6 +1138,8 @@ impl Daemon {
             generation_audit,
             tenure_revision: tenure.revision,
             execution_state,
+            admitted_peer: None,
+            configured_approval_requirement,
             execution: Some(execution),
             ticket_intake,
         })
@@ -1327,6 +1371,45 @@ impl Daemon {
         }
     }
 
+    /// Which operator decision surfaces are live on this host right now.
+    ///
+    /// Evidence, not configuration, and that distinction is the whole point:
+    /// a configured Telegram bot whose poller is not running cannot carry a
+    /// decision back, and a Slack workspace without interactive decisions
+    /// renders buttons nobody can act on. Each surface is asked whether it is
+    /// *running*, and the connected administrator is represented by the
+    /// admission this request was authenticated under rather than by a flag.
+    fn operator_surfaces(&self) -> OperatorSurfaces {
+        let mut surfaces = OperatorSurfaces::none();
+        if self.telegram.poller_live() {
+            surfaces = surfaces.with_telegram_poller();
+        }
+        if self.slack_tickets.approvals_live() {
+            surfaces = surfaces.with_slack_approvals();
+        }
+        if let Some(admission) = self.admitted_peer {
+            surfaces = surfaces.with_admitted_peer(admission);
+        }
+        surfaces
+    }
+
+    /// The three requirement sources for one call, before composition.
+    ///
+    /// The host source is the startup measurement rather than a second probe:
+    /// delegation is a property of this process's own cgroup placement, which
+    /// does not change while it lives, and re-probing per request would let two
+    /// launches in one daemon disagree about the same kernel.
+    fn approval_sources(&self, per_call: ApprovalRequirement) -> ApprovalSources {
+        ApprovalSources::new(
+            self.configured_approval_requirement,
+            ApprovalRequirement::for_measured_host(matches!(
+                self.execution_state,
+                automonique_protocol::admin::ExecutionState::SandboxEnforceableNoLane
+            )),
+            per_call,
+        )
+    }
+
     /// Measure whether this host could enforce the composed sandbox.
     ///
     /// The measurement is the capability module's read-only probe asking for
@@ -1415,7 +1498,24 @@ impl Daemon {
         stream: &mut UnixStream,
         stop: &AtomicBool,
     ) -> Result<(), DaemonError> {
-        authenticate_peer(stream)?;
+        let admission = authenticate_peer(stream)?;
+        // A connected administrator is one of the surfaces an approval decision
+        // can come back over, and it is live for exactly the length of this
+        // call. Holding the admission rather than a boolean is what keeps the
+        // claim tied to the policy that produced it.
+        self.admitted_peer = Some(admission);
+        let served = self.serve_stream(stream, stop);
+        self.admitted_peer = None;
+        served
+    }
+
+    /// Read one bounded frame from an already-admitted peer and hand it to the
+    /// lane its envelope names.
+    fn serve_stream(
+        &mut self,
+        stream: &mut UnixStream,
+        stop: &AtomicBool,
+    ) -> Result<(), DaemonError> {
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         let payload = read_payload(stream)?;
@@ -2446,7 +2546,7 @@ impl Daemon {
 
         let response = match request {
             ExecuteRequest::ExecuteRun { request_id, run_id } => {
-                match self.start_run(run_id, degraded, paused) {
+                match self.start_run(run_id, degraded, paused, now_ms) {
                     Ok(submission_id) => {
                         ExecuteResponse::accepted(request_id.clone(), run_id.clone(), submission_id)
                             .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
@@ -2495,6 +2595,15 @@ impl Daemon {
     /// handed a document from one row and a revision from another would advance
     /// the wrong row on terminal.
     ///
+    /// # The approval gate lives here, and here only
+    ///
+    /// This is the one choke point every launch passes, so it is where the
+    /// composed approval requirement is consulted — after the run resolves to
+    /// the exact document that would run, because the thing being approved is
+    /// that document and not the identifier that names it. Putting the check in
+    /// the CLI or a chat bridge would make it advisory; putting it after the
+    /// lane starts would make it a report.
+    ///
     /// # Errors
     ///
     /// Returns the [`ExecuteRefusal`] the caller is owed. A store failure is
@@ -2506,6 +2615,7 @@ impl Daemon {
         run_id: &RunId,
         degraded: bool,
         paused: bool,
+        now_ms: i64,
     ) -> Result<u64, ExecuteRefusal> {
         if degraded {
             return Err(ExecuteRefusal::GenerationDegraded);
@@ -2533,11 +2643,119 @@ impl Daemon {
             .ok_or(ExecuteRefusal::ExecutionUnavailable)?;
         let submission_id =
             u64::try_from(entry.submission_id).map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
+        self.admit_approval(&entry.spec_digest, now_ms)?;
         self.execution
             .as_mut()
             .ok_or(ExecuteRefusal::ExecutionUnavailable)?
             .start(&entry.document, record.submission_id, record.revision)?;
         Ok(submission_id)
+    }
+
+    /// Consult the composed approval requirement for one custodied document.
+    ///
+    /// The subject an approval is about is the *document*, spelled
+    /// `runspec:<spec_digest>`, not the run identifier: two runs of the same
+    /// bytes are the same thing to approve, and one run resubmitted with
+    /// different bytes is not.
+    ///
+    /// # What each answer costs
+    ///
+    /// A refusal writes nothing except an audit record, and the record is
+    /// appended *after* the decision it describes, per the audit chain's own
+    /// ordering rule. `Proceed` writes nothing at all: an action that never
+    /// required approval must not acquire a durable footprint from the lane
+    /// that would have gated it.
+    ///
+    /// # Errors
+    ///
+    /// The [`ExecuteRefusal`] the composed policy produced. A host that cannot
+    /// enforce the sandbox is reported as [`ExecuteRefusal::SandboxUnenforceable`]
+    /// rather than as an approval refusal, because that is the word the lane
+    /// already uses for it and two spellings for one fact would be worse than
+    /// the extra arm here.
+    fn admit_approval(&mut self, spec_digest: &str, now_ms: i64) -> Result<(), ExecuteRefusal> {
+        // No per-call source exists on the execute lane: the request carries a
+        // run identifier and nothing else, so the call asks for no ceremony of
+        // its own and the composition is over the other two.
+        let sources = self.approval_sources(ApprovalRequirement::Allowed);
+        let subject = format!("runspec:{spec_digest}");
+        let refusal = match automonique_policy::approval::decide(
+            sources,
+            self.operator_surfaces(),
+            ApprovalEvidence::Undecided,
+        ) {
+            ApprovalGate::Proceed => return Ok(()),
+            ApprovalGate::Refuse(ApprovalPolicyRefusal::Forbidden) => {
+                if sources.host() == ApprovalRequirement::Forbidden {
+                    ExecuteRefusal::SandboxUnenforceable
+                } else {
+                    ExecuteRefusal::ApprovalForbidden
+                }
+            }
+            ApprovalGate::Refuse(ApprovalPolicyRefusal::ApprovalDenied) => {
+                ExecuteRefusal::ApprovalDenied
+            }
+            ApprovalGate::Refuse(ApprovalPolicyRefusal::ApprovalUnreachable) => {
+                ExecuteRefusal::ApprovalUnreachable
+            }
+            // A live surface exists and nobody has decided. The durable
+            // proposal lane answers this; until it does, the truthful answer is
+            // that a decision is required and none has been made.
+            ApprovalGate::Propose => ExecuteRefusal::ApprovalRequired,
+        };
+        self.record_approval_audit(&subject, refusal, now_ms);
+        Err(refusal)
+    }
+
+    /// Append one `approval` record for a launch the composed policy stopped.
+    ///
+    /// Silent on failure, for the reason
+    /// [`Daemon::record_cancellation_audit`] gives: the refusal has already
+    /// been decided and is about to be returned, and turning a failed append
+    /// into a different answer would misreport what happened. A missing record
+    /// beside a refusal is a detectable gap; a refusal turned into a start is
+    /// not detectable at all.
+    fn record_approval_audit(&mut self, subject: &str, refusal: ExecuteRefusal, now_ms: i64) {
+        let (Ok(head), Some(recorded_at)) = (
+            self.audit_chain.head(),
+            telegram_bridge::utc_rfc3339_from_unix_millis(now_ms),
+        ) else {
+            return;
+        };
+        let (seq, prev_hash) = head.map_or_else(
+            || (1, GENESIS_PREV_HASH.to_owned()),
+            |head| (head.seq.saturating_add(1), head.record_hash),
+        );
+        let Ok(record) = AuditRecord::link(
+            seq,
+            &prev_hash,
+            AuditEvent {
+                recorded_at: &recorded_at,
+                actor: "local-peer",
+                surface: refusal.as_str(),
+                category: AuditCategory::Approval,
+                subject,
+                // Every answer this records is a launch that did not happen.
+                outcome: AuditOutcome::Denied,
+            },
+        ) else {
+            return;
+        };
+        let record_id = record.record_id();
+        let body = record.to_canonical_bytes();
+        let record_hash = record.record_hash();
+        let _ = self.audit_chain.append(AuditAppend {
+            record_id: &record_id,
+            recorded_at: record.recorded_at(),
+            actor: record.actor(),
+            surface: record.surface(),
+            category: record.category().as_str(),
+            subject: record.subject(),
+            outcome: record.outcome().as_str(),
+            body: &body,
+            prev_hash: record.prev_hash(),
+            record_hash: &record_hash,
+        });
     }
 
     /// Deliver one cancellation request to the live attempt a run has.
@@ -4115,13 +4333,47 @@ fn read_payload(stream: &mut UnixStream) -> Result<Vec<u8>, DaemonError> {
     }
 }
 
-fn authenticate_peer(stream: &UnixStream) -> Result<(), DaemonError> {
-    let credentials =
-        getsockopt(stream, sockopt::PeerCredentials).map_err(|_| DaemonError::PeerDenied)?;
-    if credentials.uid() != geteuid().as_raw() || credentials.pid() <= 0 {
-        return Err(DaemonError::PeerDenied);
-    }
-    Ok(())
+/// Decide whether a connected peer may reach the codec, and prove it.
+///
+/// The rule is unchanged — same effective user only — but it is no longer
+/// spelled here. `automonique_policy::peer` owns the decision, this function
+/// owns the `getsockopt`, and the two halves meet at [`PeerCredential`]. The
+/// same policy backs the CLI's own check, so the client and the daemon can no
+/// longer drift into two predicates that agree by inspection.
+///
+/// A `pid` of zero or less means the kernel gave no usable credential rather
+/// than an unwelcome one, so it is presented as *absent* rather than as a
+/// refused user: the policy's own documentation is explicit that no admission
+/// rule may key on a PID, and it answers `CredentialsUnavailable` for `None`.
+///
+/// # Errors
+///
+/// [`DaemonError::PeerDenied`] for every refusal. The policy's reason is
+/// deliberately not widened onto the wire: a peer this socket will not talk to
+/// learns that and nothing more.
+fn authenticate_peer(stream: &UnixStream) -> Result<Admission, DaemonError> {
+    let credential = getsockopt(stream, sockopt::PeerCredentials)
+        .ok()
+        .filter(|credentials| credentials.pid() > 0)
+        .map(|credentials| {
+            PeerCredential::new(credentials.uid(), credentials.gid(), credentials.pid())
+        });
+    local_peer_policy()?
+        .evaluate(credential)
+        .map_err(|_| DaemonError::PeerDenied)
+}
+
+/// The one peer policy this daemon serves under: its own effective user.
+///
+/// Built per connection rather than cached, because the set is one number and
+/// the alternative is a second place where the admitted set could be stale.
+///
+/// # Errors
+///
+/// [`DaemonError::PeerDenied`] if the admitted set were ever empty, which this
+/// construction cannot produce and which is refused rather than defaulted.
+fn local_peer_policy() -> Result<PeerPolicy, DaemonError> {
+    PeerPolicy::new(&[geteuid().as_raw()]).map_err(|_| DaemonError::PeerDenied)
 }
 
 fn prepare_socket_path(path: &Path) -> Result<(), DaemonError> {

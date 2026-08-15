@@ -58,6 +58,7 @@ dependencies = [
 name = "automonique-cli"
 version = "0.1.0"
 dependencies = [
+ "automonique-policy",
  "automonique-protocol",
  "automonique-runner",
  "automonique-store",
@@ -80,6 +81,7 @@ dependencies = [
  "automonique-github-connector",
  "automonique-lab",
  "automonique-observability",
+ "automonique-policy",
  "automonique-protocol",
  "automonique-runner",
  "automonique-slack-connector",

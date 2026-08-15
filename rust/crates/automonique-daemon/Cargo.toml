@@ -15,6 +15,10 @@ automonique-egress-broker = { path = "../automonique-egress-broker" }
 automonique-github-connector = { path = "../automonique-github-connector" }
 automonique-lab = { path = "../automonique-lab" }
 automonique-observability = { path = "../automonique-observability" }
+# The socket's peer rule and the approval requirement lattice are both pure
+# classification over caller-supplied observations, so both live in the policy
+# crate rather than being spelled again here.
+automonique-policy = { path = "../automonique-policy" }
 automonique-protocol = { path = "../automonique-protocol" }
 automonique-runner = { path = "../automonique-runner" }
 # The two Slack commands on the Telegram surface read and post through this

@@ -19,6 +19,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use automonique_policy::peer::{PeerCredential, PeerPolicy};
 use automonique_protocol::admin::{
     AdminCommand, AdminRequest, AdminResponse, MAX_ADMIN_CANONICAL_BYTES, OutboxReconciliation,
     ReconciliationFailure, SubmittedRunSpec, SyntheticSubmission,
@@ -305,11 +306,7 @@ fn exchange(runtime: Option<&OsStr>, payload: &[u8]) -> Result<Vec<u8>, ClientEr
         return Err(ClientError::InsecureSocket);
     }
     let mut stream = UnixStream::connect(&socket).map_err(|_| ClientError::Io)?;
-    let credentials =
-        getsockopt(&stream, sockopt::PeerCredentials).map_err(|_| ClientError::InsecureSocket)?;
-    if credentials.uid() != geteuid().as_raw() || credentials.pid() <= 0 {
-        return Err(ClientError::InsecureSocket);
-    }
+    admit_peer(&stream)?;
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
         .map_err(|_| ClientError::Io)?;
@@ -337,6 +334,36 @@ fn exchange(runtime: Option<&OsStr>, payload: &[u8]) -> Result<Vec<u8>, ClientEr
         }
         _ => Err(ClientError::Protocol("incomplete_frame")),
     }
+}
+
+/// Check that the daemon on the other end of this socket is the same user.
+///
+/// The predicate used to be written out here and again in the daemon, which
+/// meant two copies of one authority rule kept in step by inspection. Both now
+/// go through `automonique_policy::peer`, so the client and the server admit
+/// exactly the same set by construction. Behaviour is unchanged: the effective
+/// user, and nothing else, is admitted.
+///
+/// A non-positive `pid` is presented as *no credential* rather than as a
+/// refused one, because the policy is explicit that no admission rule may key
+/// on a PID, and "the kernel told us nothing" is its own refusal.
+///
+/// # Errors
+///
+/// [`ClientError::InsecureSocket`] for every refusal. The client learns that it
+/// will not talk to this endpoint, not which rule the endpoint broke.
+fn admit_peer(stream: &UnixStream) -> Result<(), ClientError> {
+    let credential = getsockopt(stream, sockopt::PeerCredentials)
+        .ok()
+        .filter(|credentials| credentials.pid() > 0)
+        .map(|credentials| {
+            PeerCredential::new(credentials.uid(), credentials.gid(), credentials.pid())
+        });
+    PeerPolicy::new(&[geteuid().as_raw()])
+        .map_err(|_| ClientError::InsecureSocket)?
+        .evaluate(credential)
+        .map(|_admission| ())
+        .map_err(|_| ClientError::InsecureSocket)
 }
 
 fn validate_private_directory(path: &Path) -> Result<(), ClientError> {

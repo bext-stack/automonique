@@ -8,6 +8,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The client's peer check is the daemon's, and both read it from here rather
+# than each spelling the same predicate.
+automonique-policy = { path = "../automonique-policy" }
 automonique-protocol = { path = "../automonique-protocol" }
 automonique-runner = { path = "../automonique-runner" }
 # The parity verbs read the shadow-comparison database directly, offline.

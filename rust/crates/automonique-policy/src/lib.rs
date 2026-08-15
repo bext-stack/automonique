@@ -1,12 +1,21 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Pure policy evaluation shared by product health surfaces.
+//! Pure policy evaluation shared by product health and authority surfaces.
 //!
 //! This crate classifies observations supplied by a caller. It deliberately
 //! performs no filesystem, process, environment, or network access.
+//!
+//! Three families live here and they are deliberately separate: [`peer`] is
+//! *who may reach a socket*, [`approval`] is *how much ceremony one action
+//! needs*, and the rules in this module are *how healthy the product is*. The
+//! only place the first two meet is
+//! [`approval::OperatorSurfaces::with_admitted_peer`], which takes a
+//! [`peer::Admission`] because a connected administrator is one of the surfaces
+//! a decision can come back over.
 
 #![forbid(unsafe_code)]
 
+pub mod approval;
 pub mod peer;
 
 /// How strongly a policy rule affects aggregate health.

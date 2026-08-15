@@ -2509,6 +2509,15 @@ pub(crate) enum SlackTicketHost {
         prepared: Option<Box<SlackTicketWorker>>,
         stop: Arc<AtomicBool>,
         worker: Option<JoinHandle<()>>,
+        /// Whether this configuration can carry an approval decision at all.
+        ///
+        /// Captured here at open because the router moves onto the worker
+        /// thread at `start`, and the approval policy has to be able to ask
+        /// this question from the serve loop. It is the same conjunction
+        /// `prepare_interaction` gates on — interactive decisions enabled *and*
+        /// the approvals capability present — so the two cannot disagree about
+        /// whether a button would be honoured.
+        approvals_enabled: bool,
     },
 }
 
@@ -2534,6 +2543,8 @@ impl SlackTicketHost {
         let Some(app_token) = app_token else {
             return Ok(Self::Disabled);
         };
+        let approvals_enabled =
+            interactive_decisions && features.contains(&SlackFeature::Approvals);
         let manage = crate::ticket_intake::FleetConfig::load(state_dir)
             .map_err(|_| SlackConfigError::TicketActionsUnavailable)?
             .ok_or(SlackConfigError::TicketActionsUnavailable)?
@@ -2585,7 +2596,26 @@ impl SlackTicketHost {
             })),
             stop: Arc::new(AtomicBool::new(false)),
             worker: None,
+            approvals_enabled,
         })
+    }
+
+    /// Whether a Slack operator could decide an approval right now.
+    ///
+    /// Three things must hold together, and the answer is evidence rather than
+    /// configuration: the workspace enables interactive decisions, the
+    /// approvals capability is present, and the Socket Mode worker is actually
+    /// running. A worker that ended took the connection with it, so a finished
+    /// handle reports the surface as gone rather than as configured.
+    pub(crate) fn approvals_live(&self) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::Configured {
+                worker,
+                approvals_enabled,
+                ..
+            } => *approvals_enabled && worker.as_ref().is_some_and(|handle| !handle.is_finished()),
+        }
     }
 
     pub fn start(&mut self) -> Result<(), SlackConfigError> {
@@ -2593,6 +2623,7 @@ impl SlackTicketHost {
             prepared,
             stop,
             worker,
+            ..
         } = self
         else {
             return Ok(());

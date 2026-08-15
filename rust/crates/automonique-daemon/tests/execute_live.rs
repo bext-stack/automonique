@@ -778,6 +778,97 @@ fn a_document_pinning_another_composition_is_refused() {
     serving.shutdown(&config);
 }
 
+/// A configured approval requirement stops a headless launch and says why.
+///
+/// Not gated on the host, because both branches are proofs of the same
+/// composition and the composition is the thing under test:
+///
+/// - on a host that can enforce the sandbox, the configured
+///   `approval_required` is the strictest source, no operator surface is live
+///   in this fixture — no Telegram poller, no Slack, and the CLI peer is gone
+///   by the time the gate runs — so the answer is `approval_unreachable`;
+/// - on a host that cannot, the *measured* source is `Forbidden` and outranks
+///   the configured one, so the answer is the lane's own word for that host.
+///
+/// A build that read the configuration and skipped the measurement would pass
+/// the first branch and fail the second; one that read the measurement and
+/// ignored the configuration would fail the first. Neither branch can pass by
+/// accident on the other's host.
+#[test]
+fn a_configured_approval_requirement_refuses_a_headless_launch_and_records_it() {
+    let (_root, config) = fixture();
+    let approvals = config.state_dir().join("approvals");
+    std::fs::create_dir(&approvals).expect("approval configuration directory");
+    std::fs::set_permissions(&approvals, std::fs::Permissions::from_mode(0o700))
+        .expect("private directory");
+    let policy = approvals.join("approvals.conf");
+    std::fs::write(
+        &policy,
+        "schema=automonique.approvals/v1\n\
+         requirement=approval_required\n\
+         end=automonique.approvals/v1\n",
+    )
+    .expect("approval configuration");
+    std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o600))
+        .expect("private configuration");
+
+    let run = "execappr1";
+    let witness = workspace_root(&config, run).join("witness.txt");
+    let script = format!("{BUSYBOX} cat > {}", witness.display());
+    let spec = run_spec(run, &script);
+    let digest = Sha256::digest(&spec.to_canonical_bytes().expect("canonical encoding")).to_hex();
+
+    let serving = serve(&config);
+    submit(&config, &spec, "execute-approval-1");
+
+    let expected = if sandbox_enforceable() {
+        ExecuteRefusal::ApprovalUnreachable
+    } else {
+        ExecuteRefusal::SandboxUnenforceable
+    };
+    let response = execute(&config, "execute-approval-1", run);
+    assert!(
+        matches!(
+            &response,
+            ExecuteResponse::Refused { refusal, .. } if *refusal == expected
+        ),
+        "expected {expected}, got {response:?}"
+    );
+
+    // Nothing started, and the read model did not move.
+    assert_eq!(
+        listed_state(&config, "after-approval-refusal", run),
+        RunState::Ready,
+        "a refused request must not move the read model"
+    );
+    assert!(
+        !spool_root(&config, run).exists(),
+        "a refused request must leave no spool"
+    );
+    assert!(!witness.exists(), "a refused request must run no workload");
+
+    serving.shutdown(&config);
+
+    // The refusal is in the hash chain, as a denial about the document rather
+    // than about the run identifier that named it: two runs of the same bytes
+    // are one thing to approve.
+    let chain = automonique_store::audit_chain::AuditChain::open(config.audit_chain_path())
+        .expect("audit chain opens");
+    let page = chain.page(0, 16).expect("a page of records");
+    let record = page
+        .entries
+        .iter()
+        .find(|entry| entry.subject == format!("runspec:{digest}"))
+        .expect("a record about the document that was refused");
+    assert_eq!(record.category, "approval");
+    assert_eq!(record.outcome, "denied");
+    assert_eq!(record.surface, expected.as_str());
+    assert_eq!(
+        chain.verify_structure().expect("a structurally sound chain"),
+        u64::try_from(page.entries.len()).expect("a small chain"),
+    );
+}
+
 /// A host that cannot contain refuses, and starts nothing at all.
 #[test]
 fn a_host_that_cannot_contain_refuses_and_executes_nothing() {

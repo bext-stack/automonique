@@ -871,6 +871,18 @@ impl TelegramHost {
         }
     }
 
+    /// Whether a Telegram operator could decide an approval right now.
+    ///
+    /// Exactly [`TelegramState::PollingLive`], which is the one state in which
+    /// this host holds both the bot lease and a client bound to it. A
+    /// configured bot whose poller has stopped is not a decision surface, and
+    /// the status this reads already makes that distinction for the operator's
+    /// benefit; the approval policy reads the same answer rather than a second
+    /// one.
+    pub(crate) fn poller_live(&self) -> bool {
+        matches!(self.status().0, TelegramState::PollingLive)
+    }
+
     /// Renew the owned lease; a no-op when Telegram is not configured.
     ///
     /// Called on the daemon's renewal cadence. A renewal failure is returned

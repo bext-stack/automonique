@@ -353,11 +353,104 @@ pub enum ExecuteRefusal {
     /// daemon could not consult its own state, and this one says it did and the
     /// delivery failed.
     CancelNotDelivered,
+    /// The composed approval policy forbids this launch outright, and no
+    /// decision can change that.
+    ///
+    /// Distinct from [`ExecuteRefusal::ApprovalDenied`]: a denial is somebody's
+    /// answer, and this is the absence of a question.
+    ApprovalForbidden,
+    /// An operator decision is required and none has been made.
+    ///
+    /// A proposal is durable and awaiting an answer; nothing was started and
+    /// nothing else was written. Presenting the same run again while the
+    /// proposal is open earns this refusal again rather than a second proposal.
+    ApprovalRequired,
+    /// An operator decided against this launch.
+    ApprovalDenied,
+    /// A decision is required and no operator surface could carry one back.
+    ///
+    /// The honest answer for a headless host: proceeding would discard the
+    /// requirement, and waiting would hold a proposal nobody will ever see. See
+    /// `automonique_policy::approval`.
+    ApprovalUnreachable,
+    /// The launch context drifted away from the one an operator approved.
+    ///
+    /// The spelling names *which* bound field differs, because "your approval
+    /// no longer applies" and "your approval no longer applies because the
+    /// program changed" are different facts to the person deciding whether to
+    /// approve again. Nothing was started.
+    ApprovalContextDrift {
+        /// The first bound field that differs from the approved context.
+        field: ApprovalContextField,
+    },
+}
+
+/// Which part of a launch context an approval was bound to.
+///
+/// Closed and ordered as the drift check evaluates them, so a refusal names the
+/// first difference rather than an arbitrary one.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ApprovalContextField {
+    /// The canonical digest of the RunSpec document in custody.
+    SpecDigest,
+    /// The absolute path of the program the document pins.
+    ProgramPath,
+    /// The content digest of the bytes behind that path.
+    ProgramSha256,
+    /// The digest of the prompt the launch would carry.
+    PromptSha256,
+    /// The opaque token standing for the working directory.
+    CwdToken,
+}
+
+impl ApprovalContextField {
+    /// Every bound field, in the order the drift check evaluates them.
+    pub const ALL: [Self; 5] = [
+        Self::SpecDigest,
+        Self::ProgramPath,
+        Self::ProgramSha256,
+        Self::PromptSha256,
+        Self::CwdToken,
+    ];
+
+    /// Stable lowercase name of the field.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SpecDigest => "spec_digest",
+            Self::ProgramPath => "program_path",
+            Self::ProgramSha256 => "program_sha256",
+            Self::PromptSha256 => "prompt_sha256",
+            Self::CwdToken => "cwd_token",
+        }
+    }
+
+    /// Stable wire spelling of the refusal that names this field.
+    ///
+    /// A `&'static str` per field rather than a formatted one, so
+    /// [`ExecuteRefusal::as_str`] stays `const` and the closed set of
+    /// spellings is visible in one place.
+    #[must_use]
+    pub const fn drift_spelling(self) -> &'static str {
+        match self {
+            Self::SpecDigest => "approval_context_drift_spec_digest",
+            Self::ProgramPath => "approval_context_drift_program_path",
+            Self::ProgramSha256 => "approval_context_drift_program_sha256",
+            Self::PromptSha256 => "approval_context_drift_prompt_sha256",
+            Self::CwdToken => "approval_context_drift_cwd_token",
+        }
+    }
+}
+
+impl fmt::Display for ApprovalContextField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 impl ExecuteRefusal {
     /// Every refusal, in canonical order.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 24] = [
         Self::UnknownRun,
         Self::RunNotReady,
         Self::AlreadyExecuting,
@@ -373,6 +466,25 @@ impl ExecuteRefusal {
         Self::ExecutionUnavailable,
         Self::NoLiveAttempt,
         Self::CancelNotDelivered,
+        Self::ApprovalForbidden,
+        Self::ApprovalRequired,
+        Self::ApprovalDenied,
+        Self::ApprovalUnreachable,
+        Self::ApprovalContextDrift {
+            field: ApprovalContextField::SpecDigest,
+        },
+        Self::ApprovalContextDrift {
+            field: ApprovalContextField::ProgramPath,
+        },
+        Self::ApprovalContextDrift {
+            field: ApprovalContextField::ProgramSha256,
+        },
+        Self::ApprovalContextDrift {
+            field: ApprovalContextField::PromptSha256,
+        },
+        Self::ApprovalContextDrift {
+            field: ApprovalContextField::CwdToken,
+        },
     ];
 
     /// Stable lowercase wire spelling.
@@ -394,6 +506,11 @@ impl ExecuteRefusal {
             Self::ExecutionUnavailable => "execution_unavailable",
             Self::NoLiveAttempt => "no_live_attempt",
             Self::CancelNotDelivered => "cancel_not_delivered",
+            Self::ApprovalForbidden => "approval_forbidden",
+            Self::ApprovalRequired => "approval_required",
+            Self::ApprovalDenied => "approval_denied",
+            Self::ApprovalUnreachable => "approval_unreachable",
+            Self::ApprovalContextDrift { field } => field.drift_spelling(),
         }
     }
 

@@ -16,8 +16,9 @@
 
 use automonique_protocol::codec::{MajorVersion, RequestId};
 use automonique_protocol::execute_api::{
-    CancelRequestRef, CancelRunOutcome, EXECUTE_CANCEL_VERSION, EXECUTE_PROTOCOL, ExecuteApiError,
-    ExecuteRefusal, ExecuteRequest, ExecuteResponse, MAX_CANCEL_REQUEST_REF_BYTES,
+    ApprovalContextField, CancelRequestRef, CancelRunOutcome, EXECUTE_CANCEL_VERSION,
+    EXECUTE_PROTOCOL, ExecuteApiError, ExecuteRefusal, ExecuteRequest, ExecuteResponse,
+    MAX_CANCEL_REQUEST_REF_BYTES,
 };
 use automonique_protocol::journal::ActionOutcome;
 use automonique_protocol::tools::RunId;
@@ -288,7 +289,7 @@ fn a_cancellation_reference_is_bounded_non_empty_and_control_free() {
 
 #[test]
 fn every_refusal_round_trips_its_exact_spelling_and_none_is_shared() {
-    assert_eq!(ExecuteRefusal::ALL.len(), 15);
+    assert_eq!(ExecuteRefusal::ALL.len(), 24);
     let mut spellings: Vec<&str> = ExecuteRefusal::ALL
         .into_iter()
         .map(ExecuteRefusal::as_str)
@@ -304,6 +305,62 @@ fn every_refusal_round_trips_its_exact_spelling_and_none_is_shared() {
     spellings.sort_unstable();
     spellings.dedup();
     assert_eq!(spellings.len(), count, "two refusals share a spelling");
+}
+
+#[test]
+fn a_context_drift_refusal_names_the_field_it_drifted_on() {
+    // The drifted field travels on the wire rather than only in a log, because
+    // "your approval no longer applies" and "your approval no longer applies
+    // because the program changed" are different facts to whoever decides
+    // whether to approve again.
+    assert_eq!(ApprovalContextField::ALL.len(), 5);
+    for field in ApprovalContextField::ALL {
+        let refusal = ExecuteRefusal::ApprovalContextDrift { field };
+        assert_eq!(refusal.as_str(), field.drift_spelling());
+        assert_eq!(
+            ExecuteRefusal::from_spelling(refusal.as_str()),
+            Some(refusal)
+        );
+        assert!(
+            refusal.as_str().ends_with(field.as_str()),
+            "the spelling must name the field"
+        );
+        assert!(!refusal.is_host_wide(), "drift is about this launch");
+    }
+    // A bare stem is not a spelling: every drift refusal names a field.
+    assert_eq!(
+        ExecuteRefusal::from_spelling("approval_context_drift"),
+        None
+    );
+}
+
+#[test]
+fn the_approval_refusals_are_about_this_launch_and_not_about_the_host() {
+    // Every one of them is answered by a decision or a re-proposal, so a
+    // caller that retries with a different run is not making any of them
+    // truthful by accident — except that none of them is host-wide, which is
+    // what `is_host_wide` exists to say.
+    for refusal in [
+        ExecuteRefusal::ApprovalForbidden,
+        ExecuteRefusal::ApprovalRequired,
+        ExecuteRefusal::ApprovalDenied,
+        ExecuteRefusal::ApprovalUnreachable,
+    ] {
+        assert!(!refusal.is_host_wide());
+    }
+    assert_eq!(
+        ExecuteRefusal::ApprovalUnreachable.as_str(),
+        "approval_unreachable"
+    );
+    assert_eq!(ExecuteRefusal::ApprovalDenied.as_str(), "approval_denied");
+    assert_eq!(
+        ExecuteRefusal::ApprovalRequired.as_str(),
+        "approval_required"
+    );
+    assert_eq!(
+        ExecuteRefusal::ApprovalForbidden.as_str(),
+        "approval_forbidden"
+    );
 }
 
 #[test]
