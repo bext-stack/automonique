@@ -2,14 +2,48 @@
 
 //! Foreground Automonique control-plane process.
 //!
-//! This first daemon slice owns a private runtime directory, a durable SQLite
-//! store, one fenced process generation, and a peer-authenticated Unix admin
-//! socket. It deliberately performs no external effects yet.
+//! This daemon owns a private runtime directory, a durable SQLite store, one
+//! fenced process generation, and a peer-authenticated Unix admin socket.
 //!
-//! That includes the run submission lane: a submitted RunSpec document is
-//! verified and durably held, and then nothing happens to it. The `SubmitRun`
-//! handler arm records what execution would still require and why none of it
-//! exists here.
+//! It performs real external effects. Every one of them is gated on an
+//! operator-written configuration file under the state directory, so a host
+//! with no configuration still has none of them; a host that has one has all
+//! of that surface, not a subset. The effects, and the file that enables each:
+//!
+//! * **Telegram** (`telegram`, `telegram_bridge`) — long-polls, publishes a
+//!   command menu, and replies. Enabled by `telegram/bot.conf`; without an
+//!   `allow=` line the token is dropped and no client is built.
+//! * **Slack** (`slack`) — a Socket Mode worker that reads channels, posts
+//!   messages, opens modals, and publishes an App Home view. Enabled by
+//!   `slack/slack.conf`.
+//! * **GitHub** (`github`, `github_actions`) — creates issues, comments,
+//!   edits checklists, and runs typed work-management mutations, each
+//!   individually enabled by an `action=` line in `github/github.conf` and
+//!   each carrying an idempotency marker that is searched for before a create
+//!   and re-searched after an ambiguous transport failure.
+//! * **Support backend** (`ticket_intake`, `ticket_work`) — polls the ticket
+//!   board into a durable store and drafts replies. Enabled by
+//!   `support/fleet.conf`. Intake itself sends nothing; sending an email or
+//!   dispatching a job happens only on an explicit operator intent.
+//! * **Provider execution** (`execute`, `compose`, `run_lane`) — a real
+//!   supervised process launch through the composed sandbox boundary, with
+//!   brokered egress (`egress`) restricted to the destinations named in the
+//!   `egress-destinations` file. Enabled by the `provider` file; absent, every
+//!   compose refuses `ComposeRefusal::NotConfigured`.
+//! * **Self-improvement** (`improvement_worker`, `improvement_publish`,
+//!   `improvement_github`, `release_activation`) — pushes a tested candidate,
+//!   opens and merges pull requests, repoints a release symlink, and restarts
+//!   a systemd user unit. Enabled by `improvement-lab.json`, and gated behind
+//!   two separate administrator approvals bound by an HMAC challenge.
+//!
+//! What it still does not do, in the words of the sites that say so: it runs
+//! no scheduler, so the automation store decides nothing; it acts on nobody's
+//! behalf, so the approval ledger permits nothing; it has no executor, so the
+//! batch registry throttles nothing. It establishes no release trust —
+//! nothing in this crate calls `release_trust_root`, so a provider binary is
+//! admitted by pinned digest and workspace identity, never by an attested
+//! signature. It has no logger, and it cannot acknowledge a Telegram callback
+//! query.
 
 use std::error::Error;
 use std::fmt;
@@ -1234,9 +1268,13 @@ impl Daemon {
     /// exactly the properties the composed launch path enforces: containment,
     /// filesystem restriction, TCP denial, and syscall restriction. It runs
     /// once at startup: delegation is a property of the daemon's own cgroup
-    /// placement, which does not change while the process lives. The answer
-    /// says nothing about executing work — this release wires no lane — and a
-    /// refusal is the expected truthful state on an undelegated host.
+    /// placement, which does not change while the process lives.
+    ///
+    /// The answer is about the host, not about work: it says what the kernel
+    /// would enforce for a launch, never that a particular run was admitted.
+    /// A refusal is the expected truthful state on an undelegated host, and on
+    /// such a host [`execute::ExecutionLane`] is still opened and still
+    /// refuses every start, so the measurement and the lane agree.
     fn measure_execution_state() -> automonique_protocol::admin::ExecutionState {
         use automonique_protocol::admin::ExecutionState;
         use automonique_runner::capability::HostCapabilities;
@@ -1480,20 +1518,22 @@ impl Daemon {
                 }
             }
             automonique_protocol::admin::AdminCommand::SubmitRun => {
-                // THIS LANE STOPS AT CUSTODY.
+                // THIS ARM STOPS AT CUSTODY.
                 //
                 // What follows verifies a document and writes it down. It does
                 // not admit the run, build a launch plan, reserve a workspace,
                 // compose a sandbox, or start a supervisor — and it must not
-                // acquire the habit of doing so quietly. Executing a submitted
-                // document would require two things this build does not have:
-                // a release trust chain that establishes the provider binary
-                // and policy the document names are the ones on this host, and
-                // an operator-enabled execution lane that a host can be
-                // measured against and refused fail-closed. `execution_state`
-                // in the status snapshot reports the second as absent on every
-                // host, by construction. Accepting a document therefore
-                // establishes custody of it and no authority over anything.
+                // acquire the habit of doing so quietly. Since the execution
+                // lane was wired, starting a submitted document is a second,
+                // separately authenticated request (`AdminCommand::Execute`,
+                // handled by `handle_execute`), which is what keeps "we hold
+                // this" and "we are running this" two decisions rather than
+                // one. Accepting a document therefore establishes custody of
+                // it and no authority over anything: the lane still refuses
+                // fail-closed on a host whose sandbox is unenforceable, still
+                // establishes no release trust for the binary the document
+                // names, and still admits only the daemon's own workspace
+                // registry and backend.
                 let now_ms = unix_millis()?;
                 let snapshot = self.store.status_snapshot_at(GENERATION_ID, now_ms)?;
                 if self.reconciliation_run_id.is_some()

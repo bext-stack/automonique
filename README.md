@@ -9,30 +9,54 @@ external effect typed, revision-checked, journaled, and reconcilable.
 
 ## Repository status
 
-Automonique is in early implementation. Its first runnable control-plane slice
-now includes a foreground daemon, peer-authenticated local administration,
-durable SQLite state, a fenced FIFO scheduler, a deterministic no-effect
-execution lane, a bounded process-runner foundation, and fail-closed sandbox
-admission planning. It also has a strict Telegram update parser with atomic
-durable dispositions/offsets, fail-only reconciliation over the authenticated
-local admin endpoint, and a read-only Codex invocation normalizer. Provider
-execution and transport networking are not connected yet. Delivery intents now
-have durable FIFO leases, exact provider receipts, retry/dead-letter outcomes,
-and explicit ambiguity reconciliation through redacted operator commands. A
-side-effect-free Telegram polling orchestrator binds parsed batches to the real
-SQLite store through a renewable per-bot lease, fenced deadline, and content
-digest. A no-client lifecycle coordinator can acquire, renew, reconcile, and
-release that lease without enabling HTTP, while the foreground daemon reports
-Telegram as explicitly disabled. Store-derived operational snapshots classify
-ready, delayed, live, ambiguous, delivered, and dead-lettered work without
-inventing runtime health. The authenticated status command exposes those
-measurements while keeping provider readiness, sandbox launch authority, and
-Telegram offset lag explicitly unavailable until they are integrated. A
-direct, TLS-verified Telegram `getUpdates` HTTPS client now exists behind the
-poller interface, but the daemon still has no token/configuration loader and
-does not start it. Large historical
-planning and development-harness surfaces remain in the tree, but they are no
-longer prerequisites for product development.
+Automonique performs real external effects. A configured daemon holds durable
+SQLite state under one fenced process generation, answers a peer-authenticated
+local admin socket, and — for each surface an operator has explicitly enabled —
+talks to Telegram, Slack, GitHub, and a support backend, and executes real
+provider processes inside the enforced sandbox with brokered network egress.
+
+Every one of those surfaces is off until an operator writes its configuration
+file by hand into the daemon's private state directory. Absent the file, the
+daemon builds no client for that surface and says so; present but malformed, it
+refuses to start rather than degrading quietly.
+
+| Surface | Enabled by | What it does when enabled |
+| --- | --- | --- |
+| Telegram | `telegram/bot.conf` | Long-polls, publishes a command menu, answers operator commands, and replies. Without an `allow=` line the token is dropped and no client is built. |
+| Slack | `slack/slack.conf` | A Socket Mode worker that reads channels, posts messages, opens modals, and publishes an App Home view. |
+| GitHub | `github/github.conf` | Creates issues, comments, edits checklists, and runs typed work-management mutations — each one separately enabled by an `action=` line, each carrying an idempotency marker checked before a create and re-checked after an ambiguous failure. |
+| Support intake | `support/fleet.conf` | Polls the ticket board into a durable store and drafts replies. Intake itself sends nothing; an email or a dispatched job happens only on an explicit operator intent. |
+| Provider execution | `provider` | Composes a bounded launch document and runs a real provider process through the full sandbox boundary, returning its answer. |
+| Brokered egress | `egress-destinations` | Starts one loopback CONNECT broker per run on a kernel-assigned ephemeral port, allowing exactly the host/port pairs the file names and denying everything else. Absent, every brokered document is refused. |
+| Self-improvement | `improvement-lab.json` | Runs a pinned agent in a worktree, pushes a tested candidate, opens and merges pull requests, repoints a release symlink, and restarts a systemd user unit. Gated behind two separate administrator approvals bound by an HMAC challenge. |
+| Durable memory | `memory/memory.conf` | The one gate whose absent state is a default rather than an off switch: memory runs under a neutral default tenant. It never migrates rows written under another tenant. |
+
+What the daemon still does not do, and says so at the sites that would have to
+change:
+
+- **No scheduler, no executor, no acting on anyone's behalf.** The automation
+  store, approval ledger, and batch registry record decisions durably and
+  truthfully, and nothing reads them to decide anything. Registering an
+  automation starts nothing, a recorded approval permits nothing, and a batch's
+  concurrency ceiling throttles nothing.
+- **No release trust.** A provider binary is admitted by pinned digest and by
+  the daemon's own workspace registry, never by a verified signature. The
+  signature seam is structurally unconstructible, not merely unimplemented.
+- **No generation handoff.** Upgrades still stop and restart the process; there
+  are no `reload`, `rollback`, or `generations` verbs.
+- **No metrics exporter, no tracing, no logger.** Bounded metrics are derived
+  from one SQLite snapshot and served over the local status command only.
+- **Named surface gaps.** Telegram `/cancel` and `/deny` answer
+  `cancel_verb_absent` and `approval_wiring_absent` rather than faking an
+  effect; callback queries cannot be acknowledged; support intake pages nothing
+  and holds no cursor or lease.
+
+Large historical planning and development-harness surfaces remain in the tree,
+but they are no longer prerequisites for product development.
+
+Status reconciled against `d10cfa5`, 2026-08-15. A pull request that adds or
+enables an external surface updates this section in the same pull request; see
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ```text
 docs/product-plan/       product goals, requirements, architecture, migration
@@ -139,17 +163,19 @@ printf '%s\n' '<receipt-or-reason>' | \
   <epoch> <attempt> <revision>
 ```
 
-The daemon creates only `automonique/` children under those roots, refuses
-permissive or foreign-owned paths, and exposes no network listener. The submit
-command accepts only bounded local synthetic work, reads its task from stdin,
-serializes it by scope, and atomically records one deterministic terminal plus
-one pending `fake.receipt`. It cannot execute a process, call a provider, drain
-the outbox, or send an external effect. `accepting_intake=true` refers only to
-this local synthetic lane. The general runner remains fail-closed and sandbox
-plans still grant no OS-enforcement or production-runner authority. A dedicated
-descriptor-closure helper exercises a fixed inert Bubblewrap/BusyBox boundary,
-but the product launch API still refuses with `missing_reviewed_helper_pin`;
-there is no provider execution success type.
+The daemon creates only `automonique/` children under those roots and refuses
+permissive or foreign-owned paths. Its only listening socket is the local Unix
+admin socket; the one network listener it ever binds is the per-run egress
+broker, on a kernel-assigned loopback port that is never shared or reused
+between runs.
+
+The `submit` command above is the synthetic lane, and it is still exactly what
+it was: bounded local synthetic work, read from stdin, serialized by scope, and
+recorded as one deterministic terminal plus one pending `fake.receipt`. That
+command executes no process, calls no provider, drains no outbox, and sends no
+external effect, and `accepting_intake=true` refers only to it. Starting real
+work is a different, separately authenticated request, so holding a document
+and running it stay two decisions rather than one.
 
 The runner now installs real, exercised kernel boundaries rather than only
 observing that kernel interfaces exist. A run cgroup provides descendant-complete
@@ -222,29 +248,33 @@ kill proven against a `setsid`-escaped descendant. The store crate adds a
 durable host-wide cancellation ledger whose delivered/already-delivered/
 conflict answers survive restart, ready to replace the control socket's
 documented in-memory ledger when the daemon composition wires the two
-together. Provider execution is planned but still cannot happen: the agents
-crate builds exact sandboxed launch plans for a digest-pinned provider
-executable and parses provider event streams incrementally, while refusing
-the things it cannot yet deliver honestly rather than approximating them.
-The daemon's status now reports a measured `execution_state`
-(`sandbox_unavailable_no_lane` / `sandbox_enforceable_no_lane`): what the
-host could enforce for a launcher, never a claim that any lane exists. The
+together. Provider execution now happens for real: the agents crate builds
+exact sandboxed launch plans for a digest-pinned provider executable and parses
+provider event streams incrementally, and the daemon's execution lane drives
+those plans through the launch helper with one worker thread per attempt. The
+daemon's status reports a measured `execution_state`
+(`sandbox_unavailable_no_lane` / `sandbox_enforceable_no_lane`): what the host
+could enforce for a launcher. Both spellings still say `no_lane`, which the
+lane's own wiring has outgrown — the measurement is honest about the host and
+stale about the lane, and correcting the vocabulary is a protocol change. The
 admin status read surface and the doctor report schema are now generated
 into the Apache-2.0 TypeScript SDK by a maintained generator with a drift
 gate that fails when the checked-in files no longer match, a typecheck
 against the package's strict tsconfig, and a test comparing the Rust
 encoder's own field sets against the generated ones. A strict Slack Socket
 Mode envelope parser with typed plan-then-ack acknowledgement discipline
-joins the Telegram parser as the second network-free connector core.
+joins the Telegram parser as the second network-free connector core; a
+configured daemon now drives that parser from a live Socket Mode worker.
 
 Enforcement needs a delegated cgroup v2 subtree, which is what the daemon gets
 as a systemd user service with `Delegate=yes`; where no delegated domain
 exists every API refuses fail-closed and never reports partial enforcement.
-These paths are exercised by tests only — the daemon does not yet call the
-backend, no provider is wired to it, and provider launch authority still
-requires the release-manifest trust chain that remains unbuilt.
+The daemon calls this backend on a configured host, but launch authority is
+still not established by signature: a provider binary is admitted by pinned
+digest and by the daemon's own workspace registry, and the release-manifest
+trust chain remains unbuilt.
 
-The Codex adapter cannot spawn or probe a process. The Telegram poller now has a concrete synchronous HTTPS
+The Telegram poller has a concrete synchronous HTTPS
 client with WebPKI certificate verification, redirects and environment proxies
 disabled, bounded response headers/body, and a request deadline inside the
 lease margin. Telegram's required token-bearing URL exists only during that
@@ -265,16 +295,17 @@ the daemon reports `lease_owned_no_client` with the lease epoch. With one, the
 token is retained in memory, one worker thread long-polls beneath the same
 lease, and the status reports `polling_live` — a daemon holding a client never
 reports a no-client state. That poller answers `/help`, `/status` and `/runs`
-from the daemon's own read surfaces on its own store connections, refuses a
-sender outside the allowlist without reading their message, and replies to
-`/run`, `/cancel`, `/approve` and `/deny` that the surface behind them does not
-exist yet rather than faking an effect. The observability crate derives bounded metrics from one timestamped
+from the daemon's own read surfaces on its own store connections and refuses a
+sender outside the allowlist without reading their message. `/run`, `/work`,
+`/research`, the Slack and GitHub verbs, the memory verbs and `/approve` now
+run for real; `/cancel` and `/deny` still reply that the surface behind them
+does not exist rather than faking an effect. The observability crate derives bounded metrics from one timestamped
 SQLite snapshot and serves them over the local authenticated status command,
 but it has no metrics exporter. A release-manifest candidate can bind the
 descriptor helper, boundary installer, fixture, workspace, and runner digests
 for review, but cannot mint launch authority; an independently authenticated
-release trust root is still missing. Those paths remain unavailable
-until enforcement and production integration are implemented.
+release trust root is still missing, so nothing a release manifest asserts is
+verified before a run.
 
 ## Clean-room and licensing
 
