@@ -36,11 +36,12 @@ jobs:
     # `tools/oracle`, `tools/contract_inventory` and `tools/surface_inventory`
     # ran nowhere. This job is what makes doc-to-derived drift a red build.
     #
-    # Deliberately NOT here: `plan/check.py --verify` and `plan/selftest.py`.
-    # They are the plan-bookkeeping checkers rather than derived-artifact ones,
-    # and wiring them is tracked separately; the one rule of `plan/check.py`
-    # that is about the published tree, `--identifiers`, already runs in
-    # `.github/workflows/scrub.yml`.
+    # The plan-bookkeeping checkers `plan/check.py --verify` and
+    # `plan/selftest.py` now run in the `plan-verifier` job below — M2 #15
+    # wired these derived-artifact checkers; M5 #34 wired the bookkeeping
+    # ones once the #4 scrub and the selftest baseline fix made them green.
+    # `plan/check.py --identifiers` additionally runs in
+    # `.github/workflows/scrub.yml` as the published-tree identifier rule.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -97,3 +98,25 @@ jobs:
             echo "::error::A verify-mode checker modified the working tree. Verify mode must compare, never regenerate."
             exit 1
           fi
+
+  plan-verifier:
+    # The plan-bookkeeping verifier and its own self-test. `selftest.py`
+    # mutates a scratch copy of the tree and asserts `check.py` detects each
+    # drift (its baseline control was inert until the #4 scrub + a two-line
+    # scratch fix); `check.py --verify` asserts the tree's integrity rules
+    # (SPDX boundary, identifier-location, evidence completeness) hold. Both
+    # went green after M1/M2; wiring them here (M5 #34) makes plan drift and
+    # a mislocated identifier a red build rather than a manual check.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Plan verifier self-test
+        run: python3 plan/selftest.py
+
+      - name: Plan integrity rules hold
+        run: python3 plan/check.py --verify
