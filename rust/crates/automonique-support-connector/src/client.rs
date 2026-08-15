@@ -218,7 +218,7 @@ impl FleetClient {
     }
 
     /// Dispatch one exact GitHub issue through Manage's project/profile and
-    /// Jean approval machinery.
+    /// approval machinery.
     pub fn dispatch_ticket(
         &self,
         request: &TicketDispatchRequest,

@@ -1009,7 +1009,7 @@ impl FakeTicketActions {
                 confirmations: Vec::new(),
                 receipt: Ok(TicketDispatchReceipt {
                     issue_id: String::from("fixture-issue"),
-                    issue_url: String::from("https://github.com/webdesign29/activ/issues/1007"),
+                    issue_url: String::from("https://github.com/example/repo/issues/1007"),
                     issue_title: String::from("List prism sites"),
                     project_label: String::from("Bext platform"),
                     site_label: Some(String::from("Bext platform")),
@@ -1021,7 +1021,7 @@ impl FakeTicketActions {
                 }),
                 statuses: VecDeque::from([Ok(TicketStatus {
                     issue_id: String::from("fixture-issue"),
-                    issue_url: String::from("https://github.com/webdesign29/activ/issues/1007"),
+                    issue_url: String::from("https://github.com/example/repo/issues/1007"),
                     issue_title: String::from("List prism sites"),
                     job_id: String::from("fixture-job-123456"),
                     job_status: TicketJobStatus::Done,
@@ -1069,7 +1069,7 @@ impl TicketActionSurface for FakeTicketActions {
         if !state.confirmed {
             return Ok(TicketStatus {
                 issue_id: String::from("fixture-issue"),
-                issue_url: String::from("https://github.com/webdesign29/activ/issues/1007"),
+                issue_url: String::from("https://github.com/example/repo/issues/1007"),
                 issue_title: String::from("List prism sites"),
                 job_id: String::from("fixture-job-123456"),
                 job_status: TicketJobStatus::PendingApproval,
@@ -1428,7 +1428,11 @@ fn explicit_email_composes_one_body_and_sends_to_the_server_bound_recipient() {
 
     let sends = actions.sends();
     assert_eq!(sends.len(), 1);
-    assert!(sends[0].action_id.starts_with("jean-email:"));
+    assert!(
+        sends[0].action_id.starts_with(
+            automonique_protocol::compat::legacy_spelling::SUPPORT_EMAIL_ACTION_PREFIX
+        )
+    );
     assert_eq!(sends[0].to, "owner@example.invalid");
     assert_eq!(sends[0].subject, "Récapitulatif des travaux IA du jour");
     assert_eq!(
@@ -1742,9 +1746,9 @@ fn deepseek_quota_is_a_typed_balance_answer_that_never_spends_a_model_call() {
 fn named_slack_and_github_facts_are_read_live_before_fast_operational_answer() {
     let fixture = Fixture::new(&[]);
     let slack = FakeSlack::reading(
-        "#jean, 2 most recent:\n1786727000 alice: à traiter https://github.com/webdesign29/activ/issues/1007\n1786726900 bob: relance https://github.com/webdesign29/activ/issues/1007",
+        "#ops, 2 most recent:\n1786727000 alice: à traiter https://github.com/example/repo/issues/1007\n1786726900 bob: relance https://github.com/example/repo/issues/1007",
     )
-    .with_channels(&["jean", "deploiements"]);
+    .with_channels(&["ops", "deploiements"]);
     let github = FakeGitHub::default();
     let outbound = FakeOutbound::default();
     let lane = FakeRunLane::answering("live operational answer");
@@ -1753,7 +1757,7 @@ fn named_slack_and_github_facts_are_read_live_before_fast_operational_answer() {
         FakeClient::new([updates(&[(
             1,
             OPERATOR,
-            "regarde les demandes Slack dans jean et les tickets GitHub à traiter",
+            "regarde les demandes Slack dans ops et les tickets GitHub à traiter",
         )])]),
         outbound.clone(),
         FakeSink::default(),
@@ -1769,15 +1773,15 @@ fn named_slack_and_github_facts_are_read_live_before_fast_operational_answer() {
         1
     );
     assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
-    assert_eq!(slack.reads(), ["jean"]);
-    assert_eq!(github.seen(), ["webdesign29/activ#1007"]);
+    assert_eq!(slack.reads(), ["ops"]);
+    assert_eq!(github.seen(), ["example/repo#1007"]);
     let prompts = lane.tasks();
     assert_eq!(prompts.len(), 1);
     assert!(prompts[0].contains("[live_slack_channel]"));
-    assert!(prompts[0].contains("channel=jean"));
-    assert!(prompts[0].contains("à traiter https://github.com/webdesign29/activ/issues/1007"));
+    assert!(prompts[0].contains("channel=ops"));
+    assert!(prompts[0].contains("à traiter https://github.com/example/repo/issues/1007"));
     assert!(prompts[0].contains("[live_github_issues]"));
-    assert!(prompts[0].contains("reference=webdesign29/activ#1007"));
+    assert!(prompts[0].contains("reference=example/repo#1007"));
     assert!(prompts[0].contains("state=open"));
     assert!(
         outbound.messages()[0].contains("route=operational_lookup_luna_none"),
@@ -1797,7 +1801,7 @@ fn explicit_ticket_request_waits_for_an_admin_confirmation_before_work() {
             updates(&[(
                 1,
                 OPERATOR,
-                "peux tu faire ce ticket stp https://github.com/webdesign29/activ/issues/1007",
+                "peux tu faire ce ticket stp https://github.com/example/repo/issues/1007",
             )]),
             updates(&[(2, OPERATOR, "/approve fixture-job")]),
             updates(&[]),
@@ -1822,7 +1826,7 @@ fn explicit_ticket_request_waits_for_an_admin_confirmation_before_work() {
     assert_eq!(dispatched.len(), 1);
     assert_eq!(
         dispatched[0].0,
-        "https://github.com/webdesign29/activ/issues/1007"
+        "https://github.com/example/repo/issues/1007"
     );
     assert_eq!(dispatched[0].1, "telegram:123456:update:1");
 
@@ -1836,7 +1840,7 @@ fn explicit_ticket_request_waits_for_an_admin_confirmation_before_work() {
     assert_eq!(
         actions.confirmations(),
         [(
-            String::from("https://github.com/webdesign29/activ/issues/1007"),
+            String::from("https://github.com/example/repo/issues/1007"),
             String::from("telegram:123456:update:1")
         )]
     );
@@ -2681,13 +2685,13 @@ fn a_member_may_read_a_channel_and_only_an_administrator_may_post_to_one() {
 #[test]
 fn slack_list_and_contextual_usage_make_the_read_post_boundary_clear() {
     let fixture = Fixture::new(&[]);
-    let slack = FakeSlack::posting("Posted to #jean (ts 1723542000.000100).")
-        .with_channels(&["jean", "deploiements"]);
+    let slack = FakeSlack::posting("Posted to #ops (ts 1723542000.000100).")
+        .with_channels(&["ops", "deploiements"]);
     let client = FakeClient::new([updates(&[
         (1, OPERATOR, "/slack list"),
-        (2, OPERATOR, "/say jean yo"),
-        (3, OPERATOR, "/say jean"),
-        (4, OPERATOR, "/slack <jean> \"yo\""),
+        (2, OPERATOR, "/say ops yo"),
+        (3, OPERATOR, "/say ops"),
+        (4, OPERATOR, "/slack <ops> \"yo\""),
     ])]);
     let outbound = FakeOutbound::default();
     let mut bridge = bridge_with_slack(
@@ -2707,17 +2711,17 @@ fn slack_list_and_contextual_usage_make_the_read_post_boundary_clear() {
     assert_eq!(report.slack_posted, 1);
     assert_eq!(
         slack.posts(),
-        vec![(String::from("jean"), String::from("yo"))],
+        vec![(String::from("ops"), String::from("yo"))],
         "the exact reported /say form posts its message"
     );
 
     let messages = outbound.messages();
-    assert!(messages[0].contains("Slack channels:\\n• jean\\n• deploiements"));
-    assert!(messages[0].contains("Read: /slack jean"));
-    assert!(messages[0].contains("Post: /say jean <message> [admin]"));
-    assert!(messages[1].contains("Posted to #jean"));
+    assert!(messages[0].contains("Slack channels:\\n• ops\\n• deploiements"));
+    assert!(messages[0].contains("Read: /slack ops"));
+    assert!(messages[0].contains("Post: /say ops <message> [admin]"));
+    assert!(messages[1].contains("Posted to #ops"));
     assert!(messages[2].contains("Missing the message to post."));
-    assert!(messages[2].contains("Example: /say jean yo"));
+    assert!(messages[2].contains("Example: /say ops yo"));
     assert!(messages[3].contains("/slack reads one channel"));
     assert!(messages[3].contains("Post: /say <channel> <message>"));
     assert!(messages[3].contains("Do not type the < > placeholders."));
@@ -4291,7 +4295,7 @@ fn durable_memory_survives_reopen_redacts_secrets_and_resets_only_conversation_h
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
         .expect("private memory root");
     let path = root.path().join("agent-memory.sqlite3");
-    let mut memory = StoreMemorySurface::open(&path, BOT_ID).expect("memory surface");
+    let mut memory = StoreMemorySurface::open(&path, BOT_ID, "primary").expect("memory surface");
 
     memory
         .capture_user(
@@ -4335,7 +4339,7 @@ fn durable_memory_survives_reopen_redacts_secrets_and_resets_only_conversation_h
         .expect("secret-bearing turn captured safely");
     drop(memory);
 
-    let mut memory = StoreMemorySurface::open(&path, BOT_ID).expect("memory reopens");
+    let mut memory = StoreMemorySurface::open(&path, BOT_ID, "primary").expect("memory reopens");
     let context = memory
         .context(OPERATOR, OPERATOR, "what do I prefer?", NOW_MS + 4)
         .expect("context");
@@ -4358,7 +4362,7 @@ fn durable_memory_survives_reopen_redacts_secrets_and_resets_only_conversation_h
     let mut store = AgentMemoryStore::open(&path).expect("canonical store");
     let edit = store
         .record_memory(&MemoryInput {
-            tenant: "inklura",
+            tenant: "primary",
             actor: &format!("telegram:{OPERATOR}"),
             scope: &format!("user:telegram:{OPERATOR}"),
             kind: MemoryKind::UserProfile,
@@ -4376,7 +4380,7 @@ fn durable_memory_survives_reopen_redacts_secrets_and_resets_only_conversation_h
         })
         .expect("Obsidian proposal");
     drop(store);
-    let mut memory = StoreMemorySurface::open(&path, BOT_ID).expect("surface reopens");
+    let mut memory = StoreMemorySurface::open(&path, BOT_ID, "primary").expect("surface reopens");
     memory
         .render(
             OPERATOR,
@@ -4392,7 +4396,7 @@ fn durable_memory_survives_reopen_redacts_secrets_and_resets_only_conversation_h
     let store = AgentMemoryStore::open(&path).expect("store reopens");
     assert_eq!(
         store
-            .item("inklura", &format!("telegram:{OPERATOR}"), 1)
+            .item("primary", &format!("telegram:{OPERATOR}"), 1)
             .expect("source")
             .expect("source exists")
             .status,
@@ -4400,7 +4404,7 @@ fn durable_memory_survives_reopen_redacts_secrets_and_resets_only_conversation_h
     );
     assert_eq!(
         store
-            .item("inklura", &format!("telegram:{OPERATOR}"), edit.id)
+            .item("primary", &format!("telegram:{OPERATOR}"), edit.id)
             .expect("replacement")
             .expect("replacement exists")
             .status,

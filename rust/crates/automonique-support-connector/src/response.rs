@@ -150,7 +150,7 @@ pub struct SupportDelivery {
     pub duplicate: bool,
 }
 
-/// Closed Jean job states exposed to Automonique.
+/// Closed backend job states exposed to Automonique.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TicketJobStatus {
     PendingApproval,
@@ -1116,12 +1116,12 @@ mod tests {
 
     #[test]
     fn ticket_dispatch_receipt_is_strict_and_typed() {
-        let bytes = br#"{"ok":true,"receipt":{"issue_id":"issue-1","issue_url":"https://github.com/webdesign29/activ/issues/1007","issue_title":"List prism sites","project_id":"ignored","project_label":"Bext platform","site_label":"bext","workspace":"site_profile","job_id":"job-1","job_status":"pending","duplicate":false,"approved":true}}"#;
+        let bytes = br#"{"ok":true,"receipt":{"issue_id":"issue-1","issue_url":"https://github.com/example/repo/issues/1007","issue_title":"List prism sites","project_id":"ignored","project_label":"Bext platform","site_label":"bext","workspace":"site_profile","job_id":"job-1","job_status":"pending","duplicate":false,"approved":true}}"#;
         assert_eq!(
             decode_ticket_dispatch(bytes).expect("decode"),
             FleetOutcome::Accepted(TicketDispatchReceipt {
                 issue_id: String::from("issue-1"),
-                issue_url: String::from("https://github.com/webdesign29/activ/issues/1007"),
+                issue_url: String::from("https://github.com/example/repo/issues/1007"),
                 issue_title: String::from("List prism sites"),
                 project_label: String::from("Bext platform"),
                 site_label: Some(String::from("bext")),
@@ -1138,7 +1138,7 @@ mod tests {
 
     #[test]
     fn ticket_status_keeps_multiline_results_but_refuses_unknown_states() {
-        let bytes = br#"{"ok":true,"status":{"issue_id":"issue-1","issue_url":"https://github.com/webdesign29/activ/issues/1007","issue_title":"List prism sites","job_id":"job-1","job_status":"done","result":"Implemented\nVerified live","created_at":"2026-08-14T20:00:00Z","updated_at":"2026-08-14T20:01:00Z"}}"#;
+        let bytes = br#"{"ok":true,"status":{"issue_id":"issue-1","issue_url":"https://github.com/example/repo/issues/1007","issue_title":"List prism sites","job_id":"job-1","job_status":"done","result":"Implemented\nVerified live","created_at":"2026-08-14T20:00:00Z","updated_at":"2026-08-14T20:01:00Z"}}"#;
         let outcome = decode_ticket_status(bytes).expect("decode");
         let status = outcome.accepted().expect("accepted");
         assert_eq!(status.job_status, TicketJobStatus::Done);

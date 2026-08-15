@@ -8,6 +8,7 @@ use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use automonique_protocol::compat::legacy_spelling;
 use automonique_store::agent_memory::{
     AgentMemoryStore, DEFAULT_RAW_RETENTION_MS, ExternalIdentity, MemoryInput, MemoryKind,
     MemorySensitivity, MemoryStatus, MemoryVisibility, MessageInput, WriteDisposition,
@@ -72,14 +73,14 @@ fn run() -> Result<(), String> {
             }
             backfill_telegram(&mut store, &tenant, &actor, &source, bot_id)?;
         }
-        "backfill-jean" => {
+        "backfill-legacy" => {
             let source = PathBuf::from(arguments.next().ok_or_else(usage)?);
             let telegram_user = arguments.next().ok_or_else(usage)?;
             let slack_user = arguments.next().ok_or_else(usage)?;
             if arguments.next().is_some() {
                 return Err(usage());
             }
-            backfill_jean(
+            backfill_legacy(
                 &mut store,
                 &tenant,
                 &actor,
@@ -156,11 +157,17 @@ fn run() -> Result<(), String> {
 
 fn usage() -> String {
     String::from(
-        "usage: automonique-memory <summary|export-obsidian|propose-obsidian|backfill-telegram|backfill-jean|hygiene|link-identity|remember-active> <database> <tenant> <actor> [command arguments]",
+        "usage: automonique-memory <summary|export-obsidian|propose-obsidian|backfill-telegram|backfill-legacy|hygiene|link-identity|remember-active> <database> <tenant> <actor> [command arguments]",
     )
 }
 
-fn backfill_jean(
+/// Import the predecessor's chat history into the durable memory store.
+///
+/// The source schema and the durable keys written here are the predecessor's
+/// spellings, declared once in
+/// [`automonique_protocol::compat::legacy_spelling`] and named from there so
+/// that re-running this verb still recognises what a previous run recorded.
+fn backfill_legacy(
     store: &mut AgentMemoryStore,
     tenant: &str,
     actor: &str,
@@ -173,37 +180,39 @@ fn backfill_jean(
         || slack_user.is_empty()
         || !slack_user.bytes().all(|byte| byte.is_ascii_alphanumeric())
     {
-        return Err(String::from("immutable Jean identities are invalid"));
+        return Err(String::from("immutable legacy identities are invalid"));
     }
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
     let source = Connection::open_with_flags(source, flags)
-        .map_err(|_| String::from("source Jean database is unavailable"))?;
+        .map_err(|_| String::from("source legacy database is unavailable"))?;
     let now = now_ms()?;
     let threshold = now
         .checked_sub(DEFAULT_RAW_RETENTION_MS)
         .ok_or_else(|| String::from("retention threshold is outside supported range"))?;
     let mut event_statement = source
-        .prepare(
-            "SELECT messageTs FROM jean_slack_events
+        .prepare(&format!(
+            "SELECT messageTs FROM {}
              WHERE author=?1 AND messageTs IS NOT NULL AND at>=?2",
-        )
-        .map_err(|_| String::from("source Jean event schema is unavailable"))?;
+            legacy_spelling::SLACK_EVENTS_TABLE,
+        ))
+        .map_err(|_| String::from("source legacy event schema is unavailable"))?;
     let eligible_threads = event_statement
         .query_map(params![slack_user, threshold], |row| {
             row.get::<_, String>(0)
         })
-        .map_err(|_| String::from("source Jean events are unreadable"))?
+        .map_err(|_| String::from("source legacy events are unreadable"))?
         .collect::<Result<BTreeSet<_>, _>>()
-        .map_err(|_| String::from("source Jean event row is corrupt"))?;
+        .map_err(|_| String::from("source legacy event row is corrupt"))?;
     let mut statement = source
-        .prepare(
-            "SELECT id,scope,role,content,at FROM jean_chat_messages
+        .prepare(&format!(
+            "SELECT id,scope,role,content,at FROM {}
              WHERE at>=?1 ORDER BY at,id",
-        )
-        .map_err(|_| String::from("source Jean chat schema is unavailable"))?;
+            legacy_spelling::CHAT_MESSAGES_TABLE,
+        ))
+        .map_err(|_| String::from("source legacy chat schema is unavailable"))?;
     let rows = statement
         .query_map([threshold], |row| {
             Ok((
@@ -214,7 +223,7 @@ fn backfill_jean(
                 row.get::<_, i64>(4)?,
             ))
         })
-        .map_err(|_| String::from("source Jean history is unreadable"))?;
+        .map_err(|_| String::from("source legacy history is unreadable"))?;
     let telegram_suffix = format!(":telegram-user:{telegram_user}");
     let legacy_suffix = format!(":{slack_user}");
     let mut recorded = 0_usize;
@@ -222,7 +231,7 @@ fn backfill_jean(
     let mut skipped = 0_usize;
     for row in rows {
         let (id, scope, role, content, at_ms) =
-            row.map_err(|_| String::from("source Jean chat row is corrupt"))?;
+            row.map_err(|_| String::from("source legacy chat row is corrupt"))?;
         let transport = if scope.starts_with("telegram:") && scope.ends_with(&telegram_suffix) {
             "telegram"
         } else if let Some(rest) = scope.strip_prefix("slack:") {
@@ -246,8 +255,8 @@ fn backfill_jean(
             continue;
         }
         let content = redact_content(&content);
-        let conversation_id = format!("jean:{scope}");
-        let transport_key = format!("jean-chat:{id}");
+        let conversation_id = format!("{}{scope}", legacy_spelling::CHAT_CONVERSATION_PREFIX);
+        let transport_key = format!("{}{id}", legacy_spelling::CHAT_TRANSPORT_KEY_PREFIX);
         match store
             .record_message(&MessageInput {
                 tenant,

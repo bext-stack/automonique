@@ -32,6 +32,43 @@ pub use generated::{CanonicalName, LegacyName};
 /// Maximum UTF-8 byte length of a registry field.
 pub const MAX_COMPAT_FIELD_BYTES: usize = 256;
 
+/// The predecessor's spellings that shipped surfaces must keep writing exactly.
+///
+/// These are not aliases the registry can retire. Each one is already the key
+/// of durable state that exists outside this repository — an idempotency key
+/// the support fleet deduplicates on, a table in the predecessor's database,
+/// the prefix of rows a previous backfill wrote into the memory store — so
+/// changing a byte does not rename anything, it addresses something else.
+/// Re-sending delivered email and re-importing an entire chat history are the
+/// two failures that would follow.
+///
+/// They live here for the same reason the registry does: this module is one of
+/// the sanctioned homes for a legacy spelling
+/// (`plan/gates.md#gate-scrub`, enforced by
+/// `plan/check.py::check_legacy_identifier_location`), so a surface that must
+/// keep the bytes can name a constant instead of repeating the spelling. The
+/// wire contract is unchanged; only where it is written down moved.
+pub mod legacy_spelling {
+    /// Prefix of the idempotency key carried by one outbound support email.
+    ///
+    /// The fleet reports a repeated `action_id` as `duplicate` rather than
+    /// sending a second message, so this prefix is the only thing standing
+    /// between a re-poll and a customer receiving the same mail twice.
+    pub const SUPPORT_EMAIL_ACTION_PREFIX: &str = "jean-email:";
+
+    /// Table of chat messages in the predecessor's SQLite database.
+    pub const CHAT_MESSAGES_TABLE: &str = "jean_chat_messages";
+
+    /// Table of Slack events in the predecessor's SQLite database.
+    pub const SLACK_EVENTS_TABLE: &str = "jean_slack_events";
+
+    /// Prefix of the conversation identifier a backfilled message is filed under.
+    pub const CHAT_CONVERSATION_PREFIX: &str = "jean:";
+
+    /// Prefix of the transport key that makes a backfilled message idempotent.
+    pub const CHAT_TRANSPORT_KEY_PREFIX: &str = "jean-chat:";
+}
+
 /// What kind of identifier an entry names.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum IdentifierClass {

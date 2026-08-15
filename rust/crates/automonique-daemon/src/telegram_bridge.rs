@@ -15,7 +15,7 @@
 //! # Explicit effects are typed and separately routed
 //!
 //! `/say` posts to a Slack channel. An explicit natural-language ticket request
-//! can also create a durable Manage/Jean job. Neither path is model-selected:
+//! can also create a durable Manage job. Neither path is model-selected:
 //! the former is a closed command and configured channel label; the latter
 //! requires an administrator, one action phrase, and one canonical GitHub issue
 //! URL. Three things follow and are worth stating together:
@@ -155,7 +155,6 @@ use crate::improvements::{
     ImprovementCoordinator, ImprovementIntent, ImprovementPlan, PreparedRenderedPlan,
 };
 
-const MEMORY_TENANT: &str = "inklura";
 const MEMORY_RECENT_LIMIT: usize = 8;
 const MEMORY_REVIEW_AFTER_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
 
@@ -244,7 +243,7 @@ pub const QUESTION_WORKER_UNAVAILABLE: &str =
 /// Most ticket execution requests accepted at once.
 pub const MAX_PENDING_TICKET_ACTIONS: usize = 4;
 
-/// How often the ticket worker asks Manage for a changed Jean job state.
+/// How often the ticket worker asks Manage for a changed job state.
 const TICKET_STATUS_POLL: Duration = Duration::from_secs(3);
 
 /// Fixed refusal while the bounded ticket-action queue is occupied.
@@ -1209,15 +1208,27 @@ pub trait MemorySurface {
 pub struct StoreMemorySurface {
     store: AgentMemoryStore,
     bot_id: i64,
+    tenant: String,
     last_prune_at_ms: i64,
 }
 
 impl StoreMemorySurface {
-    pub fn open(path: &Path, bot_id: i64) -> Result<Self, String> {
+    /// Open the durable memory this bot reads and writes.
+    ///
+    /// The tenant is part of every key, so it is supplied by the caller from
+    /// [`crate::memory_config::MemoryConfig`] rather than compiled in. A
+    /// deployment that configured none gets
+    /// [`crate::memory_config::DEFAULT_MEMORY_TENANT`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `memory_store_unavailable` when the database cannot be opened.
+    pub fn open(path: &Path, bot_id: i64, tenant: &str) -> Result<Self, String> {
         AgentMemoryStore::open(path)
             .map(|store| Self {
                 store,
                 bot_id,
+                tenant: tenant.to_owned(),
                 last_prune_at_ms: 0,
             })
             .map_err(|_| String::from("memory_store_unavailable"))
@@ -1244,7 +1255,7 @@ impl StoreMemorySurface {
         let actor = Self::actor(actor_id);
         self.store
             .bind_identity(
-                MEMORY_TENANT,
+                &self.tenant,
                 &actor,
                 ExternalIdentity {
                     platform: "telegram",
@@ -1262,7 +1273,7 @@ impl StoreMemorySurface {
         let scope = Self::external_scope(chat_id);
         if let Some(conversation) = self
             .store
-            .current_conversation(MEMORY_TENANT, actor, "telegram", &scope)
+            .current_conversation(&self.tenant, actor, "telegram", &scope)
             .map_err(|_| String::from("memory_conversation_unavailable"))?
         {
             return Ok(conversation);
@@ -1270,7 +1281,7 @@ impl StoreMemorySurface {
         let conversation = format!("telegram:{chat_id}:{at_ms}");
         self.store
             .start_conversation(
-                MEMORY_TENANT,
+                &self.tenant,
                 actor,
                 "telegram",
                 &scope,
@@ -1317,7 +1328,7 @@ impl StoreMemorySurface {
         at_ms: i64,
     ) -> Result<MemoryRecord, AgentMemoryError> {
         let changed = self.store.activate(
-            MEMORY_TENANT,
+            &self.tenant,
             actor,
             current.id,
             current.revision,
@@ -1325,11 +1336,11 @@ impl StoreMemorySurface {
             at_ms,
         )?;
         if let Some(source_id) = obsidian_source_memory_id(&current.source_key)
-            && let Some(source) = self.store.item(MEMORY_TENANT, actor, source_id)?
+            && let Some(source) = self.store.item(&self.tenant, actor, source_id)?
             && source.status == MemoryStatus::Active
         {
             self.store.supersede(
-                MEMORY_TENANT,
+                &self.tenant,
                 actor,
                 MemorySupersession {
                     old_id: source.id,
@@ -1361,7 +1372,7 @@ impl MemorySurface for StoreMemorySurface {
         let content = redact_content(text);
         self.store
             .record_message(&MessageInput {
-                tenant: MEMORY_TENANT,
+                tenant: &self.tenant,
                 actor: &actor,
                 conversation_id: &conversation,
                 transport: "telegram",
@@ -1376,7 +1387,7 @@ impl MemorySurface for StoreMemorySurface {
             let fact = redact_content(fact);
             self.store
                 .record_memory(&MemoryInput {
-                    tenant: MEMORY_TENANT,
+                    tenant: &self.tenant,
                     actor: &actor,
                     scope: &format!("user:{actor}"),
                     kind,
@@ -1410,7 +1421,7 @@ impl MemorySurface for StoreMemorySurface {
         let content = redact_content(text);
         self.store
             .record_message(&MessageInput {
-                tenant: MEMORY_TENANT,
+                tenant: &self.tenant,
                 actor: &actor,
                 conversation_id: &conversation,
                 transport: "telegram",
@@ -1434,7 +1445,7 @@ impl MemorySurface for StoreMemorySurface {
         let actor = self.bind(actor_id, at_ms)?;
         let key = telegram_outbound_message_key(self.bot_id, chat_id, message_id);
         self.store
-            .message_by_transport_key(MEMORY_TENANT, &actor, "telegram", &key, at_ms)
+            .message_by_transport_key(&self.tenant, &actor, "telegram", &key, at_ms)
             .map(|message| {
                 message
                     .filter(|message| message.role == "assistant")
@@ -1456,11 +1467,11 @@ impl MemorySurface for StoreMemorySurface {
             MemoryDirective::Summary => {
                 let counts = self
                     .store
-                    .counts(MEMORY_TENANT, &actor)
+                    .counts(&self.tenant, &actor)
                     .map_err(|_| String::from("memory_read_unavailable"))?;
                 let recent = self
                     .store
-                    .recent(MEMORY_TENANT, &actor, at_ms, MEMORY_RECENT_LIMIT)
+                    .recent(&self.tenant, &actor, at_ms, MEMORY_RECENT_LIMIT)
                     .map_err(|_| String::from("memory_read_unavailable"))?;
                 let mut text = format!(
                     "🧠 Monique memory\n{} active · {} proposals · {} conversation messages retained",
@@ -1481,7 +1492,7 @@ impl MemorySurface for StoreMemorySurface {
                 let matches = self
                     .store
                     .search(
-                        MEMORY_TENANT,
+                        &self.tenant,
                         &actor,
                         query.as_str(),
                         at_ms,
@@ -1502,7 +1513,7 @@ impl MemorySurface for StoreMemorySurface {
                 let id = Self::memory_id(memory_ref.as_str())?;
                 let memory = self
                     .store
-                    .item(MEMORY_TENANT, &actor, id)
+                    .item(&self.tenant, &actor, id)
                     .map_err(|_| String::from("memory_read_unavailable"))?
                     .ok_or_else(|| String::from("memory_not_found"))?;
                 Ok(Self::format_memory(&memory, true))
@@ -1510,7 +1521,7 @@ impl MemorySurface for StoreMemorySurface {
             MemoryDirective::Proposals => {
                 let proposals = self
                     .store
-                    .proposals(MEMORY_TENANT, &actor, MEMORY_RECENT_LIMIT)
+                    .proposals(&self.tenant, &actor, MEMORY_RECENT_LIMIT)
                     .map_err(|_| String::from("memory_read_unavailable"))?;
                 if proposals.is_empty() {
                     return Ok(String::from("No memory proposals are waiting for review."));
@@ -1526,14 +1537,14 @@ impl MemorySurface for StoreMemorySurface {
                 let id = Self::memory_id(memory_ref.as_str())?;
                 let current = self
                     .store
-                    .item(MEMORY_TENANT, &actor, id)
+                    .item(&self.tenant, &actor, id)
                     .map_err(|_| String::from("memory_read_unavailable"))?
                     .ok_or_else(|| String::from("memory_not_found"))?;
                 let changed = if matches!(directive, MemoryDirective::Approve { .. }) {
                     self.approve_memory(&actor, &current, at_ms)
                 } else {
                     self.store.deny(
-                        MEMORY_TENANT,
+                        &self.tenant,
                         &actor,
                         id,
                         current.revision,
@@ -1562,7 +1573,7 @@ impl MemorySurface for StoreMemorySurface {
         let memory = self
             .store
             .record_memory(&MemoryInput {
-                tenant: MEMORY_TENANT,
+                tenant: &self.tenant,
                 actor: &actor,
                 scope: &format!("user:{actor}"),
                 kind: MemoryKind::UserProfile,
@@ -1592,13 +1603,13 @@ impl MemorySurface for StoreMemorySurface {
         let id = Self::memory_id(memory_ref)?;
         let current = self
             .store
-            .item(MEMORY_TENANT, &actor, id)
+            .item(&self.tenant, &actor, id)
             .map_err(|_| String::from("memory_read_unavailable"))?
             .ok_or_else(|| String::from("memory_not_found"))?;
         let forgotten = self
             .store
             .forget(
-                MEMORY_TENANT,
+                &self.tenant,
                 &actor,
                 id,
                 current.revision,
@@ -1623,7 +1634,7 @@ impl MemorySurface for StoreMemorySurface {
         let revision = self
             .store
             .start_conversation(
-                MEMORY_TENANT,
+                &self.tenant,
                 &actor,
                 "telegram",
                 &Self::external_scope(chat_id),
@@ -1647,17 +1658,17 @@ impl MemorySurface for StoreMemorySurface {
         let conversation = self.conversation(&actor, chat_id, at_ms)?;
         let messages = self
             .store
-            .recent_messages(MEMORY_TENANT, &actor, &conversation, at_ms, 12)
+            .recent_messages(&self.tenant, &actor, &conversation, at_ms, 12)
             .map_err(|_| String::from("memory_conversation_unavailable"))?;
         let matches =
             match self
                 .store
-                .search(MEMORY_TENANT, &actor, query, at_ms, MEMORY_RECENT_LIMIT)
+                .search(&self.tenant, &actor, query, at_ms, MEMORY_RECENT_LIMIT)
             {
                 Ok(matches) => matches,
                 Err(_) => self
                     .store
-                    .recent(MEMORY_TENANT, &actor, at_ms, 3)
+                    .recent(&self.tenant, &actor, at_ms, 3)
                     .map_err(|_| String::from("memory_search_unavailable"))?,
             };
         let mut context = String::new();
@@ -2308,7 +2319,7 @@ impl TicketActionWorker {
                                             }).is_ok());
                                         if !registered {
                                             text = String::from(
-                                                "The ticket is pending in Manage, but Jean could not retain its cross-channel confirmation coordinates. Confirm it in Manage; no work has been released.",
+                                                "The ticket is pending in Manage, but Monique could not retain its cross-channel confirmation coordinates. Confirm it in Manage; no work has been released.",
                                             );
                                         }
                                     }
@@ -2371,7 +2382,7 @@ impl TicketActionWorker {
                                             }
                                             (
                                                 format!(
-                                                    "✅ Ticket confirmed. Jean job {} is {}.",
+                                                    "✅ Ticket confirmed. Monique job {} is {}.",
                                                     short_job_id(&receipt.job_id),
                                                     receipt.job_status.as_str()
                                                 ),
@@ -2386,7 +2397,7 @@ impl TicketActionWorker {
                                     }
                                 }
                                 _ => (
-                                    String::from("That reference matches more than one pending ticket; use the full Jean job id."),
+                                    String::from("That reference matches more than one pending ticket; use the full Monique job id."),
                                     false,
                                 ),
                             };
@@ -2444,7 +2455,7 @@ impl TicketActionWorker {
                                         chat_id: monitor.chat_id,
                                         message_id: Some(monitor.message_id),
                                         text: format!(
-                                            "I can no longer monitor Jean job {} from Telegram. The durable job remains in Manage and can be checked there.",
+                                            "I can no longer monitor Monique job {} from Telegram. The durable job remains in Manage and can be checked there.",
                                             short_job_id(&monitor.job_id)
                                         ),
                                         initial: false,
@@ -2533,7 +2544,7 @@ fn ticket_dispatch_text(receipt: &TicketDispatchReceipt) -> String {
     };
     if receipt.approved {
         format!(
-            "🎫 Ticket accepted by Manage\n{}\n{}\nProject: {}{}\nWorkspace: {}\nJean job {} · {}{}\nI’ll report status changes in this chat.",
+            "🎫 Ticket accepted by Manage\n{}\n{}\nProject: {}{}\nWorkspace: {}\nMonique job {} · {}{}\nI’ll report status changes in this chat.",
             receipt.issue_title,
             receipt.issue_url,
             receipt.project_label,
@@ -2545,7 +2556,7 @@ fn ticket_dispatch_text(receipt: &TicketDispatchReceipt) -> String {
         )
     } else {
         format!(
-            "🔐 Ticket confirmation requested\n{}\n{}\nProject: {}{}\nWorkspace: {}\nJean job {} · {}{}\nAn administrator can confirm it with /approve {} or in Manage. No work starts before confirmation.",
+            "🔐 Ticket confirmation requested\n{}\n{}\nProject: {}{}\nWorkspace: {}\nMonique job {} · {}{}\nAn administrator can confirm it with /approve {} or in Manage. No work starts before confirmation.",
             receipt.issue_title,
             receipt.issue_url,
             receipt.project_label,
@@ -2565,14 +2576,14 @@ fn ticket_status_text(status: &TicketStatus) -> String {
             let result = status.result.trim();
             if result.is_empty() {
                 format!(
-                    "✅ Ticket work finished\n{}\n{}\nJean job {}",
+                    "✅ Ticket work finished\n{}\n{}\nMonique job {}",
                     status.issue_title,
                     status.issue_url,
                     short_job_id(&status.job_id)
                 )
             } else {
                 format!(
-                    "✅ Ticket work finished\n{}\n{}\n{}\nJean job {}",
+                    "✅ Ticket work finished\n{}\n{}\n{}\nMonique job {}",
                     status.issue_title,
                     status.issue_url,
                     result,
@@ -2581,20 +2592,20 @@ fn ticket_status_text(status: &TicketStatus) -> String {
             }
         }
         TicketJobStatus::Failed => format!(
-            "❌ Ticket work failed\n{}\n{}\n{}\nJean job {}",
+            "❌ Ticket work failed\n{}\n{}\n{}\nMonique job {}",
             status.issue_title,
             status.issue_url,
             status.result.trim(),
             short_job_id(&status.job_id)
         ),
         TicketJobStatus::Cancelled => format!(
-            "⛔ Ticket work was cancelled\n{}\n{}\nJean job {}",
+            "⛔ Ticket work was cancelled\n{}\n{}\nMonique job {}",
             status.issue_title,
             status.issue_url,
             short_job_id(&status.job_id)
         ),
         state => format!(
-            "🔄 Ticket work is now {}\n{}\nJean job {}",
+            "🔄 Ticket work is now {}\n{}\nMonique job {}",
             state.as_str(),
             status.issue_url,
             short_job_id(&status.job_id)
@@ -2605,7 +2616,7 @@ fn ticket_status_text(status: &TicketStatus) -> String {
 fn ticket_dispatch_refusal(reason: &str) -> String {
     if reason.contains("issue_closed") {
         return String::from(
-            "That GitHub issue is already closed or completed, so no duplicate Jean job was started.",
+            "That GitHub issue is already closed or completed, so no duplicate Monique job was started.",
         );
     }
     if reason.contains("project_missing") || reason.contains("project_ambiguous") {
@@ -3344,7 +3355,7 @@ where
             .insert(key, (self.memory_sequence, answer));
     }
 
-    /// Deliver ticket-dispatch receipts and changed Jean job states.
+    /// Deliver ticket-dispatch receipts and changed job states.
     fn settle_ticket_completions(&mut self, cancellation: &CancellationToken) -> DispatchReport {
         let mut report = DispatchReport::default();
         while let Some(completion) = self.ticket_actions.take_completion() {
@@ -6849,10 +6860,20 @@ fn explicit_email_intent(text: &str) -> Result<Option<EmailIntent>, &'static str
     }))
 }
 
+/// The idempotency key one outbound support email is deduplicated on.
+///
+/// The prefix is the predecessor's, and it stays the predecessor's: the fleet
+/// reports a repeated `action_id` as `duplicate` instead of sending a second
+/// message, so a changed byte here would re-send every email this host has
+/// already delivered. It is declared once, in
+/// [`automonique_protocol::compat::legacy_spelling`], which is a sanctioned
+/// home for a legacy spelling; naming the constant is what lets the spelling
+/// leave this module without changing the wire contract.
 fn email_action_id(source_key: &str) -> String {
     let hex = Sha256::digest(source_key.as_bytes()).to_hex();
     format!(
-        "jean-email:{}-{}-{}-{}-{}",
+        "{}{}-{}-{}-{}-{}",
+        automonique_protocol::compat::legacy_spelling::SUPPORT_EMAIL_ACTION_PREFIX,
         &hex[0..8],
         &hex[8..12],
         &hex[12..16],
@@ -7246,7 +7267,7 @@ pub struct StoreControlSurface {
     tickets: TicketReads,
     members: MemberRoster,
     prism_sites_root: Option<PathBuf>,
-    manage_profiles_attached: bool,
+    manage_profile_app: Option<crate::manage_config::ManageProfileApp>,
     provider_state_dir: Option<PathBuf>,
     facts: HostFacts,
 }
@@ -7310,7 +7331,7 @@ impl StoreControlSurface {
             tickets: TicketReads::Detached,
             members: MemberRoster::Detached,
             prism_sites_root: None,
-            manage_profiles_attached: false,
+            manage_profile_app: None,
             provider_state_dir: None,
             facts,
         })
@@ -7349,9 +7370,16 @@ impl StoreControlSurface {
     }
 
     /// Attach Manage's fixed loopback, path-free site-profile projection.
+    ///
+    /// The app identity comes from the deployment's Manage configuration, so a
+    /// host that configured none never attaches this source and answers every
+    /// site-profile question with the not-attached refusal.
     #[must_use]
-    pub const fn with_manage_profiles(mut self) -> Self {
-        self.manage_profiles_attached = true;
+    pub fn with_manage_profiles(
+        mut self,
+        profile_app: crate::manage_config::ManageProfileApp,
+    ) -> Self {
+        self.manage_profile_app = Some(profile_app);
         self
     }
 
@@ -7814,8 +7842,10 @@ impl ControlSurface for StoreControlSurface {
             ),
             None => String::from("status=not_requested"),
         };
-        let manage_profiles = if sources.sites && self.manage_profiles_attached {
-            match crate::site_inventory::manage_profiles(question) {
+        let manage_profiles = if let (true, Some(profile_app)) =
+            (sources.sites, self.manage_profile_app.as_ref())
+        {
+            match crate::site_inventory::manage_profiles(question, profile_app) {
                 Ok(inventory) => {
                     let mut rendered = format!(
                         "source=Manage siteprofiles:all path-free read model\nstatus=available\nauthority_note=profiles identify deployed applications and business context; they do not independently prove legal server ownership or operator responsibility\nprofile_count={}\necosystem_count={}\nmanaged_count={}\ncompany_manager_count={}\nincluded={}\nomitted={}",

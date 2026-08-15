@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Typed client for the Inklura Support fleet API.
+//! Typed client for the Support backend's fleet API.
 //!
 //! One product surface is reachable here: the support board behind the fleet
 //! endpoint `POST <base>/api/manage/shelldeck/fleet`. Seven actions are spelled,

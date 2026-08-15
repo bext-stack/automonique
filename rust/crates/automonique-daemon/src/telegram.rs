@@ -92,6 +92,7 @@
 //! module cannot zero, which is the same limit the validate-and-drop path
 //! already had. Nothing in this crate renders, logs or replies with it.
 
+use crate::manage_config::ManageConfig;
 use crate::run_lane::SocketRunLane;
 use crate::telegram_bridge::{
     BridgeParts, HostFacts, OperatorRoster, StoreControlSurface, TelegramControlBridge,
@@ -677,6 +678,10 @@ impl TelegramHost {
         slack: crate::slack::SlackHost,
         ticket_gates: Arc<Mutex<crate::telegram_bridge::TicketGateRegistry>>,
     ) -> Result<LiveBridge, TelegramHostError> {
+        let manage =
+            ManageConfig::load(params.state_dir).map_err(TelegramHostError::ManageConfig)?;
+        let memory_tenant = crate::memory_config::MemoryConfig::tenant_or_default(params.state_dir)
+            .map_err(TelegramHostError::MemoryConfig)?;
         let surface = StoreControlSurface::open(
             params.database_path,
             params.run_index_path,
@@ -692,8 +697,11 @@ impl TelegramHost {
         .with_support_tickets(params.support_tickets_path)
         .with_operator_members(params.operator_members_path)
         .with_prism_sites(Path::new(crate::site_inventory::NGINX_SITES_ENABLED))
-        .with_manage_profiles()
         .with_provider_state(params.state_dir);
+        let surface = match manage.as_ref().and_then(ManageConfig::profile_app) {
+            Some(profile_app) => surface.with_manage_profiles(profile_app.clone()),
+            None => surface,
+        };
         let poller_store =
             Store::open(params.database_path).map_err(|_| TelegramHostError::StoreUnavailable)?;
         // The lane opens successfully on a deployment that has not configured
@@ -767,6 +775,7 @@ impl TelegramHost {
                     crate::telegram_bridge::StoreMemorySurface::open(
                         &params.state_dir.join("agent-memory.sqlite3"),
                         bot_id,
+                        &memory_tenant,
                     )
                     .map_err(|_| TelegramHostError::SurfaceUnavailable)?,
                 )),
@@ -940,6 +949,10 @@ pub(crate) enum TelegramHostError {
     Config(TelegramConfigError),
     /// A present GitHub read configuration was refused.
     GitHubConfig(crate::github::GitHubConfigError),
+    /// A present Manage configuration was refused.
+    ManageConfig(crate::manage_config::ManageConfigError),
+    /// A present memory configuration was refused.
+    MemoryConfig(crate::memory_config::MemoryConfigError),
     /// The second store connection could not be opened.
     StoreUnavailable,
     /// The poller's read surface could not open its own durable handles.
@@ -955,6 +968,8 @@ impl fmt::Display for TelegramHostError {
         match self {
             Self::Config(error) => write!(formatter, "telegram configuration refused: {error}"),
             Self::GitHubConfig(error) => write!(formatter, "{error}"),
+            Self::ManageConfig(error) => write!(formatter, "{error}"),
+            Self::MemoryConfig(error) => write!(formatter, "{error}"),
             Self::StoreUnavailable => {
                 formatter.write_str("telegram lease store connection unavailable")
             }
@@ -983,6 +998,8 @@ impl TelegramHostError {
             Self::Config(TelegramConfigError::AllowlistInvalid) => "telegram_config_allowlist",
             Self::Config(TelegramConfigError::AdminlistInvalid) => "telegram_config_adminlist",
             Self::GitHubConfig(error) => error.category(),
+            Self::ManageConfig(error) => error.category(),
+            Self::MemoryConfig(error) => error.category(),
             Self::StoreUnavailable => "telegram_store_unavailable",
             Self::SurfaceUnavailable => "telegram_surface_unavailable",
             Self::PollerUnavailable => "telegram_poller_unavailable",
