@@ -20,9 +20,10 @@
 //! * **`envelope_id` is not an identity.** Slack mints a fresh `envelope_id`
 //!   for every delivery attempt of the same event and signals redelivery with
 //!   `retry_attempt`. The deduplication identity is therefore the
-//!   `(team_id, channel, ts)` triple exposed as [`SlackIngress::source_key`];
-//!   `envelope_id` is only an acknowledgement key and is deliberately absent
-//!   from that key.
+//!   event `(team_id, channel, ts)` or slash-command
+//!   `(team_id, channel_id, trigger_id)` coordinates exposed as
+//!   [`SlackIngress::source_key`]; `envelope_id` is only an acknowledgement key
+//!   and is deliberately absent from that key.
 //! * **Three coordinates, not two.** A Slack app is installed per workspace and
 //!   channel/user IDs are unique only within a workspace, so a principal is
 //!   `(team_id, channel, user)` rather than Telegram's `(chat, actor)`.
@@ -272,8 +273,48 @@ pub enum SlackInputKind {
     Message,
     /// A message that mentions the app.
     AppMention,
+    /// An explicit `/github_create` invocation.
+    GitHubCreate,
+    /// An explicit `/github_reply` invocation.
+    GitHubReply,
+    /// An explicit `/github_check` invocation.
+    GitHubCheck,
+    /// An explicit `/github_uncheck` invocation.
+    GitHubUncheck,
+    /// An explicit `/github_issue` invocation.
+    GitHubIssue,
+    /// An explicit `/github_label` invocation.
+    GitHubLabel,
+    /// An explicit `/github_milestone` invocation.
+    GitHubMilestone,
+    /// An explicit `/github_epic` invocation.
+    GitHubEpic,
+    /// An explicit `/github_project` invocation.
+    GitHubProject,
+    /// The unified Slack command surface.
+    Monique,
     /// A well-formed frame outside this build's admitted input surface.
     Unsupported,
+}
+
+impl SlackInputKind {
+    /// Exact slash command for a typed GitHub command ingress.
+    #[must_use]
+    pub const fn slash_command(self) -> Option<&'static str> {
+        match self {
+            Self::GitHubCreate => Some("/github_create"),
+            Self::GitHubReply => Some("/github_reply"),
+            Self::GitHubCheck => Some("/github_check"),
+            Self::GitHubUncheck => Some("/github_uncheck"),
+            Self::GitHubIssue => Some("/github_issue"),
+            Self::GitHubLabel => Some("/github_label"),
+            Self::GitHubMilestone => Some("/github_milestone"),
+            Self::GitHubEpic => Some("/github_epic"),
+            Self::GitHubProject => Some("/github_project"),
+            Self::Monique => Some("/monique"),
+            Self::Message | Self::AppMention | Self::Unsupported => None,
+        }
+    }
 }
 
 /// Why a frame was refused while its acknowledgement key survived.
@@ -449,9 +490,10 @@ impl fmt::Debug for SlackIngress {
 impl SlackIngress {
     /// Stable transport deduplication key.
     ///
-    /// Derived from `(app, team_id, channel, ts)` and therefore identical
-    /// across every redelivery of the same event. The per-delivery
-    /// `envelope_id` is deliberately excluded.
+    /// Derived from `(app, team_id, channel, ts)` for an event, or
+    /// `(app, team_id, channel_id, trigger_id)` for a slash command. It is
+    /// therefore identical across redelivery while deliberately excluding the
+    /// per-delivery `envelope_id`.
     #[must_use]
     pub fn source_key(&self) -> &str {
         &self.source_key
@@ -473,6 +515,12 @@ impl SlackIngress {
     #[must_use]
     pub const fn kind(&self) -> SlackInputKind {
         self.kind
+    }
+
+    /// Exact slash command, present only for one of the four GitHub commands.
+    #[must_use]
+    pub const fn command(&self) -> Option<&'static str> {
+        self.kind.slash_command()
     }
 
     /// Bounded input text, present only for an admitted disposition.
@@ -630,18 +678,104 @@ pub fn parse_slack_envelope(
             }
             Ok(meta.connection_control())
         }
-        SlackEnvelopeType::SlashCommands | SlackEnvelopeType::Interactive => {
+        SlackEnvelopeType::Interactive => {
             let ack_key = meta.require_ack_key()?;
             // Recognised and acknowledgeable, but outside this slice's input
             // surface: acknowledged so Slack stops redelivering, recorded
             // content-free so no work is created.
             Ok(meta.acked(ack_key, SlackDisposition::IgnoredUnsupported, None))
         }
+        SlackEnvelopeType::SlashCommands => {
+            let ack_key = meta.require_ack_key()?;
+            Ok(slash_command(frame, meta, ack_key, policy))
+        }
         SlackEnvelopeType::EventsApi => {
             let ack_key = meta.require_ack_key()?;
             Ok(events_api(frame, meta, ack_key, policy))
         }
     }
+}
+
+fn slash_command(
+    frame: &Map<String, Value>,
+    meta: FrameMeta,
+    ack_key: SlackEnvelopeId,
+    policy: &SlackAccessPolicy,
+) -> SlackEnvelope {
+    let Some(payload) = frame.get("payload").and_then(Value::as_object) else {
+        return meta.refused(SlackRefusal::InvalidPayload);
+    };
+    let Some(command) = required_str(payload, "command") else {
+        return meta.refused(SlackRefusal::InvalidField("command"));
+    };
+    let kind = match command {
+        "/github_create" => SlackInputKind::GitHubCreate,
+        "/github_reply" => SlackInputKind::GitHubReply,
+        "/github_check" => SlackInputKind::GitHubCheck,
+        "/github_uncheck" => SlackInputKind::GitHubUncheck,
+        "/github_issue" => SlackInputKind::GitHubIssue,
+        "/github_label" => SlackInputKind::GitHubLabel,
+        "/github_milestone" => SlackInputKind::GitHubMilestone,
+        "/github_epic" => SlackInputKind::GitHubEpic,
+        "/github_project" => SlackInputKind::GitHubProject,
+        "/monique" => SlackInputKind::Monique,
+        _ => return meta.acked(ack_key, SlackDisposition::IgnoredUnsupported, None),
+    };
+
+    let Some(team) = required_str(payload, "team_id") else {
+        return meta.refused(SlackRefusal::InvalidField("team_id"));
+    };
+    let Some(channel) = required_str(payload, "channel_id") else {
+        return meta.refused(SlackRefusal::InvalidField("channel_id"));
+    };
+    let Some(user) = required_str(payload, "user_id") else {
+        return meta.refused(SlackRefusal::InvalidField("user_id"));
+    };
+    let Some(trigger_id) = required_str(payload, "trigger_id") else {
+        return meta.refused(SlackRefusal::InvalidField("trigger_id"));
+    };
+    if let Err(field) = identifier(trigger_id, "trigger_id") {
+        return meta.refused(SlackRefusal::InvalidField(field));
+    }
+    let principal = match SlackPrincipal::new(team, channel, user) {
+        Ok(principal) => principal,
+        Err(SlackError::InvalidField("channel")) => {
+            return meta.refused(SlackRefusal::InvalidField("channel_id"));
+        }
+        Err(SlackError::InvalidField("user")) => {
+            return meta.refused(SlackRefusal::InvalidField("user_id"));
+        }
+        Err(SlackError::InvalidField(field)) => {
+            return meta.refused(SlackRefusal::InvalidField(field));
+        }
+        Err(_) => return meta.refused(SlackRefusal::InvalidPayload),
+    };
+    let text = match payload.get("text") {
+        Some(Value::String(text)) => text,
+        _ => return meta.refused(SlackRefusal::InvalidField("text")),
+    };
+    if text.len() > MAX_SLACK_TEXT_BYTES || text.contains('\0') {
+        return meta.refused(SlackRefusal::InvalidField("text"));
+    }
+
+    let disposition = if policy.admits(&principal) {
+        SlackDisposition::Admitted
+    } else {
+        SlackDisposition::Denied
+    };
+    let app_id = policy.app_id().as_str();
+    let ingress = SlackIngress {
+        source_key: format!("slack:{app_id}:{team}:{channel}:command:{trigger_id}"),
+        scope: format!("slack:{app_id}:{team}:{channel}"),
+        principal,
+        kind,
+        content: if disposition == SlackDisposition::Admitted {
+            Some(text.clone())
+        } else {
+            None
+        },
+    };
+    meta.acked(ack_key, disposition, Some(ingress))
 }
 
 /// Envelope metadata accumulated before the frame body is understood.

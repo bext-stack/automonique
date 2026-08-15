@@ -136,10 +136,45 @@ impl TelegramAccessPolicy {
 pub enum TelegramInputKind {
     /// A plain message text.
     Message,
+    /// An edit to an existing message. Retained, but never treated as a fresh
+    /// command by the control bridge.
+    EditedMessage,
+    /// A message carrying one supported attachment class. Captions are
+    /// retained as content but are never executed as commands.
+    Attachment,
+    /// A Telegram Business deletion notification. Telegram supplies no actor,
+    /// so it is durable offset evidence only.
+    DeletedMessage,
     /// An inline callback payload.
     Callback,
     /// A fresh Telegram update outside this build's admitted input surface.
     Unsupported,
+}
+
+/// Closed attachment classes recognized without downloading Telegram files.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TelegramAttachmentKind {
+    Photo,
+    Document,
+    Audio,
+    Video,
+    Voice,
+    Animation,
+    Sticker,
+}
+
+impl TelegramAttachmentKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Photo => "photo",
+            Self::Document => "document",
+            Self::Audio => "audio",
+            Self::Video => "video",
+            Self::Voice => "voice",
+            Self::Animation => "animation",
+            Self::Sticker => "sticker",
+        }
+    }
 }
 
 /// Closed access disposition that must be persisted before cursor advance.
@@ -157,10 +192,13 @@ pub enum TelegramDisposition {
 #[derive(Clone, Eq, PartialEq)]
 pub struct TelegramIngress {
     update_id: u64,
+    message_id: Option<i64>,
+    reply_to_message_id: Option<i64>,
     source_key: String,
     scope: String,
     principal: Option<TelegramPrincipal>,
     kind: TelegramInputKind,
+    attachment_kind: Option<TelegramAttachmentKind>,
     content: Option<String>,
     disposition: TelegramDisposition,
 }
@@ -170,10 +208,16 @@ impl fmt::Debug for TelegramIngress {
         formatter
             .debug_struct("TelegramIngress")
             .field("update_id", &self.update_id)
+            .field("message_id", &self.message_id.map(|_| "<redacted>"))
+            .field(
+                "reply_to_message_id",
+                &self.reply_to_message_id.map(|_| "<redacted>"),
+            )
             .field("source_key", &"<redacted>")
             .field("scope", &"<redacted>")
             .field("principal", &self.principal.map(|_| "<redacted>"))
             .field("kind", &self.kind)
+            .field("attachment_kind", &self.attachment_kind)
             .field("content", &self.content.as_ref().map(|_| "<redacted>"))
             .field("disposition", &self.disposition)
             .finish()
@@ -185,6 +229,18 @@ impl TelegramIngress {
     #[must_use]
     pub const fn update_id(&self) -> u64 {
         self.update_id
+    }
+
+    /// Telegram message identity, when this ingress is a message.
+    #[must_use]
+    pub const fn message_id(&self) -> Option<i64> {
+        self.message_id
+    }
+
+    /// Exact Telegram message this input replies to, when present.
+    #[must_use]
+    pub const fn reply_to_message_id(&self) -> Option<i64> {
+        self.reply_to_message_id
     }
 
     /// Stable transport deduplication key.
@@ -209,6 +265,13 @@ impl TelegramIngress {
     #[must_use]
     pub const fn kind(&self) -> TelegramInputKind {
         self.kind
+    }
+
+    /// Attachment class, when [`Self::kind`] is
+    /// [`TelegramInputKind::Attachment`].
+    #[must_use]
+    pub const fn attachment_kind(&self) -> Option<TelegramAttachmentKind> {
+        self.attachment_kind
     }
 
     /// Bounded input text/callback data.
@@ -452,17 +515,40 @@ fn parse_fresh_update(
     }
     let discriminator = discriminators[0].as_str();
     let parsed = match discriminator {
-        "message" => {
-            let Some(message) = object.get("message") else {
+        "message" => parse_message_update(object, "message", TelegramInputKind::Message)?,
+        "edited_message" => {
+            parse_message_update(object, "edited_message", TelegramInputKind::EditedMessage)?
+        }
+        "deleted_business_messages" => {
+            let deleted = object
+                .get("deleted_business_messages")
+                .and_then(Value::as_object)
+                .ok_or(TelegramError::InvalidResponse)?;
+            let chat_id = nested_i64(deleted, &["chat", "id"])?;
+            let message_ids = deleted
+                .get("message_ids")
+                .and_then(Value::as_array)
+                .ok_or(TelegramError::InvalidResponse)?;
+            if message_ids.is_empty()
+                || message_ids.iter().any(|id| {
+                    id.as_i64()
+                        .is_none_or(|id| positive(id, "message_id").is_err())
+                })
+            {
                 return Err(TelegramError::InvalidResponse);
-            };
-            let message = message.as_object().ok_or(TelegramError::InvalidResponse)?;
-            let content = match message.get("text") {
-                None => return Ok(unsupported_ingress(update_id, policy)),
-                Some(Value::String(content)) => content.as_str(),
-                Some(_) => return Err(TelegramError::InvalidResponse),
-            };
-            Some((principal(message)?, TelegramInputKind::Message, content))
+            }
+            return Ok(TelegramIngress {
+                update_id,
+                message_id: None,
+                reply_to_message_id: None,
+                source_key: format!("telegram:{}:update:{update_id}", policy.bot_id().get()),
+                scope: format!("telegram:{}:{chat_id}", policy.bot_id().get()),
+                principal: None,
+                kind: TelegramInputKind::DeletedMessage,
+                attachment_kind: None,
+                content: None,
+                disposition: TelegramDisposition::IgnoredUnsupported,
+            });
         }
         "callback_query" => {
             let Some(callback) = object.get("callback_query") else {
@@ -485,11 +571,15 @@ fn parse_fresh_update(
                 TelegramPrincipal::new(chat_id, actor_id)?,
                 TelegramInputKind::Callback,
                 string(callback, "data")?,
+                None,
+                None,
+                None,
             ))
         }
         _ => None,
     };
-    let Some((principal, kind, content)) = parsed else {
+    let Some((principal, kind, content, message_id, reply_to_message_id, attachment_kind)) = parsed
+    else {
         return Ok(unsupported_ingress(update_id, policy));
     };
     if content.is_empty() || content.len() > MAX_TELEGRAM_INPUT_BYTES || content.contains('\0') {
@@ -502,10 +592,13 @@ fn parse_fresh_update(
     };
     Ok(TelegramIngress {
         update_id,
+        message_id,
+        reply_to_message_id,
         source_key: format!("telegram:{}:update:{update_id}", policy.bot_id().get()),
         scope: format!("telegram:{}:{}", policy.bot_id().get(), principal.chat_id()),
         principal: Some(principal),
         kind,
+        attachment_kind,
         content: if disposition == TelegramDisposition::Admitted {
             Some(content.to_owned())
         } else {
@@ -515,13 +608,100 @@ fn parse_fresh_update(
     })
 }
 
+type ParsedTelegramInput<'a> = (
+    TelegramPrincipal,
+    TelegramInputKind,
+    &'a str,
+    Option<i64>,
+    Option<i64>,
+    Option<TelegramAttachmentKind>,
+);
+
+fn parse_message_update<'a>(
+    update: &'a serde_json::Map<String, Value>,
+    field: &str,
+    text_kind: TelegramInputKind,
+) -> Result<Option<ParsedTelegramInput<'a>>, TelegramError> {
+    let message = update
+        .get(field)
+        .and_then(Value::as_object)
+        .ok_or(TelegramError::InvalidResponse)?;
+    let attachment_candidates = [
+        ("photo", TelegramAttachmentKind::Photo),
+        ("document", TelegramAttachmentKind::Document),
+        ("audio", TelegramAttachmentKind::Audio),
+        ("video", TelegramAttachmentKind::Video),
+        ("voice", TelegramAttachmentKind::Voice),
+        ("animation", TelegramAttachmentKind::Animation),
+        ("sticker", TelegramAttachmentKind::Sticker),
+    ];
+    let attachments: Vec<_> = attachment_candidates
+        .into_iter()
+        .filter(|(name, _)| message.contains_key(*name))
+        .collect();
+    if attachments.len() > 1 || (message.contains_key("text") && !attachments.is_empty()) {
+        return Err(TelegramError::InvalidResponse);
+    }
+    let (kind, attachment_kind, content) = if let Some((_, attachment)) = attachments.first() {
+        let content = match message.get("caption") {
+            Some(Value::String(caption)) => caption.as_str(),
+            Some(_) => return Err(TelegramError::InvalidResponse),
+            None => attachment.as_str(),
+        };
+        let kind = if text_kind == TelegramInputKind::EditedMessage {
+            TelegramInputKind::EditedMessage
+        } else {
+            TelegramInputKind::Attachment
+        };
+        (kind, Some(*attachment), content)
+    } else {
+        let content = match message.get("text") {
+            Some(Value::String(content)) => content.as_str(),
+            Some(_) => return Err(TelegramError::InvalidResponse),
+            None => return Ok(None),
+        };
+        (text_kind, None, content)
+    };
+    let reply_to_message_id = message
+        .get("reply_to_message")
+        .map(|value| {
+            value
+                .as_object()
+                .and_then(|reply| reply.get("message_id"))
+                .and_then(Value::as_i64)
+                .ok_or(TelegramError::InvalidResponse)
+                .and_then(|id| positive(id, "reply_to_message_id"))
+        })
+        .transpose()?;
+    let message_id = message
+        .get("message_id")
+        .map(|value| {
+            value
+                .as_i64()
+                .ok_or(TelegramError::InvalidResponse)
+                .and_then(|id| positive(id, "message_id"))
+        })
+        .transpose()?;
+    Ok(Some((
+        principal(message)?,
+        kind,
+        content,
+        message_id,
+        reply_to_message_id,
+        attachment_kind,
+    )))
+}
+
 fn unsupported_ingress(update_id: u64, policy: &TelegramAccessPolicy) -> TelegramIngress {
     TelegramIngress {
         update_id,
+        message_id: None,
+        reply_to_message_id: None,
         source_key: format!("telegram:{}:update:{update_id}", policy.bot_id().get()),
         scope: format!("telegram:{}:unsupported", policy.bot_id().get()),
         principal: None,
         kind: TelegramInputKind::Unsupported,
+        attachment_kind: None,
         content: None,
         disposition: TelegramDisposition::IgnoredUnsupported,
     }

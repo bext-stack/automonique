@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Bounded, refusing decoders for the nine operations.
+//! Bounded, refusing decoders for the thirteen operations.
 //!
 //! Each decoder takes the accepted response bytes and returns either the
 //! operation's typed payload or a [`GitHubFailure`]. Nothing panics on hostile
@@ -292,6 +292,16 @@ pub fn decode_comments(bytes: &[u8], per_page: u32) -> Result<Vec<GitHubComment>
     Ok(comments)
 }
 
+/// Decode one issue comment returned by a read or update.
+///
+/// # Errors
+///
+/// As [`decode_comments`], for one object rather than a page.
+pub fn decode_comment(bytes: &[u8]) -> Result<GitHubComment, GitHubFailure> {
+    let object = envelope(bytes)?;
+    comment(&object)
+}
+
 /// Decode the comment a create returned.
 ///
 /// # Errors
@@ -313,6 +323,20 @@ pub fn decode_comment_ref(bytes: &[u8]) -> Result<CommentRef, GitHubFailure> {
 pub fn decode_labels(bytes: &[u8]) -> Result<Vec<String>, GitHubFailure> {
     let rows = array(bytes, MAX_ISSUE_LABELS as u32)?;
     label_names(&Value::Array(rows))
+}
+
+/// Decode one requested page of repository labels.
+///
+/// Repository label pages may contain up to [`MAX_PER_PAGE`] rows, unlike an
+/// issue's own label set, which is bounded by [`MAX_ISSUE_LABELS`].
+///
+/// # Errors
+///
+/// As [`decode_labels`], plus [`GitHubFailure::TooManyItems`] when the server
+/// returned more rows than requested.
+pub fn decode_repository_labels(bytes: &[u8], per_page: u32) -> Result<Vec<String>, GitHubFailure> {
+    let rows = array(bytes, per_page)?;
+    label_names_bounded(&Value::Array(rows), per_page as usize)
 }
 
 /// Decode the account a credential belongs to.
@@ -464,8 +488,12 @@ fn login(row: &Map<String, Value>) -> Result<String, GitHubFailure> {
 /// GitHub answers with objects; the legacy mapper also accepts bare strings, so
 /// both are read here.
 fn label_names(value: &Value) -> Result<Vec<String>, GitHubFailure> {
+    label_names_bounded(value, MAX_ISSUE_LABELS)
+}
+
+fn label_names_bounded(value: &Value, max_items: usize) -> Result<Vec<String>, GitHubFailure> {
     let rows = value.as_array().ok_or(GitHubFailure::InvalidResponse)?;
-    if rows.len() > MAX_ISSUE_LABELS {
+    if rows.len() > max_items || rows.len() > MAX_PER_PAGE {
         return Err(GitHubFailure::TooManyItems);
     }
     let mut names = Vec::with_capacity(rows.len());

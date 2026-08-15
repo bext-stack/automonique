@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use automonique_store::{
     InboxSubmission, IntakePauseRequest, IntakeResumeRequest, LeaseRenewal, LeaseRequest,
-    MAX_TRANSPORT_KEY_BYTES, OutboxClaimRequest, OutboxDelivery, OutboxFailure,
+    MAX_TRANSPORT_KEY_BYTES, OutboxClaimRequest, OutboxDelivery, OutboxEnqueue, OutboxFailure,
     OutboxFailureDecision, OutboxPayloadRequest, OutboxReconciliationDecision,
     OutboxReconciliationRequest, ReconciliationDecision, ReconciliationInboxState,
     ReconciliationRequest, ReconciliationRunState, SCHEMA_VERSION, SchedulerClaim, Store,
@@ -1529,6 +1529,65 @@ fn outbox_claim_is_filtered_fifo_and_payload_requires_exact_live_lease() {
             .state,
         "pending"
     );
+}
+
+#[test]
+fn independent_outbox_enqueue_is_fenced_idempotent_and_claimable() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let epoch = lease(&mut store, "holder-a", 0);
+    let enqueue = || OutboxEnqueue {
+        intent_key: "telegram:42:update:7:reply",
+        kind: "telegram.send_message",
+        payload: br#"{"chat_id":9,"text":"hello"}"#,
+        generation_id: "generation-a",
+        holder_id: "holder-a",
+        lease_epoch: epoch,
+        now_ms: 1,
+    };
+    let first = store.enqueue_outbox(enqueue()).expect("enqueue");
+    assert!(!first.duplicate);
+    let duplicate = store.enqueue_outbox(enqueue()).expect("exact retry");
+    assert!(duplicate.duplicate);
+    assert_eq!(
+        duplicate,
+        automonique_store::OutboxEnqueueReceipt {
+            duplicate: true,
+            ..first
+        }
+    );
+    let conflict = store
+        .enqueue_outbox(OutboxEnqueue {
+            payload: br#"{"chat_id":9,"text":"different"}"#,
+            ..enqueue()
+        })
+        .expect_err("same key cannot change payload");
+    assert_eq!(conflict.category(), "outbox_conflict");
+
+    let claim = store
+        .claim_outbox(OutboxClaimRequest {
+            transport: "telegram",
+            kind: "telegram.send_message",
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            now_ms: 2,
+            ttl_ms: 10,
+        })
+        .expect("claim")
+        .expect("queued effect");
+    assert_eq!(claim.outbox_id, first.outbox_id);
+    let payload = store
+        .leased_outbox_payload(OutboxPayloadRequest {
+            outbox_id: claim.outbox_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            lease_token: &claim.lease_token,
+            now_ms: 3,
+        })
+        .expect("leased payload");
+    assert_eq!(payload.payload, enqueue().payload);
 }
 
 #[test]

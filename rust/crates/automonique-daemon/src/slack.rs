@@ -25,6 +25,12 @@
 //! rather than being ignored, because ignoring it would hide an operator error
 //! behind an honest-looking disabled state.
 //!
+//! Ticket intake additionally needs an `app_token=xapp-…` Socket Mode token and
+//! one or more repeated `admin=U…` Slack user ids. Each configured `channel=` is
+//! an intake allowlist entry. The app token and administrator list must either
+//! both be present or both be absent, so a half-configured approval surface
+//! cannot silently start.
+//!
 //! # Why an operator types a name and never an id
 //!
 //! [`ChannelId`] admits `C…`, `G…` and `D…` — every conversation the token can
@@ -67,14 +73,38 @@ use std::fmt;
 use std::fs;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use automonique_slack_connector::{
-    ChannelId, ConversationsHistoryRequest, MAX_PAGE_LIMIT, MessagePage, MessageText,
-    PostMessageRequest, SlackBase, SlackClient, SlackErrorKind, SlackFailure, SlackMessage,
-    SlackOutcome, SlackRejection, SlackToken, SlackUser, UserId, UsersInfoRequest,
+    AppsConnectionsOpenClient, ChannelId, ConversationsHistoryRequest, HomeView, MAX_PAGE_LIMIT,
+    MessageBlocks, MessagePage, MessageText, MessageTs, ModalView, OpenViewRequest,
+    PostMessageRequest, PublishViewRequest, SlackAppToken, SlackBase, SlackClient, SlackErrorKind,
+    SlackFailure, SlackMessage, SlackOutcome, SlackRejection, SlackSocketModeConnector, SlackToken,
+    SlackUser, TriggerId, UserId, UsersInfoRequest,
 };
-use automonique_transport_runtime::ChannelName;
+use automonique_store::agent_memory::{
+    AgentMemoryStore, ExternalIdentity, MessageInput, redact_content,
+};
+use automonique_store::slack_interactions::{
+    SlackInteractionAction, SlackInteractionInput, SlackInteractionRecord, SlackInteractionState,
+    SlackInteractionStore,
+};
+use automonique_support_connector::{TicketDecision, TicketDecisionOutcome};
+use automonique_transport_runtime::{
+    ChannelName, GitHubChecklistItem, GitHubIssueUrl, GitHubRepoAlias, GitHubRequest,
+};
+use automonique_transports::{
+    SlackAccessPolicy, SlackAppId, SlackDisposition, SlackInputKind, SlackPrincipal,
+    parse_slack_envelope,
+};
 
+use crate::github_actions::{
+    GitHubActionEngine, GitHubActionRequest, GitHubManagementDomain, is_github_capability_question,
+};
+use crate::run_lane::SocketRunLane;
 use crate::telegram_bridge::SlackSurface;
 
 /// Configuration path beneath the daemon's private state directory.
@@ -83,6 +113,8 @@ const CONFIG_RELATIVE: &str = "slack/slack.conf";
 const CONFIG_HEADER: &str = "schema=automonique.slack/v1";
 /// Exact final line of a complete Slack configuration.
 const CONFIG_TERMINATOR: &str = "end=automonique.slack/v1";
+const CONFIG_HEADER_V2: &str = "schema=automonique.slack/v2";
+const CONFIG_TERMINATOR_V2: &str = "end=automonique.slack/v2";
 /// Upper bound on the configuration file.
 const MAX_CONFIG_BYTES: u64 = 4_096;
 
@@ -92,6 +124,33 @@ const MAX_CONFIG_BYTES: u64 = 4_096;
 /// thirty-two channels has told a chat it may post to thirty-two rooms, and a
 /// number an owner can hold in their head is the point of the bound.
 pub const MAX_CONFIGURED_CHANNELS: usize = 32;
+/// Most Slack identities that may confirm a ticket gate.
+pub const MAX_CONFIGURED_ADMINS: usize = 32;
+/// Most Slack identities admitted to read-only Monique conversations.
+pub const MAX_CONFIGURED_MEMBERS: usize = 256;
+
+/// Independently staged Slack product capabilities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SlackFeature {
+    Approvals,
+    Conversation,
+    Commands,
+    Files,
+    AppHome,
+}
+
+impl SlackFeature {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "approvals" => Some(Self::Approvals),
+            "conversation" => Some(Self::Conversation),
+            "commands" => Some(Self::Commands),
+            "files" => Some(Self::Files),
+            "app_home" => Some(Self::AppHome),
+            _ => None,
+        }
+    }
+}
 
 /// How many messages one `/slack` reads.
 ///
@@ -233,6 +292,20 @@ pub enum SlackConfigError {
     /// [`MAX_CONFIGURED_CHANNELS`] of them — or there are none at all, which
     /// would be a configured workspace with nothing reachable in it.
     ChannelInvalid,
+    /// Socket Mode was enabled without a non-empty, unique administrator set,
+    /// or administrators were named without a Socket Mode credential.
+    AdminInvalid,
+    /// A member allowlist entry is invalid, duplicated, or over capacity.
+    MemberInvalid,
+    /// A v2 feature is unknown or repeated.
+    FeatureInvalid,
+    /// File exchange was enabled without a tenant artifact policy.
+    ArtifactPolicyRequired,
+    /// Socket Mode ticket intake was enabled without Manage's typed ticket
+    /// action capability.
+    TicketActionsUnavailable,
+    /// GitHub actions were configured but their provider lane could not open.
+    GitHubActionsUnavailable,
 }
 
 impl fmt::Display for SlackConfigError {
@@ -248,6 +321,22 @@ impl fmt::Display for SlackConfigError {
             Self::TokenInvalid => formatter.write_str("slack configuration token is invalid"),
             Self::ChannelInvalid => {
                 formatter.write_str("slack configuration channel map is invalid or empty")
+            }
+            Self::AdminInvalid => {
+                formatter.write_str("slack ticket intake administrator configuration is invalid")
+            }
+            Self::MemberInvalid => {
+                formatter.write_str("slack member allowlist configuration is invalid")
+            }
+            Self::FeatureInvalid => formatter.write_str("slack feature configuration is invalid"),
+            Self::ArtifactPolicyRequired => {
+                formatter.write_str("slack files require an explicit tenant artifact policy")
+            }
+            Self::TicketActionsUnavailable => {
+                formatter.write_str("slack ticket intake requires configured Manage actions")
+            }
+            Self::GitHubActionsUnavailable => {
+                formatter.write_str("slack GitHub actions require an available provider lane")
             }
         }
     }
@@ -265,6 +354,12 @@ impl SlackConfigError {
             Self::Malformed => "slack_config_malformed",
             Self::TokenInvalid => "slack_config_token",
             Self::ChannelInvalid => "slack_config_channel",
+            Self::AdminInvalid => "slack_config_admin",
+            Self::MemberInvalid => "slack_config_member",
+            Self::FeatureInvalid => "slack_config_feature",
+            Self::ArtifactPolicyRequired => "slack_artifact_policy_required",
+            Self::TicketActionsUnavailable => "slack_ticket_actions_unavailable",
+            Self::GitHubActionsUnavailable => "slack_github_actions_unavailable",
         }
     }
 }
@@ -315,7 +410,12 @@ impl ChannelMap {
 /// around.
 pub struct SlackConfig {
     token: SlackToken,
+    app_token: Option<SlackAppToken>,
     channels: ChannelMap,
+    admins: Vec<UserId>,
+    members: Vec<UserId>,
+    features: Vec<SlackFeature>,
+    interactive_decisions: bool,
 }
 
 impl fmt::Debug for SlackConfig {
@@ -323,7 +423,15 @@ impl fmt::Debug for SlackConfig {
         formatter
             .debug_struct("SlackConfig")
             .field("token", &"<redacted>")
+            .field(
+                "socket_mode",
+                &self.app_token.as_ref().map_or("disabled", |_| "enabled"),
+            )
             .field("channels", &self.channels.labels())
+            .field("admin_count", &self.admins.len())
+            .field("member_count", &self.members.len())
+            .field("features", &self.features)
+            .field("interactive_decisions", &self.interactive_decisions)
             .finish()
     }
 }
@@ -371,17 +479,28 @@ impl SlackConfig {
     /// is provable without a filesystem.
     pub(crate) fn parse(text: &str) -> Result<Option<Self>, SlackConfigError> {
         let mut lines = text.lines();
-        if lines.next() != Some(CONFIG_HEADER) {
-            return Err(SlackConfigError::Malformed);
-        }
+        let v2 = match lines.next() {
+            Some(CONFIG_HEADER) => false,
+            Some(CONFIG_HEADER_V2) => true,
+            _ => return Err(SlackConfigError::Malformed),
+        };
+        let terminator = if v2 {
+            CONFIG_TERMINATOR_V2
+        } else {
+            CONFIG_TERMINATOR
+        };
         let mut token: Option<SlackToken> = None;
+        let mut app_token: Option<SlackAppToken> = None;
         let mut channels: Vec<(ChannelName, ChannelId)> = Vec::new();
+        let mut admins: Vec<UserId> = Vec::new();
+        let mut members: Vec<UserId> = Vec::new();
+        let mut features: Vec<SlackFeature> = Vec::new();
         let mut terminated = false;
         for line in lines {
             if terminated {
                 return Err(SlackConfigError::Malformed);
             }
-            if line == CONFIG_TERMINATOR {
+            if line == terminator {
                 terminated = true;
                 continue;
             }
@@ -393,10 +512,24 @@ impl SlackConfig {
                             .map_err(|_| SlackConfigError::TokenInvalid)?,
                     );
                 }
+                "app_token" if app_token.is_none() => {
+                    app_token = Some(
+                        SlackAppToken::new(value.as_bytes().to_vec())
+                            .map_err(|_| SlackConfigError::TokenInvalid)?,
+                    );
+                }
                 // Repeatable, so a second one is another channel rather than a
                 // duplicate key. A repeated *label* is still refused below: two
                 // ids under one name is an ambiguity nobody can resolve later.
                 "channel" => channels.push(parse_channel_entry(value)?),
+                "admin" => {
+                    admins.push(UserId::new(value).map_err(|_| SlackConfigError::AdminInvalid)?)
+                }
+                "member" if v2 => {
+                    members.push(UserId::new(value).map_err(|_| SlackConfigError::MemberInvalid)?)
+                }
+                "feature" if v2 => features
+                    .push(SlackFeature::parse(value).ok_or(SlackConfigError::FeatureInvalid)?),
                 _ => return Err(SlackConfigError::Malformed),
             }
         }
@@ -411,9 +544,57 @@ impl SlackConfig {
                 return Err(SlackConfigError::ChannelInvalid);
             }
         }
+        if admins.len() > MAX_CONFIGURED_ADMINS
+            || admins
+                .iter()
+                .enumerate()
+                .any(|(index, admin)| admins[..index].contains(admin))
+            || app_token.is_some() == admins.is_empty()
+        {
+            return Err(SlackConfigError::AdminInvalid);
+        }
+        if !v2 {
+            members.clone_from(&admins);
+            features.extend([
+                SlackFeature::Approvals,
+                SlackFeature::Conversation,
+                SlackFeature::Commands,
+            ]);
+        }
+        if members.len() > MAX_CONFIGURED_MEMBERS
+            || members
+                .iter()
+                .enumerate()
+                .any(|(index, member)| members[..index].contains(member))
+        {
+            return Err(SlackConfigError::MemberInvalid);
+        }
+        for admin in &admins {
+            if !members.contains(admin) {
+                if members.len() == MAX_CONFIGURED_MEMBERS {
+                    return Err(SlackConfigError::MemberInvalid);
+                }
+                members.push(admin.clone());
+            }
+        }
+        if features
+            .iter()
+            .enumerate()
+            .any(|(index, feature)| features[..index].contains(feature))
+        {
+            return Err(SlackConfigError::FeatureInvalid);
+        }
+        if features.contains(&SlackFeature::Files) {
+            return Err(SlackConfigError::ArtifactPolicyRequired);
+        }
         Ok(Some(Self {
             token: token.ok_or(SlackConfigError::TokenInvalid)?,
+            app_token,
             channels: ChannelMap(channels),
+            admins,
+            members,
+            features,
+            interactive_decisions: v2,
         }))
     }
 
@@ -663,12 +844,1746 @@ impl<A: SlackApi> SlackWorkspace<A> {
 }
 
 impl<A: SlackApi> SlackSurface for SlackWorkspace<A> {
+    fn channel_labels(&self) -> Vec<String> {
+        self.channels
+            .labels()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
     fn recent_messages(&mut self, channel: &ChannelName) -> Result<String, String> {
         self.read_recent(channel)
     }
 
     fn post_message(&mut self, channel: &ChannelName, text: &str) -> Result<String, String> {
         self.post(channel, text)
+    }
+}
+
+/// A bounded Slack message event relevant to configured-channel ticket intake.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SlackTicketEvent {
+    team_id: String,
+    channel: ChannelId,
+    user: UserId,
+    text: String,
+    parent: MessageTs,
+    source_key: String,
+    app_mention: bool,
+}
+
+/// Extract the acknowledgement key independently from the event payload.
+///
+/// Socket Mode is acknowledged before any Manage or Web API call. A malformed
+/// event can therefore be dropped without Slack retrying it forever, while a
+/// malformed outer envelope is left unacknowledged and forces reconnect.
+fn socket_envelope_id(text: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()?
+        .get("envelope_id")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn slack_ticket_event(text: &str) -> Option<SlackTicketEvent> {
+    let outer: serde_json::Value = serde_json::from_str(text).ok()?;
+    if outer.get("type")?.as_str()? != "events_api" {
+        return None;
+    }
+    let payload = outer.get("payload")?.as_object()?;
+    let event_id = payload.get("event_id")?.as_str()?;
+    let team_id = payload.get("team_id")?.as_str()?;
+    let event = payload.get("event")?.as_object()?;
+    let event_type = event.get("type")?.as_str()?;
+    if !matches!(event_type, "message" | "app_mention")
+        || event.get("subtype").is_some_and(|value| !value.is_null())
+        || event.get("bot_id").is_some_and(|value| !value.is_null())
+    {
+        return None;
+    }
+    let channel = ChannelId::new(event.get("channel")?.as_str()?).ok()?;
+    let user = UserId::new(event.get("user")?.as_str()?).ok()?;
+    let text = event.get("text")?.as_str()?;
+    if text.is_empty() || text.len() > 16 * 1024 || text.chars().any(|c| c == '\0') {
+        return None;
+    }
+    let ts = event.get("ts")?.as_str()?;
+    let parent = event
+        .get("thread_ts")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(ts);
+    let parent = MessageTs::new(parent).ok()?;
+    if !team_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        || !event_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    let source_key = format!("slack:{team_id}:event:{event_id}");
+    if source_key.len() > automonique_support_connector::MAX_TICKET_SOURCE_KEY_BYTES {
+        return None;
+    }
+    Some(SlackTicketEvent {
+        team_id: team_id.to_owned(),
+        channel,
+        user,
+        text: text.to_owned(),
+        parent,
+        source_key,
+        app_mention: event_type == "app_mention",
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SlackGitHubCommand {
+    team_id: String,
+    channel: ChannelId,
+    user: UserId,
+    source_key: String,
+    request: GitHubActionRequest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SlackMoniqueCommand {
+    team_id: String,
+    channel: ChannelId,
+    user: UserId,
+    source_key: String,
+    text: String,
+}
+
+fn slack_monique_command(
+    text: &str,
+    channels: &ChannelMap,
+) -> Result<Option<SlackMoniqueCommand>, ()> {
+    let frame: serde_json::Value = serde_json::from_str(text).map_err(|_| ())?;
+    if frame.get("type").and_then(serde_json::Value::as_str) != Some("slash_commands") {
+        return Ok(None);
+    }
+    let payload = frame
+        .get("payload")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(())?;
+    if payload.get("command").and_then(serde_json::Value::as_str) != Some("/monique") {
+        return Ok(None);
+    }
+    let team = payload
+        .get("team_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    let channel = ChannelId::new(
+        payload
+            .get("channel_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(())?,
+    )
+    .map_err(|_| ())?;
+    if !channels
+        .0
+        .iter()
+        .any(|(_, configured)| configured == &channel)
+    {
+        return Ok(None);
+    }
+    let user = UserId::new(
+        payload
+            .get("user_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(())?,
+    )
+    .map_err(|_| ())?;
+    let trigger = payload
+        .get("trigger_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    let content = payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    if content.len() > automonique_transports::MAX_SLACK_TEXT_BYTES || content.contains('\0') {
+        return Err(());
+    }
+    let source_key = format!(
+        "slack:automonique-slack:{team}:{}:command:{trigger}",
+        channel.as_str()
+    );
+    if source_key.len() > automonique_support_connector::MAX_TICKET_SOURCE_KEY_BYTES {
+        return Err(());
+    }
+    Ok(Some(SlackMoniqueCommand {
+        team_id: team.to_owned(),
+        channel,
+        user,
+        source_key,
+        text: content.trim().to_owned(),
+    }))
+}
+
+fn slack_github_command(
+    text: &str,
+    channels: &ChannelMap,
+    admins: &[UserId],
+) -> Result<Option<SlackGitHubCommand>, ()> {
+    let frame: serde_json::Value = serde_json::from_str(text).map_err(|_| ())?;
+    if frame.get("type").and_then(serde_json::Value::as_str) != Some("slash_commands") {
+        return Ok(None);
+    }
+    let payload = frame
+        .get("payload")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(())?;
+    if !matches!(
+        payload.get("command").and_then(serde_json::Value::as_str),
+        Some(
+            "/github_create"
+                | "/github_reply"
+                | "/github_check"
+                | "/github_uncheck"
+                | "/github_issue"
+                | "/github_label"
+                | "/github_milestone"
+                | "/github_epic"
+                | "/github_project"
+        )
+    ) {
+        return Ok(None);
+    }
+    let team = payload
+        .get("team_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    let app_id = SlackAppId::new("automonique-slack").map_err(|_| ())?;
+    let principals = channels.0.iter().flat_map(|(_, channel)| {
+        admins
+            .iter()
+            .filter_map(|user| SlackPrincipal::new(team, channel.as_str(), user.as_str()).ok())
+    });
+    let policy = SlackAccessPolicy::new(app_id, principals).map_err(|_| ())?;
+    let envelope = parse_slack_envelope(text.as_bytes(), &policy).map_err(|_| ())?;
+    if envelope.disposition() != SlackDisposition::Admitted {
+        return Ok(None);
+    }
+    let ingress = envelope.ingress().ok_or(())?;
+    let content = ingress.content().ok_or(())?;
+    let principal = ingress.principal();
+    let channel = ChannelId::new(principal.channel()).map_err(|_| ())?;
+    let user = UserId::new(principal.user()).map_err(|_| ())?;
+    let request = github_slash_request(ingress.kind(), content)?;
+    Ok(Some(SlackGitHubCommand {
+        team_id: principal.team().to_owned(),
+        channel,
+        user,
+        source_key: ingress.source_key().to_owned(),
+        request,
+    }))
+}
+
+fn github_slash_request(kind: SlackInputKind, content: &str) -> Result<GitHubActionRequest, ()> {
+    let management_domain = match kind {
+        SlackInputKind::GitHubIssue => Some(GitHubManagementDomain::Issue),
+        SlackInputKind::GitHubLabel => Some(GitHubManagementDomain::Label),
+        SlackInputKind::GitHubMilestone => Some(GitHubManagementDomain::Milestone),
+        SlackInputKind::GitHubEpic => Some(GitHubManagementDomain::Epic),
+        SlackInputKind::GitHubProject => Some(GitHubManagementDomain::Project),
+        _ => None,
+    };
+    if let Some(domain) = management_domain {
+        return Ok(GitHubActionRequest::Manage {
+            domain,
+            instruction: GitHubRequest::new(content)
+                .map_err(|_| ())?
+                .as_str()
+                .to_owned(),
+        });
+    }
+    let (coordinate, instruction) = content.trim().split_once(char::is_whitespace).ok_or(())?;
+    let instruction = instruction.trim();
+    match kind {
+        SlackInputKind::GitHubCreate => Ok(GitHubActionRequest::Create {
+            alias: GitHubRepoAlias::new(coordinate)
+                .map_err(|_| ())?
+                .as_str()
+                .to_owned(),
+            instruction: GitHubRequest::new(instruction)
+                .map_err(|_| ())?
+                .as_str()
+                .to_owned(),
+        }),
+        SlackInputKind::GitHubReply => Ok(GitHubActionRequest::Reply {
+            issue_url: GitHubIssueUrl::new(coordinate)
+                .map_err(|_| ())?
+                .as_str()
+                .to_owned(),
+            instruction: GitHubRequest::new(instruction)
+                .map_err(|_| ())?
+                .as_str()
+                .to_owned(),
+        }),
+        SlackInputKind::GitHubCheck | SlackInputKind::GitHubUncheck => {
+            Ok(GitHubActionRequest::Check {
+                issue_url: GitHubIssueUrl::new(coordinate)
+                    .map_err(|_| ())?
+                    .as_str()
+                    .to_owned(),
+                instruction: instruction.to_owned(),
+                checked: kind == SlackInputKind::GitHubCheck,
+                exact_item: Some(
+                    GitHubChecklistItem::new(instruction)
+                        .map_err(|_| ())?
+                        .as_str()
+                        .to_owned(),
+                ),
+            })
+        }
+        SlackInputKind::Message
+        | SlackInputKind::AppMention
+        | SlackInputKind::GitHubIssue
+        | SlackInputKind::GitHubLabel
+        | SlackInputKind::GitHubMilestone
+        | SlackInputKind::GitHubEpic
+        | SlackInputKind::GitHubProject
+        | SlackInputKind::Monique
+        | SlackInputKind::Unsupported => Err(()),
+    }
+}
+
+fn one_issue_url(text: &str) -> Result<Option<String>, ()> {
+    let mut issue: Option<String> = None;
+    for token in text.split_whitespace() {
+        let token = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '"' | '\'' | '!'
+            )
+        });
+        // Slack renders named links as `<url|label>` in event text. Only the
+        // exact URL half is relevant; the label is presentation, not an action
+        // coordinate.
+        let token = token.split_once('|').map_or(token, |(url, _)| url);
+        let token = token.strip_suffix('.').unwrap_or(token);
+        let Some(locator) = automonique_github_connector::IssueLocator::parse(token) else {
+            continue;
+        };
+        let canonical = format!(
+            "https://github.com/{}/issues/{}",
+            locator.target(),
+            locator.number().get()
+        );
+        if issue.as_ref().is_some_and(|seen| seen != &canonical) {
+            return Err(());
+        }
+        issue = Some(canonical);
+    }
+    Ok(issue)
+}
+
+#[derive(Clone, Debug)]
+enum SlackTicketInteractionKind {
+    Approve,
+    RejectOpen { trigger_id: String },
+    RejectSubmit { reason: String },
+}
+
+#[derive(Clone, Debug)]
+struct SlackTicketInteraction {
+    interaction_key: String,
+    team_id: String,
+    channel: ChannelId,
+    message_ts: MessageTs,
+    user: UserId,
+    job_id: String,
+    kind: SlackTicketInteractionKind,
+}
+
+fn slack_ticket_interaction(text: &str) -> Result<Option<SlackTicketInteraction>, ()> {
+    let frame: serde_json::Value = serde_json::from_str(text).map_err(|_| ())?;
+    if frame.get("type").and_then(serde_json::Value::as_str) != Some("interactive") {
+        return Ok(None);
+    }
+    let payload = frame
+        .get("payload")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(())?;
+    let team_id = payload
+        .get("team")
+        .and_then(|value| value.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    let user = payload
+        .get("user")
+        .and_then(|value| value.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    let user = UserId::new(user).map_err(|_| ())?;
+    match payload.get("type").and_then(serde_json::Value::as_str) {
+        Some("block_actions") => {
+            let channel = payload
+                .get("channel")
+                .and_then(|value| value.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?;
+            let message_ts = payload
+                .get("container")
+                .and_then(|value| value.get("message_ts"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?;
+            let actions = payload
+                .get("actions")
+                .and_then(serde_json::Value::as_array)
+                .ok_or(())?;
+            let [action] = actions.as_slice() else {
+                return Err(());
+            };
+            let action_id = action
+                .get("action_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?;
+            let action_ts = action
+                .get("action_ts")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?;
+            let job_id = action
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?;
+            let kind = match action_id {
+                "monique_ticket_approve" => SlackTicketInteractionKind::Approve,
+                "monique_ticket_reject" => SlackTicketInteractionKind::RejectOpen {
+                    trigger_id: payload
+                        .get("trigger_id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(())?
+                        .to_owned(),
+                },
+                _ => return Ok(None),
+            };
+            Ok(Some(SlackTicketInteraction {
+                interaction_key: format!(
+                    "slack-action:{team_id}:{channel}:{message_ts}:{}:{action_ts}:{action_id}",
+                    user.as_str()
+                ),
+                team_id: team_id.to_owned(),
+                channel: ChannelId::new(channel).map_err(|_| ())?,
+                message_ts: MessageTs::new(message_ts).map_err(|_| ())?,
+                user,
+                job_id: job_id.to_owned(),
+                kind,
+            }))
+        }
+        Some("view_submission") => {
+            let view = payload
+                .get("view")
+                .and_then(serde_json::Value::as_object)
+                .ok_or(())?;
+            if view.get("callback_id").and_then(serde_json::Value::as_str)
+                != Some("monique_ticket_reject_submit")
+            {
+                return Ok(None);
+            }
+            let metadata: serde_json::Value = serde_json::from_str(
+                view.get("private_metadata")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?,
+            )
+            .map_err(|_| ())?;
+            let channel = metadata
+                .get("channel_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?;
+            let message_ts = metadata
+                .get("message_ts")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?;
+            let job_id = metadata
+                .get("job_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?;
+            let reason = view
+                .get("state")
+                .and_then(|value| value.get("values"))
+                .and_then(|value| value.get("reason"))
+                .and_then(|value| value.get("value"))
+                .and_then(|value| value.get("value"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?
+                .trim();
+            TicketDecision::reject(reason).map_err(|_| ())?;
+            let view_id = view
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?;
+            let hash = view
+                .get("hash")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("nohash");
+            Ok(Some(SlackTicketInteraction {
+                interaction_key: format!(
+                    "slack-view:{team_id}:{view_id}:{hash}:{}:reject",
+                    user.as_str()
+                ),
+                team_id: team_id.to_owned(),
+                channel: ChannelId::new(channel).map_err(|_| ())?,
+                message_ts: MessageTs::new(message_ts).map_err(|_| ())?,
+                user,
+                job_id: job_id.to_owned(),
+                kind: SlackTicketInteractionKind::RejectSubmit {
+                    reason: reason.to_owned(),
+                },
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn slack_app_home_user(text: &str) -> Result<Option<UserId>, ()> {
+    let frame: serde_json::Value = serde_json::from_str(text).map_err(|_| ())?;
+    if frame.get("type").and_then(serde_json::Value::as_str) != Some("events_api") {
+        return Ok(None);
+    }
+    let payload = frame
+        .get("payload")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(())?;
+    let event = payload
+        .get("event")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(())?;
+    if event.get("type").and_then(serde_json::Value::as_str) != Some("app_home_opened")
+        || event.get("tab").and_then(serde_json::Value::as_str) != Some("home")
+    {
+        return Ok(None);
+    }
+    UserId::new(
+        event
+            .get("user")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(())?,
+    )
+    .map(Some)
+    .map_err(|_| ())
+}
+
+struct PreparedSlackTicketInteraction {
+    interaction: SlackTicketInteraction,
+    gate: crate::telegram_bridge::PendingTicketGate,
+    record: SlackInteractionRecord,
+}
+
+trait SlackTicketPoster {
+    fn post_thread(
+        &mut self,
+        channel: &ChannelId,
+        parent: &MessageTs,
+        text: &str,
+    ) -> Result<(), ()>;
+
+    fn post_channel(&mut self, channel: &ChannelId, text: &str) -> Result<(), ()>;
+
+    fn post_approval_card(
+        &mut self,
+        channel: &ChannelId,
+        parent: &MessageTs,
+        receipt: &automonique_support_connector::TicketDispatchReceipt,
+    ) -> Result<(), ()> {
+        let short = receipt.job_id.get(..12).unwrap_or(&receipt.job_id);
+        self.post_thread(
+            channel,
+            parent,
+            &format!(
+                "🔐 Confirmation required for `{}`\n{}\nMonique job `{short}` is pending approval. A configured Slack admin can reply `confirm {short}`; the same request can also be confirmed in Telegram or Manage. No work starts before confirmation.",
+                receipt.issue_title, receipt.issue_url
+            ),
+        )
+    }
+
+    fn open_reject_modal(
+        &mut self,
+        _trigger_id: &str,
+        _job_id: &str,
+        _channel: &ChannelId,
+        _message_ts: &MessageTs,
+    ) -> Result<(), ()> {
+        Err(())
+    }
+
+    fn update_decision(
+        &mut self,
+        _channel: &ChannelId,
+        _message_ts: &MessageTs,
+        _text: &str,
+    ) -> Result<(), ()> {
+        Err(())
+    }
+
+    fn publish_home(
+        &mut self,
+        _user: &UserId,
+        _is_admin: bool,
+        _pending_count: usize,
+    ) -> Result<(), ()> {
+        Err(())
+    }
+}
+
+impl SlackTicketPoster for SlackClient {
+    fn post_thread(
+        &mut self,
+        channel: &ChannelId,
+        parent: &MessageTs,
+        text: &str,
+    ) -> Result<(), ()> {
+        let text = MessageText::new(text).map_err(|_| ())?;
+        let request = PostMessageRequest::new(channel.clone(), text).in_thread(parent.clone());
+        match SlackClient::post_message(self, &request).map_err(|_| ())? {
+            SlackOutcome::Accepted(_) => Ok(()),
+            SlackOutcome::Rejected(_) => Err(()),
+        }
+    }
+
+    fn post_channel(&mut self, channel: &ChannelId, text: &str) -> Result<(), ()> {
+        let text = MessageText::new(text).map_err(|_| ())?;
+        let request = PostMessageRequest::new(channel.clone(), text);
+        match SlackClient::post_message(self, &request).map_err(|_| ())? {
+            SlackOutcome::Accepted(_) => Ok(()),
+            SlackOutcome::Rejected(_) => Err(()),
+        }
+    }
+
+    fn post_approval_card(
+        &mut self,
+        channel: &ChannelId,
+        parent: &MessageTs,
+        receipt: &automonique_support_connector::TicketDispatchReceipt,
+    ) -> Result<(), ()> {
+        let short = receipt.job_id.get(..12).unwrap_or(&receipt.job_id);
+        let fallback = format!(
+            "Confirmation required for {} ({}) — Monique job {short}",
+            receipt.issue_title, receipt.issue_url
+        );
+        let blocks = serde_json::json!([
+            {"type":"header","text":{"type":"plain_text","text":"Confirmation required"}},
+            {"type":"section","text":{"type":"mrkdwn","text":format!("*{}*\n<{}|Open GitHub issue>\nJob `{}` is pending approval. No work starts before confirmation.", receipt.issue_title, receipt.issue_url, short)}},
+            {"type":"actions","elements":[
+                {"type":"button","action_id":"monique_ticket_approve","text":{"type":"plain_text","text":"Confirm"},"style":"primary","value":receipt.job_id,"confirm":{"title":{"type":"plain_text","text":"Confirm ticket?"},"text":{"type":"mrkdwn","text":"This releases the ticket for work."},"confirm":{"type":"plain_text","text":"Confirm"},"deny":{"type":"plain_text","text":"Cancel"}}},
+                {"type":"button","action_id":"monique_ticket_reject","text":{"type":"plain_text","text":"Reject"},"style":"danger","value":receipt.job_id},
+                {"type":"button","action_id":"monique_ticket_manage","text":{"type":"plain_text","text":"Open Manage"},"url":"https://manage.inklura.fr/"}
+            ]}
+        ]);
+        let blocks = MessageBlocks::new(&blocks.to_string()).map_err(|_| ())?;
+        let request = PostMessageRequest::new(
+            channel.clone(),
+            MessageText::new(&fallback).map_err(|_| ())?,
+        )
+        .in_thread(parent.clone())
+        .with_blocks(blocks);
+        match SlackClient::post_message(self, &request).map_err(|_| ())? {
+            SlackOutcome::Accepted(_) => Ok(()),
+            SlackOutcome::Rejected(_) => Err(()),
+        }
+    }
+
+    fn open_reject_modal(
+        &mut self,
+        trigger_id: &str,
+        job_id: &str,
+        channel: &ChannelId,
+        message_ts: &MessageTs,
+    ) -> Result<(), ()> {
+        let metadata = serde_json::json!({
+            "job_id": job_id,
+            "channel_id": channel.as_str(),
+            "message_ts": message_ts.as_str(),
+        });
+        let view = serde_json::json!({
+            "type":"modal",
+            "callback_id":"monique_ticket_reject_submit",
+            "private_metadata":metadata.to_string(),
+            "title":{"type":"plain_text","text":"Reject ticket"},
+            "submit":{"type":"plain_text","text":"Reject"},
+            "close":{"type":"plain_text","text":"Cancel"},
+            "blocks":[{"type":"input","block_id":"reason","label":{"type":"plain_text","text":"Reason"},"element":{"type":"plain_text_input","action_id":"value","multiline":true,"min_length":1,"max_length":500}}]
+        });
+        let request = OpenViewRequest::new(
+            TriggerId::new(trigger_id).map_err(|_| ())?,
+            ModalView::new(&view.to_string()).map_err(|_| ())?,
+        );
+        match SlackClient::open_view(self, &request).map_err(|_| ())? {
+            SlackOutcome::Accepted(()) => Ok(()),
+            SlackOutcome::Rejected(_) => Err(()),
+        }
+    }
+
+    fn update_decision(
+        &mut self,
+        channel: &ChannelId,
+        message_ts: &MessageTs,
+        text: &str,
+    ) -> Result<(), ()> {
+        let blocks = MessageBlocks::new(
+            &serde_json::json!([{"type":"section","text":{"type":"mrkdwn","text":text}}])
+                .to_string(),
+        )
+        .map_err(|_| ())?;
+        let request = automonique_slack_connector::UpdateMessageRequest::new(
+            channel.clone(),
+            message_ts.clone(),
+            MessageText::new(text).map_err(|_| ())?,
+        )
+        .with_blocks(blocks);
+        match SlackClient::update_message(self, &request).map_err(|_| ())? {
+            SlackOutcome::Accepted(()) => Ok(()),
+            SlackOutcome::Rejected(_) => Err(()),
+        }
+    }
+
+    fn publish_home(
+        &mut self,
+        user: &UserId,
+        is_admin: bool,
+        pending_count: usize,
+    ) -> Result<(), ()> {
+        let mut blocks = vec![
+            serde_json::json!({"type":"header","text":{"type":"plain_text","text":"Monique"}}),
+            serde_json::json!({"type":"section","text":{"type":"mrkdwn","text":"Ask me a read-only question in a DM or mention me in a configured channel. Post one GitHub issue URL in the intake channel to request work."}}),
+        ];
+        if is_admin {
+            blocks.push(serde_json::json!({"type":"section","text":{"type":"mrkdwn","text":format!("*Administrator health*\nPending confirmation gates: *{pending_count}*\nSlack Socket Mode: connected")}}));
+        } else {
+            blocks.push(serde_json::json!({"type":"context","elements":[{"type":"mrkdwn","text":"Your ticket status remains in the originating Slack thread."}]}));
+        }
+        let view = HomeView::new(&serde_json::json!({"type":"home","blocks":blocks}).to_string())
+            .map_err(|_| ())?;
+        let request = PublishViewRequest::new(user.clone(), view);
+        match SlackClient::publish_view(self, &request).map_err(|_| ())? {
+            SlackOutcome::Accepted(()) => Ok(()),
+            SlackOutcome::Rejected(_) => Err(()),
+        }
+    }
+}
+
+struct SlackTicketRouter<P> {
+    poster: P,
+    manage: Box<dyn crate::telegram_bridge::TicketActionSurface + Send>,
+    channels: ChannelMap,
+    admins: Vec<UserId>,
+    members: Vec<UserId>,
+    features: Vec<SlackFeature>,
+    interactive_decisions: bool,
+    gates: Arc<std::sync::Mutex<crate::telegram_bridge::TicketGateRegistry>>,
+    github_actions: Option<GitHubActionEngine<SocketRunLane>>,
+}
+
+impl<P: SlackTicketPoster> SlackTicketRouter<P> {
+    fn handle_monique_command(&mut self, command: SlackMoniqueCommand, context: &str) {
+        if !self.features.contains(&SlackFeature::Commands) {
+            return;
+        }
+        let text = command.text.trim();
+        let ticket_text = text.strip_prefix("ticket ").unwrap_or(text);
+        if let Ok(Some(issue_url)) = one_issue_url(ticket_text) {
+            match self.manage.dispatch_ticket(&issue_url, &command.source_key) {
+                Ok(receipt) if !receipt.approved => {
+                    let registered = self.gates.lock().ok().is_some_and(|mut gates| {
+                        gates
+                            .register(crate::telegram_bridge::PendingTicketGate {
+                                job_id: receipt.job_id.clone(),
+                                issue_url: issue_url.clone(),
+                                source_key: command.source_key.clone(),
+                            })
+                            .is_ok()
+                    });
+                    let reply = if registered {
+                        format!(
+                            "🔐 Confirmation required for {}\n{}\nMonique job `{}` is pending approval. Use `/monique approve {}` or `/monique reject {} <reason>`, or decide in Manage.",
+                            receipt.issue_title,
+                            receipt.issue_url,
+                            receipt.job_id.get(..12).unwrap_or(&receipt.job_id),
+                            receipt.job_id.get(..12).unwrap_or(&receipt.job_id),
+                            receipt.job_id.get(..12).unwrap_or(&receipt.job_id),
+                        )
+                    } else {
+                        String::from(
+                            "Manage created the pending gate, but Monique could not retain its coordinates. Decide it in Manage; no work was released.",
+                        )
+                    };
+                    let _ = self.poster.post_channel(&command.channel, &reply);
+                }
+                Ok(_) => {
+                    let _ = self.poster.post_channel(
+                        &command.channel,
+                        "Manage returned an already-approved job to unconfirmed Slack intake; no new action was taken.",
+                    );
+                }
+                Err(_) => {
+                    let _ = self.poster.post_channel(
+                        &command.channel,
+                        "Manage could not create a pending confirmation, so no work was released.",
+                    );
+                }
+            }
+            return;
+        }
+        if !self.members.contains(&command.user) {
+            let _ = self.poster.post_channel(
+                &command.channel,
+                "Only a configured Monique member can use this command. Posting one GitHub issue URL in the intake channel remains available to channel members.",
+            );
+            return;
+        }
+        if text.is_empty() || text == "help" {
+            let _ = self.poster.post_channel(
+                &command.channel,
+                "Monique commands: `ticket <GitHub issue URL>`, `help`. Admins can also use `approve <job>`, `reject <job> <reason>`, `status <job>`, and natural-language GitHub actions. Legacy `/github_*` commands remain available during migration.",
+            );
+            return;
+        }
+        let is_admin = self.admins.contains(&command.user);
+        if let Some(reference) = text.strip_prefix("approve ") {
+            if !is_admin {
+                let _ = self.poster.post_channel(
+                    &command.channel,
+                    "Only a configured Slack administrator can approve tickets.",
+                );
+                return;
+            }
+            let matches = self
+                .gates
+                .lock()
+                .map(|gates| gates.matching(reference.trim()))
+                .unwrap_or_default();
+            let [pending] = matches.as_slice() else {
+                let _ = self.poster.post_channel(
+                    &command.channel,
+                    "No unique pending ticket matches that job reference.",
+                );
+                return;
+            };
+            let reply = match self
+                .manage
+                .confirm_ticket(&pending.issue_url, &pending.source_key)
+            {
+                Ok(receipt) if receipt.approved => {
+                    let _ = self
+                        .gates
+                        .lock()
+                        .map(|mut gates| gates.resolve(&pending.job_id));
+                    format!(
+                        "✅ Confirmed by <@{}>. Monique job `{}` is {}.",
+                        command.user,
+                        receipt.job_id.get(..12).unwrap_or(&receipt.job_id),
+                        receipt.job_status.as_str()
+                    )
+                }
+                _ => String::from("Manage did not accept that approval, so no work was released."),
+            };
+            let _ = self.poster.post_channel(&command.channel, &reply);
+            return;
+        }
+        if let Some(rest) = text.strip_prefix("reject ") {
+            if !is_admin {
+                let _ = self.poster.post_channel(
+                    &command.channel,
+                    "Only a configured Slack administrator can reject tickets.",
+                );
+                return;
+            }
+            let Some((reference, reason)) = rest.trim().split_once(char::is_whitespace) else {
+                let _ = self.poster.post_channel(
+                    &command.channel,
+                    "A rejection reason is required: `/monique reject <job> <reason>`.",
+                );
+                return;
+            };
+            let Ok(decision) = TicketDecision::reject(reason) else {
+                let _ = self.poster.post_channel(
+                    &command.channel,
+                    "The rejection reason is empty or too long.",
+                );
+                return;
+            };
+            let matches = self
+                .gates
+                .lock()
+                .map(|gates| gates.matching(reference))
+                .unwrap_or_default();
+            let [pending] = matches.as_slice() else {
+                let _ = self.poster.post_channel(
+                    &command.channel,
+                    "No unique pending ticket matches that job reference.",
+                );
+                return;
+            };
+            let actor_key = format!("slack:{}:{}", command.team_id, command.user);
+            let reply = match self.manage.decide_ticket(
+                &pending.job_id,
+                &pending.source_key,
+                &command.source_key,
+                &actor_key,
+                decision,
+            ) {
+                Ok(receipt) if receipt.decision == TicketDecisionOutcome::Rejected => {
+                    let _ = self
+                        .gates
+                        .lock()
+                        .map(|mut gates| gates.resolve(&pending.job_id));
+                    format!(
+                        "⛔ Rejected by <@{}>. Monique job `{}` was cancelled.",
+                        command.user,
+                        receipt.job_id.get(..12).unwrap_or(&receipt.job_id)
+                    )
+                }
+                _ => {
+                    String::from("Manage did not accept that rejection; the gate remains pending.")
+                }
+            };
+            let _ = self.poster.post_channel(&command.channel, &reply);
+            return;
+        }
+        if let Some(reference) = text.strip_prefix("status ") {
+            if !is_admin {
+                let _ = self.poster.post_channel(
+                    &command.channel,
+                    "Ticket status for members remains in the originating thread.",
+                );
+                return;
+            }
+            let matches = self
+                .gates
+                .lock()
+                .map(|gates| gates.matching(reference.trim()))
+                .unwrap_or_default();
+            let job_id = matches
+                .first()
+                .map_or(reference.trim(), |gate| gate.job_id.as_str());
+            let reply = self.manage.ticket_status(job_id).map_or_else(
+                |_| String::from("Manage could not read that job status."),
+                |status| {
+                    format!(
+                        "Monique job `{}` is {}.\n{}",
+                        status.job_id.get(..12).unwrap_or(&status.job_id),
+                        status.job_status.as_str(),
+                        status.result.trim()
+                    )
+                },
+            );
+            let _ = self.poster.post_channel(&command.channel, &reply);
+            return;
+        }
+        if is_admin && let Some(actions) = self.github_actions.as_ref() {
+            match actions.natural_request(text) {
+                Ok(Some(request)) => {
+                    let result = self.github_actions.as_mut().expect("checked").execute(
+                        &command.source_key,
+                        request,
+                        context,
+                    );
+                    let _ = self.poster.post_channel(&command.channel, &result.text);
+                    return;
+                }
+                Ok(None) => {}
+                Err(reply) => {
+                    let _ = self.poster.post_channel(&command.channel, &reply);
+                    return;
+                }
+            }
+        }
+        let _ = self.poster.post_channel(&command.channel, "I could not map that `/monique` request to an enabled Slack capability. Use `/monique help`." );
+    }
+
+    fn handle_app_home(&mut self, user: &UserId) {
+        if !self.features.contains(&SlackFeature::AppHome) || !self.members.contains(user) {
+            return;
+        }
+        let pending_count = self
+            .gates
+            .lock()
+            .map(|gates| gates.len())
+            .unwrap_or_default();
+        let _ = self
+            .poster
+            .publish_home(user, self.admins.contains(user), pending_count);
+    }
+
+    fn prepare_interaction(
+        &self,
+        interaction: SlackTicketInteraction,
+        store: &mut SlackInteractionStore,
+    ) -> Result<Option<PreparedSlackTicketInteraction>, ()> {
+        if !self.interactive_decisions
+            || !self.features.contains(&SlackFeature::Approvals)
+            || !self.admins.contains(&interaction.user)
+            || !self
+                .channels
+                .0
+                .iter()
+                .any(|(_, channel)| channel == &interaction.channel)
+        {
+            return Ok(None);
+        }
+        let gate = self
+            .gates
+            .lock()
+            .map_err(|_| ())?
+            .matching(&interaction.job_id)
+            .into_iter()
+            .find(|gate| gate.job_id == interaction.job_id)
+            .ok_or(())?;
+        let actor_key = format!("slack:{}:{}", interaction.team_id, interaction.user);
+        let action = match interaction.kind {
+            SlackTicketInteractionKind::Approve => SlackInteractionAction::Approve,
+            SlackTicketInteractionKind::RejectOpen { .. }
+            | SlackTicketInteractionKind::RejectSubmit { .. } => SlackInteractionAction::Reject,
+        };
+        let (record, _) = store
+            .record(&SlackInteractionInput {
+                interaction_key: &interaction.interaction_key,
+                job_id: &gate.job_id,
+                ticket_source_key: &gate.source_key,
+                actor_key: &actor_key,
+                action,
+                channel_id: interaction.channel.as_str(),
+                message_ts: interaction.message_ts.as_str(),
+                recorded_at_ms: crate::unix_millis().unwrap_or_default(),
+            })
+            .map_err(|_| ())?;
+        Ok(Some(PreparedSlackTicketInteraction {
+            interaction,
+            gate,
+            record,
+        }))
+    }
+
+    fn handle_interaction(
+        &mut self,
+        prepared: PreparedSlackTicketInteraction,
+        store: &mut SlackInteractionStore,
+    ) {
+        let PreparedSlackTicketInteraction {
+            interaction,
+            gate,
+            record,
+        } = prepared;
+        if record.state != SlackInteractionState::Recorded {
+            return;
+        }
+        let now = crate::unix_millis().unwrap_or_default();
+        if let SlackTicketInteractionKind::RejectOpen { trigger_id } = &interaction.kind {
+            let state = if self
+                .poster
+                .open_reject_modal(
+                    trigger_id,
+                    &gate.job_id,
+                    &interaction.channel,
+                    &interaction.message_ts,
+                )
+                .is_ok()
+            {
+                SlackInteractionState::Applied
+            } else {
+                SlackInteractionState::Failed
+            };
+            let _ = store.resolve(&record.interaction_key, record.revision, state, now);
+            return;
+        }
+        let decision = match &interaction.kind {
+            SlackTicketInteractionKind::Approve => TicketDecision::Approve,
+            SlackTicketInteractionKind::RejectSubmit { reason } => {
+                let Ok(decision) = TicketDecision::reject(reason) else {
+                    return;
+                };
+                decision
+            }
+            SlackTicketInteractionKind::RejectOpen { .. } => return,
+        };
+        let expected = match &decision {
+            TicketDecision::Approve => TicketDecisionOutcome::Approved,
+            TicketDecision::Reject { .. } => TicketDecisionOutcome::Rejected,
+        };
+        let actor_key = format!("slack:{}:{}", interaction.team_id, interaction.user);
+        let accepted = self
+            .manage
+            .decide_ticket(
+                &gate.job_id,
+                &gate.source_key,
+                &interaction.interaction_key,
+                &actor_key,
+                decision,
+            )
+            .ok()
+            .filter(|receipt| receipt.job_id == gate.job_id && receipt.decision == expected);
+        let state = if let Some(receipt) = accepted {
+            let _ = self
+                .gates
+                .lock()
+                .map(|mut gates| gates.resolve(&gate.job_id));
+            let text = match receipt.decision {
+                TicketDecisionOutcome::Approved => format!(
+                    "✅ Confirmed by <@{}>. Monique job `{}` is {}.",
+                    interaction.user,
+                    receipt.job_id.get(..12).unwrap_or(&receipt.job_id),
+                    receipt.job_status.as_str()
+                ),
+                TicketDecisionOutcome::Rejected => format!(
+                    "⛔ Rejected by <@{}>. Monique job `{}` was cancelled.",
+                    interaction.user,
+                    receipt.job_id.get(..12).unwrap_or(&receipt.job_id)
+                ),
+            };
+            let _ =
+                self.poster
+                    .update_decision(&interaction.channel, &interaction.message_ts, &text);
+            SlackInteractionState::Applied
+        } else {
+            SlackInteractionState::Failed
+        };
+        let _ = store.resolve(&record.interaction_key, record.revision, state, now);
+    }
+
+    fn capture_memory(
+        &self,
+        memory: &mut AgentMemoryStore,
+        event: &SlackTicketEvent,
+    ) -> Result<(), ()> {
+        if !self.members.contains(&event.user)
+            || !self
+                .channels
+                .0
+                .iter()
+                .any(|(_, channel)| channel == &event.channel)
+        {
+            return Ok(());
+        }
+        let identity = memory
+            .resolve_identity(
+                "slack",
+                "automonique-slack",
+                &event.team_id,
+                event.user.as_str(),
+            )
+            .map_err(|_| ())?;
+        let (tenant, actor) = identity.unwrap_or_else(|| {
+            (
+                String::from("inklura"),
+                format!("slack:{}:{}", event.team_id, event.user),
+            )
+        });
+        memory
+            .bind_identity(
+                &tenant,
+                &actor,
+                ExternalIdentity {
+                    platform: "slack",
+                    application: "automonique-slack",
+                    external_tenant: &event.team_id,
+                    external_user: event.user.as_str(),
+                },
+                crate::unix_millis().unwrap_or_default(),
+            )
+            .map_err(|_| ())?;
+        let external_scope = format!("channel:{}:thread:{}", event.channel, event.parent);
+        let conversation_id = format!(
+            "slack:{}:{}:{}:{}",
+            event.team_id, event.channel, event.parent, event.user
+        );
+        let content = redact_content(&event.text);
+        memory
+            .record_message(&MessageInput {
+                tenant: &tenant,
+                actor: &actor,
+                conversation_id: &conversation_id,
+                transport: "slack",
+                external_scope: &external_scope,
+                transport_key: &event.source_key,
+                role: "user",
+                content: &content,
+                created_at_ms: crate::unix_millis().unwrap_or_default(),
+            })
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
+    fn capture_command_memory(
+        &self,
+        memory: &mut AgentMemoryStore,
+        command: &SlackGitHubCommand,
+    ) -> Result<(), ()> {
+        let identity = memory
+            .resolve_identity(
+                "slack",
+                "automonique-slack",
+                &command.team_id,
+                command.user.as_str(),
+            )
+            .map_err(|_| ())?;
+        let (tenant, actor) = identity.unwrap_or_else(|| {
+            (
+                String::from("inklura"),
+                format!("slack:{}:{}", command.team_id, command.user),
+            )
+        });
+        memory
+            .bind_identity(
+                &tenant,
+                &actor,
+                ExternalIdentity {
+                    platform: "slack",
+                    application: "automonique-slack",
+                    external_tenant: &command.team_id,
+                    external_user: command.user.as_str(),
+                },
+                crate::unix_millis().unwrap_or_default(),
+            )
+            .map_err(|_| ())?;
+        let content = match &command.request {
+            GitHubActionRequest::Create { instruction, .. }
+            | GitHubActionRequest::Reply { instruction, .. }
+            | GitHubActionRequest::Check { instruction, .. }
+            | GitHubActionRequest::Manage { instruction, .. } => redact_content(instruction),
+        };
+        let external_scope = format!("channel:{}:github-command", command.channel);
+        let conversation_id = format!(
+            "slack:{}:{}:github-command:{}",
+            command.team_id, command.channel, command.user
+        );
+        memory
+            .record_message(&MessageInput {
+                tenant: &tenant,
+                actor: &actor,
+                conversation_id: &conversation_id,
+                transport: "slack",
+                external_scope: &external_scope,
+                transport_key: &command.source_key,
+                role: "user",
+                content: &content,
+                created_at_ms: crate::unix_millis().unwrap_or_default(),
+            })
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
+    fn handle_github_command(&mut self, command: SlackGitHubCommand, context: &str) {
+        let result = self.github_actions.as_mut().map_or_else(
+            || crate::github_actions::GitHubActionResult {
+                text: String::from(
+                    "GitHub actions are not configured on this daemon, so nothing changed.",
+                ),
+                successful: false,
+            },
+            |actions| actions.execute(&command.source_key, command.request, context),
+        );
+        let _ = self.poster.post_channel(&command.channel, &result.text);
+    }
+
+    fn handle_with_context(&mut self, event: SlackTicketEvent, context: &str) {
+        if !self
+            .channels
+            .0
+            .iter()
+            .any(|(_, channel)| channel == &event.channel)
+        {
+            return;
+        }
+        let trimmed = event.text.trim();
+        let conversational = self.features.contains(&SlackFeature::Conversation)
+            && self.members.contains(&event.user)
+            && (event.app_mention || event.channel.as_str().starts_with('D'));
+        if conversational {
+            if is_github_capability_question(trimmed) {
+                let text = if self.github_actions.is_some() {
+                    "Yes. I can create GitHub issues, reply to them, and check or uncheck checklist items in configured repositories."
+                } else {
+                    "GitHub actions are not configured on this daemon, so I can only read configured issues here."
+                };
+                let _ = self.poster.post_thread(&event.channel, &event.parent, text);
+                return;
+            }
+            if self.admins.contains(&event.user)
+                && let Some(actions) = self.github_actions.as_ref()
+            {
+                match actions.natural_request(trimmed) {
+                    Ok(Some(request)) => {
+                        let result = self
+                            .github_actions
+                            .as_mut()
+                            .expect("GitHub action surface checked above")
+                            .execute(&event.source_key, request, context);
+                        let _ =
+                            self.poster
+                                .post_thread(&event.channel, &event.parent, &result.text);
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(text) => {
+                        let _ = self
+                            .poster
+                            .post_thread(&event.channel, &event.parent, &text);
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(reference) = trimmed
+            .strip_prefix("confirm ")
+            .or_else(|| trimmed.strip_prefix("approve "))
+        {
+            if !self.features.contains(&SlackFeature::Approvals) {
+                return;
+            }
+            self.confirm(&event, reference.trim());
+            return;
+        }
+        let issue_url = match one_issue_url(trimmed) {
+            Ok(Some(issue_url)) => issue_url,
+            Ok(None) => return,
+            Err(()) => {
+                let _ = self.poster.post_thread(
+                    &event.channel,
+                    &event.parent,
+                    "Jean found more than one GitHub issue URL. Post one ticket per message so each confirmation is exact.",
+                );
+                return;
+            }
+        };
+        if !self.features.contains(&SlackFeature::Approvals) {
+            return;
+        }
+        match self.manage.dispatch_ticket(&issue_url, &event.source_key) {
+            Ok(receipt) if !receipt.approved => {
+                let registered = self.gates.lock().ok().is_some_and(|mut gates| {
+                    gates
+                        .register(crate::telegram_bridge::PendingTicketGate {
+                            job_id: receipt.job_id.clone(),
+                            issue_url,
+                            source_key: event.source_key,
+                        })
+                        .is_ok()
+                });
+                if !registered {
+                    let _ = self.poster.post_thread(
+                        &event.channel,
+                        &event.parent,
+                        "The ticket is pending in Manage, but Jean could not retain its cross-channel confirmation coordinates. Confirm it in Manage; no work has been released.",
+                    );
+                    return;
+                }
+                if self.interactive_decisions {
+                    let _ = self
+                        .poster
+                        .post_approval_card(&event.channel, &event.parent, &receipt);
+                } else {
+                    let short = receipt.job_id.get(..12).unwrap_or(&receipt.job_id);
+                    let _ = self.poster.post_thread(
+                        &event.channel,
+                        &event.parent,
+                        &format!(
+                            "🔐 Confirmation required for `{}`\n{}\nJean job `{short}` is pending approval. A configured Slack admin can reply `confirm {short}`; the same request can also be confirmed in Telegram or Manage. No work starts before confirmation.",
+                            receipt.issue_title, receipt.issue_url
+                        ),
+                    );
+                }
+            }
+            Ok(_) => {
+                let _ = self.poster.post_thread(
+                    &event.channel,
+                    &event.parent,
+                    "Manage returned an already-approved job to an unconfirmed Slack intake. The gate contract was violated; check Manage immediately.",
+                );
+            }
+            Err(_) => {
+                let _ = self.poster.post_thread(
+                    &event.channel,
+                    &event.parent,
+                    "Manage could not create the pending ticket confirmation, so no work was released.",
+                );
+            }
+        }
+    }
+
+    fn confirm(&mut self, event: &SlackTicketEvent, reference: &str) {
+        if !self.admins.contains(&event.user) {
+            let _ = self.poster.post_thread(
+                &event.channel,
+                &event.parent,
+                "Only a configured Slack administrator can confirm this ticket.",
+            );
+            return;
+        }
+        let matches = self
+            .gates
+            .lock()
+            .map(|gates| gates.matching(reference))
+            .unwrap_or_default();
+        let [pending] = matches.as_slice() else {
+            let reply = if matches.is_empty() {
+                "No pending ticket confirmation matches that reference."
+            } else {
+                "That reference is ambiguous; reply with the full Jean job id."
+            };
+            let _ = self
+                .poster
+                .post_thread(&event.channel, &event.parent, reply);
+            return;
+        };
+        match self
+            .manage
+            .confirm_ticket(&pending.issue_url, &pending.source_key)
+        {
+            Ok(receipt) if receipt.approved => {
+                let _ = self
+                    .gates
+                    .lock()
+                    .map(|mut gates| gates.resolve(&pending.job_id));
+                let short = receipt.job_id.get(..12).unwrap_or(&receipt.job_id);
+                let _ = self.poster.post_thread(
+                    &event.channel,
+                    &event.parent,
+                    &format!(
+                        "✅ Confirmed by <@{}>. Jean job `{short}` is {}.",
+                        event.user,
+                        receipt.job_status.as_str()
+                    ),
+                );
+            }
+            Ok(_) => {
+                let _ = self.poster.post_thread(
+                    &event.channel,
+                    &event.parent,
+                    "Manage kept the ticket pending, so no work was released.",
+                );
+            }
+            Err(_) => {
+                let _ = self.poster.post_thread(
+                    &event.channel,
+                    &event.parent,
+                    "Manage did not accept that confirmation, so no work was released.",
+                );
+            }
+        }
+    }
+}
+
+pub(crate) struct SlackTicketWorker {
+    app: AppsConnectionsOpenClient,
+    connector: SlackSocketModeConnector,
+    router: SlackTicketRouter<SlackClient>,
+    memory: AgentMemoryStore,
+    interactions: SlackInteractionStore,
+}
+
+/// Socket Mode ticket-intake lifecycle, separate from Telegram's Slack read and
+/// post surface so Slack works even when Telegram is disabled.
+pub(crate) enum SlackTicketHost {
+    Disabled,
+    Configured {
+        prepared: Option<Box<SlackTicketWorker>>,
+        stop: Arc<AtomicBool>,
+        worker: Option<JoinHandle<()>>,
+    },
+}
+
+impl SlackTicketHost {
+    pub fn open(
+        state_dir: &Path,
+        admin_socket: &Path,
+        run_index_path: &Path,
+        gates: Arc<std::sync::Mutex<crate::telegram_bridge::TicketGateRegistry>>,
+    ) -> Result<Self, SlackConfigError> {
+        let Some(config) = SlackConfig::load(state_dir)? else {
+            return Ok(Self::Disabled);
+        };
+        let SlackConfig {
+            token,
+            app_token,
+            channels,
+            admins,
+            members,
+            features,
+            interactive_decisions,
+        } = config;
+        let Some(app_token) = app_token else {
+            return Ok(Self::Disabled);
+        };
+        let manage = crate::ticket_intake::FleetConfig::load(state_dir)
+            .map_err(|_| SlackConfigError::TicketActionsUnavailable)?
+            .ok_or(SlackConfigError::TicketActionsUnavailable)?
+            .into_action_client();
+        let github_actions = match crate::github::GitHubHost::load(state_dir)
+            .map_err(|_| SlackConfigError::GitHubActionsUnavailable)?
+            .into_action_surface()
+        {
+            Some(surface) => {
+                let lane = SocketRunLane::open(state_dir, admin_socket, run_index_path)
+                    .map_err(|_| SlackConfigError::GitHubActionsUnavailable)?;
+                Some(GitHubActionEngine::new(
+                    Arc::new(std::sync::Mutex::new(lane)),
+                    surface,
+                ))
+            }
+            None => None,
+        };
+        Ok(Self::Configured {
+            prepared: Some(Box::new(SlackTicketWorker {
+                app: AppsConnectionsOpenClient::new(app_token),
+                connector: SlackSocketModeConnector::new(),
+                memory: AgentMemoryStore::open(state_dir.join("agent-memory.sqlite3"))
+                    .map_err(|_| SlackConfigError::TicketActionsUnavailable)?,
+                interactions: SlackInteractionStore::open(
+                    state_dir.join("slack-ticket-interactions.sqlite3"),
+                )
+                .map_err(|_| SlackConfigError::TicketActionsUnavailable)?,
+                router: SlackTicketRouter {
+                    poster: SlackClient::new(SlackBase::production(), token),
+                    manage: Box::new(manage),
+                    channels,
+                    admins,
+                    members,
+                    features,
+                    interactive_decisions,
+                    gates,
+                    github_actions,
+                },
+            })),
+            stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
+        })
+    }
+
+    pub fn start(&mut self) -> Result<(), SlackConfigError> {
+        let Self::Configured {
+            prepared,
+            stop,
+            worker,
+        } = self
+        else {
+            return Ok(());
+        };
+        let Some(mut prepared) = prepared.take() else {
+            return Ok(());
+        };
+        let stop = Arc::clone(stop);
+        *worker = Some(
+            std::thread::Builder::new()
+                .name(String::from("automonique-slack-tickets"))
+                .spawn(move || run_slack_ticket_worker(&mut prepared, &stop))
+                .map_err(|_| SlackConfigError::TicketActionsUnavailable)?,
+        );
+        Ok(())
+    }
+
+    pub fn shutdown(&mut self) {
+        let Self::Configured { stop, worker, .. } = self else {
+            return;
+        };
+        stop.store(true, Ordering::Release);
+        if let Some(worker) = worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for SlackTicketHost {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
+    while !stop.load(Ordering::Acquire) {
+        let url = match worker.app.open() {
+            Ok(SlackOutcome::Accepted(url)) => url,
+            Ok(SlackOutcome::Rejected(_)) | Err(_) => {
+                slack_backoff(stop);
+                continue;
+            }
+        };
+        let Ok(mut connection) = worker.connector.connect(&url) else {
+            slack_backoff(stop);
+            continue;
+        };
+        while !stop.load(Ordering::Acquire) {
+            let Ok(envelope) = connection.receive_envelope() else {
+                break;
+            };
+            let Some(envelope_id) = socket_envelope_id(envelope.as_str()) else {
+                break;
+            };
+            let event = slack_ticket_event(envelope.as_str());
+            let app_home_user = match slack_app_home_user(envelope.as_str()) {
+                Ok(user) => user,
+                Err(()) => break,
+            };
+            let interaction = match slack_ticket_interaction(envelope.as_str()) {
+                Ok(interaction) => interaction,
+                Err(()) => break,
+            };
+            let prepared_interaction = match interaction {
+                Some(interaction) => match worker
+                    .router
+                    .prepare_interaction(interaction, &mut worker.interactions)
+                {
+                    Ok(prepared) => prepared,
+                    Err(()) => break,
+                },
+                None => None,
+            };
+            let command = match slack_github_command(
+                envelope.as_str(),
+                &worker.router.channels,
+                &worker.router.admins,
+            ) {
+                Ok(command) => command,
+                Err(()) => break,
+            };
+            let command = if worker.router.features.contains(&SlackFeature::Commands) {
+                command
+            } else {
+                None
+            };
+            let monique_command =
+                match slack_monique_command(envelope.as_str(), &worker.router.channels) {
+                    Ok(command) => command,
+                    Err(()) => break,
+                };
+            if event.as_ref().is_some_and(|event| {
+                worker
+                    .router
+                    .capture_memory(&mut worker.memory, event)
+                    .is_err()
+            }) {
+                break;
+            }
+            if command.as_ref().is_some_and(|command| {
+                worker
+                    .router
+                    .capture_command_memory(&mut worker.memory, command)
+                    .is_err()
+            }) {
+                break;
+            }
+            if connection.acknowledge(&envelope_id).is_err() {
+                break;
+            }
+            if let Some(event) = event {
+                let context = slack_event_context(&worker.memory, &event);
+                worker.router.handle_with_context(event, &context);
+            }
+            if let Some(command) = command {
+                let context = slack_command_context(&worker.memory, &command);
+                worker.router.handle_github_command(command, &context);
+            }
+            if let Some(interaction) = prepared_interaction {
+                worker
+                    .router
+                    .handle_interaction(interaction, &mut worker.interactions);
+            }
+            if let Some(user) = app_home_user {
+                worker.router.handle_app_home(&user);
+            }
+            if let Some(command) = monique_command {
+                worker.router.handle_monique_command(command, "");
+            }
+        }
+    }
+}
+
+fn slack_event_context(memory: &AgentMemoryStore, event: &SlackTicketEvent) -> String {
+    let (tenant, actor) = memory
+        .resolve_identity(
+            "slack",
+            "automonique-slack",
+            &event.team_id,
+            event.user.as_str(),
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| {
+            (
+                String::from("inklura"),
+                format!("slack:{}:{}", event.team_id, event.user),
+            )
+        });
+    let conversation_id = format!(
+        "slack:{}:{}:{}:{}",
+        event.team_id, event.channel, event.parent, event.user
+    );
+    recent_slack_context(memory, &tenant, &actor, &conversation_id)
+}
+
+fn slack_command_context(memory: &AgentMemoryStore, command: &SlackGitHubCommand) -> String {
+    let (tenant, actor) = memory
+        .resolve_identity(
+            "slack",
+            "automonique-slack",
+            &command.team_id,
+            command.user.as_str(),
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| {
+            (
+                String::from("inklura"),
+                format!("slack:{}:{}", command.team_id, command.user),
+            )
+        });
+    let conversation_id = format!(
+        "slack:{}:{}:github-command:{}",
+        command.team_id, command.channel, command.user
+    );
+    recent_slack_context(memory, &tenant, &actor, &conversation_id)
+}
+
+fn recent_slack_context(
+    memory: &AgentMemoryStore,
+    tenant: &str,
+    actor: &str,
+    conversation_id: &str,
+) -> String {
+    let memories = memory
+        .active_for_actor(tenant, actor, crate::unix_millis().unwrap_or_default())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|memory| format!("{}: {}", memory.kind.as_str(), memory.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Ok(messages) = memory.recent_messages(
+        tenant,
+        actor,
+        conversation_id,
+        crate::unix_millis().unwrap_or_default(),
+        20,
+    ) else {
+        return String::new();
+    };
+    let messages = messages
+        .into_iter()
+        .map(|message| format!("{}: {}", message.role, message.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let context = if memories.is_empty() {
+        messages
+    } else if messages.is_empty() {
+        format!("[reviewed memory]\n{memories}")
+    } else {
+        format!("[reviewed memory]\n{memories}\n\n[recent conversation]\n{messages}")
+    };
+    if context.len() <= 8 * 1024 {
+        return context;
+    }
+    let mut start = context.len() - 8 * 1024;
+    while !context.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("[…truncated]\n{}", &context[start..])
+}
+
+fn slack_backoff(stop: &AtomicBool) {
+    for _ in 0..10 {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -814,6 +2729,14 @@ mod tests {
         let mut text = vec![String::from(CONFIG_HEADER)];
         text.extend(lines.iter().map(|line| (*line).to_owned()));
         text.push(String::from(CONFIG_TERMINATOR));
+        text.push(String::new());
+        text.join("\n")
+    }
+
+    fn config_v2(lines: &[&str]) -> String {
+        let mut text = vec![String::from(CONFIG_HEADER_V2)];
+        text.extend(lines.iter().map(|line| (*line).to_owned()));
+        text.push(String::from(CONFIG_TERMINATOR_V2));
         text.push(String::new());
         text.join("\n")
     }
@@ -1361,5 +3284,505 @@ mod tests {
         let row = reply.lines().nth(1).expect("one row");
         assert!(row.ends_with('…'), "{row}");
         assert!(row.len() < long.len(), "{row}");
+    }
+
+    #[test]
+    fn socket_mode_requires_an_explicit_admin_set_and_redacts_both_tokens() {
+        let mut lines = complete();
+        lines.push(String::from("app_token=xapp-fixture-secret"));
+        assert_eq!(
+            SlackConfig::parse(&config(&borrowed(&lines)))
+                .expect_err("socket mode without admins")
+                .category(),
+            "slack_config_admin"
+        );
+        lines.push(String::from("admin=U0RESERVED1"));
+        let parsed = SlackConfig::parse(&config(&borrowed(&lines)))
+            .expect("ticket intake config")
+            .expect("present");
+        let rendered = format!("{parsed:?}");
+        assert!(rendered.contains("enabled"));
+        assert!(rendered.contains("admin_count: 1"));
+        assert!(!rendered.contains("fixture-secret"));
+    }
+
+    #[test]
+    fn v2_members_features_and_admin_implication_are_closed() {
+        let parsed = SlackConfig::parse(&config_v2(&[
+            &format!("token={SECRET}"),
+            "app_token=xapp-fixture-secret",
+            "channel=jean:C0RESERVED01",
+            "member=U0MEMBER001",
+            "admin=U0ADMIN001",
+            "feature=approvals",
+            "feature=conversation",
+        ]))
+        .expect("v2 config")
+        .expect("present");
+        assert_eq!(parsed.members.len(), 2);
+        assert!(parsed.members.contains(&UserId::new("U0ADMIN001").unwrap()));
+        assert_eq!(
+            parsed.features,
+            vec![SlackFeature::Approvals, SlackFeature::Conversation]
+        );
+
+        for bad in ["feature=future", "feature=approvals\nfeature=approvals"] {
+            let frame = config_v2(&[&format!("token={SECRET}"), "channel=jean:C0RESERVED01", bad]);
+            assert_eq!(
+                SlackConfig::parse(&frame)
+                    .expect_err("closed feature")
+                    .category(),
+                "slack_config_feature"
+            );
+        }
+        let files = config_v2(&[
+            &format!("token={SECRET}"),
+            "channel=jean:C0RESERVED01",
+            "feature=files",
+        ]);
+        assert_eq!(
+            SlackConfig::parse(&files)
+                .expect_err("artifact policy is mandatory")
+                .category(),
+            "slack_artifact_policy_required"
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeTicketPoster {
+        messages: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SlackTicketPoster for FakeTicketPoster {
+        fn post_thread(
+            &mut self,
+            _channel: &ChannelId,
+            _parent: &MessageTs,
+            text: &str,
+        ) -> Result<(), ()> {
+            self.messages
+                .lock()
+                .expect("messages")
+                .push(text.to_owned());
+            Ok(())
+        }
+
+        fn post_channel(&mut self, _channel: &ChannelId, text: &str) -> Result<(), ()> {
+            self.messages
+                .lock()
+                .expect("messages")
+                .push(text.to_owned());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeManage {
+        opened: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        confirmed: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    fn ticket_receipt(approved: bool) -> automonique_support_connector::TicketDispatchReceipt {
+        automonique_support_connector::TicketDispatchReceipt {
+            issue_id: String::from("issue-fixture"),
+            issue_url: String::from("https://github.com/example/project/issues/42"),
+            issue_title: String::from("Repair the form"),
+            project_label: String::from("Example"),
+            site_label: None,
+            workspace: automonique_support_connector::TicketWorkspace::InstanceDefault,
+            job_id: String::from("job-fixture-123456"),
+            job_status: if approved {
+                automonique_support_connector::TicketJobStatus::Pending
+            } else {
+                automonique_support_connector::TicketJobStatus::PendingApproval
+            },
+            duplicate: false,
+            approved,
+        }
+    }
+
+    impl crate::telegram_bridge::TicketActionSurface for FakeManage {
+        fn dispatch_ticket(
+            &mut self,
+            issue_url: &str,
+            source_key: &str,
+        ) -> Result<automonique_support_connector::TicketDispatchReceipt, String> {
+            self.opened
+                .lock()
+                .expect("opened")
+                .push((issue_url.to_owned(), source_key.to_owned()));
+            Ok(ticket_receipt(false))
+        }
+
+        fn confirm_ticket(
+            &mut self,
+            issue_url: &str,
+            source_key: &str,
+        ) -> Result<automonique_support_connector::TicketDispatchReceipt, String> {
+            self.confirmed
+                .lock()
+                .expect("confirmed")
+                .push((issue_url.to_owned(), source_key.to_owned()));
+            Ok(ticket_receipt(true))
+        }
+
+        fn ticket_status(
+            &mut self,
+            _job_id: &str,
+        ) -> Result<automonique_support_connector::TicketStatus, String> {
+            Err(String::from("not used"))
+        }
+    }
+
+    fn ticket_event(user: &str, text: &str, event_id: &str) -> SlackTicketEvent {
+        SlackTicketEvent {
+            team_id: String::from("T0RESERVED"),
+            channel: ChannelId::new("C0RESERVED01").expect("channel"),
+            user: UserId::new(user).expect("user"),
+            text: text.to_owned(),
+            parent: MessageTs::new("1723542000.000100").expect("timestamp"),
+            source_key: format!("slack:T0RESERVED:event:{event_id}"),
+            app_mention: false,
+        }
+    }
+
+    #[test]
+    fn configured_channel_ticket_waits_for_a_configured_slack_admin() {
+        let poster = FakeTicketPoster::default();
+        let messages = Arc::clone(&poster.messages);
+        let manage = FakeManage::default();
+        let opened = Arc::clone(&manage.opened);
+        let confirmed = Arc::clone(&manage.confirmed);
+        let mut router = SlackTicketRouter {
+            poster,
+            manage: Box::new(manage),
+            channels: ChannelMap(vec![(
+                name("jean"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![SlackFeature::Approvals, SlackFeature::Conversation],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+        };
+
+        router.handle_with_context(
+            ticket_event(
+                "U0REQUEST01",
+                "please handle https://github.com/example/project/issues/42",
+                "Ev1",
+            ),
+            "",
+        );
+        assert_eq!(opened.lock().expect("opened").len(), 1);
+        assert!(confirmed.lock().expect("confirmed").is_empty());
+        assert!(messages.lock().expect("messages")[0].contains("Confirmation required"));
+
+        router.handle_with_context(
+            ticket_event("U0REQUEST01", "confirm job-fixture", "Ev2"),
+            "",
+        );
+        assert!(confirmed.lock().expect("confirmed").is_empty());
+        assert!(
+            messages
+                .lock()
+                .expect("messages")
+                .iter()
+                .any(|message| message.contains("Only a configured Slack administrator"))
+        );
+
+        router.handle_with_context(ticket_event("U0ADMIN001", "confirm job-fixture", "Ev3"), "");
+        assert_eq!(confirmed.lock().expect("confirmed").len(), 1);
+        assert!(
+            messages
+                .lock()
+                .expect("messages")
+                .iter()
+                .any(|message| message.contains("Confirmed by <@U0ADMIN001>"))
+        );
+    }
+
+    #[test]
+    fn configured_admin_slack_memory_is_durable_deduplicated_and_secret_redacted() {
+        let root = tempfile::tempdir().expect("memory root");
+        std::fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private memory root");
+        let mut memory =
+            AgentMemoryStore::open(root.path().join("agent-memory.sqlite3")).expect("memory store");
+        let router = SlackTicketRouter {
+            poster: FakeTicketPoster::default(),
+            manage: Box::new(FakeManage::default()),
+            channels: ChannelMap(vec![(
+                name("jean"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![SlackFeature::Approvals, SlackFeature::Conversation],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+        };
+        let event = ticket_event(
+            "U0ADMIN001",
+            "remember token sk-123456789012345678901234",
+            "Memory1",
+        );
+        router
+            .capture_memory(&mut memory, &event)
+            .expect("first capture");
+        router
+            .capture_memory(&mut memory, &event)
+            .expect("replay capture");
+        let actor = "slack:T0RESERVED:U0ADMIN001";
+        assert_eq!(
+            memory
+                .resolve_identity("slack", "automonique-slack", "T0RESERVED", "U0ADMIN001")
+                .expect("binding"),
+            Some((String::from("inklura"), String::from(actor)))
+        );
+        assert_eq!(
+            memory.counts("inklura", actor).expect("counts").messages,
+            1,
+            "Slack event replay is one durable message"
+        );
+        let messages = memory
+            .recent_messages(
+                "inklura",
+                actor,
+                "slack:T0RESERVED:C0RESERVED01:1723542000.000100:U0ADMIN001",
+                crate::unix_millis().expect("clock"),
+                5,
+            )
+            .expect("history");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains("[REDACTED]"));
+        assert!(!messages[0].content.contains("sk-123456789012345678901234"));
+
+        router
+            .capture_memory(
+                &mut memory,
+                &ticket_event("U0REQUEST01", "private request", "Memory2"),
+            )
+            .expect("non-admin ignored");
+        assert_eq!(
+            memory
+                .resolve_identity("slack", "automonique-slack", "T0RESERVED", "U0REQUEST01")
+                .expect("no binding"),
+            None
+        );
+    }
+
+    #[test]
+    fn slack_admin_can_confirm_a_gate_created_by_another_transport() {
+        let poster = FakeTicketPoster::default();
+        let messages = Arc::clone(&poster.messages);
+        let manage = FakeManage::default();
+        let confirmed = Arc::clone(&manage.confirmed);
+        let gates = Arc::new(std::sync::Mutex::new(
+            crate::telegram_bridge::TicketGateRegistry::default(),
+        ));
+        gates
+            .lock()
+            .expect("gates")
+            .register(crate::telegram_bridge::PendingTicketGate {
+                job_id: String::from("job-from-telegram-123"),
+                issue_url: String::from("https://github.com/example/project/issues/42"),
+                source_key: String::from("telegram:123:update:9"),
+            })
+            .expect("gate registered");
+        let mut router = SlackTicketRouter {
+            poster,
+            manage: Box::new(manage),
+            channels: ChannelMap(vec![(
+                name("jean"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![SlackFeature::Approvals, SlackFeature::Conversation],
+            interactive_decisions: false,
+            gates,
+            github_actions: None,
+        };
+        router.handle_with_context(
+            ticket_event("U0ADMIN001", "confirm job-from-telegram", "Ev4"),
+            "",
+        );
+        assert_eq!(
+            confirmed.lock().expect("confirmed").as_slice(),
+            [(
+                String::from("https://github.com/example/project/issues/42"),
+                String::from("telegram:123:update:9")
+            )]
+        );
+        assert!(
+            messages
+                .lock()
+                .expect("messages")
+                .iter()
+                .any(|message| message.contains("Confirmed by <@U0ADMIN001>"))
+        );
+    }
+
+    #[test]
+    fn socket_event_is_acknowledgeable_and_excludes_bot_messages() {
+        let event = r#"{"envelope_id":"E1","type":"events_api","payload":{"event_id":"Ev1","team_id":"T0RESERVED","event":{"type":"message","channel":"C0RESERVED01","user":"U0REQUEST01","text":"https://github.com/example/project/issues/42","ts":"1723542000.000100"}}}"#;
+        assert_eq!(socket_envelope_id(event).as_deref(), Some("E1"));
+        assert_eq!(
+            slack_ticket_event(event).expect("event").source_key,
+            "slack:T0RESERVED:event:Ev1"
+        );
+        let bot = event.replace(
+            "\"type\":\"message\"",
+            "\"type\":\"message\",\"bot_id\":\"B0BOT00001\"",
+        );
+        assert!(slack_ticket_event(&bot).is_none());
+    }
+
+    #[test]
+    fn app_mentions_are_distinct_from_plain_ticket_messages() {
+        let mention = r#"{"envelope_id":"E2","type":"events_api","payload":{"event_id":"Ev2","team_id":"T0RESERVED","event":{"type":"app_mention","channel":"C0RESERVED01","user":"U0ADMIN001","text":"<@B0APP> reply https://github.com/example/project/issues/42 with the verification","ts":"1723542000.000200"}}}"#;
+        let parsed = slack_ticket_event(mention).expect("app mention");
+        assert!(parsed.app_mention);
+        assert_eq!(parsed.source_key, "slack:T0RESERVED:event:Ev2");
+
+        let plain = mention.replace("app_mention", "message");
+        assert!(
+            !slack_ticket_event(&plain)
+                .expect("plain message")
+                .app_mention
+        );
+    }
+
+    #[test]
+    fn approval_buttons_and_required_reason_submissions_are_typed() {
+        let approve = r#"{"type":"interactive","payload":{"type":"block_actions","team":{"id":"T0RESERVED"},"user":{"id":"U0ADMIN001"},"channel":{"id":"C0RESERVED01"},"container":{"message_ts":"1723542000.000100"},"trigger_id":"1337.abc","actions":[{"action_id":"monique_ticket_approve","action_ts":"1723542001.000200","value":"job-fixture-123456"}]}}"#;
+        let parsed = slack_ticket_interaction(approve)
+            .expect("valid action")
+            .expect("interaction");
+        assert_eq!(parsed.job_id, "job-fixture-123456");
+        assert!(matches!(parsed.kind, SlackTicketInteractionKind::Approve));
+
+        let reject = r#"{"type":"interactive","payload":{"type":"view_submission","team":{"id":"T0RESERVED"},"user":{"id":"U0ADMIN001"},"view":{"id":"V01","hash":"h01","callback_id":"monique_ticket_reject_submit","private_metadata":"{\"job_id\":\"job-fixture-123456\",\"channel_id\":\"C0RESERVED01\",\"message_ts\":\"1723542000.000100\"}","state":{"values":{"reason":{"value":{"type":"plain_text_input","value":"Not approved for release"}}}}}}}"#;
+        let parsed = slack_ticket_interaction(reject)
+            .expect("valid submission")
+            .expect("interaction");
+        assert!(matches!(
+            parsed.kind,
+            SlackTicketInteractionKind::RejectSubmit { ref reason }
+                if reason == "Not approved for release"
+        ));
+
+        let missing_reason = reject.replace("Not approved for release", "");
+        assert!(slack_ticket_interaction(&missing_reason).is_err());
+    }
+
+    #[test]
+    fn app_home_open_is_scoped_to_the_home_tab_user() {
+        let frame = r#"{"type":"events_api","payload":{"type":"event_callback","team_id":"T0RESERVED","event":{"type":"app_home_opened","user":"U0ADMIN001","tab":"home"}}}"#;
+        assert_eq!(
+            slack_app_home_user(frame)
+                .expect("event")
+                .map(|user| user.as_str().to_owned()),
+            Some(String::from("U0ADMIN001"))
+        );
+        assert!(
+            slack_app_home_user(&frame.replace("\"home\"", "\"messages\""))
+                .expect("messages tab")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn github_slash_commands_are_typed_without_using_ticket_intake_grammar() {
+        let channels = ChannelMap(vec![(
+            name("jean"),
+            ChannelId::new("C0RESERVED01").expect("channel"),
+        )]);
+        let admins = vec![UserId::new("U0ADMIN001").expect("admin")];
+        let frame = r#"{"accepts_response_payload":true,"envelope_id":"E3","payload":{"channel_id":"C0RESERVED01","command":"/github_reply","team_id":"T0RESERVED","text":"https://github.com/example/project/issues/42 post the verification result","trigger_id":"13345224609.abc123","user_id":"U0ADMIN001"},"type":"slash_commands"}"#;
+        let command = slack_github_command(frame, &channels, &admins)
+            .expect("valid frame")
+            .expect("admitted command");
+        assert_eq!(
+            command.request,
+            GitHubActionRequest::Reply {
+                issue_url: String::from("https://github.com/example/project/issues/42"),
+                instruction: String::from("post the verification result"),
+            }
+        );
+        assert!(command.source_key.contains(":command:"));
+
+        let denied = frame.replace("U0ADMIN001", "U0REQUEST01");
+        assert!(
+            slack_github_command(&denied, &channels, &admins)
+                .expect("content-free denial")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unified_monique_command_is_channel_scoped_and_keeps_a_stable_source_key() {
+        let channels = ChannelMap(vec![(
+            name("jean"),
+            ChannelId::new("C0RESERVED01").expect("channel"),
+        )]);
+        let frame = r#"{"accepts_response_payload":true,"envelope_id":"E4","payload":{"channel_id":"C0RESERVED01","command":"/monique","team_id":"T0RESERVED","text":"help","trigger_id":"13345224609.abc124","user_id":"U0MEMBER001"},"type":"slash_commands"}"#;
+        let command = slack_monique_command(frame, &channels)
+            .expect("frame")
+            .expect("command");
+        assert_eq!(command.text, "help");
+        assert_eq!(command.user.as_str(), "U0MEMBER001");
+        assert_eq!(
+            command.source_key,
+            "slack:automonique-slack:T0RESERVED:C0RESERVED01:command:13345224609.abc124"
+        );
+        assert!(
+            slack_monique_command(&frame.replace("C0RESERVED01", "C0OTHER00001"), &channels)
+                .expect("outside channel")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_plain_admin_issue_url_still_enters_manage_not_github_actions() {
+        let poster = FakeTicketPoster::default();
+        let manage = FakeManage::default();
+        let opened = Arc::clone(&manage.opened);
+        let mut router = SlackTicketRouter {
+            poster,
+            manage: Box::new(manage),
+            channels: ChannelMap(vec![(
+                name("jean"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![SlackFeature::Approvals, SlackFeature::Conversation],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+        };
+        router.handle_with_context(
+            ticket_event(
+                "U0ADMIN001",
+                "https://github.com/example/project/issues/42",
+                "EvPlain",
+            ),
+            "",
+        );
+        assert_eq!(opened.lock().expect("opened").len(), 1);
     }
 }

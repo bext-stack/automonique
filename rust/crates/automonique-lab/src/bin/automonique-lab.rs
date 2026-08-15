@@ -15,6 +15,10 @@ use automonique_lab::controller::{LabController, UnavailableBuildBroker};
 use automonique_lab::framing::FrameLimits;
 use automonique_lab::harness_claim::publish_current_claim;
 use automonique_lab::harness_status;
+use automonique_lab::improvement_executor::{
+    CodexRuntimePin, ImprovementExecutionRequest, ImprovementExecutor, PinnedCodexAgent,
+    VerificationProfile,
+};
 use automonique_lab::program::select_admitted;
 use automonique_lab::protocol::GitSha1;
 use automonique_lab::server::{UnixLabServer, UnixServerConfig};
@@ -70,7 +74,130 @@ where
     {
         return run_harness_claim(&arguments, &mut output);
     }
+    if arguments
+        .first()
+        .is_some_and(|value| value == "improvement-execute")
+    {
+        return run_improvement_execute(&arguments, &mut output);
+    }
     run_serve_once(&arguments)
+}
+
+fn run_improvement_execute<W: Write>(
+    arguments: &[OsString],
+    output: &mut W,
+) -> Result<(), &'static str> {
+    if arguments.len() != 5
+        || arguments[0] != "improvement-execute"
+        || arguments[1] != "--config"
+        || arguments[3] != "--request"
+    {
+        return Err("usage: automonique-lab improvement-execute --config PATH --request PATH");
+    }
+    let config = read_private_json(Path::new(&arguments[2]))?;
+    let request = read_private_json(Path::new(&arguments[4]))?;
+    if config.get("schema").and_then(serde_json::Value::as_str)
+        != Some("automonique.improvement-lab-config/v1")
+        || request.get("schema").and_then(serde_json::Value::as_str)
+            != Some("automonique.improvement-request/v1")
+    {
+        return Err("improvement document schema is invalid");
+    }
+    let path = |value: &serde_json::Value, field: &str| -> Result<PathBuf, &'static str> {
+        let value = value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or("improvement path field is missing")?;
+        if value.is_empty() || value.contains('\0') {
+            return Err("improvement path field is invalid");
+        }
+        Ok(PathBuf::from(value))
+    };
+    let text = |value: &serde_json::Value, field: &str| -> Result<String, &'static str> {
+        let value = value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or("improvement text field is missing")?;
+        if value.is_empty() || value.len() > 128 * 1024 || value.contains('\0') {
+            return Err("improvement text field is invalid");
+        }
+        Ok(value.to_owned())
+    };
+    let verification = match config
+        .get("verification")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("rust_workspace") => VerificationProfile::RustWorkspace,
+        Some("none") => VerificationProfile::None,
+        _ => return Err("improvement verification profile is invalid"),
+    };
+    let pin = CodexRuntimePin {
+        binary: path(&config, "codexBinary")?,
+        binary_sha256: text(&config, "codexBinarySha256")?,
+        codex_home: path(&config, "codexHome")?,
+        cargo_home: path(&config, "cargoHome")?,
+        rustup_home: path(&config, "rustupHome")?,
+        model: text(&config, "model")?,
+    };
+    let mut executor = ImprovementExecutor::open(
+        path(&config, "repository")?,
+        path(&config, "worktreeRoot")?,
+        verification,
+        PinnedCodexAgent::new(pin),
+    )
+    .map_err(|_| "improvement executor configuration was refused")?;
+    let request = ImprovementExecutionRequest {
+        public_id: text(&request, "publicId")?,
+        revision: request
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|revision| *revision > 0)
+            .ok_or("improvement revision is invalid")?,
+        source_base_sha: text(&request, "sourceBaseSha")?,
+        plan_digest: text(&request, "planDigest")?,
+        plan_markdown: text(&request, "planMarkdown")?,
+    };
+    let receipt = executor
+        .execute(&request)
+        .map_err(|_| "improvement execution failed")?;
+    let document = serde_json::json!({
+        "schema": "automonique.improvement-execution-receipt/v1",
+        "publicId": receipt.public_id,
+        "revision": receipt.revision,
+        "sourceBaseSha": receipt.source_base_sha,
+        "planDigest": receipt.plan_digest,
+        "candidateSha": receipt.candidate_sha,
+        "candidateTree": receipt.candidate_tree,
+        "changedPaths": receipt.changed_paths,
+        "checks": receipt.checks.iter().map(|check| serde_json::json!({
+            "command": check.command,
+            "succeeded": check.succeeded,
+        })).collect::<Vec<_>>(),
+        "threadId": receipt.thread_id,
+        "turnId": receipt.turn_id,
+        "worktree": receipt.worktree,
+    });
+    serde_json::to_writer(&mut *output, &document)
+        .map_err(|_| "could not encode improvement receipt")?;
+    output
+        .write_all(b"\n")
+        .map_err(|_| "could not write improvement receipt")
+}
+
+fn read_private_json(path: &Path) -> Result<serde_json::Value, &'static str> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| "improvement document unavailable")?;
+    if !path.is_absolute()
+        || !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != Uid::effective().as_raw()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() == 0
+        || metadata.len() > 256 * 1024
+    {
+        return Err("improvement document is not a private regular file");
+    }
+    let bytes = fs::read(path).map_err(|_| "improvement document unavailable")?;
+    serde_json::from_slice(&bytes).map_err(|_| "improvement document JSON is invalid")
 }
 
 fn bounded_arguments<I>(arguments: I) -> Result<Vec<OsString>, &'static str>

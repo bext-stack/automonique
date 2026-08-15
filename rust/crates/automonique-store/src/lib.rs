@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent_memory;
 pub mod approval_ledger;
 pub mod automation_store;
 pub mod batch_registry;
@@ -20,6 +21,7 @@ pub mod provider_journal;
 pub mod run_index;
 pub mod run_submissions;
 pub mod slack_ingress;
+pub mod slack_interactions;
 pub mod support_tickets;
 
 use std::error::Error;
@@ -922,6 +924,30 @@ pub struct TerminalRun<'a> {
 /// Identity of an atomically committed terminal transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalReceipt {
+    pub event_id: i64,
+    pub outbox_id: i64,
+    pub duplicate: bool,
+}
+
+/// One independently queued external-effect intent.
+///
+/// Unlike [`TerminalRun`], this does not finish a run. It is for effects whose
+/// source was already committed by another durable subsystem (for example, a
+/// transport ingress record) and still gives them the canonical outbox's
+/// idempotency, fencing, leasing, retry and reconciliation semantics.
+pub struct OutboxEnqueue<'a> {
+    pub intent_key: &'a str,
+    pub kind: &'a str,
+    pub payload: &'a [u8],
+    pub generation_id: &'a str,
+    pub holder_id: &'a str,
+    pub lease_epoch: u64,
+    pub now_ms: i64,
+}
+
+/// Durable identity returned when an independent outbox intent is queued.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutboxEnqueueReceipt {
     pub event_id: i64,
     pub outbox_id: i64,
     pub duplicate: bool,
@@ -2961,6 +2987,97 @@ impl Store {
     /// Count pending and delivered effect intents.
     pub fn outbox_count(&self) -> Result<u64, StoreError> {
         count_table(&self.connection, "outbox")
+    }
+
+    /// Queue one external effect under the current generation fence.
+    ///
+    /// Replaying an identical intent is idempotent, including after restart.
+    /// Reusing its key for a different kind or payload is a conflict.
+    pub fn enqueue_outbox(
+        &mut self,
+        request: OutboxEnqueue<'_>,
+    ) -> Result<OutboxEnqueueReceipt, StoreError> {
+        validate_id(request.intent_key, "outbox_intent_key")?;
+        validate_id(request.kind, "outbox_kind")?;
+        validate_payload(request.payload, "outbox_payload")?;
+        validate_id(request.generation_id, "generation_id")?;
+        validate_id(request.holder_id, "holder_id")?;
+        validate_time(request.now_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_live_lease(
+            &transaction,
+            request.generation_id,
+            request.holder_id,
+            request.lease_epoch,
+            request.now_ms,
+        )?;
+        if let Some((outbox_id, event_id, kind, payload)) = transaction
+            .query_row(
+                "SELECT outbox_id, event_id, kind, payload FROM outbox
+                 WHERE intent_key = ?1",
+                [request.intent_key],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            if kind == request.kind && payload == request.payload {
+                transaction.commit()?;
+                return Ok(OutboxEnqueueReceipt {
+                    event_id,
+                    outbox_id,
+                    duplicate: true,
+                });
+            }
+            return Err(StoreError::OutboxConflict);
+        }
+        let event_id = append_event(
+            &transaction,
+            "outbox_intent",
+            request.intent_key,
+            1,
+            request.now_ms,
+            "outbox.queued",
+            request.payload,
+        )?;
+        let insert = transaction.execute(
+            "INSERT INTO outbox
+             (intent_key, event_id, transport, kind, payload, state, revision,
+              attempts, available_ms, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, 0, ?6, ?6)",
+            params![
+                request.intent_key,
+                event_id,
+                outbox_transport(request.kind),
+                request.kind,
+                request.payload,
+                request.now_ms
+            ],
+        );
+        if let Err(error) = insert {
+            if error
+                .sqlite_error()
+                .is_some_and(|code| code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)
+            {
+                return Err(StoreError::OutboxConflict);
+            }
+            return Err(StoreError::Sqlite(error));
+        }
+        let outbox_id = transaction.last_insert_rowid();
+        transaction.commit()?;
+        Ok(OutboxEnqueueReceipt {
+            event_id,
+            outbox_id,
+            duplicate: false,
+        })
     }
 
     /// Claim the oldest matching ready effect without exposing its payload.

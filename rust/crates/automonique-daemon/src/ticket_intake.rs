@@ -356,6 +356,16 @@ impl FleetConfig {
             page_limit,
         )
     }
+
+    /// Build an independent client for an explicitly authorized ticket action.
+    ///
+    /// This reuses the same private fleet target and credential as support
+    /// intake. Constructing it performs no I/O; the Telegram action worker is
+    /// the only caller that spends it.
+    #[must_use]
+    pub(crate) fn into_action_client(self) -> FleetClient {
+        FleetClient::new(self.base, self.instance, self.token)
+    }
 }
 
 /// The durable failure that ends a worker.

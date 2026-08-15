@@ -26,8 +26,8 @@ mod telegram_control;
 pub use https_client::{
     ApprovalKeyboard, MAX_BOT_COMMAND_DESCRIPTION_CHARS, MAX_BOT_COMMAND_NAME_CHARS,
     MAX_BOT_COMMANDS, MAX_SEND_MESSAGE_TEXT_UNITS, OutboundRefusal, SendMessageRequest,
-    SetMyCommandsRequest, TelegramBotCommand, TelegramHttpsClient, TelegramOutbound,
-    TelegramOutboundClient, TelegramOutboundPlan,
+    SetMessageReactionRequest, SetMyCommandsRequest, TelegramBotCommand, TelegramHttpsClient,
+    TelegramOutbound, TelegramOutboundClient, TelegramOutboundPlan, TelegramTextStyle,
 };
 pub use slack_sink::{
     SlackDurableReceipt, SlackSinkFailure, StoreSlackDurableSink, slack_content_digest,
@@ -36,10 +36,13 @@ pub use store_sink::{Clock, ClockFailure, StoreTelegramDurableSink, SystemClock}
 pub use telegram_control::{
     ADMIN_HELP_MARK, AdminDirective, AllowedUsers, AllowlistError, ArgumentShape, COMMAND_COUNT,
     ChannelName, CommandKind, CommandManifestEntry, CommandRefusal, CommandSpec, CommandTier,
-    ControlCommand, ControlRef, MAX_ALLOWED_USERS, MAX_BOT_SUFFIX_BYTES, MAX_CHANNEL_NAME_BYTES,
-    MAX_COMMAND_NAME_BYTES, MAX_COMMAND_TEXT_BYTES, MAX_CONTROL_REF_BYTES, MAX_RUN_TASK_BYTES,
-    MAX_SAY_TEXT_BYTES, MAX_USER_ID_BYTES, OperatorAuthority, OperatorUserId, RunTask, SayText,
-    authorize_and_parse, authorize_and_parse_tiered, command_manifest, help_text, parse_command,
+    ControlCommand, ControlRef, GitHubChecklistItem, GitHubIssueUrl, GitHubRepoAlias,
+    GitHubRequest, MAX_ALLOWED_USERS, MAX_BOT_SUFFIX_BYTES, MAX_CHANNEL_NAME_BYTES,
+    MAX_COMMAND_NAME_BYTES, MAX_COMMAND_TEXT_BYTES, MAX_CONTROL_REF_BYTES,
+    MAX_GITHUB_CHECKLIST_ITEM_BYTES, MAX_GITHUB_ISSUE_URL_BYTES, MAX_GITHUB_REPO_ALIAS_BYTES,
+    MAX_GITHUB_REQUEST_BYTES, MAX_RUN_TASK_BYTES, MAX_SAY_TEXT_BYTES, MAX_USER_ID_BYTES,
+    MemoryDirective, OperatorAuthority, OperatorUserId, RunTask, SayText, authorize_and_parse,
+    authorize_and_parse_tiered, command_manifest, command_refusal_text, help_text, parse_command,
 };
 
 const MAX_LEASE_ID_BYTES: usize = 256;
@@ -192,6 +195,10 @@ pub enum HttpFailure {
     Unavailable,
     TimedOut,
     Cancelled,
+    /// The peer explicitly asked the caller to wait this many milliseconds.
+    RateLimited {
+        retry_after_ms: u64,
+    },
     ResponseTooLarge,
     UnexpectedStatus,
     UnexpectedContentType,
@@ -910,6 +917,9 @@ fn telegram_batch_digest(batch: &DurableTelegramBatch) -> [u8; 32] {
             TelegramInputKind::Message => 1,
             TelegramInputKind::Callback => 2,
             TelegramInputKind::Unsupported => 3,
+            TelegramInputKind::EditedMessage => 4,
+            TelegramInputKind::Attachment => 5,
+            TelegramInputKind::DeletedMessage => 6,
         }]);
         match &update.disposition {
             DurableDisposition::Admitted { content } => {

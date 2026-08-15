@@ -157,6 +157,7 @@ use automonique_runner::{
     WorkspaceRegistryId,
 };
 use automonique_store::run_index::{RunIndex, RunSpoolState, StateAdvance};
+use sha2::Digest as _;
 
 use crate::attempt_host::DaemonAttemptHost;
 
@@ -308,7 +309,25 @@ pub const MAX_PROMPT_BYTES: usize = automonique_runner::MAX_LAUNCH_PROMPT_BYTES;
 /// module's threading note for what that trade buys and costs. A larger program
 /// is not run under a weaker check — it is refused with
 /// [`ExecuteRefusal::ProviderBinaryUnverified`].
-pub const MAX_PROVIDER_BINARY_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_PROVIDER_BINARY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Whether one observed byte count fits within a finite read ceiling.
+///
+/// Kept as one predicate so the metadata check and the post-read growth check
+/// agree exactly at the boundary.
+pub(crate) const fn is_within_byte_limit(bytes: u64, limit: u64) -> bool {
+    bytes <= limit
+}
+
+/// Hash provider-file bytes through the optimized large-input implementation.
+///
+/// Protocol messages retain the dependency-free implementation in
+/// `automonique-protocol`; provider executables can be hundreds of MiB and are
+/// verified twice on a live request, so using that small-message transform here
+/// would turn a security check into tens of seconds of control-loop latency.
+pub(crate) fn provider_binary_digest(bytes: &[u8]) -> String {
+    format!("{ALGORITHM}:{:x}", sha2::Sha256::digest(bytes))
+}
 
 /// Directory under the state root holding one subtree per executed run.
 pub const RUNS_DIRECTORY: &str = "runs";
@@ -817,7 +836,7 @@ impl ExecutionLane {
         }
         let bytes = read_bounded(spec.executable(), MAX_PROVIDER_BINARY_BYTES)
             .ok_or(ExecuteRefusal::ProviderBinaryUnverified)?;
-        let observed = format!("{ALGORITHM}:{}", Sha256::digest(&bytes).to_hex());
+        let observed = provider_binary_digest(&bytes);
         BinaryProvenance::new(pinned.version(), &observed, None)
             .map_err(|_| ExecuteRefusal::ProviderBinaryUnverified)
     }
@@ -1168,7 +1187,7 @@ fn private_directory(path: &Path) -> Result<(), ()> {
 fn read_bounded(path: &Path, limit: u64) -> Option<Vec<u8>> {
     let file = fs::File::open(path).ok()?;
     let metadata = file.metadata().ok()?;
-    if !metadata.is_file() || metadata.len() > limit {
+    if !metadata.is_file() || !is_within_byte_limit(metadata.len(), limit) {
         return None;
     }
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
@@ -1177,7 +1196,7 @@ fn read_bounded(path: &Path, limit: u64) -> Option<Vec<u8>> {
     file.take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .ok()?;
-    if u64::try_from(bytes.len()).ok()? > limit {
+    if !is_within_byte_limit(u64::try_from(bytes.len()).ok()?, limit) {
         return None;
     }
     Some(bytes)
@@ -1234,7 +1253,10 @@ fn is_containment_run_id(run_id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TokenCancelSink, is_containment_run_id, is_safe_segment};
+    use super::{
+        MAX_PROVIDER_BINARY_BYTES, TokenCancelSink, is_containment_run_id, is_safe_segment,
+        is_within_byte_limit, provider_binary_digest,
+    };
     use crate::attempt_host::DaemonAttemptHost;
     use automonique_runner::CancellationToken;
     use automonique_runner::dispatch::DispatchOutcome;
@@ -1242,6 +1264,27 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn provider_binary_limit_accepts_the_boundary_and_refuses_the_next_byte() {
+        assert_eq!(MAX_PROVIDER_BINARY_BYTES, 512 * 1024 * 1024);
+        assert!(is_within_byte_limit(
+            MAX_PROVIDER_BINARY_BYTES,
+            MAX_PROVIDER_BINARY_BYTES
+        ));
+        assert!(!is_within_byte_limit(
+            MAX_PROVIDER_BINARY_BYTES + 1,
+            MAX_PROVIDER_BINARY_BYTES
+        ));
+    }
+
+    #[test]
+    fn optimized_provider_digest_is_the_canonical_sha256_spelling() {
+        assert_eq!(
+            provider_binary_digest(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     /// The seam between the daemon's host-wide dispatcher and a live attempt.
     ///

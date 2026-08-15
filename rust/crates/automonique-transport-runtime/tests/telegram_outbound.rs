@@ -96,6 +96,26 @@ fn a_reply_round_trips_through_the_outbound_seam_unchanged() {
 }
 
 #[test]
+fn command_output_is_preformatted_without_interpreting_its_text() {
+    let token = token();
+    let output = "line <tag> & `ticks` 😀";
+    let request = TelegramOutbound::SendMessage(
+        SendMessageRequest::new_preformatted(7, output, None).expect("request"),
+    );
+    let plan = TelegramOutboundPlan::new(42, request, &token).expect("plan");
+
+    assert_eq!(plan.request().method_name(), "sendMessage");
+    assert_eq!(
+        plan.canonical_body(),
+        r#"{"chat_id":7,"text":"line <tag> & `ticks` 😀","entities":[{"type":"pre","offset":0,"length":23}]}"#
+    );
+    assert!(
+        !plan.canonical_body().contains("parse_mode"),
+        "untrusted output must not become markup"
+    );
+}
+
+#[test]
 fn the_advertised_menu_is_the_command_registry_verbatim() {
     let token = token();
     let plan = TelegramOutboundPlan::new(42, menu(), &token).expect("plan");

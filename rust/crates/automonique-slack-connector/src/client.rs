@@ -35,15 +35,15 @@ use std::time::Duration;
 use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::response::{
-    decode_auth_test, decode_conversations_history, decode_conversations_info,
+    decode_ack, decode_auth_test, decode_conversations_history, decode_conversations_info,
     decode_conversations_list, decode_error_code, decode_post_message, decode_users_info,
 };
 use crate::{
     AuthIdentity, ChannelPage, ConversationsHistoryRequest, ConversationsInfoRequest,
-    ConversationsListRequest, MAX_SLACK_RESPONSE_BYTES, MessagePage, PostMessageRequest,
-    PostedMessage, SLACK_REQUEST_TIMEOUT_SECONDS, SlackBase, SlackChannel, SlackFailure,
-    SlackMethod, SlackOperation, SlackOutcome, SlackRejection, SlackToken, SlackUser,
-    UsersInfoRequest,
+    ConversationsListRequest, MAX_SLACK_RESPONSE_BYTES, MessagePage, OpenViewRequest,
+    PostMessageRequest, PostedMessage, PublishViewRequest, SLACK_REQUEST_TIMEOUT_SECONDS,
+    SlackBase, SlackChannel, SlackFailure, SlackMethod, SlackOperation, SlackOutcome,
+    SlackRejection, SlackToken, SlackUser, UpdateMessageRequest, UsersInfoRequest,
 };
 
 /// The media type every request asks for.
@@ -249,6 +249,27 @@ impl SlackClient {
             &SlackOperation::ChatPostMessage(request.clone()),
             decode_post_message,
         )
+    }
+
+    /// Replace one exact bot message, normally to retire interactive actions.
+    pub fn update_message(
+        &self,
+        request: &UpdateMessageRequest,
+    ) -> Result<SlackOutcome<()>, SlackFailure> {
+        self.call(&SlackOperation::ChatUpdate(request.clone()), decode_ack)
+    }
+
+    /// Open one validated modal for a Slack interaction trigger.
+    pub fn open_view(&self, request: &OpenViewRequest) -> Result<SlackOutcome<()>, SlackFailure> {
+        self.call(&SlackOperation::ViewsOpen(request.clone()), decode_ack)
+    }
+
+    /// Publish one member's App Home view.
+    pub fn publish_view(
+        &self,
+        request: &PublishViewRequest,
+    ) -> Result<SlackOutcome<()>, SlackFailure> {
+        self.call(&SlackOperation::ViewsPublish(request.clone()), decode_ack)
     }
 
     /// Issue one operation and decode its answer.

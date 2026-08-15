@@ -2,9 +2,10 @@
 
 //! Typed client for the GitHub issues surface Automonique works tickets through.
 //!
-//! Nine operations are spelled, and nothing else can be: create an issue,
+//! Thirteen operations are spelled, and nothing else can be: create an issue,
 //! comment on one, open or close one, replace its labels, read one back, read
-//! its comments, list a repository's issues, search issues, and identify the
+//! its comments, read or edit one comment, conditionally replace an issue body,
+//! list repository labels or issues, search issues, and identify the
 //! credential. Around them sit the two pieces of local contract that decide
 //! *which* repository a ticket belongs in and *what* its body says: the
 //! [`RepoMap`] resolver and the [`TicketDraft`] body builder.
@@ -71,12 +72,14 @@
 
 mod client;
 mod draft;
+mod management;
 mod repo_map;
 mod request;
 mod response;
 mod target;
 mod ticket;
 mod token;
+mod version;
 
 use std::error::Error;
 use std::fmt;
@@ -88,23 +91,30 @@ pub use draft::{
     SUPPORT_THREAD_MARKER_PREFIX, SUPPORT_THREAD_MARKER_SUFFIX, ThreadId, TicketDraft,
     TicketExchange, body_carries_marker, marker_thread_id,
 };
+pub use management::{
+    DatabaseId, IssueManagementPatch, LabelColor, LockReason, MAX_MANAGEMENT_NAME_BYTES,
+    MAX_MANAGEMENT_OPERATIONS, MAX_MANAGEMENT_TEXT_BYTES, ManagementName, ManagementReceipt,
+    ManagementRequest, ManagementText, ProjectFieldType, ProjectItemType, ProjectOwner,
+    ProjectOwnerKind, ProjectRef, ProjectStatus, ProjectViewLayout,
+};
 pub use repo_map::{
     MAX_REPO_RULES, MAX_SCOPE_IDENTIFIER_BYTES, RepoMap, RepoRule, SiteId, TenantId,
 };
 pub use request::{
-    CommentRequest, CreateIssueRequest, GetCommentsRequest, GetIssueRequest, GitHubOperation,
-    HttpMethod, IssueFilter, IssueListState, ListIssuesRequest, MAX_LIST_PAGE, MAX_SEARCH_PAGE,
-    Page, ReplaceLabelsRequest, SearchIssuesRequest, SetStateRequest, Since,
+    CommentRequest, CreateIssueRequest, GetCommentsRequest, GetIssueCommentRequest,
+    GetIssueRequest, GitHubOperation, HttpMethod, IssueFilter, IssueListState, ListIssuesRequest,
+    ListLabelsRequest, MAX_LIST_PAGE, MAX_SEARCH_PAGE, Page, ReplaceLabelsRequest,
+    SearchIssuesRequest, SetStateRequest, Since, UpdateIssueBodyRequest, UpdateIssueCommentRequest,
 };
 pub use response::{
     CommentRef, GitHubComment, GitHubIssue, GitHubReply, IssueListPage, IssueSearchPage,
-    MAX_COMMENT_COUNT, MAX_SEARCH_TOTAL, Viewer, decode_comment_ref, decode_comments,
-    decode_error_message, decode_issue, decode_issue_list, decode_issue_ref, decode_labels,
-    decode_search, decode_viewer,
+    MAX_COMMENT_COUNT, MAX_SEARCH_TOTAL, Viewer, decode_comment, decode_comment_ref,
+    decode_comments, decode_error_message, decode_issue, decode_issue_list, decode_issue_ref,
+    decode_labels, decode_repository_labels, decode_search, decode_viewer,
 };
 pub use target::{
-    GITHUB_API_ORIGIN, GitHubBase, IssueLocator, IssueNumber, IssueState, Label, MAX_ISSUE_NUMBER,
-    MAX_LABEL_BYTES, MAX_OWNER_BYTES, MAX_REPO_BYTES, Owner, Repo, RepoTarget,
+    CommentId, GITHUB_API_ORIGIN, GitHubBase, IssueLocator, IssueNumber, IssueState, Label,
+    MAX_ISSUE_NUMBER, MAX_LABEL_BYTES, MAX_OWNER_BYTES, MAX_REPO_BYTES, Owner, Repo, RepoTarget,
 };
 pub use ticket::{
     CommentKind, CommentVisibility, GithubLink, IssueBodyText, IssueComment, IssuePriority,
@@ -112,6 +122,7 @@ pub use ticket::{
     MAX_TICKET_ID_BYTES, MAX_TICKET_NAME_BYTES, TenantIssue, ticket_labels,
 };
 pub use token::{GitHubAuthorization, GitHubToken, MAX_GITHUB_TOKEN_BYTES};
+pub use version::{EntityTag, MAX_ENTITY_TAG_BYTES, Versioned};
 
 /// Longest response body accepted, before any field is read.
 ///
@@ -177,6 +188,8 @@ pub enum GitHubRefusal {
     Repo,
     /// The issue number is zero or past the accepted ceiling.
     IssueNumber,
+    /// The issue comment id is zero.
+    CommentId,
     /// The title is empty after trimming, over its ceiling, or control-bearing.
     Title,
     /// The body is empty, over [`MAX_ISSUE_BODY_BYTES`], or carries a control
@@ -206,6 +219,10 @@ pub enum GitHubRefusal {
     Text,
     /// The repository map carries more rules than [`MAX_REPO_RULES`].
     Rules,
+    /// An entity tag is empty, over-long, or not a quoted HTTP entity tag.
+    EntityTag,
+    /// A work-management identifier, value, or combination is invalid.
+    Management,
 }
 
 impl GitHubRefusal {
@@ -218,6 +235,7 @@ impl GitHubRefusal {
             Self::Owner => "owner",
             Self::Repo => "repo",
             Self::IssueNumber => "issue_number",
+            Self::CommentId => "comment_id",
             Self::Title => "title",
             Self::Body => "body",
             Self::Label => "label",
@@ -230,6 +248,8 @@ impl GitHubRefusal {
             Self::Checklist => "checklist",
             Self::Text => "text",
             Self::Rules => "rules",
+            Self::EntityTag => "entity_tag",
+            Self::Management => "management",
         }
     }
 }
@@ -619,6 +639,7 @@ mod tests {
             GitHubRefusal::Owner,
             GitHubRefusal::Repo,
             GitHubRefusal::IssueNumber,
+            GitHubRefusal::CommentId,
             GitHubRefusal::Title,
             GitHubRefusal::Body,
             GitHubRefusal::Label,
@@ -631,6 +652,7 @@ mod tests {
             GitHubRefusal::Checklist,
             GitHubRefusal::Text,
             GitHubRefusal::Rules,
+            GitHubRefusal::EntityTag,
         ];
         let mut categories: Vec<&str> = refusals.iter().map(|value| value.category()).collect();
         categories.sort_unstable();

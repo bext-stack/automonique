@@ -1044,6 +1044,7 @@ mod surface_coverage {
                 // coordinates. Their dotted spelling is owned by Slack, so
                 // this repository must inventory rather than rename them.
                 "auth.test",
+                "chat.update",
                 "checkpoint.create",
                 "checkpoint.list",
                 "checkpoint.restore",
@@ -1057,6 +1058,8 @@ mod surface_coverage {
                 "sandbox.actor",
                 "supervisor.adapter",
                 "users.info",
+                "views.open",
+                "views.publish",
                 "workspace.snapshot",
                 "workspace.source",
                 "workspace.tenant",

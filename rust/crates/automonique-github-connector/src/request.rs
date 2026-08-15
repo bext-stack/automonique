@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! The nine operations, and the exact method, path and body each renders.
+//! The thirteen operations, and the exact method, path and body each renders.
 //!
 //! [`GitHubOperation`] is the second half of the target lock (the first is the
 //! origin in `target`). A path is never a caller string: it is assembled here
@@ -15,10 +15,10 @@
 //! a protocol one: it lets a test assert one exact captured request instead of
 //! a set of permutations.
 
-use crate::target::{IssueNumber, Label, RepoTarget};
+use crate::target::{CommentId, IssueNumber, Label, RepoTarget};
 use crate::ticket::{IssueBodyText, IssueTitle};
 use crate::{
-    GitHubRefusal, IssueState, MAX_ISSUE_LABELS, MAX_PER_PAGE, MAX_SEARCH_QUERY_BYTES,
+    EntityTag, GitHubRefusal, IssueState, MAX_ISSUE_LABELS, MAX_PER_PAGE, MAX_SEARCH_QUERY_BYTES,
     MAX_TIMESTAMP_BYTES, push_json_string, push_query_encoded,
 };
 
@@ -32,10 +32,8 @@ pub const MAX_LIST_PAGE: u32 = 1_000;
 /// refused.
 pub const MAX_SEARCH_PAGE: u32 = 100;
 
-/// The four verbs this connector can issue.
+/// The five verbs this connector can issue.
 ///
-/// No `DELETE`: nothing in the ticket contract removes a remote object, and a
-/// verb this crate cannot name is a verb a caller cannot be talked into.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HttpMethod {
     /// A read.
@@ -46,6 +44,8 @@ pub enum HttpMethod {
     Patch,
     /// A replace.
     Put,
+    /// A typed deletion from the work-management surface.
+    Delete,
 }
 
 impl HttpMethod {
@@ -57,13 +57,14 @@ impl HttpMethod {
             Self::Post => "POST",
             Self::Patch => "PATCH",
             Self::Put => "PUT",
+            Self::Delete => "DELETE",
         }
     }
 
     /// Whether this verb carries a request body.
     #[must_use]
     pub const fn has_body(self) -> bool {
-        !matches!(self, Self::Get)
+        !matches!(self, Self::Get | Self::Delete)
     }
 }
 
@@ -445,6 +446,162 @@ pub struct GetCommentsRequest {
     page: Page,
 }
 
+/// Read one repository-label page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListLabelsRequest {
+    target: RepoTarget,
+    page: Page,
+}
+
+impl ListLabelsRequest {
+    /// Name one repository and one page of its labels.
+    #[must_use]
+    pub const fn new(target: RepoTarget, page: Page) -> Self {
+        Self { target, page }
+    }
+
+    /// The repository.
+    #[must_use]
+    pub const fn target(&self) -> &RepoTarget {
+        &self.target
+    }
+
+    /// The page.
+    #[must_use]
+    pub const fn page(&self) -> Page {
+        self.page
+    }
+}
+
+/// Read one issue comment and its current entity tag.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GetIssueCommentRequest {
+    target: RepoTarget,
+    comment_id: CommentId,
+}
+
+impl GetIssueCommentRequest {
+    /// Name one repository-scoped issue comment.
+    #[must_use]
+    pub const fn new(target: RepoTarget, comment_id: CommentId) -> Self {
+        Self { target, comment_id }
+    }
+
+    /// The repository.
+    #[must_use]
+    pub const fn target(&self) -> &RepoTarget {
+        &self.target
+    }
+
+    /// The comment id.
+    #[must_use]
+    pub const fn comment_id(&self) -> CommentId {
+        self.comment_id
+    }
+}
+
+/// Replace one issue body if it still has the version previously read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateIssueBodyRequest {
+    target: RepoTarget,
+    number: IssueNumber,
+    body: IssueBodyText,
+    if_match: EntityTag,
+}
+
+impl UpdateIssueBodyRequest {
+    /// Bind an issue, complete new body, and previous entity tag.
+    #[must_use]
+    pub const fn new(
+        target: RepoTarget,
+        number: IssueNumber,
+        body: IssueBodyText,
+        if_match: EntityTag,
+    ) -> Self {
+        Self {
+            target,
+            number,
+            body,
+            if_match,
+        }
+    }
+
+    /// The repository.
+    #[must_use]
+    pub const fn target(&self) -> &RepoTarget {
+        &self.target
+    }
+
+    /// The issue number.
+    #[must_use]
+    pub const fn number(&self) -> IssueNumber {
+        self.number
+    }
+
+    /// The complete replacement body.
+    #[must_use]
+    pub const fn body(&self) -> &IssueBodyText {
+        &self.body
+    }
+
+    /// The version the issue must still have.
+    #[must_use]
+    pub const fn if_match(&self) -> &EntityTag {
+        &self.if_match
+    }
+}
+
+/// Replace one issue-comment body if it still has the version previously read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateIssueCommentRequest {
+    target: RepoTarget,
+    comment_id: CommentId,
+    body: IssueBodyText,
+    if_match: EntityTag,
+}
+
+impl UpdateIssueCommentRequest {
+    /// Bind a comment, complete new body, and previous entity tag.
+    #[must_use]
+    pub const fn new(
+        target: RepoTarget,
+        comment_id: CommentId,
+        body: IssueBodyText,
+        if_match: EntityTag,
+    ) -> Self {
+        Self {
+            target,
+            comment_id,
+            body,
+            if_match,
+        }
+    }
+
+    /// The repository.
+    #[must_use]
+    pub const fn target(&self) -> &RepoTarget {
+        &self.target
+    }
+
+    /// The comment id.
+    #[must_use]
+    pub const fn comment_id(&self) -> CommentId {
+        self.comment_id
+    }
+
+    /// The complete replacement body.
+    #[must_use]
+    pub const fn body(&self) -> &IssueBodyText {
+        &self.body
+    }
+
+    /// The version the comment must still have.
+    #[must_use]
+    pub const fn if_match(&self) -> &EntityTag {
+        &self.if_match
+    }
+}
+
 impl GetCommentsRequest {
     /// Name one issue and one page of its comments.
     #[must_use]
@@ -575,8 +732,16 @@ pub enum GitHubOperation {
     ReplaceLabels(ReplaceLabelsRequest),
     /// `GET /repos/{owner}/{repo}/issues/{number}`
     GetIssue(GetIssueRequest),
+    /// `PATCH /repos/{owner}/{repo}/issues/{number}` with `If-Match`
+    UpdateIssueBody(UpdateIssueBodyRequest),
     /// `GET /repos/{owner}/{repo}/issues/{number}/comments`
     GetComments(GetCommentsRequest),
+    /// `GET /repos/{owner}/{repo}/issues/comments/{comment_id}`
+    GetIssueComment(GetIssueCommentRequest),
+    /// `PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}` with `If-Match`
+    UpdateIssueComment(UpdateIssueCommentRequest),
+    /// `GET /repos/{owner}/{repo}/labels`
+    ListLabels(ListLabelsRequest),
     /// `GET /repos/{owner}/{repo}/issues`
     ListIssues(ListIssuesRequest),
     /// `GET /search/issues`
@@ -591,10 +756,14 @@ impl GitHubOperation {
     pub const fn method(&self) -> HttpMethod {
         match self {
             Self::CreateIssue(_) | Self::Comment(_) => HttpMethod::Post,
-            Self::SetState(_) => HttpMethod::Patch,
+            Self::SetState(_) | Self::UpdateIssueBody(_) | Self::UpdateIssueComment(_) => {
+                HttpMethod::Patch
+            }
             Self::ReplaceLabels(_) => HttpMethod::Put,
             Self::GetIssue(_)
             | Self::GetComments(_)
+            | Self::GetIssueComment(_)
+            | Self::ListLabels(_)
             | Self::ListIssues(_)
             | Self::SearchIssues(_)
             | Self::Whoami => HttpMethod::Get,
@@ -609,7 +778,12 @@ impl GitHubOperation {
     pub const fn is_external_effect(&self) -> bool {
         matches!(
             self,
-            Self::CreateIssue(_) | Self::Comment(_) | Self::SetState(_) | Self::ReplaceLabels(_)
+            Self::CreateIssue(_)
+                | Self::Comment(_)
+                | Self::SetState(_)
+                | Self::ReplaceLabels(_)
+                | Self::UpdateIssueBody(_)
+                | Self::UpdateIssueComment(_)
         )
     }
 
@@ -638,12 +812,31 @@ impl GitHubOperation {
             Self::GetIssue(request) => {
                 format!("{}/{}", issues_path(request.target()), request.number())
             }
+            Self::UpdateIssueBody(request) => {
+                format!("{}/{}", issues_path(request.target()), request.number())
+            }
             Self::GetComments(request) => {
                 let page = request.page();
                 format!(
                     "{}/{}/comments?per_page={}&page={}",
                     issues_path(request.target()),
                     request.number(),
+                    page.per_page(),
+                    page.number()
+                )
+            }
+            Self::GetIssueComment(request) => {
+                issue_comment_path(request.target(), request.comment_id())
+            }
+            Self::UpdateIssueComment(request) => {
+                issue_comment_path(request.target(), request.comment_id())
+            }
+            Self::ListLabels(request) => {
+                let page = request.page();
+                format!(
+                    "/repos/{}/{}/labels?per_page={}&page={}",
+                    request.target().owner().as_str(),
+                    request.target().repo().as_str(),
                     page.per_page(),
                     page.number()
                 )
@@ -728,11 +921,25 @@ impl GitHubOperation {
                 body.push('}');
                 Some(body)
             }
+            Self::UpdateIssueBody(request) => Some(body_json(request.body())),
+            Self::UpdateIssueComment(request) => Some(body_json(request.body())),
             Self::GetIssue(_)
             | Self::GetComments(_)
+            | Self::GetIssueComment(_)
+            | Self::ListLabels(_)
             | Self::ListIssues(_)
             | Self::SearchIssues(_)
             | Self::Whoami => None,
+        }
+    }
+
+    /// The optimistic-concurrency precondition, when this is an update.
+    #[must_use]
+    pub const fn if_match(&self) -> Option<&EntityTag> {
+        match self {
+            Self::UpdateIssueBody(request) => Some(request.if_match()),
+            Self::UpdateIssueComment(request) => Some(request.if_match()),
+            _ => None,
         }
     }
 }
@@ -744,6 +951,23 @@ fn issues_path(target: &RepoTarget) -> String {
         target.owner().as_str(),
         target.repo().as_str()
     )
+}
+
+/// One repository-scoped issue-comment endpoint.
+fn issue_comment_path(target: &RepoTarget, comment_id: CommentId) -> String {
+    format!(
+        "/repos/{}/{}/issues/comments/{comment_id}",
+        target.owner().as_str(),
+        target.repo().as_str()
+    )
+}
+
+/// Render the shared body-only patch document.
+fn body_json(value: &IssueBodyText) -> String {
+    let mut body = String::from("{\"body\":");
+    push_json_string(&mut body, value.as_str());
+    body.push('}');
+    body
 }
 
 /// Append a JSON array of labels.
@@ -834,6 +1058,22 @@ mod tests {
         assert_eq!(issue.path(), "/repos/example-org/example-repo/issues/42");
         assert_eq!(issue.method(), HttpMethod::Get);
 
+        let update_issue = GitHubOperation::UpdateIssueBody(UpdateIssueBodyRequest::new(
+            target(),
+            number(),
+            IssueBodyText::new("nouveau corps").expect("body"),
+            EntityTag::new("\"issue-v1\"").expect("etag"),
+        ));
+        assert_eq!(
+            update_issue.path(),
+            "/repos/example-org/example-repo/issues/42"
+        );
+        assert_eq!(update_issue.method(), HttpMethod::Patch);
+        assert_eq!(
+            update_issue.if_match().map(EntityTag::as_str),
+            Some("\"issue-v1\"")
+        );
+
         let comments = GitHubOperation::GetComments(GetCommentsRequest::new(
             target(),
             number(),
@@ -842,6 +1082,36 @@ mod tests {
         assert_eq!(
             comments.path(),
             "/repos/example-org/example-repo/issues/42/comments?per_page=100&page=2"
+        );
+
+        let comment_id = CommentId::new(9_001).expect("comment id");
+        let comment =
+            GitHubOperation::GetIssueComment(GetIssueCommentRequest::new(target(), comment_id));
+        assert_eq!(
+            comment.path(),
+            "/repos/example-org/example-repo/issues/comments/9001"
+        );
+        assert_eq!(comment.method(), HttpMethod::Get);
+
+        let update_comment = GitHubOperation::UpdateIssueComment(UpdateIssueCommentRequest::new(
+            target(),
+            comment_id,
+            IssueBodyText::new("fait").expect("body"),
+            EntityTag::new("\"comment-v1\"").expect("etag"),
+        ));
+        assert_eq!(
+            update_comment.path(),
+            "/repos/example-org/example-repo/issues/comments/9001"
+        );
+        assert_eq!(update_comment.method(), HttpMethod::Patch);
+
+        let repo_labels = GitHubOperation::ListLabels(ListLabelsRequest::new(
+            target(),
+            Page::new(3, 100).expect("page"),
+        ));
+        assert_eq!(
+            repo_labels.path(),
+            "/repos/example-org/example-repo/labels?per_page=100&page=3"
         );
 
         let list = GitHubOperation::ListIssues(ListIssuesRequest::new(
@@ -921,6 +1191,25 @@ mod tests {
             "{\"labels\":[]}",
             "clearing every label must remain expressible"
         );
+
+        let update_issue = GitHubOperation::UpdateIssueBody(UpdateIssueBodyRequest::new(
+            target(),
+            number(),
+            IssueBodyText::new("ligne 1\nligne 2").expect("body"),
+            EntityTag::new("\"issue-v1\"").expect("etag"),
+        ));
+        assert_eq!(
+            update_issue.body().expect("body"),
+            "{\"body\":\"ligne 1\\nligne 2\"}"
+        );
+
+        let update_comment = GitHubOperation::UpdateIssueComment(UpdateIssueCommentRequest::new(
+            target(),
+            CommentId::new(9_001).expect("comment id"),
+            IssueBodyText::new("fait").expect("body"),
+            EntityTag::new("\"comment-v1\"").expect("etag"),
+        ));
+        assert_eq!(update_comment.body().expect("body"), "{\"body\":\"fait\"}");
     }
 
     #[test]
@@ -946,6 +1235,11 @@ mod tests {
         let reads = [
             GitHubOperation::GetIssue(GetIssueRequest::new(target(), number())),
             GitHubOperation::GetComments(GetCommentsRequest::new(target(), number(), page())),
+            GitHubOperation::GetIssueComment(GetIssueCommentRequest::new(
+                target(),
+                CommentId::new(9_001).expect("comment id"),
+            )),
+            GitHubOperation::ListLabels(ListLabelsRequest::new(target(), page())),
             GitHubOperation::ListIssues(ListIssuesRequest::new(
                 target(),
                 IssueFilter::default(),
@@ -970,6 +1264,18 @@ mod tests {
             GitHubOperation::ReplaceLabels(
                 ReplaceLabelsRequest::new(target(), number(), Vec::new()).expect("labels"),
             ),
+            GitHubOperation::UpdateIssueBody(UpdateIssueBodyRequest::new(
+                target(),
+                number(),
+                body(),
+                EntityTag::new("\"issue-v1\"").expect("etag"),
+            )),
+            GitHubOperation::UpdateIssueComment(UpdateIssueCommentRequest::new(
+                target(),
+                CommentId::new(9_001).expect("comment id"),
+                body(),
+                EntityTag::new("\"comment-v1\"").expect("etag"),
+            )),
         ];
         for write in writes {
             assert!(write.is_external_effect(), "{write:?} is a write");

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 use automonique_transports::{
-    MAX_TELEGRAM_INPUT_BYTES, TelegramAccessPolicy, TelegramBotId, TelegramDisposition,
-    TelegramError, TelegramInputKind, TelegramPrincipal, parse_telegram_updates,
+    MAX_TELEGRAM_INPUT_BYTES, TelegramAccessPolicy, TelegramAttachmentKind, TelegramBotId,
+    TelegramDisposition, TelegramError, TelegramInputKind, TelegramPrincipal,
+    parse_telegram_updates,
 };
 
 fn policy() -> TelegramAccessPolicy {
@@ -16,7 +17,7 @@ fn policy() -> TelegramAccessPolicy {
 #[test]
 fn admitted_message_has_stable_source_scope_and_offset() {
     let batch = parse_telegram_updates(
-        br#"{"ok":true,"result":[{"update_id":9,"message":{"chat":{"id":-100},"from":{"id":42},"text":"hello"}}]}"#,
+        br#"{"ok":true,"result":[{"update_id":9,"message":{"message_id":77,"chat":{"id":-100},"from":{"id":42},"text":"hello"}}]}"#,
         9,
         &policy(),
     )
@@ -27,6 +28,7 @@ fn admitted_message_has_stable_source_scope_and_offset() {
     };
     assert_eq!(update.source_key(), "telegram:7:update:9");
     assert_eq!(update.scope(), "telegram:7:-100");
+    assert_eq!(update.message_id(), Some(77));
     assert_eq!(update.kind(), TelegramInputKind::Message);
     assert_eq!(update.disposition(), TelegramDisposition::Admitted);
     assert_eq!(
@@ -34,6 +36,67 @@ fn admitted_message_has_stable_source_scope_and_offset() {
         Some(TelegramPrincipal::new(-100, 42).unwrap())
     );
     assert_eq!(update.content(), Some("hello"));
+}
+
+#[test]
+fn direct_reply_identity_is_retained() {
+    let batch = parse_telegram_updates(
+        br#"{"ok":true,"result":[{"update_id":9,"message":{"message_id":77,"chat":{"id":-100},"from":{"id":42},"reply_to_message":{"message_id":55},"text":"send this"}}]}"#,
+        9,
+        &policy(),
+    )
+    .expect("batch");
+    assert_eq!(batch.updates()[0].reply_to_message_id(), Some(55));
+}
+
+#[test]
+fn edits_attachments_and_business_deletes_have_closed_semantics() {
+    let edited = parse_telegram_updates(
+        br#"{"ok":true,"result":[{"edited_message":{"message_id":77,"chat":{"id":-100},"from":{"id":42},"text":"changed"},"update_id":20}]}"#,
+        20,
+        &policy(),
+    )
+    .expect("edited");
+    assert_eq!(edited.updates()[0].kind(), TelegramInputKind::EditedMessage);
+    assert_eq!(edited.updates()[0].content(), Some("changed"));
+    assert_eq!(
+        edited.updates()[0].disposition(),
+        TelegramDisposition::Admitted
+    );
+
+    let attachment = parse_telegram_updates(
+        br#"{"ok":true,"result":[{"message":{"message_id":78,"chat":{"id":-100},"from":{"id":42},"document":{"file_id":"opaque"},"caption":"please inspect"},"update_id":21}]}"#,
+        21,
+        &policy(),
+    )
+    .expect("attachment");
+    assert_eq!(
+        attachment.updates()[0].kind(),
+        TelegramInputKind::Attachment
+    );
+    assert_eq!(
+        attachment.updates()[0].attachment_kind(),
+        Some(TelegramAttachmentKind::Document)
+    );
+    assert_eq!(attachment.updates()[0].content(), Some("please inspect"));
+
+    let deleted = parse_telegram_updates(
+        br#"{"ok":true,"result":[{"deleted_business_messages":{"business_connection_id":"opaque","chat":{"id":-100},"message_ids":[77,78]},"update_id":22}]}"#,
+        22,
+        &policy(),
+    )
+    .expect("deletion");
+    assert_eq!(
+        deleted.updates()[0].kind(),
+        TelegramInputKind::DeletedMessage
+    );
+    assert_eq!(
+        deleted.updates()[0].disposition(),
+        TelegramDisposition::IgnoredUnsupported
+    );
+    assert_eq!(deleted.updates()[0].principal(), None);
+    assert_eq!(deleted.updates()[0].content(), None);
+    assert_eq!(deleted.updates()[0].scope(), "telegram:7:-100");
 }
 
 #[test]
@@ -126,7 +189,6 @@ fn malformed_error_and_ambiguous_update_shapes_are_refused() {
 fn unsupported_fresh_updates_are_content_free_and_do_not_wedge_the_offset() {
     for payload in [
         br#"{"ok":true,"result":[{"update_id":12}]}"#.as_slice(),
-        br#"{"ok":true,"result":[{"message":{"chat":{"id":-100},"from":{"id":42},"photo":[]},"update_id":12}]}"#.as_slice(),
         br#"{"ok":true,"result":[{"message":{"chat":{"id":-100},"from":{"id":42},"location":{"latitude":1.25,"longitude":2.5}},"update_id":12}]}"#.as_slice(),
         br#"{"ok":true,"result":[{"edited_message":{},"update_id":12}]}"#.as_slice(),
         br#"{"ok":true,"result":[{"callback_query":{"from":{"id":42},"inline_message_id":"i","game_short_name":"g"},"update_id":12}]}"#.as_slice(),

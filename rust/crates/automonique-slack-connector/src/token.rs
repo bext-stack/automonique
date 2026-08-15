@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! The Slack bot credential and the narrow view an HTTP boundary gets of it.
+//! Slack credentials and the narrow view an HTTP boundary gets of them.
 //!
 //! This mirrors `GitHubToken` in `automonique-github-connector`, `FleetToken`
 //! in `automonique-support-connector` and `OpaqueBotToken` in
@@ -25,6 +25,14 @@ use crate::SlackRefusal;
 /// entirely different service cannot be handed to Slack at all.
 pub const SLACK_BOT_TOKEN_PREFIX: &str = "xoxb-";
 
+/// The only Socket Mode credential prefix this connector accepts.
+///
+/// An app-level token represents the application rather than one installation
+/// and is the credential Slack accepts on `apps.connections.open`. Keeping it
+/// distinct from [`SlackToken`] makes it impossible to spend the bot token on
+/// the Socket Mode bootstrap call, or the app token on a Web API operation.
+pub const SLACK_APP_TOKEN_PREFIX: &str = "xapp-";
+
 /// Longest bearer credential accepted.
 ///
 /// A current `xoxb-` token is under 100 bytes; the ceiling leaves room for a
@@ -40,6 +48,14 @@ pub const MAX_SLACK_TOKEN_BYTES: usize = 512;
 /// [`SLACK_BOT_TOKEN_PREFIX`] are checked once, at construction, so rendering
 /// the header afterwards cannot fail.
 pub struct SlackToken(Vec<u8>);
+
+/// A Slack app-level credential used only to open Socket Mode connections.
+///
+/// Like [`SlackToken`], this type has no `Display`, redacts `Debug`, lends its
+/// bytes only through a callback view, and best-effort overwrites its storage on
+/// drop. The separate type is the important part: a caller cannot accidentally
+/// substitute one Slack credential audience for the other.
+pub struct SlackAppToken(Vec<u8>);
 
 impl SlackToken {
     /// Construct a bounded, header-safe bot credential.
@@ -77,6 +93,45 @@ impl SlackToken {
     pub fn authorization(&self) -> SlackAuthorization<'_> {
         SlackAuthorization(&self.0)
     }
+}
+
+impl SlackAppToken {
+    /// Construct a bounded, header-safe app-level credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SlackRefusal::AppToken`] when the secret is empty, longer than
+    /// [`MAX_SLACK_TOKEN_BYTES`], contains a byte outside RFC 6750 `token68`, or
+    /// is not prefixed [`SLACK_APP_TOKEN_PREFIX`] followed by at least one byte.
+    pub fn new(secret: impl Into<Vec<u8>>) -> Result<Self, SlackRefusal> {
+        let secret = secret.into();
+        if !valid_token(&secret, SLACK_APP_TOKEN_PREFIX) {
+            return Err(SlackRefusal::AppToken);
+        }
+        Ok(Self(secret))
+    }
+
+    /// Whether a credential is held at all.
+    #[must_use]
+    pub fn is_present(&self) -> bool {
+        !self.0.is_empty()
+    }
+
+    /// Lend the credential to the Socket Mode HTTP boundary for one call.
+    #[must_use]
+    pub fn authorization(&self) -> SlackAuthorization<'_> {
+        SlackAuthorization(&self.0)
+    }
+}
+
+fn valid_token(secret: &[u8], prefix: &str) -> bool {
+    secret.len() > prefix.len()
+        && secret.len() <= MAX_SLACK_TOKEN_BYTES
+        && secret.starts_with(prefix.as_bytes())
+        && secret.iter().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
+        })
 }
 
 /// A deliberate, short-lived credential view for the HTTP boundary.
@@ -130,6 +185,12 @@ impl fmt::Debug for SlackToken {
     }
 }
 
+impl fmt::Debug for SlackAppToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SlackAppToken(<redacted>)")
+    }
+}
+
 impl Drop for SlackToken {
     fn drop(&mut self) {
         // Best-effort hygiene only. Rust does not guarantee an optimizer
@@ -141,6 +202,12 @@ impl Drop for SlackToken {
     }
 }
 
+impl Drop for SlackAppToken {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +215,7 @@ mod tests {
     /// A synthetic bot token. It is not a real credential and addresses
     /// nothing: no server outside this crate's own tests ever sees it.
     const SECRET: &str = "xoxb-0000000000-0000000000-fixture-never-print";
+    const APP_SECRET: &str = "xapp-1-A0FIXTURE-fixture-never-print";
 
     #[test]
     fn a_token_renders_the_exact_bearer_header_and_nothing_else() {
@@ -193,6 +261,35 @@ mod tests {
             );
         }
         assert!(SlackToken::new(b"xoxb-a".to_vec()).is_ok());
+    }
+
+    #[test]
+    fn an_app_token_has_its_own_audience_and_is_always_redacted() {
+        let token = SlackAppToken::new(APP_SECRET.as_bytes().to_vec()).expect("app token");
+        assert!(token.is_present());
+        token.authorization().with_header_value(|header| {
+            assert_eq!(header, format!("Bearer {APP_SECRET}"));
+        });
+        let rendered = format!("{token:?} {:?}", token.authorization());
+        assert!(!rendered.contains(APP_SECRET), "rendered: {rendered}");
+        assert!(!rendered.contains("xapp-"), "rendered: {rendered}");
+        assert!(rendered.contains("<redacted>"));
+
+        for refused in [
+            SECRET,
+            "xoxp-fixture",
+            "xapp-",
+            "xapp",
+            "xapp-fixture with space",
+            "xapp-fixture\r\ninjected",
+            "",
+        ] {
+            assert_eq!(
+                SlackAppToken::new(refused.as_bytes().to_vec()).err(),
+                Some(SlackRefusal::AppToken),
+                "{refused:?}"
+            );
+        }
     }
 
     #[test]

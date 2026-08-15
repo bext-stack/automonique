@@ -84,15 +84,17 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use automonique_daemon::compose::{
-    ANSWER_LEAF, ANSWER_PLACEHOLDER, ComposeRefusal, Composition, CompositionInputs, DEFAULT_ARGV,
-    PROVIDER_CONFIG_NAME, ProviderConfig, WORKSPACE_PLACEHOLDER, compose,
+    ANSWER_LEAF, ANSWER_PLACEHOLDER, COMPOSE_MEMORY_BYTES, ComposeRefusal, Composition,
+    CompositionInputs, DEFAULT_ARGV, PROVIDER_CONFIG_NAME, ProviderConfig, ProviderRunProfile,
+    QUESTION_MEMORY_BYTES, QUESTION_MODEL_CONFIG, QUESTION_REASONING_CONFIG, WORKSPACE_PLACEHOLDER,
+    compose, compose_with_profile,
 };
 use automonique_daemon::execute::{
     DAEMON_BACKEND_ID, DAEMON_WORKSPACE_REGISTRY, locate_launch_helper, offered_host_features,
     run_workspace,
 };
-use automonique_daemon::run_lane::SocketRunLane;
-use automonique_daemon::telegram_bridge::{RunFailure, RunLane};
+use automonique_daemon::run_lane::{CONVERSATION_PROVIDER_CONFIG_NAME, SocketRunLane};
+use automonique_daemon::telegram_bridge::{QuestionProfile, QuestionRuntime, RunFailure, RunLane};
 use automonique_daemon::{Daemon, DaemonConfig};
 use automonique_egress_broker::{BrokerConfig, EgressBroker};
 use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse};
@@ -521,6 +523,110 @@ fn the_task_reaches_the_prompt_and_nothing_else() {
     );
 }
 
+#[test]
+fn read_only_question_profile_lowers_reasoning_without_reading_task_text() {
+    let fixture = Fixture::new(None, None);
+    let home = fixture.provider_home();
+    write_private(
+        &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
+        &busybox_provider(&home, &[]),
+    );
+    let state_dir = fixture.state_dir();
+    let provider = fixture.provider();
+    let offered = features();
+    let inputs = CompositionInputs {
+        state_dir: &state_dir,
+        run_id: "question-profile1",
+        provider: &provider,
+        offered_features: &offered,
+        egress_configured: true,
+    };
+    let composition = compose_with_profile(
+        "ordinary question text",
+        &inputs,
+        ProviderRunProfile::FastConversation,
+    )
+    .expect("question profile composes");
+    let spec = RunSpec::from_canonical_bytes(composition.document()).expect("document decodes");
+    let arguments: Vec<String> = spec
+        .arguments()
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["-c", QUESTION_REASONING_CONFIG]),
+        "Q&A profile must carry the explicit low-reasoning override: {arguments:?}"
+    );
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["-c", QUESTION_MODEL_CONFIG]),
+        "Q&A profile must carry the explicit fast-model override: {arguments:?}"
+    );
+    assert_eq!(
+        spec.sandbox().budgets().cgroup_memory().quantity(),
+        QUESTION_MEMORY_BYTES,
+        "conversation has a smaller memory ceiling than complex work"
+    );
+
+    let standard = compose(
+        "AUTOMONIQUE_READ_ONLY_QA_V1\nuser-shaped marker",
+        &CompositionInputs {
+            state_dir: &state_dir,
+            run_id: "standard-profile1",
+            provider: &provider,
+            offered_features: &offered,
+            egress_configured: true,
+        },
+    )
+    .expect("standard profile composes");
+    let standard = RunSpec::from_canonical_bytes(standard.document()).expect("document decodes");
+    assert!(
+        !standard
+            .arguments()
+            .iter()
+            .any(|argument| argument == QUESTION_REASONING_CONFIG),
+        "task text must not select the Q&A profile"
+    );
+    assert_ne!(
+        standard.sandbox().budgets().cgroup_memory().quantity(),
+        QUESTION_MEMORY_BYTES,
+        "standard work must retain its independent resource profile"
+    );
+    assert_eq!(
+        standard.sandbox().budgets().cgroup_memory().quantity(),
+        COMPOSE_MEMORY_BYTES
+    );
+
+    let intelligent = compose_with_profile(
+        "an operational question",
+        &CompositionInputs {
+            state_dir: &state_dir,
+            run_id: "intelligent-question1",
+            provider: &provider,
+            offered_features: &offered,
+            egress_configured: true,
+        },
+        ProviderRunProfile::IntelligentQuestion,
+    )
+    .expect("intelligent question profile composes");
+    let intelligent =
+        RunSpec::from_canonical_bytes(intelligent.document()).expect("document decodes");
+    assert_eq!(
+        intelligent.sandbox().budgets().cgroup_memory().quantity(),
+        QUESTION_MEMORY_BYTES
+    );
+    assert!(
+        !intelligent
+            .arguments()
+            .iter()
+            .any(|argument| argument == QUESTION_MODEL_CONFIG),
+        "operational Q&A must retain the configured intelligent model"
+    );
+}
+
 /// A deployment that configured nothing composes nothing, and says so.
 #[test]
 fn an_unconfigured_deployment_composes_nothing() {
@@ -872,6 +978,113 @@ fn an_unconfigured_daemon_answers_not_configured() {
         Err(RunFailure::NotConfigured),
         "an unconfigured daemon must refuse in a word an operator can read"
     );
+}
+
+#[test]
+fn a_dedicated_conversation_provider_is_selected_for_bounded_fast_profiles() {
+    let fixture = Fixture::new(None, Some("127.0.0.1 1 loopback\n"));
+    let primary_home = fixture.provider_home();
+    write_private(
+        &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
+        &busybox_provider(&primary_home, &["sh", "-c", "true > {answer}"]),
+    );
+    let conversation_home = fixture.state_dir().join("conversation-home");
+    std::fs::create_dir(&conversation_home).expect("conversation home");
+    std::fs::set_permissions(&conversation_home, std::fs::Permissions::from_mode(0o700))
+        .expect("private conversation home");
+    write_private(
+        &fixture.state_dir().join(CONVERSATION_PROVIDER_CONFIG_NAME),
+        &busybox_provider(&conversation_home, &["sh", "-c", "true > {answer}"]),
+    );
+
+    let lane = open_lane(&fixture);
+    assert_eq!(
+        lane.question_runtime(QuestionProfile::Conversation),
+        QuestionRuntime::deepseek_flash(QuestionProfile::Conversation)
+    );
+    assert_eq!(
+        lane.question_runtime(QuestionProfile::OperationalLookup),
+        QuestionRuntime::deepseek_flash(QuestionProfile::OperationalLookup)
+    );
+    assert_eq!(
+        lane.question_runtime(QuestionProfile::Operational),
+        QuestionRuntime::codex(QuestionProfile::Operational),
+        "operational questions must retain the primary intelligent provider"
+    );
+}
+
+#[test]
+fn a_malformed_conversation_provider_fails_closed_without_codex_fallback() {
+    let fixture = Fixture::new(None, Some("127.0.0.1 1 loopback\n"));
+    let primary_home = fixture.provider_home();
+    write_private(
+        &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
+        &busybox_provider(&primary_home, &["sh", "-c", "true > {answer}"]),
+    );
+    write_private(
+        &fixture.state_dir().join(CONVERSATION_PROVIDER_CONFIG_NAME),
+        "schema=unknown\n",
+    );
+
+    let mut lane = open_lane(&fixture);
+    assert_eq!(
+        lane.question_runtime(QuestionProfile::Conversation),
+        QuestionRuntime::conversation_provider_refused()
+    );
+    assert_eq!(
+        lane.run_question(
+            "do not spend the primary provider",
+            QuestionProfile::Conversation
+        ),
+        Err(RunFailure::NotConfigured)
+    );
+}
+
+/// Paid, owner-triggered proof that the small adapter works through the real
+/// prompt slot, cgroup, Landlock boundary and CONNECT broker. Ignored by every
+/// ordinary test run; it reads only explicit path coordinates from the
+/// environment and never accepts a credential value there.
+#[test]
+#[ignore = "requires an explicitly configured paid DeepSeek provider"]
+fn live_deepseek_conversation_answers_through_the_contained_lane() {
+    let test = "live_deepseek_conversation_answers_through_the_contained_lane";
+    if let Some(reason) = first_failing_gate() {
+        panic!("{test} containment gate failed: {reason}");
+    }
+    let binary = std::env::var("AUTOMONIQUE_LIVE_DEEPSEEK_BINARY")
+        .expect("set the absolute contained adapter path");
+    let home = std::env::var("AUTOMONIQUE_LIVE_DEEPSEEK_HOME")
+        .expect("set the absolute private provider-home path");
+    assert!(Path::new(&binary).is_absolute());
+    assert!(Path::new(&home).is_absolute());
+
+    let fixture = Fixture::new(None, Some("api.deepseek.com 443 public\n"));
+    write_private(
+        &fixture.state_dir().join(CONVERSATION_PROVIDER_CONFIG_NAME),
+        &format!(
+            "binary={binary}\nhome={home}\nversion=deepseek-v4-flash-live-proof\n\
+             arg=--output\narg={{answer}}\n"
+        ),
+    );
+    let serving = serve(&fixture.config);
+    let mut lane = open_lane(&fixture);
+    assert_eq!(
+        lane.question_runtime(QuestionProfile::Conversation),
+        QuestionRuntime::deepseek_flash(QuestionProfile::Conversation)
+    );
+    let started = Instant::now();
+    let answer = lane
+        .run_question(
+            "Reply with exactly: AUTOMONIQUE-DEEPSEEK-CONTAINED-OK",
+            QuestionProfile::Conversation,
+        )
+        .expect("live contained provider answer");
+    assert_eq!(answer, "AUTOMONIQUE-DEEPSEEK-CONTAINED-OK");
+    assert!(
+        started.elapsed() < Duration::from_secs(25),
+        "the provider exceeded its complete request budget"
+    );
+    serving.shutdown(&fixture.config);
 }
 
 /// Run one task, failing the test rather than hanging if the lane does not

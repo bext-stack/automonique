@@ -18,8 +18,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use automonique_observability::{MetricName, MetricValue, StoreProjection};
@@ -95,18 +95,25 @@ use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::sys::socket::{getsockopt, sockopt};
 use nix::unistd::geteuid;
 
+mod agent_activity;
 pub mod attempt_host;
 pub mod cancel_custody;
+pub mod codex_usage;
 pub mod compose;
+pub mod deepseek_balance;
 pub mod egress;
 pub mod execute;
+pub mod github;
+pub mod github_actions;
 pub mod improvement_github;
 pub mod improvement_publish;
 pub mod improvement_worker;
 pub mod improvements;
+mod model_inventory;
 pub mod release_activation;
 pub mod release_builder;
 pub mod run_lane;
+mod site_inventory;
 pub mod skill_runtime;
 pub mod slack;
 mod synthetic;
@@ -617,6 +624,8 @@ pub struct Daemon {
     controller: automonique_core::Controller,
     reconciliation_run_id: Option<i64>,
     telegram: telegram::TelegramHost,
+    /// Configured-channel Slack ticket intake and confirmation lifecycle.
+    slack_tickets: slack::SlackTicketHost,
     run_submissions: RunSubmissionLog,
     /// The listing read model derived from `run_submissions`.
     ///
@@ -844,9 +853,22 @@ impl Daemon {
         // on a host with no Telegram at all, which is the point of loading it
         // outside the Telegram host: an operator who wrote a bad `slack.conf`
         // is told so whether or not anything is composed to use it.
+        let ticket_gates = Arc::new(Mutex::new(
+            telegram_bridge::TicketGateRegistry::open(
+                state_dir.join("ticket-confirmations.v1.json"),
+            )
+            .map_err(|_| DaemonError::SlackRefused("ticket_gate_store_unavailable"))?,
+        ));
+        let slack_tickets = slack::SlackTicketHost::open(
+            &state_dir,
+            &config.admin_socket(),
+            &config.run_index_path(),
+            Arc::clone(&ticket_gates),
+        )
+        .map_err(|error| DaemonError::SlackRefused(error.category()))?;
         let slack = slack::SlackHost::open(&state_dir)
             .map_err(|error| DaemonError::SlackRefused(error.category()))?;
-        let telegram = telegram::TelegramHost::open(
+        let telegram = telegram::TelegramHost::open_with_ticket_gates(
             &telegram::TelegramHostParams {
                 state_dir: &state_dir,
                 database_path: &config.database_path(),
@@ -861,6 +883,7 @@ impl Daemon {
                 execution_state,
             },
             slack,
+            ticket_gates,
         )
         .map_err(|error| DaemonError::TelegramRefused(error.category()))?;
 
@@ -967,6 +990,7 @@ impl Daemon {
             controller: automonique_core::Controller::new(),
             reconciliation_run_id: None,
             telegram,
+            slack_tickets,
             run_submissions,
             run_index,
             automations,
@@ -1032,9 +1056,14 @@ impl Daemon {
         // here and nowhere else, so a process that opened a daemon and never
         // served has issued no request to the fleet either.
         let started = self
-            .telegram
+            .slack_tickets
             .start()
-            .map_err(|error| DaemonError::TelegramRefused(error.category()))
+            .map_err(|error| DaemonError::SlackRefused(error.category()))
+            .and_then(|()| {
+                self.telegram
+                    .start()
+                    .map_err(|error| DaemonError::TelegramRefused(error.category()))
+            })
             .and_then(|()| {
                 self.ticket_intake
                     .start()
@@ -1104,6 +1133,7 @@ impl Daemon {
         if let Some(execution) = self.execution.take() {
             execution.shutdown();
         }
+        self.slack_tickets.shutdown();
         // Support intake ends beside them, and for the same reason: its worker
         // writes to a durable sibling database this generation owns, so it must
         // stop and be joined while the generation is still held. It has no
