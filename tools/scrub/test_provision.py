@@ -25,8 +25,10 @@ SYNTHETIC = {
 KEY = b"k" * 32
 
 
-def entries() -> list[tuple[str, bytes]]:
-    return list(SYNTHETIC.items())
+def entries() -> list[provision.ValueEntry]:
+    return [
+        provision.ValueEntry(family, value) for family, value in SYNTHETIC.items()
+    ]
 
 
 class ParseValuesTests(unittest.TestCase):
@@ -37,13 +39,13 @@ class ParseValuesTests(unittest.TestCase):
         parsed = provision.parse_values(
             self.text(
                 ["# a comment", ""]
-                + [f"{family}: {value.decode()}" for family, value in entries()]
+                + [f"{e.family}: {e.value.decode()}" for e in entries()]
             )
         )
         self.assertEqual(entries(), parsed)
 
     def test_every_required_family_must_appear(self) -> None:
-        lines = [f"{f}: {v.decode()}" for f, v in entries()][:-1]
+        lines = [f"{e.family}: {e.value.decode()}" for e in entries()][:-1]
         with self.assertRaisesRegex(scan.ScrubError, "environment-name"):
             provision.parse_values(self.text(lines))
 
@@ -62,7 +64,7 @@ class ParseValuesTests(unittest.TestCase):
             self.assertIn(family, message)
 
     def test_a_partly_filled_template_names_the_remaining_blanks(self) -> None:
-        lines = [f"{f}: {v.decode()}" for f, v in entries()][:-1]
+        lines = [f"{e.family}: {e.value.decode()}" for e in entries()][:-1]
         lines.append("environment-name:")
         with self.assertRaises(scan.ScrubError) as caught:
             provision.parse_values(self.text(lines))
@@ -134,7 +136,9 @@ class BundleTests(unittest.TestCase):
         self.assertEqual([], findings)
 
     def test_duplicate_values_are_refused(self) -> None:
-        duplicated = entries() + [("internal-product", SYNTHETIC["legacy-name"])]
+        duplicated = entries() + [
+            provision.ValueEntry("internal-product", SYNTHETIC["legacy-name"])
+        ]
         with self.assertRaisesRegex(scan.ScrubError, "same fingerprint"):
             provision.build_bundle(duplicated, KEY)
 
@@ -153,13 +157,129 @@ class LiveValueTests(unittest.TestCase):
         # AGENTS.md is tracked, so a phrase from it stands in for an unscrubbed
         # value without this test needing a real private identifier.
         live = provision.unscrubbed(
-            [("legacy-name", b"Automonique agent contract")], provision.ROOT
+            [provision.ValueEntry("legacy-name", b"Automonique agent contract")],
+            provision.ROOT,
         )
         self.assertEqual(["legacy-name"], live)
 
     def test_a_value_absent_from_the_tree_is_not_reported(self) -> None:
         self.assertEqual(
-            [], provision.unscrubbed([("legacy-name", self.absent())], provision.ROOT)
+            [],
+            provision.unscrubbed(
+                [provision.ValueEntry("legacy-name", self.absent())], provision.ROOT
+            ),
+        )
+
+
+class HomeAnnotationTests(unittest.TestCase):
+    """`@home` is what makes a deliberately retained value fingerprintable."""
+
+    def parse_one(self, line: str) -> provision.ValueEntry:
+        lines = [
+            f"{e.family}: {e.value.decode()}"
+            for e in entries()
+            if e.family != "legacy-name"
+        ]
+        parsed = provision.parse_values("\n".join([line, *lines]) + "\n")
+        return next(entry for entry in parsed if entry.family == "legacy-name")
+
+    def test_a_line_without_an_annotation_declares_no_home(self) -> None:
+        self.assertEqual((), self.parse_one("legacy-name: retained-name").homes)
+
+    def test_one_annotation_is_parsed_and_kept_off_the_value(self) -> None:
+        entry = self.parse_one("legacy-name: retained-name @home docs/inventory.md")
+        self.assertEqual(b"retained-name", entry.value)
+        self.assertEqual(("docs/inventory.md",), entry.homes)
+
+    def test_several_annotations_are_ordered_as_written(self) -> None:
+        entry = self.parse_one(
+            "legacy-name: retained-name @home docs/inventory.md @home src/registry.rs"
+        )
+        self.assertEqual(("docs/inventory.md", "src/registry.rs"), entry.homes)
+
+    def test_a_malformed_home_names_its_line_and_is_refused(self) -> None:
+        for annotation in ("/etc/passwd", "../outside.md", "docs/", "docs/*.md"):
+            with self.subTest(annotation=annotation):
+                with self.assertRaisesRegex(scan.ScrubError, "line 1"):
+                    self.parse_one(f"legacy-name: retained-name @home {annotation}")
+
+    def test_the_same_home_twice_is_refused(self) -> None:
+        with self.assertRaisesRegex(scan.ScrubError, "same home twice"):
+            self.parse_one("legacy-name: n @home docs/a.md @home docs/a.md")
+
+    def test_the_bundle_carries_homes_and_still_no_value(self) -> None:
+        annotated = [
+            provision.ValueEntry(entry.family, entry.value, ("docs/inventory.md",))
+            if entry.family == "legacy-name"
+            else entry
+            for entry in entries()
+        ]
+        bundle = provision.build_bundle(annotated, KEY)
+        self.assertEqual(scan.RULE_SCHEMA_V2, bundle["schema"])
+        by_family = {rule["family"]: rule for rule in bundle["rules"]}
+        self.assertEqual(["docs/inventory.md"], by_family["legacy-name"]["homes"])
+        # Only the annotated rule gains the field; the rest are unchanged.
+        for family in ("third-party-product", "internal-product", "environment-name"):
+            self.assertNotIn("homes", by_family[family])
+        rendered = json.dumps(bundle).encode()
+        for value in SYNTHETIC.values():
+            self.assertNotIn(value, rendered)
+
+    def test_the_scanner_accepts_a_bundle_carrying_homes(self) -> None:
+        annotated = [
+            provision.ValueEntry(entry.family, entry.value, ("docs/inventory.md",))
+            if entry.family == "legacy-name"
+            else entry
+            for entry in entries()
+        ]
+        rules = scan.parse_rules(
+            provision.build_bundle(annotated, KEY),
+            expected_algorithm="hmac-sha256",
+            require_families=True,
+        )
+        homes = {rule.family: rule.homes for rule in rules}
+        self.assertEqual(("docs/inventory.md",), homes["legacy-name"])
+
+    def test_a_value_retained_only_in_its_home_is_provisionable(self) -> None:
+        """The blocker homes exist to remove.
+
+        `unscrubbed` refuses to fingerprint a value still in the tree. A value
+        the repository deliberately keeps is always still in the tree, so
+        without homes it could never be fingerprinted at all.
+        """
+        phrase = b"Automonique agent contract"
+        home = next(
+            path
+            for path, _, content in scan.tracked_blobs(provision.ROOT)
+            if phrase in content
+        )
+        self.assertEqual(
+            ["legacy-name"],
+            provision.unscrubbed(
+                [provision.ValueEntry("legacy-name", phrase)], provision.ROOT
+            ),
+        )
+        self.assertEqual(
+            [],
+            provision.unscrubbed(
+                [provision.ValueEntry("legacy-name", phrase, (home,))], provision.ROOT
+            ),
+        )
+
+    def test_a_home_that_is_not_a_tracked_file_is_caught_before_upload(self) -> None:
+        self.assertEqual(
+            ["legacy-name"],
+            provision.phantom_homes(
+                [provision.ValueEntry("legacy-name", b"x", ("does/not/exist.md",))],
+                provision.ROOT,
+            ),
+        )
+        self.assertEqual(
+            [],
+            provision.phantom_homes(
+                [provision.ValueEntry("legacy-name", b"x", ("AGENTS.md",))],
+                provision.ROOT,
+            ),
         )
 
 

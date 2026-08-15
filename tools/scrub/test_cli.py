@@ -58,7 +58,9 @@ INTERNAL = standin("standin", "internal", "product")
 ENVIRONMENT_NAME = standin("STANDIN", "ENVIRONMENT", "NAME", separator="_")
 
 
-def protected_environment(covered: bytes) -> tuple[dict[str, str], str]:
+def protected_environment(
+    covered: bytes, *, homes: tuple[str, ...] = ()
+) -> tuple[dict[str, str], str]:
     """Build the two secrets the publication job receives, and name the rule.
 
     The bundle comes from `provision.build_bundle` rather than from a literal
@@ -68,10 +70,10 @@ def protected_environment(covered: bytes) -> tuple[dict[str, str], str]:
     """
     document = provision.build_bundle(
         [
-            ("legacy-name", FIRST_PASS),
-            ("third-party-product", covered),
-            ("internal-product", INTERNAL),
-            ("environment-name", ENVIRONMENT_NAME),
+            provision.ValueEntry("legacy-name", FIRST_PASS),
+            provision.ValueEntry("third-party-product", covered, homes),
+            provision.ValueEntry("internal-product", INTERNAL),
+            provision.ValueEntry("environment-name", ENVIRONMENT_NAME),
         ],
         KEY,
     )
@@ -261,6 +263,117 @@ class CoverageIsExactlyTheInstalledRulesTests(CommandFixture):
         result = self.run_scan("--require-protected", environment=environment)
         self.assertEqual(1, result.returncode)
         self.assertIn(f"rule={rule_id}", result.stderr)
+
+
+class PushScopeTests(CommandFixture):
+    """The two flags the `protected-push-scrub` job runs with."""
+
+    def revision(self, reference: str = "HEAD") -> str:
+        return self.git("rev-parse", reference).stdout.decode().strip()
+
+    def test_tree_scope_states_which_question_it_answered(self) -> None:
+        result = self.run_scan("--scope", "tree")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn(scan.SCOPE_NOTE, result.stdout)
+        self.assertIn("currently tracked", result.stdout)
+        self.assertIn("0 commit messages", result.stdout)
+
+    def test_full_scope_does_not_carry_the_tree_note(self) -> None:
+        self.assertNotIn(scan.SCOPE_NOTE, self.run_scan().stdout)
+
+    def test_a_deleted_value_is_invisible_to_the_push_job_and_visible_to_publication(
+        self,
+    ) -> None:
+        """The honest limit of a push gate, measured rather than asserted.
+
+        This is the pair that justifies keeping `publication-scrub` around: the
+        push job cannot see what a clone still exposes, so a green push tick is
+        never evidence that a rewrite is unnecessary.
+        """
+        self.reintroduce(COVERED, in_message=False)
+        self.write("doc.md", RETAINED)
+        self.git("add", "doc.md")
+        self.git("commit", "-q", "-m", "remove the regression")
+        environment, rule_id = protected_environment(COVERED)
+
+        pushed = self.run_scan(
+            "--require-protected", "--scope", "tree", environment=environment
+        )
+        self.assertEqual(0, pushed.returncode, pushed.stderr)
+
+        publication = self.run_scan("--require-protected", environment=environment)
+        self.assertEqual(1, publication.returncode)
+        self.assertIn(f"rule={rule_id}", publication.stderr)
+        self.assertValueAbsent(publication, COVERED)
+
+    def test_the_pushed_range_carries_the_commit_message_the_tree_lost(self) -> None:
+        base = self.revision()
+        self.reintroduce(COVERED, in_message=True)
+        tip = self.revision()
+        environment, rule_id = protected_environment(COVERED)
+
+        without = self.run_scan(
+            "--require-protected", "--scope", "tree", environment=environment
+        )
+        self.assertEqual(0, without.returncode, without.stderr)
+
+        with_range = self.run_scan(
+            "--require-protected",
+            "--scope",
+            "tree",
+            "--commits",
+            f"{base}..{tip}",
+            environment=environment,
+        )
+        self.assertEqual(1, with_range.returncode)
+        self.assertIn(f"rule={rule_id} source=commit", with_range.stderr)
+        self.assertValueAbsent(with_range, COVERED)
+
+    def test_a_range_that_is_not_a_revision_selector_is_a_configuration_error(
+        self,
+    ) -> None:
+        result = self.run_scan("--scope", "tree", "--commits", "main;rm -rf /")
+        self.assertEqual(2, result.returncode)
+        self.assertIn("revision selector", result.stderr)
+
+
+class SanctionedHomeCommandTests(CommandFixture):
+    """A retained value passes in its home and fails one file over."""
+
+    def test_a_bundle_home_suppresses_the_file_it_names(self) -> None:
+        self.write("inventory.md", b"classified: " + COVERED + b"\n")
+        self.git("add", "inventory.md")
+        self.git("commit", "-q", "-m", "add the sanctioned inventory")
+        environment, rule_id = protected_environment(
+            COVERED, homes=("inventory.md",)
+        )
+
+        exempt = self.run_scan(
+            "--require-protected", "--scope", "tree", environment=environment
+        )
+        self.assertEqual(0, exempt.returncode, exempt.stderr)
+
+        self.write("elsewhere.md", b"copied: " + COVERED + b"\n")
+        self.git("add", "elsewhere.md")
+        result = self.run_scan(
+            "--require-protected", "--scope", "tree", environment=environment
+        )
+        self.assertEqual(1, result.returncode)
+        self.assertIn(
+            scan.render_finding(scan.Finding(rule_id, "file", "elsewhere.md", 1)),
+            result.stderr,
+        )
+        self.assertValueAbsent(result, COVERED)
+
+    def test_a_home_naming_no_tracked_file_refuses_the_run(self) -> None:
+        environment, _ = protected_environment(COVERED, homes=("inventory.md",))
+        result = self.run_scan(
+            "--require-protected", "--scope", "tree", environment=environment
+        )
+        self.assertEqual(2, result.returncode)
+        self.assertIn("not a tracked file", result.stderr)
+        # The rule ID is nameable; the path came from a secret and is not.
+        self.assertNotIn("inventory.md", result.stderr)
 
 
 if __name__ == "__main__":

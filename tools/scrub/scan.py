@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Elastic-2.0
 
-"""Scan tracked blobs and reachable commit messages for fingerprinted values."""
+"""Scan tracked blobs and reachable commit messages for fingerprinted values.
+
+Two scopes, because two jobs need different answers. `--scope full` is the
+publication question — "is this value reachable from any ref?" — and it costs a
+pass over every historical blob and every commit message. `--scope tree` is the
+push question — "does the state a reviewer is about to read contain it?" — and
+it reads only the tracked blobs and their path names, which is what makes it
+cheap enough to run on every push. `--commits <range>` adds exactly the
+messages a push introduced, so a push job can cover both without paying for the
+whole history.
+"""
 
 from __future__ import annotations
 
@@ -23,7 +33,18 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 PUBLIC_RULES = pathlib.Path(__file__).with_name("synthetic-rules.json")
 ALLOWLIST = pathlib.Path(__file__).with_name("allowlist.json")
 RULE_SCHEMA = "automonique.scrub-rules/v1"
+# v2 adds exactly one optional per-rule field, `homes`. A value that is
+# deliberately retained in a named file — the way a legacy identifier is
+# retained in the classified inventory — cannot be fingerprinted at all under
+# v1, because its own sanctioned home would fail the scan forever. Naming the
+# home is what makes the rule installable, and naming it per rule is what keeps
+# one rule's exemption from widening another's.
+RULE_SCHEMA_V2 = "automonique.scrub-rules/v2"
+SUPPORTED_RULE_SCHEMAS = (RULE_SCHEMA, RULE_SCHEMA_V2)
 ALLOWLIST_SCHEMA = "automonique.scrub-allowlist/v1"
+SCOPES = ("tree", "full")
+MAX_HOMES_PER_RULE = 16
+MAX_HOME_BYTES = 512
 REQUIRED_FAMILIES = frozenset(
     {
         "legacy-name",
@@ -43,10 +64,25 @@ COVERAGE_NOTE = (
     "that private identifiers are absent; only a run with the protected rule "
     "bundle can support that claim. See plan/gates.md#gate-scrub."
 )
+# The same distinction the coverage note makes, for the other axis. A tree
+# scope pass says the checkout is clean; it says nothing about what stays
+# reachable in history, and a reader deciding whether a repository is safe to
+# publish needs to be told which question was answered.
+SCOPE_NOTE = (
+    "note: this run used --scope tree, so it read only the currently tracked "
+    "blobs and their path names. Historical blobs and commit messages outside "
+    "any --commits range were not read; only a --scope full run can support a "
+    "claim about what remains reachable."
+)
 RULE_ID = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\Z")
 PROTECTED_RULE_ID = re.compile(r"p[12]-[0-9]{3}\Z")
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 ENVIRONMENT_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
+# A commit range reaches `git rev-list` as an argument. It may name refs,
+# SHAs and the range operators, and nothing that git would read as an option or
+# a pathspec — a leading `-` or a `--` separator would let a caller change what
+# the command does rather than which commits it walks.
+COMMIT_RANGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/^~@{}-]{0,255}\Z")
 EXPECTED_ALLOWLIST = {
     "product-mascot": (
         "Monique",
@@ -75,6 +111,52 @@ class Rule:
     algorithm: str
     length: int
     digest: str
+    # Repository-relative paths whose *file content* this rule does not judge.
+    # Deliberately narrow: a home suppresses nothing about the file's name, and
+    # nothing about a historical blob or a commit message, because those are
+    # not the sanctioned copy — they are the copies nobody will ever retire.
+    homes: tuple[str, ...] = ()
+
+
+def parse_home(value: Any, *, label: str) -> str:
+    """Validate one sanctioned-home path, or refuse to install the rule.
+
+    A home is an exemption, so a malformed one must never be interpreted
+    generously. It is a repository-relative POSIX path naming one file: not
+    absolute, not `..`-relative, not a directory, not a glob. `scan_repository`
+    compares it against the exact path git reports, so anything that would not
+    compare equal is a home that silently suppresses nothing.
+    """
+    if not isinstance(value, str) or not value:
+        raise ScrubError(f"{label} has a home that is not a non-empty string")
+    if len(value.encode("utf-8")) > MAX_HOME_BYTES:
+        raise ScrubError(f"{label} has a home longer than {MAX_HOME_BYTES} bytes")
+    if value != value.strip():
+        raise ScrubError(f"{label} has a home with surrounding whitespace")
+    if value.startswith("/") or "\\" in value:
+        raise ScrubError(f"{label} has a home that is not a relative POSIX path")
+    if value.endswith("/"):
+        raise ScrubError(f"{label} has a home naming a directory, not a file")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ScrubError(f"{label} has a home with an empty or relative segment")
+    if any(character in value for character in "*?[]"):
+        raise ScrubError(f"{label} has a home containing a glob character")
+    return value
+
+
+def parse_homes(entry: Mapping[str, Any], *, label: str) -> tuple[str, ...]:
+    listed = entry.get("homes")
+    if listed is None:
+        return ()
+    if not isinstance(listed, list) or not listed:
+        raise ScrubError(f"{label} declares an empty or non-list homes field")
+    if len(listed) > MAX_HOMES_PER_RULE:
+        raise ScrubError(f"{label} declares more than {MAX_HOMES_PER_RULE} homes")
+    homes = tuple(parse_home(item, label=label) for item in listed)
+    if len(set(homes)) != len(homes):
+        raise ScrubError(f"{label} declares the same home twice")
+    return homes
 
 
 @dataclasses.dataclass(frozen=True)
@@ -107,7 +189,10 @@ def read_json(path: pathlib.Path) -> dict[str, Any]:
 def parse_rules(
     document: dict[str, Any], *, expected_algorithm: str, require_families: bool
 ) -> list[Rule]:
-    if set(document) != {"schema", "rules"} or document.get("schema") != RULE_SCHEMA:
+    if set(document) != {"schema", "rules"}:
+        raise ScrubError("rule document has an unsupported shape or schema")
+    schema = document.get("schema")
+    if schema not in SUPPORTED_RULE_SCHEMAS:
         raise ScrubError("rule document has an unsupported shape or schema")
     entries = document.get("rules")
     if not isinstance(entries, list) or not entries:
@@ -116,8 +201,18 @@ def parse_rules(
     seen: set[str] = set()
     seen_fingerprints: set[tuple[str, int, str]] = set()
     required_fields = {"id", "family", "algorithm", "length", "digest"}
+    # `homes` is the only optional field, and only under v2. A v1 document
+    # carrying it is not a v1 document a v1 reader would have understood, so it
+    # is refused rather than silently upgraded.
+    permitted_fields = (
+        required_fields | {"homes"} if schema == RULE_SCHEMA_V2 else required_fields
+    )
     for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != required_fields:
+        if (
+            not isinstance(entry, dict)
+            or not required_fields <= set(entry)
+            or not set(entry) <= permitted_fields
+        ):
             raise ScrubError("each rule must contain only fingerprint metadata")
         rule_id = entry.get("id")
         family = entry.get("family")
@@ -145,9 +240,10 @@ def parse_rules(
         fingerprint = (algorithm, length, digest)
         if fingerprint in seen_fingerprints:
             raise ScrubError("rule document contains a duplicate fingerprint")
+        homes = parse_homes(entry, label=label)
         seen.add(rule_id)
         seen_fingerprints.add(fingerprint)
-        rules.append(Rule(rule_id, family, algorithm, length, digest))
+        rules.append(Rule(rule_id, family, algorithm, length, digest, homes))
     present = {rule.family for rule in rules}
     if require_families and present != REQUIRED_FAMILIES:
         missing = ", ".join(sorted(REQUIRED_FAMILIES - present))
@@ -249,9 +345,24 @@ def require_complete_history(repository: pathlib.Path) -> None:
         raise ScrubError("commit-message scan requires a complete, non-shallow history")
 
 
-def commit_messages(repository: pathlib.Path) -> list[tuple[str, bytes]]:
-    require_complete_history(repository)
-    commits = git(repository, "rev-list", "--all").decode("ascii").splitlines()
+def commit_messages(
+    repository: pathlib.Path, *, revisions: str | None = None
+) -> list[tuple[str, bytes]]:
+    """Messages for `revisions`, or for every reachable commit when unset.
+
+    Only the everything case needs a complete history: "no reachable commit
+    carries this value" is a claim a shallow clone cannot support. A named
+    range asks a smaller question, and git refuses loudly if the range is not
+    present, so a shallow clone that has the range may answer it.
+    """
+    if revisions is None:
+        require_complete_history(repository)
+        selector = ["--all"]
+    else:
+        if not COMMIT_RANGE.fullmatch(revisions):
+            raise ScrubError("commit range is not a plain revision selector")
+        selector = [revisions, "--"]
+    commits = git(repository, "rev-list", *selector).decode("ascii").splitlines()
     messages: list[tuple[str, bytes]] = []
     for commit_id in commits:
         raw = git(repository, "cat-file", "commit", commit_id)
@@ -282,6 +393,30 @@ def grouped_rules(rules: list[Rule]) -> dict[tuple[str, int], list[Rule]]:
     for rule in rules:
         groups.setdefault((rule.algorithm, rule.length), []).append(rule)
     return groups
+
+
+def groups_for_file(
+    groups: dict[tuple[str, int], list[Rule]], path: str
+) -> tuple[dict[tuple[str, int], list[Rule]], frozenset[str]]:
+    """The groups that judge `path`'s content, and the rules that do not.
+
+    Suppression removes the rule from the group rather than filtering findings
+    afterwards, so a group left empty is not hashed at all. That matters:
+    hashing is per distinct `(algorithm, length)` and runs over every byte
+    offset, so a sanctioned home should cost nothing rather than cost a full
+    pass whose findings are then thrown away.
+    """
+    suppressed = frozenset(
+        rule.rule_id for rules in groups.values() for rule in rules if path in rule.homes
+    )
+    if not suppressed:
+        return groups, suppressed
+    narrowed: dict[tuple[str, int], list[Rule]] = {}
+    for key, rules in groups.items():
+        kept = [rule for rule in rules if rule.rule_id not in suppressed]
+        if kept:
+            narrowed[key] = kept
+    return narrowed, suppressed
 
 
 def scan_bytes(
@@ -318,18 +453,58 @@ def scan_bytes(
     return findings
 
 
+def require_homes_exist(rules: list[Rule], tracked: set[str]) -> None:
+    """Refuse a rule whose sanctioned home is not a file in this tree.
+
+    A home that names nothing suppresses nothing, so it cannot cause a false
+    pass — but it is a rule document that no longer describes this repository,
+    and the next reader will believe an exemption is in force that is not. Same
+    defect as an Apache licence root that does not exist on disk, and treated
+    the same way: a configuration error, not a finding.
+
+    The refusal names the rule and never the path. The rule document arrives
+    from a secret and this message goes to a CI log; a rule ID is
+    non-sensitive by construction, and a path from that document is not this
+    function's to publish.
+    """
+    phantom = sorted(
+        rule.rule_id
+        for rule in rules
+        if any(home not in tracked for home in rule.homes)
+    )
+    if phantom:
+        raise ScrubError(
+            "these rules declare a sanctioned home that is not a tracked file, so "
+            f"the exemption is not in force: {', '.join(phantom)}"
+        )
+
+
 def scan_repository(
     repository: pathlib.Path,
     rules: list[Rule],
     *,
     hmac_key: bytes | None = None,
+    scope: str = "full",
+    commits: str | None = None,
 ) -> tuple[list[Finding], int, int]:
+    if scope not in SCOPES:
+        raise ScrubError(f"unknown scan scope: {scope}")
     before = repository_state(repository)
     groups = grouped_rules(rules)
     blobs = tracked_blobs(repository)
-    messages = commit_messages(repository)
-    current_object_ids = {object_id for _, object_id, _ in blobs}
-    old_blobs = historical_blobs(repository, current_object_ids)
+    # Tree scope answers "what would a reader of this checkout find", so it
+    # reads the index and stops. Full scope answers "what is reachable", which
+    # is the publication question and costs every historical blob.
+    if scope == "full":
+        messages = commit_messages(repository, revisions=commits)
+        current_object_ids = {object_id for _, object_id, _ in blobs}
+        old_blobs = historical_blobs(repository, current_object_ids)
+    else:
+        messages = (
+            [] if commits is None else commit_messages(repository, revisions=commits)
+        )
+        old_blobs = []
+    require_homes_exist(rules, {path for path, _, _ in blobs})
     findings: list[Finding] = []
     for path, _, content in blobs:
         path_findings = scan_bytes(
@@ -340,12 +515,13 @@ def scan_repository(
             hmac_key=hmac_key,
         )
         findings.extend(path_findings)
+        file_groups, _ = groups_for_file(groups, path)
         findings.extend(
             scan_bytes(
                 content,
                 source="file",
                 location="<redacted-path>" if path_findings else path,
-                groups=groups,
+                groups=file_groups,
                 hmac_key=hmac_key,
             )
         )
@@ -402,6 +578,21 @@ def main() -> int:
     parser.add_argument("--allowlist", type=pathlib.Path, default=ALLOWLIST)
     parser.add_argument("--require-protected", action="store_true")
     parser.add_argument(
+        "--scope",
+        choices=SCOPES,
+        default="full",
+        help="full: tracked blobs, path names, historical blobs and commit "
+        "messages. tree: tracked blobs and path names only — what a reader of "
+        "this checkout would find, without the cost of the whole history.",
+    )
+    parser.add_argument(
+        "--commits",
+        default=None,
+        help="a git revision range whose commit messages are scanned. Adds the "
+        "messages a push introduced to a tree-scope run; narrows a full-scope "
+        "run to that range instead of every reachable commit.",
+    )
+    parser.add_argument(
         "--protected-rules-env", default="AUTOMONIQUE_SCRUB_PROTECTED_RULES_B64"
     )
     parser.add_argument(
@@ -422,7 +613,11 @@ def main() -> int:
             required=args.require_protected,
         )
         findings, file_count, message_count = scan_repository(
-            args.repository.resolve(), public_rules + protected, hmac_key=key
+            args.repository.resolve(),
+            public_rules + protected,
+            hmac_key=key,
+            scope=args.scope,
+            commits=args.commits,
         )
     except ScrubError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
@@ -432,12 +627,17 @@ def main() -> int:
     if findings:
         print(f"scrub: FAIL ({len(findings)} finding(s))", file=sys.stderr)
         return 1
+    described = (
+        "current-or-reachable" if args.scope == "full" else "currently tracked"
+    )
     print(
-        f"ok — scrubbed {file_count} current-or-reachable Git blobs and "
+        f"ok — scrubbed {file_count} {described} Git blobs and "
         f"{message_count} commit "
         f"messages with {len(public_rules)} synthetic and {len(protected)} "
         f"protected rules; {len(allowlist)} retained decisions"
     )
+    if args.scope == "tree":
+        print(SCOPE_NOTE)
     if not protected:
         print(COVERAGE_NOTE)
     return 0
