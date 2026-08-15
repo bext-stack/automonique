@@ -5415,6 +5415,11 @@ where
                 }
                 (chat_id, text, false, None)
             }
+            Answer::ImprovementGate { message } => {
+                report.answered += 1;
+                self.send_outbound(TelegramOutbound::SendMessage(message), cancellation, report);
+                return;
+            }
         };
         let request = if preformatted {
             SendMessageRequest::new_preformatted(chat_id, text, reply_to_message_id)
@@ -5812,6 +5817,8 @@ enum Answer {
         text: String,
         mutated: bool,
     },
+    /// A two-gate self-improvement decision with fixed inline controls.
+    ImprovementGate { message: SendMessageRequest },
 }
 
 /// The reply for a durable surface that could not be read or written.
