@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Elastic-2.0
+name: Bug report
+description: Something behaves incorrectly.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Expected vs actual behaviour.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Commit / version
+      description: The `main` commit or release the daemon was running.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs / status
+      description: Relevant `automonique status`, `doctor`, or journal output. Redact any private identifier before pasting into this public repo.

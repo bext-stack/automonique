@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Elastic-2.0
+version: 2
+# Cargo is intentionally exact-pinned (a small, audited dependency set); its
+# advisories are handled by cargo-deny in CI (issue #33), not by version bumps
+# here. Dependabot tracks GitHub Actions only.
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"

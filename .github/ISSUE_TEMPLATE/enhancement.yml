@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Elastic-2.0
+name: Enhancement
+description: Propose a change or new capability.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+    validations:
+      required: true
+  - type: input
+    id: milestone
+    attributes:
+      label: Related milestone / issue
+      description: e.g. M6, or #NN — if it fits the improvement program.

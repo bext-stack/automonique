@@ -1,0 +1,32 @@
+# Code owners for Automonique.
+# Enforcement requires a branch-protection rule that requests review from code
+# owners; none is installed today (tracked with the repository-visibility
+# decision, issue #5), so these entries are advisory until that rule exists.
+
+# Default owner for everything not matched below.
+*                                   @benfavre
+
+# Governance, licensing, provenance, and identity — the authority surface.
+/GOVERNANCE.md                      @benfavre
+/AGENTS.md                          @benfavre
+/LICENSE                            @benfavre
+/LICENSE-POLICY.md                  @benfavre
+/LICENSES/                          @benfavre
+/NOTICE                             @benfavre
+/TRADEMARKS.md                      @benfavre
+/COMMERCIAL.md                      @benfavre
+/PROVENANCE.md                      @benfavre
+/SECURITY.md                        @benfavre
+/.github/                           @benfavre
+/.github/identity/                  @benfavre
+
+# The product requirements corpus and the improvement program.
+/docs/product-plan/                 @benfavre
+/docs/improvement-plan/             @benfavre
+
+# Protected security boundaries.
+/tools/oracle/                      @benfavre
+/tools/scrub/                       @benfavre
+/rust/crates/automonique-sandbox/   @benfavre
+/rust/crates/automonique-runner/    @benfavre
+/rust/crates/automonique-egress-broker/ @benfavre
