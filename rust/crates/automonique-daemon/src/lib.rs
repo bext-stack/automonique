@@ -92,6 +92,7 @@ use automonique_protocol::batch_runner::{
 };
 use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, RequestId, decode_frame, encode_frame};
 use automonique_protocol::digest::{ALGORITHM, Sha256, Sha256Digest};
+use automonique_protocol::execute_api::ApprovalContextField;
 use automonique_protocol::execute_api::{
     CancelRunOutcome, ExecuteRefusal, ExecuteRequest, ExecuteResponse,
 };
@@ -111,7 +112,7 @@ use automonique_store::approval_ledger::{
 };
 use automonique_store::approval_requests::{
     ApprovalContext, ApprovalOutcome, ApprovalProposal, ApprovalRequestError,
-    ApprovalRequestRecord, ApprovalRequests, ApprovalState,
+    ApprovalRequestRecord, ApprovalRequests, ApprovalState, StoredApprovalContext,
 };
 use automonique_store::audit_chain::{AuditAppend, AuditChain, GENESIS_PREV_HASH};
 use automonique_store::automation_store::{
@@ -572,6 +573,39 @@ fn mint_request_key(
 /// elsewhere, and a reader holding one digest could not tell which of them it
 /// had.
 const APPROVAL_KEY_DOMAIN: &[u8] = b"automonique.approval-request/v1/key\0";
+
+/// The first bound field of an approved context that no longer matches.
+///
+/// A pure total function over two contexts: no file is read here and no clock
+/// is consulted, so the whole comparison is enumerable by test. The order is
+/// [`ApprovalContextField::ALL`]'s, so a refusal names the first real
+/// difference rather than whichever one a hash map happened to yield.
+///
+/// The five arms are the five fields, one each. A field added to
+/// [`ApprovalContext`] without an arm here fails to compile, which is the point
+/// of listing them rather than looping: a binding that silently stopped
+/// covering a field would weaken the approval without changing a test.
+fn approved_context_drift(
+    approved: &StoredApprovalContext,
+    observed: ApprovalContext<'_>,
+) -> Option<ApprovalContextField> {
+    let ApprovalContext {
+        spec_digest,
+        program_path,
+        program_sha256,
+        prompt_sha256,
+        cwd_token,
+    } = observed;
+    ApprovalContextField::ALL
+        .into_iter()
+        .find(|field| match field {
+            ApprovalContextField::SpecDigest => approved.spec_digest != spec_digest,
+            ApprovalContextField::ProgramPath => approved.program_path != program_path,
+            ApprovalContextField::ProgramSha256 => approved.program_sha256 != program_sha256,
+            ApprovalContextField::PromptSha256 => approved.prompt_sha256 != prompt_sha256,
+            ApprovalContextField::CwdToken => approved.cwd_token != cwd_token,
+        })
+}
 
 /// What one subject's proposal history says about it.
 ///
@@ -2900,6 +2934,11 @@ impl Daemon {
     /// the CLI or a chat bridge would make it advisory; putting it after the
     /// lane starts would make it a report.
     ///
+    /// A granted approval is re-checked against the launch context it was
+    /// bound to before it admits anything; see
+    /// [`Daemon::verify_approved_context`] for which drift that closes and
+    /// which it leaves open.
+    ///
     /// # Errors
     ///
     /// Returns the [`ExecuteRefusal`] the caller is owed. A store failure is
@@ -2990,7 +3029,20 @@ impl Daemon {
             self.operator_surfaces(),
             evidence_of(&history),
         ) {
-            ApprovalGate::Proceed => return Ok(()),
+            ApprovalGate::Proceed => {
+                // Only a launch that *needed* an approval has an approved
+                // context to have drifted from. A composition that permits it
+                // outright must not acquire a second admission gate from a lane
+                // it does not belong to, so the re-check is inside the arm the
+                // requirement reached rather than outside it.
+                if sources.compose() != ApprovalRequirement::ApprovalRequired {
+                    return Ok(());
+                }
+                match self.verify_approved_context(&history, spec_digest, document) {
+                    Ok(()) => return Ok(()),
+                    Err(refusal) => refusal,
+                }
+            }
             ApprovalGate::Refuse(ApprovalPolicyRefusal::Forbidden) => {
                 if sources.host() == ApprovalRequirement::Forbidden {
                     ExecuteRefusal::SandboxUnenforceable
@@ -3013,6 +3065,85 @@ impl Daemon {
         };
         self.record_approval_audit(&subject, refusal, now_ms);
         Err(refusal)
+    }
+
+    /// Re-check that the launch context still matches the one approved.
+    ///
+    /// # The window this closes, and the one it does not
+    ///
+    /// An operator approves a *document*, and between that moment and the
+    /// launch every one of the five things the document resolves to can change:
+    /// the bytes in custody, the path the program is pinned at, the bytes
+    /// behind that path, the bytes in the prompt slot, and the working
+    /// directory the run is placed in. Comparing all five against what was
+    /// bound at proposal time closes **approval → admission** drift: an
+    /// approval granted for one launch cannot be spent on a different one.
+    ///
+    /// It does not close **admission → exec** drift. The runner opens the
+    /// executable, hashes it, and then `execve`s *the path* rather than the
+    /// bytes it hashed, so the file behind a verified path can still change in
+    /// the window between the two. That residual is real and this check does
+    /// not narrow it; roadmap item 48 closes it with a sealed memfd, and this
+    /// module must not claim otherwise — an approval system that binds context
+    /// and then executes a path whose bytes can change is *better* than
+    /// approval theater, and the distance from there to "verified" is exactly
+    /// one item.
+    ///
+    /// # Why this is not the provider-pin check
+    ///
+    /// The execution lane already hashes the pinned program and compares it to
+    /// the document's own pin, refusing
+    /// [`ExecuteRefusal::ProviderBinaryUnverified`]. That answers "this
+    /// document does not describe this binary". This one answers "this binary
+    /// is not the one that was approved", which is a different fact with a
+    /// different remedy: the first is a bad document, and the second is a
+    /// document whose world moved and needs a fresh decision. Two checks, two
+    /// refusals, and neither is derivable from the other.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecuteRefusal::ApprovalContextDrift`] naming the first bound field
+    /// that differs, in the order [`ApprovalContextField::ALL`] declares.
+    /// Nothing is started and nothing is written but the audit record its
+    /// caller appends.
+    fn verify_approved_context(
+        &self,
+        history: &[ApprovalRequestRecord],
+        spec_digest: &str,
+        document: &[u8],
+    ) -> Result<(), ExecuteRefusal> {
+        // The newest granted proposal is the one the policy admitted this
+        // launch under, so it is the one whose binding has to still hold.
+        let Some(approved) = history
+            .iter()
+            .rev()
+            .find(|record| record.state == ApprovalState::Granted)
+        else {
+            return Ok(());
+        };
+        let spec = RunSpec::from_canonical_bytes(document)
+            .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
+        let program_path = spec
+            .executable()
+            .to_str()
+            .ok_or(ExecuteRefusal::ProviderBinaryUnverified)?;
+        // Observed now, by the same reads the proposal was bound with. A
+        // program or prompt that cannot be observed at all is not "unchanged":
+        // it is the lane's own refusal, and it is answered as one.
+        let (program_sha256, prompt_sha256) =
+            execute::approval_context_digests(&self.state_dir, &spec)
+                .ok_or(ExecuteRefusal::ProviderBinaryUnverified)?;
+        let observed = ApprovalContext {
+            spec_digest,
+            program_path,
+            program_sha256: &program_sha256,
+            prompt_sha256: &prompt_sha256,
+            cwd_token: spec.cwd_token().as_str(),
+        };
+        match approved_context_drift(&approved.context, observed) {
+            None => Ok(()),
+            Some(field) => Err(ExecuteRefusal::ApprovalContextDrift { field }),
+        }
     }
 
     /// Create the proposal this launch is waiting on, or report the open one.
@@ -5254,6 +5385,176 @@ fn reconciliation_command_refusal(error: &StoreError) -> bool {
             | StoreError::OutboxConflict
             | StoreError::NotFound(_)
     )
+}
+
+#[cfg(test)]
+mod approval_context_tests {
+    use super::{
+        APPROVAL_KEY_DOMAIN, ApprovalContext, ApprovalContextField, StoredApprovalContext,
+        approved_context_drift, mint_request_key,
+    };
+
+    const SPEC: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const PROGRAM: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const PROMPT: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+    const OTHER: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+
+    fn approved() -> StoredApprovalContext {
+        StoredApprovalContext {
+            spec_digest: String::from(SPEC),
+            program_path: String::from("/usr/bin/example-provider"),
+            program_sha256: String::from(PROGRAM),
+            prompt_sha256: String::from(PROMPT),
+            cwd_token: String::from("cwd-1"),
+        }
+    }
+
+    fn observed() -> ApprovalContext<'static> {
+        ApprovalContext {
+            spec_digest: SPEC,
+            program_path: "/usr/bin/example-provider",
+            program_sha256: PROGRAM,
+            prompt_sha256: PROMPT,
+            cwd_token: "cwd-1",
+        }
+    }
+
+    #[test]
+    fn an_unchanged_context_names_no_drift() {
+        assert_eq!(approved_context_drift(&approved(), observed()), None);
+    }
+
+    /// One assertion per bound component, each naming its own field.
+    ///
+    /// The list is the whole binding, so a component that stopped being
+    /// compared would fail here rather than silently weaken every approval in
+    /// the product. The count assertion is what makes that true of a *new*
+    /// component too: adding one to `ApprovalContextField` without a case here
+    /// fails this test rather than passing vacuously.
+    #[test]
+    fn every_bound_component_drifts_on_its_own_and_names_itself() {
+        let mutations: [(ApprovalContextField, ApprovalContext<'static>); 5] = [
+            (
+                ApprovalContextField::SpecDigest,
+                ApprovalContext {
+                    spec_digest: OTHER,
+                    ..observed()
+                },
+            ),
+            (
+                ApprovalContextField::ProgramPath,
+                ApprovalContext {
+                    program_path: "/usr/bin/other-provider",
+                    ..observed()
+                },
+            ),
+            (
+                ApprovalContextField::ProgramSha256,
+                ApprovalContext {
+                    program_sha256: OTHER,
+                    ..observed()
+                },
+            ),
+            (
+                ApprovalContextField::PromptSha256,
+                ApprovalContext {
+                    prompt_sha256: OTHER,
+                    ..observed()
+                },
+            ),
+            (
+                ApprovalContextField::CwdToken,
+                ApprovalContext {
+                    cwd_token: "cwd-2",
+                    ..observed()
+                },
+            ),
+        ];
+        assert_eq!(
+            mutations.len(),
+            ApprovalContextField::ALL.len(),
+            "a bound component was added without a drift case"
+        );
+        for (expected, drifted) in mutations {
+            assert_eq!(
+                approved_context_drift(&approved(), drifted),
+                Some(expected),
+                "{expected} did not name itself"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_field_in_declaration_order_wins_when_several_drift() {
+        // A launch whose whole world moved is reported as one fact, and it is
+        // the first one, so the answer does not depend on iteration order.
+        let everything = ApprovalContext {
+            spec_digest: OTHER,
+            program_path: "/usr/bin/other-provider",
+            program_sha256: OTHER,
+            prompt_sha256: OTHER,
+            cwd_token: "cwd-2",
+        };
+        assert_eq!(
+            approved_context_drift(&approved(), everything),
+            Some(ApprovalContextField::SpecDigest)
+        );
+        // And with the first one restored, the next one in order.
+        let rest = ApprovalContext {
+            spec_digest: SPEC,
+            ..everything
+        };
+        assert_eq!(
+            approved_context_drift(&approved(), rest),
+            Some(ApprovalContextField::ProgramPath)
+        );
+    }
+
+    #[test]
+    fn a_re_proposal_mints_a_reference_the_first_one_did_not() {
+        let first = mint_request_key("runspec:one", "run-1", SPEC, 1_000, 0);
+        // Same coordinates, one prior proposal: a distinct reference, which is
+        // what makes re-proposal structurally impossible to confuse with
+        // reviving the row that expired.
+        let second = mint_request_key("runspec:one", "run-1", SPEC, 1_000, 1);
+        assert_ne!(first, second);
+        // Deterministic, so a retry of the same proposal is a replay rather
+        // than a second row.
+        assert_eq!(
+            first,
+            mint_request_key("runspec:one", "run-1", SPEC, 1_000, 0)
+        );
+        // Every coordinate is part of the identity.
+        assert_ne!(
+            first,
+            mint_request_key("runspec:two", "run-1", SPEC, 1_000, 0)
+        );
+        assert_ne!(
+            first,
+            mint_request_key("runspec:one", "run-2", SPEC, 1_000, 0)
+        );
+        assert_ne!(
+            first,
+            mint_request_key("runspec:one", "run-1", OTHER, 1_000, 0)
+        );
+        assert_ne!(
+            first,
+            mint_request_key("runspec:one", "run-1", SPEC, 2_000, 0)
+        );
+
+        assert_eq!(
+            first.len(),
+            automonique_store::approval_requests::REQUEST_KEY_BYTES
+        );
+        assert!(first.starts_with(automonique_store::approval_requests::REQUEST_KEY_PREFIX));
+        assert!(
+            first[4..].bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "the reference must be opaque hexadecimal"
+        );
+        // Domain separation, so the reference cannot collide with a plain
+        // re-hash of values that appear elsewhere.
+        assert!(APPROVAL_KEY_DOMAIN.ends_with(b"\0"));
+    }
 }
 
 #[cfg(test)]

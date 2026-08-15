@@ -64,6 +64,22 @@
 //! is what makes the repair possible: it is the ledger key this row's decision
 //! was recorded under, and it is set in the same statement as the transition.
 //!
+//! # What the bound context closes, and what it does not
+//!
+//! Five columns record the launch context a decision was made about: the
+//! document's canonical digest, the program's path, the digest of the bytes
+//! behind that path, the digest of the prompt, and the working-directory token.
+//! They are denormalized onto the row rather than re-derived from the document
+//! because a refusal has to be able to **name the field that drifted**, and a
+//! comparison against a document is only ever "these differ somewhere".
+//!
+//! A consumer that re-observes all five before acting closes **approval →
+//! admission** drift: an approval granted for one launch cannot be spent on a
+//! different one. It does not close **admission → exec** drift, because a
+//! runner that hashes a path and then executes that path can still be handed
+//! different bytes in between. This module makes no claim about that window,
+//! and a reader should not infer one from the presence of a digest column.
+//!
 //! # What a row does not establish
 //!
 //! - A `pending` row proves a decision was **asked for**, never that anyone saw
