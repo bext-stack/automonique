@@ -201,6 +201,13 @@ pub struct TelegramIngress {
     attachment_kind: Option<TelegramAttachmentKind>,
     content: Option<String>,
     disposition: TelegramDisposition,
+    /// Telegram's identifier for one pressed inline button.
+    ///
+    /// Present only on a callback update, and only there because it is the one
+    /// coordinate `answerCallbackQuery` needs and nothing else in this product
+    /// can use. A press that arrives without one is not acknowledgeable, so a
+    /// caller must treat `None` as "do not claim to have answered".
+    callback_query_id: Option<String>,
 }
 
 impl fmt::Debug for TelegramIngress {
@@ -220,11 +227,24 @@ impl fmt::Debug for TelegramIngress {
             .field("attachment_kind", &self.attachment_kind)
             .field("content", &self.content.as_ref().map(|_| "<redacted>"))
             .field("disposition", &self.disposition)
+            .field(
+                "callback_query_id",
+                &self.callback_query_id.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
 
 impl TelegramIngress {
+    /// Telegram's identifier for one pressed inline button.
+    ///
+    /// `None` for everything that is not an admitted callback. A caller
+    /// without one must not claim to have acknowledged a press.
+    #[must_use]
+    pub fn callback_query_id(&self) -> Option<&str> {
+        self.callback_query_id.as_deref()
+    }
+
     /// Telegram update identity.
     #[must_use]
     pub const fn update_id(&self) -> u64 {
@@ -514,6 +534,7 @@ fn parse_fresh_update(
         return Ok(unsupported_ingress(update_id, policy));
     }
     let discriminator = discriminators[0].as_str();
+    let mut callback_query_id: Option<String> = None;
     let parsed = match discriminator {
         "message" => parse_message_update(object, "message", TelegramInputKind::Message)?,
         "edited_message" => {
@@ -546,6 +567,7 @@ fn parse_fresh_update(
                 principal: None,
                 kind: TelegramInputKind::DeletedMessage,
                 attachment_kind: None,
+                callback_query_id: None,
                 content: None,
                 disposition: TelegramDisposition::IgnoredUnsupported,
             });
@@ -567,11 +589,17 @@ fn parse_fresh_update(
             }
             let actor_id = nested_i64(callback, &["from", "id"])?;
             let chat_id = nested_i64(callback, &["message", "chat", "id"])?;
+            // Both coordinates a decision needs to be answered *in place*: the
+            // query identifier dismisses the spinner, and the message
+            // identifier is the keyboard that has to stop looking live. A
+            // callback that carries neither cannot be acknowledged, and this is
+            // where that is discovered rather than at send time.
+            callback_query_id = Some(string(callback, "id")?.to_owned());
             Some((
                 TelegramPrincipal::new(chat_id, actor_id)?,
                 TelegramInputKind::Callback,
                 string(callback, "data")?,
-                None,
+                Some(nested_i64(callback, &["message", "message_id"])?),
                 None,
                 None,
             ))
@@ -605,6 +633,14 @@ fn parse_fresh_update(
             None
         },
         disposition,
+        // Acknowledging a press this bot refused would tell whoever pressed it
+        // that the button worked, so the coordinate travels only with an
+        // admitted update.
+        callback_query_id: if disposition == TelegramDisposition::Admitted {
+            callback_query_id
+        } else {
+            None
+        },
     })
 }
 
@@ -700,6 +736,7 @@ fn unsupported_ingress(update_id: u64, policy: &TelegramAccessPolicy) -> Telegra
         source_key: format!("telegram:{}:update:{update_id}", policy.bot_id().get()),
         scope: format!("telegram:{}:unsupported", policy.bot_id().get()),
         principal: None,
+        callback_query_id: None,
         kind: TelegramInputKind::Unsupported,
         attachment_kind: None,
         content: None,

@@ -648,6 +648,21 @@ fn updates(rows: &[(u64, i64, &str)]) -> ClientBehavior {
     ClientBehavior::Body(format!("{{\"ok\":true,\"result\":[{body}]}}"))
 }
 
+/// One pressed inline button, as Telegram delivers it.
+fn callback_updates(rows: &[(u64, i64, &str)]) -> ClientBehavior {
+    let body = rows
+        .iter()
+        .map(|(update_id, from, data)| {
+            format!(
+                r#"{{"update_id":{update_id},"callback_query":{{"id":"cbq-{update_id}","data":{},"from":{{"id":{from}}},"message":{{"message_id":{update_id},"chat":{{"id":{from}}}}}}}}}"#,
+                serde_json_string(data)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    ClientBehavior::Body(format!("{{\"ok\":true,\"result\":[{body}]}}"))
+}
+
 fn updates_with_reply(
     update_id: u64,
     from: i64,
@@ -2750,6 +2765,154 @@ fn an_approval_reference_reaches_the_lane_and_a_second_press_decides_nothing_twi
     assert!(
         messages[1].contains("Already approved"),
         "a second press must say so rather than claim a second decision"
+    );
+}
+
+/// A pressed approval button is answered, decided and stripped, in that order.
+///
+/// The order is the assertion. Telegram gives roughly ten seconds to answer a
+/// callback query, and the decision behind the press is a socket round-trip
+/// that writes two databases and a hash chain; answering afterwards would leave
+/// an operator watching a spinner give up on a button that worked. The strip
+/// follows, so a decided message stops offering a control.
+#[test]
+fn a_pressed_approval_button_is_acknowledged_then_decided_then_stripped() {
+    let fixture = Fixture::new(&[]);
+    let key = "apr-000102030405060708090a0b0c0d0e0f";
+    let client = FakeClient::new([callback_updates(&[(3, OPERATOR, &format!("{key}:a"))])]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::default();
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        client.clone(),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+
+    poll(&mut bridge).expect("poll commits");
+
+    let methods: Vec<String> = outbound
+        .sent()
+        .into_iter()
+        .map(|call| call.method)
+        .collect();
+    assert_eq!(
+        methods,
+        vec![
+            "answerCallbackQuery",
+            "editMessageReplyMarkup",
+            "sendMessage"
+        ],
+        "the acknowledgement must not queue behind the durable decision"
+    );
+    let calls = outbound.sent();
+    // The acknowledgement claims nothing about the outcome: the press arrived,
+    // and the outcome follows once it is durable.
+    assert_eq!(calls[0].body, r#"{"callback_query_id":"cbq-3"}"#);
+    // An empty row list is "no keyboard": the decided message offers nothing.
+    assert!(
+        calls[1].body.contains(r#""inline_keyboard":[]"#),
+        "a decided message must carry no live keyboard: {}",
+        calls[1].body
+    );
+    assert_eq!(
+        lane.decisions(),
+        vec![(
+            key.to_owned(),
+            true,
+            format!("telegram:{BOT_ID}:{OPERATOR}")
+        )]
+    );
+    assert!(calls[2].body.contains("Approved"));
+}
+
+/// A second press decides nothing twice and still strips.
+#[test]
+fn a_second_press_of_one_approval_decides_nothing_twice() {
+    let fixture = Fixture::new(&[]);
+    let key = "apr-0f0e0d0c0b0a09080706050403020100";
+    let data = format!("{key}:a");
+    let client = FakeClient::new([callback_updates(&[
+        (3, OPERATOR, &data),
+        (4, OPERATOR, &data),
+    ])]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::default();
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        client.clone(),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+
+    poll(&mut bridge).expect("poll commits");
+
+    // Two presses reached the lane, and the lane answered the second one the
+    // way the durable fence does. Exactly one decision exists.
+    assert_eq!(lane.decisions().len(), 2);
+    let messages = outbound.messages();
+    assert!(messages[0].contains("Approved"));
+    assert!(
+        messages[1].contains("Already approved"),
+        "a repeat press must say so rather than claim a second decision"
+    );
+    // Both presses were acknowledged; neither left a live keyboard behind.
+    assert_eq!(
+        outbound
+            .sent()
+            .iter()
+            .filter(|call| call.method == "answerCallbackQuery")
+            .count(),
+        2
+    );
+    assert_eq!(
+        outbound
+            .sent()
+            .iter()
+            .filter(|call| call.method == "editMessageReplyMarkup")
+            .count(),
+        2
+    );
+}
+
+/// A press by somebody who may not decide is refused inside the button.
+///
+/// A toast rather than a message: a refusal posted to the chat would tell
+/// everyone else in it who pressed what.
+#[test]
+fn a_press_by_a_non_approver_is_refused_inside_the_button() {
+    let fixture = Fixture::new(&[]);
+    let key = "apr-000102030405060708090a0b0c0d0e0f";
+    // A configured but non-admin operator: allowed to speak, not to decide.
+    // That is the interesting case — a stranger never reaches this branch at
+    // all, because the transport policy refuses them before the bridge sees it.
+    let client = FakeClient::new([callback_updates(&[(3, MEMBER, &format!("{key}:a"))])]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::default();
+    let mut bridge = bridge_with_roster(
+        &fixture,
+        client.clone(),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+        roster(&[OPERATOR], &[MEMBER]),
+    );
+
+    poll(&mut bridge).expect("poll commits");
+
+    assert!(
+        lane.decisions().is_empty(),
+        "a press this bridge refused must not reach the lane"
+    );
+    let calls = outbound.sent();
+    assert_eq!(calls.len(), 1, "nothing but the toast was sent");
+    assert_eq!(calls[0].method, "answerCallbackQuery");
+    assert!(calls[0].body.contains("Only a configured administrator"));
+    assert!(
+        outbound.messages().is_empty(),
+        "a refusal must not become a message the whole chat reads"
     );
 }
 

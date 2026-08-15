@@ -122,13 +122,51 @@ fn denied_actor_is_returned_for_durable_disposition() {
 #[test]
 fn callback_uses_actor_and_message_chat_coordinates() {
     let batch = parse_telegram_updates(
-        br#"{"ok":true,"result":[{"callback_query":{"data":"approve:7","from":{"id":42},"message":{"chat":{"id":-100}}},"update_id":11}]}"#,
+        br#"{"ok":true,"result":[{"callback_query":{"id":"cbq-9","data":"approve:7","from":{"id":42},"message":{"message_id":5,"chat":{"id":-100}}},"update_id":11}]}"#,
         0,
         &policy(),
     )
     .expect("batch");
     assert_eq!(batch.updates()[0].kind(), TelegramInputKind::Callback);
     assert_eq!(batch.updates()[0].content(), Some("approve:7"));
+    // Both coordinates a press needs to be answered in place: the query
+    // identifier dismisses the spinner and the message identifier is the
+    // keyboard that has to stop looking live.
+    assert_eq!(batch.updates()[0].callback_query_id(), Some("cbq-9"));
+    assert_eq!(batch.updates()[0].message_id(), Some(5));
+}
+
+/// A press this bot refused carries no acknowledgement coordinate.
+///
+/// Acknowledging it would tell whoever pressed the button that it worked, which
+/// is exactly what a denied sender must not learn.
+#[test]
+fn a_denied_callback_carries_no_acknowledgement_coordinate() {
+    let batch = parse_telegram_updates(
+        br#"{"ok":true,"result":[{"callback_query":{"id":"cbq-9","data":"approve:7","from":{"id":99},"message":{"message_id":5,"chat":{"id":-100}}},"update_id":11}]}"#,
+        0,
+        &policy(),
+    )
+    .expect("batch");
+    assert_eq!(batch.updates()[0].kind(), TelegramInputKind::Callback);
+    assert_eq!(batch.updates()[0].content(), None);
+    assert_eq!(batch.updates()[0].callback_query_id(), None);
+}
+
+/// A callback with no identifier or no message coordinate is refused.
+#[test]
+fn a_callback_missing_a_coordinate_is_refused_rather_than_half_admitted() {
+    for payload in [
+        // No `id`: nothing to acknowledge.
+        br#"{"ok":true,"result":[{"callback_query":{"data":"approve:7","from":{"id":42},"message":{"message_id":5,"chat":{"id":-100}}},"update_id":11}]}"#.as_slice(),
+        // No `message_id`: no keyboard to strip.
+        br#"{"ok":true,"result":[{"callback_query":{"id":"cbq-9","data":"approve:7","from":{"id":42},"message":{"chat":{"id":-100}}},"update_id":11}]}"#.as_slice(),
+    ] {
+        assert!(
+            parse_telegram_updates(payload, 0, &policy()).is_err(),
+            "a half-addressed press must not be admitted"
+        );
+    }
 }
 
 #[test]
@@ -228,7 +266,7 @@ fn floating_point_fields_in_old_or_unsupported_payloads_do_not_wedge() {
     assert_eq!(batch.updates()[0].content(), Some("fresh"));
 
     let callback = parse_telegram_updates(
-        br#"{"ok":true,"result":[{"callback_query":{"data":"x","from":{"id":42},"message":{"chat":{"id":-100},"location":{"latitude":1.25,"longitude":2.5}}},"update_id":10}]}"#,
+        br#"{"ok":true,"result":[{"callback_query":{"id":"cbq-1","data":"x","from":{"id":42},"message":{"message_id":3,"chat":{"id":-100},"location":{"latitude":1.25,"longitude":2.5}}},"update_id":10}]}"#,
         10,
         &policy(),
     )

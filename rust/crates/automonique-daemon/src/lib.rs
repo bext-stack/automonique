@@ -3140,8 +3140,14 @@ impl Daemon {
                         "telegram:{bot_id}:approval:{}:{rung}:{chat_id}",
                         record.request_key
                     );
-                    let Some(payload) = telegram_bridge::telegram_notice_payload(*chat_id, &text)
-                    else {
+                    // The notice carries its own buttons: an operator who is
+                    // reminded should be able to answer where they were
+                    // reminded, without retyping a reference they were shown.
+                    let Some(payload) = telegram_bridge::telegram_notice_payload(
+                        *chat_id,
+                        &text,
+                        Some(&record.request_key),
+                    ) else {
                         continue;
                     };
                     let receipt = self

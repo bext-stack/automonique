@@ -132,14 +132,14 @@ use automonique_support_connector::{
     TicketDispatchRequest, TicketJobStatus, TicketStatus, TicketStatusRequest, TicketWorkspace,
 };
 use automonique_transport_runtime::{
-    AdminDirective, AllowedUsers, ApprovalKeyboard, CancellationToken, ChannelName, ControlCommand,
-    HttpFailure, MAX_ALLOWED_USERS, MAX_COMMAND_TEXT_BYTES, MAX_SEND_MESSAGE_TEXT_UNITS,
-    MemoryDirective, OpaqueBotToken, OperatorAuthority, PollOutcome, PollerLease, RuntimeError,
-    SendMessageRequest, SetMessageReactionRequest, SetMyCommandsRequest, TelegramBotCommand,
-    TelegramDurableSink, TelegramHttpClient, TelegramHttpPlan, TelegramHttpResponse,
-    TelegramOutbound, TelegramOutboundClient, TelegramOutboundPlan, TelegramPoller,
-    TelegramTextStyle, authorize_and_parse_tiered, command_manifest, command_refusal_text,
-    help_text,
+    AdminDirective, AllowedUsers, AnswerCallbackQueryRequest, ApprovalKeyboard, CancellationToken,
+    ChannelName, ControlCommand, EditMessageReplyMarkupRequest, HttpFailure, InlineButtonLabel,
+    MAX_ALLOWED_USERS, MAX_COMMAND_TEXT_BYTES, MAX_SEND_MESSAGE_TEXT_UNITS, MemoryDirective,
+    OpaqueBotToken, OperatorAuthority, PollOutcome, PollerLease, RuntimeError, SendMessageRequest,
+    SetMessageReactionRequest, SetMyCommandsRequest, TelegramBotCommand, TelegramDurableSink,
+    TelegramHttpClient, TelegramHttpPlan, TelegramHttpResponse, TelegramOutbound,
+    TelegramOutboundClient, TelegramOutboundPlan, TelegramPoller, TelegramTextStyle,
+    authorize_and_parse_tiered, command_manifest, command_refusal_text, help_text,
 };
 use automonique_transports::{
     TelegramAccessPolicy, TelegramBotId, TelegramDisposition, TelegramIngress, TelegramInputKind,
@@ -3831,27 +3831,48 @@ where
                 },
                 TelegramDisposition::IgnoredUnsupported => Answer::Ignore,
                 TelegramDisposition::Admitted => {
-                    if !self.authority.is_admin(principal.actor_id()) {
-                        Answer::Refused {
-                            chat_id: principal.chat_id(),
-                            text: String::from(QUESTION_ADMIN_ONLY),
+                    let Some(callback) = update.content() else {
+                        return Answer::Ignore;
+                    };
+                    // A press that carries an approval reference is answered
+                    // *inside the button*: an operator who is not an approver
+                    // learns it there, as a toast, rather than by a message
+                    // arriving in the chat for everyone else to read.
+                    if let Some((request_key, granted)) = parse_approval_callback(callback) {
+                        let Some(callback_query_id) = update.callback_query_id() else {
+                            return Answer::Ignore;
+                        };
+                        if !self.authority.is_admin(principal.actor_id()) {
+                            return Answer::CallbackRefused {
+                                callback_query_id: callback_query_id.to_owned(),
+                                text: String::from(APPROVAL_CALLBACK_NOT_PERMITTED),
+                            };
                         }
-                    } else if let Some(callback) = update.content() {
+                        return Answer::ApprovalDecisionReady {
+                            chat_id: principal.chat_id(),
+                            message_id: update.message_id(),
+                            callback_query_id: callback_query_id.to_owned(),
+                            request_key: request_key.to_owned(),
+                            granted,
+                            decider: telegram_actor_key(self.bot_id, principal.actor_id()),
+                        };
+                    }
+                    if self.authority.is_admin(principal.actor_id()) {
                         self.improvement_callback_answer(
                             principal.actor_id(),
                             principal.chat_id(),
                             callback,
                         )
                     } else {
-                        Answer::Ignore
+                        Answer::Refused {
+                            chat_id: principal.chat_id(),
+                            text: String::from(QUESTION_ADMIN_ONLY),
+                        }
                     }
                 }
             };
         }
         if update.kind() != TelegramInputKind::Message {
-            // A callback carries no operator command in this build, and
-            // acknowledging one needs `answerCallbackQuery`, which the outbound
-            // vocabulary deliberately cannot spell.
             return Answer::Ignore;
         }
         match update.disposition() {
@@ -5312,6 +5333,56 @@ where
         }
     }
 
+    /// Dismiss the spinner one press raised.
+    ///
+    /// Direct rather than durable, and deliberately: an acknowledgement has a
+    /// deadline of seconds, and a row in an outbox drained on the next poll
+    /// would miss it. Nothing is lost when it fails — the operator sees a
+    /// spinner time out on a press that still took effect, which is worse than
+    /// nothing and much better than a decision that waited for a queue.
+    fn acknowledge_callback(
+        &mut self,
+        callback_query_id: &str,
+        text: Option<&str>,
+        cancellation: &CancellationToken,
+        report: &mut DispatchReport,
+    ) {
+        let Ok(request) = AnswerCallbackQueryRequest::new(callback_query_id, text) else {
+            report.send_refused += 1;
+            return;
+        };
+        self.send_outbound(
+            TelegramOutbound::AnswerCallbackQuery(request),
+            cancellation,
+            report,
+        );
+    }
+
+    /// Take the buttons off one exact message.
+    ///
+    /// Direct for the reason the acknowledgement is: it belongs to the press
+    /// the operator is watching. A failure leaves a stale keyboard, which the
+    /// single-use coordinate behind it already makes harmless — the second
+    /// press finds the proposal decided and is told so — so this is a view
+    /// repair rather than a safety one, and it never gates the decision.
+    fn strip_keyboard(
+        &mut self,
+        chat_id: i64,
+        message_id: i64,
+        cancellation: &CancellationToken,
+        report: &mut DispatchReport,
+    ) {
+        let Ok(request) = EditMessageReplyMarkupRequest::strip(chat_id, message_id) else {
+            report.send_refused += 1;
+            return;
+        };
+        self.send_outbound(
+            TelegramOutbound::EditMessageReplyMarkup(request),
+            cancellation,
+            report,
+        );
+    }
+
     /// Carry out one `/admin` directive, and say whether it moved a row.
     ///
     /// Only an administrator reaches here — the tier gate in
@@ -5641,6 +5712,66 @@ where
             }
             return;
         }
+        if let Answer::CallbackRefused {
+            callback_query_id,
+            text,
+        } = answer
+        {
+            self.acknowledge_callback(&callback_query_id, Some(&text), cancellation, report);
+            report.refused += 1;
+            return;
+        }
+        if let Answer::ApprovalDecisionReady {
+            chat_id,
+            message_id,
+            callback_query_id,
+            request_key,
+            granted,
+            decider,
+        } = answer
+        {
+            // ORDER IS THE POINT HERE, AND IT IS NOT THE OBVIOUS ONE.
+            //
+            // The acknowledgement goes first, before any durable work. Telegram
+            // gives roughly ten seconds to answer a callback query, and the
+            // decision behind this press is a socket round-trip to a daemon
+            // that writes two databases and a hash chain. Answering afterwards
+            // would leave the operator watching a spinner that eventually gives
+            // up on a button that in fact worked.
+            //
+            // The acknowledgement claims nothing about the outcome for exactly
+            // that reason: it says the press arrived, and the outcome follows
+            // as a message once it is durable.
+            self.acknowledge_callback(&callback_query_id, None, cancellation, report);
+            let decided = self
+                .lane
+                .lock()
+                .map_err(|_| ApprovalDecisionFailure::Unavailable)
+                .and_then(|mut lane| lane.decide_approval(&request_key, granted, &decider));
+            // The keyboard comes off whatever the answer was. A press that
+            // found the proposal already decided, or expired, is a press whose
+            // buttons are stale, and leaving them live is how an operator ends
+            // up pressing something that silently does nothing.
+            if let Some(message_id) = message_id {
+                self.strip_keyboard(chat_id, message_id, cancellation, report);
+            }
+            let text = match decided {
+                Ok(answer) => String::from(approval_reply(answer, granted)),
+                Err(failure) => String::from(failure.operator_reply()),
+            };
+            self.deliver(
+                Answer::Answered {
+                    chat_id,
+                    text,
+                    preformatted: false,
+                },
+                actor_id,
+                reply_to_message_id,
+                cancellation,
+                report,
+            );
+            return;
+        }
         if let Answer::TicketDenialReady {
             chat_id,
             message_id,
@@ -5770,7 +5901,10 @@ where
             Answer::TicketActionReady { .. } => {
                 unreachable!("handled before reply rendering")
             }
-            Answer::TicketApprovalReady { .. } | Answer::TicketDenialReady { .. } => {
+            Answer::TicketApprovalReady { .. }
+            | Answer::TicketDenialReady { .. }
+            | Answer::ApprovalDecisionReady { .. }
+            | Answer::CallbackRefused { .. } => {
                 unreachable!("handled before reply rendering")
             }
             Answer::EmailActionReady { .. } => {
@@ -5884,7 +6018,13 @@ where
                     .map(|keyboard| keyboard.approve_callback().to_owned()),
                 revise_callback: message
                     .approval_keyboard()
-                    .map(|keyboard| keyboard.revise_callback().to_owned()),
+                    .map(|keyboard| keyboard.secondary_callback().to_owned()),
+                decision_pair: message.approval_keyboard().is_some_and(|keyboard| {
+                    keyboard
+                        .buttons()
+                        .get(1)
+                        .is_some_and(|(label, _)| *label == InlineButtonLabel::Deny)
+                }),
             };
             let Ok(payload) = serde_json::to_vec(&durable) else {
                 report.send_refused += 1;
@@ -5993,7 +6133,12 @@ where
                 persisted.revise_callback.as_deref(),
             ) {
                 (Some(approve), Some(revise)) => {
-                    let Ok(keyboard) = ApprovalKeyboard::new(approve, revise) else {
+                    let rebuilt = if persisted.decision_pair {
+                        ApprovalKeyboard::decision(approve, revise)
+                    } else {
+                        ApprovalKeyboard::new(approve, revise)
+                    };
+                    let Ok(keyboard) = rebuilt else {
                         let _ = self.surface.fail_telegram_outbound(
                             &lease,
                             None,
@@ -6111,19 +6256,45 @@ pub(crate) const TELEGRAM_SEND_KIND: &str = "telegram.send_message";
 /// `None` when the text or the chat is outside Telegram's own bounds — which is
 /// checked here, by the same constructor the delivery path uses, so a row that
 /// this admits is a row the drain can send.
-pub(crate) fn telegram_notice_payload(chat_id: i64, text: &str) -> Option<Vec<u8>> {
+pub(crate) fn telegram_notice_payload(
+    chat_id: i64,
+    text: &str,
+    decision_for: Option<&str>,
+) -> Option<Vec<u8>> {
     let request = SendMessageRequest::new(chat_id, text, None).ok()?;
+    let keyboard = match decision_for {
+        None => None,
+        Some(request_key) => Some(
+            ApprovalKeyboard::decision(
+                approval_callback_data(request_key, true),
+                approval_callback_data(request_key, false),
+            )
+            .ok()?,
+        ),
+    };
     serde_json::to_vec(&PersistedTelegramMessage {
         chat_id: request.chat_id(),
         text: request.text().to_owned(),
         preformatted: false,
         reply_to_message_id: request.reply_to_message_id(),
-        approve_callback: None,
-        revise_callback: None,
+        approve_callback: keyboard
+            .as_ref()
+            .map(|keyboard| keyboard.approve_callback().to_owned()),
+        revise_callback: keyboard
+            .as_ref()
+            .map(|keyboard| keyboard.secondary_callback().to_owned()),
+        decision_pair: keyboard.is_some(),
     })
     .ok()
 }
 
+/// The durable form of one staged message.
+///
+/// `deny_unknown_fields` is what makes a row this build cannot render a
+/// dead-letter rather than a partially-honoured send. `decision_pair` is
+/// `#[serde(default)]` so rows staged before it existed still decode: a
+/// keyboard with no recorded pairing is the approve / request-changes one the
+/// self-improvement gate has always used.
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedTelegramMessage {
@@ -6133,6 +6304,9 @@ struct PersistedTelegramMessage {
     reply_to_message_id: Option<i64>,
     approve_callback: Option<String>,
     revise_callback: Option<String>,
+    /// Whether the second button denies rather than requests changes.
+    #[serde(default)]
+    decision_pair: bool,
 }
 
 fn telegram_outbound_message_key(bot_id: i64, chat_id: i64, message_id: i64) -> String {
@@ -6216,6 +6390,28 @@ enum Answer {
         chat_id: i64,
         message_id: Option<i64>,
         approval_ref: String,
+    },
+    /// One pressed approval button, ready to be answered in place.
+    ///
+    /// Carries both coordinates the press needs — the query identifier that
+    /// dismisses the spinner and the message identifier whose keyboard has to
+    /// stop looking live — and the tier-checked actor that will be recorded as
+    /// the decider.
+    ApprovalDecisionReady {
+        chat_id: i64,
+        message_id: Option<i64>,
+        callback_query_id: String,
+        request_key: String,
+        granted: bool,
+        decider: String,
+    },
+    /// One pressed button refused inside the button itself.
+    ///
+    /// A toast rather than a message, because a refusal that posted to the chat
+    /// would tell everyone else in it who pressed what.
+    CallbackRefused {
+        callback_query_id: String,
+        text: String,
     },
     /// An administrator rejection of one pending ticket gate.
     ///
@@ -7373,6 +7569,55 @@ fn cancel_request_ref(update: &TelegramIngress, chat_id: i64) -> String {
 /// by literal: this module is a transport surface, and the one string it has to
 /// recognize is not a reason to take a dependency on another crate's grammar.
 const APPROVAL_REFERENCE_PREFIX: &str = "apr-";
+
+/// The toast a press by somebody who may not decide receives.
+///
+/// Answered inside the button. Nothing is posted to the chat, so a press by a
+/// non-approver does not become a message everyone else in the chat reads.
+pub const APPROVAL_CALLBACK_NOT_PERMITTED: &str =
+    "Only a configured administrator can decide an approval. Nothing was decided.";
+
+/// The verb suffix one approval button carries.
+///
+/// One byte each, appended after a separator, so the whole payload is the
+/// reference plus two characters — comfortably inside Telegram's 64-byte
+/// `callback_data` ceiling with room for a longer reference later.
+const APPROVAL_CALLBACK_GRANT: &str = "a";
+/// The refusing counterpart of [`APPROVAL_CALLBACK_GRANT`].
+const APPROVAL_CALLBACK_DENY: &str = "d";
+
+/// Mint the opaque payload one approval button carries.
+///
+/// The reference comes first so the whole payload starts with the `apr-`
+/// grammar: a surface can tell which lane a press belongs to by looking at the
+/// front of it, exactly as it can for a typed reference.
+#[must_use]
+pub fn approval_callback_data(request_key: &str, granted: bool) -> String {
+    let verb = if granted {
+        APPROVAL_CALLBACK_GRANT
+    } else {
+        APPROVAL_CALLBACK_DENY
+    };
+    format!("{request_key}:{verb}")
+}
+
+/// Read one approval button payload, or nothing.
+///
+/// Total and allocation-free. Anything that is not exactly this grammar — a
+/// self-improvement challenge, a payload from an older build, a value somebody
+/// typed — is `None`, and the caller falls through to whatever else claims it.
+#[must_use]
+pub fn parse_approval_callback(callback: &str) -> Option<(&str, bool)> {
+    let (request_key, verb) = callback.rsplit_once(':')?;
+    if !request_key.starts_with(APPROVAL_REFERENCE_PREFIX) {
+        return None;
+    }
+    match verb {
+        APPROVAL_CALLBACK_GRANT => Some((request_key, true)),
+        APPROVAL_CALLBACK_DENY => Some((request_key, false)),
+        _ => None,
+    }
+}
 
 /// The actor key one Telegram administrator is recorded under.
 ///
@@ -8847,7 +9092,9 @@ fn ticket_detail(record: &TicketRecord) -> String {
 
 #[cfg(test)]
 mod notice_payload_tests {
-    use super::{PersistedTelegramMessage, telegram_notice_payload};
+    use automonique_transport_runtime::MAX_CALLBACK_DATA_BYTES;
+
+    use super::{PersistedTelegramMessage, parse_approval_callback, telegram_notice_payload};
 
     /// A staged notice is a row the drain can rebuild into a real send.
     ///
@@ -8858,7 +9105,7 @@ mod notice_payload_tests {
     /// the approval lane rather than in the encoding.
     #[test]
     fn a_staged_notice_rebuilds_into_the_message_the_drain_sends() {
-        let payload = telegram_notice_payload(-1_001, "An approval is still waiting.")
+        let payload = telegram_notice_payload(-1_001, "An approval is still waiting.", None)
             .expect("a payload for a legal chat and text");
         let decoded: PersistedTelegramMessage =
             serde_json::from_slice(&payload).expect("the drain's own decode");
@@ -8880,12 +9127,42 @@ mod notice_payload_tests {
     /// waiting.
     #[test]
     fn a_notice_the_transport_would_refuse_is_never_staged() {
-        assert!(telegram_notice_payload(0, "text").is_none(), "chat zero");
-        assert!(telegram_notice_payload(7, "").is_none(), "empty text");
         assert!(
-            telegram_notice_payload(7, "bell\u{7}here").is_none(),
+            telegram_notice_payload(0, "text", None).is_none(),
+            "chat zero"
+        );
+        assert!(telegram_notice_payload(7, "", None).is_none(), "empty text");
+        assert!(
+            telegram_notice_payload(7, "bell\u{7}here", None).is_none(),
             "control characters"
         );
+    }
+
+    /// A notice that carries buttons carries the pair a decision needs.
+    #[test]
+    fn a_notice_with_buttons_carries_the_decision_pair_and_stays_inside_the_ceiling() {
+        let key = "apr-000102030405060708090a0b0c0d0e0f";
+        let payload = telegram_notice_payload(7, "An approval is waiting.", Some(key))
+            .expect("a payload with buttons");
+        let decoded: PersistedTelegramMessage =
+            serde_json::from_slice(&payload).expect("the drain's own decode");
+        assert!(decoded.decision_pair, "the second button denies");
+        let approve = decoded.approve_callback.expect("an approve coordinate");
+        let deny = decoded.revise_callback.expect("a deny coordinate");
+        assert_ne!(approve, deny);
+        for callback in [&approve, &deny] {
+            assert!(
+                callback.len() <= MAX_CALLBACK_DATA_BYTES,
+                "{callback} is past Telegram's callback_data ceiling"
+            );
+            assert!(
+                callback.starts_with("apr-"),
+                "the lane is readable up front"
+            );
+        }
+        // Round-trips through the grammar the poller reads.
+        assert_eq!(parse_approval_callback(&approve), Some((key, true)));
+        assert_eq!(parse_approval_callback(&deny), Some((key, false)));
     }
 }
 

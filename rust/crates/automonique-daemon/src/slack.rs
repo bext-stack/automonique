@@ -88,6 +88,7 @@ use automonique_slack_connector::{
 use automonique_store::agent_memory::{
     AgentMemoryStore, ExternalIdentity, MessageInput, redact_content,
 };
+use automonique_store::approval_requests::{ApprovalRequests, ApprovalState};
 use automonique_store::slack_interactions::{
     SlackInteractionAction, SlackInteractionInput, SlackInteractionRecord, SlackInteractionState,
     SlackInteractionStore,
@@ -1267,6 +1268,102 @@ struct SlackTicketInteraction {
     kind: SlackTicketInteractionKind,
 }
 
+/// One pressed approval button, before any authorization is applied.
+///
+/// Deliberately not a [`SlackTicketInteraction`]: that one is bound to a live
+/// ticket gate and journalled against Slack message coordinates, and this one
+/// is bound to a durable proposal whose exactly-once guarantee is the daemon's
+/// fence. Folding them together would mean widening the ticket journal's
+/// `CHECK` constraints to hold rows it was not designed for.
+#[derive(Clone, Debug)]
+struct SlackApprovalInteraction {
+    team_id: String,
+    channel: ChannelId,
+    message_ts: MessageTs,
+    user: UserId,
+    request_key: String,
+    granted: bool,
+}
+
+/// The `action_id` an approve button carries.
+const SLACK_APPROVAL_GRANT_ACTION: &str = "automonique_approval_grant";
+/// The `action_id` a deny button carries.
+const SLACK_APPROVAL_DENY_ACTION: &str = "automonique_approval_deny";
+
+/// Read one pressed approval button, or nothing.
+///
+/// The button's `value` is the opaque reference and nothing else. It is checked
+/// against the `apr-` grammar here rather than trusted, because a `value` is
+/// whatever the message that rendered it said — and this build renders those
+/// messages, so anything else is a payload from somewhere it should not be.
+fn slack_approval_interaction(text: &str) -> Result<Option<SlackApprovalInteraction>, ()> {
+    let frame: serde_json::Value = serde_json::from_str(text).map_err(|_| ())?;
+    if frame.get("type").and_then(serde_json::Value::as_str) != Some("interactive") {
+        return Ok(None);
+    }
+    let payload = frame
+        .get("payload")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(())?;
+    if payload.get("type").and_then(serde_json::Value::as_str) != Some("block_actions") {
+        return Ok(None);
+    }
+    let actions = payload
+        .get("actions")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(())?;
+    // Exactly one action per payload, as the ticket lane requires and for the
+    // same reason: two presses in one envelope is not a shape this product
+    // renders, so admitting it would be admitting somebody else's.
+    let [action] = actions.as_slice() else {
+        return Err(());
+    };
+    let granted = match action
+        .get("action_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?
+    {
+        SLACK_APPROVAL_GRANT_ACTION => true,
+        SLACK_APPROVAL_DENY_ACTION => false,
+        _ => return Ok(None),
+    };
+    let request_key = action
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    if !request_key.starts_with(APPROVAL_REFERENCE_PREFIX) {
+        return Err(());
+    }
+    let team_id = payload
+        .get("team")
+        .and_then(|value| value.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    let user = payload
+        .get("user")
+        .and_then(|value| value.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    let channel = payload
+        .get("channel")
+        .and_then(|value| value.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    let message_ts = payload
+        .get("container")
+        .and_then(|value| value.get("message_ts"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    Ok(Some(SlackApprovalInteraction {
+        team_id: team_id.to_owned(),
+        channel: ChannelId::new(channel).map_err(|_| ())?,
+        message_ts: MessageTs::new(message_ts).map_err(|_| ())?,
+        user: UserId::new(user).map_err(|_| ())?,
+        request_key: request_key.to_owned(),
+        granted,
+    }))
+}
+
 fn slack_ticket_interaction(text: &str) -> Result<Option<SlackTicketInteraction>, ()> {
     let frame: serde_json::Value = serde_json::from_str(text).map_err(|_| ())?;
     if frame.get("type").and_then(serde_json::Value::as_str) != Some("interactive") {
@@ -1493,6 +1590,24 @@ pub(crate) trait SlackTicketPoster {
         Err(())
     }
 
+    /// Post one durable approval proposal as a card an administrator can
+    /// decide from.
+    ///
+    /// The buttons carry the opaque reference as their `value` and nothing
+    /// else: a `value` travels back verbatim, so anything descriptive in it
+    /// would be a fact this product asserted about itself and then believed.
+    ///
+    /// Defaulted like every other effect on this trait, so the shadow poster
+    /// and the test fakes stay source-compatible and post nothing.
+    fn post_approval_request(
+        &mut self,
+        _channel: &ChannelId,
+        _request_key: &str,
+        _expires_at_ms: i64,
+    ) -> Result<(), ()> {
+        Err(())
+    }
+
     fn update_decision(
         &mut self,
         _channel: &ChannelId,
@@ -1608,6 +1723,33 @@ impl SlackTicketPoster for SlackClient {
         }
     }
 
+    fn post_approval_request(
+        &mut self,
+        channel: &ChannelId,
+        request_key: &str,
+        expires_at_ms: i64,
+    ) -> Result<(), ()> {
+        let fallback = format!("Approval waiting: {request_key}");
+        let blocks = serde_json::json!([
+            {"type":"header","text":{"type":"plain_text","text":"Approval required"}},
+            {"type":"section","text":{"type":"mrkdwn","text":format!("Reference `{request_key}`. No run starts under it before a decision, and it stops being answerable at {expires_at_ms}.")}},
+            {"type":"actions","elements":[
+                {"type":"button","action_id":SLACK_APPROVAL_GRANT_ACTION,"text":{"type":"plain_text","text":"Approve"},"style":"primary","value":request_key,"confirm":{"title":{"type":"plain_text","text":"Approve this run?"},"text":{"type":"mrkdwn","text":"This permits the run to start. Starting it is a separate command."},"confirm":{"type":"plain_text","text":"Approve"},"deny":{"type":"plain_text","text":"Cancel"}}},
+                {"type":"button","action_id":SLACK_APPROVAL_DENY_ACTION,"text":{"type":"plain_text","text":"Deny"},"style":"danger","value":request_key}
+            ]}
+        ]);
+        let blocks = MessageBlocks::new(&blocks.to_string()).map_err(|_| ())?;
+        let request = PostMessageRequest::new(
+            channel.clone(),
+            MessageText::new(&fallback).map_err(|_| ())?,
+        )
+        .with_blocks(blocks);
+        match SlackClient::post_message(self, &request).map_err(|_| ())? {
+            SlackOutcome::Accepted(_) => Ok(()),
+            SlackOutcome::Rejected(_) => Err(()),
+        }
+    }
+
     fn update_decision(
         &mut self,
         channel: &ChannelId,
@@ -1668,6 +1810,14 @@ struct SlackTicketRouter<P> {
     interactive_decisions: bool,
     gates: Arc<std::sync::Mutex<crate::telegram_bridge::TicketGateRegistry>>,
     github_actions: Option<GitHubActionEngine<SocketRunLane>>,
+    /// A read-only view of the durable proposals this workspace can decide.
+    ///
+    /// Its own connection rather than the daemon's: this router runs on the
+    /// Socket Mode thread, and a handle borrowed from the serve loop would
+    /// either need a lock around every request or would race one. `None` when
+    /// the table would not open, which makes the listing verb refuse rather
+    /// than answer emptily.
+    approvals: Option<ApprovalRequests>,
     /// The lane one durable approval decision travels down.
     ///
     /// Its own handle rather than the GitHub engine's, because the two are
@@ -1739,11 +1889,22 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
         if text.is_empty() || text == "help" {
             let _ = self.poster.post_channel(
                 &command.channel,
-                "Monique commands: `ticket <GitHub issue URL>`, `help`. Admins can also use `approve <job>`, `reject <job> <reason>`, `status <job>`, and natural-language GitHub actions. Legacy `/github_*` commands remain available during migration.",
+                "Monique commands: `ticket <GitHub issue URL>`, `help`. Admins can also use `approvals` to list what is waiting, `approve <reference>`, `reject <job> <reason>`, `status <job>`, and natural-language GitHub actions. Legacy `/github_*` commands remain available during migration.",
             );
             return;
         }
         let is_admin = self.admins.contains(&command.user);
+        if text == "approvals" {
+            if !is_admin {
+                let _ = self.poster.post_channel(
+                    &command.channel,
+                    "Only a configured Slack administrator can list approvals.",
+                );
+                return;
+            }
+            self.post_pending_approvals(&command);
+            return;
+        }
         // An `apr-` reference is a durable approval proposal on this daemon's
         // own lane, and it is answered before the ticket ladder below: that
         // ladder resolves references by *prefix* against a live gate registry,
@@ -1917,6 +2078,112 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             }
         }
         let _ = self.poster.post_channel(&command.channel, "I could not map that `/monique` request to an enabled Slack capability. Use `/monique help`." );
+    }
+
+    /// Answer one pressed approval button.
+    ///
+    /// # Idempotency is the daemon's fence, not a Slack journal
+    ///
+    /// The ticket lane journals every interaction before acknowledging, because
+    /// Socket Mode redelivers and a second `decide_ticket` would be a second
+    /// call to another service. This lane needs no journal: a redelivered press
+    /// makes the same `Daemon::record_decision` call, and that call is
+    /// exactly-once by a fenced `UPDATE` over a write-once ledger. The second
+    /// press finds the decision and is told so. Widening the ticket journal's
+    /// `CHECK` constraints to hold rows for a lane that does not need them
+    /// would be schema churn buying nothing.
+    ///
+    /// # A press by somebody who may not decide
+    ///
+    /// Ignored, exactly as the ticket lane ignores one: `prepare_interaction`
+    /// answers `Ok(None)` and nothing is posted. This connector has no
+    /// ephemeral method, and adding one to tell an unauthorized presser that
+    /// they are unauthorized would be a new outbound effect for a message the
+    /// four-way gate already makes harmless.
+    fn handle_approval_interaction(&mut self, interaction: SlackApprovalInteraction) {
+        if !self.may_decide(&interaction.user, &interaction.channel) {
+            return;
+        }
+        let decider = format!("slack:{}:{}", interaction.team_id, interaction.user);
+        let Some(lane) = self.approval_lane.as_mut() else {
+            return;
+        };
+        let decided = lane.decide_approval(&interaction.request_key, interaction.granted, &decider);
+        // The card is rewritten whatever the answer was. A press that found the
+        // proposal already decided, or expired, is a press whose buttons are
+        // stale, and a live-looking control that does nothing is worse than a
+        // wrong one.
+        let text = match decided {
+            Ok(answer) => {
+                let verb = match (answer, interaction.granted) {
+                    (ApprovalDecisionAnswer::Recorded, true) => "✅ Approved",
+                    (ApprovalDecisionAnswer::Recorded, false) => "⛔ Denied",
+                    (ApprovalDecisionAnswer::AlreadyRecorded, true) => "✅ Already approved",
+                    (ApprovalDecisionAnswer::AlreadyRecorded, false) => "⛔ Already denied",
+                };
+                format!(
+                    "{verb} by <@{}>. Reference `{}`.",
+                    interaction.user, interaction.request_key
+                )
+            }
+            Err(failure) => failure.operator_reply().to_owned(),
+        };
+        // A failed rewrite does not roll anything back: the decision is durable
+        // and the card is a view of it.
+        let _ = self
+            .poster
+            .update_decision(&interaction.channel, &interaction.message_ts, &text);
+    }
+
+    /// Whether one presser may decide an approval in one channel.
+    ///
+    /// The same four gates `prepare_interaction` applies, in the same order,
+    /// because a button is not a different authority from a modal: the
+    /// workspace enables interactive decisions, the approvals capability is
+    /// present, the presser is on the configured admin list, and the press came
+    /// from a channel this deployment configured. Any one of them failing is
+    /// the same answer, and it is a silent one.
+    fn may_decide(&self, user: &UserId, channel: &ChannelId) -> bool {
+        self.interactive_decisions
+            && self.features.contains(&SlackFeature::Approvals)
+            && self.admins.contains(user)
+            && self.channels.0.iter().any(|(_, known)| known == channel)
+    }
+
+    /// Post one card per proposal an administrator could decide right now.
+    ///
+    /// Read straight off the durable table rather than from anything this
+    /// worker remembers, so a card is a view of what is actually pending and a
+    /// restart loses nothing.
+    fn post_pending_approvals(&mut self, command: &SlackMoniqueCommand) {
+        let Some(approvals) = self.approvals.as_ref() else {
+            let _ = self.poster.post_channel(
+                &command.channel,
+                "The approval table would not answer, so nothing is listed.",
+            );
+            return;
+        };
+        let pending = approvals.pending(MAX_LISTED_APPROVALS).unwrap_or_default();
+        if pending.is_empty() {
+            let _ = self
+                .poster
+                .post_channel(&command.channel, "No approval is waiting.");
+            return;
+        }
+        for record in pending {
+            debug_assert_eq!(record.state, ApprovalState::Pending);
+            if self
+                .poster
+                .post_approval_request(&command.channel, &record.request_key, record.expires_at_ms)
+                .is_err()
+            {
+                let _ = self.poster.post_channel(
+                    &command.channel,
+                    "Slack refused an approval card, so the list is incomplete.",
+                );
+                return;
+            }
+        }
     }
 
     /// Record one Slack administrator's decision on one durable proposal.
@@ -2488,6 +2755,7 @@ pub(crate) fn replay_slack_trace(
             crate::telegram_bridge::TicketGateRegistry::default(),
         )),
         github_actions: None,
+        approvals: None,
         // The replay router reaches no daemon by construction: a parity replay
         // must not be able to decide anything.
         approval_lane: None,
@@ -2574,6 +2842,12 @@ fn legacy_observation(state_dir: &Path) -> Result<Option<LegacyObservation>, Sla
 /// for the reason the Telegram surface pins it: a transport recognizing one
 /// string is not a reason to depend on another crate's grammar.
 const APPROVAL_REFERENCE_PREFIX: &str = "apr-";
+
+/// Largest number of proposals one listing renders as cards.
+///
+/// Each card is a separate `chat.postMessage`, so an unbounded listing would
+/// be an unbounded burst against somebody else's rate limit.
+const MAX_LISTED_APPROVALS: usize = 8;
 
 /// Socket Mode ticket-intake lifecycle, separate from Telegram's Slack read and
 /// post surface so Slack works even when Telegram is disabled.
@@ -2666,6 +2940,10 @@ impl SlackTicketHost {
                     interactive_decisions,
                     gates,
                     github_actions,
+                    approvals: ApprovalRequests::open(
+                        state_dir.join(crate::APPROVAL_REQUESTS_NAME),
+                    )
+                    .ok(),
                     approval_lane: SocketRunLane::open(state_dir, admin_socket, run_index_path)
                         .ok(),
                 },
@@ -2773,6 +3051,14 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
                 },
                 None => None,
             };
+            // Parsed before the acknowledgement, like every other admitted
+            // shape on this envelope, so a payload this build cannot read
+            // breaks the connection rather than being acknowledged and
+            // dropped.
+            let approval = match slack_approval_interaction(envelope.as_str()) {
+                Ok(approval) => approval,
+                Err(()) => break,
+            };
             let command = match slack_github_command(
                 envelope.as_str(),
                 &worker.router.channels,
@@ -2840,6 +3126,9 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
                 worker
                     .router
                     .handle_interaction(interaction, &mut worker.interactions);
+            }
+            if let Some(approval) = approval {
+                worker.router.handle_approval_interaction(approval);
             }
             if let Some(user) = app_home_user {
                 worker.router.handle_app_home(&user);
@@ -3719,6 +4008,69 @@ mod tests {
         );
     }
 
+    /// One pressed approval button, as Slack's Socket Mode delivers it.
+    fn approval_press(action_id: &str, value: &str) -> String {
+        serde_json::json!({
+            "type": "interactive",
+            "payload": {
+                "type": "block_actions",
+                "team": {"id": "T0RESERVED01"},
+                "user": {"id": "U0ADMIN001"},
+                "channel": {"id": "C0RESERVED01"},
+                "container": {"message_ts": "1723542000.000100"},
+                "actions": [{"action_id": action_id, "value": value, "action_ts": "1723542001.1"}]
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn an_approval_press_carries_only_an_opaque_reference() {
+        let key = "apr-000102030405060708090a0b0c0d0e0f";
+        let granted = slack_approval_interaction(&approval_press(SLACK_APPROVAL_GRANT_ACTION, key))
+            .expect("a readable press")
+            .expect("an approval press");
+        assert_eq!(granted.request_key, key);
+        assert!(granted.granted);
+        assert_eq!(granted.user.as_str(), "U0ADMIN001");
+
+        let denied = slack_approval_interaction(&approval_press(SLACK_APPROVAL_DENY_ACTION, key))
+            .expect("a readable press")
+            .expect("an approval press");
+        assert!(!denied.granted);
+
+        // A button from another lane is not this lane's to read.
+        assert!(
+            slack_approval_interaction(&approval_press("monique_ticket_approve", "job-1"))
+                .expect("a readable press")
+                .is_none()
+        );
+        // A value outside the `apr-` grammar on *this* lane's action is a
+        // payload from somewhere it should not be, and it breaks the
+        // connection rather than being ignored.
+        assert!(
+            slack_approval_interaction(&approval_press(SLACK_APPROVAL_GRANT_ACTION, "job-1"))
+                .is_err()
+        );
+        // Two presses in one envelope is not a shape this product renders.
+        let doubled = serde_json::json!({
+            "type": "interactive",
+            "payload": {
+                "type": "block_actions",
+                "team": {"id": "T0RESERVED01"},
+                "user": {"id": "U0ADMIN001"},
+                "channel": {"id": "C0RESERVED01"},
+                "container": {"message_ts": "1723542000.000100"},
+                "actions": [
+                    {"action_id": SLACK_APPROVAL_GRANT_ACTION, "value": key},
+                    {"action_id": SLACK_APPROVAL_DENY_ACTION, "value": key}
+                ]
+            }
+        })
+        .to_string();
+        assert!(slack_approval_interaction(&doubled).is_err());
+    }
+
     #[derive(Clone, Default)]
     struct FakeTicketPoster {
         messages: Arc<std::sync::Mutex<Vec<String>>>,
@@ -3817,6 +4169,69 @@ mod tests {
         }
     }
 
+    /// A router whose only variable is the four-way decide gate.
+    fn decide_gate_router(
+        interactive_decisions: bool,
+        features: Vec<SlackFeature>,
+        admins: Vec<&str>,
+    ) -> SlackTicketRouter<FakeTicketPoster> {
+        SlackTicketRouter {
+            poster: FakeTicketPoster::default(),
+            manage: Box::new(FakeManage::default()),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
+            channels: ChannelMap(vec![(
+                name("ops"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: admins
+                .into_iter()
+                .map(|admin| UserId::new(admin).expect("admin"))
+                .collect(),
+            members: Vec::new(),
+            features,
+            interactive_decisions,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+            approvals: None,
+            approval_lane: None,
+        }
+    }
+
+    /// Every one of the four gates refuses a press on its own.
+    ///
+    /// A button is not a different authority from a modal, so this is the same
+    /// conjunction `prepare_interaction` applies — and it is asserted one gate
+    /// at a time, because a test that only checked the all-pass case would pass
+    /// against a build that had dropped three of them.
+    #[test]
+    fn every_gate_refuses_an_approval_press_on_its_own() {
+        let admin = UserId::new("U0ADMIN001").expect("admin");
+        let channel = ChannelId::new("C0RESERVED01").expect("channel");
+        let approvals = vec![SlackFeature::Approvals, SlackFeature::Conversation];
+
+        let permitted = decide_gate_router(true, approvals.clone(), vec!["U0ADMIN001"]);
+        assert!(permitted.may_decide(&admin, &channel));
+
+        // Interactive decisions disabled: a v1 workspace decides nothing.
+        assert!(
+            !decide_gate_router(false, approvals.clone(), vec!["U0ADMIN001"])
+                .may_decide(&admin, &channel)
+        );
+        // The approvals capability absent: a half-configured surface renders
+        // buttons nobody can act on, and this is where that is refused.
+        assert!(
+            !decide_gate_router(true, vec![SlackFeature::Conversation], vec!["U0ADMIN001"])
+                .may_decide(&admin, &channel)
+        );
+        // Not on the admin allowlist.
+        assert!(!permitted.may_decide(&UserId::new("U0MEMBER01").expect("member"), &channel));
+        // A channel this deployment did not configure.
+        assert!(!permitted.may_decide(&admin, &ChannelId::new("C0ELSEWHERE").expect("channel")));
+    }
+
     #[test]
     fn configured_channel_ticket_waits_for_a_configured_slack_admin() {
         let poster = FakeTicketPoster::default();
@@ -3841,6 +4256,7 @@ mod tests {
                 crate::telegram_bridge::TicketGateRegistry::default(),
             )),
             github_actions: None,
+            approvals: None,
             approval_lane: None,
         };
 
@@ -3919,6 +4335,7 @@ mod tests {
                     crate::telegram_bridge::TicketGateRegistry::default(),
                 )),
                 github_actions: None,
+                approvals: None,
                 approval_lane: None,
             }
         }
@@ -4121,6 +4538,7 @@ mod tests {
                 crate::telegram_bridge::TicketGateRegistry::default(),
             )),
             github_actions: None,
+            approvals: None,
             approval_lane: None,
         };
         let event = ticket_event(
@@ -4206,6 +4624,7 @@ mod tests {
             interactive_decisions: false,
             gates,
             github_actions: None,
+            approvals: None,
             approval_lane: None,
         };
         router.handle_with_context(
@@ -4370,6 +4789,7 @@ mod tests {
                 crate::telegram_bridge::TicketGateRegistry::default(),
             )),
             github_actions: None,
+            approvals: None,
             approval_lane: None,
         };
         router.handle_with_context(

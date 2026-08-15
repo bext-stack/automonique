@@ -71,8 +71,18 @@ fn run_with_stdin(
     child.wait_with_output().expect("client output")
 }
 
+/// Wait for the spawned daemon to answer a status request.
+///
+/// The budget is generous on purpose. Every poll spawns a fresh client binary,
+/// and the daemon it is waiting for opens a private SQLite database per durable
+/// module under `synchronous = FULL` — which is the crate's storage discipline
+/// and grows by one file whenever a module lands. On an unloaded host readiness
+/// is well under a second; under a full parallel test run the same work has to
+/// share the disk with everything else, and a budget tight enough to catch a
+/// hang was also tight enough to fail on a busy machine. A daemon that is
+/// genuinely stuck still fails here, a few seconds later.
 fn wait_ready(runtime: &std::path::Path, state: &std::path::Path) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let output = run(runtime, state, &["status", "--json"]);
         if output.status.success() {

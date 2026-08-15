@@ -208,14 +208,16 @@ impl TelegramOutboundClient for TelegramHttpsClient {
 /// The complete set of request paths this module can render.
 ///
 /// Private on purpose: it is the target lock itself. Every URL is built from
-/// one of these three constants, so no caller-supplied text can ever become a
-/// method name.
+/// one of these constants, so no caller-supplied text can ever become a method
+/// name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WireMethod {
     GetUpdates,
     SendMessage,
     SetMessageReaction,
     SetMyCommands,
+    AnswerCallbackQuery,
+    EditMessageReplyMarkup,
 }
 
 impl WireMethod {
@@ -225,6 +227,8 @@ impl WireMethod {
             Self::SendMessage => "sendMessage",
             Self::SetMessageReaction => "setMessageReaction",
             Self::SetMyCommands => "setMyCommands",
+            Self::AnswerCallbackQuery => "answerCallbackQuery",
+            Self::EditMessageReplyMarkup => "editMessageReplyMarkup",
         }
     }
 }
@@ -323,9 +327,11 @@ pub enum OutboundRefusal {
     CommandDescription,
     /// The command list is empty or over Telegram's ceiling.
     CommandCount,
-    /// An inline approval callback is empty, over Telegram's 64-byte limit, or
-    /// control-bearing.
+    /// An inline approval callback is empty, over Telegram's 64-byte limit,
+    /// control-bearing, repeated, or the keyboard is empty or over-wide.
     CallbackData,
+    /// A callback query identifier is empty, over-long, or control-bearing.
+    CallbackQueryId,
 }
 
 impl OutboundRefusal {
@@ -342,6 +348,7 @@ impl OutboundRefusal {
             Self::CommandDescription => "command_description",
             Self::CommandCount => "command_count",
             Self::CallbackData => "callback_data",
+            Self::CallbackQueryId => "callback_query_id",
         }
     }
 }
@@ -367,49 +374,134 @@ pub struct SendMessageRequest {
     approval_keyboard: Option<ApprovalKeyboard>,
 }
 
-/// A fixed two-choice inline keyboard for an exact durable approval challenge.
+/// Telegram's `callback_data` ceiling, in bytes.
 ///
-/// Labels are product vocabulary rather than model output. Only the opaque,
-/// single-use callback coordinates vary.
+/// The Bot API's own bound, and it is the reason every reference this product
+/// puts on a button is opaque and short rather than descriptive.
+pub const MAX_CALLBACK_DATA_BYTES: usize = 64;
+
+/// The closed set of labels an inline button may carry.
+///
+/// Product vocabulary rather than model output or operator text: a button label
+/// is the thing an operator reads before doing something irreversible, and the
+/// only part of it that varies is the opaque coordinate behind it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InlineButtonLabel {
+    /// Accept the thing.
+    Approve,
+    /// Send it back for changes. Not a refusal.
+    RequestChanges,
+    /// Refuse the thing.
+    Deny,
+}
+
+impl InlineButtonLabel {
+    /// The exact text Telegram renders.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "Approve",
+            Self::RequestChanges => "Request changes",
+            Self::Deny => "Deny",
+        }
+    }
+}
+
+/// Largest number of buttons one inline keyboard carries.
+///
+/// One row, and three is what approve / deny / request-changes needs. A row a
+/// phone cannot show whole is a row whose last button is the one nobody presses.
+pub const MAX_INLINE_BUTTONS: usize = 3;
+
+/// A bounded one-row inline keyboard for an exact durable decision.
+///
+/// Labels come from a closed set and the callbacks are opaque coordinates, so
+/// nothing a caller supplies reaches the rendered text.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalKeyboard {
-    approve_callback: String,
-    revise_callback: String,
+    buttons: Vec<(InlineButtonLabel, String)>,
 }
 
 impl ApprovalKeyboard {
-    /// Bind the two fixed buttons to bounded opaque callback values.
+    /// Bind the approve / request-changes pair a self-improvement gate offers.
+    ///
+    /// # Errors
+    ///
+    /// [`OutboundRefusal::CallbackData`] for an empty, over-long,
+    /// control-bearing or repeated callback value.
     pub fn new(
         approve_callback: impl Into<String>,
         revise_callback: impl Into<String>,
     ) -> Result<Self, OutboundRefusal> {
-        let approve_callback = approve_callback.into();
-        let revise_callback = revise_callback.into();
-        for callback in [&approve_callback, &revise_callback] {
-            if callback.is_empty() || callback.len() > 64 || callback.chars().any(char::is_control)
+        Self::bounded(vec![
+            (InlineButtonLabel::Approve, approve_callback.into()),
+            (InlineButtonLabel::RequestChanges, revise_callback.into()),
+        ])
+    }
+
+    /// Bind the approve / deny pair a durable approval proposal offers.
+    ///
+    /// A separate constructor rather than a label argument, because the two
+    /// pairs are two products: "request changes" sends something back and
+    /// "deny" ends it, and a caller that could choose between them by passing a
+    /// value could choose wrong.
+    ///
+    /// # Errors
+    ///
+    /// [`OutboundRefusal::CallbackData`], as [`ApprovalKeyboard::new`].
+    pub fn decision(
+        approve_callback: impl Into<String>,
+        deny_callback: impl Into<String>,
+    ) -> Result<Self, OutboundRefusal> {
+        Self::bounded(vec![
+            (InlineButtonLabel::Approve, approve_callback.into()),
+            (InlineButtonLabel::Deny, deny_callback.into()),
+        ])
+    }
+
+    fn bounded(buttons: Vec<(InlineButtonLabel, String)>) -> Result<Self, OutboundRefusal> {
+        if buttons.is_empty() || buttons.len() > MAX_INLINE_BUTTONS {
+            return Err(OutboundRefusal::CallbackData);
+        }
+        for (_, callback) in &buttons {
+            if callback.is_empty()
+                || callback.len() > MAX_CALLBACK_DATA_BYTES
+                || callback.chars().any(char::is_control)
             {
                 return Err(OutboundRefusal::CallbackData);
             }
         }
-        if approve_callback == revise_callback {
-            return Err(OutboundRefusal::CallbackData);
+        // Two buttons that answer to the same coordinate are one button wearing
+        // two labels, and whichever the operator pressed the effect is the same.
+        for (index, (_, callback)) in buttons.iter().enumerate() {
+            if buttons[index + 1..]
+                .iter()
+                .any(|(_, other)| other == callback)
+            {
+                return Err(OutboundRefusal::CallbackData);
+            }
         }
-        Ok(Self {
-            approve_callback,
-            revise_callback,
-        })
+        Ok(Self { buttons })
+    }
+
+    /// The buttons, in render order.
+    #[must_use]
+    pub fn buttons(&self) -> &[(InlineButtonLabel, String)] {
+        &self.buttons
     }
 
     /// Opaque callback bound to the affirmative choice.
     #[must_use]
     pub fn approve_callback(&self) -> &str {
-        &self.approve_callback
+        &self.buttons[0].1
     }
 
-    /// Opaque callback bound to the request-changes choice.
+    /// Opaque callback bound to the second choice, whichever it is.
     #[must_use]
-    pub fn revise_callback(&self) -> &str {
-        &self.revise_callback
+    pub fn secondary_callback(&self) -> &str {
+        self.buttons
+            .get(1)
+            .map_or("", |(_, callback)| callback.as_str())
     }
 }
 
@@ -596,6 +688,144 @@ impl SetMessageReactionRequest {
     }
 }
 
+/// A validated acknowledgement of one pressed inline button.
+///
+/// The identifier is Telegram's own for the press, and the optional text is the
+/// toast the operator sees. Product vocabulary only: this is the one place a
+/// refusal reaches an operator inside the button they pressed rather than as a
+/// new message, and it is bounded so it cannot become a channel for anything
+/// longer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnswerCallbackQueryRequest {
+    callback_query_id: String,
+    text: Option<String>,
+}
+
+/// Longest toast one callback acknowledgement carries.
+///
+/// Telegram's own ceiling is 200 characters; this is the same number in bytes,
+/// which is the stricter reading and therefore the safe one.
+pub const MAX_CALLBACK_ANSWER_BYTES: usize = 200;
+
+impl AnswerCallbackQueryRequest {
+    /// Acknowledge one press, optionally with a toast.
+    ///
+    /// # Errors
+    ///
+    /// [`OutboundRefusal::CallbackQueryId`] for an empty, over-long or
+    /// control-bearing identifier, and [`OutboundRefusal::Text`] for a toast
+    /// outside its own bound.
+    pub fn new(
+        callback_query_id: impl Into<String>,
+        text: Option<&str>,
+    ) -> Result<Self, OutboundRefusal> {
+        let callback_query_id = callback_query_id.into();
+        if callback_query_id.is_empty()
+            || callback_query_id.len() > MAX_CALLBACK_QUERY_ID_BYTES
+            || callback_query_id.chars().any(char::is_control)
+        {
+            return Err(OutboundRefusal::CallbackQueryId);
+        }
+        let text = match text {
+            None => None,
+            Some(text) => {
+                if text.is_empty()
+                    || text.len() > MAX_CALLBACK_ANSWER_BYTES
+                    || text.chars().any(char::is_control)
+                {
+                    return Err(OutboundRefusal::Text);
+                }
+                Some(text.to_owned())
+            }
+        };
+        Ok(Self {
+            callback_query_id,
+            text,
+        })
+    }
+
+    /// Telegram's identifier for the press being acknowledged.
+    #[must_use]
+    pub fn callback_query_id(&self) -> &str {
+        &self.callback_query_id
+    }
+
+    /// The toast, if one was supplied.
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+}
+
+/// Longest callback query identifier this surface accepts.
+pub const MAX_CALLBACK_QUERY_ID_BYTES: usize = 128;
+
+/// A validated replacement of one message's inline keyboard.
+///
+/// `keyboard` of `None` strips the buttons, which is the whole reason this
+/// method exists: a decided proposal must not keep showing a live-looking
+/// control.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditMessageReplyMarkupRequest {
+    chat_id: i64,
+    message_id: i64,
+    keyboard: Option<ApprovalKeyboard>,
+}
+
+impl EditMessageReplyMarkupRequest {
+    /// Remove every button from one exact message.
+    ///
+    /// # Errors
+    ///
+    /// [`OutboundRefusal::ChatId`] for a zero chat and
+    /// [`OutboundRefusal::MessageId`] for a non-positive message id.
+    pub fn strip(chat_id: i64, message_id: i64) -> Result<Self, OutboundRefusal> {
+        Self::with_keyboard(chat_id, message_id, None)
+    }
+
+    /// Replace one exact message's keyboard, or strip it with `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`OutboundRefusal::ChatId`] for a zero chat and
+    /// [`OutboundRefusal::MessageId`] for a non-positive message id.
+    pub fn with_keyboard(
+        chat_id: i64,
+        message_id: i64,
+        keyboard: Option<ApprovalKeyboard>,
+    ) -> Result<Self, OutboundRefusal> {
+        if chat_id == 0 {
+            return Err(OutboundRefusal::ChatId);
+        }
+        if message_id <= 0 {
+            return Err(OutboundRefusal::MessageId);
+        }
+        Ok(Self {
+            chat_id,
+            message_id,
+            keyboard,
+        })
+    }
+
+    /// Chat containing the edited message.
+    #[must_use]
+    pub const fn chat_id(&self) -> i64 {
+        self.chat_id
+    }
+
+    /// Message whose keyboard is replaced.
+    #[must_use]
+    pub const fn message_id(&self) -> i64 {
+        self.message_id
+    }
+
+    /// The replacement keyboard, or `None` when this strips.
+    #[must_use]
+    pub const fn keyboard(&self) -> Option<&ApprovalKeyboard> {
+        self.keyboard.as_ref()
+    }
+}
+
 /// One entry of Telegram's advertised command menu.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TelegramBotCommand {
@@ -706,6 +936,19 @@ pub enum TelegramOutbound {
     SetMessageReaction(SetMessageReactionRequest),
     /// Replace the advertised command menu.
     SetMyCommands(SetMyCommandsRequest),
+    /// Dismiss the spinner one pressed inline button raised.
+    ///
+    /// Telegram gives roughly ten seconds to answer a callback query before the
+    /// client gives up and the operator sees a button that appears to have done
+    /// nothing. That deadline is why this is its own method: it has to be sent
+    /// before the durable work the press causes, not after it.
+    AnswerCallbackQuery(AnswerCallbackQueryRequest),
+    /// Replace, or remove, the inline keyboard on one exact message.
+    ///
+    /// Sent with no buttons to strip a decided message, which is what turns
+    /// "the single-use coordinate refuses a second press" into something the
+    /// operator can see rather than discover.
+    EditMessageReplyMarkup(EditMessageReplyMarkupRequest),
 }
 
 impl TelegramOutbound {
@@ -714,6 +957,8 @@ impl TelegramOutbound {
             Self::SendMessage(_) => WireMethod::SendMessage,
             Self::SetMessageReaction(_) => WireMethod::SetMessageReaction,
             Self::SetMyCommands(_) => WireMethod::SetMyCommands,
+            Self::AnswerCallbackQuery(_) => WireMethod::AnswerCallbackQuery,
+            Self::EditMessageReplyMarkup(_) => WireMethod::EditMessageReplyMarkup,
         }
     }
 
@@ -746,11 +991,8 @@ impl TelegramOutbound {
                     body.push_str(&reply_to.to_string());
                 }
                 if let Some(keyboard) = &request.approval_keyboard {
-                    body.push_str(",\"reply_markup\":{\"inline_keyboard\":[[{\"text\":\"Approve\",\"callback_data\":");
-                    push_json_string(&mut body, &keyboard.approve_callback);
-                    body.push_str("},{\"text\":\"Request changes\",\"callback_data\":");
-                    push_json_string(&mut body, &keyboard.revise_callback);
-                    body.push_str("}]]}");
+                    body.push_str(",\"reply_markup\":");
+                    push_inline_keyboard(&mut body, keyboard.buttons());
                 }
                 body.push('}');
             }
@@ -760,6 +1002,29 @@ impl TelegramOutbound {
                 body.push_str(",\"message_id\":");
                 body.push_str(&request.message_id.to_string());
                 body.push_str(",\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👀\"}]}");
+            }
+            Self::AnswerCallbackQuery(request) => {
+                body.push_str("{\"callback_query_id\":");
+                push_json_string(&mut body, &request.callback_query_id);
+                if let Some(text) = &request.text {
+                    body.push_str(",\"text\":");
+                    push_json_string(&mut body, text);
+                }
+                body.push('}');
+            }
+            Self::EditMessageReplyMarkup(request) => {
+                body.push_str("{\"chat_id\":");
+                body.push_str(&request.chat_id.to_string());
+                body.push_str(",\"message_id\":");
+                body.push_str(&request.message_id.to_string());
+                body.push_str(",\"reply_markup\":");
+                match &request.keyboard {
+                    Some(keyboard) => push_inline_keyboard(&mut body, keyboard.buttons()),
+                    // An empty row list is Telegram's own spelling for "no
+                    // keyboard", and it is what strips a decided message.
+                    None => body.push_str("{\"inline_keyboard\":[]}"),
+                }
+                body.push('}');
             }
             Self::SetMyCommands(request) => {
                 body.push_str("{\"commands\":[");
@@ -921,6 +1186,26 @@ fn utf16_units(text: &str) -> usize {
 /// serializer; the escape set is the whole of RFC 8259's requirement — the two
 /// mandatory escapes plus every code point below `0x20` — with `DEL` escaped as
 /// well so no C0/C1-adjacent byte reaches a log verbatim.
+/// Render one inline keyboard as Telegram's `reply_markup` value.
+///
+/// One row, in the order the buttons were bound. Every label comes from the
+/// closed set and every callback is escaped here, so nothing interpolated into
+/// this fragment is raw.
+fn push_inline_keyboard(body: &mut String, buttons: &[(InlineButtonLabel, String)]) {
+    body.push_str("{\"inline_keyboard\":[[");
+    for (index, (label, callback)) in buttons.iter().enumerate() {
+        if index > 0 {
+            body.push(',');
+        }
+        body.push_str("{\"text\":");
+        push_json_string(body, label.as_str());
+        body.push_str(",\"callback_data\":");
+        push_json_string(body, callback);
+        body.push('}');
+    }
+    body.push_str("]]}");
+}
+
 fn push_json_string(out: &mut String, value: &str) {
     out.push('"');
     for character in value.chars() {
@@ -1213,6 +1498,25 @@ mod tests {
             "https://api.telegram.org/bot42:fixture-token/setMyCommands"
         );
 
+        let answering = TelegramOutbound::AnswerCallbackQuery(
+            AnswerCallbackQueryRequest::new("cbq-1", None).expect("acknowledgement"),
+        );
+        let answering = PreparedRequest::from_outbound(&outbound_plan(&token, answering))
+            .expect("prepare acknowledgement");
+        assert_eq!(
+            answering.url,
+            "https://api.telegram.org/bot42:fixture-token/answerCallbackQuery"
+        );
+        let stripping = TelegramOutbound::EditMessageReplyMarkup(
+            EditMessageReplyMarkupRequest::strip(-1_001, 17).expect("strip"),
+        );
+        let stripping = PreparedRequest::from_outbound(&outbound_plan(&token, stripping))
+            .expect("prepare strip");
+        assert_eq!(
+            stripping.url,
+            "https://api.telegram.org/bot42:fixture-token/editMessageReplyMarkup"
+        );
+
         // The lock is the enum: these renderings are the complete set of
         // request paths this module can produce.
         assert_eq!(WireMethod::GetUpdates.as_str(), "getUpdates");
@@ -1222,6 +1526,132 @@ mod tests {
             "setMessageReaction"
         );
         assert_eq!(WireMethod::SetMyCommands.as_str(), "setMyCommands");
+        assert_eq!(
+            WireMethod::AnswerCallbackQuery.as_str(),
+            "answerCallbackQuery"
+        );
+        assert_eq!(
+            WireMethod::EditMessageReplyMarkup.as_str(),
+            "editMessageReplyMarkup"
+        );
+    }
+
+    #[test]
+    fn a_decision_keyboard_renders_approve_and_deny_and_bounds_every_entry() {
+        let keyboard = ApprovalKeyboard::decision("apr-aaaa", "apd-aaaa").expect("keyboard");
+        let outbound = TelegramOutbound::SendMessage(
+            SendMessageRequest::new(7, "Approval waiting", None)
+                .expect("message")
+                .with_approval_keyboard(keyboard),
+        );
+        assert_eq!(
+            outbound.canonical_body(),
+            r#"{"chat_id":7,"text":"Approval waiting","reply_markup":{"inline_keyboard":[[{"text":"Approve","callback_data":"apr-aaaa"},{"text":"Deny","callback_data":"apd-aaaa"}]]}}"#
+        );
+        // "Deny" and "Request changes" are different products, and the pair a
+        // caller picks is a constructor rather than an argument.
+        assert_eq!(InlineButtonLabel::Deny.as_str(), "Deny");
+        assert_eq!(
+            InlineButtonLabel::RequestChanges.as_str(),
+            "Request changes"
+        );
+        assert_eq!(InlineButtonLabel::Approve.as_str(), "Approve");
+
+        // Telegram's own 64-byte ceiling, at the boundary and one past it.
+        assert!(ApprovalKeyboard::decision("a".repeat(MAX_CALLBACK_DATA_BYTES), "b").is_ok());
+        assert_eq!(
+            ApprovalKeyboard::decision("a".repeat(MAX_CALLBACK_DATA_BYTES + 1), "b").err(),
+            Some(OutboundRefusal::CallbackData)
+        );
+        // Two buttons answering to one coordinate are one button wearing two
+        // labels, whichever the operator pressed.
+        assert_eq!(
+            ApprovalKeyboard::decision("same", "same").err(),
+            Some(OutboundRefusal::CallbackData)
+        );
+        assert_eq!(
+            ApprovalKeyboard::decision("", "b").err(),
+            Some(OutboundRefusal::CallbackData)
+        );
+        assert_eq!(
+            ApprovalKeyboard::decision("bell\u{7}", "b").err(),
+            Some(OutboundRefusal::CallbackData)
+        );
+    }
+
+    #[test]
+    fn an_acknowledgement_body_is_canonical_and_bounded() {
+        let bare = TelegramOutbound::AnswerCallbackQuery(
+            AnswerCallbackQueryRequest::new("cbq-1", None).expect("acknowledgement"),
+        );
+        assert_eq!(bare.method_name(), "answerCallbackQuery");
+        assert_eq!(bare.canonical_body(), r#"{"callback_query_id":"cbq-1"}"#);
+
+        let toast = TelegramOutbound::AnswerCallbackQuery(
+            AnswerCallbackQueryRequest::new("cbq-1", Some("Already decided \"by\" somebody"))
+                .expect("acknowledgement"),
+        );
+        assert_eq!(
+            toast.canonical_body(),
+            r#"{"callback_query_id":"cbq-1","text":"Already decided \"by\" somebody"}"#
+        );
+
+        assert_eq!(
+            AnswerCallbackQueryRequest::new("", None).err(),
+            Some(OutboundRefusal::CallbackQueryId)
+        );
+        assert_eq!(
+            AnswerCallbackQueryRequest::new("x".repeat(MAX_CALLBACK_QUERY_ID_BYTES + 1), None)
+                .err(),
+            Some(OutboundRefusal::CallbackQueryId)
+        );
+        assert_eq!(
+            AnswerCallbackQueryRequest::new("cbq-1", Some("")).err(),
+            Some(OutboundRefusal::Text)
+        );
+        assert_eq!(
+            AnswerCallbackQueryRequest::new(
+                "cbq-1",
+                Some(&"x".repeat(MAX_CALLBACK_ANSWER_BYTES + 1))
+            )
+            .err(),
+            Some(OutboundRefusal::Text)
+        );
+    }
+
+    #[test]
+    fn a_strip_sends_an_empty_keyboard_and_a_replacement_sends_the_new_one() {
+        let strip = TelegramOutbound::EditMessageReplyMarkup(
+            EditMessageReplyMarkupRequest::strip(-1_001, 17).expect("strip"),
+        );
+        // Byte-exact: an empty row list is Telegram's own spelling for "no
+        // keyboard", and a decided message must carry no live control.
+        assert_eq!(
+            strip.canonical_body(),
+            r#"{"chat_id":-1001,"message_id":17,"reply_markup":{"inline_keyboard":[]}}"#
+        );
+
+        let replace = TelegramOutbound::EditMessageReplyMarkup(
+            EditMessageReplyMarkupRequest::with_keyboard(
+                7,
+                3,
+                Some(ApprovalKeyboard::decision("apr-a", "apd-a").expect("keyboard")),
+            )
+            .expect("replacement"),
+        );
+        assert_eq!(
+            replace.canonical_body(),
+            r#"{"chat_id":7,"message_id":3,"reply_markup":{"inline_keyboard":[[{"text":"Approve","callback_data":"apr-a"},{"text":"Deny","callback_data":"apd-a"}]]}}"#
+        );
+
+        assert_eq!(
+            EditMessageReplyMarkupRequest::strip(0, 17).err(),
+            Some(OutboundRefusal::ChatId)
+        );
+        assert_eq!(
+            EditMessageReplyMarkupRequest::strip(7, 0).err(),
+            Some(OutboundRefusal::MessageId)
+        );
     }
 
     #[test]

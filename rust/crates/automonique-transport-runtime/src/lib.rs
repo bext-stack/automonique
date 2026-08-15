@@ -24,8 +24,10 @@ mod store_sink;
 mod telegram_control;
 
 pub use https_client::{
-    ApprovalKeyboard, MAX_BOT_COMMAND_DESCRIPTION_CHARS, MAX_BOT_COMMAND_NAME_CHARS,
-    MAX_BOT_COMMANDS, MAX_SEND_MESSAGE_TEXT_UNITS, OutboundRefusal, SendMessageRequest,
+    AnswerCallbackQueryRequest, ApprovalKeyboard, EditMessageReplyMarkupRequest, InlineButtonLabel,
+    MAX_BOT_COMMAND_DESCRIPTION_CHARS, MAX_BOT_COMMAND_NAME_CHARS, MAX_BOT_COMMANDS,
+    MAX_CALLBACK_ANSWER_BYTES, MAX_CALLBACK_DATA_BYTES, MAX_CALLBACK_QUERY_ID_BYTES,
+    MAX_INLINE_BUTTONS, MAX_SEND_MESSAGE_TEXT_UNITS, OutboundRefusal, SendMessageRequest,
     SetMessageReactionRequest, SetMyCommandsRequest, TelegramBotCommand, TelegramHttpsClient,
     TelegramOutbound, TelegramOutboundClient, TelegramOutboundPlan, TelegramTextStyle,
 };
