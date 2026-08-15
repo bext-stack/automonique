@@ -64,6 +64,13 @@ jobs:
       - name: Parity ledger matches feature-parity.md
         run: python3 tools/parity/ledger.py
 
+      # Not a derived artifact but the same class of claim: an enumeration that
+      # would otherwise decay into a false statement about what has been
+      # verified. It refuses a scope claiming a comparison the tree cannot
+      # support, and fails if a cited effect seam is renamed out from under it.
+      - name: Live parity scopes match the code and the ledger
+        run: python3 tools/parity/live_scopes.py
+
       - name: Identifier inventory matches the permitted corpus
         run: python3 tools/identifiers/inventory.py verify
 
