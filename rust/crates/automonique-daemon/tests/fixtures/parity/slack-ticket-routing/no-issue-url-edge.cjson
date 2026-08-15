@@ -1,0 +1,2 @@
+{"category":"edge","parity_row":"github-issue-as-durable-ticket-truth","provenance":"synthetic","schema":"automonique.parity-trace/v1","scope":"slack-ticket-routing","workspace":{"admins":["U0TRACEADM1"],"channel":"C0TRACE0001","members":["U0TRACEADM1"],"team":"T0TRACE0001"}}
+{"app_mention":false,"channel":"C0TRACE0001","event_id":"Ev0000000001","record":"inbound-event","text":"thanks everyone, no link here","thread_ts":"1700000000.000100","user":"U0TRACEUSR1"}

@@ -146,6 +146,7 @@ pub mod improvements;
 pub mod manage_config;
 pub mod memory_config;
 mod model_inventory;
+pub mod parity_trace;
 pub mod release_activation;
 pub mod release_builder;
 pub mod run_lane;

@@ -2367,6 +2367,87 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
     }
 }
 
+/// Replay one Slack golden trace against the real router.
+///
+/// Builds the production [`SlackTicketRouter`] — not a stand-in for it — with
+/// the shadow surfaces from [`crate::shadow`] and the workspace the trace
+/// carries, feeds it the trace's inbound events, and answers with the envelope
+/// stream it decided. Nothing here opens a socket, a database or a clock.
+///
+/// The GitHub action engine is deliberately absent: the router holds it over a
+/// concrete lane type, so it cannot be replaced with the deterministic replay
+/// lane. A trace that declares provider interactions for this scope is therefore
+/// refused rather than replayed with those interactions silently ignored.
+pub(crate) fn replay_slack_trace(
+    trace: &crate::parity_trace::Trace,
+) -> Result<
+    Vec<automonique_protocol::parity::IntendedActionEnvelope>,
+    crate::parity_trace::TraceError,
+> {
+    use crate::parity_trace::TraceError;
+
+    let header = trace.header();
+    if header.scope != SLACK_PARITY_SCOPE {
+        return Err(TraceError::UnknownScope);
+    }
+    if !trace.provider_interactions().is_empty() {
+        return Err(TraceError::ProviderInteractionUnconsumed);
+    }
+    let workspace = &header.workspace;
+    let channel =
+        ChannelId::new(&workspace.channel).map_err(|_| TraceError::Field("workspace.channel"))?;
+    let identities = |values: &[String], field: &'static str| {
+        values
+            .iter()
+            .map(|value| UserId::new(value).map_err(|_| TraceError::Field(field)))
+            .collect::<Result<Vec<UserId>, TraceError>>()
+    };
+    let recorder = crate::parity_trace::replay_recorder(&header.scope);
+    let mut router = SlackTicketRouter {
+        poster: crate::shadow::ShadowPoster::new(recorder.clone()),
+        manage: Box::new(crate::shadow::ShadowTicketSurface::new(recorder.clone())),
+        manage_url: None,
+        memory_tenant: String::from("replay"),
+        channels: ChannelMap(vec![(
+            ChannelName::new("replay").map_err(|_| TraceError::Field("workspace.channel"))?,
+            channel.clone(),
+        )]),
+        admins: identities(&workspace.admins, "workspace.admins")?,
+        members: identities(&workspace.members, "workspace.members")?,
+        features: vec![
+            SlackFeature::Approvals,
+            SlackFeature::Conversation,
+            SlackFeature::Commands,
+        ],
+        interactive_decisions: false,
+        gates: Arc::new(std::sync::Mutex::new(
+            crate::telegram_bridge::TicketGateRegistry::default(),
+        )),
+        github_actions: None,
+    };
+    for event in trace.events() {
+        let source_key = format!("slack:{}:event:{}", workspace.team, event.event_id);
+        if source_key.len() > automonique_support_connector::MAX_TICKET_SOURCE_KEY_BYTES {
+            return Err(TraceError::Field("event_id"));
+        }
+        router.handle_with_context(
+            SlackTicketEvent {
+                team_id: workspace.team.clone(),
+                channel: ChannelId::new(&event.channel)
+                    .map_err(|_| TraceError::Field("event.channel"))?,
+                user: UserId::new(&event.user).map_err(|_| TraceError::Field("event.user"))?,
+                text: event.text.clone(),
+                parent: MessageTs::new(&event.thread_ts)
+                    .map_err(|_| TraceError::Field("event.thread_ts"))?,
+                source_key,
+                app_mention: event.app_mention,
+            },
+            "",
+        );
+    }
+    Ok(recorder.envelopes())
+}
+
 pub(crate) struct SlackTicketWorker {
     app: AppsConnectionsOpenClient,
     connector: SlackSocketModeConnector,
@@ -3703,7 +3784,7 @@ mod tests {
     mod shadow_zero_effect {
         use super::*;
         use crate::shadow::{
-            MemorySink, ShadowClock, ShadowPoster, ShadowRecorder, ShadowTicketSurface,
+            MemorySink, ShadowClock, ShadowPoster, ShadowTicketSurface, SharedRecorder,
         };
         use automonique_protocol::parity::{ActionKind, ParityEngine};
 
@@ -3743,12 +3824,24 @@ mod tests {
             );
         }
 
-        fn recorder() -> ShadowRecorder<MemorySink> {
-            ShadowRecorder::new(
+        /// One recorder for both decorators: the poster and the ticket surface
+        /// are two halves of one engine's decision stream, so they share a
+        /// sequence rather than each keeping their own.
+        fn recorder() -> SharedRecorder<MemorySink> {
+            SharedRecorder::opened(
                 "slack-ticket-routing",
                 ParityEngine::ShadowCandidate,
                 ShadowClock::Fixed(1_700_000_000_000),
                 MemorySink::new(),
+            )
+        }
+
+        fn shadow_router(
+            recorder: &SharedRecorder<MemorySink>,
+        ) -> SlackTicketRouter<ShadowPoster<MemorySink>> {
+            router(
+                ShadowPoster::new(recorder.clone()),
+                Box::new(ShadowTicketSurface::new(recorder.clone())),
             )
         }
 
@@ -3770,10 +3863,8 @@ mod tests {
             assert!(posts_by_primary > 0);
             assert_eq!(dispatches_by_primary, 1);
 
-            let mut shadow = router(
-                ShadowPoster::new(recorder()),
-                Box::new(ShadowTicketSurface::new(recorder())),
-            );
+            let recorder = recorder();
+            let mut shadow = shadow_router(&recorder);
             drive(&mut shadow);
 
             assert_eq!(
@@ -3791,30 +3882,33 @@ mod tests {
 
         #[test]
         fn the_shadow_router_records_the_decisions_it_suppressed() {
-            let mut shadow = router(
-                ShadowPoster::new(recorder()),
-                Box::new(ShadowTicketSurface::new(recorder())),
-            );
+            let recorder = recorder();
+            let mut shadow = shadow_router(&recorder);
             drive(&mut shadow);
-            let envelopes = shadow.poster.recorder().sink().envelopes().to_vec();
+            let envelopes = recorder.envelopes();
             let kinds: Vec<ActionKind> = envelopes
                 .iter()
                 .map(|envelope| envelope.action().kind())
                 .collect();
             assert_eq!(
                 kinds,
-                vec![ActionKind::SlackThreadReply, ActionKind::SlackThreadReply],
-                "the suppressed replies are recorded, in order"
+                vec![
+                    ActionKind::TicketDispatch,
+                    ActionKind::SlackThreadReply,
+                    ActionKind::SlackThreadReply
+                ],
+                "one stream, in the order the engine decided: dispatch, then the \
+                 card it provoked, then the refusal of the unauthorized confirm"
             );
             assert!(
-                envelopes[0]
+                envelopes[1]
                     .action()
                     .value("text")
                     .expect("text")
                     .contains("Confirmation required")
             );
             assert!(
-                envelopes[1]
+                envelopes[2]
                     .action()
                     .value("text")
                     .expect("text")
@@ -3824,29 +3918,27 @@ mod tests {
 
         #[test]
         fn each_event_opens_its_own_envelope_sequence() {
-            let mut shadow = router(
-                ShadowPoster::new(recorder()),
-                Box::new(ShadowTicketSurface::new(recorder())),
-            );
+            let recorder = recorder();
+            let mut shadow = shadow_router(&recorder);
             drive(&mut shadow);
-            let envelopes = shadow.poster.recorder().sink().envelopes();
+            let envelopes = recorder.envelopes();
             assert_eq!(envelopes[0].sequence(), 0);
-            assert_eq!(envelopes[1].sequence(), 0);
-            assert_ne!(envelopes[0].source_key(), envelopes[1].source_key());
+            assert_eq!(envelopes[1].sequence(), 1);
+            assert_eq!(envelopes[0].source_key(), envelopes[1].source_key());
+            // The second event restarts the sequence, so position n always
+            // means "the nth decision for this event" and two engines' streams
+            // can be paired position by position.
+            assert_eq!(envelopes[2].sequence(), 0);
+            assert_ne!(envelopes[1].source_key(), envelopes[2].source_key());
         }
 
         #[test]
         fn a_shadow_run_is_byte_identical_under_a_fixed_clock() {
             let bytes = |()| {
-                let mut shadow = router(
-                    ShadowPoster::new(recorder()),
-                    Box::new(ShadowTicketSurface::new(recorder())),
-                );
+                let recorder = recorder();
+                let mut shadow = shadow_router(&recorder);
                 drive(&mut shadow);
-                shadow
-                    .poster
-                    .recorder()
-                    .sink()
+                recorder
                     .envelopes()
                     .iter()
                     .map(automonique_protocol::parity::IntendedActionEnvelope::to_canonical_bytes)

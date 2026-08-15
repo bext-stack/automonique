@@ -61,6 +61,8 @@
 //! fixed clock produces byte-identical envelopes, which is what makes the
 //! golden-trace corpus deterministic.
 
+use std::sync::{Arc, Mutex};
+
 use automonique_protocol::parity::{
     ActionKind, IntendedAction, IntendedActionEnvelope, ParityEngine, ParityError,
 };
@@ -400,31 +402,104 @@ impl<S: EnvelopeSink> ShadowRecorder<S> {
     }
 }
 
+/// One recorder, shared by every decorator on one scope.
+///
+/// The Slack poster and the ticket surface are separate objects but they are
+/// two halves of *one* engine's decision stream: a router that posts a card and
+/// then dispatches a ticket decided those two things in that order, for that one
+/// event. Two independent recorders would restart the sequence at each seam and
+/// the comparison would be pairing the wrong positions — so the recorder is
+/// shared, and the sequence it hands out is the engine's, not the decorator's.
+///
+/// A mutex rather than a cell because the router holds its ticket surface as
+/// `Box<dyn TicketActionSurface + Send>`. Every critical section here is a
+/// handful of moves with no IO under the lock beyond the sink's own write, and a
+/// poisoned lock is treated the same way a full sink is: counted, never
+/// propagated, because a recorder must not change what the engine decides.
+#[derive(Debug)]
+pub struct SharedRecorder<S>(Arc<Mutex<ShadowRecorder<S>>>);
+
+impl<S> Clone for SharedRecorder<S> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<S: EnvelopeSink> SharedRecorder<S> {
+    /// Share one recorder.
+    #[must_use]
+    pub fn new(recorder: ShadowRecorder<S>) -> Self {
+        Self(Arc::new(Mutex::new(recorder)))
+    }
+
+    /// Begin the decisions provoked by one inbound event.
+    pub fn begin_source(&self, source_key: &str) {
+        if let Ok(mut recorder) = self.0.lock() {
+            recorder.begin_source(source_key);
+        }
+    }
+
+    /// Record one intended action, answering whether it landed.
+    pub fn record(&self, action: Result<IntendedAction, ParityError>) -> bool {
+        self.0
+            .lock()
+            .is_ok_and(|mut recorder| recorder.record(action))
+    }
+
+    /// Read the recorder beneath.
+    ///
+    /// `None` when the lock is poisoned, which is a recording gap rather than a
+    /// value to invent.
+    pub fn with<R>(&self, read: impl FnOnce(&ShadowRecorder<S>) -> R) -> Option<R> {
+        self.0.lock().ok().map(|recorder| read(&recorder))
+    }
+
+    /// How many envelopes could not be recorded.
+    #[must_use]
+    pub fn refusals(&self) -> usize {
+        self.with(ShadowRecorder::refusals).unwrap_or_default()
+    }
+
+    /// Start a shared recorder for one scope.
+    #[must_use]
+    pub fn opened(scope: &str, engine: ParityEngine, clock: ShadowClock, sink: S) -> Self {
+        Self::new(ShadowRecorder::new(scope, engine, clock, sink))
+    }
+}
+
+impl SharedRecorder<MemorySink> {
+    /// Everything recorded so far, in record order.
+    ///
+    /// Only for the in-memory sink: the durable one answers reads from its own
+    /// tables, and copying a database into a vector would be a second source of
+    /// truth for the evidence a gate rests on.
+    #[must_use]
+    pub fn envelopes(&self) -> Vec<IntendedActionEnvelope> {
+        self.with(|recorder| recorder.sink().envelopes().to_vec())
+            .unwrap_or_default()
+    }
+}
+
 /// A [`SlackTicketPoster`] that decides and never posts.
 ///
 /// It holds no client. There is no field through which a Slack call could be
 /// made, which is the strongest form the zero-effect property can take.
 #[derive(Debug)]
 pub struct ShadowPoster<S> {
-    recorder: ShadowRecorder<S>,
+    recorder: SharedRecorder<S>,
 }
 
 impl<S: EnvelopeSink> ShadowPoster<S> {
-    /// Wrap a recorder as a Slack poster.
+    /// Wrap a shared recorder as a Slack poster.
     #[must_use]
-    pub const fn new(recorder: ShadowRecorder<S>) -> Self {
+    pub const fn new(recorder: SharedRecorder<S>) -> Self {
         Self { recorder }
     }
 
     /// The recorder beneath.
     #[must_use]
-    pub const fn recorder(&self) -> &ShadowRecorder<S> {
+    pub const fn recorder(&self) -> &SharedRecorder<S> {
         &self.recorder
-    }
-
-    /// The recorder beneath, mutably.
-    pub const fn recorder_mut(&mut self) -> &mut ShadowRecorder<S> {
-        &mut self.recorder
     }
 }
 
@@ -525,25 +600,20 @@ impl<S: EnvelopeSink> SlackTicketPoster for ShadowPoster<S> {
 /// shaped like the real ones, for the reason the module documentation gives.
 #[derive(Debug)]
 pub struct ShadowTicketSurface<S> {
-    recorder: ShadowRecorder<S>,
+    recorder: SharedRecorder<S>,
 }
 
 impl<S: EnvelopeSink> ShadowTicketSurface<S> {
-    /// Wrap a recorder as a ticket surface.
+    /// Wrap a shared recorder as a ticket surface.
     #[must_use]
-    pub const fn new(recorder: ShadowRecorder<S>) -> Self {
+    pub const fn new(recorder: SharedRecorder<S>) -> Self {
         Self { recorder }
     }
 
     /// The recorder beneath.
     #[must_use]
-    pub const fn recorder(&self) -> &ShadowRecorder<S> {
+    pub const fn recorder(&self) -> &SharedRecorder<S> {
         &self.recorder
-    }
-
-    /// The recorder beneath, mutably.
-    pub const fn recorder_mut(&mut self) -> &mut ShadowRecorder<S> {
-        &mut self.recorder
     }
 
     /// A synthetic job identity, derived from the coordinates it stands for.
@@ -807,6 +877,10 @@ mod tests {
         )
     }
 
+    fn shared() -> SharedRecorder<MemorySink> {
+        SharedRecorder::new(recorder())
+    }
+
     #[test]
     fn a_mode_spelling_outside_the_closed_set_is_not_a_mode() {
         assert_eq!(
@@ -887,42 +961,42 @@ mod tests {
 
     #[test]
     fn the_ticket_surface_records_a_dispatch_and_returns_an_unapproved_receipt() {
-        let mut surface = ShadowTicketSurface::new(recorder());
-        surface.recorder_mut().begin_source("slack:T:event:A");
+        let mut surface = ShadowTicketSurface::new(shared());
+        surface.recorder().begin_source("slack:T:event:A");
         let receipt = surface
             .dispatch_ticket("https://example.invalid/issues/1", "slack:T:event:A")
             .expect("synthetic receipt");
         assert!(!receipt.approved);
         assert_eq!(receipt.job_status, TicketJobStatus::PendingApproval);
-        let envelopes = surface.recorder().sink().envelopes();
+        let envelopes = surface.recorder().envelopes();
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].action().kind(), ActionKind::TicketDispatch);
     }
 
     #[test]
     fn a_confirmation_answers_approved_so_the_router_takes_the_same_branch() {
-        let mut surface = ShadowTicketSurface::new(recorder());
-        surface.recorder_mut().begin_source("slack:T:event:A");
+        let mut surface = ShadowTicketSurface::new(shared());
+        surface.recorder().begin_source("slack:T:event:A");
         let receipt = surface
             .confirm_ticket("https://example.invalid/issues/1", "slack:T:event:A")
             .expect("synthetic receipt");
         assert!(receipt.approved);
         assert_eq!(
-            surface.recorder().sink().envelopes()[0].action().kind(),
+            surface.recorder().envelopes()[0].action().kind(),
             ActionKind::TicketConfirm
         );
     }
 
     #[test]
     fn a_rejection_records_its_reason() {
-        let mut surface = ShadowTicketSurface::new(recorder());
-        surface.recorder_mut().begin_source("slack:T:event:A");
+        let mut surface = ShadowTicketSurface::new(shared());
+        surface.recorder().begin_source("slack:T:event:A");
         let decision = TicketDecision::reject("out of scope").expect("valid reason");
         let receipt = surface
             .decide_ticket("job-1", "slack:T:event:A", "d1", "a1", decision)
             .expect("synthetic receipt");
         assert_eq!(receipt.decision, TicketDecisionOutcome::Rejected);
-        let action = surface.recorder().sink().envelopes()[0].action().clone();
+        let action = surface.recorder().envelopes()[0].action().clone();
         assert_eq!(action.kind(), ActionKind::TicketDecision);
         assert_eq!(action.value("decision"), Some("reject"));
         assert_eq!(action.value("reason"), Some("out of scope"));
@@ -930,10 +1004,10 @@ mod tests {
 
     #[test]
     fn a_status_read_records_no_intended_action() {
-        let mut surface = ShadowTicketSurface::new(recorder());
-        surface.recorder_mut().begin_source("slack:T:event:A");
+        let mut surface = ShadowTicketSurface::new(shared());
+        surface.recorder().begin_source("slack:T:event:A");
         let _ = surface.ticket_status("job-1").expect("synthetic status");
-        assert!(surface.recorder().sink().envelopes().is_empty());
+        assert!(surface.recorder().envelopes().is_empty());
     }
 
     #[test]
