@@ -16,14 +16,19 @@ Every source file that supports comments must carry:
 SPDX-License-Identifier: Elastic-2.0
 ```
 
-## SDKs and integration libraries — Apache License 2.0
+## SDKs — Apache License 2.0
 
-Content below these roots is licensed under `Apache-2.0`, including its tests,
+Content below this root is licensed under `Apache-2.0`, including its tests,
 examples, generated client source, and package documentation:
 
 - `sdk/`
-- `integrations/`
-- `connectors/`
+
+This is the only Apache-2.0 root. It previously also listed `integrations/` and
+`connectors/`; neither directory was ever created, and the provider connectors
+shipped instead as Elastic-2.0 crates under `rust/crates/` — see
+[the 2026-08-15 decision](plan/owner-decisions/2026-08-15-connector-licence-boundary.md).
+They stay Elastic-2.0: each is locked to a single backend's wire protocol and is
+consumed only by the daemon, which is not what an Apache root exists to enable.
 
 Each independently distributed package must include the Apache-2.0 licence and
 declare `Apache-2.0` in its package metadata. Source files that support comments
@@ -33,9 +38,11 @@ must carry:
 SPDX-License-Identifier: Apache-2.0
 ```
 
-Moving product-core code below one of these roots does not relicense it. Such a
-move requires owner review before distribution; the development check only
-enforces the declared path and SPDX mapping.
+Moving product-core code below this root does not relicense it. Such a move
+requires owner review before distribution; the development check only enforces
+the declared path and SPDX mapping. That rule is why the connectors were
+re-documented rather than moved: relicensing shipped Elastic-2.0 code is a
+decision to be taken deliberately, not a side effect of a directory rename.
 
 ## Commercial terms
 

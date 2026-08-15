@@ -160,7 +160,10 @@ TRACK = {
 HARNESS_ITEMS = {f"R0-{n:02d}" for n in range(19, 41)}
 HARNESS_GATE = "GATE-HARNESS"
 
-# Apache-2.0 applies below sdk/ and integrations/ only (LICENSE-POLICY.md)
+# The archived plan's Apache-2.0 epics. `LICENSE-POLICY.md` narrowed the tree's
+# Apache boundary to `sdk/` alone on 2026-08-15; the roots R8F and R13 reserve
+# hold no code, and stay reserved as planned work — see
+# plan/owner-decisions/2026-08-15-connector-licence-boundary.md.
 APACHE_EPICS = {"R8B", "R8F", "R13"}
 APACHE_ITEMS = {"R11-08", "R11-09"}
 

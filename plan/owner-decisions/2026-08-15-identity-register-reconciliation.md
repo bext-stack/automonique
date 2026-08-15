@@ -129,9 +129,12 @@ because CI fetched a public key at runtime is a weak link worth not building.
 - emits a warning and a run-summary line on every run saying the register is
   pending and that this job is not evidence that it is truthful.
 
-That is the same shape as `PENDING_ROOT_DECISION` in `tools/check_licenses.py`:
-a known-pending state recorded as data, enforcing in both directions, retiring
-itself when the decision lands. The alternative — letting the workflow be red
+That is the same shape as the `PENDING_ROOT_DECISION` set `tools/check_licenses.py`
+carried while the connector licence boundary was undecided: a known-pending state
+recorded as data, enforcing in both directions, retiring itself when the decision
+lands. It did retire — that decision landed on 2026-08-15 and the set was
+removed with it, which is the shape working as intended rather than a lost
+precedent. The alternative — letting the workflow be red
 from the day it merges, on every push, fixable by nobody but the owner — would
 have taught everyone to ignore a red identity check, which costs more than the
 check is worth.

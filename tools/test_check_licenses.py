@@ -33,10 +33,25 @@ class LicenceBoundaryTests(TemporaryTreeFixture):
         paths = [
             self.write("rust/src/lib.rs", "// SPDX-License-Identifier: Elastic-2.0\n"),
             self.write("sdk/client.ts", "// SPDX-License-Identifier: Apache-2.0\n"),
-            self.write("integrations/example.py", "# SPDX-License-Identifier: Apache-2.0\n"),
-            self.write("connectors/chat.rs", "// SPDX-License-Identifier: Apache-2.0\n"),
+            # A connector is product code under `rust/crates/`, not a root of
+            # its own — the 2026-08-15 decision. It is Elastic-2.0 like the rest
+            # of the daemon it is built for.
+            self.write(
+                "rust/crates/automonique-slack-connector/src/lib.rs",
+                "// SPDX-License-Identifier: Elastic-2.0\n",
+            ),
         ]
         self.assertEqual(check_licenses.check_paths(self.root, paths), [])
+
+    def test_a_connector_carrying_apache_is_refused(self) -> None:
+        """The boundary has to refuse the licence the documents used to promise."""
+        path = self.write(
+            "rust/crates/automonique-support-connector/src/lib.rs",
+            "// SPDX-License-Identifier: Apache-2.0\n",
+        )
+        problems = check_licenses.check_paths(self.root, [path])
+        self.assertEqual(1, len(problems))
+        self.assertIn("expected Elastic-2.0", problems[0])
 
     def test_missing_and_wrong_identifiers_are_refused(self) -> None:
         paths = [
@@ -61,23 +76,18 @@ class DeclaredRootTests(TemporaryTreeFixture):
     because a rule about paths cannot be exercised by paths that do not exist.
     """
 
-    def roots(self, declared: set[str], *, pending: set[str] = frozenset()):
-        return unittest.mock.patch.multiple(
-            check_licenses,
-            APACHE_ROOTS=declared,
-            PENDING_ROOT_DECISION=pending,
-        )
+    def roots(self, declared: set[str]):
+        return unittest.mock.patch.object(check_licenses, "APACHE_ROOTS", declared)
 
-    def test_a_root_that_exists_produces_neither_problem_nor_notice(self) -> None:
+    def test_a_root_that_exists_produces_no_problem(self) -> None:
         self.write("sdk/client.ts", "// SPDX-License-Identifier: Apache-2.0\n")
         with self.roots({"sdk"}):
-            self.assertEqual(([], []), check_licenses.check_declared_roots(self.root))
+            self.assertEqual([], check_licenses.check_declared_roots(self.root))
 
     def test_a_phantom_root_is_a_problem(self) -> None:
         self.write("sdk/client.ts", "// SPDX-License-Identifier: Apache-2.0\n")
         with self.roots({"sdk", "connectors"}):
-            problems, notices = check_licenses.check_declared_roots(self.root)
-        self.assertEqual([], notices)
+            problems = check_licenses.check_declared_roots(self.root)
         self.assertEqual(1, len(problems))
         self.assertIn("connectors/", problems[0])
         self.assertIn("gates nothing", problems[0])
@@ -86,41 +96,37 @@ class DeclaredRootTests(TemporaryTreeFixture):
         """`sdk` has to be a directory. A file named `sdk` gates nothing either."""
         (self.root / "connectors").write_text("not a directory\n")
         with self.roots({"connectors"}):
-            problems, _ = check_licenses.check_declared_roots(self.root)
-        self.assertEqual(1, len(problems))
+            self.assertEqual(1, len(check_licenses.check_declared_roots(self.root)))
 
-    def test_a_pending_root_is_a_notice_and_not_a_problem(self) -> None:
-        with self.roots({"connectors"}, pending={"connectors"}):
-            problems, notices = check_licenses.check_declared_roots(self.root)
-        self.assertEqual([], problems)
-        self.assertEqual(1, len(notices))
-        self.assertIn(check_licenses.PENDING_DECISION_MEMO, notices[0])
-
-    def test_the_pending_set_only_covers_roots_that_are_declared(self) -> None:
-        """A stale pending entry must not be able to hide a future root."""
-        self.assertLessEqual(
-            check_licenses.PENDING_ROOT_DECISION, check_licenses.APACHE_ROOTS
-        )
-
-    def test_this_repository_declares_the_roots_it_is_pending_on(self) -> None:
+    def test_this_repository_declares_only_roots_that_exist(self) -> None:
         """The live state, asserted rather than assumed.
 
-        When the owner's decision lands, whichever option it is, this test is
-        the one that has to change: either the directories exist, or the roots
-        are gone from `APACHE_ROOTS`, and either way `PENDING_ROOT_DECISION`
-        empties.
+        The 2026-08-15 decision settled this: `sdk/` is the only Apache root,
+        the connectors stay Elastic-2.0, and the two roots that never existed
+        are gone. Nothing is pending, so a phantom root is now a plain failure
+        with no exemption to route it through.
         """
-        problems, notices = check_licenses.check_declared_roots(check_licenses.ROOT)
-        self.assertEqual([], problems)
-        self.assertEqual(
-            sorted(check_licenses.PENDING_ROOT_DECISION),
-            sorted(
-                name
-                for name in check_licenses.APACHE_ROOTS
-                if not (check_licenses.ROOT / name).is_dir()
-            ),
-        )
-        self.assertEqual(len(check_licenses.PENDING_ROOT_DECISION), len(notices))
+        self.assertEqual([], check_licenses.check_declared_roots(check_licenses.ROOT))
+        for name in check_licenses.APACHE_ROOTS:
+            self.assertTrue((check_licenses.ROOT / name).is_dir(), name)
+
+    def test_the_connector_crates_are_not_under_an_apache_root(self) -> None:
+        """The decision's substance, not just its bookkeeping.
+
+        Option 2 kept the connectors Elastic-2.0 where they already were. If one
+        is ever moved below an Apache root, that is the deliberate relicensing
+        `LICENSE-POLICY.md` reserves for owner review, and it should fail here
+        first.
+        """
+        crates = check_licenses.ROOT / "rust/crates"
+        connectors = sorted(crates.glob("*-connector"))
+        self.assertTrue(connectors, "no connector crates found to check")
+        for crate in connectors:
+            relative = crate.relative_to(check_licenses.ROOT)
+            self.assertNotIn(relative.parts[0], check_licenses.APACHE_ROOTS)
+            self.assertEqual(
+                "Elastic-2.0", check_licenses.expected_identifier(relative)
+            )
 
 
 if __name__ == "__main__":

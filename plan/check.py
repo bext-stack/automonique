@@ -370,7 +370,15 @@ def check_gates(items: list[dict]) -> set[str]:
 
 
 def check_licence(items: list[dict]) -> None:
-    """LICENSE-POLICY.md: Apache-2.0 only below sdk/ and integrations/."""
+    """Apache-2.0 items may only write below sdk/, integrations/ or connectors/.
+
+    This governs the archived plan graph, not the tree. `LICENSE-POLICY.md`
+    narrowed to `sdk/` alone on 2026-08-15 because the other two roots hold no
+    code; the 27 blocked `R8F`/`R13` items that reserve them are planned work,
+    and an Apache root for those is a decision to take when they ship. See
+    `plan/owner-decisions/2026-08-15-connector-licence-boundary.md`, and
+    `tools/check_licenses.py` for the boundary that applies to files on disk.
+    """
     for it in items:
         apache = it["licence"] == "Apache-2.0"
         paths = it["allowed_paths"]

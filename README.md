@@ -62,8 +62,6 @@ enables an external surface updates this section in the same pull request; see
 docs/product-plan/       product goals, requirements, architecture, migration
 rust/crates/             Rust product crates and tests
 sdk/                     Apache-2.0 client SDKs
-integrations/            Apache-2.0 integration libraries
-connectors/              Apache-2.0 connector libraries
 plan/                    optional roadmap and historical evidence
 tools/                   development and optional historical harness tools
 
@@ -314,6 +312,7 @@ specification, authorized structural references, public standards, and
 provenanced black-box fixtures are permitted; see `AGENTS.md` and
 [`PROVENANCE.md`](PROVENANCE.md).
 
-Product code is under Elastic-2.0. Code under `sdk/`, `integrations/`, and
-`connectors/` is under Apache-2.0. See
-[`LICENSE-POLICY.md`](LICENSE-POLICY.md).
+Product code is under Elastic-2.0, and `sdk/` is the only Apache-2.0 root. The
+provider connectors are Elastic-2.0 crates under `rust/crates/`: they are
+daemon-internal libraries, each locked to one backend, and nothing outside the
+daemon consumes them. See [`LICENSE-POLICY.md`](LICENSE-POLICY.md).

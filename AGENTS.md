@@ -78,8 +78,9 @@ ambiguous remote state, or non-fast-forward rejection.
 
 ## Licence boundary
 
-Product code uses `Elastic-2.0`. Code under `sdk/`, `integrations/`, and
-`connectors/` uses `Apache-2.0`.
+Product code uses `Elastic-2.0`. Code under `sdk/` uses `Apache-2.0`, and `sdk/`
+is the only Apache-2.0 root. The provider connectors under `rust/crates/` are
+Elastic-2.0 daemon-internal libraries, not Apache-2.0 client libraries.
 
 Do not move or duplicate code across that boundary without recording the
 licence consequence and obtaining owner review before distribution. Release

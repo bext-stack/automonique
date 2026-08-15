@@ -368,8 +368,17 @@ it was worth building.
 **State: advisory/open.**
 
 `LICENSE-POLICY.md` states a precise boundary — product `Elastic-2.0`, `sdk/`
-`integrations/`, and `connectors/` `Apache-2.0`. The intentionally lightweight
-development check validates source SPDX headers against those roots.
+`Apache-2.0`. The intentionally lightweight development check validates source
+SPDX headers against that root, and refuses a declared root that is not a
+directory in the tree, so the boundary cannot read as green while gating
+nothing.
+
+**Amended 2026-08-15** by
+[`plan/owner-decisions/2026-08-15-connector-licence-boundary.md`](owner-decisions/2026-08-15-connector-licence-boundary.md).
+This quoted the boundary as also covering `integrations/` and `connectors/`.
+Neither directory ever existed, so that part of the boundary gated nothing; the
+provider connectors shipped as Elastic-2.0 crates under `rust/crates/` and stay
+there.
 
 Blocks: only a claim that an artifact is ready for distribution. It does not
 block product, SDK, connector, or release-tooling implementation.
