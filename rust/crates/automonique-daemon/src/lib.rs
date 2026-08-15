@@ -72,7 +72,7 @@ use automonique_protocol::approval_api::{
     ApprovalContinuation, ApprovalCursor, ApprovalDecision, ApprovalDisposition, ApprovalKey,
     ApprovalListPage, ApprovalReceiptView, ApprovalRecordParts, ApprovalRecordView,
     ApprovalRefusal, ApprovalRequest, ApprovalResponse, ApprovalSubject, ApprovalsBySubject,
-    Decider, ListApprovals, RecordApproval, RecordedApproval,
+    DecideRequest, Decider, ListApprovals, RecordApproval, RecordedApproval,
 };
 use automonique_protocol::audit::{AuditCategory, AuditEvent, AuditOutcome, AuditRecord};
 use automonique_protocol::automation::{AutomationActor, EnablementState};
@@ -108,6 +108,10 @@ use automonique_store::approval_ledger::{
     ApprovalDecision as StoreApprovalDecision, ApprovalDecisionRecord,
     ApprovalDisposition as StoreApprovalDisposition, ApprovalEntry, ApprovalLedger,
     ApprovalLedgerError,
+};
+use automonique_store::approval_requests::{
+    ApprovalContext, ApprovalOutcome, ApprovalProposal, ApprovalRequestError,
+    ApprovalRequestRecord, ApprovalRequests, ApprovalState,
 };
 use automonique_store::audit_chain::{AuditAppend, AuditChain, GENESIS_PREV_HASH};
 use automonique_store::automation_store::{
@@ -218,15 +222,36 @@ pub const AUTOMATION_REGISTRY_NAME: &str = concat!("automations", ".sqlite3");
 /// versions independently — and because a decision record is not scheduler
 /// state.
 ///
-/// WHAT THIS FILE DOES NOT DO. It gates nothing. **A `granted` row in this file
-/// allows no action in this build, because nothing consults it**: there is no
-/// scheduler, no executor and no provider turn that reads a decision before
-/// acting, and a `denied` row stops nothing for the same reason. It is written
-/// now so that a gate, when one lands, reads a durable decision rather than
-/// inventing one. It is also not the per-session binding —
-/// `automonique_store::provider_journal`'s `provider_approvals` table is that,
-/// keyed on `(session_id, approval_key)` — and no transaction spans the two.
+/// WHAT THIS FILE NOW DOES. A `granted` row under an `apr-` key **admits a
+/// launch**: [`Daemon::start_run`] reads this ledger through
+/// [`APPROVAL_REQUESTS_NAME`] before any attempt starts, and a `denied` row
+/// refuses one. That is new — every earlier release of this comment said the
+/// opposite, truthfully, because nothing consulted the file.
+///
+/// WHAT IT STILL DOES NOT DO. It holds no pending state, by design: a decision
+/// that was never made has no row here, and the question it answers lives in
+/// [`APPROVAL_REQUESTS_NAME`]. It records a decider without verifying one — the
+/// tier check happens at the surface that accepted the decision — and it is not
+/// the per-session binding, which is `automonique_store::provider_journal`'s
+/// `provider_approvals` table, keyed on `(session_id, approval_key)`. No
+/// transaction spans this file and either of those two.
 pub const APPROVAL_LEDGER_NAME: &str = concat!("approvals", ".sqlite3");
+
+/// Durable approval proposals, a sibling of [`DATABASE_NAME`].
+///
+/// One row per thing awaiting an operator decision, keyed by an opaque `apr-`
+/// reference and bound to the exact launch context it was raised for. Separate
+/// from [`APPROVAL_LEDGER_NAME`] for the reason every sibling log is separate —
+/// its schema versions independently — and for one more: that file is
+/// write-once and has no pending state, which is the right shape for an answer
+/// and the wrong shape for a question.
+///
+/// A decision touches both files and no transaction spans them. The ledger row
+/// is written first and this row is transitioned second, so a crash in between
+/// leaves a durable decision whose proposal still reads `pending` — a gap that
+/// heals on the next read, because both halves are idempotent. The other order
+/// would leave a proposal claiming an authority no ledger backs.
+pub const APPROVAL_REQUESTS_NAME: &str = concat!("approval-requests", ".sqlite3");
 
 /// Durable batch registry, a sibling of [`DATABASE_NAME`].
 ///
@@ -444,6 +469,12 @@ impl DaemonConfig {
         self.state_dir().join(APPROVAL_LEDGER_NAME)
     }
 
+    /// Durable approval proposal path.
+    #[must_use]
+    pub fn approval_requests_path(&self) -> PathBuf {
+        self.state_dir().join(APPROVAL_REQUESTS_NAME)
+    }
+
     /// Durable batch registry path.
     #[must_use]
     pub fn batch_registry_path(&self) -> PathBuf {
@@ -474,6 +505,248 @@ impl DaemonConfig {
         self.state_dir().join(EGRESS_DESTINATIONS_NAME)
     }
 }
+
+/// How long one approval proposal stays answerable.
+///
+/// A compiled constant rather than a per-call field, so a caller cannot raise a
+/// proposal that never expires. #21 makes it configurable per lane; until then
+/// one number is the honest answer, and it is stated here rather than buried in
+/// the call that uses it.
+pub const APPROVAL_LIFETIME_MS: i64 = 60 * 60 * 1_000;
+
+/// Who this daemon records as the proposer of a launch approval.
+///
+/// The execute lane carries no actor — the request is a run identifier over a
+/// peer-authenticated socket — so the proposer is the lane, named once here
+/// rather than invented at each call site.
+pub const APPROVAL_PROPOSER: &str = "automonique.execute";
+
+/// Bound on how many stale proposals one open repairs.
+///
+/// A generation dies mid-decision at most as often as it dies, so the real
+/// number is small; the bound is here so a corrupted table cannot make startup
+/// unbounded.
+const APPROVAL_RECONCILE_LIMIT: usize = 256;
+
+/// Mint the opaque reference one proposal is addressed by.
+///
+/// A domain-separated digest over the coordinates that make this proposal *this
+/// one*: the subject, the run, the document, the instant, and how many
+/// proposals the subject already has. The last component is what makes a
+/// re-proposal after an expiry a genuinely new key rather than the same one
+/// recomputed — which is what makes reviving a terminal row impossible rather
+/// than merely forbidden.
+///
+/// It is a digest rather than a counter because the reference travels through
+/// chat messages and inline-button payloads, and a counter would let a reader
+/// tell how many approvals this deployment has ever raised.
+fn mint_request_key(
+    subject: &str,
+    run_id: &str,
+    spec_digest: &str,
+    requested_at_ms: i64,
+    prior_proposals: usize,
+) -> String {
+    let mut material = Vec::from(APPROVAL_KEY_DOMAIN);
+    for component in [
+        subject,
+        run_id,
+        spec_digest,
+        &requested_at_ms.to_string(),
+        &prior_proposals.to_string(),
+    ] {
+        material.extend_from_slice(component.as_bytes());
+        material.push(0);
+    }
+    let digest = Sha256::digest(&material).to_hex();
+    format!(
+        "{}{}",
+        automonique_store::approval_requests::REQUEST_KEY_PREFIX,
+        &digest[..automonique_store::approval_requests::REQUEST_KEY_HEX_BYTES]
+    )
+}
+
+/// Domain separator for [`mint_request_key`].
+///
+/// Without it the reference would be a plain re-hash of values that appear
+/// elsewhere, and a reader holding one digest could not tell which of them it
+/// had.
+const APPROVAL_KEY_DOMAIN: &[u8] = b"automonique.approval-request/v1/key\0";
+
+/// What one subject's proposal history says about it.
+///
+/// The newest *terminal decision* wins, and an expiry is deliberately not one:
+/// a proposal that timed out leaves the subject undecided, which is what makes
+/// a re-proposal the right next step rather than a second denial.
+fn evidence_of(history: &[ApprovalRequestRecord]) -> ApprovalEvidence {
+    history
+        .iter()
+        .rev()
+        .find_map(|record| match record.state {
+            ApprovalState::Granted => Some(ApprovalEvidence::Granted),
+            ApprovalState::Denied => Some(ApprovalEvidence::Denied),
+            ApprovalState::Pending | ApprovalState::Expired => None,
+        })
+        .unwrap_or(ApprovalEvidence::Undecided)
+}
+
+/// Complete decisions that reached the ledger but not their proposal.
+///
+/// The repair half of the two-database seam this lane documents. A pending row
+/// whose key already has a ledger entry was decided by a generation that died
+/// between the two writes; the entry says what was decided and when, so the
+/// transition is replayed from it rather than guessed.
+///
+/// A pending row with no ledger entry is left alone: it is a question nobody
+/// answered, which is exactly what it should look like.
+fn reconcile_approval_requests(
+    requests: &mut ApprovalRequests,
+    ledger: &ApprovalLedger,
+) -> Result<(), DaemonError> {
+    let page = requests
+        .page(0, APPROVAL_RECONCILE_LIMIT)
+        .map_err(|error| DaemonError::ApprovalRequestsFailed(error.category()))?;
+    for record in page.records {
+        if !record.state.is_pending() {
+            continue;
+        }
+        let Some(entry) = ledger
+            .entry(&record.request_key)
+            .map_err(|error| DaemonError::ApprovalLedgerFailed(error.category()))?
+        else {
+            continue;
+        };
+        let outcome = if entry.decision.grants() {
+            ApprovalOutcome::Granted
+        } else {
+            ApprovalOutcome::Denied
+        };
+        match requests.decide(
+            &record.request_key,
+            record.revision,
+            outcome,
+            &record.request_key,
+            entry.decided_at_ms,
+        ) {
+            // A row another writer repaired first is repaired; that is the
+            // point of the fence, and it is not this daemon's failure.
+            Ok(_) | Err(ApprovalRequestError::StaleRevision) => {}
+            Err(error) => return Err(DaemonError::ApprovalRequestsFailed(error.category())),
+        }
+    }
+    Ok(())
+}
+
+/// Whether one decision was newly recorded or found already recorded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalDecisionDisposition {
+    /// This call wrote the decision.
+    Recorded,
+    /// The exact decision was already durable. Nothing changed.
+    AlreadyRecorded,
+}
+
+impl ApprovalDecisionDisposition {
+    /// Stable machine-oriented spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::AlreadyRecorded => "already_recorded",
+        }
+    }
+}
+
+/// What one recorded decision established.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalDecisionReceipt {
+    /// Row identity of the durable decision in the ledger.
+    pub entry_id: i64,
+    /// Opaque reference the proposal was addressed by.
+    pub request_key: String,
+    /// What was decided about.
+    pub subject: String,
+    /// Run the proposal was raised for.
+    pub run_id: String,
+    /// What was decided.
+    pub outcome: ApprovalOutcome,
+    /// Who decided, as the deciding surface's tier-checked actor.
+    ///
+    /// Empty on an [`ApprovalDecisionDisposition::AlreadyRecorded`] answer read
+    /// back from the proposal row rather than the ledger: that row records the
+    /// decision, not the decider, and reporting this call's own actor as the
+    /// earlier decider would be a lie about who answered.
+    pub decider: String,
+    /// The instant the durable decision records. On a replay this is the
+    /// *first* decision's instant.
+    pub decided_at_ms: i64,
+    /// Whether this call wrote the decision or found it.
+    pub disposition: ApprovalDecisionDisposition,
+}
+
+/// Why one decision was refused. Exactly one reason per answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ApprovalDecisionRefusal {
+    /// The reference is not an approval reference at all.
+    ///
+    /// Distinct from [`ApprovalDecisionRefusal::UnknownRequest`] so a surface
+    /// can tell "that is not one of ours" from "we have never seen it", which
+    /// is what lets one verb serve two reference grammars.
+    MalformedKey,
+    /// No proposal is recorded under that reference.
+    UnknownRequest,
+    /// The proposal already carries a different decision. Nothing was written.
+    AlreadyDecided {
+        /// What the durable decision says.
+        outcome: ApprovalOutcome,
+        /// Who it records, when this answer came from the ledger.
+        decider: String,
+    },
+    /// The deadline passed before this decision arrived.
+    ///
+    /// Not folded into [`ApprovalDecisionRefusal::AlreadyDecided`]: a question
+    /// that closed unanswered and one that was answered are different facts,
+    /// and only the first is worth re-proposing.
+    RequestExpired,
+    /// The decision ledger holds its full capacity.
+    LedgerFull,
+    /// This daemon's own durable state would not answer.
+    DecisionUnavailable,
+}
+
+impl ApprovalDecisionRefusal {
+    /// Stable machine-readable category.
+    #[must_use]
+    pub const fn category(&self) -> &'static str {
+        match self {
+            Self::MalformedKey => "malformed_key",
+            Self::UnknownRequest => "unknown_request",
+            Self::AlreadyDecided { .. } => "already_decided",
+            Self::RequestExpired => "request_expired",
+            Self::LedgerFull => "ledger_full",
+            Self::DecisionUnavailable => "decision_unavailable",
+        }
+    }
+}
+
+impl fmt::Display for ApprovalDecisionRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MalformedKey => formatter.write_str("that is not an approval reference"),
+            Self::UnknownRequest => formatter.write_str("no approval is recorded under that key"),
+            Self::AlreadyDecided { outcome, .. } => {
+                write!(formatter, "that approval is already {outcome}")
+            }
+            Self::RequestExpired => formatter.write_str("that approval expired unanswered"),
+            Self::LedgerFull => formatter.write_str("the approval ledger is full"),
+            Self::DecisionUnavailable => {
+                formatter.write_str("this daemon's approval state would not answer")
+            }
+        }
+    }
+}
+
+impl Error for ApprovalDecisionRefusal {}
 
 /// A daemon lifecycle or local-control refusal.
 #[derive(Debug)]
@@ -579,6 +852,15 @@ pub enum DaemonError {
     /// ignored a malformed channel map would be a host whose reachable set is
     /// not the one the owner wrote down.
     SlackRefused(&'static str),
+    /// The durable approval proposal table failed in a way no client caused.
+    /// The payload is the stable category from
+    /// `automonique_store::approval_requests`.
+    ///
+    /// The same line [`ApprovalLedgerFailed`](Self::ApprovalLedgerFailed)
+    /// draws: a malformed field, a conflicting key and a stale fence are
+    /// answered to the caller, while corruption, a schema mismatch and storage
+    /// failure say this daemon's own durable state is unsound.
+    ApprovalRequestsFailed(&'static str),
     /// The standing approval configuration is present and unusable. The payload
     /// is the stable category from [`approval_policy`].
     ///
@@ -614,6 +896,7 @@ impl DaemonError {
             Self::GenerationAuditFailed(category) => category,
             Self::TicketIntakeRefused(category) => category,
             Self::SlackRefused(category) => category,
+            Self::ApprovalRequestsFailed(category) => category,
             Self::ApprovalPolicyRefused(category) => category,
         }
     }
@@ -672,6 +955,9 @@ impl fmt::Display for DaemonError {
             }
             Self::SlackRefused(category) => {
                 write!(formatter, "slack configuration refused: {category}")
+            }
+            Self::ApprovalRequestsFailed(category) => {
+                write!(formatter, "approval requests failed: {category}")
             }
             Self::ApprovalPolicyRefused(category) => {
                 write!(formatter, "approval configuration refused: {category}")
@@ -755,6 +1041,20 @@ pub struct Daemon {
     /// because no handler in this build acts on anybody's behalf — so its whole
     /// role here is to answer the approval lane truthfully across restarts.
     approvals: ApprovalLedger,
+    /// The durable record of what is waiting for an operator decision.
+    ///
+    /// A plain field for the reason [`Daemon::run_index`] is: it owns no
+    /// dispatcher and dropping it closes a database. Unlike its siblings this
+    /// one *is* read on the request path — [`Daemon::start_run`] consults it
+    /// before any attempt starts — which is what turns
+    /// [`Daemon::approvals`] from a record into a gate.
+    approval_requests: ApprovalRequests,
+    /// This daemon's private state directory.
+    ///
+    /// Held because the approval lane hashes a prompt slot out of it when it
+    /// raises a proposal, and re-deriving it from a config this struct no
+    /// longer owns would be a second answer to a question with one.
+    state_dir: PathBuf,
     /// The durable record of which submissions each batch declared, and where
     /// each of them was last reported to have got to.
     ///
@@ -795,15 +1095,6 @@ pub struct Daemon {
     /// crate asserting a fact about another crate's schema.
     tenure_revision: u64,
     execution_state: automonique_protocol::admin::ExecutionState,
-    /// Proof that an administrator is connected *right now*, for the length of
-    /// one request and no longer.
-    ///
-    /// This is the third operator decision surface, beside the Telegram poller
-    /// and Slack, and it is the one whose liveness is exactly a call frame. It
-    /// holds an [`Admission`] rather than a boolean so the claim cannot be
-    /// asserted by code that never admitted anybody: the type is reachable only
-    /// from `PeerPolicy::evaluate`.
-    admitted_peer: Option<Admission>,
     /// The one settable input to the approval requirement every launch is
     /// composed against.
     ///
@@ -1053,6 +1344,15 @@ impl Daemon {
         let approvals = ApprovalLedger::open(config.approval_ledger_path())
             .map_err(|error| DaemonError::ApprovalLedgerFailed(error.category()))?;
 
+        // The proposal table opens beside the ledger it links to, and the two
+        // are reconciled once before this daemon answers anything: a decision
+        // that reached the ledger while a previous generation was dying leaves
+        // its proposal reading `pending`, and repairing it here is cheaper than
+        // teaching every reader to notice.
+        let mut approval_requests = ApprovalRequests::open(config.approval_requests_path())
+            .map_err(|error| DaemonError::ApprovalRequestsFailed(error.category()))?;
+        reconcile_approval_requests(&mut approval_requests, &approvals)?;
+
         // The batch registry opens beside the ledger, under the same fence and
         // before the socket guard is disarmed, for the same reason: a daemon
         // that cannot durably record which submissions a batch declared must not
@@ -1133,12 +1433,13 @@ impl Daemon {
             audit_chain,
             automations,
             approvals,
+            approval_requests,
+            state_dir,
             batches,
             attempt_host: Some(attempt_host),
             generation_audit,
             tenure_revision: tenure.revision,
             execution_state,
-            admitted_peer: None,
             configured_approval_requirement,
             execution: Some(execution),
             ticket_intake,
@@ -1373,12 +1674,27 @@ impl Daemon {
 
     /// Which operator decision surfaces are live on this host right now.
     ///
-    /// Evidence, not configuration, and that distinction is the whole point:
-    /// a configured Telegram bot whose poller is not running cannot carry a
+    /// Evidence, not configuration, and that distinction is the whole point: a
+    /// configured Telegram bot whose poller is not running cannot carry a
     /// decision back, and a Slack workspace without interactive decisions
     /// renders buttons nobody can act on. Each surface is asked whether it is
-    /// *running*, and the connected administrator is represented by the
-    /// admission this request was authenticated under rather than by a flag.
+    /// *running*.
+    ///
+    /// # Why the connected peer is not one of them
+    ///
+    /// `automonique_policy::approval::OperatorSurfaces` can carry an admitted
+    /// administrative peer, and this daemon deliberately never gives it one.
+    /// Every request that reaches this gate arrives over the admin socket, so a
+    /// peer is always admitted while it runs — including the peer that asked
+    /// for the launch. Counting it would mean the requirement was satisfied by
+    /// the requester's own connection, which is exactly what an approval gate
+    /// exists to prevent, and it would make "no operator surface is reachable"
+    /// unreachable rather than rare.
+    ///
+    /// An operator at a terminal is of course able to decide: they run the
+    /// approval verb, which is a *second* request from a person who read the
+    /// refusal. This daemon cannot know whether anyone will make it, so it must
+    /// not hold a proposal open on the hope that somebody does.
     fn operator_surfaces(&self) -> OperatorSurfaces {
         let mut surfaces = OperatorSurfaces::none();
         if self.telegram.poller_live() {
@@ -1386,9 +1702,6 @@ impl Daemon {
         }
         if self.slack_tickets.approvals_live() {
             surfaces = surfaces.with_slack_approvals();
-        }
-        if let Some(admission) = self.admitted_peer {
-            surfaces = surfaces.with_admitted_peer(admission);
         }
         surfaces
     }
@@ -1498,24 +1811,7 @@ impl Daemon {
         stream: &mut UnixStream,
         stop: &AtomicBool,
     ) -> Result<(), DaemonError> {
-        let admission = authenticate_peer(stream)?;
-        // A connected administrator is one of the surfaces an approval decision
-        // can come back over, and it is live for exactly the length of this
-        // call. Holding the admission rather than a boolean is what keeps the
-        // claim tied to the policy that produced it.
-        self.admitted_peer = Some(admission);
-        let served = self.serve_stream(stream, stop);
-        self.admitted_peer = None;
-        served
-    }
-
-    /// Read one bounded frame from an already-admitted peer and hand it to the
-    /// lane its envelope names.
-    fn serve_stream(
-        &mut self,
-        stream: &mut UnixStream,
-        stop: &AtomicBool,
-    ) -> Result<(), DaemonError> {
+        authenticate_peer(stream)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         let payload = read_payload(stream)?;
@@ -2643,7 +2939,7 @@ impl Daemon {
             .ok_or(ExecuteRefusal::ExecutionUnavailable)?;
         let submission_id =
             u64::try_from(entry.submission_id).map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
-        self.admit_approval(&entry.spec_digest, now_ms)?;
+        self.admit_approval(&record.run_id, &entry.spec_digest, &entry.document, now_ms)?;
         self.execution
             .as_mut()
             .ok_or(ExecuteRefusal::ExecutionUnavailable)?
@@ -2673,16 +2969,26 @@ impl Daemon {
     /// rather than as an approval refusal, because that is the word the lane
     /// already uses for it and two spellings for one fact would be worse than
     /// the extra arm here.
-    fn admit_approval(&mut self, spec_digest: &str, now_ms: i64) -> Result<(), ExecuteRefusal> {
+    fn admit_approval(
+        &mut self,
+        run_id: &str,
+        spec_digest: &str,
+        document: &[u8],
+        now_ms: i64,
+    ) -> Result<(), ExecuteRefusal> {
         // No per-call source exists on the execute lane: the request carries a
         // run identifier and nothing else, so the call asks for no ceremony of
         // its own and the composition is over the other two.
         let sources = self.approval_sources(ApprovalRequirement::Allowed);
         let subject = format!("runspec:{spec_digest}");
+        let history = self
+            .approval_requests
+            .by_subject(&subject)
+            .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
         let refusal = match automonique_policy::approval::decide(
             sources,
             self.operator_surfaces(),
-            ApprovalEvidence::Undecided,
+            evidence_of(&history),
         ) {
             ApprovalGate::Proceed => return Ok(()),
             ApprovalGate::Refuse(ApprovalPolicyRefusal::Forbidden) => {
@@ -2698,13 +3004,292 @@ impl Daemon {
             ApprovalGate::Refuse(ApprovalPolicyRefusal::ApprovalUnreachable) => {
                 ExecuteRefusal::ApprovalUnreachable
             }
-            // A live surface exists and nobody has decided. The durable
-            // proposal lane answers this; until it does, the truthful answer is
-            // that a decision is required and none has been made.
-            ApprovalGate::Propose => ExecuteRefusal::ApprovalRequired,
+            // A live surface exists and nobody has decided. Put the question in
+            // front of them — or find the one already there — and refuse this
+            // launch until it is answered.
+            ApprovalGate::Propose => {
+                self.propose_approval(run_id, &subject, spec_digest, document, &history, now_ms)?
+            }
         };
         self.record_approval_audit(&subject, refusal, now_ms);
         Err(refusal)
+    }
+
+    /// Create the proposal this launch is waiting on, or report the open one.
+    ///
+    /// Create-or-report, never create-again: a run asked for twice while its
+    /// proposal is open earns the same refusal twice and leaves one question in
+    /// front of the operator. A row that expired without an answer is not
+    /// reopened — it is terminal — so this mints a *fresh* key beside it, which
+    /// is what makes re-proposal structurally distinct from revival.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecuteRefusal::ApprovalRequired`] is the success path: it says the
+    /// proposal is durable and the launch did not happen. A context that cannot
+    /// be observed at all is [`ExecuteRefusal::ProviderBinaryUnverified`] or
+    /// [`ExecuteRefusal::PromptUnresolvable`] rather than an empty binding, and
+    /// a table that will not take the row is
+    /// [`ExecuteRefusal::ExecutionUnavailable`].
+    fn propose_approval(
+        &mut self,
+        run_id: &str,
+        subject: &str,
+        spec_digest: &str,
+        document: &[u8],
+        history: &[ApprovalRequestRecord],
+        now_ms: i64,
+    ) -> Result<ExecuteRefusal, ExecuteRefusal> {
+        if history.iter().any(|record| record.is_answerable_at(now_ms)) {
+            return Ok(ExecuteRefusal::ApprovalRequired);
+        }
+        let spec = RunSpec::from_canonical_bytes(document)
+            .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
+        let program_path = spec
+            .executable()
+            .to_str()
+            .ok_or(ExecuteRefusal::ProviderBinaryUnverified)?
+            .to_owned();
+        let state_dir = self.state_dir.clone();
+        let (program_sha256, prompt_sha256) = execute::approval_context_digests(&state_dir, &spec)
+            .ok_or(ExecuteRefusal::ProviderBinaryUnverified)?;
+        let request_key = mint_request_key(subject, run_id, spec_digest, now_ms, history.len());
+        let expires_at_ms = now_ms.saturating_add(APPROVAL_LIFETIME_MS);
+        self.approval_requests
+            .propose(ApprovalProposal {
+                request_key: &request_key,
+                subject,
+                run_id,
+                context: ApprovalContext {
+                    spec_digest,
+                    program_path: &program_path,
+                    program_sha256: &program_sha256,
+                    prompt_sha256: &prompt_sha256,
+                    cwd_token: spec.cwd_token().as_str(),
+                },
+                requested_by: APPROVAL_PROPOSER,
+                requested_at_ms: now_ms,
+                expires_at_ms,
+            })
+            .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
+        Ok(ExecuteRefusal::ApprovalRequired)
+    }
+
+    /// Record one operator decision. **The only function that decides an
+    /// approval**, and every surface routes through it.
+    ///
+    /// Telegram's `/approve` and `/deny`, Slack's slash verb and its buttons,
+    /// and the CLI's approval verb all reach exactly this call — the bridges by
+    /// dialling this daemon's own socket, which is the same shape cancellation
+    /// uses and for the same reason. That is the whole of what makes the
+    /// surfaces equal in authority: same fence, same ledger, same audit record,
+    /// same answers, rather than four implementations that agree today.
+    ///
+    /// # The write order, and the failure it buys
+    ///
+    /// The ledger row is written **first** and the proposal transitioned
+    /// **second**, across two databases no transaction spans. A crash between
+    /// them leaves a durable decision whose proposal still reads `pending`;
+    /// the next call under the same key finds the ledger row, is answered
+    /// `AlreadyRecorded` — which writes nothing — and completes the transition,
+    /// so the gap heals on replay. `Daemon::open` performs that same repair
+    /// once for every pending row, so a generation that died mid-decision does
+    /// not wait for somebody to press the button again.
+    ///
+    /// The other order would leave a proposal reading `granted` with no
+    /// decision anywhere: a row claiming an authority no ledger backs, and
+    /// nothing able to tell that it was never decided.
+    ///
+    /// # Authority
+    ///
+    /// This function records the decider it is given and does not verify one.
+    /// The tier check belongs to the surface that accepted the decision — the
+    /// Telegram bridge's admin tier, Slack's admin allowlist, the socket's peer
+    /// admission — and each is asserted by its own test. A caller inside this
+    /// process that skipped its gate would be recorded as faithfully as one
+    /// that did not, which is why no surface is allowed to build one of these
+    /// calls from a message body.
+    ///
+    /// # Errors
+    ///
+    /// [`ApprovalDecisionRefusal`], naming exactly one reason. Every refusal
+    /// writes nothing to either database.
+    pub fn record_decision(
+        &mut self,
+        request_key: &str,
+        outcome: ApprovalOutcome,
+        decider: &str,
+        now_ms: i64,
+    ) -> Result<ApprovalDecisionReceipt, ApprovalDecisionRefusal> {
+        let record = self
+            .approval_requests
+            .entry(request_key)
+            .map_err(|error| match error.category() {
+                "invalid_field" => ApprovalDecisionRefusal::MalformedKey,
+                _ => ApprovalDecisionRefusal::DecisionUnavailable,
+            })?
+            .ok_or(ApprovalDecisionRefusal::UnknownRequest)?;
+
+        match record.state {
+            // An expiry is the absence of an answer, so a late decision is not
+            // accepted into it: the operator is told the question closed and
+            // may raise a fresh one.
+            ApprovalState::Expired => return Err(ApprovalDecisionRefusal::RequestExpired),
+            ApprovalState::Granted | ApprovalState::Denied => {
+                return self.already_decided(&record, outcome);
+            }
+            ApprovalState::Pending => {}
+        }
+        // A proposal past its deadline is answered as expired even before the
+        // sweep reaches it, so the answer does not depend on sweep latency.
+        if !record.is_answerable_at(now_ms) {
+            return Err(ApprovalDecisionRefusal::RequestExpired);
+        }
+
+        let receipt = self
+            .approvals
+            .record(ApprovalDecisionRecord {
+                approval_key: request_key,
+                subject: &record.subject,
+                decision: match outcome {
+                    ApprovalOutcome::Granted => StoreApprovalDecision::Granted,
+                    ApprovalOutcome::Denied => StoreApprovalDecision::Denied,
+                },
+                decider,
+                decided_at_ms: now_ms,
+            })
+            .map_err(|error| match error {
+                ApprovalLedgerError::Conflict {
+                    recorded_decision,
+                    recorded_decider,
+                    ..
+                } => ApprovalDecisionRefusal::AlreadyDecided {
+                    outcome: if recorded_decision.grants() {
+                        ApprovalOutcome::Granted
+                    } else {
+                        ApprovalOutcome::Denied
+                    },
+                    decider: recorded_decider,
+                },
+                ApprovalLedgerError::LedgerFull { .. } => ApprovalDecisionRefusal::LedgerFull,
+                _ => ApprovalDecisionRefusal::DecisionUnavailable,
+            })?;
+
+        match self.approval_requests.decide(
+            request_key,
+            record.revision,
+            outcome,
+            request_key,
+            now_ms,
+        ) {
+            Ok(_) => {}
+            // Somebody else moved the row between the read and the write. The
+            // ledger is write-once, so whatever they recorded is what happened;
+            // re-read and report theirs rather than claiming this call's.
+            Err(ApprovalRequestError::StaleRevision) => {
+                let current = self
+                    .approval_requests
+                    .entry(request_key)
+                    .map_err(|_| ApprovalDecisionRefusal::DecisionUnavailable)?
+                    .ok_or(ApprovalDecisionRefusal::UnknownRequest)?;
+                return self.already_decided(&current, outcome);
+            }
+            Err(_) => return Err(ApprovalDecisionRefusal::DecisionUnavailable),
+        }
+
+        self.record_decision_audit(&record.subject, outcome, decider, now_ms);
+        Ok(ApprovalDecisionReceipt {
+            entry_id: receipt.entry_id,
+            request_key: request_key.to_owned(),
+            subject: record.subject,
+            run_id: record.run_id,
+            outcome,
+            decider: decider.to_owned(),
+            decided_at_ms: receipt.decided_at_ms,
+            disposition: match receipt.disposition {
+                StoreApprovalDisposition::Recorded => ApprovalDecisionDisposition::Recorded,
+                StoreApprovalDisposition::AlreadyRecorded => {
+                    ApprovalDecisionDisposition::AlreadyRecorded
+                }
+            },
+        })
+    }
+
+    /// Answer a caller whose proposal already carries a decision.
+    ///
+    /// An exact retry — same reference, same answer — is a *success* carrying
+    /// the first decision's receipt, because that is what the caller asked for
+    /// and it is already true. That is what makes a double-clicked button one
+    /// decision and two acknowledgements. A different answer is a refusal
+    /// naming what stands, so an operator who denied an already-granted
+    /// proposal learns which answer won rather than seeing their own echoed
+    /// back.
+    ///
+    /// The decider and the row identity come from the **ledger**, not from the
+    /// proposal row: the proposal records that a decision happened, and the
+    /// ledger records who made it. Reporting this call's own actor as the
+    /// earlier decider would be a lie about who answered.
+    fn already_decided(
+        &self,
+        record: &ApprovalRequestRecord,
+        outcome: ApprovalOutcome,
+    ) -> Result<ApprovalDecisionReceipt, ApprovalDecisionRefusal> {
+        let recorded = match record.state {
+            ApprovalState::Granted => ApprovalOutcome::Granted,
+            ApprovalState::Denied => ApprovalOutcome::Denied,
+            // Only the two decided states reach here: an expiry is refused
+            // earlier and a pending row is not decided at all.
+            ApprovalState::Pending | ApprovalState::Expired => {
+                return Err(ApprovalDecisionRefusal::DecisionUnavailable);
+            }
+        };
+        let entry = record
+            .approval_key
+            .as_deref()
+            .and_then(|key| self.approvals.entry(key).ok().flatten())
+            .ok_or(ApprovalDecisionRefusal::DecisionUnavailable)?;
+        if recorded != outcome {
+            return Err(ApprovalDecisionRefusal::AlreadyDecided {
+                outcome: recorded,
+                decider: entry.decider,
+            });
+        }
+        Ok(ApprovalDecisionReceipt {
+            entry_id: entry.entry_id,
+            request_key: record.request_key.clone(),
+            subject: record.subject.clone(),
+            run_id: record.run_id.clone(),
+            outcome: recorded,
+            decider: entry.decider,
+            decided_at_ms: entry.decided_at_ms,
+            disposition: ApprovalDecisionDisposition::AlreadyRecorded,
+        })
+    }
+
+    /// Append one `approval` record for a decision that was just recorded.
+    ///
+    /// Silent on failure for the reason [`Daemon::record_cancellation_audit`]
+    /// gives, and written *after* the decision for the reason the audit chain's
+    /// own header gives: a decision with no audit record is a detectable gap,
+    /// and an audit record for a decision nobody made is a false claim nothing
+    /// can detect.
+    fn record_decision_audit(
+        &mut self,
+        subject: &str,
+        outcome: ApprovalOutcome,
+        decider: &str,
+        now_ms: i64,
+    ) {
+        self.append_approval_record(
+            subject,
+            decider,
+            "automonique.approval",
+            match outcome {
+                ApprovalOutcome::Granted => AuditOutcome::Success,
+                ApprovalOutcome::Denied => AuditOutcome::Denied,
+            },
+            now_ms,
+        );
     }
 
     /// Append one `approval` record for a launch the composed policy stopped.
@@ -2716,6 +3301,33 @@ impl Daemon {
     /// beside a refusal is a detectable gap; a refusal turned into a start is
     /// not detectable at all.
     fn record_approval_audit(&mut self, subject: &str, refusal: ExecuteRefusal, now_ms: i64) {
+        // The actor is the socket's peer, which this lane models as the local
+        // operator and nothing finer: the execute lane carries no actor, so
+        // claiming a name here would be inventing one.
+        self.append_approval_record(
+            subject,
+            "local-peer",
+            refusal.as_str(),
+            // Every answer this records is a launch that did not happen.
+            AuditOutcome::Denied,
+            now_ms,
+        );
+    }
+
+    /// Append one `approval` record to the hash-chained audit log.
+    ///
+    /// One builder for every approval-category record this daemon writes, so
+    /// the refusal path and the decision path cannot drift into two shapes of
+    /// the same claim. Failure is silent: the thing being recorded has already
+    /// happened by the time this runs.
+    fn append_approval_record(
+        &mut self,
+        subject: &str,
+        actor: &str,
+        surface: &str,
+        outcome: AuditOutcome,
+        now_ms: i64,
+    ) {
         let (Ok(head), Some(recorded_at)) = (
             self.audit_chain.head(),
             telegram_bridge::utc_rfc3339_from_unix_millis(now_ms),
@@ -2731,12 +3343,11 @@ impl Daemon {
             &prev_hash,
             AuditEvent {
                 recorded_at: &recorded_at,
-                actor: "local-peer",
-                surface: refusal.as_str(),
+                actor,
+                surface,
                 category: AuditCategory::Approval,
                 subject,
-                // Every answer this records is a launch that did not happen.
-                outcome: AuditOutcome::Denied,
+                outcome,
             },
         ) else {
             return;
@@ -3164,26 +3775,34 @@ impl Daemon {
     ///
     /// # What an accepted write here does, and what it does not
     ///
-    /// It commits one write-once row saying that somebody identifying
-    /// themselves as `decider` answered `decision` about `subject`. **Nothing
-    /// else happens.** In particular:
+    /// There are two writes on this lane and they are not the same thing.
     ///
-    /// - **A recorded approval allows nothing.** No handler in this daemon
-    ///   consults this ledger before doing anything, because no handler here
-    ///   acts on anybody's behalf: there is no scheduler, no executor and no
-    ///   provider turn. A `granted` row permits nothing that was not already
-    ///   permitted.
-    /// - **A recorded denial blocks nothing**, for the same reason and with the
-    ///   same force. The row is written beside the action, never in front of it.
+    /// [`ApprovalRequest::DecideRequest`] answers a durable proposal. **That
+    /// one gates**: the decision it records is the one [`Daemon::start_run`]
+    /// reads before any attempt starts, so a `granted` row under an `apr-`
+    /// reference admits a launch and a `denied` row refuses it. It converges on
+    /// [`Daemon::record_decision`] together with every chat surface, which is
+    /// what makes the CLI and the bridges equal in authority rather than three
+    /// implementations that agree today.
+    ///
+    /// [`ApprovalRequest::RecordApproval`] writes a free-form decision under a
+    /// caller-chosen key. A key that names a live proposal is routed through the
+    /// same one function; a key that names nothing still writes the row it
+    /// always wrote, and **that row gates nothing** — there is no proposal for
+    /// it to decide and no launch bound to it.
+    ///
+    /// In both cases:
+    ///
     /// - **The decider is not authenticated.** [`authenticate_peer`] established
     ///   that the peer is this user; that string says which person or runbook
     ///   behind that user answered, and the daemon records it verbatim.
     /// - **The decision is bound to no provider session.** That binding is
     ///   `provider_journal`'s, in a different database, under a different key.
     ///
-    /// That is why a landed write answers `accepted` rather than `completed`:
-    /// the row is committed, and the decision the row records has not taken
-    /// effect anywhere, because there is nowhere for it to take effect yet.
+    /// A landed write answers `accepted` rather than `completed` because the
+    /// row is committed and what it authorizes has not happened yet: an
+    /// approved run still has to be started, and starting it is the Execute
+    /// lane's answer, not this one's.
     ///
     /// # Fencing
     ///
@@ -3228,6 +3847,10 @@ impl Daemon {
             ApprovalRequest::ApprovalsBySubject { request_id, query } => {
                 self.approvals_by_subject(request_id, query)?
             }
+            ApprovalRequest::DecideRequest {
+                request_id,
+                decision,
+            } => self.decide_request(request_id, decision, now_ms)?,
         };
         let response = response
             .to_message()
@@ -3260,6 +3883,27 @@ impl Daemon {
         decision: &RecordApproval,
         now_ms: i64,
     ) -> Result<ApprovalResponse, DaemonError> {
+        // A key that names a live proposal is the same decision the chat
+        // surfaces make, so it takes the same path: one function, one fence,
+        // one audit record. A key that names nothing is the ledger's own
+        // free-form lane and still writes the row it always wrote.
+        if self
+            .approval_requests
+            .entry(decision.approval_key().as_str())
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return self.decide_request(
+                request_id,
+                &DecideRequest::new(
+                    decision.approval_key().clone(),
+                    decision.decision(),
+                    decision.decider().clone(),
+                ),
+                now_ms,
+            );
+        }
         let receipt = match self.approvals.record(ApprovalDecisionRecord {
             approval_key: decision.approval_key().as_str(),
             subject: decision.subject().as_str(),
@@ -3307,6 +3951,53 @@ impl Daemon {
             )
             .map_err(approval_refused)?,
         })
+    }
+
+    /// Decide one durable proposal over the wire.
+    ///
+    /// A thin projection onto [`Daemon::record_decision`], which is where the
+    /// ordering, the fence and the audit record live. Nothing is decided here;
+    /// this arm translates one typed refusal vocabulary into another and hands
+    /// back the same receipt every other surface gets.
+    fn decide_request(
+        &mut self,
+        request_id: &RequestId,
+        decision: &DecideRequest,
+        now_ms: i64,
+    ) -> Result<ApprovalResponse, DaemonError> {
+        let outcome = match decision.decision() {
+            ApprovalDecision::Granted => ApprovalOutcome::Granted,
+            ApprovalDecision::Denied => ApprovalOutcome::Denied,
+        };
+        match self.record_decision(
+            decision.request_key().as_str(),
+            outcome,
+            decision.decider().as_str(),
+            now_ms,
+        ) {
+            Ok(receipt) => Ok(ApprovalResponse::Recorded {
+                request_id: request_id.clone(),
+                receipt: ApprovalReceiptView::new(
+                    checked_row_id(receipt.entry_id)?,
+                    decision.request_key().clone(),
+                    decision.decision(),
+                    match receipt.disposition {
+                        ApprovalDecisionDisposition::Recorded => ApprovalDisposition::Recorded,
+                        ApprovalDecisionDisposition::AlreadyRecorded => {
+                            ApprovalDisposition::AlreadyRecorded
+                        }
+                    },
+                    automonique_protocol::primitives::EpochMillis::from_millis(
+                        receipt.decided_at_ms,
+                    ),
+                )
+                .map_err(approval_refused)?,
+            }),
+            Err(refusal) => Ok(ApprovalResponse::Refused {
+                request_id: request_id.clone(),
+                refusal: wire_approval_refusal(&refusal),
+            }),
+        }
     }
 
     /// One bounded page of every recorded decision.
@@ -3858,6 +4549,26 @@ fn refuse_automation(
     })
 }
 
+/// Project one decision refusal onto the Approval protocol's vocabulary.
+///
+/// Two of this daemon's reasons have no wire spelling of their own and are
+/// deliberately widened rather than invented: a malformed reference is the
+/// protocol's `invalid_field`, because that is what a caller supplied, and an
+/// unreadable durable state is `unknown_request`, because the honest thing to
+/// tell a caller whose proposal this daemon cannot read is that it has no
+/// answer for that reference — not that the proposal was decided.
+const fn wire_approval_refusal(refusal: &ApprovalDecisionRefusal) -> ApprovalRefusal {
+    match refusal {
+        ApprovalDecisionRefusal::MalformedKey => ApprovalRefusal::InvalidField,
+        ApprovalDecisionRefusal::UnknownRequest | ApprovalDecisionRefusal::DecisionUnavailable => {
+            ApprovalRefusal::UnknownRequest
+        }
+        ApprovalDecisionRefusal::AlreadyDecided { .. } => ApprovalRefusal::AlreadyDecided,
+        ApprovalDecisionRefusal::RequestExpired => ApprovalRefusal::RequestExpired,
+        ApprovalDecisionRefusal::LedgerFull => ApprovalRefusal::LedgerFull,
+    }
+}
+
 fn approval_refused(error: automonique_protocol::approval_api::ApprovalApiError) -> DaemonError {
     DaemonError::ProtocolRefused(error.category())
 }
@@ -4345,6 +5056,12 @@ fn read_payload(stream: &mut UnixStream) -> Result<Vec<u8>, DaemonError> {
 /// than an unwelcome one, so it is presented as *absent* rather than as a
 /// refused user: the policy's own documentation is explicit that no admission
 /// rule may key on a PID, and it answers `CredentialsUnavailable` for `None`.
+///
+/// The returned [`Admission`] is the proof the caller must hold to proceed, and
+/// [`Daemon::handle_stream`] holds it by construction: there is no path from a
+/// refusal to a served frame. It is deliberately *not* carried onto the
+/// approval lane's surface set — see [`Daemon::operator_surfaces`] for why a
+/// peer that is making a request is not a surface for answering it.
 ///
 /// # Errors
 ///

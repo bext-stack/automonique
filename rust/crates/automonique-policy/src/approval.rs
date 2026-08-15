@@ -258,6 +258,14 @@ impl OperatorSurfaces {
     /// asserted by a caller that never admitted anybody: an `Admission` is
     /// obtainable only from [`PeerPolicy::evaluate`].
     ///
+    /// **No lane in the product supplies one today, deliberately.** Its daemon
+    /// serves every gated request over one admin socket, so a peer is always
+    /// admitted while the gate runs — including the peer that made the request
+    /// being gated. Counting that peer would let a requester satisfy the
+    /// requirement their own request triggered. The constructor exists because
+    /// a surface where the peer is *not* the requester is a real shape, and it
+    /// is better declared than migrated in later.
+    ///
     /// [`PeerPolicy::evaluate`]: crate::peer::PeerPolicy::evaluate
     #[must_use]
     pub const fn with_admitted_peer(mut self, admission: Admission) -> Self {

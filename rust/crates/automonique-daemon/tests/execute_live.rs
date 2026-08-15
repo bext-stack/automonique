@@ -864,7 +864,9 @@ fn a_configured_approval_requirement_refuses_a_headless_launch_and_records_it() 
     assert_eq!(record.outcome, "denied");
     assert_eq!(record.surface, expected.as_str());
     assert_eq!(
-        chain.verify_structure().expect("a structurally sound chain"),
+        chain
+            .verify_structure()
+            .expect("a structurally sound chain"),
         u64::try_from(page.entries.len()).expect("a small chain"),
     );
 }

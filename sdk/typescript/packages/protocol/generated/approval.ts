@@ -115,8 +115,8 @@ export function decodeApprovalDisposition(value: string): ApprovalDisposition {
   return value as ApprovalDisposition;
 }
 
-export type ApprovalRefusal = "cursor_out_of_range" | "invalid_field" | "ledger_full" | "unknown_approval";
-export const ApprovalRefusal_VALUES: readonly ApprovalRefusal[] = ["cursor_out_of_range", "invalid_field", "ledger_full", "unknown_approval"];
+export type ApprovalRefusal = "already_decided" | "cursor_out_of_range" | "invalid_field" | "ledger_full" | "request_expired" | "unknown_approval" | "unknown_request";
+export const ApprovalRefusal_VALUES: readonly ApprovalRefusal[] = ["already_decided", "cursor_out_of_range", "invalid_field", "ledger_full", "request_expired", "unknown_approval", "unknown_request"];
 /** Security-sensitive: an undefined value is refused. */
 export function decodeApprovalRefusal(value: string): ApprovalRefusal {
   if (!(ApprovalRefusal_VALUES as readonly string[]).includes(value)) {
@@ -275,6 +275,29 @@ export function encodeApprovalsBySubject(request_id: RequestId, body: ApprovalsB
     ["page_size", {kind: "integer", value: refuse(APPROVAL_PAGE_SIZE_OUT_OF_RANGE, () => ApprovalPageSize(body.page_size))}],
     ["since", {kind: "integer", value: refuse(APPROVAL_COUNTER_OUT_OF_RANGE, () => ApprovalCursor(body.since))}],
     ["subject", {kind: "string", value: refuse(APPROVAL_INVALID_FIELD, () => ApprovalSubject(body.subject))}],
+  ]);
+}
+
+/** Answer one durable approval proposal. Deliberately narrower than `record_approval`: there is no subject, because the subject is what the proposal already binds and a decision that carried one would let a caller assert what it was deciding about. There is no instant either, for the reason `record_approval` has none. This is the lane every operator surface converges on, and the decision it records is the one a launch is admitted against. */
+export const APPROVAL_DECIDE_REQUEST_REQUEST_KIND = "decide_request";
+export interface DecideRequestBody {
+  readonly decider: Decider;
+  readonly decision: ApprovalDecision;
+  readonly request_key: ApprovalKey;
+}
+
+/** The exact key set this command's wire body carries. */
+export const DecideRequestBody_FIELDS: readonly string[] = [
+  "decider",
+  "decision",
+  "request_key",
+];
+
+export function encodeDecideRequest(request_id: RequestId, body: DecideRequestBody): Uint8Array {
+  return encodeApprovalRequest(request_id, APPROVAL_DECIDE_REQUEST_REQUEST_KIND, [
+    ["decider", {kind: "string", value: refuse(APPROVAL_INVALID_FIELD, () => Decider(body.decider))}],
+    ["decision", {kind: "string", value: refuse(APPROVAL_UNKNOWN_ENUM_VALUE, () => decodeApprovalDecision(body.decision))}],
+    ["request_key", {kind: "string", value: refuse(APPROVAL_INVALID_FIELD, () => ApprovalKey(body.request_key))}],
   ]);
 }
 

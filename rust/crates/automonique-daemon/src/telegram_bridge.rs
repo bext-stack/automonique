@@ -128,8 +128,8 @@ use automonique_store::{
 };
 use automonique_support_connector::{
     FleetClient, FleetOutcome, SupportDelivery, SupportEmailRequest, TicketDecision,
-    TicketDecisionReceipt, TicketDecisionRequest, TicketDispatchReceipt, TicketDispatchRequest,
-    TicketJobStatus, TicketStatus, TicketStatusRequest, TicketWorkspace,
+    TicketDecisionOutcome, TicketDecisionReceipt, TicketDecisionRequest, TicketDispatchReceipt,
+    TicketDispatchRequest, TicketJobStatus, TicketStatus, TicketStatusRequest, TicketWorkspace,
 };
 use automonique_transport_runtime::{
     AdminDirective, AllowedUsers, ApprovalKeyboard, CancellationToken, ChannelName, ControlCommand,
@@ -243,6 +243,15 @@ pub const QUESTION_WORKER_UNAVAILABLE: &str =
 
 /// Most ticket execution requests accepted at once.
 pub const MAX_PENDING_TICKET_ACTIONS: usize = 4;
+
+/// The reason recorded when an administrator denies a ticket from chat.
+///
+/// Fixed product vocabulary rather than operator text. The chat grammar for
+/// `/deny` is one reference and nothing else — widening it to free text would
+/// put a caller-supplied string into a record another system stores and
+/// renders — so the reason says who denied it and where, which is the part a
+/// later reader needs.
+const TELEGRAM_DENIAL_REASON: &str = "Denied by an administrator from the operator chat surface.";
 
 /// How often the ticket worker asks Manage for a changed job state.
 const TICKET_STATUS_POLL: Duration = Duration::from_secs(3);
@@ -816,8 +825,6 @@ pub enum DraftOutcome {
 /// this enum is the whole outcome of the command that produced it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Unavailable {
-    /// `/deny`: Manage rejection is not yet exposed by the typed connector.
-    ApprovalWiring,
     /// The extended GitHub planning vocabulary is parsed but its typed action
     /// engine is not yet connected to this bridge.
     GitHubManagementWiring,
@@ -828,7 +835,6 @@ impl Unavailable {
     #[must_use]
     pub const fn category(self) -> &'static str {
         match self {
-            Self::ApprovalWiring => "approval_wiring_absent",
             Self::GitHubManagementWiring => "github_management_wiring_absent",
         }
     }
@@ -840,9 +846,6 @@ impl Unavailable {
     #[must_use]
     pub const fn operator_reply(self) -> &'static str {
         match self {
-            Self::ApprovalWiring => {
-                "Not available yet. Denying a pending Manage ticket is not exposed by this connector, so nothing was decided."
-            }
             Self::GitHubManagementWiring => {
                 "Not available yet. This GitHub management command is not connected to a typed action engine, so nothing changed."
             }
@@ -884,8 +887,8 @@ impl Unavailable {
             | ControlCommand::GitHubEpic { .. }
             | ControlCommand::GitHubProject { .. }
             | ControlCommand::Cancel { .. }
-            | ControlCommand::Approve { .. } => None,
-            ControlCommand::Deny { .. } => Some(Self::ApprovalWiring),
+            | ControlCommand::Approve { .. }
+            | ControlCommand::Deny { .. } => None,
         }
     }
 }
@@ -1704,6 +1707,71 @@ impl MemorySurface for StoreMemorySurface {
     }
 }
 
+/// What one recorded approval decision established.
+///
+/// Two answers rather than one, because the difference is the whole of what a
+/// double-clicked button proves: the first press wrote the decision and the
+/// second found it. Both are successes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalDecisionAnswer {
+    /// This decision wrote the durable row.
+    Recorded,
+    /// The exact decision was already durable. Nothing changed.
+    AlreadyRecorded,
+}
+
+/// Why one approval decision was refused.
+///
+/// Every variant is a fact about the operator's own reference, phrased so the
+/// reply tells them what to do next. There is deliberately no variant carrying
+/// a daemon-internal reason: a chat reply that named one would be leaking the
+/// shape of the host to whoever can type in the chat.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalDecisionFailure {
+    /// No proposal is recorded under that reference.
+    Unknown,
+    /// The proposal already carries a different decision.
+    AlreadyDecided,
+    /// The deadline passed before the decision arrived.
+    Expired,
+    /// The reference is not an approval reference.
+    Invalid,
+    /// This surface could not reach the lane that decides.
+    Unavailable,
+}
+
+impl ApprovalDecisionFailure {
+    /// Stable, content-free category.
+    #[must_use]
+    pub const fn category(self) -> &'static str {
+        match self {
+            Self::Unknown => "approval_unknown",
+            Self::AlreadyDecided => "approval_already_decided",
+            Self::Expired => "approval_expired",
+            Self::Invalid => "approval_reference_invalid",
+            Self::Unavailable => "approval_unavailable",
+        }
+    }
+
+    /// The fixed reply an operator receives.
+    #[must_use]
+    pub const fn operator_reply(self) -> &'static str {
+        match self {
+            Self::Unknown => "No approval is waiting under that reference. Nothing was decided.",
+            Self::AlreadyDecided => {
+                "That approval already carries a different answer, and answers are final. Nothing was decided."
+            }
+            Self::Expired => {
+                "That approval expired before an answer arrived, so nothing was decided. Ask for the run again to raise a fresh one."
+            }
+            Self::Invalid => "That is not an approval reference. Nothing was decided.",
+            Self::Unavailable => {
+                "The approval lane did not answer, so nothing was decided. Try again."
+            }
+        }
+    }
+}
+
 /// The lane that turns one task string into one contained run and its answer.
 ///
 /// A seam for the same reason [`ControlSurface`] is one: the whole dispatch
@@ -1748,6 +1816,32 @@ pub trait RunLane {
     ) -> Result<CancelRunOutcome, RunFailure> {
         let _ = (run_ref, request_ref);
         Err(RunFailure::Unavailable)
+    }
+
+    /// Record one operator decision on one durable approval proposal.
+    ///
+    /// `decider` is the tier-checked actor this bridge admitted. The gate is
+    /// here, in front of the call, and never inside the payload: the daemon
+    /// records the name it is given and cannot check it, so a surface that
+    /// forwarded a name from a message body would be laundering an
+    /// unauthenticated claim into a durable row.
+    ///
+    /// The default refuses, for the reason [`RunLane::cancel_run`]'s does: a
+    /// lane that cannot reach a daemon can decide nothing, and answering
+    /// anything else would claim an effect no test lane has.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ApprovalDecisionFailure`] that names the outcome. Every
+    /// one of them wrote nothing.
+    fn decide_approval(
+        &mut self,
+        request_key: &str,
+        granted: bool,
+        decider: &str,
+    ) -> Result<ApprovalDecisionAnswer, ApprovalDecisionFailure> {
+        let _ = (request_key, granted, decider);
+        Err(ApprovalDecisionFailure::Unavailable)
     }
 
     /// Run one bounded, read-only conversational question.
@@ -2249,9 +2343,24 @@ struct TicketConfirmJob {
     approval_ref: String,
 }
 
+/// One typed, idempotent rejection of one pending ticket gate.
+///
+/// Carries both keys the decision endpoint binds, and neither is derived here:
+/// `decision_key` is the inbound update's own source key, so a redelivered
+/// Telegram update is a replay rather than a second rejection, and `actor_key`
+/// is the tier-checked administrator this bridge admitted.
+struct TicketDecideJob {
+    chat_id: i64,
+    message_id: Option<i64>,
+    approval_ref: String,
+    decision_key: String,
+    actor_key: String,
+}
+
 enum TicketActionJob {
     Open(TicketOpenJob),
     Confirm(TicketConfirmJob),
+    Decide(TicketDecideJob),
 }
 
 struct TicketActionCompletion {
@@ -2419,6 +2528,69 @@ impl TicketActionWorker {
                                 }
                                 _ => (
                                     String::from("That reference matches more than one pending ticket; use the full Monique job id."),
+                                    false,
+                                ),
+                            };
+                            if completed
+                                .send(TicketActionCompletion {
+                                    chat_id: job.chat_id,
+                                    message_id: job.message_id,
+                                    text,
+                                    initial: true,
+                                    successful,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Ok(TicketActionJob::Decide(job)) => {
+                            let matches = worker_gates
+                                .lock()
+                                .map(|gates| gates.matching(&job.approval_ref))
+                                .unwrap_or_default();
+                            let (text, successful) = match matches.as_slice() {
+                                [] => (
+                                    String::from("No pending ticket decision matches that reference."),
+                                    false,
+                                ),
+                                [gate] => match TicketDecision::reject(TELEGRAM_DENIAL_REASON) {
+                                    Err(_) => (
+                                        String::from("That rejection could not be composed, so nothing was decided."),
+                                        false,
+                                    ),
+                                    Ok(decision) => match surface.decide_ticket(
+                                        &gate.job_id,
+                                        &gate.source_key,
+                                        &job.decision_key,
+                                        &job.actor_key,
+                                        decision,
+                                    ) {
+                                        Ok(receipt)
+                                            if receipt.job_id == gate.job_id
+                                                && receipt.decision
+                                                    == TicketDecisionOutcome::Rejected =>
+                                        {
+                                            let _ = worker_gates
+                                                .lock()
+                                                .map(|mut gates| gates.resolve(&gate.job_id));
+                                            (
+                                                format!(
+                                                    "⛔ Ticket rejected. Job {} was cancelled and no work was released.",
+                                                    short_job_id(&receipt.job_id)
+                                                ),
+                                                true,
+                                            )
+                                        }
+                                        Ok(_) => (
+                                            String::from("The ticket backend did not record that rejection, so nothing was decided."),
+                                            false,
+                                        ),
+                                        Err(reason) => (ticket_dispatch_refusal(&reason), false),
+                                    },
+                                },
+                                _ => (
+                                    String::from("That reference matches more than one pending ticket; use the full job id."),
                                     false,
                                 ),
                             };
@@ -3968,11 +4140,18 @@ where
                             mutated,
                         }
                     }
-                    Ok(ControlCommand::Approve { approval_ref }) => Answer::TicketApprovalReady {
-                        chat_id: principal.chat_id(),
-                        message_id: update.message_id(),
-                        approval_ref: approval_ref.as_str().to_owned(),
-                    },
+                    // Both verbs serve two reference grammars. An `apr-`
+                    // reference is a durable approval proposal and goes to the
+                    // lane that decides one; anything else is a ticket gate and
+                    // keeps the path it always had. The grammar is what
+                    // disambiguates, so neither lane has to resolve a reference
+                    // that belongs to the other.
+                    Ok(ControlCommand::Approve { approval_ref }) => {
+                        self.approval_answer(update, principal, approval_ref.as_str(), true)
+                    }
+                    Ok(ControlCommand::Deny { approval_ref }) => {
+                        self.approval_answer(update, principal, approval_ref.as_str(), false)
+                    }
                     // `/cancel` is admin-tier and the tier gate above already
                     // ran, so an operator who reaches here is authorized.
                     // Answered synchronously rather than queued to a worker,
@@ -5055,11 +5234,11 @@ where
             | ControlCommand::Admin { .. }
             | ControlCommand::Approve { .. }
             // Answered by its own dispatch arm, like `/approve` and `/run`.
-            | ControlCommand::Cancel { .. } => String::new(),
+            | ControlCommand::Cancel { .. }
+            | ControlCommand::Deny { .. } => String::new(),
             // `Unavailable::for_command` decided these before `render` was
             // reached. Answering them here would be a second dispatch table.
-            ControlCommand::Deny { .. }
-            | ControlCommand::GitHubCreate { .. }
+            ControlCommand::GitHubCreate { .. }
             | ControlCommand::GitHubReply { .. }
             | ControlCommand::GitHubCheck { .. }
             | ControlCommand::GitHubUncheck { .. }
@@ -5071,6 +5250,65 @@ where
                 .map_or_else(String::new, |unavailable| {
                     unavailable.operator_reply().to_owned()
                 }),
+        }
+    }
+
+    /// Answer `/approve` or `/deny` on whichever lane the reference names.
+    ///
+    /// Two lanes share one verb, and the `apr-` grammar is what tells them
+    /// apart before either resolves anything. That matters more than it looks:
+    /// the ticket lane resolves references by *prefix* against a live registry,
+    /// so a reference from the other lane fed to it could match a ticket the
+    /// operator did not mean.
+    ///
+    /// The approval lane is answered synchronously, like `/cancel` and unlike
+    /// the ticket lane: it is one local socket exchange, where a ticket
+    /// decision is a network call to another service and belongs on a worker.
+    ///
+    /// Authorization is the tier gate that already ran — both verbs are
+    /// admin-tier — and the actor it admitted is what travels as the decider.
+    /// Nothing here is read from the message body.
+    fn approval_answer(
+        &mut self,
+        update: &TelegramIngress,
+        principal: TelegramPrincipal,
+        reference: &str,
+        granted: bool,
+    ) -> Answer {
+        let chat_id = principal.chat_id();
+        if !reference.starts_with(APPROVAL_REFERENCE_PREFIX) {
+            return if granted {
+                Answer::TicketApprovalReady {
+                    chat_id,
+                    message_id: update.message_id(),
+                    approval_ref: reference.to_owned(),
+                }
+            } else {
+                Answer::TicketDenialReady {
+                    chat_id,
+                    message_id: update.message_id(),
+                    approval_ref: reference.to_owned(),
+                    decision_key: update.source_key().to_owned(),
+                    actor_key: telegram_actor_key(self.bot_id, principal.actor_id()),
+                }
+            };
+        }
+        let decider = telegram_actor_key(self.bot_id, principal.actor_id());
+        let decided = self
+            .lane
+            .lock()
+            .map_err(|_| ApprovalDecisionFailure::Unavailable)
+            .and_then(|mut lane| lane.decide_approval(reference, granted, &decider));
+        match decided {
+            Ok(answer) => Answer::Answered {
+                chat_id,
+                text: String::from(approval_reply(answer, granted)),
+                preformatted: false,
+            },
+            Err(failure) => Answer::Refused {
+                chat_id,
+                text: String::from(failure.operator_reply()),
+            },
         }
     }
 
@@ -5403,6 +5641,47 @@ where
             }
             return;
         }
+        if let Answer::TicketDenialReady {
+            chat_id,
+            message_id,
+            approval_ref,
+            decision_key,
+            actor_key,
+        } = answer
+        {
+            match self
+                .ticket_actions
+                .submit(TicketActionJob::Decide(TicketDecideJob {
+                    chat_id,
+                    message_id,
+                    approval_ref,
+                    decision_key,
+                    actor_key,
+                })) {
+                Ok(()) => report.ticket_actions_queued += 1,
+                Err(TicketActionSubmitFailure::Busy) => self.deliver(
+                    Answer::Refused {
+                        chat_id,
+                        text: String::from(TICKET_ACTION_BUSY),
+                    },
+                    actor_id,
+                    reply_to_message_id,
+                    cancellation,
+                    report,
+                ),
+                Err(TicketActionSubmitFailure::Unavailable) => self.deliver(
+                    Answer::Unavailable {
+                        chat_id,
+                        text: String::from(TICKET_ACTION_UNAVAILABLE),
+                    },
+                    actor_id,
+                    reply_to_message_id,
+                    cancellation,
+                    report,
+                ),
+            }
+            return;
+        }
         if let Answer::EmailActionReady {
             chat_id,
             message_id,
@@ -5491,7 +5770,7 @@ where
             Answer::TicketActionReady { .. } => {
                 unreachable!("handled before reply rendering")
             }
-            Answer::TicketApprovalReady { .. } => {
+            Answer::TicketApprovalReady { .. } | Answer::TicketDenialReady { .. } => {
                 unreachable!("handled before reply rendering")
             }
             Answer::EmailActionReady { .. } => {
@@ -5904,11 +6183,23 @@ enum Answer {
         issue_url: String,
         source_key: String,
     },
-    /// An administrator confirmation of one pending Manage ticket gate.
+    /// An administrator confirmation of one pending ticket gate.
     TicketApprovalReady {
         chat_id: i64,
         message_id: Option<i64>,
         approval_ref: String,
+    },
+    /// An administrator rejection of one pending ticket gate.
+    ///
+    /// Separate from [`Answer::TicketApprovalReady`] rather than a flag on it,
+    /// because a rejection carries two idempotency keys a confirmation does
+    /// not: the inbound update's source key and the tier-checked actor.
+    TicketDenialReady {
+        chat_id: i64,
+        message_id: Option<i64>,
+        approval_ref: String,
+        decision_key: String,
+        actor_key: String,
     },
     /// One explicit outbound Support email with server-bound effect coordinates.
     EmailActionReady {
@@ -7045,6 +7336,47 @@ fn cancel_request_ref(update: &TelegramIngress, chat_id: i64) -> String {
         || format!("tg:u:{}", update.update_id()),
         |message_id| format!("tg:{chat_id}:{message_id}"),
     )
+}
+
+/// Prefix that tells a durable approval reference from a ticket reference.
+///
+/// Pinned by literal from `automonique_store::approval_requests::REQUEST_KEY_PREFIX`
+/// rather than imported, for the reason the store crate pins protocol constants
+/// by literal: this module is a transport surface, and the one string it has to
+/// recognize is not a reason to take a dependency on another crate's grammar.
+const APPROVAL_REFERENCE_PREFIX: &str = "apr-";
+
+/// The actor key one Telegram administrator is recorded under.
+///
+/// The bot identity is part of it because one operator id means nothing without
+/// the bot it spoke to — the same shape Slack's `slack:{team}:{user}` key has,
+/// and for the same reason.
+fn telegram_actor_key(bot_id: i64, actor_id: i64) -> String {
+    format!("telegram:{bot_id}:{actor_id}")
+}
+
+/// The operator's reply for one recorded approval decision.
+///
+/// A repeat press says so rather than claiming a second decision: the operator
+/// pressed twice and exactly one decision exists, and telling them that is the
+/// difference between an idempotent surface and one that looks broken.
+///
+/// An approval does not start anything, and the reply says so. Approving is
+/// permission; starting is a separate command, and a reply that implied
+/// otherwise would have an operator waiting for a run nobody asked for.
+const fn approval_reply(answer: ApprovalDecisionAnswer, granted: bool) -> &'static str {
+    match (answer, granted) {
+        (ApprovalDecisionAnswer::Recorded, true) => {
+            "Approved. The run may start; ask for it again to start it."
+        }
+        (ApprovalDecisionAnswer::Recorded, false) => "Denied. Nothing will start under it.",
+        (ApprovalDecisionAnswer::AlreadyRecorded, true) => {
+            "Already approved, and still approved. Nothing changed."
+        }
+        (ApprovalDecisionAnswer::AlreadyRecorded, false) => {
+            "Already denied, and still denied. Nothing changed."
+        }
+    }
 }
 
 /// The operator's reply for one cancellation the ledger answered.

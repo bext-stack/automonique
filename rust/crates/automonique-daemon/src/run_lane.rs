@@ -72,6 +72,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use automonique_protocol::admin::{AdminRequest, AdminResponse, SubmittedRunSpec};
+use automonique_protocol::approval_api::{
+    ApprovalDecision, ApprovalDisposition, ApprovalKey, ApprovalRefusal, ApprovalRequest,
+    ApprovalResponse, DecideRequest, Decider,
+};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_protocol::execute_api::{
     CancelRequestRef, CancelRunOutcome, ExecuteRefusal, ExecuteRequest, ExecuteResponse,
@@ -83,7 +87,10 @@ use crate::compose::{
     ComposeRefusal, Composition, CompositionInputs, ProviderConfig, ProviderRunProfile, compose,
     compose_with_profile, read_answer,
 };
-use crate::telegram_bridge::{QuestionProfile, QuestionRuntime, RunFailure, RunLane};
+use crate::telegram_bridge::{
+    ApprovalDecisionAnswer, ApprovalDecisionFailure, QuestionProfile, QuestionRuntime, RunFailure,
+    RunLane,
+};
 
 /// Optional provider configuration used only for ordinary conversation.
 ///
@@ -380,6 +387,71 @@ impl SocketRunLane {
         }
     }
 
+    /// Ask the approval lane to record one operator decision.
+    ///
+    /// Over the same socket the bridge already starts and cancels runs on, and
+    /// therefore through the same `Daemon::record_decision` the CLI reaches:
+    /// one function, one fence, one ledger, one audit record. The bridge holds
+    /// no handle to the daemon — it runs on the poller thread and shares
+    /// nothing with the serve loop — so this round-trip *is* the in-process
+    /// call, made the only way this seam allows.
+    ///
+    /// The refusals are not collapsed to one word. Each of the four an operator
+    /// can act on is a different next step: check the reference, accept the
+    /// answer that stands, raise a fresh proposal, or retry.
+    fn decide(
+        &self,
+        request_key: &str,
+        granted: bool,
+        decider: &str,
+    ) -> Result<ApprovalDecisionAnswer, ApprovalDecisionFailure> {
+        let request = ApprovalRequest::DecideRequest {
+            request_id: RequestId::new(format!("approval-{request_key}"))
+                .map_err(|_| ApprovalDecisionFailure::Invalid)?,
+            decision: DecideRequest::new(
+                ApprovalKey::new(request_key).map_err(|_| ApprovalDecisionFailure::Invalid)?,
+                if granted {
+                    ApprovalDecision::Granted
+                } else {
+                    ApprovalDecision::Denied
+                },
+                Decider::new(decider).map_err(|_| ApprovalDecisionFailure::Invalid)?,
+            ),
+        };
+        let payload = request
+            .to_message()
+            .map_err(|_| ApprovalDecisionFailure::Unavailable)?
+            .to_canonical_bytes();
+        let response = self
+            .exchange(&payload)
+            .map_err(|_| ApprovalDecisionFailure::Unavailable)?;
+        match ApprovalResponse::from_canonical_bytes(&response)
+            .map_err(|_| ApprovalDecisionFailure::Unavailable)?
+        {
+            ApprovalResponse::Recorded { receipt, .. } => Ok(match receipt.disposition() {
+                ApprovalDisposition::Recorded => ApprovalDecisionAnswer::Recorded,
+                ApprovalDisposition::AlreadyRecorded => ApprovalDecisionAnswer::AlreadyRecorded,
+            }),
+            ApprovalResponse::Refused { refusal, .. } => Err(match refusal {
+                ApprovalRefusal::UnknownRequest | ApprovalRefusal::UnknownApproval => {
+                    ApprovalDecisionFailure::Unknown
+                }
+                ApprovalRefusal::AlreadyDecided => ApprovalDecisionFailure::AlreadyDecided,
+                ApprovalRefusal::RequestExpired => ApprovalDecisionFailure::Expired,
+                ApprovalRefusal::InvalidField => ApprovalDecisionFailure::Invalid,
+                ApprovalRefusal::CursorOutOfRange | ApprovalRefusal::LedgerFull => {
+                    ApprovalDecisionFailure::Unavailable
+                }
+            }),
+            // A conflict or a read answer to a decision is this daemon
+            // answering a question nobody asked, which says nothing about the
+            // decision and is therefore the same word as a dropped connection.
+            ApprovalResponse::Conflict { .. }
+            | ApprovalResponse::ApprovalList { .. }
+            | ApprovalResponse::ApprovalDetail { .. } => Err(ApprovalDecisionFailure::Unavailable),
+        }
+    }
+
     /// Issue one bounded request on this daemon's admin socket.
     fn exchange(&self, payload: &[u8]) -> Result<Vec<u8>, RunFailure> {
         let mut stream = UnixStream::connect(&self.admin_socket).map_err(unavailable)?;
@@ -430,6 +502,15 @@ impl RunLane for SocketRunLane {
         request_ref: &str,
     ) -> Result<CancelRunOutcome, RunFailure> {
         self.cancel(run_ref, request_ref)
+    }
+
+    fn decide_approval(
+        &mut self,
+        request_key: &str,
+        granted: bool,
+        decider: &str,
+    ) -> Result<ApprovalDecisionAnswer, ApprovalDecisionFailure> {
+        self.decide(request_key, granted, decider)
     }
 
     fn run_question(&mut self, task: &str, profile: QuestionProfile) -> Result<String, RunFailure> {

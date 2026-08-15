@@ -14,13 +14,20 @@
 //! decoded by its own decoder. A receipt this file assembled, or a page no
 //! decoder admitted, would prove nothing.
 //!
-//! # What this surface still does not do
+//! # Two lanes, and only one of them gates
 //!
-//! Nothing here gates anything, and these tests do not pretend otherwise:
+//! A decision recorded under a **caller-chosen** key still gates nothing, and
 //! [`a_recorded_decision_allows_nothing_because_nothing_consults_it`] is the
-//! assertion that the daemon behaves identically on both sides of a recorded
-//! `granted` and a recorded `denied`, which is the honest shape of "a recorded
-//! approval allows no action today".
+//! assertion that the daemon behaves identically on both sides of one: there is
+//! no proposal for it to answer and no launch bound to it.
+//!
+//! A decision recorded against a durable **proposal** — an `apr-` reference —
+//! is the one the execute lane reads before it starts anything.
+//! [`a_decision_on_a_proposal_reaches_both_databases_and_a_replay_writes_nothing`]
+//! proves that it lands in both databases and that a second press changes
+//! neither, and
+//! [`a_decision_that_reached_the_ledger_but_not_its_proposal_heals_on_the_next_open`]
+//! proves the seam between them repairs itself rather than needing a human.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -51,6 +58,9 @@ use automonique_protocol::runs_api::{
 };
 use automonique_protocol::wire::{JsonValue, Message};
 use automonique_store::approval_ledger::ApprovalLedger;
+use automonique_store::approval_requests::{
+    ApprovalContext, ApprovalProposal, ApprovalRequests, ApprovalState,
+};
 
 fn fixture() -> (tempfile::TempDir, DaemonConfig) {
     let root = tempfile::tempdir().expect("temporary root");
@@ -981,13 +991,240 @@ fn one_socket_places_each_frame_by_the_protocol_it_declares() {
     serving.shutdown(&config);
 }
 
-/// A recorded decision is evidence and not a gate.
+/// A durable proposal seeded before the daemon opens.
 ///
-/// Nothing in this build consults the ledger before acting, and this is the
-/// honest shape of that claim: the daemon's own counters and its intake switch
-/// are exactly as they were, on both sides of a recorded `granted` *and* a
-/// recorded `denied`. A `denied` decision about the shutdown command does not
+/// Written through the store's own API rather than by hand, so a test cannot
+/// create a row the product could not.
+const PROPOSAL_KEY: &str = "apr-0102030405060708090a0b0c0d0e0f10";
+const PROPOSAL_SUBJECT: &str =
+    "runspec:1111111111111111111111111111111111111111111111111111111111111111";
+
+fn seed_proposal(config: &DaemonConfig, expires_at_ms: i64) {
+    // The daemon creates its own state directory on open; seeding happens
+    // before that, so this stands in for it with the same private mode.
+    let state_dir = config.state_dir();
+    if !state_dir.exists() {
+        std::fs::create_dir_all(&state_dir).expect("state directory");
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("private state directory");
+    }
+    let mut requests =
+        ApprovalRequests::open(config.approval_requests_path()).expect("proposal table opens");
+    requests
+        .propose(ApprovalProposal {
+            request_key: PROPOSAL_KEY,
+            subject: PROPOSAL_SUBJECT,
+            run_id: "approvallive1",
+            context: ApprovalContext {
+                spec_digest: "1111111111111111111111111111111111111111111111111111111111111111",
+                program_path: "/usr/bin/example-provider",
+                program_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
+                prompt_sha256: "3333333333333333333333333333333333333333333333333333333333333333",
+                cwd_token: "cwd-1",
+            },
+            requested_by: "automonique.execute",
+            requested_at_ms: 1_000,
+            expires_at_ms,
+        })
+        .expect("a durable proposal");
+}
+
+fn decide(config: &DaemonConfig, label: &str, decision: ApprovalDecision) -> ApprovalResponse {
+    approval(
+        config,
+        &ApprovalRequest::DecideRequest {
+            request_id: RequestId::new(label).expect("request identifier"),
+            decision: automonique_protocol::approval_api::DecideRequest::new(
+                ApprovalKey::new(PROPOSAL_KEY).expect("approval key"),
+                decision,
+                Decider::new("test:operator").expect("decider"),
+            ),
+        },
+    )
+}
+
+/// One decision on one proposal lands in both databases, and a replay writes
+/// neither again.
+///
+/// The two writes are in two databases no transaction spans, so "both agree"
+/// is the property that matters and it is asserted from the files themselves
+/// after the daemon that wrote them has stopped.
+#[test]
+fn a_decision_on_a_proposal_reaches_both_databases_and_a_replay_writes_nothing() {
+    let (_root, config) = fixture();
+    seed_proposal(&config, 10_000_000_000_000);
+    let serving = serve(&config);
+
+    let first = decide(&config, "decide-1", ApprovalDecision::Granted);
+    let ApprovalResponse::Recorded { receipt, .. } = &first else {
+        panic!("expected a durable decision, got {first:?}")
+    };
+    assert_eq!(receipt.disposition(), ApprovalDisposition::Recorded);
+    assert_eq!(receipt.approval_key().as_str(), PROPOSAL_KEY);
+    assert_eq!(receipt.decision(), ApprovalDecision::Granted);
+    let first_instant = receipt.decided_at().as_millis();
+
+    // A second press of the same button. Exactly one decision exists, and the
+    // caller gets the first one back rather than a refusal.
+    let replay = decide(&config, "decide-2", ApprovalDecision::Granted);
+    let ApprovalResponse::Recorded { receipt, .. } = &replay else {
+        panic!("expected the first decision back, got {replay:?}")
+    };
+    assert_eq!(receipt.disposition(), ApprovalDisposition::AlreadyRecorded);
+    assert_eq!(receipt.decided_at().as_millis(), first_instant);
+
+    // The opposite answer on a decided proposal is refused, and the recorded
+    // answer stands. An operator who pressed the wrong button learns which
+    // answer won rather than seeing their own echoed back.
+    let contradiction = decide(&config, "decide-3", ApprovalDecision::Denied);
+    assert!(
+        matches!(
+            &contradiction,
+            ApprovalResponse::Refused { refusal, .. }
+                if *refusal == ApprovalRefusal::AlreadyDecided
+        ),
+        "expected already_decided, got {contradiction:?}"
+    );
+
+    serving.shutdown(&config);
+
+    // Both databases, read from the files the daemon left behind.
+    let requests =
+        ApprovalRequests::open(config.approval_requests_path()).expect("proposal table reopens");
+    let record = requests
+        .entry(PROPOSAL_KEY)
+        .expect("readable row")
+        .expect("a row under that key");
+    assert_eq!(record.state, ApprovalState::Granted);
+    assert_eq!(record.approval_key.as_deref(), Some(PROPOSAL_KEY));
+    assert_eq!(record.decided_at_ms, Some(first_instant));
+
+    let ledger = ApprovalLedger::open(config.approval_ledger_path()).expect("ledger reopens");
+    let entry = ledger
+        .entry(PROPOSAL_KEY)
+        .expect("readable ledger")
+        .expect("a decision under that key");
+    assert!(entry.decision.grants());
+    assert_eq!(entry.subject, PROPOSAL_SUBJECT);
+    assert_eq!(entry.decider, "test:operator");
+    assert_eq!(entry.decided_at_ms, first_instant);
+    assert_eq!(ledger.decision_count().expect("count"), 1);
+}
+
+/// A decision that reached the ledger and not its proposal heals on the next
+/// open.
+///
+/// This is the crash the two-database seam buys, injected exactly: the ledger
+/// row is written and the proposal is left `pending`, which is what a
+/// generation that died between the two writes leaves behind. The repair is a
+/// property of opening, not of somebody pressing the button again.
+#[test]
+fn a_decision_that_reached_the_ledger_but_not_its_proposal_heals_on_the_next_open() {
+    let (_root, config) = fixture();
+    seed_proposal(&config, 10_000_000_000_000);
+    {
+        // The first half of a decision, and nothing else. No daemon is running,
+        // so this is the durable state a crash between the two writes leaves.
+        let mut ledger = ApprovalLedger::open(config.approval_ledger_path()).expect("ledger opens");
+        ledger
+            .record(automonique_store::approval_ledger::ApprovalDecisionRecord {
+                approval_key: PROPOSAL_KEY,
+                subject: PROPOSAL_SUBJECT,
+                decision: automonique_store::approval_ledger::ApprovalDecision::Denied,
+                decider: "test:operator",
+                decided_at_ms: 4_000,
+            })
+            .expect("the ledger half of a decision");
+    }
+    // Before the repair the proposal still reads pending: the gap is real.
+    {
+        let requests = ApprovalRequests::open(config.approval_requests_path()).expect("table");
+        assert_eq!(
+            requests
+                .entry(PROPOSAL_KEY)
+                .expect("readable")
+                .expect("a row")
+                .state,
+            ApprovalState::Pending
+        );
+    }
+
+    let serving = serve(&config);
+    serving.shutdown(&config);
+
+    let requests = ApprovalRequests::open(config.approval_requests_path()).expect("table reopens");
+    let record = requests
+        .entry(PROPOSAL_KEY)
+        .expect("readable")
+        .expect("a row");
+    assert_eq!(
+        record.state,
+        ApprovalState::Denied,
+        "opening must replay the decision the ledger already holds"
+    );
+    // Replayed from the ledger's own instant rather than from the clock of the
+    // daemon that noticed: the decision happened when it happened.
+    assert_eq!(record.decided_at_ms, Some(4_000));
+    assert_eq!(record.approval_key.as_deref(), Some(PROPOSAL_KEY));
+}
+
+/// Each refusal on the decide lane is its own word.
+#[test]
+fn deciding_an_absent_or_expired_proposal_is_answered_in_its_own_word() {
+    let (_root, config) = fixture();
+    let serving = serve(&config);
+
+    // Nothing was seeded, so there is no proposal at all. That is a different
+    // absence from a decision nobody made, and it has its own spelling.
+    let absent = decide(&config, "decide-absent", ApprovalDecision::Granted);
+    assert!(
+        matches!(
+            &absent,
+            ApprovalResponse::Refused { refusal, .. }
+                if *refusal == ApprovalRefusal::UnknownRequest
+        ),
+        "expected unknown_request, got {absent:?}"
+    );
+    serving.shutdown(&config);
+
+    let (_expired_root, expired_config) = fixture();
+    // A proposal whose deadline is already in the past when the daemon reads
+    // it. A late decision is not accepted into it, and the answer says so
+    // rather than pretending the question is still open.
+    seed_proposal(&expired_config, 2_000);
+    let serving = serve(&expired_config);
+    let late = decide(&expired_config, "decide-late", ApprovalDecision::Granted);
+    assert!(
+        matches!(
+            &late,
+            ApprovalResponse::Refused { refusal, .. }
+                if *refusal == ApprovalRefusal::RequestExpired
+        ),
+        "expected request_expired, got {late:?}"
+    );
+    serving.shutdown(&expired_config);
+
+    let ledger =
+        ApprovalLedger::open(expired_config.approval_ledger_path()).expect("ledger reopens");
+    assert_eq!(
+        ledger.decision_count().expect("count"),
+        0,
+        "a refused decision must write nothing"
+    );
+}
+
+/// A recorded decision under a caller-chosen key is evidence and not a gate.
+///
+/// Nothing consults the free-form half of this ledger before acting, and this
+/// is the honest shape of that claim: the daemon's own counters and its intake
+/// switch are exactly as they were, on both sides of a recorded `granted` *and*
+/// a recorded `denied`. A `denied` decision about the shutdown command does not
 /// close intake, and a `granted` one does not open anything.
+///
+/// The `apr-` half of the same ledger *is* a gate, and
+/// [`a_decision_on_a_proposal_reaches_both_databases_and_a_replay_writes_nothing`]
+/// is where that is proved. The two are different keys into one file, which is
+/// why both claims are true at once.
 #[test]
 fn a_recorded_decision_allows_nothing_because_nothing_consults_it() {
     let (_root, config) = fixture();

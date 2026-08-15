@@ -3872,7 +3872,10 @@ fn approval_refusal_values() -> Vec<String> {
             ApprovalRefusal::UnknownApproval
             | ApprovalRefusal::CursorOutOfRange
             | ApprovalRefusal::LedgerFull
-            | ApprovalRefusal::InvalidField => refusal.as_str().to_owned(),
+            | ApprovalRefusal::InvalidField
+            | ApprovalRefusal::UnknownRequest
+            | ApprovalRefusal::AlreadyDecided
+            | ApprovalRefusal::RequestExpired => refusal.as_str().to_owned(),
         })
         .collect()
 }
@@ -4288,6 +4291,31 @@ fn approval_module() -> GeneratedModule {
                     coupling: None,
                 },
                 RequestCommand {
+                    kind: "decide_request".to_owned(),
+                    name: "DecideRequest".to_owned(),
+                    doc: "Answer one durable approval proposal. Deliberately narrower than \
+                          `record_approval`: there is no subject, because the subject is what \
+                          the proposal already binds and a decision that carried one would let \
+                          a caller assert what it was deciding about. There is no instant \
+                          either, for the reason `record_approval` has none. This is the lane \
+                          every operator surface converges on, and the decision it records is \
+                          the one a launch is admitted against."
+                        .to_owned(),
+                    fields: vec![
+                        checked_field("decider", DECIDER, "APPROVAL_INVALID_FIELD"),
+                        RequestField {
+                            name: "decision".to_owned(),
+                            input_name: "decision".to_owned(),
+                            value: RequestValue::Enum {
+                                type_name: "ApprovalDecision".to_owned(),
+                                unknown_category: "APPROVAL_UNKNOWN_ENUM_VALUE".to_owned(),
+                            },
+                        },
+                        checked_field("request_key", APPROVAL_KEY, "APPROVAL_INVALID_FIELD"),
+                    ],
+                    coupling: None,
+                },
+                RequestCommand {
                     kind: "list_approvals".to_owned(),
                     name: "ListApprovals".to_owned(),
                     doc: "Ask for one bounded page of every recorded decision. `since` is the \
@@ -4339,7 +4367,7 @@ fn approval_module() -> GeneratedModule {
                     coupling: None,
                 },
             ],
-            // This protocol version defines exactly the four requests above.
+            // This protocol version defines exactly the five requests above.
             // `tests/codegen.rs` proves the list against the Rust encoders
             // themselves rather than against this claim.
             request_kinds_not_generated: Vec::new(),

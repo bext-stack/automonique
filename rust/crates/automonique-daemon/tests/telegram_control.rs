@@ -26,13 +26,13 @@ use automonique_daemon::github::{
 };
 use automonique_daemon::slack::SLACK_NOT_CONFIGURED;
 use automonique_daemon::telegram_bridge::{
-    BridgeParts, ControlSurface, DispatchReport, EmailActionSurface, HostFacts,
-    MAX_PENDING_QUESTIONS, MAX_QUESTION_CONTEXT_BYTES, MAX_QUESTION_PROMPT_BYTES, MemberChange,
-    MemorySurface, NO_TICKETS_RECORDED, OperatorRoster, QUESTION_ADMIN_ONLY,
-    QUESTION_FRENCH_GREETING, QUESTION_GREETING, QUESTION_IDENTITY, QUESTION_SMALL_TALK,
-    QUESTION_TICKETS_LISTED, RunFailure, RunLane, SlackSurface, StoreControlSurface,
-    StoreMemorySurface, TICKET_ACTION_UNAVAILABLE, TICKET_NOT_FOUND, TICKETS_LISTED,
-    TICKETS_NOT_ENABLED, TelegramControlBridge, TicketActionSurface, Unavailable,
+    ApprovalDecisionAnswer, ApprovalDecisionFailure, BridgeParts, ControlSurface, DispatchReport,
+    EmailActionSurface, HostFacts, MAX_PENDING_QUESTIONS, MAX_QUESTION_CONTEXT_BYTES,
+    MAX_QUESTION_PROMPT_BYTES, MemberChange, MemorySurface, NO_TICKETS_RECORDED, OperatorRoster,
+    QUESTION_ADMIN_ONLY, QUESTION_FRENCH_GREETING, QUESTION_GREETING, QUESTION_IDENTITY,
+    QUESTION_SMALL_TALK, QUESTION_TICKETS_LISTED, RunFailure, RunLane, SlackSurface,
+    StoreControlSurface, StoreMemorySurface, TICKET_ACTION_UNAVAILABLE, TICKET_NOT_FOUND,
+    TICKETS_LISTED, TICKETS_NOT_ENABLED, TelegramControlBridge, TicketActionSurface,
 };
 use automonique_github_connector::IssueLocator;
 use automonique_protocol::admin::ExecutionState;
@@ -697,6 +697,12 @@ struct FakeRunLaneState {
     /// answered the way the durable ledger answers one.
     delivered: BTreeSet<String>,
     cancel_failure: Option<RunFailure>,
+    /// Every `(request_key, granted, decider)` the bridge presented, in order.
+    decisions: Vec<(String, bool, String)>,
+    /// Proposals this lane has already decided, so a second press is answered
+    /// the way the durable fence answers one.
+    decided: BTreeSet<String>,
+    decision_failure: Option<ApprovalDecisionFailure>,
 }
 
 #[derive(Default)]
@@ -733,6 +739,17 @@ impl FakeRunLane {
 
     fn cancels(&self) -> Vec<(String, String)> {
         self.state.lock().expect("lane state").cancels.clone()
+    }
+
+    /// A lane whose decisions never reach a ledger.
+    fn refusing_decisions(failure: ApprovalDecisionFailure) -> Self {
+        let lane = Self::default();
+        lane.state.lock().expect("lane state").decision_failure = Some(failure);
+        lane
+    }
+
+    fn decisions(&self) -> Vec<(String, bool, String)> {
+        self.state.lock().expect("lane state").decisions.clone()
     }
 
     fn blocking(answer: &str) -> Self {
@@ -815,6 +832,28 @@ impl RunLane for FakeRunLane {
             Ok(CancelRunOutcome::Delivered)
         } else {
             Ok(CancelRunOutcome::AlreadyDelivered)
+        }
+    }
+
+    /// Answer a decision the way the durable lane does: the first press writes
+    /// the row and every later one finds it, with no second effect.
+    fn decide_approval(
+        &mut self,
+        request_key: &str,
+        granted: bool,
+        decider: &str,
+    ) -> Result<ApprovalDecisionAnswer, ApprovalDecisionFailure> {
+        let mut state = self.state.lock().expect("lane state");
+        state
+            .decisions
+            .push((request_key.to_owned(), granted, decider.to_owned()));
+        if let Some(failure) = state.decision_failure {
+            return Err(failure);
+        }
+        if state.decided.insert(request_key.to_owned()) {
+            Ok(ApprovalDecisionAnswer::Recorded)
+        } else {
+            Ok(ApprovalDecisionAnswer::AlreadyRecorded)
         }
     }
 }
@@ -2621,25 +2660,30 @@ fn a_question_provider_failure_is_reported_without_command_dispatch() {
     assert!(!messages[0].contains(r#""entities""#));
 }
 
-/// Every command with no surface behind it says so, and does nothing.
+/// A ticket reference on either verb reaches the ticket lane, and says so when
+/// that lane is not configured.
 ///
 /// `/run` and `/cancel` are deliberately absent: both have a surface now, and
 /// [`a_run_reaches_the_lane_and_its_answer_is_the_reply`] and
 /// [`a_cancel_reaches_the_lane_and_a_telegram_retry_cancels_nothing_twice`] are
-/// where they are proved.
+/// where they are proved. `/deny` used to answer `Unavailable::ApprovalWiring`
+/// here; that variant is gone, because the typed connector *does* expose
+/// rejection and the bridge now dispatches it.
 #[test]
-fn commands_without_a_surface_say_nothing_happened() {
+fn a_ticket_reference_reaches_the_ticket_lane_on_both_verbs() {
     let fixture = Fixture::new(&[]);
     let client = FakeClient::new([updates(&[
         (3, OPERATOR, "/approve approval-1"),
         (4, OPERATOR, "/deny approval-1"),
     ])]);
     let outbound = FakeOutbound::default();
-    let mut bridge = bridge(
+    let lane = FakeRunLane::default();
+    let mut bridge = bridge_with_lane(
         &fixture,
         client.clone(),
         outbound.clone(),
         FakeSink::default(),
+        lane.clone(),
     );
 
     let report = poll(&mut bridge).expect("poll commits");
@@ -2648,18 +2692,125 @@ fn commands_without_a_surface_say_nothing_happened() {
     assert_eq!(report.sent, 2);
 
     let messages = outbound.messages();
-    assert!(messages[0].contains(TICKET_ACTION_UNAVAILABLE));
-    assert!(messages[1].contains(Unavailable::ApprovalWiring.operator_reply()));
-    assert!(
-        messages[1].contains("Not available yet."),
-        "an unavailable command must not read as an accepted one"
-    );
+    for message in &messages {
+        assert!(message.contains(TICKET_ACTION_UNAVAILABLE));
+    }
+    // Neither reference reached the approval lane: a reference outside the
+    // `apr-` grammar belongs to the ticket lane, and feeding it to a lane that
+    // resolves by prefix could match something the operator did not mean.
+    assert!(lane.decisions().is_empty());
     // Nothing was submitted: the run index is still empty.
     let mut surface = fixture.surface();
     assert_eq!(
         surface.runs_text().expect("runs render"),
         "No runs recorded."
     );
+}
+
+/// An `apr-` reference reaches the approval lane, and a second press decides
+/// nothing twice.
+///
+/// The two halves are the whole of what an idempotent decision surface has to
+/// prove: the lane sees the tier-checked actor rather than anything from the
+/// message body, and a repeated press is answered without a second effect.
+#[test]
+fn an_approval_reference_reaches_the_lane_and_a_second_press_decides_nothing_twice() {
+    let fixture = Fixture::new(&[]);
+    let key = "apr-000102030405060708090a0b0c0d0e0f";
+    let client = FakeClient::new([updates(&[
+        (3, OPERATOR, &format!("/approve {key}")),
+        (4, OPERATOR, &format!("/approve {key}")),
+    ])]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::default();
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        client.clone(),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.answered, 2);
+    assert_eq!(report.unavailable, 0);
+
+    let decisions = lane.decisions();
+    assert_eq!(decisions.len(), 2);
+    for (request_key, granted, decider) in &decisions {
+        assert_eq!(request_key, key);
+        assert!(granted);
+        // The decider is the tier-checked actor this bridge admitted, carrying
+        // the bot it spoke to. Nothing here came from the message body.
+        assert!(decider.starts_with("telegram:"));
+        assert!(decider.ends_with(&OPERATOR.to_string()));
+    }
+    let messages = outbound.messages();
+    assert!(messages[0].contains("Approved"));
+    assert!(
+        messages[1].contains("Already approved"),
+        "a second press must say so rather than claim a second decision"
+    );
+}
+
+/// `/deny` on an `apr-` reference denies, and each refusal names its own fact.
+#[test]
+fn a_denial_reaches_the_lane_and_every_refusal_is_its_own_answer() {
+    let key = "apr-0f0e0d0c0b0a09080706050403020100";
+    let fixture = Fixture::new(&[]);
+    let client = FakeClient::new([updates(&[(3, OPERATOR, &format!("/deny {key}"))])]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::default();
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        client.clone(),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+    poll(&mut bridge).expect("poll commits");
+    assert_eq!(
+        lane.decisions(),
+        vec![(
+            key.to_owned(),
+            false,
+            format!("telegram:{BOT_ID}:{OPERATOR}"),
+        )]
+    );
+    assert!(outbound.messages()[0].contains("Denied"));
+
+    // Each refusal is a different next step for the operator, so none of them
+    // is collapsed into a neighbour.
+    for (failure, expected) in [
+        (ApprovalDecisionFailure::Unknown, "No approval is waiting"),
+        (ApprovalDecisionFailure::AlreadyDecided, "already carries"),
+        (ApprovalDecisionFailure::Expired, "expired"),
+        (ApprovalDecisionFailure::Unavailable, "did not answer"),
+    ] {
+        let fixture = Fixture::new(&[]);
+        let client = FakeClient::new([updates(&[(3, OPERATOR, &format!("/deny {key}"))])]);
+        let outbound = FakeOutbound::default();
+        let mut bridge = bridge_with_lane(
+            &fixture,
+            client.clone(),
+            outbound.clone(),
+            FakeSink::default(),
+            FakeRunLane::refusing_decisions(failure),
+        );
+        poll(&mut bridge).expect("poll commits");
+        let messages = outbound.messages();
+        assert!(
+            messages[0].contains(expected),
+            "{} did not name its own fact: {}",
+            failure.category(),
+            messages[0]
+        );
+        assert!(
+            messages[0].contains("nothing was decided")
+                || messages[0].contains("Nothing was decided"),
+            "a refusal must say nothing happened"
+        );
+    }
 }
 
 /// `/cancel` reaches the lane, and a redelivered update cancels nothing twice.

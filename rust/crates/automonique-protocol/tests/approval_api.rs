@@ -378,8 +378,17 @@ fn a_disposition_a_refusal_and_a_conflict_field_all_fail_closed() {
             "unknown_approval",
             "cursor_out_of_range",
             "ledger_full",
-            "invalid_field"
+            "invalid_field",
+            "unknown_request",
+            "already_decided",
+            "request_expired",
         ],
+    );
+    // A proposal nobody raised and a decision nobody made are different
+    // absences, and the two spellings must not collapse into each other.
+    assert_ne!(
+        ApprovalRefusal::UnknownRequest,
+        ApprovalRefusal::UnknownApproval
     );
     assert_eq!(ApprovalRefusal::from_spelling("already_recorded"), None);
     assert_eq!(ApprovalRefusal::from_spelling("conflict"), None);

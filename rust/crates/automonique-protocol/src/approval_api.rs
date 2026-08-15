@@ -831,6 +831,84 @@ impl RecordApproval {
     }
 }
 
+/// One operator decision on one durable proposal.
+///
+/// Deliberately narrower than [`RecordApproval`]: there is **no subject**. The
+/// subject is what the proposal already binds, and a decision that carried one
+/// would let a transport assert what it was deciding about. A bridge sends a
+/// reference and an answer; the daemon supplies everything else from the row.
+///
+/// There is no timestamp either, for the reason [`RecordApproval`] has none.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecideRequest {
+    request_key: ApprovalKey,
+    decision: ApprovalDecision,
+    decider: Decider,
+}
+
+impl DecideRequest {
+    /// Present one decision on one proposal.
+    #[must_use]
+    pub const fn new(
+        request_key: ApprovalKey,
+        decision: ApprovalDecision,
+        decider: Decider,
+    ) -> Self {
+        Self {
+            request_key,
+            decision,
+            decider,
+        }
+    }
+
+    /// The proposal being decided.
+    #[must_use]
+    pub const fn request_key(&self) -> &ApprovalKey {
+        &self.request_key
+    }
+
+    /// What was answered.
+    #[must_use]
+    pub const fn decision(&self) -> ApprovalDecision {
+        self.decision
+    }
+
+    /// Who answered, as the deciding surface's tier-checked actor.
+    ///
+    /// Recorded here and verified there: this protocol carries a name, and the
+    /// surface that accepted the decision is the only place that can check it.
+    #[must_use]
+    pub const fn decider(&self) -> &Decider {
+        &self.decider
+    }
+
+    fn to_body(&self) -> JsonValue {
+        JsonValue::Object(vec![
+            (
+                "decider".to_owned(),
+                JsonValue::String(self.decider.as_str().to_owned()),
+            ),
+            (
+                "decision".to_owned(),
+                JsonValue::String(self.decision.as_str().to_owned()),
+            ),
+            (
+                "request_key".to_owned(),
+                JsonValue::String(self.request_key.as_str().to_owned()),
+            ),
+        ])
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, ApprovalApiError> {
+        exact_fields(body, &["decider", "decision", "request_key"])?;
+        Ok(Self::new(
+            ApprovalKey::new(required_string(body, "request_key")?)?,
+            decode_decision(&required_string(body, "decision")?)?,
+            Decider::new(required_string(body, "decider")?)?,
+        ))
+    }
+}
+
 /// A bounded request for one page of every recorded decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ListApprovals {
@@ -1463,15 +1541,33 @@ pub enum ApprovalRefusal {
     LedgerFull,
     /// A supplied field was outside the durable ledger's grammar.
     InvalidField,
+    /// No proposal is recorded under that reference.
+    ///
+    /// Distinct from [`ApprovalRefusal::UnknownApproval`], which is about the
+    /// decision ledger: a proposal nobody raised and a decision nobody made are
+    /// different absences, and only the second one means the question was
+    /// asked.
+    UnknownRequest,
+    /// The proposal already carries a different decision. Nothing was written.
+    AlreadyDecided,
+    /// The proposal's deadline passed before the decision arrived.
+    ///
+    /// Not folded into [`ApprovalRefusal::AlreadyDecided`]: a question that
+    /// closed unanswered and one that was answered are different facts, and
+    /// only the first is worth raising again.
+    RequestExpired,
 }
 
 impl ApprovalRefusal {
     /// Every refusal, in canonical order.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 7] = [
         Self::UnknownApproval,
         Self::CursorOutOfRange,
         Self::LedgerFull,
         Self::InvalidField,
+        Self::UnknownRequest,
+        Self::AlreadyDecided,
+        Self::RequestExpired,
     ];
 
     /// Stable lowercase wire spelling.
@@ -1482,6 +1578,9 @@ impl ApprovalRefusal {
             Self::CursorOutOfRange => "cursor_out_of_range",
             Self::LedgerFull => "ledger_full",
             Self::InvalidField => "invalid_field",
+            Self::UnknownRequest => "unknown_request",
+            Self::AlreadyDecided => "already_decided",
+            Self::RequestExpired => "request_expired",
         }
     }
 
@@ -1539,6 +1638,14 @@ pub enum ApprovalRequest {
         /// Subject, cursor and page size.
         query: ApprovalsBySubject,
     },
+    /// Decide one durable proposal. The lane every operator surface converges
+    /// on.
+    DecideRequest {
+        /// Correlation identifier.
+        request_id: RequestId,
+        /// The reference, the answer and who answered.
+        decision: DecideRequest,
+    },
 }
 
 impl ApprovalRequest {
@@ -1549,7 +1656,8 @@ impl ApprovalRequest {
             Self::RecordApproval { request_id, .. }
             | Self::ListApprovals { request_id, .. }
             | Self::ApprovalDetail { request_id, .. }
-            | Self::ApprovalsBySubject { request_id, .. } => request_id,
+            | Self::ApprovalsBySubject { request_id, .. }
+            | Self::DecideRequest { request_id, .. } => request_id,
         }
     }
 
@@ -1560,7 +1668,10 @@ impl ApprovalRequest {
     /// rather than for anything that decides it.
     #[must_use]
     pub const fn is_mutation(&self) -> bool {
-        matches!(self, Self::RecordApproval { .. })
+        matches!(
+            self,
+            Self::RecordApproval { .. } | Self::DecideRequest { .. }
+        )
     }
 
     /// Encode the request as a canonical message.
@@ -1596,6 +1707,13 @@ impl ApprovalRequest {
                 envelope(request_id.clone(), "approvals_by_subject")?,
                 query.to_body()?,
             )),
+            Self::DecideRequest {
+                request_id,
+                decision,
+            } => Ok(Message::new(
+                envelope(request_id.clone(), "decide_request")?,
+                decision.to_body(),
+            )),
         }
     }
 
@@ -1629,6 +1747,10 @@ impl ApprovalRequest {
             "approvals_by_subject" => Ok(Self::ApprovalsBySubject {
                 request_id,
                 query: ApprovalsBySubject::from_body(message.body())?,
+            }),
+            "decide_request" => Ok(Self::DecideRequest {
+                request_id,
+                decision: DecideRequest::from_body(message.body())?,
             }),
             _ => Err(ApprovalApiError::UnknownKind),
         }

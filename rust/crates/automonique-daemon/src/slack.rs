@@ -106,7 +106,9 @@ use crate::github_actions::{
 };
 use crate::manage_config::ManageUrl;
 use crate::run_lane::SocketRunLane;
-use crate::telegram_bridge::SlackSurface;
+use crate::telegram_bridge::{
+    ApprovalDecisionAnswer, ApprovalDecisionFailure, RunLane as _, SlackSurface,
+};
 
 /// Configuration path beneath the daemon's private state directory.
 const CONFIG_RELATIVE: &str = "slack/slack.conf";
@@ -1666,6 +1668,14 @@ struct SlackTicketRouter<P> {
     interactive_decisions: bool,
     gates: Arc<std::sync::Mutex<crate::telegram_bridge::TicketGateRegistry>>,
     github_actions: Option<GitHubActionEngine<SocketRunLane>>,
+    /// The lane one durable approval decision travels down.
+    ///
+    /// Its own handle rather than the GitHub engine's, because the two are
+    /// enabled independently: a workspace that approves runs and configures no
+    /// GitHub host still has to be able to decide. `None` only when this
+    /// daemon's own run index would not open, which is the same condition
+    /// every other socket lane refuses on.
+    approval_lane: Option<SocketRunLane>,
 }
 
 impl<P: SlackTicketPoster> SlackTicketRouter<P> {
@@ -1734,6 +1744,29 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             return;
         }
         let is_admin = self.admins.contains(&command.user);
+        // An `apr-` reference is a durable approval proposal on this daemon's
+        // own lane, and it is answered before the ticket ladder below: that
+        // ladder resolves references by *prefix* against a live gate registry,
+        // so a reference from the other lane fed to it could match a ticket
+        // nobody meant. The grammar is what keeps the two apart.
+        for (prefix, granted) in [("approve ", true), ("reject ", false)] {
+            let Some(rest) = text.strip_prefix(prefix) else {
+                continue;
+            };
+            let reference = rest.split_whitespace().next().unwrap_or_default();
+            if !reference.starts_with(APPROVAL_REFERENCE_PREFIX) {
+                continue;
+            }
+            if !is_admin {
+                let _ = self.poster.post_channel(
+                    &command.channel,
+                    "Only a configured Slack administrator can decide an approval.",
+                );
+                return;
+            }
+            self.decide_approval(&command, reference, granted);
+            return;
+        }
         if let Some(reference) = text.strip_prefix("approve ") {
             if !is_admin {
                 let _ = self.poster.post_channel(
@@ -1884,6 +1917,37 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             }
         }
         let _ = self.poster.post_channel(&command.channel, "I could not map that `/monique` request to an enabled Slack capability. Use `/monique help`." );
+    }
+
+    /// Record one Slack administrator's decision on one durable proposal.
+    ///
+    /// Dials this daemon's own socket, exactly as the Telegram bridge does, so
+    /// both surfaces reach the one `Daemon::record_decision` rather than two
+    /// implementations that agree today. The decider is the admin-allowlisted
+    /// actor this router admitted; nothing is read from the command text but
+    /// the reference itself.
+    fn decide_approval(&mut self, command: &SlackMoniqueCommand, reference: &str, granted: bool) {
+        let decider = format!("slack:{}:{}", command.team_id, command.user);
+        let Some(lane) = self.approval_lane.as_mut() else {
+            let _ = self.poster.post_channel(
+                &command.channel,
+                ApprovalDecisionFailure::Unavailable.operator_reply(),
+            );
+            return;
+        };
+        let reply = match lane.decide_approval(reference, granted, &decider) {
+            Ok(answer) => {
+                let verb = match (answer, granted) {
+                    (ApprovalDecisionAnswer::Recorded, true) => "✅ Approved",
+                    (ApprovalDecisionAnswer::Recorded, false) => "⛔ Denied",
+                    (ApprovalDecisionAnswer::AlreadyRecorded, true) => "✅ Already approved",
+                    (ApprovalDecisionAnswer::AlreadyRecorded, false) => "⛔ Already denied",
+                };
+                format!("{verb} by <@{}>. Reference `{reference}`.", command.user)
+            }
+            Err(failure) => failure.operator_reply().to_owned(),
+        };
+        let _ = self.poster.post_channel(&command.channel, &reply);
     }
 
     fn handle_app_home(&mut self, user: &UserId) {
@@ -2424,6 +2488,9 @@ pub(crate) fn replay_slack_trace(
             crate::telegram_bridge::TicketGateRegistry::default(),
         )),
         github_actions: None,
+        // The replay router reaches no daemon by construction: a parity replay
+        // must not be able to decide anything.
+        approval_lane: None,
     };
     for event in trace.events() {
         let source_key = format!("slack:{}:event:{}", workspace.team, event.event_id);
@@ -2500,6 +2567,13 @@ fn legacy_observation(state_dir: &Path) -> Result<Option<LegacyObservation>, Sla
         ),
     }))
 }
+
+/// Prefix that tells a durable approval reference from a ticket reference.
+///
+/// Pinned by literal from `automonique_store::approval_requests::REQUEST_KEY_PREFIX`,
+/// for the reason the Telegram surface pins it: a transport recognizing one
+/// string is not a reason to depend on another crate's grammar.
+const APPROVAL_REFERENCE_PREFIX: &str = "apr-";
 
 /// Socket Mode ticket-intake lifecycle, separate from Telegram's Slack read and
 /// post surface so Slack works even when Telegram is disabled.
@@ -2592,6 +2666,8 @@ impl SlackTicketHost {
                     interactive_decisions,
                     gates,
                     github_actions,
+                    approval_lane: SocketRunLane::open(state_dir, admin_socket, run_index_path)
+                        .ok(),
                 },
             })),
             stop: Arc::new(AtomicBool::new(false)),
@@ -3765,6 +3841,7 @@ mod tests {
                 crate::telegram_bridge::TicketGateRegistry::default(),
             )),
             github_actions: None,
+            approval_lane: None,
         };
 
         router.handle_with_context(
@@ -3842,6 +3919,7 @@ mod tests {
                     crate::telegram_bridge::TicketGateRegistry::default(),
                 )),
                 github_actions: None,
+                approval_lane: None,
             }
         }
 
@@ -4043,6 +4121,7 @@ mod tests {
                 crate::telegram_bridge::TicketGateRegistry::default(),
             )),
             github_actions: None,
+            approval_lane: None,
         };
         let event = ticket_event(
             "U0ADMIN001",
@@ -4127,6 +4206,7 @@ mod tests {
             interactive_decisions: false,
             gates,
             github_actions: None,
+            approval_lane: None,
         };
         router.handle_with_context(
             ticket_event("U0ADMIN001", "confirm job-from-telegram", "Ev4"),
@@ -4290,6 +4370,7 @@ mod tests {
                 crate::telegram_bridge::TicketGateRegistry::default(),
             )),
             github_actions: None,
+            approval_lane: None,
         };
         router.handle_with_context(
             ticket_event(

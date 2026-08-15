@@ -7122,8 +7122,8 @@ mod approval_surface {
         ApprovalDecision, ApprovalDisposition, ApprovalKey, ApprovalListPage, ApprovalPageSize,
         ApprovalReceiptView, ApprovalRecordParts, ApprovalRecordView, ApprovalRefusal,
         ApprovalRequest, ApprovalResponse, ApprovalSubject, ApprovalsBySubject, ConflictField,
-        Decider, ListApprovals, MAX_APPROVAL_API_FIELD_BYTES, MAX_APPROVAL_PAGE_ITEMS,
-        RecordApproval, RecordedApproval,
+        DecideRequest, Decider, ListApprovals, MAX_APPROVAL_API_FIELD_BYTES,
+        MAX_APPROVAL_PAGE_ITEMS, RecordApproval, RecordedApproval,
     };
     use automonique_protocol::codec::{MAX_REQUEST_ID_BYTES, MajorVersion};
     use automonique_protocol::codegen::{
@@ -8725,11 +8725,19 @@ mod approval_surface {
                 approval_key: key("approval/1"),
             },
             ApprovalRequest::ApprovalsBySubject {
-                request_id: id,
+                request_id: id.clone(),
                 query: ApprovalsBySubject::new(
                     subject("effect:one"),
                     ApprovalCursor::START,
                     page_size(1),
+                ),
+            },
+            ApprovalRequest::DecideRequest {
+                request_id: id,
+                decision: DecideRequest::new(
+                    key("apr-000102030405060708090a0b0c0d0e0f"),
+                    ApprovalDecision::Granted,
+                    decider("ops/oncall"),
                 ),
             },
         ];
@@ -8741,7 +8749,8 @@ mod approval_surface {
                 ApprovalRequest::RecordApproval { .. }
                 | ApprovalRequest::ListApprovals { .. }
                 | ApprovalRequest::ApprovalDetail { .. }
-                | ApprovalRequest::ApprovalsBySubject { .. } => {}
+                | ApprovalRequest::ApprovalsBySubject { .. }
+                | ApprovalRequest::DecideRequest { .. } => {}
             }
         }
         let encoded: BTreeSet<String> = requests
@@ -8895,10 +8904,13 @@ mod approval_surface {
             (
                 "ApprovalRefusal",
                 &[
+                    "already_decided",
                     "cursor_out_of_range",
                     "invalid_field",
                     "ledger_full",
+                    "request_expired",
                     "unknown_approval",
+                    "unknown_request",
                 ],
             ),
         ];

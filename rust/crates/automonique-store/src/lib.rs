@@ -10,6 +10,7 @@
 
 pub mod agent_memory;
 pub mod approval_ledger;
+pub mod approval_requests;
 pub mod audit_chain;
 pub mod automation_store;
 pub mod batch_registry;

@@ -42,12 +42,22 @@
 //! identifying themselves as `decider` was named as having made it.** That is
 //! the whole of it. In particular:
 //!
-//! - **It does not enforce the decision.** Nothing here gates anything. A
-//!   `denied` row does not stop the denied thing from happening, and a `granted`
-//!   row does not permit anything that was not already permitted. The row is
-//!   written beside the action, never in front of it, so a reader must never
-//!   treat the presence of a row as proof that a gated action was allowed or
-//!   blocked.
+//! - **It does not enforce the decision.** Nothing in *this module* gates
+//!   anything: it stores rows and answers questions about them.
+//!
+//!   What a row means to a reader now depends on its key, and the difference is
+//!   worth stating plainly because this comment used to say the opposite. A row
+//!   under an `apr-` key answers a durable proposal in
+//!   [`crate::approval_requests`], and the daemon reads it **in front of** the
+//!   launch it is about: a `granted` row there admits a run and a `denied` row
+//!   refuses one. A row under any other key is written beside an action rather
+//!   than in front of it, because there is no proposal for it to answer and no
+//!   launch bound to it, and for those a reader must still not treat the
+//!   presence of a row as proof that anything was allowed or blocked.
+//!
+//!   Neither reading is this module's to make. It records; the gate is
+//!   `automonique-daemon`'s, and it is the only thing that turns a row into a
+//!   permission.
 //! - **It does not verify the decider's authority.** `decider` is recorded
 //!   exactly as supplied; this module cannot tell an operator from a runbook
 //!   from a typo. Authenticating the local peer is the daemon's `SO_PEERCRED`
@@ -404,6 +414,11 @@ pub type Recorded<T> = Result<T, ApprovalLedgerError>;
 /// and no "expired". A decision that was never made has no row, and a decision
 /// that was reconsidered is a second row under a new key — see the module
 /// documentation for both.
+///
+/// Where the question itself lives is [`crate::approval_requests`], which does
+/// have a pending state and an expired one. That split is deliberate: an
+/// expiry is the *absence* of an answer, and giving this enum a third variant
+/// for it would let a sweeper write a decision nobody made.
 ///
 /// The spellings are the ones [`crate::provider_journal`]'s `ApprovalDecision`
 /// already writes, and `denied` is the protocol's own spelling for a refusal.

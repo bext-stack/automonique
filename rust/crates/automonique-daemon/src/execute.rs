@@ -329,6 +329,48 @@ pub(crate) fn provider_binary_digest(bytes: &[u8]) -> String {
     format!("{ALGORITHM}:{:x}", sha2::Sha256::digest(bytes))
 }
 
+/// The two digests an approval binds that are not in the document itself.
+///
+/// A RunSpec carries the *path* of its program and the *name* of its prompt
+/// slot; the bytes behind both are host state that can change after an operator
+/// approves and before the launch happens. Hashing them here is what lets the
+/// approval bind them.
+///
+/// Both are computed exactly the way the admission path computes them — the
+/// same reads, the same ceilings, the same `read_bounded` — so an approval
+/// binds the values the launch will later be checked against rather than a
+/// second opinion about them. The prefix `provider_binary_digest` carries is
+/// stripped, because these are stored as bare hexadecimal beside the run's
+/// canonical spec digest and a mixed alphabet in one row would be a trap for
+/// the comparison.
+///
+/// `None` means one of them could not be observed at all: an unreadable
+/// program, an unresolvable prompt, or a prompt this build cannot address. A
+/// caller must treat that as a refusal, never as an empty binding.
+pub(crate) fn approval_context_digests(
+    state_dir: &Path,
+    spec: &RunSpec,
+) -> Option<(String, String)> {
+    let program = read_bounded(spec.executable(), MAX_PROVIDER_BINARY_BYTES)?;
+    let program_sha256 = provider_binary_digest(&program)
+        .strip_prefix(&format!("{ALGORITHM}:"))?
+        .to_owned();
+
+    let slot = match spec.prompt_delivery() {
+        PromptDeliveryPlan::ProtectedReference(reference) => reference.as_str().to_owned(),
+        PromptDeliveryPlan::Stdin | PromptDeliveryPlan::BackendSession(_) => return None,
+    };
+    if !is_safe_segment(&slot) {
+        return None;
+    }
+    let limit = u64::try_from(MAX_PROMPT_BYTES).ok()?;
+    let prompt = read_bounded(&state_dir.join(PROMPTS_DIRECTORY).join(&slot), limit)?;
+    if prompt.is_empty() {
+        return None;
+    }
+    Some((program_sha256, Sha256::digest(&prompt).to_hex()))
+}
+
 /// Directory under the state root holding one subtree per executed run.
 pub const RUNS_DIRECTORY: &str = "runs";
 
