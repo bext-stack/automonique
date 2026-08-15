@@ -15,9 +15,12 @@
 
 ## What went wrong
 
-Commits `75ab771`, `76aa528` and `5df55ca` were authored and committed as
-`Benjamin Favre <ben@webdesign29.net>` and carried a `Co-Authored-By` trailer
-naming an assistant. Every prior commit on `main` is authored and committed as
+Commits `75ab771`, `76aa528` and `5df55ca` were authored and committed under the
+owner's personal Git identity — the name and address in their ambient
+`git config`, which this document does not repeat — and carried a
+`Co-Authored-By` trailer naming an assistant. The exact spelling is recoverable
+from those commit objects and is not what the decision turns on. Every prior
+commit on `main` is authored and committed as
 `Automonique Candidate <candidate@automonique.invalid>`, the identity
 `tools/git_broker.py` sets for a candidate commit.
 

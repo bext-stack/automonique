@@ -8,6 +8,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The legacy-history backfill addresses the predecessor's schema and the durable
+# keys a previous backfill wrote. Those spellings are declared once, in the
+# compatibility registry that is their sanctioned home, and named from here.
+automonique-protocol = { path = "../automonique-protocol" }
 nix.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true

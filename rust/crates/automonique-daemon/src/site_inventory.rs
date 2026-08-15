@@ -29,7 +29,6 @@ pub const MAX_PRISM_APPS: usize = 128;
 /// Most enabled Prism hostnames one snapshot retains.
 pub const MAX_PRISM_SITES: usize = 256;
 const MANAGE_PROFILE_ENDPOINT: &str = "http://127.0.0.1/__bext/sdk/kv/get";
-const MANAGE_PROFILE_APP: &str = "inklura-manage-prism";
 const MAX_MANAGE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MANAGE_PROFILES: usize = 500;
 const MAX_SELECTED_PROFILES: usize = 24;
@@ -87,10 +86,16 @@ pub struct ManageProfileInventory {
 
 /// Read the bounded, path-free site-profile projection from Manage's local KV.
 ///
-/// The fixed loopback endpoint and app identity are deployment configuration,
-/// not model-controlled input. Filesystem paths and design tokens are never
-/// decoded into this read model.
-pub fn manage_profiles(question: &str) -> Result<ManageProfileInventory, SiteInventoryFailure> {
+/// The fixed loopback endpoint is a property of the deployment's own host. The
+/// app identity is deployment configuration too, and is supplied by the caller
+/// from [`crate::manage_config::ManageConfig`] rather than compiled in — a host
+/// that configured none never reaches this function. Neither is
+/// model-controlled input. Filesystem paths and design tokens are never decoded
+/// into this read model.
+pub fn manage_profiles(
+    question: &str,
+    profile_app: &crate::manage_config::ManageProfileApp,
+) -> Result<ManageProfileInventory, SiteInventoryFailure> {
     let config = ureq::Agent::config_builder()
         .https_only(false)
         .proxy(None)
@@ -102,7 +107,7 @@ pub fn manage_profiles(question: &str) -> Result<ManageProfileInventory, SiteInv
         .post(MANAGE_PROFILE_ENDPOINT)
         .header("content-type", "application/json")
         .header("accept", "application/json")
-        .header("x-bext-app-id", MANAGE_PROFILE_APP)
+        .header("x-bext-app-id", profile_app.as_str())
         .config()
         .timeout_global(Some(Duration::from_millis(1_200)))
         .build()
@@ -558,9 +563,9 @@ mod tests {
             },
             {
                 "kind": "ecosystem",
-                "ref": "webdesign29-prism",
-                "label": "Webdesign29",
-                "context": "Site vitrine de l'agence web Webdesign29 à Brest"
+                "ref": "example-agency-prism",
+                "label": "Example Agency",
+                "context": "Site vitrine de l'agence web Example Agency à Brest"
             }
         ]);
         let bytes = serde_json::to_vec(&serde_json::json!({ "value": rows })).expect("fixture");
@@ -569,7 +574,7 @@ mod tests {
             decode_manage_profiles(&bytes, "what agency or agencies manage this webserver?")
                 .expect("profiles");
 
-        assert_eq!(inventory.selected[0].reference, "webdesign29-prism");
+        assert_eq!(inventory.selected[0].reference, "example-agency-prism");
     }
 
     #[test]

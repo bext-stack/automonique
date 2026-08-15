@@ -104,6 +104,7 @@ use automonique_transports::{
 use crate::github_actions::{
     GitHubActionEngine, GitHubActionRequest, GitHubManagementDomain, is_github_capability_question,
 };
+use crate::manage_config::ManageUrl;
 use crate::run_lane::SocketRunLane;
 use crate::telegram_bridge::SlackSurface;
 
@@ -306,6 +307,10 @@ pub enum SlackConfigError {
     TicketActionsUnavailable,
     /// GitHub actions were configured but their provider lane could not open.
     GitHubActionsUnavailable,
+    /// A present Manage configuration was refused.
+    ManageConfig(crate::manage_config::ManageConfigError),
+    /// A present memory configuration was refused.
+    MemoryConfig(crate::memory_config::MemoryConfigError),
 }
 
 impl fmt::Display for SlackConfigError {
@@ -338,6 +343,8 @@ impl fmt::Display for SlackConfigError {
             Self::GitHubActionsUnavailable => {
                 formatter.write_str("slack GitHub actions require an available provider lane")
             }
+            Self::ManageConfig(error) => write!(formatter, "{error}"),
+            Self::MemoryConfig(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -360,6 +367,8 @@ impl SlackConfigError {
             Self::ArtifactPolicyRequired => "slack_artifact_policy_required",
             Self::TicketActionsUnavailable => "slack_ticket_actions_unavailable",
             Self::GitHubActionsUnavailable => "slack_github_actions_unavailable",
+            Self::ManageConfig(error) => error.category(),
+            Self::MemoryConfig(error) => error.category(),
         }
     }
 }
@@ -1386,6 +1395,7 @@ trait SlackTicketPoster {
         channel: &ChannelId,
         parent: &MessageTs,
         receipt: &automonique_support_connector::TicketDispatchReceipt,
+        _manage_url: Option<&ManageUrl>,
     ) -> Result<(), ()> {
         let short = receipt.job_id.get(..12).unwrap_or(&receipt.job_id);
         self.post_thread(
@@ -1456,20 +1466,28 @@ impl SlackTicketPoster for SlackClient {
         channel: &ChannelId,
         parent: &MessageTs,
         receipt: &automonique_support_connector::TicketDispatchReceipt,
+        manage_url: Option<&ManageUrl>,
     ) -> Result<(), ()> {
         let short = receipt.job_id.get(..12).unwrap_or(&receipt.job_id);
         let fallback = format!(
             "Confirmation required for {} ({}) — Monique job {short}",
             receipt.issue_title, receipt.issue_url
         );
+        // The console address is one deployment's, so the button exists only
+        // where one is configured. Omitting it costs the card nothing: both
+        // decisions are on the card itself, and a link to a host this
+        // installation does not have would be worse than no link.
+        let mut elements = vec![
+            serde_json::json!({"type":"button","action_id":"monique_ticket_approve","text":{"type":"plain_text","text":"Confirm"},"style":"primary","value":receipt.job_id,"confirm":{"title":{"type":"plain_text","text":"Confirm ticket?"},"text":{"type":"mrkdwn","text":"This releases the ticket for work."},"confirm":{"type":"plain_text","text":"Confirm"},"deny":{"type":"plain_text","text":"Cancel"}}}),
+            serde_json::json!({"type":"button","action_id":"monique_ticket_reject","text":{"type":"plain_text","text":"Reject"},"style":"danger","value":receipt.job_id}),
+        ];
+        if let Some(url) = manage_url {
+            elements.push(serde_json::json!({"type":"button","action_id":"monique_ticket_manage","text":{"type":"plain_text","text":"Open Manage"},"url":url.as_str()}));
+        }
         let blocks = serde_json::json!([
             {"type":"header","text":{"type":"plain_text","text":"Confirmation required"}},
             {"type":"section","text":{"type":"mrkdwn","text":format!("*{}*\n<{}|Open GitHub issue>\nJob `{}` is pending approval. No work starts before confirmation.", receipt.issue_title, receipt.issue_url, short)}},
-            {"type":"actions","elements":[
-                {"type":"button","action_id":"monique_ticket_approve","text":{"type":"plain_text","text":"Confirm"},"style":"primary","value":receipt.job_id,"confirm":{"title":{"type":"plain_text","text":"Confirm ticket?"},"text":{"type":"mrkdwn","text":"This releases the ticket for work."},"confirm":{"type":"plain_text","text":"Confirm"},"deny":{"type":"plain_text","text":"Cancel"}}},
-                {"type":"button","action_id":"monique_ticket_reject","text":{"type":"plain_text","text":"Reject"},"style":"danger","value":receipt.job_id},
-                {"type":"button","action_id":"monique_ticket_manage","text":{"type":"plain_text","text":"Open Manage"},"url":"https://manage.inklura.fr/"}
-            ]}
+            {"type":"actions","elements":elements}
         ]);
         let blocks = MessageBlocks::new(&blocks.to_string()).map_err(|_| ())?;
         let request = PostMessageRequest::new(
@@ -1566,6 +1584,8 @@ impl SlackTicketPoster for SlackClient {
 struct SlackTicketRouter<P> {
     poster: P,
     manage: Box<dyn crate::telegram_bridge::TicketActionSurface + Send>,
+    manage_url: Option<ManageUrl>,
+    memory_tenant: String,
     channels: ChannelMap,
     admins: Vec<UserId>,
     members: Vec<UserId>,
@@ -1965,7 +1985,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             .map_err(|_| ())?;
         let (tenant, actor) = identity.unwrap_or_else(|| {
             (
-                String::from("inklura"),
+                self.memory_tenant.clone(),
                 format!("slack:{}:{}", event.team_id, event.user),
             )
         });
@@ -2019,7 +2039,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             .map_err(|_| ())?;
         let (tenant, actor) = identity.unwrap_or_else(|| {
             (
-                String::from("inklura"),
+                self.memory_tenant.clone(),
                 format!("slack:{}:{}", command.team_id, command.user),
             )
         });
@@ -2141,7 +2161,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                 let _ = self.poster.post_thread(
                     &event.channel,
                     &event.parent,
-                    "Jean found more than one GitHub issue URL. Post one ticket per message so each confirmation is exact.",
+                    "Monique found more than one GitHub issue URL. Post one ticket per message so each confirmation is exact.",
                 );
                 return;
             }
@@ -2164,21 +2184,24 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                     let _ = self.poster.post_thread(
                         &event.channel,
                         &event.parent,
-                        "The ticket is pending in Manage, but Jean could not retain its cross-channel confirmation coordinates. Confirm it in Manage; no work has been released.",
+                        "The ticket is pending in Manage, but Monique could not retain its cross-channel confirmation coordinates. Confirm it in Manage; no work has been released.",
                     );
                     return;
                 }
                 if self.interactive_decisions {
-                    let _ = self
-                        .poster
-                        .post_approval_card(&event.channel, &event.parent, &receipt);
+                    let _ = self.poster.post_approval_card(
+                        &event.channel,
+                        &event.parent,
+                        &receipt,
+                        self.manage_url.as_ref(),
+                    );
                 } else {
                     let short = receipt.job_id.get(..12).unwrap_or(&receipt.job_id);
                     let _ = self.poster.post_thread(
                         &event.channel,
                         &event.parent,
                         &format!(
-                            "🔐 Confirmation required for `{}`\n{}\nJean job `{short}` is pending approval. A configured Slack admin can reply `confirm {short}`; the same request can also be confirmed in Telegram or Manage. No work starts before confirmation.",
+                            "🔐 Confirmation required for `{}`\n{}\nMonique job `{short}` is pending approval. A configured Slack admin can reply `confirm {short}`; the same request can also be confirmed in Telegram or Manage. No work starts before confirmation.",
                             receipt.issue_title, receipt.issue_url
                         ),
                     );
@@ -2219,7 +2242,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             let reply = if matches.is_empty() {
                 "No pending ticket confirmation matches that reference."
             } else {
-                "That reference is ambiguous; reply with the full Jean job id."
+                "That reference is ambiguous; reply with the full Monique job id."
             };
             let _ = self
                 .poster
@@ -2240,7 +2263,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                     &event.channel,
                     &event.parent,
                     &format!(
-                        "✅ Confirmed by <@{}>. Jean job `{short}` is {}.",
+                        "✅ Confirmed by <@{}>. Monique job `{short}` is {}.",
                         event.user,
                         receipt.job_status.as_str()
                     ),
@@ -2309,6 +2332,11 @@ impl SlackTicketHost {
             .map_err(|_| SlackConfigError::TicketActionsUnavailable)?
             .ok_or(SlackConfigError::TicketActionsUnavailable)?
             .into_action_client();
+        let manage_url = crate::manage_config::ManageConfig::load(state_dir)
+            .map_err(SlackConfigError::ManageConfig)?
+            .and_then(|config| config.url().cloned());
+        let memory_tenant = crate::memory_config::MemoryConfig::tenant_or_default(state_dir)
+            .map_err(SlackConfigError::MemoryConfig)?;
         let github_actions = match crate::github::GitHubHost::load(state_dir)
             .map_err(|_| SlackConfigError::GitHubActionsUnavailable)?
             .into_action_surface()
@@ -2336,6 +2364,8 @@ impl SlackTicketHost {
                 router: SlackTicketRouter {
                     poster: SlackClient::new(SlackBase::production(), token),
                     manage: Box::new(manage),
+                    manage_url,
+                    memory_tenant,
                     channels,
                     admins,
                     members,
@@ -2466,11 +2496,13 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
                 break;
             }
             if let Some(event) = event {
-                let context = slack_event_context(&worker.memory, &event);
+                let context =
+                    slack_event_context(&worker.memory, &worker.router.memory_tenant, &event);
                 worker.router.handle_with_context(event, &context);
             }
             if let Some(command) = command {
-                let context = slack_command_context(&worker.memory, &command);
+                let context =
+                    slack_command_context(&worker.memory, &worker.router.memory_tenant, &command);
                 worker.router.handle_github_command(command, &context);
             }
             if let Some(interaction) = prepared_interaction {
@@ -2488,7 +2520,11 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
     }
 }
 
-fn slack_event_context(memory: &AgentMemoryStore, event: &SlackTicketEvent) -> String {
+fn slack_event_context(
+    memory: &AgentMemoryStore,
+    default_tenant: &str,
+    event: &SlackTicketEvent,
+) -> String {
     let (tenant, actor) = memory
         .resolve_identity(
             "slack",
@@ -2500,7 +2536,7 @@ fn slack_event_context(memory: &AgentMemoryStore, event: &SlackTicketEvent) -> S
         .flatten()
         .unwrap_or_else(|| {
             (
-                String::from("inklura"),
+                String::from(default_tenant),
                 format!("slack:{}:{}", event.team_id, event.user),
             )
         });
@@ -2511,7 +2547,11 @@ fn slack_event_context(memory: &AgentMemoryStore, event: &SlackTicketEvent) -> S
     recent_slack_context(memory, &tenant, &actor, &conversation_id)
 }
 
-fn slack_command_context(memory: &AgentMemoryStore, command: &SlackGitHubCommand) -> String {
+fn slack_command_context(
+    memory: &AgentMemoryStore,
+    default_tenant: &str,
+    command: &SlackGitHubCommand,
+) -> String {
     let (tenant, actor) = memory
         .resolve_identity(
             "slack",
@@ -2523,7 +2563,7 @@ fn slack_command_context(memory: &AgentMemoryStore, command: &SlackGitHubCommand
         .flatten()
         .unwrap_or_else(|| {
             (
-                String::from("inklura"),
+                String::from(default_tenant),
                 format!("slack:{}:{}", command.team_id, command.user),
             )
         });
@@ -3311,7 +3351,7 @@ mod tests {
         let parsed = SlackConfig::parse(&config_v2(&[
             &format!("token={SECRET}"),
             "app_token=xapp-fixture-secret",
-            "channel=jean:C0RESERVED01",
+            "channel=ops:C0RESERVED01",
             "member=U0MEMBER001",
             "admin=U0ADMIN001",
             "feature=approvals",
@@ -3327,7 +3367,7 @@ mod tests {
         );
 
         for bad in ["feature=future", "feature=approvals\nfeature=approvals"] {
-            let frame = config_v2(&[&format!("token={SECRET}"), "channel=jean:C0RESERVED01", bad]);
+            let frame = config_v2(&[&format!("token={SECRET}"), "channel=ops:C0RESERVED01", bad]);
             assert_eq!(
                 SlackConfig::parse(&frame)
                     .expect_err("closed feature")
@@ -3337,7 +3377,7 @@ mod tests {
         }
         let files = config_v2(&[
             &format!("token={SECRET}"),
-            "channel=jean:C0RESERVED01",
+            "channel=ops:C0RESERVED01",
             "feature=files",
         ]);
         assert_eq!(
@@ -3456,8 +3496,10 @@ mod tests {
         let mut router = SlackTicketRouter {
             poster,
             manage: Box::new(manage),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
             channels: ChannelMap(vec![(
-                name("jean"),
+                name("ops"),
                 ChannelId::new("C0RESERVED01").expect("channel"),
             )]),
             admins: vec![UserId::new("U0ADMIN001").expect("admin")],
@@ -3519,8 +3561,10 @@ mod tests {
         let router = SlackTicketRouter {
             poster: FakeTicketPoster::default(),
             manage: Box::new(FakeManage::default()),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
             channels: ChannelMap(vec![(
-                name("jean"),
+                name("ops"),
                 ChannelId::new("C0RESERVED01").expect("channel"),
             )]),
             admins: vec![UserId::new("U0ADMIN001").expect("admin")],
@@ -3548,16 +3592,16 @@ mod tests {
             memory
                 .resolve_identity("slack", "automonique-slack", "T0RESERVED", "U0ADMIN001")
                 .expect("binding"),
-            Some((String::from("inklura"), String::from(actor)))
+            Some((String::from("primary"), String::from(actor)))
         );
         assert_eq!(
-            memory.counts("inklura", actor).expect("counts").messages,
+            memory.counts("primary", actor).expect("counts").messages,
             1,
             "Slack event replay is one durable message"
         );
         let messages = memory
             .recent_messages(
-                "inklura",
+                "primary",
                 actor,
                 "slack:T0RESERVED:C0RESERVED01:1723542000.000100:U0ADMIN001",
                 crate::unix_millis().expect("clock"),
@@ -3603,8 +3647,10 @@ mod tests {
         let mut router = SlackTicketRouter {
             poster,
             manage: Box::new(manage),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
             channels: ChannelMap(vec![(
-                name("jean"),
+                name("ops"),
                 ChannelId::new("C0RESERVED01").expect("channel"),
             )]),
             admins: vec![UserId::new("U0ADMIN001").expect("admin")],
@@ -3706,7 +3752,7 @@ mod tests {
     #[test]
     fn github_slash_commands_are_typed_without_using_ticket_intake_grammar() {
         let channels = ChannelMap(vec![(
-            name("jean"),
+            name("ops"),
             ChannelId::new("C0RESERVED01").expect("channel"),
         )]);
         let admins = vec![UserId::new("U0ADMIN001").expect("admin")];
@@ -3734,7 +3780,7 @@ mod tests {
     #[test]
     fn unified_monique_command_is_channel_scoped_and_keeps_a_stable_source_key() {
         let channels = ChannelMap(vec![(
-            name("jean"),
+            name("ops"),
             ChannelId::new("C0RESERVED01").expect("channel"),
         )]);
         let frame = r#"{"accepts_response_payload":true,"envelope_id":"E4","payload":{"channel_id":"C0RESERVED01","command":"/monique","team_id":"T0RESERVED","text":"help","trigger_id":"13345224609.abc124","user_id":"U0MEMBER001"},"type":"slash_commands"}"#;
@@ -3762,8 +3808,10 @@ mod tests {
         let mut router = SlackTicketRouter {
             poster,
             manage: Box::new(manage),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
             channels: ChannelMap(vec![(
-                name("jean"),
+                name("ops"),
                 ChannelId::new("C0RESERVED01").expect("channel"),
             )]),
             admins: vec![UserId::new("U0ADMIN001").expect("admin")],

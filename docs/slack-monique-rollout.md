@@ -13,7 +13,7 @@ mode `0600`, inside a private state directory. Never commit it.
 schema=automonique.slack/v2
 token=xoxb-REDACTED
 app_token=xapp-REDACTED
-channel=jean:C0000000000
+channel=<channel-label>:C0000000000
 member=U0000000001
 admin=U0000000002
 feature=approvals
@@ -23,8 +23,10 @@ feature=app_home
 end=automonique.slack/v2
 ```
 
-- `channel=` is the exact intake/output allowlist. Any human in an allowlisted
-  intake channel may post one GitHub issue URL to create a pending gate.
+- `channel=` is the exact intake/output allowlist, written as
+  `<channel-label>:<channel-id>`. The label is the operator's own name for the
+  channel and is configuration, never code. Any human in an allowlisted intake
+  channel may post one GitHub issue URL to create a pending gate.
 - `member=` enables read-only conversation, `/monique help`, and App Home.
 - `admin=` enables mutation. Every admin is implicitly a member.
 - `feature=` is repeatable and closed to `approvals`, `conversation`,
@@ -36,6 +38,30 @@ end=automonique.slack/v2
 artifact size, retention, access and deletion policy and the external-upload
 connector is activated. A Slack file is never treated as model-readable merely
 because Slack delivered its metadata.
+
+## Manage configuration
+
+The Manage console's address and its key-value app identity are properties of
+one deployment, so they live beside the credentials rather than in source. The
+file is `<state>/manage/manage.conf`, owned by the daemon user, mode `0600`.
+Never commit it.
+
+```text
+schema=automonique.manage/v1
+url=https://manage.example.test/
+profile_app=<manage-app-id>
+end=automonique.manage/v1
+```
+
+- `url=` must be an `https://` URL. It is the "Open Manage" button on the
+  interactive approval card. With no file, or no `url=`, the card is posted
+  without that button; both decisions remain on the card itself.
+- `profile_app=` is the app identity the site-profile read model addresses.
+  With no file, or no `profile_app=`, that source is never attached and
+  site-profile questions answer `source=not_attached`.
+- An absent file disables both. A present file that is world-readable, is
+  malformed, sets an unknown or duplicate key, carries an invalid value, or
+  sets neither key refuses daemon startup rather than being ignored.
 
 ## Slack app settings
 

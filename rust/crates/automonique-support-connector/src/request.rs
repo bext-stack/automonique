@@ -169,7 +169,7 @@ impl TicketDecisionRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TicketDispatchMode {
     /// Create or recover the pending confirmation request. This never releases
-    /// work to Jean.
+    /// work to the backend's job runner.
     RequestApproval,
     /// Release the exact request after an eligible administrator confirmed it.
     Confirmed,
@@ -781,12 +781,12 @@ mod tests {
         );
 
         let reply = FleetRequest::SupportThreadReply(
-            SupportReplyRequest::new("jean-email:abc", THREAD_ID, "bonjour").expect("reply"),
+            SupportReplyRequest::new("legacy-email:abc", THREAD_ID, "bonjour").expect("reply"),
         );
         assert_eq!(
             reply.canonical_body(&instance),
             format!(
-                r#"{{"action":"support-thread-reply","id":"sd-instance-01","action_id":"jean-email:abc","thread_id":"{THREAD_ID}","text":"bonjour"}}"#
+                r#"{{"action":"support-thread-reply","id":"sd-instance-01","action_id":"legacy-email:abc","thread_id":"{THREAD_ID}","text":"bonjour"}}"#
             )
         );
 
@@ -808,7 +808,7 @@ mod tests {
 
         let ticket = FleetRequest::TicketDispatch(
             TicketDispatchRequest::new(
-                "https://github.com/webdesign29/activ/issues/1007",
+                "https://github.com/example/repo/issues/1007",
                 "telegram:8784297904:update:123",
             )
             .expect("ticket"),
@@ -816,12 +816,12 @@ mod tests {
         assert_eq!(
             ticket.canonical_body(&instance),
             "{\"action\":\"automonique-ticket-dispatch\",\"id\":\"sd-instance-01\",\
-             \"issue_url\":\"https://github.com/webdesign29/activ/issues/1007\",\
+             \"issue_url\":\"https://github.com/example/repo/issues/1007\",\
              \"source_key\":\"telegram:8784297904:update:123\",\"confirmed\":false}"
         );
         let confirmed = FleetRequest::TicketDispatch(
             TicketDispatchRequest::confirmed(
-                "https://github.com/webdesign29/activ/issues/1007",
+                "https://github.com/example/repo/issues/1007",
                 "telegram:8784297904:update:123",
             )
             .expect("confirmed ticket"),
@@ -829,7 +829,7 @@ mod tests {
         assert_eq!(
             confirmed.canonical_body(&instance),
             "{\"action\":\"automonique-ticket-dispatch\",\"id\":\"sd-instance-01\",\
-             \"issue_url\":\"https://github.com/webdesign29/activ/issues/1007\",\
+             \"issue_url\":\"https://github.com/example/repo/issues/1007\",\
              \"source_key\":\"telegram:8784297904:update:123\",\"confirmed\":true}"
         );
         let rejected = FleetRequest::TicketDecision(
@@ -888,7 +888,7 @@ mod tests {
         );
         let ticket = FleetRequest::TicketDispatch(
             TicketDispatchRequest::new(
-                "https://github.com/webdesign29/activ/issues/1007",
+                "https://github.com/example/repo/issues/1007",
                 "telegram:bot:update:1",
             )
             .expect("ticket"),
@@ -905,7 +905,7 @@ mod tests {
 
     #[test]
     fn ticket_dispatch_accepts_only_canonical_urls_and_stable_keys() {
-        let url = "https://github.com/webdesign29/activ/issues/1007";
+        let url = "https://github.com/example/repo/issues/1007";
         let request = TicketDispatchRequest::new(url, "telegram:bot:update:1").expect("request");
         assert_eq!(request.issue_url(), url);
         assert_eq!(request.source_key(), "telegram:bot:update:1");
@@ -917,11 +917,11 @@ mod tests {
             TicketDispatchMode::Confirmed
         );
         for refused in [
-            "http://github.com/webdesign29/activ/issues/1007",
-            "https://github.com/webdesign29/activ/pull/1007",
-            "https://github.com/webdesign29/activ/issues/0",
-            "https://example.test/webdesign29/activ/issues/1007",
-            "https://github.com/webdesign29/activ/issues/1007?x=1",
+            "http://github.com/example/repo/issues/1007",
+            "https://github.com/example/repo/pull/1007",
+            "https://github.com/example/repo/issues/0",
+            "https://example.test/example/repo/issues/1007",
+            "https://github.com/example/repo/issues/1007?x=1",
         ] {
             assert_eq!(
                 TicketDispatchRequest::new(refused, "telegram:bot:update:1").err(),

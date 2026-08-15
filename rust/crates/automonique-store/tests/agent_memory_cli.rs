@@ -19,7 +19,7 @@ fn obsidian_export_excludes_raw_history_and_edits_return_as_proposals() {
     let mut store = AgentMemoryStore::open(&database).expect("memory store");
     let memory = store
         .record_memory(&MemoryInput {
-            tenant: "inklura",
+            tenant: "primary",
             actor: "telegram:42",
             scope: "user:telegram:42",
             kind: MemoryKind::UserProfile,
@@ -43,7 +43,7 @@ fn obsidian_export_excludes_raw_history_and_edits_return_as_proposals() {
         .args([
             "export-obsidian",
             database.to_str().expect("database path"),
-            "inklura",
+            "primary",
             "telegram:42",
             vault.to_str().expect("vault path"),
         ])
@@ -67,7 +67,7 @@ fn obsidian_export_excludes_raw_history_and_edits_return_as_proposals() {
         .args([
             "propose-obsidian",
             database.to_str().expect("database path"),
-            "inklura",
+            "primary",
             "telegram:42",
             note.to_str().expect("note path"),
         ])
@@ -77,7 +77,7 @@ fn obsidian_export_excludes_raw_history_and_edits_return_as_proposals() {
 
     let store = AgentMemoryStore::open(&database).expect("memory reopens");
     let proposals = store
-        .proposals("inklura", "telegram:42", 5)
+        .proposals("primary", "telegram:42", 5)
         .expect("proposals");
     assert_eq!(proposals.len(), 1);
     assert_eq!(proposals[0].source_transport, "obsidian");
@@ -87,7 +87,7 @@ fn obsidian_export_excludes_raw_history_and_edits_return_as_proposals() {
     );
     assert_eq!(
         store
-            .item("inklura", "telegram:42", memory.id)
+            .item("primary", "telegram:42", memory.id)
             .expect("source read")
             .expect("source exists")
             .status,
@@ -145,7 +145,7 @@ fn telegram_backfill_is_ninety_day_bounded_replayable_and_redacted() {
             .args([
                 "backfill-telegram",
                 database.to_str().expect("database path"),
-                "inklura",
+                "primary",
                 "telegram:42",
                 source.to_str().expect("source path"),
                 "123",
@@ -160,7 +160,7 @@ fn telegram_backfill_is_ninety_day_bounded_replayable_and_redacted() {
     }
     let store = AgentMemoryStore::open(&database).expect("memory store");
     let messages = store
-        .recent_messages("inklura", "telegram:42", "telegram:42:backfill", now, 5)
+        .recent_messages("primary", "telegram:42", "telegram:42:backfill", now, 5)
         .expect("history");
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].content, "my token [REDACTED]");

@@ -1427,7 +1427,7 @@ mod tests {
 
     fn memory<'a>(source_key: &'a str, content: &'a str, status: MemoryStatus) -> MemoryInput<'a> {
         MemoryInput {
-            tenant: "inklura",
+            tenant: "primary",
             actor: "ben",
             scope: "user:ben",
             kind: MemoryKind::UserProfile,
@@ -1457,7 +1457,7 @@ mod tests {
         let replay = store.record_memory(&input).expect("replayed");
         assert_eq!(first, replay);
         let found = store
-            .search("inklura", "ben", "réponses concises", 1_500, 5)
+            .search("primary", "ben", "réponses concises", 1_500, 5)
             .expect("search");
         assert_eq!(found, vec![first]);
         assert!(
@@ -1472,7 +1472,7 @@ mod tests {
     fn messages_are_deduplicated_and_pruned_after_ninety_days() {
         let (_root, mut store) = store();
         let message = MessageInput {
-            tenant: "inklura",
+            tenant: "primary",
             actor: "ben",
             conversation_id: "telegram:chat:7",
             transport: "telegram",
@@ -1490,7 +1490,7 @@ mod tests {
             store.record_message(&message).expect("replay"),
             WriteDisposition::Duplicate
         );
-        assert_eq!(store.counts("inklura", "ben").expect("counts").messages, 1);
+        assert_eq!(store.counts("primary", "ben").expect("counts").messages, 1);
         assert_eq!(
             store
                 .prune_messages(10 + DEFAULT_RAW_RETENTION_MS)
@@ -1508,7 +1508,7 @@ mod tests {
         ] {
             store
                 .record_message(&MessageInput {
-                    tenant: "inklura",
+                    tenant: "primary",
                     actor: "ben",
                     conversation_id: "telegram:chat:7",
                     transport: "telegram",
@@ -1522,11 +1522,11 @@ mod tests {
         }
         assert_eq!(
             store
-                .prune_control_messages("inklura", "ben")
+                .prune_control_messages("primary", "ben")
                 .expect("prune commands"),
             1
         );
-        assert_eq!(store.counts("inklura", "ben").expect("counts").messages, 1);
+        assert_eq!(store.counts("primary", "ben").expect("counts").messages, 1);
     }
 
     #[test]
@@ -1534,7 +1534,7 @@ mod tests {
         let (_root, mut store) = store();
         store
             .record_message(&MessageInput {
-                tenant: "inklura",
+                tenant: "primary",
                 actor: "telegram:42",
                 conversation_id: "telegram:chat:7",
                 transport: "telegram",
@@ -1547,7 +1547,7 @@ mod tests {
             .expect("message");
         let exact = store
             .message_by_transport_key(
-                "inklura",
+                "primary",
                 "telegram:42",
                 "telegram",
                 "telegram:9:message:7:55",
@@ -1559,7 +1559,7 @@ mod tests {
         assert!(
             store
                 .message_by_transport_key(
-                    "inklura",
+                    "primary",
                     "telegram:99",
                     "telegram",
                     "telegram:9:message:7:55",
@@ -1571,7 +1571,7 @@ mod tests {
         assert!(
             store
                 .message_by_transport_key(
-                    "inklura",
+                    "primary",
                     "telegram:42",
                     "telegram",
                     "telegram:9:message:7:55",
@@ -1586,11 +1586,11 @@ mod tests {
     fn a_new_conversation_moves_only_the_head_and_keeps_prior_history() {
         let (_root, mut store) = store();
         store
-            .start_conversation("inklura", "ben", "telegram", "chat:7", "first", 10)
+            .start_conversation("primary", "ben", "telegram", "chat:7", "first", 10)
             .expect("first conversation");
         store
             .record_message(&MessageInput {
-                tenant: "inklura",
+                tenant: "primary",
                 actor: "ben",
                 conversation_id: "first",
                 transport: "telegram",
@@ -1603,26 +1603,26 @@ mod tests {
             .expect("first message");
         assert_eq!(
             store
-                .start_conversation("inklura", "ben", "telegram", "chat:7", "second", 20)
+                .start_conversation("primary", "ben", "telegram", "chat:7", "second", 20)
                 .expect("second conversation"),
             2
         );
         assert_eq!(
             store
-                .current_conversation("inklura", "ben", "telegram", "chat:7")
+                .current_conversation("primary", "ben", "telegram", "chat:7")
                 .expect("head"),
             Some(String::from("second"))
         );
         assert_eq!(
             store
-                .recent_messages("inklura", "ben", "first", 21, 10)
+                .recent_messages("primary", "ben", "first", 21, 10)
                 .expect("prior history")
                 .len(),
             1
         );
         assert!(
             store
-                .recent_messages("inklura", "ben", "second", 21, 10)
+                .recent_messages("primary", "ben", "second", 21, 10)
                 .expect("new history")
                 .is_empty()
         );
@@ -1640,12 +1640,12 @@ mod tests {
             .expect("candidate");
         assert_eq!(candidate.revision, 1);
         let active = store
-            .activate("inklura", "ben", candidate.id, 1, "owner approval", 2_100)
+            .activate("primary", "ben", candidate.id, 1, "owner approval", 2_100)
             .expect("active");
         assert_eq!(active.status, MemoryStatus::Active);
         assert_eq!(active.revision, 2);
         assert!(matches!(
-            store.activate("inklura", "ben", candidate.id, 1, "stale", 2_200),
+            store.activate("primary", "ben", candidate.id, 1, "stale", 2_200),
             Err(AgentMemoryError::StaleRevision)
         ));
     }
@@ -1656,7 +1656,7 @@ mod tests {
         assert_eq!(
             store
                 .bind_identity(
-                    "inklura",
+                    "primary",
                     "ben",
                     ExternalIdentity {
                         platform: "telegram",
@@ -1673,11 +1673,11 @@ mod tests {
             store
                 .resolve_identity("telegram", "monique", "telegram", "765")
                 .expect("resolve"),
-            Some((String::from("inklura"), String::from("ben")))
+            Some((String::from("primary"), String::from("ben")))
         );
         assert!(matches!(
             store.bind_identity(
-                "inklura",
+                "primary",
                 "someone-else",
                 ExternalIdentity {
                     platform: "telegram",

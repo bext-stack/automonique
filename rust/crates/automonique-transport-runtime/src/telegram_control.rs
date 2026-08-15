@@ -1445,7 +1445,7 @@ pub fn command_refusal_text(text: &str, refusal: CommandRefusal) -> String {
     match refusal {
         CommandRefusal::MissingArgument => match kind {
             CommandKind::Say => String::from(
-                "Missing the message to post. Usage: /say <channel> <message>. Example: /say jean yo",
+                "Missing the message to post. Usage: /say <channel> <message>. Example: /say ops yo",
             ),
             CommandKind::Slack => {
                 String::from("Missing the channel label. Usage: /slack <channel|list>.")
@@ -2608,11 +2608,11 @@ mod tests {
     #[test]
     fn refusal_text_explains_the_specific_command_shape() {
         assert_eq!(
-            command_refusal_text("/say jean", CommandRefusal::MissingArgument),
-            "Missing the message to post. Usage: /say <channel> <message>. Example: /say jean yo"
+            command_refusal_text("/say ops", CommandRefusal::MissingArgument),
+            "Missing the message to post. Usage: /say <channel> <message>. Example: /say ops yo"
         );
         assert_eq!(
-            command_refusal_text("/slack <jean> \"yo\"", CommandRefusal::UnexpectedArgument),
+            command_refusal_text("/slack <ops> \"yo\"", CommandRefusal::UnexpectedArgument),
             "/slack reads one channel and accepts only its label (or list). Read: /slack <channel>. Post: /say <channel> <message>. Do not type the < > placeholders."
         );
         assert_eq!(
@@ -2620,10 +2620,7 @@ mod tests {
             "/status takes no arguments. Usage: /status."
         );
         assert_eq!(
-            command_refusal_text(
-                "/say jean secret-looking text",
-                CommandRefusal::NotPermitted
-            ),
+            command_refusal_text("/say ops secret-looking text", CommandRefusal::NotPermitted),
             CommandRefusal::NotPermitted.operator_reply(),
             "authorization refusals remain independent of command contents"
         );

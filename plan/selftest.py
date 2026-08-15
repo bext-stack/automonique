@@ -35,6 +35,15 @@ def scratch(tmp: pathlib.Path) -> pathlib.Path:
     (work / "docs/product-plan/reference").mkdir(parents=True)
     shutil.copy(ROOT / "docs/product-plan/reference/work-breakdown.md",
                 work / "docs/product-plan/reference/work-breakdown.md")
+    # The two anti-vacuity controls in `check_legacy_identifier_location` need
+    # the files they are about. Without them the *baseline* fails, and a
+    # baseline that already fails makes every mutation below pass without
+    # proving anything — including the mutations guarding that very rule.
+    shutil.copy(ROOT / "docs/product-plan/reference/legacy-inventory.md",
+                work / "docs/product-plan/reference/legacy-inventory.md")
+    (work / "rust/crates/automonique-protocol/src/compat").mkdir(parents=True)
+    shutil.copy(ROOT / "rust/crates/automonique-protocol/src/compat/generated.rs",
+                work / "rust/crates/automonique-protocol/src/compat/generated.rs")
     return work
 
 
