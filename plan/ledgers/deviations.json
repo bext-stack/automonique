@@ -1,0 +1,60 @@
+{
+ "action_kinds": [
+  "slack-thread-reply",
+  "slack-channel-post",
+  "slack-approval-card",
+  "slack-decision-update",
+  "ticket-dispatch",
+  "ticket-confirm",
+  "ticket-decision",
+  "telegram-send",
+  "github-issue-action",
+  "support-email-send",
+  "no-action"
+ ],
+ "counts": {
+  "by_reason": {
+   "bug-fix": 0,
+   "deliberate-improvement": 0
+  },
+  "by_scope": {},
+  "entries": 0,
+  "findings": 0
+ },
+ "entries": [],
+ "fields": [
+  "state_transition",
+  "action_effect",
+  "receipt",
+  "receipt_timestamp",
+  "rendered_message",
+  "provider_event",
+  "provider_event_id",
+  "resource_class"
+ ],
+ "finding_kinds": [
+  "masked-field-registered",
+  "deviation-without-rationale"
+ ],
+ "findings": [],
+ "generated_by": "tools/parity/deviations.py",
+ "licence": "Elastic-2.0",
+ "masked_fields": [
+  "receipt_timestamp",
+  "provider_event_id"
+ ],
+ "reasons": [
+  "bug-fix",
+  "deliberate-improvement"
+ ],
+ "relations": [
+  "value_differs",
+  "absent_in_candidate",
+  "absent_in_reference",
+  "type_differs",
+  "order_differs",
+  "masked_nondeterministic"
+ ],
+ "schema": "automonique.parity-deviations-ledger/v1",
+ "source": "docs/product-plan/reference/known-deviations.md"
+}
