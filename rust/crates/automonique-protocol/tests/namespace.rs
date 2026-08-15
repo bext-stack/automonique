@@ -1004,7 +1004,7 @@ mod surface_coverage {
         }
 
         // What scanning the class would produce, measured rather than asserted
-        // away: four shipped identities outside the namespace. Renaming a
+        // away: shipped identities outside the namespace. Renaming a
         // durable identifier needs a migration contract this item does not
         // have, and none of the four is inventoried, so the gate records the
         // class instead of scanning it — and this is the record. An
@@ -1040,11 +1040,23 @@ mod surface_coverage {
                 // file really is markdown and saying so in its extension is
                 // worth more than avoiding a shape.
                 "answer.md",
+                // Slack Web API method names are external, stable protocol
+                // coordinates. Their dotted spelling is owned by Slack, so
+                // this repository must inventory rather than rename them.
+                "auth.test",
                 "checkpoint.create",
                 "checkpoint.list",
                 "checkpoint.restore",
+                "conversations.history",
+                "conversations.info",
+                "conversations.list",
+                // Private state and release-manifest filenames are durable
+                // filesystem coordinates rather than protocol identities.
+                "improvements.sqlite3",
+                "manifest.json",
                 "sandbox.actor",
                 "supervisor.adapter",
+                "users.info",
                 "workspace.snapshot",
                 "workspace.source",
                 "workspace.tenant",

@@ -24,10 +24,10 @@ mod store_sink;
 mod telegram_control;
 
 pub use https_client::{
-    MAX_BOT_COMMAND_DESCRIPTION_CHARS, MAX_BOT_COMMAND_NAME_CHARS, MAX_BOT_COMMANDS,
-    MAX_SEND_MESSAGE_TEXT_UNITS, OutboundRefusal, SendMessageRequest, SetMyCommandsRequest,
-    TelegramBotCommand, TelegramHttpsClient, TelegramOutbound, TelegramOutboundClient,
-    TelegramOutboundPlan,
+    ApprovalKeyboard, MAX_BOT_COMMAND_DESCRIPTION_CHARS, MAX_BOT_COMMAND_NAME_CHARS,
+    MAX_BOT_COMMANDS, MAX_SEND_MESSAGE_TEXT_UNITS, OutboundRefusal, SendMessageRequest,
+    SetMyCommandsRequest, TelegramBotCommand, TelegramHttpsClient, TelegramOutbound,
+    TelegramOutboundClient, TelegramOutboundPlan,
 };
 pub use slack_sink::{
     SlackDurableReceipt, SlackSinkFailure, StoreSlackDurableSink, slack_content_digest,

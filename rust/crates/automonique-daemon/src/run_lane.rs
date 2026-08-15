@@ -361,8 +361,16 @@ impl RunLane for SocketRunLane {
             return Err(RunFailure::NotConfigured);
         };
         let run_id = self.next_run_id()?;
+        let task = match crate::skill_runtime::load_active(&self.state_dir) {
+            Ok(Some(skills)) => format!(
+                "[approved_skills manifest={}]{}\n[/approved_skills]\n\n[user_task]\n{}\n[/user_task]",
+                skills.manifest_digest, skills.instructions, task
+            ),
+            Ok(None) => task.to_owned(),
+            Err(_) => return Err(RunFailure::Unavailable),
+        };
         let composition = compose(
-            task,
+            &task,
             &CompositionInputs {
                 state_dir: &self.state_dir,
                 run_id: &run_id,

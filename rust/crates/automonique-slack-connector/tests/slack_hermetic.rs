@@ -505,8 +505,7 @@ fn paging_a_history_returns_slacks_own_cursor_verbatim_on_the_next_request() {
     assert_eq!(captured.len(), 2);
     assert_eq!(captured[0].body, "channel=C0RESERVED&limit=1");
     assert_eq!(
-        captured[1].body,
-        "channel=C0RESERVED&limit=1&cursor=bmV4dF90czoxNzIzNTQxMDAw",
+        captured[1].body, "channel=C0RESERVED&limit=1&cursor=bmV4dF90czoxNzIzNTQxMDAw",
         "the cursor must go back exactly as Slack issued it"
     );
 }
