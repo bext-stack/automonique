@@ -12,9 +12,10 @@ commercial terms. A DCO sign-off alone is not the planned relicensing basis.
 Commits use the truthful identity of their author and carry no assistant
 attribution or co-author trailer. Codex-authored commits use
 `Automonique Candidate <candidate@automonique.invalid>`; human-authored commits
-use the human's configured identity. The historical identity register and
-checker remain in the repository as an audit tool but no longer run in default
-CI.
+use the human's configured identity. The identity register and checker are an
+audit tool, and the `identity` workflow runs them on every push and pull
+request — it refuses a commit whose author or committer the register does not
+list, and a commit carrying an attribution trailer.
 Dedicated workload identities may still be configured for unattended release
 or deployment automation.
 
