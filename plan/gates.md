@@ -38,8 +38,10 @@ claimed and what is true stays visible:
 - `plan/work-graph.toml` is checked in and regenerable from
   `docs/product-plan/reference/work-breakdown.md`;
 - ~~`python3 plan/check.py --verify` exits zero in CI on every push~~ —
-  **amended.** No workflow runs `plan/check.py --verify`; `.github/workflows/plan.yml`
-  (workflow name `source-policy`) runs the licence checker and nothing else. It
+  **amended.** No workflow runs `plan/check.py --verify`. `.github/workflows/plan.yml`
+  (workflow name `source-policy`) runs the licence checker in its
+  `licence-boundary` job and, since 2026-08-15, the tools test suite and the six
+  derived-artifact checkers in its `derived-artifacts` job — but not this one. It
   exits zero when run on demand. What *is* wired into CI on every push is the
   one rule of that checker which is about the published tree rather than plan
   bookkeeping: `python3 plan/check.py --identifiers`, run by the
@@ -51,7 +53,12 @@ claimed and what is true stays visible:
   plan thirteen distinct ways and requires the checker to refuse each one — and
   which is itself guarded against passing vacuously by a baseline control it
   runs first. That is a stronger demonstration than one broken commit, and it
-  is also not a build gate: nothing runs it automatically either.
+  is also not a build gate: nothing runs it automatically either. Since
+  2026-08-15 drift *is* a build failure for the derived artifacts generated from
+  the product corpus — the parity ledger, identifier inventory, contract and
+  surface inventories, capability ledger and oracle boundary, all verified by
+  the `derived-artifacts` job — but not for `plan/work-graph.toml`, which is
+  what this bullet claimed.
 
 Making the first amended bullet true again is a workflow change, not a plan
 change: add a job running `plan/check.py --verify`. It is deliberately not done

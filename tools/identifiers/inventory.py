@@ -173,6 +173,21 @@ def read(root: pathlib.Path, relative: str) -> str:
         raise InventoryError(f"cannot read permitted source {relative}: {exc}") from exc
 
 
+def require_corpus_file(name: str, relative: str) -> None:
+    """Refuse a citation of a file outside the permitted corpus.
+
+    The boundary is a property of the path alone, so every caller checks it
+    before reading the file. A source outside the corpus is not evidence of
+    anything, so a content check applied first could only mask this refusal
+    with an unrelated message.
+    """
+    if not relative.startswith(f"{CORPUS}/"):
+        raise InventoryError(
+            f"entry {name!r} cites {relative}, which is outside the permitted "
+            f"corpus {CORPUS}/"
+        )
+
+
 def corpus_files(root: pathlib.Path) -> list[str]:
     base = root / CORPUS
     if not base.is_dir():
@@ -1137,11 +1152,7 @@ def record(
 ) -> None:
     declaration.validate(name)
     for relative in files:
-        if not relative.startswith(f"{CORPUS}/"):
-            raise InventoryError(
-                f"entry {name!r} cites {relative}, which is outside the permitted "
-                f"corpus {CORPUS}/"
-            )
+        require_corpus_file(name, relative)
     source = {"region": region_id, "files": list(files), "evidence": evidence}
     if declaration.disposition in CLASSIFIED:
         entry = {
@@ -1194,6 +1205,7 @@ def build(root: pathlib.Path) -> dict:
         )
 
     for cited in CITED:
+        require_corpus_file(cited.name, cited.file)
         text = read(root, cited.file)
         if cited.name not in text:
             raise InventoryError(

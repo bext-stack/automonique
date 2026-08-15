@@ -26,3 +26,67 @@ jobs:
 
       - name: Licence checker negative controls
         run: python3 -m unittest -v tools.test_check_licenses
+
+  derived-artifacts:
+    # Every derived artifact in this repository is generated from a prose source
+    # by a checker that can also verify without writing. Until now none of them
+    # ran anywhere: editing `feature-parity.md` without regenerating
+    # `plan/ledgers/parity.json` was invisible, and 13 of the 14 top-level
+    # `tools/test_*.py` files plus all of `tools/parity`, `tools/identifiers`,
+    # `tools/oracle`, `tools/contract_inventory` and `tools/surface_inventory`
+    # ran nowhere. This job is what makes doc-to-derived drift a red build.
+    #
+    # Deliberately NOT here: `plan/check.py --verify` and `plan/selftest.py`.
+    # They are the plan-bookkeeping checkers rather than derived-artifact ones,
+    # and wiring them is tracked separately; the one rule of `plan/check.py`
+    # that is about the published tree, `--identifiers`, already runs in
+    # `.github/workflows/scrub.yml`.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The whole suite, not a list of modules: a new `tools/**/test_*.py` file
+      # is picked up by being written, so nobody has to remember this file.
+      # `-t tools` makes `tools/` the import root, which is how the packages
+      # under it (`parity`, `identifiers`, `oracle`, ...) address each other.
+      - name: Tools test suite
+        run: python3 -m unittest discover -s tools -t tools -p 'test_*.py'
+
+      # Each of these re-derives its artifact in memory and compares. None of
+      # them writes without an explicit flag (`--write`, `--check`, `verify`
+      # subcommand), which the "wrote nothing" step below re-proves rather than
+      # trusting: a checker that quietly regenerated its own input would report
+      # agreement with itself forever.
+      - name: Parity ledger matches feature-parity.md
+        run: python3 tools/parity/ledger.py
+
+      - name: Identifier inventory matches the permitted corpus
+        run: python3 tools/identifiers/inventory.py verify
+
+      - name: Contract inventory matches its permitted sources
+        run: python3 tools/contract_inventory/check.py
+
+      - name: Surface inventory derived views current
+        run: python3 tools/surface_inventory/verify.py
+
+      - name: Capability ledger keyed and scheduled
+        run: python3 tools/capability_ledger.py
+
+      - name: Oracle boundary document matches its vocabulary
+        run: python3 tools/oracle/check_boundary.py
+
+      # The verify modes above are only worth running if they are read-only.
+      # If any step regenerated an artifact instead of comparing against it,
+      # the diff appears here and this job fails rather than passing on a
+      # freshly written copy of whatever it was supposed to be checking.
+      - name: Prove the checkers wrote nothing
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code; then
+            echo "::error::A verify-mode checker modified the working tree. Verify mode must compare, never regenerate."
+            exit 1
+          fi
