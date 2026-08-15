@@ -31,6 +31,13 @@ SKIP_PARTS = {
 }
 SPDX = re.compile(r"SPDX-License-Identifier:\s*([^\s*<>]+)")
 APACHE_ROOTS = {"sdk", "integrations", "connectors"}
+# Declared roots the owner has not yet decided the fate of. A root here is
+# reported on every run and does not fail the check; a declared root that is
+# *not* here and does not exist on disk does fail. Removing a name from this
+# set is the one-line act that converts its notice into a failure, and is the
+# last step of whichever option the memo below records.
+PENDING_ROOT_DECISION = {"integrations", "connectors"}
+PENDING_DECISION_MEMO = "plan/owner-decisions/2026-08-15-connector-licence-boundary.md"
 
 
 def repository_paths(root: pathlib.Path = ROOT) -> list[pathlib.Path]:
@@ -63,6 +70,41 @@ def expected_identifier(relative: pathlib.Path) -> str:
     return "Apache-2.0" if relative.parts[0] in APACHE_ROOTS else "Elastic-2.0"
 
 
+def check_declared_roots(root: pathlib.Path) -> tuple[list[str], list[str]]:
+    """Every declared Apache root must be a directory that exists.
+
+    A root that does not exist gates nothing, and a checker that silently gates
+    nothing is worse than no checker: it reads as a green boundary while the
+    boundary is a sentence in a document. The failure has to be about the
+    declaration, because there is no file to hang it on — the whole defect is
+    the absence of files.
+
+    Returns `(problems, notices)`. A root the owner has not yet ruled on is a
+    notice: it is printed on every run so it cannot be forgotten, and it does
+    not fail a check nobody without owner authority can fix. Any other phantom
+    root is a problem.
+    """
+    problems: list[str] = []
+    notices: list[str] = []
+    for name in sorted(APACHE_ROOTS):
+        if (root / name).is_dir():
+            continue
+        if name in PENDING_ROOT_DECISION:
+            notices.append(
+                f"{name}/: declared an Apache-2.0 root but absent from the tree, so "
+                f"it gates nothing. Pending an owner decision — see "
+                f"{PENDING_DECISION_MEMO}"
+            )
+            continue
+        problems.append(
+            f"{name}/: declared an Apache-2.0 root but is not a directory in this "
+            f"tree, so the declaration gates nothing. Create it, remove it from "
+            f"APACHE_ROOTS and from the documents that quote the boundary, or "
+            f"record it in PENDING_ROOT_DECISION with a decision memo."
+        )
+    return problems, notices
+
+
 def check_paths(root: pathlib.Path, paths: Iterable[pathlib.Path]) -> list[str]:
     problems: list[str] = []
     for path in paths:
@@ -89,12 +131,18 @@ def check_paths(root: pathlib.Path, paths: Iterable[pathlib.Path]) -> list[str]:
 
 
 def main() -> int:
-    problems = check_paths(ROOT, repository_paths(ROOT))
+    root_problems, notices = check_declared_roots(ROOT)
+    problems = root_problems + check_paths(ROOT, repository_paths(ROOT))
+    for notice in notices:
+        print(f"pending: {notice}", file=sys.stderr)
     if problems:
         for problem in problems:
             print(f"error: {problem}", file=sys.stderr)
         return 1
-    print("ok — repository source licence boundary")
+    print(
+        "ok — repository source licence boundary"
+        + (f" ({len(notices)} declared root(s) pending a decision)" if notices else "")
+    )
     return 0
 
 
