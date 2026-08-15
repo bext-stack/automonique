@@ -641,23 +641,26 @@ by, M8 item 45; independent of M2.
 
 ### Approach
 
-**Auto-deny writes a real decision.** On expiry, the sweeper transitions the
-request row to `expired` *and* records
-`ApprovalDecisionRecord { decision: Denied, decider: "system:ttl", … }` in the
-ledger. This follows the ledger's own argument
-(`approval_ledger.rs:174-186`): "A denial that expires by garbage collection is
-not a denial." An expired approval that leaves no denial row would be exactly
-that.
+**Auto-deny records a timeout, not a forged decision** *(amended 2026-08-15 to
+match the shipped implementation, `c36fbf5`)*. On expiry the sweeper transitions
+the request row to `expired` and appends a **#23 audit record with outcome
+`timeout`** — it deliberately writes **no** ledger decision. The write-once
+`ApprovalLedger` records decisions people made; putting a `decider: "system:ttl"`
+denial there would stamp a decider's name on a silence, and the
+`approval_requests` schema `CHECK ((state IN ('granted','denied')) = (approval_key
+IS NOT NULL))` makes an `expired` row structurally incapable of carrying a ledger
+key. The earlier draft of this section (which asked for a real `Denied` ledger
+row) was superseded on that reasoning; the audit chain, not the ledger, is where
+the timeout is durably and tamper-evidently recorded.
 
-**Capacity consequence — flag for the owner.** `MAX_APPROVAL_DECISIONS = 65_536`
-(`approval_ledger.rs:217`) is a **hard lifetime ceiling with no prune at all**
-(`:174-186`). Auto-deny makes every expired proposal consume one permanent slot.
-At even ten expiring proposals a day that is ~18 years, so the ceiling is not
-urgent — but it changes from "a bound on decisions humans made" to "a bound on
-proposals ever made", and it should be (a) documented in the module header, and
-(b) surfaced as an operational metric beside the existing
-`decision_count()` status counter (`lib.rs:1373`), so a full ledger is seen
-approaching rather than discovered as a `LedgerFull` refusal.
+**Capacity consequence — no longer a concern.** Because expiry writes an audit
+record rather than a ledger decision, expired proposals do **not** consume
+permanent `ApprovalLedger` slots. `MAX_APPROVAL_DECISIONS = 65_536`
+(`approval_ledger.rs:217`) is a hard lifetime ceiling with no prune, but only
+real human decisions count against it, so an expiring-proposal storm cannot
+exhaust it. It remains a hard ceiling worth surfacing as an operational metric
+beside the existing `decision_count()` status counter (`lib.rs:1373`), so a full
+ledger is seen approaching rather than discovered as a `LedgerFull` refusal.
 
 **Sweeper placement.** A `Daemon`-owned periodic sweep, fenced on the
 generation lease like every other write, calling
