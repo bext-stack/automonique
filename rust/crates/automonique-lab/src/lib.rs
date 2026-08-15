@@ -4,11 +4,13 @@
 
 pub mod build;
 pub mod canonical_json;
+pub mod codex_app_server;
 pub mod controller;
 pub mod framing;
 pub mod git;
 pub mod harness_claim;
 pub mod harness_status;
+pub mod improvement_executor;
 pub mod program;
 pub mod protocol;
 pub mod provider;

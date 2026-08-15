@@ -12,6 +12,8 @@ automonique-core = { path = "../automonique-core" }
 # The execution lane starts one loopback CONNECT broker per run that needs
 # egress, so the daemon composes the broker rather than merely describing one.
 automonique-egress-broker = { path = "../automonique-egress-broker" }
+automonique-github-connector = { path = "../automonique-github-connector" }
+automonique-lab = { path = "../automonique-lab" }
 automonique-observability = { path = "../automonique-observability" }
 automonique-protocol = { path = "../automonique-protocol" }
 automonique-runner = { path = "../automonique-runner" }
@@ -32,6 +34,9 @@ automonique-transport-runtime = { path = "../automonique-transport-runtime" }
 automonique-transports = { path = "../automonique-transports" }
 nix.workspace = true
 rusqlite.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

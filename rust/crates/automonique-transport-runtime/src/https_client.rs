@@ -308,6 +308,9 @@ pub enum OutboundRefusal {
     CommandDescription,
     /// The command list is empty or over Telegram's ceiling.
     CommandCount,
+    /// An inline approval callback is empty, over Telegram's 64-byte limit, or
+    /// control-bearing.
+    CallbackData,
 }
 
 impl OutboundRefusal {
@@ -322,6 +325,7 @@ impl OutboundRefusal {
             Self::CommandName => "command_name",
             Self::CommandDescription => "command_description",
             Self::CommandCount => "command_count",
+            Self::CallbackData => "callback_data",
         }
     }
 }
@@ -343,6 +347,47 @@ pub struct SendMessageRequest {
     chat_id: i64,
     text: String,
     reply_to_message_id: Option<i64>,
+    approval_keyboard: Option<ApprovalKeyboard>,
+}
+
+/// A fixed two-choice inline keyboard for an exact durable approval challenge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalKeyboard {
+    approve_callback: String,
+    revise_callback: String,
+}
+
+impl ApprovalKeyboard {
+    pub fn new(
+        approve_callback: impl Into<String>,
+        revise_callback: impl Into<String>,
+    ) -> Result<Self, OutboundRefusal> {
+        let approve_callback = approve_callback.into();
+        let revise_callback = revise_callback.into();
+        for callback in [&approve_callback, &revise_callback] {
+            if callback.is_empty() || callback.len() > 64 || callback.chars().any(char::is_control)
+            {
+                return Err(OutboundRefusal::CallbackData);
+            }
+        }
+        if approve_callback == revise_callback {
+            return Err(OutboundRefusal::CallbackData);
+        }
+        Ok(Self {
+            approve_callback,
+            revise_callback,
+        })
+    }
+
+    #[must_use]
+    pub fn approve_callback(&self) -> &str {
+        &self.approve_callback
+    }
+
+    #[must_use]
+    pub fn revise_callback(&self) -> &str {
+        &self.revise_callback
+    }
 }
 
 impl SendMessageRequest {
@@ -375,7 +420,19 @@ impl SendMessageRequest {
             chat_id,
             text,
             reply_to_message_id,
+            approval_keyboard: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_approval_keyboard(mut self, keyboard: ApprovalKeyboard) -> Self {
+        self.approval_keyboard = Some(keyboard);
+        self
+    }
+
+    #[must_use]
+    pub const fn approval_keyboard(&self) -> Option<&ApprovalKeyboard> {
+        self.approval_keyboard.as_ref()
     }
 
     /// Chat this message is addressed to.
@@ -410,6 +467,7 @@ impl fmt::Debug for SendMessageRequest {
                 "text",
                 &format_args!("<redacted:{} bytes>", self.text.len()),
             )
+            .field("approval_keyboard", &self.approval_keyboard.is_some())
             .finish()
     }
 }
@@ -554,6 +612,13 @@ impl TelegramOutbound {
                 if let Some(reply_to) = request.reply_to_message_id {
                     body.push_str(",\"reply_to_message_id\":");
                     body.push_str(&reply_to.to_string());
+                }
+                if let Some(keyboard) = &request.approval_keyboard {
+                    body.push_str(",\"reply_markup\":{\"inline_keyboard\":[[{\"text\":\"Approve\",\"callback_data\":");
+                    push_json_string(&mut body, &keyboard.approve_callback);
+                    body.push_str("},{\"text\":\"Request changes\",\"callback_data\":");
+                    push_json_string(&mut body, &keyboard.revise_callback);
+                    body.push_str("}]]}");
                 }
                 body.push('}');
             }
@@ -930,6 +995,25 @@ mod tests {
         TelegramOutbound::SendMessage(
             SendMessageRequest::new(-1_001, text, None).expect("send message"),
         )
+    }
+
+    #[test]
+    fn approval_buttons_render_as_fixed_labels_and_opaque_callbacks() {
+        let keyboard = ApprovalKeyboard::new("imp:a:plan:opaque-nonce", "imp:r:plan:opaque-nonce")
+            .expect("keyboard");
+        let outbound = TelegramOutbound::SendMessage(
+            SendMessageRequest::new(7, "Plan ready", None)
+                .expect("message")
+                .with_approval_keyboard(keyboard),
+        );
+        assert_eq!(
+            outbound.canonical_body(),
+            r#"{"chat_id":7,"text":"Plan ready","reply_markup":{"inline_keyboard":[[{"text":"Approve","callback_data":"imp:a:plan:opaque-nonce"},{"text":"Request changes","callback_data":"imp:r:plan:opaque-nonce"}]]}}"#
+        );
+        assert_eq!(
+            ApprovalKeyboard::new("same", "same").err(),
+            Some(OutboundRefusal::CallbackData)
+        );
     }
 
     #[test]

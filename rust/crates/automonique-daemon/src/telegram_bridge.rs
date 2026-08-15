@@ -104,6 +104,7 @@ use std::time::Duration;
 
 use automonique_protocol::admin::ExecutionState;
 use automonique_store::Store;
+use automonique_store::improvements::{ApprovalKind, ImprovementState};
 use automonique_store::operator_members::{
     MemberDisposition, OperatorMemberError, OperatorMemberStore,
 };
@@ -122,6 +123,12 @@ use automonique_transport_runtime::{
 use automonique_transports::{
     TelegramAccessPolicy, TelegramBotId, TelegramDisposition, TelegramIngress, TelegramInputKind,
     TelegramPrincipal, parse_telegram_updates,
+};
+
+use crate::improvement_github::ImprovementGitHubBroker;
+use crate::improvement_worker::{ActivationDisposition, ImprovementWorker};
+use crate::improvements::{
+    GateDecision, ImprovementCoordinator, ImprovementIntent, ImprovementPlan, PreparedRenderedPlan,
 };
 
 /// How long the worker waits after a refused poll before trying again.
@@ -982,6 +989,9 @@ pub struct TelegramControlBridge<C, O, S, R, L> {
     surface: R,
     lane: L,
     slack: Option<Box<dyn SlackSurface + Send>>,
+    improvements: Option<ImprovementCoordinator>,
+    improvement_github: Option<ImprovementGitHubBroker>,
+    improvement_worker: Option<ImprovementWorker>,
     policy: TelegramAccessPolicy,
     roster: OperatorRoster,
     authority: OperatorAuthority,
@@ -1017,6 +1027,15 @@ where
     /// [`RuntimeError::InvalidConfiguration`] for a roster that cannot compose
     /// its own configuration.
     pub fn new(parts: BridgeParts<C, O, S, R, L>) -> Result<Self, RuntimeError> {
+        Self::new_with_improvements(parts, None, None, None)
+    }
+
+    pub fn new_with_improvements(
+        parts: BridgeParts<C, O, S, R, L>,
+        improvements: Option<ImprovementCoordinator>,
+        improvement_github: Option<ImprovementGitHubBroker>,
+        improvement_worker: Option<ImprovementWorker>,
+    ) -> Result<Self, RuntimeError> {
         let BridgeParts {
             client,
             outbound,
@@ -1048,6 +1067,9 @@ where
             surface,
             lane,
             slack,
+            improvements,
+            improvement_github,
+            improvement_worker,
             policy,
             roster,
             authority,
@@ -1285,12 +1307,6 @@ where
         let Some(principal) = update.principal() else {
             return Answer::Ignore;
         };
-        if update.kind() != TelegramInputKind::Message {
-            // A callback carries no operator command in this build, and
-            // acknowledging one needs `answerCallbackQuery`, which the outbound
-            // vocabulary deliberately cannot spell.
-            return Answer::Ignore;
-        }
         match update.disposition() {
             TelegramDisposition::Denied => Answer::DeniedSender {
                 chat_id: principal.chat_id(),
@@ -1300,6 +1316,35 @@ where
                 let Some(text) = update.content() else {
                     return Answer::Ignore;
                 };
+                if update.kind() == TelegramInputKind::Callback {
+                    if !self.authority.is_admin(principal.actor_id()) {
+                        return Answer::Refused {
+                            chat_id: principal.chat_id(),
+                            text: "Not authorized for that. Ask an administrator.".to_owned(),
+                        };
+                    }
+                    return self.improvement_callback_answer(
+                        principal.actor_id(),
+                        principal.chat_id(),
+                        text,
+                    );
+                }
+                if update.kind() != TelegramInputKind::Message {
+                    return Answer::Ignore;
+                }
+                if self.authority.is_admin(principal.actor_id())
+                    && (ImprovementIntent::revision(text).is_some()
+                        || ImprovementIntent::recognize(text).is_some())
+                {
+                    let now_ms = crate::unix_millis().unwrap_or_default();
+                    return self.improvement_plan_answer(
+                        principal.actor_id(),
+                        principal.chat_id(),
+                        update.source_key(),
+                        text,
+                        now_ms,
+                    );
+                }
                 // Bound as a statement so the gate's borrow of `self` ends
                 // before a rendered answer needs `self` mutably.
                 let parsed =
@@ -1379,6 +1424,467 @@ where
                 }
             }
         }
+    }
+
+    fn improvement_plan_answer(
+        &mut self,
+        actor_id: i64,
+        chat_id: i64,
+        source_key: &str,
+        question: &str,
+        now_ms: i64,
+    ) -> Answer {
+        let record = if let Some((improvement_id, guidance)) = ImprovementIntent::revision(question)
+        {
+            let current = self
+                .improvements
+                .as_ref()
+                .and_then(|coordinator| coordinator.store().get(improvement_id).ok().flatten());
+            if current.as_ref().is_some_and(|record| {
+                record.state == ImprovementState::PlanApproved
+                    && matches!(
+                        guidance.request.to_ascii_lowercase().as_str(),
+                        "continue" | "retry"
+                    )
+            }) {
+                return self.execute_approved_improvement(
+                    actor_id,
+                    chat_id,
+                    current.expect("checked above"),
+                    now_ms,
+                );
+            }
+            match self
+                .improvements
+                .as_mut()
+                .ok_or(())
+                .and_then(|coordinator| {
+                    coordinator
+                        .revise(improvement_id, &guidance, actor_id, now_ms)
+                        .map_err(|_| ())
+                }) {
+                Ok(record) => record,
+                Err(()) => return improvement_unavailable(chat_id),
+            }
+        } else {
+            let Some(intent) = ImprovementIntent::recognize(question) else {
+                return improvement_unavailable(chat_id);
+            };
+            match self
+                .improvements
+                .as_mut()
+                .ok_or(())
+                .and_then(|coordinator| {
+                    coordinator
+                        .capture(source_key, actor_id, chat_id, &intent, now_ms)
+                        .map_err(|_| ())
+                }) {
+                Ok(record) => record,
+                Err(()) => return improvement_unavailable(chat_id),
+            }
+        };
+
+        if record.state == ImprovementState::PlanReview {
+            return self.present_improvement_gate(actor_id, chat_id, &record, now_ms);
+        }
+        if record.state != ImprovementState::Draft {
+            return Answer::Answered {
+                chat_id,
+                text: format!(
+                    "{} is currently {} at revision {}.",
+                    record.public_id(),
+                    record.state,
+                    record.revision
+                ),
+            };
+        }
+        let prepared = match self
+            .improvements
+            .as_ref()
+            .and_then(|coordinator| {
+                coordinator
+                    .prepared_plan(record.entry_id, record.revision)
+                    .ok()
+            })
+            .flatten()
+        {
+            Some(prepared) => prepared,
+            None => {
+                let source_base_sha = match self
+                    .improvement_github
+                    .as_mut()
+                    .ok_or(())
+                    .and_then(|broker| broker.source_base_sha().map_err(|_| ()))
+                {
+                    Ok(sha) => sha,
+                    Err(()) => return improvement_unavailable(chat_id),
+                };
+                let request_json = serde_json::to_string(&record.summary).unwrap_or_default();
+                let prompt = format!(
+                    "Return only one JSON object with exactly these fields: title (string), intent (string), scope (non-empty string array), exclusions (non-empty string array), acceptance (non-empty string array), risks (non-empty string array), activation (non-empty string array). Draft the smallest safe implementation plan for this owner-requested Automonique self-improvement. Include tests, the two approval gates, rollback, skill hot reload versus supervised code/mixed restart, and no repository administration or production deployment. Source base is {source_base_sha}. Owner request JSON: {request_json}"
+                );
+                let response = match self.lane.run(&prompt) {
+                    Ok(response) => response,
+                    Err(_) => return improvement_unavailable(chat_id),
+                };
+                if !response.trim_start().starts_with('{') {
+                    return improvement_unavailable(chat_id);
+                }
+                let plan: ImprovementPlan = match serde_json::from_str(response.trim()) {
+                    Ok(plan) => plan,
+                    Err(_) => return improvement_unavailable(chat_id),
+                };
+                let rendered = match plan.render_with_source_base(&record, &source_base_sha) {
+                    Ok(rendered) => rendered,
+                    Err(_) => return improvement_unavailable(chat_id),
+                };
+                if self.improvements.as_mut().is_none_or(|coordinator| {
+                    coordinator
+                        .prepare_plan(
+                            record.entry_id,
+                            record.revision,
+                            &source_base_sha,
+                            &rendered,
+                            now_ms,
+                        )
+                        .is_err()
+                }) {
+                    return improvement_unavailable(chat_id);
+                }
+                PreparedRenderedPlan {
+                    source_base_sha,
+                    plan: rendered,
+                }
+            }
+        };
+        let title = format!("{}: Automonique improvement", record.public_id());
+        let publication = match self
+            .improvement_github
+            .as_mut()
+            .ok_or(())
+            .and_then(|broker| {
+                broker
+                    .publish_plan(&record.public_id(), record.revision, &title, &prepared.plan)
+                    .map_err(|_| ())
+            }) {
+            Ok(publication) => publication,
+            Err(()) => return improvement_unavailable(chat_id),
+        };
+        let reviewed = match self
+            .improvements
+            .as_mut()
+            .ok_or(())
+            .and_then(|coordinator| {
+                coordinator
+                    .record_plan_publication(
+                        record.entry_id,
+                        record.revision,
+                        &prepared.plan,
+                        &publication.plan_head_sha,
+                        &prepared.source_base_sha,
+                        publication.issue_number,
+                        &publication.issue_url,
+                        publication.plan_pr_number,
+                        &publication.plan_pr_url,
+                        now_ms,
+                    )
+                    .map_err(|_| ())
+            }) {
+            Ok(reviewed) => reviewed,
+            Err(()) => return improvement_unavailable(chat_id),
+        };
+        self.present_improvement_gate(actor_id, chat_id, &reviewed, now_ms)
+    }
+
+    fn present_improvement_gate(
+        &mut self,
+        actor_id: i64,
+        chat_id: i64,
+        record: &automonique_store::improvements::ImprovementRecord,
+        now_ms: i64,
+    ) -> Answer {
+        let (kind, text) = match record.state {
+            ImprovementState::PlanReview => (
+                ApprovalKind::Plan,
+                format!(
+                    "{} plan revision {} is ready.\n\nIssue: {}\nPlan PR: {}\nPlan digest: {}\nSource base: {}\n\nApprove authorizes implementation of this exact plan only. Release and activation still require a second approval.",
+                    record.public_id(),
+                    record.revision,
+                    record.issue_url.as_deref().unwrap_or("unavailable"),
+                    record.plan_pr_url.as_deref().unwrap_or("unavailable"),
+                    record.plan_digest.as_deref().unwrap_or("unavailable"),
+                    record.source_base_sha.as_deref().unwrap_or("unavailable"),
+                ),
+            ),
+            ImprovementState::ReleaseReview => (
+                ApprovalKind::Release,
+                format!(
+                    "{} release revision {} is tested and ready.\n\nImplementation PR: {}\nTested commit: {}\nRelease manifest: {}\n\nApprove merges this exact PR head and activates this exact manifest.",
+                    record.public_id(),
+                    record.revision,
+                    record
+                        .implementation_pr_url
+                        .as_deref()
+                        .unwrap_or("unavailable"),
+                    record
+                        .implementation_head_sha
+                        .as_deref()
+                        .unwrap_or("unavailable"),
+                    record
+                        .release_manifest_digest
+                        .as_deref()
+                        .unwrap_or("unavailable"),
+                ),
+            ),
+            _ => return improvement_unavailable(chat_id),
+        };
+        match self
+            .improvements
+            .as_mut()
+            .ok_or(())
+            .and_then(|coordinator| {
+                coordinator
+                    .present_gate(
+                        record.entry_id,
+                        record.revision,
+                        kind,
+                        actor_id,
+                        chat_id,
+                        now_ms,
+                        text,
+                    )
+                    .map_err(|_| ())
+            }) {
+            Ok(gate) => Answer::ImprovementGate {
+                message: gate.message,
+            },
+            Err(()) => improvement_unavailable(chat_id),
+        }
+    }
+
+    fn improvement_callback_answer(
+        &mut self,
+        actor_id: i64,
+        chat_id: i64,
+        callback: &str,
+    ) -> Answer {
+        let now_ms = crate::unix_millis().unwrap_or_default();
+        let outcome = match self
+            .improvements
+            .as_mut()
+            .ok_or(())
+            .and_then(|coordinator| {
+                coordinator
+                    .handle_callback(callback, actor_id, chat_id, now_ms)
+                    .map_err(|_| ())
+            }) {
+            Ok(outcome) => outcome,
+            Err(()) => return improvement_unavailable(chat_id),
+        };
+        if outcome.decision == GateDecision::RequestChanges {
+            return Answer::Answered {
+                chat_id,
+                text: format!(
+                    "Changes requested for {}. Send `{}: your revision guidance` to draft the next revision.",
+                    outcome.improvement.public_id(),
+                    outcome.improvement.public_id()
+                ),
+            };
+        }
+        match outcome.improvement.state {
+            ImprovementState::PlanApproved => {
+                self.execute_approved_improvement(actor_id, chat_id, outcome.improvement, now_ms)
+            }
+            ImprovementState::ReleaseApproved => {
+                let record = outcome.improvement;
+                let merge = self
+                    .improvement_github
+                    .as_mut()
+                    .ok_or(())
+                    .and_then(|broker| {
+                        broker
+                            .merge_implementation(
+                                record.implementation_pr_number.unwrap_or_default(),
+                                record
+                                    .implementation_head_sha
+                                    .as_deref()
+                                    .unwrap_or_default(),
+                            )
+                            .map_err(|_| ())
+                    });
+                let Ok(merge) = merge else {
+                    return improvement_unavailable(chat_id);
+                };
+                if record.implementation_tree_sha.as_deref() != Some(merge.merged_tree_sha.as_str())
+                {
+                    return improvement_unavailable(chat_id);
+                }
+                let activating =
+                    match self
+                        .improvements
+                        .as_mut()
+                        .ok_or(())
+                        .and_then(|coordinator| {
+                            coordinator
+                                .start_activation(record.entry_id, record.revision, now_ms)
+                                .map_err(|_| ())
+                        }) {
+                        Ok(record) => record,
+                        Err(()) => return improvement_unavailable(chat_id),
+                    };
+                let digest = activating
+                    .release_manifest_digest
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_owned();
+                let activation = self
+                    .improvement_worker
+                    .as_mut()
+                    .and_then(|worker| worker.activate(&activating, &digest).ok());
+                let Some(activation) = activation else {
+                    let _ = self.improvements.as_mut().and_then(|coordinator| {
+                        coordinator
+                            .fail(
+                                activating.entry_id,
+                                activating.revision,
+                                "activation_failed",
+                                now_ms,
+                            )
+                            .ok()
+                    });
+                    return improvement_unavailable(chat_id);
+                };
+                if activation == ActivationDisposition::Scheduled {
+                    return Answer::Answered {
+                        chat_id,
+                        text: format!(
+                            "{} code activation is scheduled for release {}. The supervised helper will record completion or rollback after restart readiness is known.",
+                            activating.public_id(),
+                            digest
+                        ),
+                    };
+                }
+                match self.improvements.as_mut().and_then(|coordinator| {
+                    coordinator
+                        .complete_activation(
+                            activating.entry_id,
+                            activating.revision,
+                            &digest,
+                            now_ms,
+                        )
+                        .ok()
+                }) {
+                    Some(completed) => Answer::Answered {
+                        chat_id,
+                        text: format!("{} is active at release {}.", completed.public_id(), digest),
+                    },
+                    None => improvement_unavailable(chat_id),
+                }
+            }
+            _ => improvement_unavailable(chat_id),
+        }
+    }
+
+    fn execute_approved_improvement(
+        &mut self,
+        _actor_id: i64,
+        chat_id: i64,
+        approved: automonique_store::improvements::ImprovementRecord,
+        now_ms: i64,
+    ) -> Answer {
+        let prepared = match self
+            .improvements
+            .as_ref()
+            .and_then(|coordinator| coordinator.approved_plan(&approved).ok())
+        {
+            Some(plan) => plan,
+            None => return improvement_unavailable(chat_id),
+        };
+        if self.improvement_worker.is_none() {
+            return Answer::Unavailable {
+                chat_id,
+                text: format!(
+                    "{} is approved, but the owner-provisioned improvement lab is not configured. Configure it, then send `{}: continue`.",
+                    approved.public_id(),
+                    approved.public_id()
+                ),
+            };
+        }
+        if self.improvement_github.as_mut().is_none_or(|broker| {
+            broker
+                .merge_plan(
+                    approved.plan_pr_number.unwrap_or_default(),
+                    approved.plan_head_sha.as_deref().unwrap_or_default(),
+                )
+                .is_err()
+        }) {
+            return improvement_unavailable(chat_id);
+        }
+        let implementing = match self.improvements.as_mut().and_then(|coordinator| {
+            coordinator
+                .start_implementation(approved.entry_id, approved.revision, now_ms)
+                .ok()
+        }) {
+            Some(record) => record,
+            None => return improvement_unavailable(chat_id),
+        };
+        let receipt = match self
+            .improvement_worker
+            .as_mut()
+            .and_then(|worker| worker.execute(&implementing, &prepared).ok())
+        {
+            Some(receipt) => receipt,
+            None => {
+                let _ = self.improvements.as_mut().and_then(|coordinator| {
+                    coordinator
+                        .fail(
+                            implementing.entry_id,
+                            implementing.revision,
+                            "implementation_failed",
+                            now_ms,
+                        )
+                        .ok()
+                });
+                return improvement_unavailable(chat_id);
+            }
+        };
+        let pr = match self.improvement_github.as_mut().and_then(|broker| {
+            broker
+                .publish_implementation_pr(
+                    &implementing.public_id(),
+                    &receipt.push.branch,
+                    &format!("{}: approved implementation", implementing.public_id()),
+                    &format!(
+                        "Approved plan: {}\n\nTested commit: `{}`\nTree: `{}`\nRelease manifest: `{}`",
+                        prepared.plan.sha256,
+                        receipt.execution.candidate_sha,
+                        receipt.execution.candidate_tree,
+                        receipt.release.manifest_digest,
+                    ),
+                )
+                .ok()
+        }) {
+            Some(pr) if pr.head_sha == receipt.execution.candidate_sha => pr,
+            _ => return improvement_unavailable(chat_id),
+        };
+        let release = match self.improvements.as_mut().and_then(|coordinator| {
+            coordinator
+                .record_release_candidate(
+                    implementing.entry_id,
+                    implementing.revision,
+                    &receipt.execution.candidate_sha,
+                    &receipt.execution.candidate_tree,
+                    &receipt.release.manifest_digest,
+                    pr.number,
+                    &pr.url,
+                    now_ms,
+                )
+                .ok()
+        }) {
+            Some(record) => record,
+            None => return improvement_unavailable(chat_id),
+        };
+        self.present_improvement_gate(_actor_id, chat_id, &release, now_ms)
     }
 
     /// Render the answer to a command this build performs.
@@ -1638,6 +2144,11 @@ where
                 }
                 (chat_id, text)
             }
+            Answer::ImprovementGate { message } => {
+                report.answered += 1;
+                self.send_outbound(TelegramOutbound::SendMessage(message), cancellation, report);
+                return;
+            }
         };
         let Ok(request) = SendMessageRequest::new(chat_id, text, None) else {
             report.send_refused += 1;
@@ -1712,11 +2223,21 @@ enum Answer {
         text: String,
         mutated: bool,
     },
+    /// A two-gate self-improvement decision with fixed inline controls.
+    ImprovementGate { message: SendMessageRequest },
 }
 
 /// The reply for a durable surface that could not be read or written.
 fn surface_unavailable() -> String {
     SurfaceRefusal::Unavailable.operator_reply().to_owned()
+}
+
+fn improvement_unavailable(chat_id: i64) -> Answer {
+    Answer::Unavailable {
+        chat_id,
+        text: "The improvement workflow could not safely advance. Its durable state was preserved; retry after checking the private plan repository and lab configuration."
+            .to_owned(),
+    }
 }
 
 /// One list of Telegram user ids, or `none`.

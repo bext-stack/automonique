@@ -677,22 +677,49 @@ impl TelegramHost {
         let lane =
             SocketRunLane::open(params.state_dir, params.admin_socket, params.run_index_path)
                 .map_err(|_| TelegramHostError::SurfaceUnavailable)?;
-        TelegramControlBridge::new(BridgeParts {
-            client: TelegramHttpsClient::new(),
-            outbound: TelegramHttpsClient::new(),
-            sink: StoreTelegramDurableSink::new(poller_store, SystemClock),
-            surface,
-            lane,
-            // `None` on a host with no `slack.conf`, which is what makes
-            // `/slack` and `/say` answer that Slack is not configured rather
-            // than fail. A refused configuration never reaches here: it failed
-            // startup before this host was opened.
-            slack: slack.into_surface(),
-            roster: live.roster,
-            inbound_token: live.inbound_token,
-            outbound_token: live.outbound_token,
-            long_poll_seconds: TELEGRAM_LONG_POLL_SECONDS,
-        })
+        let improvements = Some(
+            crate::improvements::ImprovementCoordinator::open_default(params.state_dir)
+                .map_err(|_| TelegramHostError::SurfaceUnavailable)?,
+        );
+        let planning_repo =
+            automonique_github_connector::RepoTarget::parse("bext-stack", "automonique-plans")
+                .expect("fixed planning repository");
+        let source_repo =
+            automonique_github_connector::RepoTarget::parse("bext-stack", "automonique")
+                .expect("fixed source repository");
+        let improvement_github = Some(
+            crate::improvement_github::ImprovementGitHubBroker::production(
+                planning_repo,
+                source_repo,
+                "main",
+                "main",
+            )
+            .map_err(|_| TelegramHostError::SurfaceUnavailable)?,
+        );
+        let improvement_worker =
+            crate::improvement_worker::ImprovementWorker::load(params.state_dir)
+                .map_err(|_| TelegramHostError::SurfaceUnavailable)?;
+        TelegramControlBridge::new_with_improvements(
+            BridgeParts {
+                client: TelegramHttpsClient::new(),
+                outbound: TelegramHttpsClient::new(),
+                sink: StoreTelegramDurableSink::new(poller_store, SystemClock),
+                surface,
+                lane,
+                // `None` on a host with no `slack.conf`, which is what makes
+                // `/slack` and `/say` answer that Slack is not configured rather
+                // than fail. A refused configuration never reaches here: it failed
+                // startup before this host was opened.
+                slack: slack.into_surface(),
+                roster: live.roster,
+                inbound_token: live.inbound_token,
+                outbound_token: live.outbound_token,
+                long_poll_seconds: TELEGRAM_LONG_POLL_SECONDS,
+            },
+            improvements,
+            improvement_github,
+            improvement_worker,
+        )
         .map_err(TelegramHostError::Runtime)
     }
 

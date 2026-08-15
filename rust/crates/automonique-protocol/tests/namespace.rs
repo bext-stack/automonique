@@ -1043,6 +1043,10 @@ mod surface_coverage {
                 "checkpoint.create",
                 "checkpoint.list",
                 "checkpoint.restore",
+                // Private state and release-manifest filenames are durable
+                // filesystem coordinates rather than protocol identities.
+                "improvements.sqlite3",
+                "manifest.json",
                 "sandbox.actor",
                 "supervisor.adapter",
                 "workspace.snapshot",
