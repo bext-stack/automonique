@@ -1040,6 +1040,13 @@ mod surface_coverage {
                 // file really is markdown and saying so in its extension is
                 // worth more than avoiding a shape.
                 "answer.md",
+                // A **doctor check code**, on this list for exactly the reason
+                // `supervisor.adapter` is: the report's codes are dotted
+                // diagnostic identifiers a scanner cannot tell from a protocol
+                // name by shape. Entered rather than renamed, because the code
+                // is what an operator reads in `doctor --json` and a namespace
+                // prefix on it would buy nothing.
+                "audit.chain",
                 // Slack Web API method names are external, stable protocol
                 // coordinates. Their dotted spelling is owned by Slack, so
                 // this repository must inventory rather than rename them.

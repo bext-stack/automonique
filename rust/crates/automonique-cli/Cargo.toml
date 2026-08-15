@@ -16,6 +16,10 @@ nix.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# The audit-verify tests tamper with a chain database behind the store API's
+# back, which is the only way to prove the verifier catches what an attacker
+# with file access would do. Nothing in `src/` opens SQLite directly.
+rusqlite.workspace = true
 tempfile.workspace = true
 
 [lints]

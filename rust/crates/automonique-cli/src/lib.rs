@@ -13,6 +13,7 @@ use std::path::{Component, Path, PathBuf};
 mod admin_client;
 mod approval;
 mod attempt;
+mod audit;
 mod automation;
 mod batch;
 mod diagnostics;
@@ -44,7 +45,7 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
-const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique automation register <automation-id> <actor>\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique batch register <batch-id> [--label <label>] [--sequential | --parallel <ceiling>] <member-key>...\n       automonique batch advance <batch-id> <member-key> <revision> <state> <last-sequence>\n       automonique batch list [--cursor <entry-id>] [--page <size>]\n       automonique batch detail <batch-id>\n       automonique parity compare <database> <scope> [--registry <path>] [--category <category>]\n       automonique parity score <database> <scope>\n       automonique parity gate <database> <scope> <decision-key> <decider> [--registry <path>]\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique shutdown\n";
+const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique automation register <automation-id> <actor>\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique batch register <batch-id> [--label <label>] [--sequential | --parallel <ceiling>] <member-key>...\n       automonique batch advance <batch-id> <member-key> <revision> <state> <last-sequence>\n       automonique batch list [--cursor <entry-id>] [--page <size>]\n       automonique batch detail <batch-id>\n       automonique parity compare <database> <scope> [--registry <path>] [--category <category>]\n       automonique parity score <database> <scope>\n       automonique parity gate <database> <scope> <decision-key> <decider> [--registry <path>]\n       automonique audit verify <database>\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique shutdown\n";
 
 #[derive(Clone)]
 enum Command {
@@ -89,6 +90,7 @@ enum Command {
     Approval(approval::Operation),
     Batch(batch::Operation),
     Parity(parity::Operation),
+    Audit(audit::Operation),
 }
 
 /// Execute one closed product command. Arguments exclude the program name.
@@ -387,6 +389,18 @@ where
                 }
             }
         }
+        // Offline for the reason the parity verbs are, and one further one: a
+        // verifier that had to ask the daemon whether its own audit chain was
+        // intact would be asking the suspect.
+        (Some(command), Some(action), Some(database), None) if command == "audit" => {
+            match action.to_str() {
+                Some("verify") => Command::Audit(audit::Operation::Verify { database }),
+                _ => {
+                    let _ = stderr.write_all(USAGE.as_bytes());
+                    return 2;
+                }
+            }
+        }
         (Some(command), Some(operation), Some(socket_path), None)
             if command == "attempt" && operation == "heartbeat" =>
         {
@@ -515,6 +529,9 @@ where
         }
         Command::Parity(operation) => {
             return parity::run(&operation, &mut stdout, &mut stderr);
+        }
+        Command::Audit(operation) => {
+            return audit::run(&operation, &mut stdout, &mut stderr);
         }
         Command::Shutdown => {
             return admin_shutdown(runtime.as_deref(), &mut stdout, &mut stderr);
@@ -1033,6 +1050,7 @@ fn inspect_doctor(runtime: Option<&OsStr>) -> Result<DoctorReportV1, DoctorRepor
     let admin_socket = inspect_admin_socket(runtime);
     DoctorReportV1::new([
         runtime_check(runtime),
+        inspect_audit_chain(std::env::var_os("XDG_STATE_HOME").as_deref()),
         admin_socket.clone(),
         inspect_process_control(),
         inspect_database_health(&admin_socket),
@@ -1107,6 +1125,94 @@ pub fn inspect_runtime(runtime: Option<&OsStr>) -> Result<DoctorReportV1, Doctor
     let check = runtime_check(runtime);
     DoctorReportV1::new([check])
 }
+
+/// File name of the durable audit chain inside the product state directory.
+///
+/// Pinned by literal from `automonique_daemon`'s `AUDIT_CHAIN_NAME`. This crate
+/// does not depend on the daemon — it reads durable databases directly, as the
+/// parity verbs do — so the spelling is named here. Public so the one crate
+/// that sees both can assert the two agree; a `doctor` looking in the wrong
+/// place would report a healthy chain on a host that has a broken one.
+pub const AUDIT_CHAIN_NAME: &str = "audit-chain.sqlite3";
+
+/// Report whether this host's audit chain is structurally intact.
+///
+/// **This is the structural half of verification only**: positions contiguous
+/// from one, the genesis link 64 zeros, each `prev_hash` its predecessor's
+/// `record_hash`. It catches a deleted or reordered record. It does not
+/// recompute a single hash, so it cannot catch an edited body — that is
+/// `automonique audit verify <database>`, which runs both halves. A healthy
+/// line here is not a statement that the chain verifies.
+///
+/// An absent chain is `Unavailable`, not a finding: a host that has recorded
+/// nothing has nothing to be wrong with, and reporting that as a fault would
+/// train an operator to ignore the line that matters.
+fn inspect_audit_chain(state: Option<&OsStr>) -> DoctorCheck {
+    let Some(state) = state else {
+        return audit_chain_reason(
+            CheckStatus::Unavailable,
+            "audit.state-environment-missing",
+            "XDG state directory is unavailable",
+        );
+    };
+    let path = Path::new(state).join("automonique").join(AUDIT_CHAIN_NAME);
+    if !path.exists() {
+        return audit_chain_reason(
+            CheckStatus::Unavailable,
+            "audit.chain-absent",
+            "No audit chain has been recorded on this host",
+        );
+    }
+    match automonique_store::audit_chain::AuditChain::open(&path) {
+        Err(error) => audit_chain_reason(
+            CheckStatus::Finding,
+            "audit.chain-unreadable",
+            match error.category() {
+                "insecure_path" => "Audit chain path is not private and owned",
+                "schema_version" => "Audit chain holds an unsupported schema",
+                _ => "Audit chain could not be opened",
+            },
+        ),
+        Ok(chain) => match chain.verify_structure() {
+            Ok(_) => audit_chain_healthy(),
+            Err(_) => audit_chain_reason(
+                CheckStatus::Finding,
+                "audit.chain-broken",
+                "Audit chain structure is broken; run `automonique audit verify`",
+            ),
+        },
+    }
+}
+
+/// One `audit.chain` check carrying a reason.
+///
+/// Not [`non_healthy`]: that helper pins every check it builds to the
+/// `runtime.directory` code, and a report refuses two checks under one code. A
+/// second check needs its own constructor rather than a shared one with a
+/// parameter, which is why this exists rather than a widened signature.
+fn audit_chain_reason(status: CheckStatus, code: &str, message: &str) -> DoctorCheck {
+    DoctorCheck::new(
+        FindingCode::new(AUDIT_CHAIN_CHECK_CODE).expect("constant check code is valid"),
+        status,
+        Some(DoctorReason::new(
+            FindingCode::new(code).expect("constant reason code is valid"),
+            FindingMessage::new(message).expect("constant reason message is valid"),
+        )),
+    )
+    .expect("constant audit chain check is coherent")
+}
+
+fn audit_chain_healthy() -> DoctorCheck {
+    DoctorCheck::new(
+        FindingCode::new(AUDIT_CHAIN_CHECK_CODE).expect("constant check code is valid"),
+        CheckStatus::Healthy,
+        None,
+    )
+    .expect("constant healthy check is coherent")
+}
+
+/// The one check code every audit-chain line carries.
+const AUDIT_CHAIN_CHECK_CODE: &str = "audit.chain";
 
 fn runtime_check(runtime: Option<&OsStr>) -> DoctorCheck {
     let Some(runtime) = runtime else {

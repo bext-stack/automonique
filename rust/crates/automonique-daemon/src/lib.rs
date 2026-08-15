@@ -244,6 +244,18 @@ pub const BATCH_REGISTRY_NAME: &str = concat!("batches", ".sqlite3");
 /// one ledger file has one owner. See [`attempt_host`].
 pub const RUN_CANCEL_LEDGER_NAME: &str = concat!("run-cancel-ledger", ".sqlite3");
 
+/// Durable hash-chained audit records, a sibling of [`DATABASE_NAME`].
+///
+/// Separate for the reason every sibling is, plus one specific to this file: it
+/// is append-only and never pruned, so its growth is unlike any other store's
+/// and an operator who wants to archive it should be moving one file rather
+/// than a table out of a shared one.
+///
+/// `automonique audit verify` and the `doctor` report both locate it by joining
+/// this name onto the product state directory, and `automonique-cli` pins the
+/// spelling by literal because it does not depend on this crate.
+pub const AUDIT_CHAIN_NAME: &str = concat!("audit-chain", ".sqlite3");
+
 /// Durable support ticket record, a sibling of [`DATABASE_NAME`].
 ///
 /// One row per fleet support issue this host has seen on the board, carrying the
@@ -395,6 +407,12 @@ impl DaemonConfig {
     #[must_use]
     pub fn run_cancel_ledger_path(&self) -> PathBuf {
         self.state_dir().join(RUN_CANCEL_LEDGER_NAME)
+    }
+
+    /// Durable hash-chained audit record path.
+    #[must_use]
+    pub fn audit_chain_path(&self) -> PathBuf {
+        self.state_dir().join(AUDIT_CHAIN_NAME)
     }
 
     /// Durable run index path.
