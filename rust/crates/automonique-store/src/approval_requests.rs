@@ -853,6 +853,34 @@ impl ApprovalRequests {
         Ok(records)
     }
 
+    /// Pending rows, oldest first.
+    ///
+    /// The backlog view: what is in front of an operator right now. A sweeper
+    /// that reminds reads this and computes its own milestones, which is why
+    /// there is no "due for a reminder" query — the ladder is a policy the
+    /// caller owns, and baking one into a `WHERE` clause would put it in two
+    /// places.
+    ///
+    /// # Errors
+    ///
+    /// [`ApprovalRequestError::InvalidField`] for a limit outside
+    /// `1..=MAX_APPROVAL_REQUEST_PAGE`.
+    pub fn pending(&self, limit: usize) -> Requested<Vec<ApprovalRequestRecord>> {
+        if limit == 0 || limit > MAX_APPROVAL_REQUEST_PAGE {
+            return Err(ApprovalRequestError::InvalidField("limit"));
+        }
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {RECORD_COLUMNS} FROM approval_requests
+             WHERE state = 'pending' ORDER BY request_entry_id LIMIT ?1"
+        ))?;
+        let rows = statement.query_map([to_db_usize(limit)?], raw_record)?;
+        let mut records = Vec::new();
+        for raw in rows {
+            records.push(validated_record(raw?)?);
+        }
+        Ok(records)
+    }
+
     /// One bounded page of every row, oldest first.
     ///
     /// # Errors

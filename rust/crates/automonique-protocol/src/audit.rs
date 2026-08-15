@@ -239,10 +239,18 @@ pub enum AuditOutcome {
     Timeout,
     /// The decision was to refuse.
     Denied,
-    /// It was raised to a second approver.
+    /// It was raised, rather than answered.
     ///
-    /// Reserved for the same reason [`AuditCategory::Escalation`] is, and
-    /// asserted by test to have no emitter in this build.
+    /// The approval sweep emits this when a proposal's reminder or escalation
+    /// rung comes due and a notice is staged: something was pushed in front of
+    /// an operator, and no decision was made. It is deliberately not
+    /// [`AuditOutcome::Timeout`], which says the deadline passed, and not
+    /// [`AuditOutcome::Denied`], which says somebody refused.
+    ///
+    /// [`AuditCategory::Escalation`] stays reserved and unemitted, and the two
+    /// are not the same claim: raising a question to the *same* approver again
+    /// is a reminder, and raising it to a second, identified approver is an
+    /// escalation this product still has no identity to name.
     Escalated,
 }
 

@@ -507,13 +507,42 @@ impl DaemonConfig {
     }
 }
 
-/// How long one approval proposal stays answerable.
+/// How often the approval sweep runs.
 ///
-/// A compiled constant rather than a per-call field, so a caller cannot raise a
-/// proposal that never expires. #21 makes it configurable per lane; until then
-/// one number is the honest answer, and it is stated here rather than buried in
-/// the call that uses it.
-pub const APPROVAL_LIFETIME_MS: i64 = 60 * 60 * 1_000;
+/// Expiry is a deadline rather than an event, so somebody has to look. Thirty
+/// seconds bounds how long a proposal reads `pending` after its deadline
+/// passed; it does not bound when a *decision* on such a proposal is refused,
+/// because [`Daemon::record_decision`] compares the deadline itself and does
+/// not wait for the sweep to notice.
+const APPROVAL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Largest number of proposals one sweep transitions or reminds about.
+///
+/// The sweep runs on the accept loop, so it must not be able to hold the socket
+/// for an unbounded stretch. A backlog past this simply takes the next tick.
+const APPROVAL_SWEEP_BATCH: usize = 64;
+
+/// Who this daemon records as the actor on a sweep's own audit records.
+///
+/// Not an operator, and named so a reader cannot mistake it for one: the sweep
+/// is the clock noticing, and an expiry is a thing that happened to a proposal
+/// rather than a thing a person did to it.
+pub const APPROVAL_SWEEPER: &str = "system:ttl";
+
+/// The operator-facing text of one reminder rung.
+///
+/// The reference is the whole of the content. A notice that quoted the run, the
+/// program or the prompt would put a document's contents into a chat message
+/// this daemon did not compose and cannot bound, and the operator already has a
+/// verb that reads the proposal in full.
+fn approval_notice_text(rung: &str, request_key: &str) -> String {
+    let opening = if rung == "escalation" {
+        "An approval is close to expiring"
+    } else {
+        "An approval is still waiting"
+    };
+    format!("{opening}: `/approve {request_key}` or `/deny {request_key}`.")
+}
 
 /// Who this daemon records as the proposer of a launch approval.
 ///
@@ -1137,6 +1166,12 @@ pub struct Daemon {
     /// inputs are not settable: the host's is measured, and the call's arrives
     /// with the call.
     configured_approval_requirement: ApprovalRequirement,
+    /// How long a proposal stays answerable, and when it is reminded about.
+    ///
+    /// Read once at open beside the requirement it belongs to, so one file
+    /// answers both questions and a proposal cannot be raised under a lifetime
+    /// from one generation and reminded under a ladder from another.
+    approval_lifetime: approval_policy::ApprovalLifetime,
     /// The lane that starts contained attempts for custodied documents.
     ///
     /// Opened on every host, including one that can never execute anything:
@@ -1448,6 +1483,9 @@ impl Daemon {
         let configured_approval_requirement =
             approval_policy::ApprovalPolicyConfig::requirement_or_default(&state_dir)
                 .map_err(|error| DaemonError::ApprovalPolicyRefused(error.category()))?;
+        let approval_lifetime =
+            approval_policy::ApprovalPolicyConfig::lifetime_or_default(&state_dir)
+                .map_err(|error| DaemonError::ApprovalPolicyRefused(error.category()))?;
         socket_cleanup.disarm();
 
         Ok(Self {
@@ -1475,6 +1513,7 @@ impl Daemon {
             tenure_revision: tenure.revision,
             execution_state,
             configured_approval_requirement,
+            approval_lifetime,
             execution: Some(execution),
             ticket_intake,
         })
@@ -1518,6 +1557,10 @@ impl Daemon {
     /// closed and do not stop the daemon.
     pub fn serve(mut self, stop: &AtomicBool) -> Result<(), DaemonError> {
         let mut next_renewal = std::time::Instant::now() + LEASE_RENEW_INTERVAL;
+        // The first sweep runs immediately: a daemon that just took over a
+        // generation is exactly the one most likely to be holding proposals
+        // that expired while nobody was serving.
+        let mut next_approval_sweep = std::time::Instant::now();
         // LIVE TELEGRAM POLLING BEGINS HERE, AND NOWHERE ELSE.
         //
         // Opening a daemon composes the bridge; serving it is what puts the
@@ -1573,6 +1616,17 @@ impl Daemon {
                     && let Err(error) = self.tick_synthetic()
                 {
                     break Err(error);
+                }
+                // The approval sweep runs on its own cadence rather than on
+                // every accept poll: it reads two databases, and a deadline
+                // measured in minutes does not need to be checked at the rate a
+                // socket is polled.
+                if std::time::Instant::now() >= next_approval_sweep {
+                    match unix_millis().and_then(|now_ms| self.tick_approvals(now_ms)) {
+                        Ok(()) => {}
+                        Err(error) => break Err(error),
+                    }
+                    next_approval_sweep = std::time::Instant::now() + APPROVAL_SWEEP_INTERVAL;
                 }
                 match self.listener.accept() {
                     Ok((mut stream, _)) => {
@@ -2986,6 +3040,141 @@ impl Daemon {
         Ok(submission_id)
     }
 
+    /// Expire what timed out, and remind about what has not.
+    ///
+    /// # An expiry is not a denial, and this is where that is enforced
+    ///
+    /// A proposal that reached its deadline unanswered moves to `expired` and
+    /// the sweep appends an audit record whose outcome is `timeout`. It
+    /// deliberately does **not** write a decision. A denial names a decider,
+    /// and there was none: nobody answered. Forging one would put an operator's
+    /// name on a silence, and every later reader — the audit chain, the ledger,
+    /// the `by_subject` history — would show a refusal that no person made.
+    /// The distinction survives in the vocabulary, which is why the audit
+    /// outcome set has `timeout` at all.
+    ///
+    /// The launch this stopped is not left ambiguous by that choice: an expired
+    /// proposal leaves its subject *undecided*, so the next request for the
+    /// same document raises a fresh proposal rather than inheriting an answer.
+    ///
+    /// # Fenced, bounded, and idempotent
+    ///
+    /// Every transition is the store's single fenced `UPDATE`, so a proposal
+    /// somebody decided a millisecond before the sweep reached it fails the
+    /// fence and keeps their answer. A second sweep over the same row writes
+    /// nothing for the same reason. The batch is bounded because this runs on
+    /// the accept loop.
+    ///
+    /// # Reminders ride the durable outbox
+    ///
+    /// A notice is *staged*, never sent: the sweep enqueues it and the Telegram
+    /// bridge's existing drain delivers it under the existing lease, retry and
+    /// rate-limit budget. The outbox's own unique intent key is the ladder's
+    /// memory — one row per proposal per rung, ever — so no column has to
+    /// remember which notices went out and a sweep that runs every thirty
+    /// seconds does not send a reminder every thirty seconds.
+    ///
+    /// A proposal decided between staging and delivery still delivers its
+    /// notice. That race is real and it is the cheap side of the trade: a
+    /// reminder about a just-answered question is noise, and the alternative —
+    /// re-reading the proposal inside the delivery path — would put approval
+    /// state on the poller thread to save an occasional message.
+    fn tick_approvals(&mut self, now_ms: i64) -> Result<(), DaemonError> {
+        let due = self
+            .approval_requests
+            .expiring_before(now_ms, APPROVAL_SWEEP_BATCH)
+            .map_err(|error| DaemonError::ApprovalRequestsFailed(error.category()))?;
+        for record in due {
+            match self
+                .approval_requests
+                .expire(&record.request_key, record.revision, now_ms)
+            {
+                Ok(_) => self.append_approval_record(
+                    &record.subject,
+                    APPROVAL_SWEEPER,
+                    "approval_expired",
+                    AuditOutcome::Timeout,
+                    now_ms,
+                ),
+                // Somebody answered between the read and the write. Their
+                // answer stands and this sweep has nothing to record.
+                Err(ApprovalRequestError::StaleRevision) => {}
+                Err(error) => {
+                    return Err(DaemonError::ApprovalRequestsFailed(error.category()));
+                }
+            }
+        }
+        self.stage_approval_notices(now_ms)
+    }
+
+    /// Stage the reminder and escalation notices that have come due.
+    ///
+    /// Silent when no operator surface can carry one: a notice staged for a bot
+    /// with no poller is a row nothing will ever claim, and filling the outbox
+    /// with them would turn a missing surface into a backlog.
+    fn stage_approval_notices(&mut self, now_ms: i64) -> Result<(), DaemonError> {
+        let Some((bot_id, audience)) = self.telegram.notice_targets() else {
+            return Ok(());
+        };
+        if audience.is_empty() {
+            return Ok(());
+        }
+        let audience: Vec<i64> = audience.to_vec();
+        let pending = self
+            .approval_requests
+            .pending(APPROVAL_SWEEP_BATCH)
+            .map_err(|error| DaemonError::ApprovalRequestsFailed(error.category()))?;
+        for record in pending {
+            let lifetime = self.approval_lifetime;
+            for (rung, due_at) in [
+                ("reminder", lifetime.reminder_at(record.requested_at_ms)),
+                ("escalation", lifetime.escalation_at(record.requested_at_ms)),
+            ] {
+                if now_ms < due_at {
+                    continue;
+                }
+                let text = approval_notice_text(rung, &record.request_key);
+                let mut staged = false;
+                for chat_id in &audience {
+                    let intent_key = format!(
+                        "telegram:{bot_id}:approval:{}:{rung}:{chat_id}",
+                        record.request_key
+                    );
+                    let Some(payload) = telegram_bridge::telegram_notice_payload(*chat_id, &text)
+                    else {
+                        continue;
+                    };
+                    let receipt = self
+                        .store
+                        .enqueue_outbox(automonique_store::OutboxEnqueue {
+                            intent_key: &intent_key,
+                            kind: telegram_bridge::TELEGRAM_SEND_KIND,
+                            payload: &payload,
+                            generation_id: GENERATION_ID,
+                            holder_id: self.instance_id.as_str(),
+                            lease_epoch: self.lease_epoch,
+                            now_ms,
+                        })?;
+                    staged |= !receipt.duplicate;
+                }
+                // One record per rung per proposal, not one per recipient and
+                // not one per sweep: the outbox's unique key already decided
+                // whether this rung is new, and the audit chain records the
+                // rung rather than the fan-out.
+                if staged {
+                    self.append_approval_record(
+                        &record.subject,
+                        APPROVAL_SWEEPER,
+                        &format!("approval_{rung}"),
+                        AuditOutcome::Escalated,
+                        now_ms,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Consult the composed approval requirement for one custodied document.
     ///
     /// The subject an approval is about is the *document*, spelled
@@ -3185,7 +3374,7 @@ impl Daemon {
         let (program_sha256, prompt_sha256) = execute::approval_context_digests(&state_dir, &spec)
             .ok_or(ExecuteRefusal::ProviderBinaryUnverified)?;
         let request_key = mint_request_key(subject, run_id, spec_digest, now_ms, history.len());
-        let expires_at_ms = now_ms.saturating_add(APPROVAL_LIFETIME_MS);
+        let expires_at_ms = self.approval_lifetime.expires_at(now_ms);
         self.approval_requests
             .propose(ApprovalProposal {
                 request_key: &request_key,

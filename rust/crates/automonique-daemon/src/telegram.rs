@@ -530,6 +530,17 @@ pub(crate) enum TelegramHost {
     Live {
         coordinator: Box<TelegramLeaseCoordinator<SystemClock>>,
         control: Box<PollerControl>,
+        /// Configured bot identity, kept beside the audience it addresses.
+        bot_id: i64,
+        /// Configured administrators, kept for the approval sweep.
+        ///
+        /// Their user identifiers double as private chat identifiers, which is
+        /// what makes a direct notice addressable at all. Held on the host
+        /// rather than read back from the config file when a notice is due:
+        /// the file holds a credential, and re-reading it to learn a number
+        /// this process already had would be a second read of a secret for no
+        /// reason.
+        notice_audience: Vec<i64>,
     },
 }
 
@@ -657,9 +668,16 @@ impl TelegramHost {
         else {
             return Ok(Self::LeaseOwned { coordinator });
         };
+        // Captured before the roster is consumed into the bridge. The approval
+        // sweep runs on the serve loop and has no other way to learn who a
+        // reminder is for: administrators come only from configuration, never
+        // from the durable roster, so this is the whole of the audience.
+        let notice_audience = live.roster.admins().to_vec();
         let bridge = Self::compose(params, bot_id, *live, slack, ticket_gates)?;
         Ok(Self::Live {
             coordinator,
+            bot_id,
+            notice_audience,
             control: Box::new(PollerControl {
                 lease: Arc::new(Mutex::new(lease)),
                 stop: Arc::new(AtomicBool::new(false)),
@@ -854,6 +872,7 @@ impl TelegramHost {
             Self::Live {
                 coordinator,
                 control,
+                ..
             } => (
                 coordinator,
                 if control.stopped() {
@@ -868,6 +887,25 @@ impl TelegramHost {
             // The lease was released, so this host owns nothing to poll with
             // whatever it still holds a client for.
             TelegramHostState::DisabledNoClient => (TelegramState::DisabledNoClient, None),
+        }
+    }
+
+    /// Who an approval notice goes to, and which bot sends it.
+    ///
+    /// `None` unless this host is live: a bot with no poller cannot deliver a
+    /// reminder, and staging one for it would fill the outbox with notices
+    /// nobody will read. That is the same distinction
+    /// [`Self::poller_live`] draws, and for the same reason.
+    pub(crate) fn notice_targets(&self) -> Option<(i64, &[i64])> {
+        match self {
+            Self::Disabled | Self::LeaseOwned { .. } => None,
+            Self::Live {
+                bot_id,
+                notice_audience,
+                ..
+            } => self
+                .poller_live()
+                .then_some((*bot_id, notice_audience.as_slice())),
         }
     }
 
@@ -903,6 +941,7 @@ impl TelegramHost {
             Self::Live {
                 coordinator,
                 control,
+                ..
             } => {
                 let renewed = coordinator
                     .renew()

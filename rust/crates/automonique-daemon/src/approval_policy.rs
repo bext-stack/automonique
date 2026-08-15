@@ -11,8 +11,16 @@
 //! ```text
 //! schema=automonique.approvals/v1
 //! requirement=approval_required
+//! ttl_ms=3600000
+//! reminder_percent=50
+//! escalation_percent=80
 //! end=automonique.approvals/v1
 //! ```
+//!
+//! Every key but `requirement` is optional and defaults to a compiled value.
+//! There is deliberately no spelling for "no expiry": a proposal that can never
+//! time out is a question the sweep could never reach, and the ladder is a
+//! fraction of a bounded lifetime rather than a schedule of its own.
 //!
 //! # An absent file means [`ApprovalRequirement::Allowed`], not "disabled"
 //!
@@ -49,6 +57,29 @@ const CONFIG_TERMINATOR: &str = "end=automonique.approvals/v1";
 /// Upper bound on the configuration file.
 const MAX_CONFIG_BYTES: u64 = 4_096;
 
+/// Narrowest lifetime a proposal may be configured with.
+///
+/// A minute is already short for a question a person has to read and answer;
+/// anything below it would expire proposals faster than an operator could act,
+/// which is a denial dressed as a timeout.
+const MIN_TTL_MS: i64 = 60 * 1_000;
+
+/// Widest lifetime a proposal may be configured with.
+///
+/// A week. Past that the proposal outlives the state it was bound to in every
+/// practical sense — the program, the prompt and the working directory have all
+/// had time to move — and #20's drift check would refuse it anyway.
+const MAX_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// How long one proposal stays answerable when nothing is configured.
+pub const DEFAULT_APPROVAL_TTL_MS: i64 = 60 * 60 * 1_000;
+
+/// Fraction of the lifetime at which the first reminder is staged.
+pub const DEFAULT_REMINDER_PERCENT: u8 = 50;
+
+/// Fraction of the lifetime at which the escalation notice is staged.
+pub const DEFAULT_ESCALATION_PERCENT: u8 = 80;
+
 /// What a deployment that configured nothing asks for on its own.
 ///
 /// The loosest requirement, because this source is the only settable one and a
@@ -71,6 +102,11 @@ pub enum ApprovalPolicyConfigError {
     Malformed,
     /// `requirement` is absent or is not one of the lattice's three spellings.
     RequirementInvalid,
+    /// `ttl_ms` is not a positive integer inside the admitted range.
+    LifetimeInvalid,
+    /// A ladder percentage is outside `1..=99`, or the reminder does not come
+    /// strictly before the escalation.
+    LadderInvalid,
 }
 
 impl fmt::Display for ApprovalPolicyConfigError {
@@ -85,6 +121,11 @@ impl fmt::Display for ApprovalPolicyConfigError {
             Self::RequirementInvalid => {
                 formatter.write_str("approval configuration requirement is invalid")
             }
+            Self::LifetimeInvalid => {
+                formatter.write_str("approval configuration lifetime is outside the admitted range")
+            }
+            Self::LadderInvalid => formatter
+                .write_str("approval configuration reminder ladder is empty or out of order"),
         }
     }
 }
@@ -100,6 +141,8 @@ impl ApprovalPolicyConfigError {
             Self::Unreadable => "approval_config_unreadable",
             Self::Malformed => "approval_config_malformed",
             Self::RequirementInvalid => "approval_config_requirement_invalid",
+            Self::LifetimeInvalid => "approval_config_lifetime_invalid",
+            Self::LadderInvalid => "approval_config_ladder_invalid",
         }
     }
 }
@@ -108,6 +151,64 @@ impl ApprovalPolicyConfigError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApprovalPolicyConfig {
     requirement: ApprovalRequirement,
+    ttl_ms: i64,
+    reminder_percent: u8,
+    escalation_percent: u8,
+}
+
+/// The lifetime and reminder ladder one lane's proposals are raised under.
+///
+/// Carried as one value rather than three loose numbers so a caller cannot pair
+/// a lifetime with somebody else's ladder, and validated at construction so a
+/// consumer never has to re-check the ordering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApprovalLifetime {
+    ttl_ms: i64,
+    reminder_percent: u8,
+    escalation_percent: u8,
+}
+
+impl ApprovalLifetime {
+    /// The compiled default: an hour, reminded at half and escalated at 80%.
+    pub const DEFAULT: Self = Self {
+        ttl_ms: DEFAULT_APPROVAL_TTL_MS,
+        reminder_percent: DEFAULT_REMINDER_PERCENT,
+        escalation_percent: DEFAULT_ESCALATION_PERCENT,
+    };
+
+    /// How long a proposal stays answerable.
+    #[must_use]
+    pub const fn ttl_ms(self) -> i64 {
+        self.ttl_ms
+    }
+
+    /// The instant one proposal raised at `requested_at_ms` stops being
+    /// answerable.
+    ///
+    /// Saturating, so a clock near the end of the representable range produces
+    /// a deadline the store will still admit rather than a wrapped one.
+    #[must_use]
+    pub const fn expires_at(self, requested_at_ms: i64) -> i64 {
+        requested_at_ms.saturating_add(self.ttl_ms)
+    }
+
+    /// The instant the reminder rung is due for one proposal.
+    #[must_use]
+    pub const fn reminder_at(self, requested_at_ms: i64) -> i64 {
+        self.rung_at(requested_at_ms, self.reminder_percent)
+    }
+
+    /// The instant the escalation rung is due for one proposal.
+    #[must_use]
+    pub const fn escalation_at(self, requested_at_ms: i64) -> i64 {
+        self.rung_at(requested_at_ms, self.escalation_percent)
+    }
+
+    const fn rung_at(self, requested_at_ms: i64, percent: u8) -> i64 {
+        // Percentages are bounded to 1..=99 at construction, so the product
+        // cannot overflow a lifetime that is itself bounded to a week.
+        requested_at_ms.saturating_add(self.ttl_ms / 100 * percent as i64)
+    }
 }
 
 impl ApprovalPolicyConfig {
@@ -121,6 +222,29 @@ impl ApprovalPolicyConfig {
     #[must_use]
     pub const fn requirement(self) -> ApprovalRequirement {
         self.requirement
+    }
+
+    /// The lifetime and ladder this configuration sets.
+    #[must_use]
+    pub const fn lifetime(self) -> ApprovalLifetime {
+        ApprovalLifetime {
+            ttl_ms: self.ttl_ms,
+            reminder_percent: self.reminder_percent,
+            escalation_percent: self.escalation_percent,
+        }
+    }
+
+    /// The configured lifetime, defaulting to [`ApprovalLifetime::DEFAULT`]
+    /// when nothing is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApprovalPolicyConfigError`] for a present file that is
+    /// insecure, unreadable, or malformed. An absent file is never an error.
+    pub fn lifetime_or_default(
+        state_dir: &Path,
+    ) -> Result<ApprovalLifetime, ApprovalPolicyConfigError> {
+        Ok(Self::load(state_dir)?.map_or(ApprovalLifetime::DEFAULT, Self::lifetime))
     }
 
     /// The configured requirement, defaulting to
@@ -173,6 +297,9 @@ impl ApprovalPolicyConfig {
             return Err(ApprovalPolicyConfigError::Malformed);
         }
         let mut requirement: Option<ApprovalRequirement> = None;
+        let mut ttl_ms: Option<i64> = None;
+        let mut reminder_percent: Option<u8> = None;
+        let mut escalation_percent: Option<u8> = None;
         let mut terminated = false;
         for line in lines {
             if terminated {
@@ -192,22 +319,63 @@ impl ApprovalPolicyConfig {
                             .ok_or(ApprovalPolicyConfigError::RequirementInvalid)?,
                     );
                 }
+                "ttl_ms" if ttl_ms.is_none() => {
+                    let parsed = value
+                        .parse::<i64>()
+                        .map_err(|_| ApprovalPolicyConfigError::LifetimeInvalid)?;
+                    if !(MIN_TTL_MS..=MAX_TTL_MS).contains(&parsed) {
+                        return Err(ApprovalPolicyConfigError::LifetimeInvalid);
+                    }
+                    ttl_ms = Some(parsed);
+                }
+                "reminder_percent" if reminder_percent.is_none() => {
+                    reminder_percent = Some(percent(value)?);
+                }
+                "escalation_percent" if escalation_percent.is_none() => {
+                    escalation_percent = Some(percent(value)?);
+                }
                 _ => return Err(ApprovalPolicyConfigError::Malformed),
             }
         }
         if !terminated {
             return Err(ApprovalPolicyConfigError::Malformed);
         }
+        let reminder_percent = reminder_percent.unwrap_or(DEFAULT_REMINDER_PERCENT);
+        let escalation_percent = escalation_percent.unwrap_or(DEFAULT_ESCALATION_PERCENT);
+        // A ladder whose rungs are level or inverted is not a ladder. Refusing
+        // it is cheaper than deciding at runtime which of two notices a
+        // proposal should have received first.
+        if reminder_percent >= escalation_percent {
+            return Err(ApprovalPolicyConfigError::LadderInvalid);
+        }
         Ok(Some(Self {
             requirement: requirement.ok_or(ApprovalPolicyConfigError::RequirementInvalid)?,
+            ttl_ms: ttl_ms.unwrap_or(DEFAULT_APPROVAL_TTL_MS),
+            reminder_percent,
+            escalation_percent,
         }))
     }
+}
+
+/// Parse one ladder percentage, which must leave room on both sides.
+///
+/// Zero would fire a notice the instant a proposal is raised, and a hundred
+/// would fire it at the deadline, where the expiry notice already is.
+fn percent(value: &str) -> Result<u8, ApprovalPolicyConfigError> {
+    let parsed = value
+        .parse::<u8>()
+        .map_err(|_| ApprovalPolicyConfigError::LadderInvalid)?;
+    if !(1..=99).contains(&parsed) {
+        return Err(ApprovalPolicyConfigError::LadderInvalid);
+    }
+    Ok(parsed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalPolicyConfig, ApprovalRequirement, DEFAULT_APPROVAL_REQUIREMENT, MAX_CONFIG_BYTES,
+        ApprovalLifetime, ApprovalPolicyConfig, ApprovalRequirement, DEFAULT_APPROVAL_REQUIREMENT,
+        DEFAULT_APPROVAL_TTL_MS, MAX_CONFIG_BYTES,
     };
 
     const FRAME: &str = "schema=automonique.approvals/v1\n\
@@ -330,6 +498,105 @@ mod tests {
                 )),
                 "approval_config_requirement_invalid",
                 "{value:?} is not a requirement this lattice spells",
+            );
+        }
+    }
+
+    #[test]
+    fn the_lifetime_defaults_and_its_ladder_is_ordered() {
+        let config = ApprovalPolicyConfig::parse(FRAME)
+            .expect("a complete frame")
+            .expect("a present configuration");
+        let lifetime = config.lifetime();
+        assert_eq!(lifetime, ApprovalLifetime::DEFAULT);
+        assert_eq!(lifetime.ttl_ms(), DEFAULT_APPROVAL_TTL_MS);
+        // The rungs are strictly inside the lifetime and strictly ordered, so a
+        // proposal is reminded, then escalated, then expired — never two at
+        // once and never out of order.
+        let raised = 1_000;
+        assert!(lifetime.reminder_at(raised) > raised);
+        assert!(lifetime.reminder_at(raised) < lifetime.escalation_at(raised));
+        assert!(lifetime.escalation_at(raised) < lifetime.expires_at(raised));
+        assert_eq!(
+            lifetime.expires_at(raised),
+            raised + DEFAULT_APPROVAL_TTL_MS
+        );
+        // A clock at the end of the representable range yields a deadline the
+        // store will still admit rather than a wrapped one.
+        assert_eq!(lifetime.expires_at(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn a_configured_lifetime_and_ladder_replace_the_defaults() {
+        let config = ApprovalPolicyConfig::parse(
+            "schema=automonique.approvals/v1\n\
+             requirement=approval_required\n\
+             ttl_ms=600000\n\
+             reminder_percent=25\n\
+             escalation_percent=75\n\
+             end=automonique.approvals/v1\n",
+        )
+        .expect("a complete frame")
+        .expect("a present configuration");
+        let lifetime = config.lifetime();
+        assert_eq!(lifetime.ttl_ms(), 600_000);
+        assert_eq!(lifetime.reminder_at(0), 150_000);
+        assert_eq!(lifetime.escalation_at(0), 450_000);
+        assert_eq!(lifetime.expires_at(0), 600_000);
+    }
+
+    #[test]
+    fn a_lifetime_outside_the_admitted_range_is_refused() {
+        for value in ["0", "-1", "59999", "604800001", "", "3600000.0", "abc"] {
+            assert_eq!(
+                category(&format!(
+                    "schema=automonique.approvals/v1\n\
+                     requirement=allowed\n\
+                     ttl_ms={value}\n\
+                     end=automonique.approvals/v1\n"
+                )),
+                "approval_config_lifetime_invalid",
+                "{value:?} is not a lifetime a proposal can be raised under",
+            );
+        }
+        // There is no spelling for "never expires": the key is a number or it
+        // is refused, and the range has no open end.
+        assert_eq!(
+            category(
+                "schema=automonique.approvals/v1\n\
+                 requirement=allowed\n\
+                 ttl_ms=never\n\
+                 end=automonique.approvals/v1\n"
+            ),
+            "approval_config_lifetime_invalid",
+        );
+    }
+
+    #[test]
+    fn a_ladder_that_is_level_or_inverted_is_refused() {
+        for (reminder, escalation) in [("50", "50"), ("80", "50"), ("99", "1")] {
+            assert_eq!(
+                category(&format!(
+                    "schema=automonique.approvals/v1\n\
+                     requirement=allowed\n\
+                     reminder_percent={reminder}\n\
+                     escalation_percent={escalation}\n\
+                     end=automonique.approvals/v1\n"
+                )),
+                "approval_config_ladder_invalid",
+                "{reminder}/{escalation} is not an ordered ladder",
+            );
+        }
+        for value in ["0", "100", "255", "256", "-1", ""] {
+            assert_eq!(
+                category(&format!(
+                    "schema=automonique.approvals/v1\n\
+                     requirement=allowed\n\
+                     reminder_percent={value}\n\
+                     end=automonique.approvals/v1\n"
+                )),
+                "approval_config_ladder_invalid",
+                "{value:?} leaves no room on one side",
             );
         }
     }

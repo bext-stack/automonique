@@ -1168,6 +1168,99 @@ fn a_decision_that_reached_the_ledger_but_not_its_proposal_heals_on_the_next_ope
     assert_eq!(record.approval_key.as_deref(), Some(PROPOSAL_KEY));
 }
 
+/// An expiry records a timeout and forges no decision.
+///
+/// The sweep runs before this daemon's first accept, so any answered request
+/// proves it has run — which is what makes this deterministic rather than a
+/// sleep. What it asserts is the distinction the whole vocabulary exists for:
+/// the proposal is terminal, the audit chain says `timeout`, and the decision
+/// ledger is still empty. A denial names a decider, and nobody answered.
+#[test]
+fn an_expiry_records_a_timeout_and_forges_no_decision() {
+    let (_root, config) = fixture();
+    // A deadline already in the past when the daemon opens.
+    seed_proposal(&config, 2_000);
+    let serving = serve(&config);
+    assert!(matches!(
+        call(&config, AdminCommand::Status),
+        AdminResponse::Status { .. }
+    ));
+    serving.shutdown(&config);
+
+    let requests = ApprovalRequests::open(config.approval_requests_path()).expect("table reopens");
+    let record = requests
+        .entry(PROPOSAL_KEY)
+        .expect("readable")
+        .expect("a row");
+    assert_eq!(record.state, ApprovalState::Expired);
+    assert!(record.decided_at_ms.is_some());
+    // The load-bearing negative: an expiry links to no ledger row, because it
+    // is the absence of an answer rather than one.
+    assert_eq!(record.approval_key, None);
+
+    let ledger = ApprovalLedger::open(config.approval_ledger_path()).expect("ledger reopens");
+    assert_eq!(
+        ledger.decision_count().expect("count"),
+        0,
+        "a timeout must not forge a decision nobody made"
+    );
+
+    let chain = automonique_store::audit_chain::AuditChain::open(config.audit_chain_path())
+        .expect("audit chain opens");
+    let page = chain.page(0, 32).expect("a page of records");
+    let record = page
+        .entries
+        .iter()
+        .find(|entry| entry.subject == PROPOSAL_SUBJECT)
+        .expect("a record about the proposal that expired");
+    assert_eq!(record.category, "approval");
+    assert_eq!(record.outcome, "timeout");
+    assert_eq!(record.surface, "approval_expired");
+    // Named so a reader cannot mistake the clock for a person.
+    assert_eq!(record.actor, "system:ttl");
+}
+
+/// A second daemon over the same expired row writes nothing more.
+///
+/// The sweep is idempotent because the transition is fenced, not because it
+/// remembers what it did. Opening a second daemon over the same state is the
+/// cheapest way to run the sweep twice over one row.
+#[test]
+fn a_second_sweep_over_an_expired_proposal_records_nothing_more() {
+    let (_root, config) = fixture();
+    seed_proposal(&config, 2_000);
+    let serving = serve(&config);
+    assert!(matches!(
+        call(&config, AdminCommand::Status),
+        AdminResponse::Status { .. }
+    ));
+    serving.shutdown(&config);
+    let after_first = automonique_store::audit_chain::AuditChain::open(config.audit_chain_path())
+        .expect("audit chain opens")
+        .record_count()
+        .expect("count");
+
+    let serving = serve(&config);
+    assert!(matches!(
+        call(&config, AdminCommand::Status),
+        AdminResponse::Status { .. }
+    ));
+    serving.shutdown(&config);
+
+    let chain = automonique_store::audit_chain::AuditChain::open(config.audit_chain_path())
+        .expect("audit chain reopens");
+    assert_eq!(
+        chain.record_count().expect("count"),
+        after_first,
+        "a second sweep over a terminal row must write nothing"
+    );
+    // And the chain is still a chain: nothing wrote a fork.
+    assert_eq!(
+        chain.verify_structure().expect("a sound chain"),
+        u64::try_from(after_first).expect("a small chain")
+    );
+}
+
 /// Each refusal on the decide lane is its own word.
 #[test]
 fn deciding_an_absent_or_expired_proposal_is_answered_in_its_own_word() {

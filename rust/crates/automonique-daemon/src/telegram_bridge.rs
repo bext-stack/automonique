@@ -6096,6 +6096,34 @@ where
     }
 }
 
+/// The durable outbox kind every Telegram message is staged under.
+///
+/// Named here rather than spelled at each call site, because a stager and a
+/// drainer that disagreed about it would produce rows nothing ever claims.
+pub(crate) const TELEGRAM_SEND_KIND: &str = "telegram.send_message";
+
+/// Build the durable payload for one plain notice this bridge would deliver.
+///
+/// The whole of what a caller outside the poller thread needs to stage a
+/// message: the payload shape is this module's, so exposing a builder keeps it
+/// that way rather than letting a second module learn the serde field names.
+///
+/// `None` when the text or the chat is outside Telegram's own bounds — which is
+/// checked here, by the same constructor the delivery path uses, so a row that
+/// this admits is a row the drain can send.
+pub(crate) fn telegram_notice_payload(chat_id: i64, text: &str) -> Option<Vec<u8>> {
+    let request = SendMessageRequest::new(chat_id, text, None).ok()?;
+    serde_json::to_vec(&PersistedTelegramMessage {
+        chat_id: request.chat_id(),
+        text: request.text().to_owned(),
+        preformatted: false,
+        reply_to_message_id: request.reply_to_message_id(),
+        approve_callback: None,
+        revise_callback: None,
+    })
+    .ok()
+}
+
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedTelegramMessage {
@@ -7998,7 +8026,7 @@ impl ControlSurface for StoreControlSurface {
         self.store
             .enqueue_outbox(OutboxEnqueue {
                 intent_key,
-                kind: "telegram.send_message",
+                kind: TELEGRAM_SEND_KIND,
                 payload,
                 generation_id: &self.facts.generation_id,
                 holder_id: &self.facts.holder_id,
@@ -8017,7 +8045,7 @@ impl ControlSurface for StoreControlSurface {
             .store
             .claim_outbox(OutboxClaimRequest {
                 transport: "telegram",
-                kind: "telegram.send_message",
+                kind: TELEGRAM_SEND_KIND,
                 generation_id: &self.facts.generation_id,
                 holder_id: &self.facts.holder_id,
                 lease_epoch: self.facts.lease_epoch,
@@ -8815,6 +8843,50 @@ fn ticket_detail(record: &TicketRecord) -> String {
         record.fleet_issue_id,
     ));
     detail
+}
+
+#[cfg(test)]
+mod notice_payload_tests {
+    use super::{PersistedTelegramMessage, telegram_notice_payload};
+
+    /// A staged notice is a row the drain can rebuild into a real send.
+    ///
+    /// The stager lives on the serve loop and the drain lives on the poller
+    /// thread, and the only thing joining them is this payload. A shape one
+    /// side writes and the other dead-letters would be a reminder that is
+    /// durably queued and never delivered, which looks exactly like a bug in
+    /// the approval lane rather than in the encoding.
+    #[test]
+    fn a_staged_notice_rebuilds_into_the_message_the_drain_sends() {
+        let payload = telegram_notice_payload(-1_001, "An approval is still waiting.")
+            .expect("a payload for a legal chat and text");
+        let decoded: PersistedTelegramMessage =
+            serde_json::from_slice(&payload).expect("the drain's own decode");
+        assert_eq!(decoded.chat_id, -1_001);
+        assert_eq!(decoded.text, "An approval is still waiting.");
+        assert!(!decoded.preformatted);
+        assert_eq!(decoded.reply_to_message_id, None);
+        // No keyboard: a reminder is a message, and the durable rebuild refuses
+        // a half-populated callback pair.
+        assert_eq!(decoded.approve_callback, None);
+        assert_eq!(decoded.revise_callback, None);
+    }
+
+    /// Text or a chat the transport would refuse is refused here instead.
+    ///
+    /// Checked at staging by the same constructor the delivery path uses, so a
+    /// row this admits is a row the drain can send. The alternative is a
+    /// dead-lettered row and an operator who never learns their approval was
+    /// waiting.
+    #[test]
+    fn a_notice_the_transport_would_refuse_is_never_staged() {
+        assert!(telegram_notice_payload(0, "text").is_none(), "chat zero");
+        assert!(telegram_notice_payload(7, "").is_none(), "empty text");
+        assert!(
+            telegram_notice_payload(7, "bell\u{7}here").is_none(),
+            "control characters"
+        );
+    }
 }
 
 #[cfg(test)]
