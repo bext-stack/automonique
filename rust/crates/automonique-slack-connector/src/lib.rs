@@ -2,13 +2,24 @@
 
 //! Typed client for the Slack Web API surface Automonique reads and speaks on.
 //!
-//! Six bot-token Web API methods are spelled: identify the credential, list the
-//! conversations it can see, read one conversation, read one conversation's
-//! recent messages, resolve one user, and post one message. Five are reads. The
-//! sixth — [`SlackClient::post_message`] — is the only
-//! externally visible effect this crate can produce, and it is marked as one by
-//! [`SlackOperation::is_external_effect`] so an approval layer never has to
-//! re-derive it from a verb.
+//! Nine bot-token Web API methods are spelled, one per [`SlackMethod`]
+//! variant, and nothing else can be.
+//!
+//! Five are reads: identify the credential ([`SlackClient::auth_test`]), list
+//! the conversations the token can see
+//! ([`SlackClient::conversations_list`]), read one conversation
+//! ([`SlackClient::conversations_info`]), read one conversation's recent
+//! messages ([`SlackClient::conversations_history`]), and resolve one user
+//! ([`SlackClient::users_info`]).
+//!
+//! Four are externally visible effects: post one message
+//! ([`SlackClient::post_message`]), replace one existing bot message
+//! ([`SlackClient::update_message`]), open one modal for an interaction
+//! trigger ([`SlackClient::open_view`]), and publish one App Home view
+//! ([`SlackClient::publish_view`]). Each is marked as an effect by
+//! [`SlackOperation::is_external_effect`], so an approval layer never has to
+//! re-derive the distinction from a verb — and the four are exactly the
+//! variants that predicate answers `true` for.
 //!
 //! Socket Mode bootstrap is kept apart because it has a different credential
 //! audience and transport: [`AppsConnectionsOpenClient`] spends only an
@@ -69,12 +80,17 @@
 //! [`SlackFailure::MissingField`], and a refusal Slack explained is a typed
 //! [`SlackRejection`] rather than an empty list.
 //!
-//! Two scope decisions are deliberate. Only `public_channel` and
-//! `private_channel` are listable ([`ConversationTypes`]): a Slack `im` object
-//! carries no `name`, and decoding one as a nameless channel is precisely the
-//! empty-string repair this crate exists to avoid. And a posted message is
-//! text and an optional thread parent — Block Kit payloads are a later
-//! refinement that belongs beside a block model, not inside a text field.
+//! One scope decision is deliberate: only `public_channel` and
+//! `private_channel` are listable ([`ConversationTypes`]), because a Slack
+//! `im` object carries no `name`, and decoding one as a nameless channel is
+//! precisely the empty-string repair this crate exists to avoid.
+//!
+//! Block Kit arrived beside a block model rather than inside a text field, as
+//! intended: [`MessageBlocks`] validates a bounded JSON array against
+//! [`MAX_MESSAGE_BLOCKS`] and [`MAX_BLOCK_KIT_BYTES`] before it can be
+//! attached, and the accessible `text` stays mandatory on every posted or
+//! updated message, so a client that cannot render blocks still reads
+//! something.
 
 mod client;
 mod connections;

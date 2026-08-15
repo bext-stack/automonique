@@ -21,3 +21,12 @@ or deployment automation.
 No contribution may include credentials, personal or customer data, private
 provider transcripts, real infrastructure identifiers, absolute home paths, or
 material without a verified right to use and distribute it.
+
+## Change checklist
+
+- A pull request that adds or enables an external surface — a network call, a
+  connector, a command that reaches a third-party API, or a configuration file
+  that turns one of those on — updates the "Repository status" section of
+  [`README.md`](README.md) in the same pull request, and moves its
+  reconciliation stamp to the reviewed commit. A reader making a risk decision
+  from that section must not be reading a description of an older system.

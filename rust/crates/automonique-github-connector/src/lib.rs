@@ -2,13 +2,30 @@
 
 //! Typed client for the GitHub issues surface Automonique works tickets through.
 //!
-//! Thirteen operations are spelled, and nothing else can be: create an issue,
-//! comment on one, open or close one, replace its labels, read one back, read
-//! its comments, read or edit one comment, conditionally replace an issue body,
-//! list repository labels or issues, search issues, and identify the
-//! credential. Around them sit the two pieces of local contract that decide
-//! *which* repository a ticket belongs in and *what* its body says: the
-//! [`RepoMap`] resolver and the [`TicketDraft`] body builder.
+//! Two request vocabularies are spelled, and nothing outside them can be.
+//!
+//! The **issue surface** is thirteen operations, one per [`GitHubOperation`]
+//! variant: create an issue, comment on one, open or close one, replace its
+//! labels, read one back, read its comments, read or edit one comment,
+//! conditionally replace an issue body, list repository labels or issues,
+//! search issues, and identify the credential. Six of them are writes, which
+//! [`GitHubOperation::is_external_effect`] answers for directly.
+//!
+//! The **work-management surface** is thirty-seven typed mutations, one per
+//! [`ManagementRequest`] constructor, sent through
+//! [`GitHubClient::manage`]: labels and milestones (create, update, delete),
+//! issue metadata, locking and unlocking, transferring and pinning, the
+//! sub-issue hierarchy and issue dependencies, and the Projects surface —
+//! projects, fields, views, items, drafts and statuses. That module exposes
+//! constructors rather than paths for the same reason the issue surface does,
+//! and validates every repository and project coordinate before a request can
+//! be rendered. A management plan is bounded at
+//! [`MAX_MANAGEMENT_OPERATIONS`], and its bodies are produced by `serde_json`
+//! rather than by interpolating operator or model text.
+//!
+//! Around both sit the two pieces of local contract that decide *which*
+//! repository a ticket belongs in and *what* its body says: the [`RepoMap`]
+//! resolver and the [`TicketDraft`] body builder.
 //!
 //! # Target lock
 //!

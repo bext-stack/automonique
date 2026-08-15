@@ -3,10 +3,25 @@
 //! Typed client for the Support backend's fleet API.
 //!
 //! One product surface is reachable here: the support board behind the fleet
-//! endpoint `POST <base>/api/manage/shelldeck/fleet`. Seven actions are spelled,
-//! and nothing else can be: reading the support queue, resolving a mail message
-//! to its thread, adding an internal note, replying on a thread, and sending a
-//! support email.
+//! endpoint `POST <base>/api/manage/shelldeck/fleet`. Eight actions are
+//! spelled — one per private `WireAction` variant — and nothing else can be.
+//!
+//! Five work the support queue directly: read it
+//! ([`FleetClient::support_issues`]), resolve a mail message to its thread
+//! ([`FleetClient::resolve_thread`]), add an internal note
+//! ([`FleetClient::add_thread_note`]), reply on a thread
+//! ([`FleetClient::reply_thread`]), and send a support email
+//! ([`FleetClient::send_email`]).
+//!
+//! Three drive the backend's own ticket jobs: dispatch one
+//! ([`FleetClient::dispatch_ticket`]), record an administrator's terminal
+//! decision on a pending gate ([`FleetClient::decide_ticket`]), and read a
+//! job's status back ([`FleetClient::ticket_status`]).
+//!
+//! Three of the eight are reads — `support_issues`, `resolve_thread` and
+//! `ticket_status`. The other five change something the backend's users can
+//! see, and three of those five (`reply_thread`, `send_email`,
+//! `dispatch_ticket`) are visible to a client rather than only to staff.
 //!
 //! # Target lock
 //!

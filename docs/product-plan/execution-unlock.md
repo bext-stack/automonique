@@ -1,6 +1,13 @@
 # Execution unlock — owner decision brief
 
-Status: **awaiting owner decision.** Nothing in this document has been acted on.
+Status: **superseded in part by events — see the Decision record appended on
+2026-08-15 at the end of this file.** Gates B and C were opened in the tree
+between 2026-08-13 and 2026-08-15 without a written decision record; Gate A
+remains closed. The brief below is preserved unaltered as the record of what
+was withheld at the time it was written, and its original status line read
+"awaiting owner decision; nothing in this document has been acted on." Read it
+as the question, and the appended record as what happened to it.
+
 It exists so the owner can decide, with the exact code in front of them, what it
 takes to open the one capability the control plane deliberately withholds:
 running a real provider process against a real workspace.
@@ -187,3 +194,67 @@ speculatively):
 
 Until you decide, the control plane stays fail-closed by construction, which is
 the correct state for it to sit in.
+
+---
+
+## Decision record — recorded 2026-08-15, for owner countersignature
+
+**Status of this section: a record of what happened, not a grant.** The brief
+above is left exactly as it was written, because rewriting it would destroy the
+evidence of what was withheld at the time. This section is appended so that the
+gap between that brief and the tree is stated rather than discovered.
+
+**What this section is not.** It does not assert that any authority was given,
+and it must not be read as one. Where a gate was opened without a written
+decision record, the row below says so in those words, and the owner is the
+only person who can convert it into a record of authority — by countersigning,
+or by declining and directing what happens to the code that was landed.
+
+### What opened, when, and on what evidence
+
+Commits are cited by SHA rather than by subject line; several subjects in this
+range carry identifiers the publication scrub removes from the tree.
+
+| Gate / capability | Opened | Evidence | Written authority |
+|---|---|---|---|
+| **Gate C** — a daemon execution lane (`admission → launch → spool` behind an authenticated lane), named in this brief as buildable work that "waits on B1" | 2026-08-13 | `9b0cbfb` | **None found.** The lane was built before B1 was recorded. |
+| **A real provider binary driven through the enforced launch path** (Gate B2/B3 in substance, and Gate C's provider-provenance prerequisite) | 2026-08-13 | `34dc56d` | **None found.** |
+| **Gate B3 — egress posture**, resolved as a brokered egress component rather than a direct grant | 2026-08-14 | `7974128` (broker), `6702b43` (wired into the execute lane) | **None found.** The option chosen is the one this brief calls "a brokered egress component (to be built)", which is the more conservative of the two it names. |
+| **Live Telegram transport** | 2026-08-13 | `1981e73` | **None found.** |
+| **Live Slack transport, including outbound posting** | 2026-08-14 | `d49e8da` (connector), `550265b` (wired to an operator verb) | **None found.** |
+| **Live GitHub writes** (issue create, comment, checklist, work management) | 2026-08-14 | `e4f4fd8` | **None found.** |
+| **Live support-backend intake and ticket dispatch** | 2026-08-14 | `050c722` | **None found.** |
+| **A provider-backed operator command** (`/run`: task → sandboxed agent run → answer) | 2026-08-14 | `13b9aee` | **None found.** |
+| **Self-improvement: push, pull request, release activation, service restart** | 2026-08-15 | `4c1cb22` (core), `3341f0c` (approved lifecycle) | **None found.** Activation is gated behind two administrator approvals in the running system; that is a runtime control, not a written authorization to build it. |
+| **Gate A** — release trust-root cryptographic backend | not opened | `SignatureProof` still wraps an uninhabited enum; nothing in the daemon calls `release_trust_root` | n/a — correctly still closed |
+
+### What the written record actually says
+
+The most recent standing authority record,
+[`plan/owner-decisions/2026-08-12-direct-codex-development.md`](../../plan/owner-decisions/2026-08-12-direct-codex-development.md),
+grants ordinary direct development and explicitly **withholds** "live
+transport/provider enablement … absent exact contemporaneous authority". Every
+row above postdates it. `AGENTS.md` allows that authority to be given
+contemporaneously — spoken in-session, not necessarily in a file — so the
+absence of a written record does not establish that no authority was given. It
+establishes only that none was written down, which is the defect this section
+exists to close.
+
+### What the owner is being asked to do
+
+1. **Countersign or decline each row.** For each capability above, record
+   either "authorized on `<date>`, retroactively confirmed" or "not
+   authorized", in a new dated file under `plan/owner-decisions/`. A decline is
+   an actionable answer: it names code to disable behind its configuration
+   gate, not code to argue about.
+2. **Decide Gate A separately.** It is untouched and independent, and the
+   recommendation in this brief still stands: it affects release admission
+   only, and does not block a run.
+3. **Set the rule for next time.** The reason this record is retroactive is
+   that no step in the process required a written decision before a surface
+   went live. The corresponding forward control is the status-reconciliation
+   checklist item in [`CONTRIBUTING.md`](../../CONTRIBUTING.md): a pull request
+   that enables an external surface updates the repository status in the same
+   pull request. That makes the *disclosure* automatic; making the
+   *authorization* automatic is a separate decision the owner may want to make
+   here.
