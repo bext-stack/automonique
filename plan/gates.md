@@ -15,7 +15,7 @@ longer a development admission control.
 | [`GATE-BASELINE`](#gate-baseline) | `BOOT-001` | ~~all work~~ **closed** |
 | [`GATE-IDENTITY`](#gate-identity) | `BOOT-002` | advisory identity-hardening claim only |
 | [`GATE-SCRUB`](#gate-scrub) | `BOOT-003` | making the repository public |
-| [`GATE-ORACLE`](#gate-oracle) | `BOOT-004` | differential parity, fixture capture |
+| [`GATE-ORACLE`](#gate-oracle) | `BOOT-004` | archive-differential parity, fixture capture |
 | [`GATE-HARNESS`](#gate-harness) | owner decision | further self-host harness work (`R0-19`…`R0-40`) |
 | [`GATE-LICENCE`](#gate-licence) | first distribution contract | advisory release-readiness claim only |
 
@@ -269,7 +269,21 @@ parity and shadow oracle) depends on that comparison. Until `BOOT-004` nothing
 separated the oracle's output from the legacy source it runs against, so
 running one would have contaminated the clean room it is meant to protect.
 
-Blocks: `R0-02` and `R0-07` fixture capture, and all differential parity work.
+Blocks: `R0-02` and `R0-07` fixture capture, and **archive-differential**
+parity work — any comparison that requires reading, executing, or receiving
+output derived from the private legacy archive on the custody host.
+
+**Scope re-stated 2026-08-15** by
+[`plan/owner-decisions/2026-08-15-gate-oracle-scope.md`](owner-decisions/2026-08-15-gate-oracle-scope.md).
+This line previously read "and all differential parity work", which was broader
+than the hazard: live-traffic shadow comparison observes only what the legacy
+bot publishes into shared channels this daemon is already a member of — the same
+bytes every workspace member receives — so it needs no custody-host access, no
+archive credential, and no cooperation from the custodian. It never crosses this
+boundary, so this gate never governed it. What the gate blocks is unchanged in
+substance; what it *claimed* to block was wider than what it protects. The
+narrowing is to the blocking claim only: nothing below is relaxed, and the
+boundary mechanism itself is untouched.
 
 Closing evidence:
 

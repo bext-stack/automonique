@@ -45,8 +45,11 @@ Agents implementing the clean product must not receive legacy implementation
 source. A parity oracle may execute privately against synthetic inputs, but it
 must expose only bounded behavior results and must not emit source, private
 data, credentials, proprietary identifiers, or implementation text. The
-enforcement mechanism for that boundary is unbuilt; it is tracked as
-`GATE-ORACLE` in `plan/gates.md` and blocks differential parity work.
+enforcement mechanism for that boundary is built and measured — `tools/oracle/`,
+under `BOOT-004` — but is not yet accepted: it is tracked as `GATE-ORACLE` in
+`plan/gates.md`, which stays open on its fourth closing condition and states
+what it blocks. That statement is the authority for the scope; this paragraph
+does not restate it.
 
 ## Repository identity
 
