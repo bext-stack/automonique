@@ -13,7 +13,7 @@ repository_root=$(CDPATH= cd -- "$script_directory/.." && pwd)
 cd "$repository_root/rust"
 
 CARGO_TARGET_DIR=target/chat-provider-static \
-RUSTFLAGS='-C target-feature=+crt-static' \
-    cargo build --release -p automonique-chat-provider
+    cargo rustc --release -p automonique-chat-provider \
+    --bin automonique-chat-provider -- -C target-feature=+crt-static
 
 file target/chat-provider-static/release/automonique-chat-provider
