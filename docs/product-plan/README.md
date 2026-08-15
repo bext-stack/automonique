@@ -11,14 +11,30 @@ When documents disagree, use this order and stop on an unresolved conflict:
 | Layer | Authority | Where |
 |---|---|---|
 | 1 | licensing, governance, security, provenance, agent policy | `LICENSE-POLICY.md`, `GOVERNANCE.md`, `SECURITY.md`, `PROVENANCE.md`, `AGENTS.md` |
-| 2 | blocking gates | `plan/gates.md` |
-| 3 | executable plan — order, authority, licence class | `plan/work-graph.toml`, `plan/contracts/` |
-| 4 | product intent and target architecture | this file, `architecture.md` |
-| 5 | product requirements and the capability ledger | `requirements/` |
-| 6 | historical context | `reference/` |
+| 2 | product intent and target architecture | this file, `architecture.md` |
+| 3 | product requirements and the capability ledger | `requirements/` |
+| 4 | historical context | `reference/` |
 
 No requirement can grant itself authority that a higher layer withholds. A
 lower layer may refine a higher one; it may never widen it.
+
+**Amended 2026-08-15.** `plan/gates.md` and the executable plan
+(`plan/work-graph.toml`, `plan/contracts/`) previously occupied blocking layers
+2 and 3. They no longer do, and they had already stopped doing so elsewhere:
+`AGENTS.md` § Automonique development policy and `GOVERNANCE.md` § Review both
+record that the harness under `plan/` is retained as planning history and is
+not a prerequisite for development or a governance boundary. This table was the
+last document still asserting the old order, which made it the one a reader
+would have obeyed. Requirements move up accordingly.
+
+`plan/gates.md` keeps one real and non-blocking role, the one its own header
+claims: it holds the **closing evidence a capability claim needs**. A gate no
+longer decides whether work may start, be committed, or be pushed; it decides
+whether a particular claim — "the scrub is complete", "identity separation is
+achieved" — is supported. Read it that way, and never as an admission control.
+`plan/check.py` may still interpret gates as blocking for someone who
+explicitly opts into the archived graph workflow; that is a tool mode, not this
+repository's decision order.
 
 `reference/` material describes the prior product and migration. It is context,
 never a source of new product requirements, and cannot override any higher
