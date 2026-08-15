@@ -103,7 +103,7 @@ pub const MAX_ALLOWED_USERS: usize = 256;
 /// being read rather than after an allocation.
 pub const MAX_USER_ID_BYTES: usize = 20;
 /// Number of commands in the closed registry.
-pub const COMMAND_COUNT: usize = 26;
+pub const COMMAND_COUNT: usize = 27;
 
 const _: () = assert!(COMMAND_COUNT == CommandKind::ALL.len());
 const _: () = assert!(MAX_COMMAND_NAME_BYTES <= MAX_COMMAND_TEXT_BYTES);
@@ -238,6 +238,8 @@ pub enum CommandKind {
     Forget,
     /// Start a fresh conversation while preserving long-term memory.
     New,
+    /// Run one explicitly authorized public-web research question.
+    Research,
     /// Create one GitHub issue in a configured repository.
     GitHubCreate,
     /// Reply to one exact GitHub issue.
@@ -272,6 +274,7 @@ impl CommandKind {
         Self::Remember,
         Self::Forget,
         Self::New,
+        Self::Research,
         Self::GitHubCreate,
         Self::GitHubReply,
         Self::GitHubCheck,
@@ -387,6 +390,12 @@ impl CommandKind {
                 name: "new",
                 description: "Start a new conversation",
                 argument: ArgumentShape::None,
+                tier: CommandTier::Admin,
+            },
+            Self::Research => CommandSpec {
+                name: "research",
+                description: "Authorize public-web research for one exact question",
+                argument: ArgumentShape::Task,
                 tier: CommandTier::Admin,
             },
             Self::GitHubCreate => CommandSpec {
@@ -560,6 +569,9 @@ pub fn help_text() -> String {
     for entry in command_manifest() {
         let usage = match entry.kind.argument() {
             ArgumentShape::None => String::new(),
+            ArgumentShape::Task if entry.kind == CommandKind::Research => {
+                String::from(" <question>")
+            }
             ArgumentShape::Task => String::from(" <task>"),
             ArgumentShape::Reference => String::from(" <reference>"),
             ArgumentShape::Directive => String::from(" <add|remove|list> [user_id]"),
@@ -1193,6 +1205,11 @@ pub enum ControlCommand {
     Forget { memory_ref: ControlRef },
     /// Reset the active conversation projection, not long-term memory.
     New,
+    /// Spend one contained run with live public-web search enabled.
+    Research {
+        /// The exact bounded question whose public-web lookup is authorized.
+        question: RunTask,
+    },
     /// Create one issue in the configured repository this alias resolves to.
     GitHubCreate {
         /// The owner-configured repository alias.
@@ -1297,6 +1314,7 @@ impl ControlCommand {
             Self::Remember { .. } => CommandKind::Remember,
             Self::Forget { .. } => CommandKind::Forget,
             Self::New => CommandKind::New,
+            Self::Research { .. } => CommandKind::Research,
             Self::GitHubCreate { .. } => CommandKind::GitHubCreate,
             Self::GitHubReply { .. } => CommandKind::GitHubReply,
             Self::GitHubCheck { .. } => CommandKind::GitHubCheck,
@@ -1433,6 +1451,9 @@ pub fn command_refusal_text(text: &str, refusal: CommandRefusal) -> String {
                 String::from("Missing the channel label. Usage: /slack <channel|list>.")
             }
             CommandKind::Run => String::from("Missing the task. Usage: /run <task>."),
+            CommandKind::Research => {
+                String::from("Missing the question. Usage: /research <question>.")
+            }
             CommandKind::Admin => {
                 String::from("Missing the admin action. Usage: /admin <add|remove|list> [user_id].")
             }
@@ -1531,6 +1552,7 @@ const fn command_usage(kind: CommandKind) -> &'static str {
         CommandKind::GitHubProject => "/github_project <request>",
         CommandKind::Work => "/work <reference>",
         CommandKind::Run => "/run <task>",
+        CommandKind::Research => "/research <question>",
         CommandKind::Say => "/say <channel> <message>",
         CommandKind::Cancel => "/cancel <reference>",
         CommandKind::Approve => "/approve <reference>",
@@ -1887,6 +1909,9 @@ fn parse_arguments(kind: CommandKind, rest: &str) -> Result<ControlCommand, Comm
             one_reference(rest).map(|memory_ref| ControlCommand::Forget { memory_ref })
         }
         CommandKind::New => no_argument(rest).map(|()| ControlCommand::New),
+        CommandKind::Research => {
+            RunTask::new(rest).map(|question| ControlCommand::Research { question })
+        }
         CommandKind::GitHubCreate => {
             one_github_repository_request(rest).map(|(repo_alias, request)| {
                 ControlCommand::GitHubCreate {
@@ -2149,6 +2174,7 @@ mod tests {
             assert!(text.contains(entry.description), "{}", entry.name);
         }
         assert!(text.contains("/run <task>"));
+        assert!(text.contains("/research <question>"));
         assert!(text.contains("/slack <channel|list>"));
         assert!(text.contains("/say <channel> <message>"));
         assert!(text.contains("/cancel <reference>"));
@@ -2163,6 +2189,24 @@ mod tests {
         assert!(text.contains("/tickets — "));
         assert!(text.contains("ask read-only questions in ordinary language"));
         assert!(text.contains("actions still require an explicit command"));
+    }
+
+    #[test]
+    fn research_command_is_exact_bounded_public_web_consent() {
+        assert_eq!(
+            parse_command("/research who maintains example.com?"),
+            Ok(ControlCommand::Research {
+                question: RunTask::new("who maintains example.com?").expect("question")
+            })
+        );
+        assert_eq!(
+            parse_command("/research"),
+            Err(CommandRefusal::MissingArgument)
+        );
+        assert_eq!(
+            command_refusal_text("/research", CommandRefusal::MissingArgument),
+            "Missing the question. Usage: /research <question>."
+        );
     }
 
     #[test]
@@ -2753,6 +2797,7 @@ mod tests {
             (CommandKind::Remember, CommandTier::Admin),
             (CommandKind::Forget, CommandTier::Admin),
             (CommandKind::New, CommandTier::Admin),
+            (CommandKind::Research, CommandTier::Admin),
             (CommandKind::GitHubCreate, CommandTier::Admin),
             (CommandKind::GitHubReply, CommandTier::Admin),
             (CommandKind::GitHubCheck, CommandTier::Admin),
@@ -2784,6 +2829,7 @@ mod tests {
                     | CommandKind::Remember
                     | CommandKind::Forget
                     | CommandKind::New
+                    | CommandKind::Research
                     | CommandKind::GitHubCreate
                     | CommandKind::GitHubReply
                     | CommandKind::GitHubCheck

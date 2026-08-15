@@ -187,6 +187,8 @@ pub enum ProviderRunProfile {
     FastConversation,
     /// Full configured model for a complex but still read-only question.
     IntelligentQuestion,
+    /// Explicitly authorized public-web research through Codex's native tool.
+    WebResearch,
 }
 
 /// Codex's per-invocation override for latency-sensitive read-only Q&A.
@@ -825,6 +827,14 @@ fn argv(
             )
         })
         .collect();
+    if arguments.first().is_some_and(|arg| arg == "exec")
+        && profile == ProviderRunProfile::WebResearch
+    {
+        // The command itself is selected by trusted dispatch after an
+        // explicit `/research` message. User text remains on stdin and can
+        // never turn an ordinary question into a web-enabled run.
+        arguments.insert(0, OsString::from("--search"));
+    }
     if profile == ProviderRunProfile::FastConversation
         && arguments.first().is_some_and(|arg| arg == "exec")
     {
@@ -915,6 +925,7 @@ fn sandbox(parts: &DocumentParts<'_>, home: &str) -> Result<SandboxSpec, Compose
                 ProviderRunProfile::FastConversation | ProviderRunProfile::IntelligentQuestion => {
                     QUESTION_MEMORY_BYTES
                 }
+                ProviderRunProfile::WebResearch => QUESTION_MEMORY_BYTES,
             },
             cgroup_cpu_millicores: 4_000,
             rlimit_processes: COMPOSE_PROCESSES,
