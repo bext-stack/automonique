@@ -10,7 +10,10 @@ fn assert_bounded_usage(stderr: &[u8]) {
     let usage = std::str::from_utf8(stderr).expect("usage is UTF-8");
     assert!(usage.starts_with("usage: automonique doctor [--json]\n"));
     assert!(usage.ends_with("       automonique shutdown\n"));
-    assert!(usage.len() <= 2 * 1024);
+    // A ceiling on the usage text, not on the command set. See the same bound
+    // in `tests/attempt_client.rs`, which also enumerates the lines that must
+    // survive any future trim.
+    assert!(usage.len() <= 4 * 1024, "usage is {} bytes", usage.len());
 }
 
 fn private_runtime() -> tempfile::TempDir {

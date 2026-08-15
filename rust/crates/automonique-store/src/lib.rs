@@ -20,6 +20,7 @@ pub mod operator_members;
 pub mod provider_journal;
 pub mod run_index;
 pub mod run_submissions;
+pub mod shadow_comparisons;
 pub mod slack_ingress;
 pub mod slack_interactions;
 pub mod support_tickets;

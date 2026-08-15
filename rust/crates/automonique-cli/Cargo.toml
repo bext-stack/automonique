@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 automonique-protocol = { path = "../automonique-protocol" }
 automonique-runner = { path = "../automonique-runner" }
+# The parity verbs read the shadow-comparison database directly, offline.
+automonique-store = { path = "../automonique-store" }
 nix.workspace = true
 serde_json.workspace = true
 

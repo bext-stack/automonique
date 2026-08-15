@@ -199,12 +199,18 @@ fn assert_bounded_usage(stderr: &str) {
         "not the usage string: {stderr}"
     );
     assert!(stderr.ends_with("       automonique shutdown\n"));
-    assert!(stderr.len() <= 2 * 1024);
+    // A ceiling on the usage text, not a ceiling on the command set: the
+    // property is that a malformed invocation answers with a bounded usage
+    // string rather than an unbounded dump. It rises when the product gains a
+    // verb group, and every line the assertions below enumerate has to survive.
+    assert!(stderr.len() <= 4 * 1024, "usage is {} bytes", stderr.len());
     for line in [
         "       automonique attempt heartbeat <socket-path>\n",
         "       automonique attempt inspect <socket-path> <attempt-id>\n",
         "       automonique attempt events <socket-path> <attempt-id> [cursor]\n",
         "       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n",
+        "       automonique parity score <database> <scope>\n",
+        "       automonique parity gate <database> <scope> <decision-key> <decider> [--registry <path>]\n",
     ] {
         assert!(stderr.contains(line), "usage lost {line:?}: {stderr}");
     }

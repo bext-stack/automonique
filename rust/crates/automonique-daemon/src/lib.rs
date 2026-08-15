@@ -149,6 +149,8 @@ mod model_inventory;
 pub mod release_activation;
 pub mod release_builder;
 pub mod run_lane;
+pub mod shadow;
+pub mod shadow_config;
 mod site_inventory;
 pub mod skill_runtime;
 pub mod slack;

@@ -311,6 +311,14 @@ pub enum SlackConfigError {
     ManageConfig(crate::manage_config::ManageConfigError),
     /// A present memory configuration was refused.
     MemoryConfig(crate::memory_config::MemoryConfigError),
+    /// A present shadow configuration was refused.
+    ShadowConfig(crate::shadow_config::ShadowConfigError),
+    /// An identity to observe was configured and its recorder could not open.
+    ///
+    /// Refused rather than quietly disabled: an operator who named a comparison
+    /// target believes a comparison is being recorded, and a harness that
+    /// silently records nothing produces a gate decision over no evidence.
+    ShadowRecorderUnavailable,
 }
 
 impl fmt::Display for SlackConfigError {
@@ -345,6 +353,9 @@ impl fmt::Display for SlackConfigError {
             }
             Self::ManageConfig(error) => write!(formatter, "{error}"),
             Self::MemoryConfig(error) => write!(formatter, "{error}"),
+            Self::ShadowConfig(error) => write!(formatter, "{error}"),
+            Self::ShadowRecorderUnavailable => formatter
+                .write_str("shadow observation is configured but its recorder is unavailable"),
         }
     }
 }
@@ -369,6 +380,8 @@ impl SlackConfigError {
             Self::GitHubActionsUnavailable => "slack_github_actions_unavailable",
             Self::ManageConfig(error) => error.category(),
             Self::MemoryConfig(error) => error.category(),
+            Self::ShadowConfig(error) => error.category(),
+            Self::ShadowRecorderUnavailable => "shadow_recorder_unavailable",
         }
     }
 }
@@ -945,6 +958,52 @@ fn slack_ticket_event(text: &str) -> Option<SlackTicketEvent> {
     })
 }
 
+/// Parse one message the configured reference bot published.
+///
+/// Deliberately the mirror image of [`slack_ticket_event`]'s filter: that
+/// function drops every message carrying a `bot_id`, which would drop the one
+/// engine the parity harness exists to compare against, *before* an observer
+/// could see it. So the tap is here, upstream of routing, and it is as narrow as
+/// the problem allows — a message is admitted only when it carries a `bot_id`
+/// **and** its author is the exact configured identity. Nothing this returns
+/// reaches the router; it reaches [`crate::shadow::LegacyObserver`], which
+/// records and does not act.
+fn slack_legacy_bot_message(
+    text: &str,
+    legacy_bot_user: &str,
+) -> Option<crate::shadow::LegacyMessage> {
+    let outer: serde_json::Value = serde_json::from_str(text).ok()?;
+    if outer.get("type")?.as_str()? != "events_api" {
+        return None;
+    }
+    let event = outer.get("payload")?.get("event")?.as_object()?;
+    if event.get("type")?.as_str()? != "message" {
+        return None;
+    }
+    // The bot_id is what makes this message one the router already discards.
+    if event.get("bot_id").is_none_or(serde_json::Value::is_null) {
+        return None;
+    }
+    if event.get("user").and_then(serde_json::Value::as_str)? != legacy_bot_user {
+        return None;
+    }
+    let channel = ChannelId::new(event.get("channel")?.as_str()?).ok()?;
+    let body = event.get("text")?.as_str()?;
+    if body.is_empty() || body.len() > 16 * 1024 || body.chars().any(|c| c == '\0') {
+        return None;
+    }
+    let ts = event.get("ts")?.as_str()?;
+    let thread = event.get("thread_ts").and_then(serde_json::Value::as_str);
+    let in_thread = thread.is_some();
+    let thread_ts = MessageTs::new(thread.unwrap_or(ts)).ok()?;
+    Some(crate::shadow::LegacyMessage {
+        channel: channel.to_string(),
+        thread_ts: thread_ts.to_string(),
+        in_thread,
+        text: body.to_owned(),
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SlackGitHubCommand {
     team_id: String,
@@ -1380,7 +1439,21 @@ struct PreparedSlackTicketInteraction {
     record: SlackInteractionRecord,
 }
 
-trait SlackTicketPoster {
+/// The Slack effect seam.
+///
+/// `pub(crate)` rather than private so [`crate::shadow`] can decorate it from a
+/// sibling module. Nothing outside this crate can name it, and
+/// [`SlackTicketRouter`] is already generic over it, so the decoration costs the
+/// router no change.
+pub(crate) trait SlackTicketPoster {
+    /// Note which inbound event the decisions that follow belong to.
+    ///
+    /// A no-op for every production implementation: a poster that actually posts
+    /// has no use for the correlation. The recording decorator needs it, because
+    /// an intended-action envelope is keyed by the source event it was decided
+    /// for, and the posting methods below carry no such key.
+    fn begin_source(&mut self, _source_key: &str) {}
+
     fn post_thread(
         &mut self,
         channel: &ChannelId,
@@ -1597,6 +1670,7 @@ struct SlackTicketRouter<P> {
 
 impl<P: SlackTicketPoster> SlackTicketRouter<P> {
     fn handle_monique_command(&mut self, command: SlackMoniqueCommand, context: &str) {
+        self.poster.begin_source(&command.source_key);
         if !self.features.contains(&SlackFeature::Commands) {
             return;
         }
@@ -2084,6 +2158,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
     }
 
     fn handle_github_command(&mut self, command: SlackGitHubCommand, context: &str) {
+        self.poster.begin_source(&command.source_key);
         let result = self.github_actions.as_mut().map_or_else(
             || crate::github_actions::GitHubActionResult {
                 text: String::from(
@@ -2097,6 +2172,11 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
     }
 
     fn handle_with_context(&mut self, event: SlackTicketEvent, context: &str) {
+        // Every decision below belongs to this event. Establishing the
+        // correlation here rather than in the socket loop means a recording
+        // poster is correctly keyed however the router is driven — including
+        // from the golden-trace replay, which has no socket loop.
+        self.poster.begin_source(&event.source_key);
         if !self
             .channels
             .0
@@ -2293,6 +2373,51 @@ pub(crate) struct SlackTicketWorker {
     router: SlackTicketRouter<SlackClient>,
     memory: AgentMemoryStore,
     interactions: SlackInteractionStore,
+    /// The reference engine's half of the parity comparison.
+    ///
+    /// `None` unless an installation configures an identity to observe. It
+    /// records and never acts, so its presence cannot change what this worker
+    /// does with an event.
+    legacy: Option<LegacyObservation>,
+}
+
+/// The configured reference identity and the recorder that files its messages.
+struct LegacyObservation {
+    bot_user: String,
+    observer: crate::shadow::LegacyObserver<crate::shadow::DurableSink>,
+}
+
+/// The parity scope this worker's decisions and observations are filed under.
+const SLACK_PARITY_SCOPE: &str = "slack-ticket-routing";
+
+/// Build the reference-engine observer, when an installation configures one.
+///
+/// Three outcomes, and they are deliberately distinct: no shadow configuration
+/// at all is `Ok(None)`; a configuration that names no identity to observe is
+/// also `Ok(None)`, because suppressing a scope and having something to compare
+/// it against are independent choices; and a configuration that names one whose
+/// recorder cannot open is a refusal.
+fn legacy_observation(state_dir: &Path) -> Result<Option<LegacyObservation>, SlackConfigError> {
+    let Some(config) = crate::shadow_config::ShadowConfig::load(state_dir)
+        .map_err(SlackConfigError::ShadowConfig)?
+    else {
+        return Ok(None);
+    };
+    let Some(bot_user) = config.legacy_bot_user() else {
+        return Ok(None);
+    };
+    let store = automonique_store::shadow_comparisons::ShadowComparisonStore::open(
+        crate::shadow_config::ShadowConfig::database_path(state_dir),
+    )
+    .map_err(|_| SlackConfigError::ShadowRecorderUnavailable)?;
+    Ok(Some(LegacyObservation {
+        bot_user: bot_user.to_owned(),
+        observer: crate::shadow::LegacyObserver::new(
+            SLACK_PARITY_SCOPE,
+            crate::shadow::ShadowClock::Host,
+            crate::shadow::DurableSink::new(store),
+        ),
+    }))
 }
 
 /// Socket Mode ticket-intake lifecycle, separate from Telegram's Slack read and
@@ -2351,8 +2476,10 @@ impl SlackTicketHost {
             }
             None => None,
         };
+        let legacy = legacy_observation(state_dir)?;
         Ok(Self::Configured {
             prepared: Some(Box::new(SlackTicketWorker {
+                legacy,
                 app: AppsConnectionsOpenClient::new(app_token),
                 connector: SlackSocketModeConnector::new(),
                 memory: AgentMemoryStore::open(state_dir.join("agent-memory.sqlite3"))
@@ -2494,6 +2621,22 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
             }
             if connection.acknowledge(&envelope_id).is_err() {
                 break;
+            }
+            // The parity tap, upstream of the router and of the bot_id filter
+            // that would otherwise have dropped the reference engine's own
+            // messages. It records; it cannot route, reply or mutate anything.
+            if let Some(legacy) = worker.legacy.as_mut() {
+                if let Some(event) = event.as_ref() {
+                    legacy.observer.correlate(
+                        &event.channel.to_string(),
+                        &event.parent.to_string(),
+                        &event.source_key,
+                    );
+                }
+                if let Some(message) = slack_legacy_bot_message(envelope.as_str(), &legacy.bot_user)
+                {
+                    legacy.observer.observe(&message);
+                }
             }
             if let Some(event) = event {
                 let context =
@@ -3546,6 +3689,208 @@ mod tests {
                 .iter()
                 .any(|message| message.contains("Confirmed by <@U0ADMIN001>"))
         );
+    }
+
+    /// The zero-effect property, which is what the whole parity milestone rests
+    /// on.
+    ///
+    /// A shadow harness whose shadow half can still post converts a *missing*
+    /// gate into a *false* one, so the assertion is not "the envelopes look
+    /// right" — it is "the production seams received nothing". Both halves are
+    /// checked against the same scenario: the spying surfaces record what the
+    /// primary engine does, the shadow surfaces are given the identical events,
+    /// and the spies are then re-read to prove they did not move.
+    mod shadow_zero_effect {
+        use super::*;
+        use crate::shadow::{
+            MemorySink, ShadowClock, ShadowPoster, ShadowRecorder, ShadowTicketSurface,
+        };
+        use automonique_protocol::parity::{ActionKind, ParityEngine};
+
+        const ISSUE: &str = "please handle https://github.com/example/project/issues/42";
+
+        fn router<P: SlackTicketPoster>(
+            poster: P,
+            manage: Box<dyn crate::telegram_bridge::TicketActionSurface + Send>,
+        ) -> SlackTicketRouter<P> {
+            SlackTicketRouter {
+                poster,
+                manage,
+                manage_url: None,
+                memory_tenant: String::from("primary"),
+                channels: ChannelMap(vec![(
+                    name("ops"),
+                    ChannelId::new("C0RESERVED01").expect("channel"),
+                )]),
+                admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+                members: vec![UserId::new("U0ADMIN001").expect("member")],
+                features: vec![SlackFeature::Approvals, SlackFeature::Conversation],
+                interactive_decisions: false,
+                gates: Arc::new(std::sync::Mutex::new(
+                    crate::telegram_bridge::TicketGateRegistry::default(),
+                )),
+                github_actions: None,
+            }
+        }
+
+        /// The same two events for both engines: one intake that opens a gate,
+        /// one confirmation attempt by somebody who may not confirm.
+        fn drive<P: SlackTicketPoster>(router: &mut SlackTicketRouter<P>) {
+            router.handle_with_context(ticket_event("U0REQUEST01", ISSUE, "Ev1"), "");
+            router.handle_with_context(
+                ticket_event("U0REQUEST01", "confirm job-fixture", "Ev2"),
+                "",
+            );
+        }
+
+        fn recorder() -> ShadowRecorder<MemorySink> {
+            ShadowRecorder::new(
+                "slack-ticket-routing",
+                ParityEngine::ShadowCandidate,
+                ShadowClock::Fixed(1_700_000_000_000),
+                MemorySink::new(),
+            )
+        }
+
+        #[test]
+        fn the_shadow_router_reaches_no_production_seam() {
+            let spy_poster = FakeTicketPoster::default();
+            let posted = Arc::clone(&spy_poster.messages);
+            let spy_manage = FakeManage::default();
+            let opened = Arc::clone(&spy_manage.opened);
+            let confirmed = Arc::clone(&spy_manage.confirmed);
+
+            // The scenario really does produce effects when the production
+            // seams are in place. Without this half, "zero calls" would be
+            // satisfied by a scenario that never asked for anything.
+            let mut primary = router(spy_poster, Box::new(spy_manage));
+            drive(&mut primary);
+            let posts_by_primary = posted.lock().expect("messages").len();
+            let dispatches_by_primary = opened.lock().expect("opened").len();
+            assert!(posts_by_primary > 0);
+            assert_eq!(dispatches_by_primary, 1);
+
+            let mut shadow = router(
+                ShadowPoster::new(recorder()),
+                Box::new(ShadowTicketSurface::new(recorder())),
+            );
+            drive(&mut shadow);
+
+            assert_eq!(
+                posted.lock().expect("messages").len(),
+                posts_by_primary,
+                "a shadow poster must not reach Slack"
+            );
+            assert_eq!(
+                opened.lock().expect("opened").len(),
+                dispatches_by_primary,
+                "a shadow ticket surface must not reach the support backend"
+            );
+            assert!(confirmed.lock().expect("confirmed").is_empty());
+        }
+
+        #[test]
+        fn the_shadow_router_records_the_decisions_it_suppressed() {
+            let mut shadow = router(
+                ShadowPoster::new(recorder()),
+                Box::new(ShadowTicketSurface::new(recorder())),
+            );
+            drive(&mut shadow);
+            let envelopes = shadow.poster.recorder().sink().envelopes().to_vec();
+            let kinds: Vec<ActionKind> = envelopes
+                .iter()
+                .map(|envelope| envelope.action().kind())
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![ActionKind::SlackThreadReply, ActionKind::SlackThreadReply],
+                "the suppressed replies are recorded, in order"
+            );
+            assert!(
+                envelopes[0]
+                    .action()
+                    .value("text")
+                    .expect("text")
+                    .contains("Confirmation required")
+            );
+            assert!(
+                envelopes[1]
+                    .action()
+                    .value("text")
+                    .expect("text")
+                    .contains("Only a configured Slack administrator")
+            );
+        }
+
+        #[test]
+        fn each_event_opens_its_own_envelope_sequence() {
+            let mut shadow = router(
+                ShadowPoster::new(recorder()),
+                Box::new(ShadowTicketSurface::new(recorder())),
+            );
+            drive(&mut shadow);
+            let envelopes = shadow.poster.recorder().sink().envelopes();
+            assert_eq!(envelopes[0].sequence(), 0);
+            assert_eq!(envelopes[1].sequence(), 0);
+            assert_ne!(envelopes[0].source_key(), envelopes[1].source_key());
+        }
+
+        #[test]
+        fn a_shadow_run_is_byte_identical_under_a_fixed_clock() {
+            let bytes = |()| {
+                let mut shadow = router(
+                    ShadowPoster::new(recorder()),
+                    Box::new(ShadowTicketSurface::new(recorder())),
+                );
+                drive(&mut shadow);
+                shadow
+                    .poster
+                    .recorder()
+                    .sink()
+                    .envelopes()
+                    .iter()
+                    .map(automonique_protocol::parity::IntendedActionEnvelope::to_canonical_bytes)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bytes(()), bytes(()));
+        }
+    }
+
+    #[test]
+    fn a_reference_bot_message_is_seen_upstream_of_the_filter_that_drops_it() {
+        let envelope = |body: &str| {
+            format!(
+                "{{\"type\":\"events_api\",\"payload\":{{\"event_id\":\"Ev1\",\"team_id\":\"T0RESERVED\",\"event\":{{{body}}}}}}}"
+            )
+        };
+        let bot = envelope(
+            "\"type\":\"message\",\"bot_id\":\"B0OTHER0001\",\"user\":\"U0REFERENCE\",\"channel\":\"C0RESERVED01\",\"text\":\"on it\",\"ts\":\"1723542000.000100\",\"thread_ts\":\"1723542000.000100\"",
+        );
+        // The router's own parser drops it, which is exactly why the observer
+        // taps upstream.
+        assert!(slack_ticket_event(&bot).is_none());
+        let observed = slack_legacy_bot_message(&bot, "U0REFERENCE").expect("observed");
+        assert_eq!(observed.channel, "C0RESERVED01");
+        assert!(observed.in_thread);
+        assert_eq!(observed.text, "on it");
+
+        // Only the configured identity is admitted; every other bot stays
+        // dropped, so the allowance is one bot rather than all of them.
+        assert!(slack_legacy_bot_message(&bot, "U0SOMEONEELSE").is_none());
+
+        // A human message carries no bot_id and is the router's business, not
+        // the observer's.
+        let human = envelope(
+            "\"type\":\"message\",\"user\":\"U0REFERENCE\",\"channel\":\"C0RESERVED01\",\"text\":\"hello\",\"ts\":\"1723542000.000100\"",
+        );
+        assert!(slack_legacy_bot_message(&human, "U0REFERENCE").is_none());
+
+        // A top-level post is distinguishable from a threaded reply.
+        let top_level = envelope(
+            "\"type\":\"message\",\"bot_id\":\"B0OTHER0001\",\"user\":\"U0REFERENCE\",\"channel\":\"C0RESERVED01\",\"text\":\"notice\",\"ts\":\"1723542000.000100\"",
+        );
+        let observed = slack_legacy_bot_message(&top_level, "U0REFERENCE").expect("observed");
+        assert!(!observed.in_thread);
     }
 
     #[test]

@@ -29,6 +29,7 @@ pub mod journal;
 pub mod memory_api;
 pub mod models;
 pub mod namespace;
+pub mod parity;
 pub mod primitives;
 pub mod protocols;
 pub mod provider;
