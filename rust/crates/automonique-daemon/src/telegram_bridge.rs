@@ -150,7 +150,7 @@ use crate::github::IssueFactDetail;
 use crate::github_actions::{
     GitHubActionEngine, GitHubActionRequest, GitHubManagementDomain, is_github_capability_question,
 };
-use crate::improvement_github::ImprovementGitHubBroker;
+use crate::improvement_github::{ImprovementGitHubBroker, ImprovementGitHubError};
 use crate::improvement_worker::ImprovementWorker;
 use crate::improvements::{
     ImprovementCoordinator, ImprovementIntent, ImprovementPlan, PreparedRenderedPlan,
@@ -4238,19 +4238,32 @@ where
                 .improvements
                 .as_ref()
                 .and_then(|coordinator| coordinator.store().get(improvement_id).ok().flatten());
-            if current.as_ref().is_some_and(|record| {
-                record.state == ImprovementState::PlanApproved
-                    && matches!(
-                        guidance.request.to_ascii_lowercase().as_str(),
-                        "continue" | "retry"
-                    )
-            }) {
-                return self.execute_approved_improvement(
-                    actor_id,
-                    chat_id,
-                    current.expect("checked above"),
-                    now_ms,
-                );
+            // The approval challenge is consumed on the press, so a lane that
+            // stopped short — the lab was unconfigured, or a required check had
+            // not finished — has to be resumable without a second button.
+            let resume = matches!(
+                guidance.request.to_ascii_lowercase().as_str(),
+                "continue" | "retry"
+            )
+            .then(|| current.as_ref().map(|record| record.state))
+            .flatten();
+            match resume {
+                Some(ImprovementState::PlanApproved) => {
+                    return self.execute_approved_improvement(
+                        actor_id,
+                        chat_id,
+                        current.expect("checked above"),
+                        now_ms,
+                    );
+                }
+                Some(ImprovementState::ReleaseApproved) => {
+                    return self.activate_approved_release(
+                        chat_id,
+                        current.expect("checked above"),
+                        now_ms,
+                    );
+                }
+                _ => {}
             }
             match self
                 .improvements
@@ -4499,94 +4512,150 @@ where
                 self.execute_approved_improvement(actor_id, chat_id, outcome.improvement, now_ms)
             }
             ImprovementState::ReleaseApproved => {
-                let record = outcome.improvement;
-                let merge = self
-                    .improvement_github
-                    .as_mut()
-                    .ok_or(())
-                    .and_then(|broker| {
-                        broker
-                            .merge_implementation(
-                                record.implementation_pr_number.unwrap_or_default(),
-                                record
-                                    .implementation_head_sha
-                                    .as_deref()
-                                    .unwrap_or_default(),
-                            )
-                            .map_err(|_| ())
-                    });
-                let Ok(merge) = merge else {
-                    return improvement_unavailable(chat_id);
-                };
-                if record.implementation_tree_sha.as_deref() != Some(merge.merged_tree_sha.as_str())
-                {
-                    return improvement_unavailable(chat_id);
-                }
-                let activating =
-                    match self
-                        .improvements
-                        .as_mut()
-                        .ok_or(())
-                        .and_then(|coordinator| {
-                            coordinator
-                                .start_activation(record.entry_id, record.revision, now_ms)
-                                .map_err(|_| ())
-                        }) {
-                        Ok(record) => record,
-                        Err(()) => return improvement_unavailable(chat_id),
-                    };
-                let digest = activating
-                    .release_manifest_digest
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_owned();
-                let activation = self
-                    .improvement_worker
-                    .as_mut()
-                    .and_then(|worker| worker.activate(&activating, &digest).ok());
-                let Some(activation) = activation else {
-                    let _ = self.improvements.as_mut().and_then(|coordinator| {
-                        coordinator
-                            .fail(
-                                activating.entry_id,
-                                activating.revision,
-                                "activation_failed",
-                                now_ms,
-                            )
-                            .ok()
-                    });
-                    return improvement_unavailable(chat_id);
-                };
-                if activation == crate::improvement_worker::ActivationDisposition::Scheduled {
-                    return Answer::Answered {
-                        chat_id,
-                        text: format!(
-                            "{} code activation is scheduled for release {}. The supervised helper will record completion or rollback after restart readiness is known.",
-                            activating.public_id(),
-                            digest
-                        ),
-                        preformatted: false,
-                    };
-                }
-                match self.improvements.as_mut().and_then(|coordinator| {
-                    coordinator
-                        .complete_activation(
-                            activating.entry_id,
-                            activating.revision,
-                            &digest,
-                            now_ms,
-                        )
-                        .ok()
-                }) {
-                    Some(completed) => Answer::Answered {
-                        chat_id,
-                        text: format!("{} is active at release {}.", completed.public_id(), digest),
-                        preformatted: false,
-                    },
-                    None => improvement_unavailable(chat_id),
-                }
+                self.activate_approved_release(chat_id, outcome.improvement, now_ms)
             }
             _ => improvement_unavailable(chat_id),
+        }
+    }
+
+    /// Merge and activate one approved release, but only once the required
+    /// checks are green on exactly the commit that is about to be merged.
+    ///
+    /// The gate runs before the merge, not only before the link switch: a
+    /// squash merge into a public `main` is the irreversible half of this
+    /// operation, and a red candidate must not reach it. A pending or red
+    /// verdict leaves the record in `release_approved` so the owner can resume
+    /// with `IMP-000001: continue` — the release challenge was consumed on
+    /// approval and there is no second button to press.
+    fn activate_approved_release(
+        &mut self,
+        chat_id: i64,
+        record: automonique_store::improvements::ImprovementRecord,
+        now_ms: i64,
+    ) -> Answer {
+        let head_sha = record
+            .implementation_head_sha
+            .as_deref()
+            .unwrap_or_default()
+            .to_owned();
+        let evidence = match self
+            .improvement_github
+            .as_mut()
+            .ok_or(ImprovementGitHubError::NotFound)
+            .and_then(|broker| broker.candidate_ci(&head_sha))
+            .and_then(|evidence| evidence.canonical_json())
+        {
+            Ok(evidence) => evidence,
+            Err(ImprovementGitHubError::CiPending(check)) => {
+                return Answer::Answered {
+                    chat_id,
+                    text: format!(
+                        "{} stays release_approved: required check `{}` is still running on the tested commit. Send `{}: continue` once it finishes.",
+                        record.public_id(),
+                        check,
+                        record.public_id()
+                    ),
+                    preformatted: false,
+                };
+            }
+            Err(ImprovementGitHubError::CiRed(check)) => {
+                return Answer::Answered {
+                    chat_id,
+                    text: format!(
+                        "{} stays release_approved and nothing was merged: required check `{}` did not pass on the tested commit.",
+                        record.public_id(),
+                        check
+                    ),
+                    preformatted: false,
+                };
+            }
+            Err(ImprovementGitHubError::CiAbsent(check)) => {
+                return Answer::Answered {
+                    chat_id,
+                    text: format!(
+                        "{} stays release_approved and nothing was merged: required check `{}` never ran on the tested commit.",
+                        record.public_id(),
+                        check
+                    ),
+                    preformatted: false,
+                };
+            }
+            Err(_) => return improvement_unavailable(chat_id),
+        };
+        let merge = self
+            .improvement_github
+            .as_mut()
+            .ok_or(())
+            .and_then(|broker| {
+                broker
+                    .merge_implementation(
+                        record.implementation_pr_number.unwrap_or_default(),
+                        &head_sha,
+                    )
+                    .map_err(|_| ())
+            });
+        let Ok(merge) = merge else {
+            return improvement_unavailable(chat_id);
+        };
+        if record.implementation_tree_sha.as_deref() != Some(merge.merged_tree_sha.as_str()) {
+            return improvement_unavailable(chat_id);
+        }
+        let activating = match self
+            .improvements
+            .as_mut()
+            .ok_or(())
+            .and_then(|coordinator| {
+                coordinator
+                    .start_activation(record.entry_id, record.revision, &evidence, now_ms)
+                    .map_err(|_| ())
+            }) {
+            Ok(record) => record,
+            Err(()) => return improvement_unavailable(chat_id),
+        };
+        let digest = activating
+            .release_manifest_digest
+            .as_deref()
+            .unwrap_or_default()
+            .to_owned();
+        let activation = self
+            .improvement_worker
+            .as_mut()
+            .and_then(|worker| worker.activate(&activating, &digest).ok());
+        let Some(activation) = activation else {
+            let _ = self.improvements.as_mut().and_then(|coordinator| {
+                coordinator
+                    .fail(
+                        activating.entry_id,
+                        activating.revision,
+                        "activation_failed",
+                        now_ms,
+                    )
+                    .ok()
+            });
+            return improvement_unavailable(chat_id);
+        };
+        if activation == crate::improvement_worker::ActivationDisposition::Scheduled {
+            return Answer::Answered {
+                chat_id,
+                text: format!(
+                    "{} code activation is scheduled for release {}. The supervised helper will record completion or rollback after restart readiness is known.",
+                    activating.public_id(),
+                    digest
+                ),
+                preformatted: false,
+            };
+        }
+        match self.improvements.as_mut().and_then(|coordinator| {
+            coordinator
+                .complete_activation(activating.entry_id, activating.revision, &digest, now_ms)
+                .ok()
+        }) {
+            Some(completed) => Answer::Answered {
+                chat_id,
+                text: format!("{} is active at release {}.", completed.public_id(), digest),
+                preformatted: false,
+            },
+            None => improvement_unavailable(chat_id),
         }
     }
 

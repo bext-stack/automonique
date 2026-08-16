@@ -5,10 +5,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use automonique_store::improvements::{
-    ApprovalAttempt, ApprovalKind, ImprovementState, ImprovementStore, ImprovementStoreError,
-    NewApprovalChallenge, NewImprovement, PlanSubmission, ReleaseSubmission, StateTransition,
+    ApprovalAttempt, ApprovalKind, IMPROVEMENT_STORE_SCHEMA_VERSION, ImprovementState,
+    ImprovementStore, ImprovementStoreError, MAX_CI_EVIDENCE_BYTES, NewApprovalChallenge,
+    NewImprovement, PlanSubmission, ReleaseSubmission, StateTransition,
 };
 use tempfile::TempDir;
+
+/// A canonical evidence document of the shape the GitHub broker produces.
+const CI_EVIDENCE: &str = r#"{"gates":[{"check_run_id":1,"completed_at":"2026-08-15T10:00:00Z","name":"workspace","url":"https://github.com/owner/repository/runs/1"}],"head_sha":"1111111111111111111111111111111111111111"}"#;
 
 struct PrivateStore {
     _directory: TempDir,
@@ -126,6 +130,7 @@ fn full_two_gate_lifecycle_survives_restart_and_has_an_append_only_history() {
             to: ImprovementState::Implementing,
             failure_reason: None,
             active_release_digest: None,
+            ci_evidence: None,
             now_ms: 5_000,
         })
         .expect("start implementation");
@@ -154,7 +159,7 @@ fn full_two_gate_lifecycle_survives_restart_and_has_an_append_only_history() {
         "approve:release:nonce",
     );
     approve(&mut store, "approve:release:nonce", 3_900);
-    store
+    let activating = store
         .transition(StateTransition {
             improvement_id: id,
             expected_revision: 6,
@@ -162,9 +167,11 @@ fn full_two_gate_lifecycle_survives_restart_and_has_an_append_only_history() {
             to: ImprovementState::Activating,
             failure_reason: None,
             active_release_digest: None,
+            ci_evidence: Some(CI_EVIDENCE),
             now_ms: 7_000,
         })
         .expect("begin activation");
+    assert_eq!(activating.ci_evidence.as_deref(), Some(CI_EVIDENCE));
     let completed = store
         .transition(StateTransition {
             improvement_id: id,
@@ -173,6 +180,7 @@ fn full_two_gate_lifecycle_survives_restart_and_has_an_append_only_history() {
             to: ImprovementState::Completed,
             failure_reason: None,
             active_release_digest: Some("sha256:release-one"),
+            ci_evidence: None,
             now_ms: 8_000,
         })
         .expect("complete activation");
@@ -316,6 +324,7 @@ fn revisions_are_fences_and_approval_states_have_no_unguarded_transition() {
             to: ImprovementState::Draft,
             failure_reason: None,
             active_release_digest: None,
+            ci_evidence: None,
             now_ms: 3_000,
         })
         .expect_err("stale revision");
@@ -335,6 +344,7 @@ fn revisions_are_fences_and_approval_states_have_no_unguarded_transition() {
             to: ImprovementState::PlanApproved,
             failure_reason: None,
             active_release_digest: None,
+            ci_evidence: None,
             now_ms: 3_000,
         })
         .expect_err("approval bypass");
@@ -357,6 +367,7 @@ fn requesting_a_plan_revision_clears_the_superseded_binding() {
             to: ImprovementState::Draft,
             failure_reason: None,
             active_release_digest: None,
+            ci_evidence: None,
             now_ms: 3_000,
         })
         .expect("request revision");
@@ -414,6 +425,7 @@ fn release_changes_return_to_a_fresh_plan_approval() {
             to: ImprovementState::Implementing,
             failure_reason: None,
             active_release_digest: None,
+            ci_evidence: None,
             now_ms: 5_000,
         })
         .expect("start implementation");
@@ -460,4 +472,191 @@ fn store_paths_must_remain_private() {
         .expect("loosen database permissions");
     let error = ImprovementStore::open(private.path()).expect_err("privacy refusal");
     assert!(matches!(error, ImprovementStoreError::InsecurePath(_)));
+}
+
+/// Drive one improvement to `release_approved`, the state the CI gate guards.
+fn release_approved(store: &mut ImprovementStore) -> i64 {
+    let id = create(store);
+    plan(store, id);
+    challenge(store, id, 2, ApprovalKind::Plan, "approve:plan:gate");
+    approve(store, "approve:plan:gate", 3_500);
+    store
+        .transition(StateTransition {
+            improvement_id: id,
+            expected_revision: 3,
+            actor: "automonique:lab",
+            to: ImprovementState::Implementing,
+            failure_reason: None,
+            active_release_digest: None,
+            ci_evidence: None,
+            now_ms: 5_000,
+        })
+        .expect("start implementation");
+    store
+        .submit_release(ReleaseSubmission {
+            improvement_id: id,
+            expected_revision: 4,
+            actor: "automonique:lab",
+            implementation_head_sha: "cccccccccccccccccccccccccccccccccccccccc",
+            implementation_tree_sha: "dddddddddddddddddddddddddddddddddddddddd",
+            release_manifest_digest: "sha256:release-gate",
+            implementation_pr_number: 31,
+            implementation_pr_url: "https://github.com/bext-stack/automonique/pull/31",
+            now_ms: 6_000,
+        })
+        .expect("submit release");
+    challenge(store, id, 5, ApprovalKind::Release, "approve:release:gate");
+    approve(store, "approve:release:gate", 3_900);
+    id
+}
+
+fn begin_activation(
+    store: &mut ImprovementStore,
+    id: i64,
+    ci_evidence: Option<&str>,
+) -> Result<(), ImprovementStoreError> {
+    store
+        .transition(StateTransition {
+            improvement_id: id,
+            expected_revision: 6,
+            actor: "automonique:activator",
+            to: ImprovementState::Activating,
+            failure_reason: None,
+            active_release_digest: None,
+            ci_evidence,
+            now_ms: 7_000,
+        })
+        .map(drop)
+}
+
+#[test]
+fn activation_is_unreachable_without_recorded_ci_evidence() {
+    let (_private, mut store) = store();
+    let id = release_approved(&mut store);
+    assert!(matches!(
+        begin_activation(&mut store, id, None).expect_err("evidence is required"),
+        ImprovementStoreError::InvalidField("ci_evidence")
+    ));
+    // The refusal must not have moved the record: a release that could not
+    // prove its CI is still approved, not half-activated.
+    let current = store.get(id).expect("read").expect("record");
+    assert_eq!(current.state, ImprovementState::ReleaseApproved);
+    assert_eq!(current.revision, 6);
+    assert_eq!(current.ci_evidence, None);
+
+    begin_activation(&mut store, id, Some(CI_EVIDENCE)).expect("green evidence activates");
+    let current = store.get(id).expect("read").expect("record");
+    assert_eq!(current.state, ImprovementState::Activating);
+    assert_eq!(current.ci_evidence.as_deref(), Some(CI_EVIDENCE));
+}
+
+#[test]
+fn ci_evidence_is_bounded_and_refused_outside_activation() {
+    let (_private, mut store) = store();
+    let id = release_approved(&mut store);
+    for rejected in ["", "   ", "not-json"] {
+        assert!(matches!(
+            begin_activation(&mut store, id, Some(rejected)).expect_err("shape"),
+            ImprovementStoreError::InvalidField("ci_evidence")
+        ));
+    }
+    let oversized = format!("{{\"gates\":\"{}\"}}", "e".repeat(MAX_CI_EVIDENCE_BYTES));
+    assert!(matches!(
+        begin_activation(&mut store, id, Some(&oversized)).expect_err("bound"),
+        ImprovementStoreError::InvalidField("ci_evidence")
+    ));
+    // Evidence on any other target is a caller confusion, not a harmless extra.
+    let stray = store
+        .transition(StateTransition {
+            improvement_id: id,
+            expected_revision: 6,
+            actor: "automonique:controller",
+            to: ImprovementState::Failed,
+            failure_reason: Some("ci_red"),
+            active_release_digest: None,
+            ci_evidence: Some(CI_EVIDENCE),
+            now_ms: 7_000,
+        })
+        .expect_err("evidence outside activation");
+    assert!(matches!(
+        stray,
+        ImprovementStoreError::InvalidField("ci_evidence")
+    ));
+}
+
+#[test]
+fn an_approved_release_can_fail_without_ever_activating() {
+    let (_private, mut store) = store();
+    let id = release_approved(&mut store);
+    let failed = store
+        .transition(StateTransition {
+            improvement_id: id,
+            expected_revision: 6,
+            actor: "automonique:controller",
+            to: ImprovementState::Failed,
+            failure_reason: Some("ci_red"),
+            active_release_digest: None,
+            ci_evidence: None,
+            now_ms: 7_000,
+        })
+        .expect("release_approved has an exit other than activating");
+    assert_eq!(failed.state, ImprovementState::Failed);
+    assert_eq!(failed.failure_reason.as_deref(), Some("ci_red"));
+    assert_eq!(failed.ci_evidence, None);
+}
+
+#[test]
+fn a_v1_database_migrates_to_v2_with_its_journal_intact() {
+    let private = PrivateStore::new();
+    {
+        let mut store = ImprovementStore::open(private.path()).expect("create");
+        let id = release_approved(&mut store);
+        assert_eq!(id, 1);
+    }
+
+    // Put the file back at V1: drop the column the migration adds and reset the
+    // version, so what reopens is a database that has never seen this change.
+    {
+        let connection = rusqlite::Connection::open(private.path()).expect("open");
+        connection
+            .execute_batch("ALTER TABLE improvements DROP COLUMN ci_evidence;")
+            .expect("undo the column");
+        connection
+            .pragma_update(None, "user_version", 1)
+            .expect("undo the version");
+    }
+
+    let mut store = ImprovementStore::open(private.path()).expect("migrate v1 to v2");
+    let record = store.get(1).expect("read").expect("record");
+    assert_eq!(record.state, ImprovementState::ReleaseApproved);
+    assert_eq!(record.revision, 6);
+    assert_eq!(
+        record.summary,
+        "Teach Monique to explain a failed site check."
+    );
+    assert_eq!(
+        record.implementation_head_sha.as_deref(),
+        Some("cccccccccccccccccccccccccccccccccccccccc")
+    );
+    assert_eq!(record.ci_evidence, None);
+    assert_eq!(store.events(1).expect("events").len(), 6);
+
+    // And the migrated database is the same shape as a freshly created one:
+    // the gate applies to it exactly as it does to a new install.
+    begin_activation(&mut store, 1, Some(CI_EVIDENCE)).expect("gate applies after migration");
+}
+
+#[test]
+fn an_unknown_future_schema_version_is_still_refused() {
+    let private = PrivateStore::new();
+    drop(ImprovementStore::open(private.path()).expect("create"));
+    let connection = rusqlite::Connection::open(private.path()).expect("open");
+    connection
+        .pragma_update(None, "user_version", IMPROVEMENT_STORE_SCHEMA_VERSION + 1)
+        .expect("future version");
+    drop(connection);
+    assert!(matches!(
+        ImprovementStore::open(private.path()).expect_err("future schema"),
+        ImprovementStoreError::SchemaVersion { .. }
+    ));
 }

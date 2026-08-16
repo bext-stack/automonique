@@ -14,6 +14,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use automonique_github_connector::RepoTarget;
+use automonique_lab::improvement_executor::REQUIRED_CI_CHECKS;
+use automonique_store::improvements::MAX_CI_EVIDENCE_BYTES;
 use serde_json::{Value, json};
 
 use crate::improvements::RenderedPlan;
@@ -22,6 +24,7 @@ const GH: &str = "/usr/bin/gh";
 const MAX_REQUEST_BYTES: usize = 128 * 1024;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RECONCILE_PAGES: u32 = 10;
+const MAX_TIMESTAMP_BYTES: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlanPublication {
@@ -47,6 +50,55 @@ pub struct MergeReceipt {
     pub merged_sha: String,
     pub merged_tree_sha: String,
     pub recovered: bool,
+}
+
+/// One required check that completed successfully on the candidate commit.
+///
+/// `name` is borrowed from `REQUIRED_CI_CHECKS` rather than copied out of the
+/// API response, so a name that reaches durable evidence or a refusal message
+/// is always one this repository pinned, never one GitHub supplied.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CiGate {
+    pub name: &'static str,
+    pub check_run_id: u64,
+    pub url: String,
+    pub completed_at: String,
+}
+
+/// Green remote CI for one exact commit: the commit, and every required check.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CiEvidence {
+    pub head_sha: String,
+    pub gates: Vec<CiGate>,
+}
+
+impl CiEvidence {
+    /// The bounded, key-ordered JSON the improvement store keeps. Evidence a
+    /// reader cannot re-check against GitHub is not evidence, so every gate
+    /// carries the run id and URL that identify the run it is asserting about.
+    pub fn canonical_json(&self) -> Result<String, ImprovementGitHubError> {
+        let gates = self
+            .gates
+            .iter()
+            .map(|gate| {
+                json!({
+                    "name": gate.name,
+                    "check_run_id": gate.check_run_id,
+                    "url": gate.url,
+                    "completed_at": gate.completed_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        let encoded = serde_json::to_string(&json!({
+            "head_sha": self.head_sha,
+            "gates": gates,
+        }))
+        .map_err(|_| ImprovementGitHubError::InvalidField("ci evidence"))?;
+        if encoded.len() > MAX_CI_EVIDENCE_BYTES {
+            return Err(ImprovementGitHubError::InvalidField("ci evidence"));
+        }
+        Ok(encoded)
+    }
 }
 
 #[derive(Debug)]
@@ -215,6 +267,62 @@ impl<A: GitHubApi> ImprovementGitHubBroker<A> {
         validate_number(number)?;
         validate_sha1(approved_head_sha, "approved_head_sha")?;
         self.merge(self.source_repo.clone(), number, approved_head_sha)
+    }
+
+    /// Read the required check runs GitHub recorded for exactly this commit.
+    ///
+    /// Green is never "nothing was red". Each name in `REQUIRED_CI_CHECKS` must
+    /// have its own completed, successful run on this exact SHA, so a workflow
+    /// that was deleted, renamed, or never triggered refuses as `CiAbsent`
+    /// rather than passing vacuously — and an empty list, the case a
+    /// "no failures" reduction gets wrong, refuses for the same reason.
+    ///
+    /// A check that has been re-run has several runs under one name; the one
+    /// with the highest id is the current verdict.
+    pub fn candidate_ci(&mut self, head_sha: &str) -> Result<CiEvidence, ImprovementGitHubError> {
+        validate_sha1(head_sha, "head_sha")?;
+        self.require_public(self.source_repo.clone())?;
+        let response = self.api.get(&format!(
+            "repos/{}/commits/{head_sha}/check-runs?per_page=100",
+            self.source_repo
+        ))?;
+        let runs = array(
+            response
+                .get("check_runs")
+                .cloned()
+                .ok_or(ImprovementGitHubError::InvalidResponse("check runs"))?,
+            "check runs",
+        )?;
+        let mut gates = Vec::with_capacity(REQUIRED_CI_CHECKS.len());
+        for required in REQUIRED_CI_CHECKS {
+            let latest = runs
+                .iter()
+                .filter(|run| {
+                    run.get("name").and_then(Value::as_str) == Some(*required)
+                        && run.get("head_sha").and_then(Value::as_str) == Some(head_sha)
+                })
+                .max_by_key(|run| run.get("id").and_then(Value::as_u64).unwrap_or_default())
+                .ok_or(ImprovementGitHubError::CiAbsent(required))?;
+            if latest.get("status").and_then(Value::as_str) != Some("completed") {
+                return Err(ImprovementGitHubError::CiPending(required));
+            }
+            if latest.get("conclusion").and_then(Value::as_str) != Some("success") {
+                return Err(ImprovementGitHubError::CiRed(required));
+            }
+            gates.push(CiGate {
+                name: required,
+                check_run_id: latest
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or(ImprovementGitHubError::InvalidResponse("check run id"))?,
+                url: url(latest)?,
+                completed_at: timestamp(latest, "completed_at")?,
+            });
+        }
+        Ok(CiEvidence {
+            head_sha: head_sha.to_owned(),
+            gates,
+        })
     }
 
     fn require_private(&mut self, repo: RepoTarget) -> Result<(), ImprovementGitHubError> {
@@ -561,6 +669,22 @@ fn url(value: &Value) -> Result<String, ImprovementGitHubError> {
     Ok(url.to_owned())
 }
 
+fn timestamp(value: &Value, field: &'static str) -> Result<String, ImprovementGitHubError> {
+    let text = value
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or(ImprovementGitHubError::InvalidResponse("timestamp"))?;
+    if text.is_empty()
+        || text.len() > MAX_TIMESTAMP_BYTES
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':' | b'.' | b'+'))
+    {
+        return Err(ImprovementGitHubError::InvalidResponse("timestamp"));
+    }
+    Ok(text.to_owned())
+}
+
 fn sha(value: &Value) -> Result<String, ImprovementGitHubError> {
     let sha = value
         .get("sha")
@@ -684,6 +808,14 @@ pub enum ImprovementGitHubError {
     Conflict(&'static str),
     NotFound,
     ApiRefused,
+    /// A required check is still running. The release stays approved and the
+    /// owner may resume it; nothing has been merged.
+    CiPending(&'static str),
+    /// A required check completed with something other than success.
+    CiRed(&'static str),
+    /// A required check has no run at all on this commit — deleted, renamed,
+    /// or never triggered. Distinct from red because the owner action differs.
+    CiAbsent(&'static str),
     Io(std::io::Error),
 }
 
@@ -702,6 +834,14 @@ impl fmt::Display for ImprovementGitHubError {
             Self::Conflict(reason) => write!(formatter, "improvement GitHub conflict: {reason}"),
             Self::NotFound => formatter.write_str("improvement GitHub resource not found"),
             Self::ApiRefused => formatter.write_str("GitHub refused improvement operation"),
+            Self::CiPending(check) => write!(formatter, "required check is still running: {check}"),
+            Self::CiRed(check) => write!(formatter, "required check did not pass: {check}"),
+            Self::CiAbsent(check) => {
+                write!(
+                    formatter,
+                    "required check never ran on this commit: {check}"
+                )
+            }
             Self::Io(error) => write!(formatter, "improvement GitHub I/O error: {error}"),
         }
     }
@@ -719,6 +859,198 @@ impl Error for ImprovementGitHubError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    const HEAD: &str = "1111111111111111111111111111111111111111";
+
+    #[derive(Debug, Default)]
+    struct FakeApi {
+        responses: VecDeque<Value>,
+        endpoints: Vec<String>,
+    }
+
+    impl GitHubApi for FakeApi {
+        fn get(&mut self, endpoint: &str) -> Result<Value, ImprovementGitHubError> {
+            self.endpoints.push(endpoint.to_owned());
+            self.responses
+                .pop_front()
+                .ok_or(ImprovementGitHubError::NotFound)
+        }
+
+        fn get_optional(
+            &mut self,
+            endpoint: &str,
+        ) -> Result<Option<Value>, ImprovementGitHubError> {
+            self.get(endpoint).map(Some)
+        }
+
+        fn send(
+            &mut self,
+            _method: &'static str,
+            endpoint: &str,
+            _body: &Value,
+        ) -> Result<Value, ImprovementGitHubError> {
+            self.endpoints.push(endpoint.to_owned());
+            self.responses
+                .pop_front()
+                .ok_or(ImprovementGitHubError::NotFound)
+        }
+    }
+
+    fn run(name: &str, id: u64, status: &str, conclusion: Value) -> Value {
+        json!({
+            "id": id,
+            "name": name,
+            "head_sha": HEAD,
+            "status": status,
+            "conclusion": conclusion,
+            "completed_at": "2026-08-15T10:00:00Z",
+            "html_url": format!("https://github.com/owner/repository/runs/{id}"),
+        })
+    }
+
+    fn completed(name: &str, id: u64) -> Value {
+        run(name, id, "completed", json!("success"))
+    }
+
+    fn broker_reading(runs: Vec<Value>) -> ImprovementGitHubBroker<FakeApi> {
+        let api = FakeApi {
+            responses: VecDeque::from([json!({"private": false}), json!({"check_runs": runs})]),
+            endpoints: Vec::new(),
+        };
+        ImprovementGitHubBroker::new(
+            api,
+            RepoTarget::parse("owner", "planning").expect("planning repository"),
+            RepoTarget::parse("owner", "repository").expect("source repository"),
+            "main",
+            "main",
+        )
+        .expect("broker")
+    }
+
+    fn verdict(runs: Vec<Value>) -> Result<CiEvidence, ImprovementGitHubError> {
+        broker_reading(runs).candidate_ci(HEAD)
+    }
+
+    fn all_required() -> Vec<Value> {
+        REQUIRED_CI_CHECKS
+            .iter()
+            .enumerate()
+            .map(|(index, name)| completed(name, index as u64 + 1))
+            .collect()
+    }
+
+    #[test]
+    fn every_required_check_completing_successfully_is_the_only_green() {
+        let evidence = verdict(all_required()).expect("green");
+        assert_eq!(evidence.head_sha, HEAD);
+        assert_eq!(
+            evidence
+                .gates
+                .iter()
+                .map(|gate| gate.name)
+                .collect::<Vec<_>>(),
+            REQUIRED_CI_CHECKS.to_vec()
+        );
+    }
+
+    #[test]
+    fn an_empty_check_list_refuses_rather_than_passing_vacuously() {
+        assert!(matches!(
+            verdict(Vec::new()),
+            Err(ImprovementGitHubError::CiAbsent("workspace"))
+        ));
+    }
+
+    #[test]
+    fn a_missing_renamed_or_untriggered_required_check_is_absent_not_green() {
+        let mut runs = all_required();
+        runs.remove(1);
+        runs.push(completed("some-other-job", 99));
+        assert!(matches!(
+            verdict(runs),
+            Err(ImprovementGitHubError::CiAbsent("licence-boundary"))
+        ));
+    }
+
+    #[test]
+    fn a_required_check_still_in_flight_is_pending() {
+        let mut runs = all_required();
+        runs[0] = run("workspace", 1, "in_progress", Value::Null);
+        assert!(matches!(
+            verdict(runs),
+            Err(ImprovementGitHubError::CiPending("workspace"))
+        ));
+    }
+
+    #[test]
+    fn any_conclusion_other_than_success_is_red() {
+        for conclusion in ["failure", "timed_out", "cancelled", "stale", "neutral"] {
+            let mut runs = all_required();
+            runs[2] = run("development-scrub", 3, "completed", json!(conclusion));
+            assert!(
+                matches!(
+                    verdict(runs),
+                    Err(ImprovementGitHubError::CiRed("development-scrub"))
+                ),
+                "{conclusion} was not treated as red"
+            );
+        }
+    }
+
+    #[test]
+    fn a_re_run_is_judged_by_its_latest_attempt() {
+        let mut older = all_required();
+        older[0] = run("workspace", 1, "completed", json!("failure"));
+        let mut runs = older.clone();
+        runs.push(completed("workspace", 40));
+        assert!(verdict(runs).is_ok(), "the newer successful run should win");
+
+        let mut runs = older;
+        runs.insert(0, completed("workspace", 0));
+        assert!(matches!(
+            verdict(runs),
+            Err(ImprovementGitHubError::CiRed("workspace"))
+        ));
+    }
+
+    #[test]
+    fn a_run_recorded_against_another_commit_does_not_count() {
+        let mut runs = all_required();
+        runs[0]["head_sha"] = json!("2222222222222222222222222222222222222222");
+        assert!(matches!(
+            verdict(runs),
+            Err(ImprovementGitHubError::CiAbsent("workspace"))
+        ));
+    }
+
+    #[test]
+    fn the_verdict_reads_the_checks_api_for_exactly_the_tested_commit() {
+        let mut broker = broker_reading(all_required());
+        broker.candidate_ci(HEAD).expect("green");
+        assert_eq!(
+            broker.api.endpoints.last().map(String::as_str),
+            Some(format!("repos/owner/repository/commits/{HEAD}/check-runs?per_page=100").as_str())
+        );
+        assert!(safe_endpoint(&format!(
+            "repos/owner/repository/commits/{HEAD}/check-runs?per_page=100"
+        )));
+    }
+
+    #[test]
+    fn evidence_is_canonical_bounded_json_naming_every_gate() {
+        let evidence = verdict(all_required()).expect("green");
+        let encoded = evidence.canonical_json().expect("canonical");
+        assert!(encoded.len() <= MAX_CI_EVIDENCE_BYTES);
+        assert_eq!(encoded, evidence.canonical_json().expect("stable"));
+        for name in REQUIRED_CI_CHECKS {
+            assert!(
+                encoded.contains(name),
+                "{name} is missing from the evidence"
+            );
+        }
+        assert!(encoded.contains(HEAD));
+    }
 
     #[test]
     fn base64_and_endpoint_grammars_are_deterministic() {

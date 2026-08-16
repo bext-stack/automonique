@@ -22,11 +22,12 @@ use rusqlite::{
 
 use crate::{BUSY_TIMEOUT, StoreError, validate_database_path};
 
-pub const IMPROVEMENT_STORE_SCHEMA_VERSION: u32 = 1;
+pub const IMPROVEMENT_STORE_SCHEMA_VERSION: u32 = 2;
 pub const MAX_IMPROVEMENTS: usize = 65_536;
 pub const MAX_FIELD_BYTES: usize = 512;
 pub const MAX_URL_BYTES: usize = 2_048;
 pub const MAX_SUMMARY_BYTES: usize = 8_192;
+pub const MAX_CI_EVIDENCE_BYTES: usize = 4_096;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE improvements (
@@ -115,6 +116,19 @@ CREATE INDEX improvement_events_by_improvement
     ON improvement_events(improvement_id, revision);
 CREATE INDEX improvement_challenges_by_improvement
     ON improvement_approval_challenges(improvement_id, approval_kind, bound_revision);
+"#;
+
+/// The remote-CI evidence a release must carry before it may activate: the
+/// exact commit CI ran on, and one entry per required check naming its run.
+///
+/// The column is nullable because a V1 database may already hold rows in
+/// `activating` or `completed` that predate the gate, and a migration that
+/// refused to open such a database would lose the journal it is meant to
+/// preserve. Presence is enforced on the write path instead: `transition`
+/// requires it to reach `activating`, so no new record can get there without
+/// it.
+const MIGRATE_V1_TO_V2: &str = r#"
+ALTER TABLE improvements ADD COLUMN ci_evidence TEXT;
 "#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -342,6 +356,10 @@ pub struct StateTransition<'a> {
     pub to: ImprovementState,
     pub failure_reason: Option<&'a str>,
     pub active_release_digest: Option<&'a str>,
+    /// Required to reach `activating` and refused anywhere else. This is what
+    /// makes "a release activates only on green remote CI" a property of the
+    /// store rather than a convention the caller is trusted to keep.
+    pub ci_evidence: Option<&'a str>,
     pub now_ms: i64,
 }
 
@@ -391,6 +409,7 @@ pub struct ImprovementRecord {
     pub active_release_digest: Option<String>,
     pub last_actor: String,
     pub failure_reason: Option<String>,
+    pub ci_evidence: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -799,6 +818,10 @@ impl ImprovementStore {
                 implementation_pr_number = CASE WHEN ?1 = 'implementing' THEN NULL ELSE implementation_pr_number END,
                 implementation_pr_url = CASE WHEN ?1 = 'implementing' THEN NULL ELSE implementation_pr_url END,
                 active_release_digest = ?3, failure_reason = ?4,
+                ci_evidence = CASE
+                    WHEN ?1 = 'activating' THEN ?9
+                    WHEN ?1 IN ('draft', 'implementing') THEN NULL
+                    ELSE ci_evidence END,
                 last_actor = ?5, updated_at_ms = ?6
              WHERE entry_id = ?7 AND revision = ?8",
             params![
@@ -809,7 +832,8 @@ impl ImprovementStore {
                 input.actor,
                 input.now_ms,
                 input.improvement_id,
-                to_db_u64(input.expected_revision, "expected_revision")?
+                to_db_u64(input.expected_revision, "expected_revision")?,
+                input.ci_evidence
             ],
         )?;
         insert_event(
@@ -1046,6 +1070,7 @@ impl ImprovementStore {
                 implementation_head_sha = NULL, implementation_tree_sha = NULL,
                 release_manifest_digest = NULL, implementation_pr_number = NULL,
                 implementation_pr_url = NULL, active_release_digest = NULL,
+                ci_evidence = NULL,
                 last_actor = ?3, updated_at_ms = ?4
              WHERE entry_id = ?5 AND revision = ?6",
             params![
@@ -1110,6 +1135,11 @@ fn require_transition(from: ImprovementState, to: ImprovementState) -> Stored<()
             | (ImprovementState::Activating, ImprovementState::Failed)
             | (ImprovementState::Activating, ImprovementState::RolledBack)
             | (ImprovementState::Implementing, ImprovementState::Failed)
+            // An approved release whose remote CI is red has nowhere else to
+            // go. Before the CI gate, `release_approved` could only ever exit
+            // into `activating`, which meant "refuse to activate" had no
+            // durable spelling at all.
+            | (ImprovementState::ReleaseApproved, ImprovementState::Failed)
     );
     if allowed {
         Ok(())
@@ -1194,7 +1224,7 @@ const RECORD_COLUMNS: &str = "entry_id, request_key, actor_id, chat_id, summary,
     issue_number, issue_url, plan_pr_number, plan_pr_url, implementation_head_sha,
     implementation_tree_sha, release_manifest_digest, implementation_pr_number,
     implementation_pr_url, active_release_digest, last_actor, failure_reason,
-    created_at_ms, updated_at_ms";
+    ci_evidence, created_at_ms, updated_at_ms";
 
 fn read_by_id(connection: &Connection, id: i64) -> Stored<Option<ImprovementRecord>> {
     connection
@@ -1298,8 +1328,9 @@ fn raw_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImprovementRecord> {
         active_release_digest: row.get(21)?,
         last_actor: row.get(22)?,
         failure_reason: row.get(23)?,
-        created_at_ms: row.get(24)?,
-        updated_at_ms: row.get(25)?,
+        ci_evidence: row.get(24)?,
+        created_at_ms: row.get(25)?,
+        updated_at_ms: row.get(26)?,
     })
 }
 
@@ -1496,6 +1527,30 @@ fn validate_transition(input: &StateTransition<'_>) -> Stored<()> {
     if input.to != ImprovementState::Completed && input.active_release_digest.is_some() {
         return Err(ImprovementStoreError::InvalidField("active_release_digest"));
     }
+    // `activating` is the state in which the release link is switched, so this
+    // is the last point at which "CI was green for exactly this commit" can be
+    // required rather than assumed. Any other target carrying evidence is a
+    // caller confusion, not a harmless extra.
+    if input.to == ImprovementState::Activating {
+        validate_ci_evidence(
+            input
+                .ci_evidence
+                .ok_or(ImprovementStoreError::InvalidField("ci_evidence"))?,
+        )?;
+    } else if input.ci_evidence.is_some() {
+        return Err(ImprovementStoreError::InvalidField("ci_evidence"));
+    }
+    Ok(())
+}
+
+fn validate_ci_evidence(value: &str) -> Stored<()> {
+    if value.trim().is_empty()
+        || value.len() > MAX_CI_EVIDENCE_BYTES
+        || value.contains('\0')
+        || !value.starts_with('{')
+    {
+        return Err(ImprovementStoreError::InvalidField("ci_evidence"));
+    }
     Ok(())
 }
 
@@ -1576,6 +1631,9 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Stored<()> {
     if version == IMPROVEMENT_STORE_SCHEMA_VERSION {
         return Ok(());
     }
+    if version == 1 {
+        return migrate_v1_to_v2(connection);
+    }
     if version != 0 {
         return Err(ImprovementStoreError::SchemaVersion {
             found: version,
@@ -1593,9 +1651,20 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Stored<()> {
             supported: IMPROVEMENT_STORE_SCHEMA_VERSION,
         });
     }
+    // A fresh database is the base schema plus every migration replayed in
+    // order, so the two ways of arriving at the current version cannot drift.
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(SCHEMA_V1)?;
+    transaction.execute_batch(MIGRATE_V1_TO_V2)?;
     transaction.pragma_update(None, "user_version", IMPROVEMENT_STORE_SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v1_to_v2(connection: &mut Connection) -> Stored<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(MIGRATE_V1_TO_V2)?;
+    transaction.pragma_update(None, "user_version", 2)?;
     transaction.commit()?;
     Ok(())
 }

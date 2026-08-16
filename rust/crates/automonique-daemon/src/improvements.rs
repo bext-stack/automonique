@@ -521,19 +521,25 @@ impl ImprovementCoordinator {
             .map_err(ImprovementError::Store)
     }
 
+    /// Enter activation, carrying the remote-CI evidence for exactly the
+    /// commit that was merged. The parameter is required rather than optional
+    /// so that no caller — including one written later — can reach `activating`
+    /// without having read a green verdict first.
     pub fn start_activation(
         &mut self,
         improvement_id: i64,
         expected_revision: u64,
+        ci_evidence: &str,
         now_ms: i64,
     ) -> Result<ImprovementRecord, ImprovementError> {
-        self.transition(
+        self.transition_with_evidence(
             improvement_id,
             expected_revision,
             ImprovementState::Activating,
             "automonique:activator",
             None,
             None,
+            Some(ci_evidence),
             now_ms,
         )
     }
@@ -603,6 +609,30 @@ impl ImprovementCoordinator {
         failure_reason: Option<&str>,
         now_ms: i64,
     ) -> Result<ImprovementRecord, ImprovementError> {
+        self.transition_with_evidence(
+            improvement_id,
+            expected_revision,
+            to,
+            actor,
+            active_release_digest,
+            failure_reason,
+            None,
+            now_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transition_with_evidence(
+        &mut self,
+        improvement_id: i64,
+        expected_revision: u64,
+        to: ImprovementState,
+        actor: &str,
+        active_release_digest: Option<&str>,
+        failure_reason: Option<&str>,
+        ci_evidence: Option<&str>,
+        now_ms: i64,
+    ) -> Result<ImprovementRecord, ImprovementError> {
         self.store
             .transition(StateTransition {
                 improvement_id,
@@ -611,6 +641,7 @@ impl ImprovementCoordinator {
                 actor,
                 active_release_digest,
                 failure_reason,
+                ci_evidence,
                 now_ms,
             })
             .map_err(ImprovementError::Store)
