@@ -66,21 +66,33 @@ mixed releases switch an atomic release link, restart the configured systemd
 user service, verify readiness, and restore the prior code and skill links if
 readiness fails.
 
-**The restart interrupts in-flight work, and this is a known temporary
-mechanism, not the design.** Every Telegram, Slack and Support turn in progress
-in the restarted generation is lost — nothing is drained and nothing is
-transferred. The specified mechanism is the generation handoff in
-[`reload-protocol.md`](product-plan/requirements/reload-protocol.md), which is
-not built yet. The deviation, its exact blast radius and its retirement
-condition are recorded in
-[`plan/owner-decisions/2026-08-15-restart-activation-deviation.md`](../plan/owner-decisions/2026-08-15-restart-activation-deviation.md).
-Activate code releases when the system is quiet.
+Code activation is automatic after the second approval, exact-commit CI gate,
+and merge. The out-of-band activation helper switches the release link and asks
+the supervisor for an orderly restart. The daemon stops accepting new work and
+joins already accepted Telegram questions, provider attempts, Slack work and
+Support work before its process exits. Activation refuses before changing the
+link unless the configured service reports `TimeoutStopUSec=infinity`, which
+prevents systemd from turning a long drain into a kill.
+
+This is a **drain-and-restart**, not the generation handoff specified in
+[`reload-protocol.md`](product-plan/requirements/reload-protocol.md). Accepted
+work is preserved, but intake is briefly unavailable between the old process
+releasing its leases and the successor becoming ready. True overlap with zero
+intake gap still requires generation handoff.
 
 For code activation to switch the executable atomically, the configured unit's
 `ExecStart` must invoke
 `<state-directory>/improvement-code/current/bin/automonique daemon --foreground`.
+The code release also carries the pinned `automonique-chat-provider` and
+`automonique-launch-enter` companions. The conversation-provider configuration
+should name
+`<state-directory>/improvement-code/current/bin/automonique-chat-provider` so
+the same atomic link switches all three executables together; the daemon finds
+the launch helper beside its own executable.
 The initially installed executable may schedule the one-shot activation helper,
-but subsequent service starts must resolve the `current` release link.
+but subsequent service starts must resolve the `current` release link. The unit
+must also set `TimeoutStopSec=infinity`; a bounded timeout makes code activation
+fail closed while leaving the current link and generation untouched.
 
 ## Owner prerequisites
 

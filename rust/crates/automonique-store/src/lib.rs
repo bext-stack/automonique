@@ -1544,6 +1544,15 @@ impl Store {
         Ok(now_ms)
     }
 
+    /// Observe lease-authority time without performing a durable operation.
+    ///
+    /// Runtime adapters use this to compare an in-memory deadline with the
+    /// same clock domain that the store will use when it fences the eventual
+    /// read or commit. Audit timestamps remain caller-supplied Unix time.
+    pub fn observe_lease_now_ms(&self, caller_now_ms: i64) -> Result<i64, StoreError> {
+        self.lease_now_ms(caller_now_ms)
+    }
+
     /// Exact path opened by this store.
     #[must_use]
     pub fn path(&self) -> &Path {

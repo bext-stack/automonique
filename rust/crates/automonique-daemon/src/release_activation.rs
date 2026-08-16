@@ -5,8 +5,10 @@
 //! This adapter is invoked only after the release challenge moved durable
 //! improvement state to `release_approved`. It atomically points `current` at
 //! the exact manifest digest, restarts one configured systemd user unit, and
-//! restores the prior target if readiness fails. It never builds, downloads,
-//! merges, or chooses a unit from model output.
+//! restores the prior target if readiness fails. Before changing the link it
+//! proves the supervisor permits an unbounded orderly stop, so accepted work
+//! is joined by the daemon rather than killed at a service timeout. It never
+//! builds, downloads, merges, or chooses a unit from model output.
 
 use std::error::Error;
 use std::fmt;
@@ -66,6 +68,14 @@ struct Manifest {
     plan_digest: String,
     binary_path: String,
     binary_sha256: String,
+    #[serde(default)]
+    chat_provider_binary_path: Option<String>,
+    #[serde(default)]
+    chat_provider_binary_sha256: Option<String>,
+    #[serde(default)]
+    launch_helper_binary_path: Option<String>,
+    #[serde(default)]
+    launch_helper_binary_sha256: Option<String>,
     changed_paths: Vec<String>,
     #[serde(default)]
     skill_manifest_digest: Option<String>,
@@ -103,11 +113,12 @@ pub enum ActivationMechanism {
     /// Switch the link, restart the supervised unit, verify readiness, and
     /// restore the previous link if readiness fails.
     ///
-    /// Every in-flight turn in the restarted generation is lost. A process
-    /// also cannot survive its own restart, which is why the improvement
-    /// worker performs this out of band in a transient unit — a property of
-    /// this variant, not of activation. Accepted as temporary; see
-    /// `plan/owner-decisions/2026-08-15-restart-activation-deviation.md`.
+    /// The daemon's orderly SIGTERM path stops intake and joins accepted work.
+    /// Activation admits this mechanism only when the service has an unbounded
+    /// stop timeout, preventing the supervisor from converting a long drain
+    /// into a kill. A process still cannot survive its own restart, which is
+    /// why the improvement worker performs this out of band in a transient
+    /// unit — a property of this variant, not of activation.
     SupervisedRestart,
 }
 
@@ -118,6 +129,8 @@ impl ActivationMechanism {
 }
 
 pub trait ReleaseSupervisor {
+    /// Whether an orderly stop may take as long as accepted work needs.
+    fn drain_guaranteed(&mut self, unit: &str) -> Result<bool, ReleaseActivationError>;
     fn restart(&mut self, unit: &str) -> Result<(), ReleaseActivationError>;
     fn ready(&mut self, unit: &str) -> Result<bool, ReleaseActivationError>;
 }
@@ -126,6 +139,23 @@ pub trait ReleaseSupervisor {
 pub struct SystemdUserSupervisor;
 
 impl ReleaseSupervisor for SystemdUserSupervisor {
+    fn drain_guaranteed(&mut self, unit: &str) -> Result<bool, ReleaseActivationError> {
+        validate_unit(unit)?;
+        let output = Command::new(SYSTEMCTL)
+            .args([
+                "--user",
+                "show",
+                unit,
+                "--property=TimeoutStopUSec",
+                "--value",
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(ReleaseActivationError::Io)?;
+        Ok(output.status.success() && output.stdout == b"infinity\n")
+    }
+
     fn restart(&mut self, unit: &str) -> Result<(), ReleaseActivationError> {
         validate_unit(unit)?;
         let status = Command::new(SYSTEMCTL)
@@ -202,6 +232,11 @@ impl<S: ReleaseSupervisor> CodeReleaseActivator<S> {
         let release = self.verify(expected_manifest_digest)?;
         if release.kind == ReleaseKind::SkillOnly {
             return Err(ReleaseActivationError::WrongActivator);
+        }
+        if mechanism == ActivationMechanism::SupervisedRestart
+            && !self.supervisor.drain_guaranteed(&self.unit)?
+        {
+            return Err(ReleaseActivationError::DrainNotGuaranteed);
         }
         let current = self.root.join(CURRENT_NAME);
         let previous_target = read_current_target(&current)?;
@@ -295,6 +330,48 @@ impl<S: ReleaseSupervisor> CodeReleaseActivator<S> {
         let binary_bytes = read_bounded(&binary, MAX_BINARY_BYTES)?;
         if encode_hex(&Sha256::digest(&binary_bytes)) != manifest.binary_sha256 {
             return Err(ReleaseActivationError::DigestMismatch("binary"));
+        }
+        match (
+            manifest.chat_provider_binary_path.as_deref(),
+            manifest.chat_provider_binary_sha256.as_deref(),
+        ) {
+            (Some(path), Some(digest)) => {
+                validate_chat_provider_binary_path(path)?;
+                validate_sha256(digest, "chat_provider_binary_sha256")?;
+                let bytes = read_bounded(&release.join(path), MAX_BINARY_BYTES)?;
+                if encode_hex(&Sha256::digest(&bytes)) != digest {
+                    return Err(ReleaseActivationError::DigestMismatch(
+                        "chat_provider_binary",
+                    ));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(ReleaseActivationError::InvalidManifest(
+                    "chat_provider_binary",
+                ));
+            }
+        }
+        match (
+            manifest.launch_helper_binary_path.as_deref(),
+            manifest.launch_helper_binary_sha256.as_deref(),
+        ) {
+            (Some(path), Some(digest)) => {
+                validate_launch_helper_binary_path(path)?;
+                validate_sha256(digest, "launch_helper_binary_sha256")?;
+                let bytes = read_bounded(&release.join(path), MAX_BINARY_BYTES)?;
+                if encode_hex(&Sha256::digest(&bytes)) != digest {
+                    return Err(ReleaseActivationError::DigestMismatch(
+                        "launch_helper_binary",
+                    ));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(ReleaseActivationError::InvalidManifest(
+                    "launch_helper_binary",
+                ));
+            }
         }
         let kind = ReleaseKind::classify(&manifest.changed_paths)?;
         match (kind, manifest.skill_manifest_digest.as_deref()) {
@@ -435,6 +512,32 @@ fn validate_binary_path(path: &str) -> Result<(), ReleaseActivationError> {
     Ok(())
 }
 
+fn validate_chat_provider_binary_path(path: &str) -> Result<(), ReleaseActivationError> {
+    let mut components = Path::new(path).components();
+    if components.next() != Some(Component::Normal("bin".as_ref()))
+        || components.next() != Some(Component::Normal("automonique-chat-provider".as_ref()))
+        || components.next().is_some()
+    {
+        return Err(ReleaseActivationError::InvalidManifest(
+            "chat_provider_binary_path",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_launch_helper_binary_path(path: &str) -> Result<(), ReleaseActivationError> {
+    let mut components = Path::new(path).components();
+    if components.next() != Some(Component::Normal("bin".as_ref()))
+        || components.next() != Some(Component::Normal("automonique-launch-enter".as_ref()))
+        || components.next().is_some()
+    {
+        return Err(ReleaseActivationError::InvalidManifest(
+            "launch_helper_binary_path",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_relative_path(path: &str) -> Result<(), ReleaseActivationError> {
     if path.is_empty() || path.len() > 1_024 || Path::new(path).is_absolute() {
         return Err(ReleaseActivationError::InvalidManifest("changed_path"));
@@ -513,6 +616,7 @@ pub enum ReleaseActivationError {
     WrongActivator,
     StateConflict,
     Supervisor,
+    DrainNotGuaranteed,
     ActivationRolledBack,
     RollbackFailed,
     Io(std::io::Error),
@@ -536,6 +640,8 @@ impl fmt::Display for ReleaseActivationError {
             }
             Self::StateConflict => formatter.write_str("release activation already in progress"),
             Self::Supervisor => formatter.write_str("release supervisor refused restart"),
+            Self::DrainNotGuaranteed => formatter
+                .write_str("release supervisor does not guarantee an unbounded graceful drain"),
             Self::ActivationRolledBack => {
                 formatter.write_str("release activation failed and was rolled back")
             }
@@ -565,9 +671,13 @@ mod tests {
     struct FakeSupervisor {
         outcomes: VecDeque<bool>,
         restarts: usize,
+        drain_guaranteed: bool,
     }
 
     impl ReleaseSupervisor for FakeSupervisor {
+        fn drain_guaranteed(&mut self, _unit: &str) -> Result<bool, ReleaseActivationError> {
+            Ok(self.drain_guaranteed)
+        }
         fn restart(&mut self, _unit: &str) -> Result<(), ReleaseActivationError> {
             self.restarts += 1;
             Ok(())
@@ -580,9 +690,13 @@ mod tests {
     fn add_release(root: &Path, source: char) -> String {
         let binary = format!("automonique-{source}").into_bytes();
         let binary_digest = encode_hex(&Sha256::digest(&binary));
+        let chat_provider = format!("chat-provider-{source}").into_bytes();
+        let chat_provider_digest = encode_hex(&Sha256::digest(&chat_provider));
+        let launch_helper = format!("launch-helper-{source}").into_bytes();
+        let launch_helper_digest = encode_hex(&Sha256::digest(&launch_helper));
         let source_sha = source.to_string().repeat(40);
         let manifest = format!(
-            "{{\"schema\":\"{MANIFEST_SCHEMA}\",\"source_sha\":\"{source_sha}\",\"plan_digest\":\"sha256:{}\",\"binary_path\":\"bin/automonique\",\"binary_sha256\":\"{binary_digest}\",\"changed_paths\":[\"rust/crates/automonique-daemon/src/lib.rs\"]}}",
+            "{{\"schema\":\"{MANIFEST_SCHEMA}\",\"source_sha\":\"{source_sha}\",\"plan_digest\":\"sha256:{}\",\"binary_path\":\"bin/automonique\",\"binary_sha256\":\"{binary_digest}\",\"chat_provider_binary_path\":\"bin/automonique-chat-provider\",\"chat_provider_binary_sha256\":\"{chat_provider_digest}\",\"launch_helper_binary_path\":\"bin/automonique-launch-enter\",\"launch_helper_binary_sha256\":\"{launch_helper_digest}\",\"changed_paths\":[\"rust/crates/automonique-daemon/src/lib.rs\"]}}",
             "b".repeat(64)
         );
         let digest = encode_hex(&Sha256::digest(manifest.as_bytes()));
@@ -597,7 +711,16 @@ mod tests {
         }
         fs::write(release.join(MANIFEST_NAME), manifest).expect("manifest");
         fs::write(release.join("bin/automonique"), binary).expect("binary");
-        for file in [release.join(MANIFEST_NAME), release.join("bin/automonique")] {
+        fs::write(release.join("bin/automonique-chat-provider"), chat_provider)
+            .expect("chat provider");
+        fs::write(release.join("bin/automonique-launch-enter"), launch_helper)
+            .expect("launch helper");
+        for file in [
+            release.join(MANIFEST_NAME),
+            release.join("bin/automonique"),
+            release.join("bin/automonique-chat-provider"),
+            release.join("bin/automonique-launch-enter"),
+        ] {
             fs::set_permissions(file, fs::Permissions::from_mode(0o600)).expect("private file");
         }
         format!("sha256:{digest}")
@@ -620,6 +743,7 @@ mod tests {
         let supervisor = FakeSupervisor {
             outcomes: VecDeque::from([false, true]),
             restarts: 0,
+            drain_guaranteed: true,
         };
         let mut activator =
             CodeReleaseActivator::new(root.path(), "automonique.service", supervisor)
@@ -642,6 +766,10 @@ mod tests {
     }
 
     impl ReleaseSupervisor for RecordingSupervisor {
+        fn drain_guaranteed(&mut self, _unit: &str) -> Result<bool, ReleaseActivationError> {
+            self.calls.push("drain_guaranteed");
+            Ok(true)
+        }
         fn restart(&mut self, _unit: &str) -> Result<(), ReleaseActivationError> {
             self.calls.push("restart");
             Ok(())
@@ -691,13 +819,52 @@ mod tests {
             .activate_with(ActivationMechanism::SupervisedRestart, &candidate)
             .expect("activated");
 
-        assert_eq!(activator.supervisor.calls, ["restart", "ready"]);
+        assert_eq!(
+            activator.supervisor.calls,
+            ["drain_guaranteed", "restart", "ready"]
+        );
         assert_eq!(
             fs::read_link(root.path().join(CURRENT_NAME)).expect("current"),
             candidate_target
         );
         assert_eq!(receipt.previous_target.as_deref(), Some(&*previous_target));
         assert_eq!(receipt.release.manifest_digest, candidate);
+    }
+
+    #[test]
+    fn a_bounded_stop_timeout_refuses_before_switching_the_release() {
+        let root = tempfile::tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("private");
+        fs::create_dir(root.path().join(RELEASES_NAME)).expect("releases");
+        fs::set_permissions(
+            root.path().join(RELEASES_NAME),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("private");
+        let previous = add_release(root.path(), 'a');
+        let candidate = add_release(root.path(), 'c');
+        let previous_target = Path::new(RELEASES_NAME).join(previous.trim_start_matches("sha256:"));
+        symlink(&previous_target, root.path().join(CURRENT_NAME)).expect("current");
+        let mut activator = CodeReleaseActivator::new(
+            root.path(),
+            "automonique.service",
+            FakeSupervisor {
+                outcomes: VecDeque::new(),
+                restarts: 0,
+                drain_guaranteed: false,
+            },
+        )
+        .expect("activator");
+
+        assert!(matches!(
+            activator.activate(&candidate),
+            Err(ReleaseActivationError::DrainNotGuaranteed)
+        ));
+        assert_eq!(
+            fs::read_link(root.path().join(CURRENT_NAME)).expect("current"),
+            previous_target
+        );
+        assert_eq!(activator.supervisor.restarts, 0);
     }
 
     #[test]

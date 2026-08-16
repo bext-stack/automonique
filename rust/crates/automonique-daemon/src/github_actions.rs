@@ -93,6 +93,11 @@ where
         Self { lane, surface }
     }
 
+    /// Credential-free aliases from the configured repository allowlist.
+    pub fn repository_aliases(&self) -> Vec<String> {
+        self.surface.repository_aliases()
+    }
+
     /// Bind the next provider run to the Slack thread that requested it.
     pub fn set_slack_progress_target(&self, target: Option<SlackProgressTarget>) {
         if let Ok(mut lane) = self.lane.lock() {

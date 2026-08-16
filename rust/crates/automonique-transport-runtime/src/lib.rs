@@ -426,6 +426,15 @@ pub enum SinkFailure {
 /// Store adapter seam. Implementations validate the same lease on read and
 /// commit and commit every disposition plus offset in one transaction.
 pub trait TelegramDurableSink {
+    /// Observe the clock domain in which [`PollerLease::expires_ms`] lives.
+    ///
+    /// Compatibility sinks that use caller time can keep the default. A store
+    /// backed by a monotonic lease clock must override this so the runtime does
+    /// not compare a boot-time expiry with a Unix audit timestamp.
+    fn observe_lease_now_ms(&mut self, caller_now_ms: i64) -> Result<i64, SinkFailure> {
+        Ok(caller_now_ms)
+    }
+
     fn read_offset(
         &mut self,
         lease: &PollerLease,
@@ -777,7 +786,11 @@ where
         if lease.bot_id != self.policy.bot_id().get() {
             return Err(RuntimeError::LeaseMismatch);
         }
-        let poll_deadline_ms = now_ms
+        let lease_now_ms = self
+            .sink
+            .observe_lease_now_ms(now_ms)
+            .map_err(RuntimeError::Sink)?;
+        let poll_deadline_ms = lease_now_ms
             .checked_add(i64::from(self.long_poll_seconds) * 1_000)
             .and_then(|deadline| deadline.checked_add(TELEGRAM_HTTP_LEASE_MARGIN_MS))
             .ok_or(RuntimeError::InvalidConfiguration("long_poll_deadline"))?;
@@ -809,7 +822,14 @@ where
             .execute(&plan, cancellation)
             .map_err(RuntimeError::Http)?;
         check_cancelled(cancellation)?;
-        if response.completed_ms < now_ms || response.completed_ms >= lease.expires_ms {
+        if response.completed_ms < now_ms {
+            return Err(RuntimeError::LeaseExpired);
+        }
+        let completion_lease_now_ms = self
+            .sink
+            .observe_lease_now_ms(response.completed_ms)
+            .map_err(RuntimeError::Sink)?;
+        if completion_lease_now_ms >= lease.expires_ms {
             return Err(RuntimeError::LeaseExpired);
         }
         if response.status != 200 {

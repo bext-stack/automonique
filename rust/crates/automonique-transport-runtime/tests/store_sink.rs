@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
-use automonique_store::{LeaseRequest, Store, TelegramPollerLeaseRequest};
+use automonique_store::{LeaseRequest, LeaseTimeSource, Store, TelegramPollerLeaseRequest};
 use automonique_transport_runtime::{
     CancellationToken, Clock, ClockFailure, DurableDisposition, DurableTelegramBatch,
     DurableTelegramUpdate, HttpFailure, OpaqueBotToken, PendingCommit, PollerLease, SinkFailure,
@@ -26,6 +26,26 @@ impl TelegramHttpClient for NoHttp {
     ) -> Result<TelegramHttpResponse, HttpFailure> {
         self.0.fetch_add(1, Ordering::AcqRel);
         Err(HttpFailure::Unavailable)
+    }
+}
+
+struct EmptyUpdates {
+    calls: Arc<AtomicUsize>,
+    completed_ms: i64,
+}
+
+impl TelegramHttpClient for EmptyUpdates {
+    fn execute(
+        &mut self,
+        _plan: &TelegramHttpPlan<'_>,
+        _cancellation: &CancellationToken,
+    ) -> Result<TelegramHttpResponse, HttpFailure> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        Ok(TelegramHttpResponse {
+            status: 200,
+            body: br#"{"ok":true,"result":[]}"#.to_vec(),
+            completed_ms: self.completed_ms,
+        })
     }
 }
 
@@ -224,6 +244,75 @@ impl Clock for TestClock {
     fn now_ms(&mut self) -> Result<i64, ClockFailure> {
         Ok(self.0.load(Ordering::Acquire))
     }
+}
+
+#[derive(Clone)]
+struct TestLeaseClock(Arc<AtomicI64>);
+
+impl LeaseTimeSource for TestLeaseClock {
+    fn now_boottime_ms(&self) -> Result<i64, &'static str> {
+        Ok(self.0.load(Ordering::Acquire))
+    }
+}
+
+#[test]
+fn poller_compares_store_lease_expiry_in_lease_clock_domain() {
+    const WALL_NOW_MS: i64 = 1_786_890_000_000;
+    const LEASE_NOW_MS: i64 = 100;
+
+    let directory = tempfile::tempdir().expect("private directory");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private mode");
+    let path = directory.path().join("store.sqlite3");
+    let lease_clock = TestLeaseClock(Arc::new(AtomicI64::new(LEASE_NOW_MS)));
+    let mut store =
+        Store::open_with_lease_time_source(&path, Arc::new(lease_clock)).expect("boot-time store");
+    let authority = store
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "generation-a",
+            holder_id: "poller-a",
+            now_ms: WALL_NOW_MS,
+            ttl_ms: 20_000,
+        })
+        .expect("generation authority");
+    let lease = PollerLease::try_from(
+        store
+            .acquire_telegram_poller_lease(TelegramPollerLeaseRequest {
+                bot_id: 7,
+                generation_id: "generation-a",
+                holder_id: "poller-a",
+                authority_lease_epoch: authority.epoch,
+                now_ms: WALL_NOW_MS,
+                ttl_ms: 10_000,
+            })
+            .expect("poller lease"),
+    )
+    .expect("runtime lease");
+    assert!(
+        lease.expires_ms < WALL_NOW_MS,
+        "clock domains deliberately diverge"
+    );
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let client = EmptyUpdates {
+        calls: Arc::clone(&calls),
+        completed_ms: WALL_NOW_MS + 1,
+    };
+    let sink = StoreTelegramDurableSink::new(store, TestClock::new(WALL_NOW_MS));
+    let mut poller = TelegramPoller::new(
+        client,
+        sink,
+        policy(),
+        OpaqueBotToken::new(b"fixture-token".to_vec()).expect("token"),
+        3,
+    )
+    .expect("poller");
+
+    let outcome = poller
+        .poll_once(&lease, WALL_NOW_MS, &CancellationToken::new())
+        .expect("wall-time audit and boot-time lease coexist");
+    assert_eq!(outcome.next_offset, 0);
+    assert_eq!(calls.load(Ordering::Acquire), 1);
 }
 
 fn open_fixture() -> (tempfile::TempDir, std::path::PathBuf, Store, PollerLease) {

@@ -168,6 +168,7 @@ pub mod improvement_worker;
 pub mod improvements;
 mod lease_identity;
 mod lease_time;
+mod local_knowledge;
 pub mod manage_config;
 pub mod memory_config;
 mod model_inventory;

@@ -42,8 +42,10 @@ change:
 - **No release trust.** A provider binary is admitted by pinned digest and by
   the daemon's own workspace registry, never by a verified signature. The
   signature seam is structurally unconstructible, not merely unimplemented.
-- **No generation handoff.** Upgrades still stop and restart the process; there
-  are no `reload`, `rollback`, or `generations` verbs.
+- **No generation handoff.** Approved code upgrades drain accepted work and
+  restart the process through an atomic release link; there are no `reload`,
+  `rollback`, or `generations` verbs and intake does not overlap between the
+  two generations. Skill-only releases hot-reload without a process restart.
 - **No metrics exporter, no tracing, no logger.** Bounded metrics are derived
   from one SQLite snapshot and served over the local status command only.
 - **Named surface gaps.** Telegram `/cancel` and `/deny` answer

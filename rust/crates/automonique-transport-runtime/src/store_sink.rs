@@ -149,6 +149,12 @@ impl<C> TelegramDurableSink for StoreTelegramDurableSink<C>
 where
     C: Clock,
 {
+    fn observe_lease_now_ms(&mut self, caller_now_ms: i64) -> Result<i64, SinkFailure> {
+        self.store
+            .observe_lease_now_ms(caller_now_ms)
+            .map_err(map_read_error)
+    }
+
     fn read_offset(
         &mut self,
         lease: &PollerLease,

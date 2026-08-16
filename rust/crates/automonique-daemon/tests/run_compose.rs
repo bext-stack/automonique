@@ -95,7 +95,7 @@ use automonique_daemon::execute::{
 };
 use automonique_daemon::run_lane::{CONVERSATION_PROVIDER_CONFIG_NAME, SocketRunLane};
 use automonique_daemon::telegram_bridge::{QuestionProfile, QuestionRuntime, RunFailure, RunLane};
-use automonique_daemon::{Daemon, DaemonConfig};
+use automonique_daemon::{Daemon, DaemonConfig, RUN_INDEX_NAME};
 use automonique_egress_broker::{BrokerConfig, EgressBroker};
 use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
@@ -1125,6 +1125,38 @@ fn live_deepseek_conversation_answers_through_the_contained_lane() {
         "the provider exceeded its complete request budget"
     );
     serving.shutdown(&fixture.config);
+}
+
+/// Owner-triggered proof against the already-running daemon rather than a
+/// test fixture. This is the closest bounded reproduction of Telegram's
+/// question worker: it opens the production socket lane over live state,
+/// submits one ordinary conversation, starts it through the live admin socket,
+/// and waits for the answer from that daemon's run index.
+#[test]
+#[ignore = "requires an explicitly configured live daemon and paid DeepSeek provider"]
+fn live_daemon_answers_a_deepseek_conversation_through_its_admin_socket() {
+    let state = PathBuf::from(
+        std::env::var("AUTOMONIQUE_LIVE_STATE_DIR").expect("set the private live state path"),
+    );
+    let runtime = PathBuf::from(
+        std::env::var("AUTOMONIQUE_LIVE_RUNTIME_DIR").expect("set the live runtime path"),
+    );
+    assert!(state.is_absolute());
+    assert!(runtime.is_absolute());
+
+    let mut lane = SocketRunLane::open(
+        &state,
+        &runtime.join("automonique/admin.sock"),
+        &state.join(RUN_INDEX_NAME),
+    )
+    .expect("open live socket lane");
+    let answer = lane
+        .run_question(
+            "Reply with exactly: AUTOMONIQUE-LIVE-TELEGRAM-LANE-OK",
+            QuestionProfile::Conversation,
+        )
+        .expect("live daemon conversation answer");
+    assert_eq!(answer, "AUTOMONIQUE-LIVE-TELEGRAM-LANE-OK");
 }
 
 /// Run one task, failing the test rather than hanging if the lane does not

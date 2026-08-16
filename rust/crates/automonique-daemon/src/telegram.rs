@@ -730,6 +730,7 @@ impl TelegramHost {
         .with_support_tickets(params.support_tickets_path)
         .with_operator_members(params.operator_members_path)
         .with_prism_sites(Path::new(crate::site_inventory::NGINX_SITES_ENABLED))
+        .with_local_knowledge(&crate::local_knowledge::catalog_path(params.state_dir))
         .with_provider_state(params.state_dir);
         let surface = match manage.as_ref().and_then(ManageConfig::profile_app) {
             Some(profile_app) => surface.with_manage_profiles(profile_app.clone()),

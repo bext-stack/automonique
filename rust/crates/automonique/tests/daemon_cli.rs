@@ -179,7 +179,7 @@ fn cli_inspects_and_dead_letters_exact_expired_outbox_without_exposing_payload()
     assert_eq!(degraded["operational"]["outbox_in_flight_ambiguous"], 1);
     assert_eq!(
         degraded["operational"]["provider_available"],
-        serde_json::json!({"state": "unavailable", "value": null})
+        serde_json::json!({"state": "measured", "value": 0})
     );
     let id = outbox_id.to_string();
     let inspect = run(&runtime, &state, &["outbox", "inspect", &id]);
@@ -279,10 +279,7 @@ fn the_product_binary_serves_status_and_shutdown_end_to_end() {
         human.contains("telegram offset lag: unavailable\n"),
         "{human}"
     );
-    assert!(
-        human.contains("provider available: unavailable\n"),
-        "{human}"
-    );
+    assert!(human.contains("provider available: measured\n"), "{human}");
     assert!(
         human.contains("sandbox launch refusals: unavailable\n"),
         "{human}"
@@ -304,11 +301,11 @@ fn the_product_binary_serves_status_and_shutdown_end_to_end() {
     assert_eq!(value["operational"]["outbox_in_flight_ambiguous"], 0);
     assert_eq!(value["operational"]["telegram_pollers_live"], 0);
     assert_eq!(value["operational"]["telegram_pollers_expired"], 0);
-    for unavailable in [
-        "telegram_offset_lag",
-        "provider_available",
-        "sandbox_launch_refusals",
-    ] {
+    assert_eq!(
+        value["operational"]["provider_available"],
+        serde_json::json!({"state": "measured", "value": 0})
+    );
+    for unavailable in ["telegram_offset_lag", "sandbox_launch_refusals"] {
         assert_eq!(
             value["operational"][unavailable],
             serde_json::json!({"state": "unavailable", "value": null})

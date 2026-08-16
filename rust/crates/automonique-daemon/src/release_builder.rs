@@ -146,18 +146,71 @@ fn build_code_release(
     if !output.status.success() {
         return Err(ReleaseBuildError::BuildFailed);
     }
+    let launch_helper_output = bounded_output(
+        Command::new("cargo")
+            .current_dir(worktree.join("rust"))
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "-p",
+                "automonique-runner",
+                "--bin",
+                "automonique-launch-enter",
+            ]),
+    )?;
+    if !launch_helper_output.status.success() {
+        return Err(ReleaseBuildError::BuildFailed);
+    }
+    let chat_provider_target = worktree.join("rust/target/chat-provider-static");
+    let chat_provider_output = bounded_output(
+        Command::new("cargo")
+            .current_dir(worktree.join("rust"))
+            .env("CARGO_TARGET_DIR", &chat_provider_target)
+            .args([
+                "rustc",
+                "--release",
+                "--locked",
+                "-p",
+                "automonique-chat-provider",
+                "--bin",
+                "automonique-chat-provider",
+                "--",
+                "-C",
+                "target-feature=+crt-static",
+            ]),
+    )?;
+    if !chat_provider_output.status.success() {
+        return Err(ReleaseBuildError::BuildFailed);
+    }
     let binary = worktree.join("rust/target/release/automonique");
     let binary_bytes = fs::read(&binary).map_err(ReleaseBuildError::Io)?;
     if binary_bytes.is_empty() || binary_bytes.len() > 512 * 1024 * 1024 {
         return Err(ReleaseBuildError::InvalidField("binary"));
     }
     let binary_digest = encode_hex(&Sha256::digest(&binary_bytes));
+    let chat_provider = chat_provider_target.join("release/automonique-chat-provider");
+    let chat_provider_bytes = fs::read(&chat_provider).map_err(ReleaseBuildError::Io)?;
+    if chat_provider_bytes.is_empty() || chat_provider_bytes.len() > 512 * 1024 * 1024 {
+        return Err(ReleaseBuildError::InvalidField("chat_provider_binary"));
+    }
+    let chat_provider_digest = encode_hex(&Sha256::digest(&chat_provider_bytes));
+    let launch_helper = worktree.join("rust/target/release/automonique-launch-enter");
+    let launch_helper_bytes = fs::read(&launch_helper).map_err(ReleaseBuildError::Io)?;
+    if launch_helper_bytes.is_empty() || launch_helper_bytes.len() > 512 * 1024 * 1024 {
+        return Err(ReleaseBuildError::InvalidField("launch_helper_binary"));
+    }
+    let launch_helper_digest = encode_hex(&Sha256::digest(&launch_helper_bytes));
     let manifest = serde_json::to_vec(&json!({
         "schema": "automonique.code-release/v1",
         "source_sha": candidate_sha,
         "plan_digest": plan_digest,
         "binary_path": "bin/automonique",
         "binary_sha256": binary_digest,
+        "chat_provider_binary_path": "bin/automonique-chat-provider",
+        "chat_provider_binary_sha256": chat_provider_digest,
+        "launch_helper_binary_path": "bin/automonique-launch-enter",
+        "launch_helper_binary_sha256": launch_helper_digest,
         "changed_paths": changed_paths,
         "skill_manifest_digest": skill_manifest_digest,
     }))
@@ -167,6 +220,14 @@ fn build_code_release(
     let release = materialize(&releases, &digest, |staging| {
         private_create_dir_all(&staging.join("bin"))?;
         write_executable(&staging.join("bin/automonique"), &binary_bytes)?;
+        write_executable(
+            &staging.join("bin/automonique-chat-provider"),
+            &chat_provider_bytes,
+        )?;
+        write_executable(
+            &staging.join("bin/automonique-launch-enter"),
+            &launch_helper_bytes,
+        )?;
         write_immutable(&staging.join("manifest.json"), &manifest)
     })?;
     Ok(BuiltRelease {

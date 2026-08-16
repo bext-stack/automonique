@@ -69,6 +69,13 @@ const GH_CREDENTIAL: &str = "gh-cli-active-account";
 
 /// An allowlisted issue source plus explicitly configured typed actions.
 pub trait GitHubSurface: Send {
+    /// Credential-free repository coordinates admitted by local policy.
+    ///
+    /// These are configuration entries, not a live organization inventory.
+    fn configured_repositories(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Read one exact issue and render bounded, untrusted facts.
     fn issue_facts(
         &mut self,
@@ -868,6 +875,10 @@ impl fmt::Debug for GitHubWorkspace {
 }
 
 impl GitHubSurface for GitHubWorkspace {
+    fn configured_repositories(&self) -> Vec<String> {
+        self.repositories.iter().map(ToString::to_string).collect()
+    }
+
     fn issue_facts(
         &mut self,
         locator: &IssueLocator,
