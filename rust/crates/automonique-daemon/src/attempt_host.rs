@@ -82,6 +82,21 @@
 //!   the dispatcher's and are unchanged by owning one: a delivery says a
 //!   request reached a sink once, and anyone holding the host may cancel any
 //!   attempt registered on it.
+//!
+//! # Cancellation arrives here, and nowhere else
+//!
+//! This is the *only* path by which a run stops on request. It matters enough
+//! to state from this end as well as the other: **a transport event is never a
+//! cancellation.** A progress subscriber that disconnects, a socket that
+//! closes, an endpoint that shuts down, a bridge that dies — none of them
+//! reaches this module, and none of them can, because
+//! [`progress_hub`](crate::progress_hub) holds no registration, no sink and no
+//! containment handle. It could not cancel a run if it decided to.
+//!
+//! The consequence is the one an operator relies on: closing the window you are
+//! watching a run through does not stop the run. Stopping it is
+//! `Daemon::cancel_run`, named above, and it is an explicit request with a
+//! request reference and a durable ledger row.
 
 use std::fmt;
 use std::path::{Path, PathBuf};

@@ -289,7 +289,10 @@
 
 use core::fmt::Write as _;
 
-use crate::admin::{AdminError, DaemonState, ExecutionState, OperationalMetric, TelegramState};
+use crate::admin::{
+    AdminError, DaemonState, ENDPOINT_MATURITY, ExecutionState, Maturity, OperationalMetric,
+    TelegramState,
+};
 use crate::approval_api::{
     ApprovalApiError, ApprovalDecision, ApprovalDisposition, ApprovalRefusal, ConflictField,
 };
@@ -303,6 +306,7 @@ use crate::codec::CodecError;
 use crate::digest::Sha256;
 use crate::event::{Authority, EventKind, MAX_RETRY_AFTER_MS, RetryCategory, StepStatus};
 use crate::primitives::ValueError;
+use crate::progress_api::{StreamMessageKind, StreamRefusal};
 use crate::runs_api::{
     LIFECYCLE_AUTHORITIES, LifecycleCoverage, RunState, RunsApiError, RunsRefusal, SpoolEventKind,
     SubmissionState,
@@ -1485,6 +1489,36 @@ fn execution_state_values() -> Vec<String> {
     .collect()
 }
 
+/// The declared [`Maturity`] spellings, pinned to the Rust wire strings.
+fn maturity_values() -> Vec<String> {
+    Maturity::ALL
+        .into_iter()
+        .map(|maturity| match maturity {
+            Maturity::Experimental | Maturity::Stable | Maturity::Deprecated => {
+                maturity.as_str().to_owned()
+            }
+        })
+        .collect()
+}
+
+/// The endpoints [`ENDPOINT_MATURITY`] declares at one maturity.
+///
+/// Three lists rather than one table of pairs, because a `readonly string[]` is
+/// a shape this generator already emits and a list of tuples is not. Nothing is
+/// lost: the three partition the table, and a client that wants the pair reads
+/// which list a name is in.
+///
+/// Order is the table's, which is lane order rather than alphabetical, and it is
+/// kept for the reason [`ConstantValue::Words`] keeps every order it is given —
+/// it is a fact about the declaration rather than a presentation of a set.
+fn endpoints_at(maturity: Maturity) -> Vec<String> {
+    ENDPOINT_MATURITY
+        .iter()
+        .filter(|(_, declared)| *declared == maturity)
+        .map(|(endpoint, _)| (*endpoint).to_owned())
+        .collect()
+}
+
 /// The declared [`TelegramState`] spellings, pinned to the Rust wire strings.
 fn telegram_state_values() -> Vec<String> {
     [
@@ -2096,15 +2130,47 @@ fn admin_status_module() -> GeneratedModule {
         source: "automonique_protocol::admin".to_owned(),
         constants: vec![
             Constant {
+                name: "ADMIN_CAPABILITY".to_owned(),
+                doc: "What this build's local endpoints can do, as one monotonic integer. A \
+                      client compares it against the number it was written for; it never \
+                      assumes the two must be equal."
+                    .to_owned(),
+                value: ConstantValue::Count(
+                    usize::try_from(crate::admin::ADMIN_CAPABILITY)
+                        .expect("the capability integer fits a usize"),
+                ),
+            },
+            Constant {
                 name: "ADMIN_PROTOCOL".to_owned(),
                 doc: "Stable protocol name for local daemon administration.".to_owned(),
                 value: ConstantValue::Text(crate::admin::ADMIN_PROTOCOL.to_owned()),
+            },
+            Constant {
+                name: "DEPRECATED_ENDPOINTS".to_owned(),
+                doc: "Endpoints still served and going away. New clients use their \
+                      replacements."
+                    .to_owned(),
+                value: ConstantValue::Words(endpoints_at(Maturity::Deprecated)),
+            },
+            Constant {
+                name: "EXPERIMENTAL_ENDPOINTS".to_owned(),
+                doc: "Endpoints that may change shape or disappear. Depend on one \
+                      deliberately."
+                    .to_owned(),
+                value: ConstantValue::Words(endpoints_at(Maturity::Experimental)),
             },
             Constant {
                 name: "MAX_ADMIN_CANONICAL_BYTES".to_owned(),
                 doc: "Maximum canonical message bytes the local admin transport accepts."
                     .to_owned(),
                 value: ConstantValue::Count(crate::admin::MAX_ADMIN_CANONICAL_BYTES),
+            },
+            Constant {
+                name: "STABLE_ENDPOINTS".to_owned(),
+                doc: "Endpoints that will not change shape incompatibly. A removal is a \
+                      deprecation first and a capability bump second."
+                    .to_owned(),
+                value: ConstantValue::Words(endpoints_at(Maturity::Stable)),
             },
         ],
         branded_ids: vec![BrandedId {
@@ -2132,6 +2198,15 @@ fn admin_status_module() -> GeneratedModule {
                 name: "ExecutionState".to_owned(),
                 sensitivity: EnumSensitivity::SecuritySensitive,
                 values: execution_state_values(),
+                wire_order: None,
+            },
+            GeneratedEnum {
+                name: "Maturity".to_owned(),
+                // A client decides whether to depend on an endpoint from this.
+                // Retaining a spelling this build does not define would mean
+                // guessing how much of a promise the endpoint is.
+                sensitivity: EnumSensitivity::SecuritySensitive,
+                values: maturity_values(),
                 wire_order: None,
             },
             GeneratedEnum {
@@ -2187,10 +2262,13 @@ fn admin_status_module() -> GeneratedModule {
             Interface {
                 name: "DaemonStatus".to_owned(),
                 doc: "One consistent snapshot. `operational` and `durable_state` are always \
-                      present; only `telegram_poller_epoch` may be null."
+                      present; only `telegram_poller_epoch` may be null. `capability` is the \
+                      answering daemon's, which is not necessarily this client's \
+                      `ADMIN_CAPABILITY`."
                     .to_owned(),
                 fields: vec![
                     required("accepting_intake", "boolean"),
+                    counter("capability"),
                     required("durable_state", "DurableStateCounts"),
                     counter("event_cursor"),
                     required("execution_state", "ExecutionState"),
@@ -5464,12 +5542,20 @@ fn progress_enum(name: &str, values: Vec<String>) -> GeneratedEnum {
     }
 }
 
-/// The `automonique.progress/v1` frame surface.
+/// The `automonique.progress/v1` frame surface and its live stream.
 ///
-/// A read surface with no command surface, like [`doctor_module`]: a frame is
-/// something a client decodes, and there is no request on this schema for a
-/// client to build. The transport that will carry them — a bounded fan-out with
-/// cursors — is a separate change, and it will carry exactly this shape.
+/// Two shapes that travel together and version apart. A [`ProgressFrame`] is
+/// what a run *produced* and also travels as a runner spool payload, where no
+/// subscriber exists; a stream message is what one subscriber is *told*, and it
+/// carries a frame inside it. That is why the module declares two protocol
+/// names rather than one.
+///
+/// There is no command surface, for the reason [`doctor_module`] has none: the
+/// one request on this schema is a `subscribe`, and it does not travel the
+/// admin envelope this generator's request builders emit. The subscribe body is
+/// declared as an interface a client encodes itself.
+///
+/// [`ProgressFrame`]: crate::progress_api::ProgressFrame
 fn progress_module() -> GeneratedModule {
     GeneratedModule {
         file_name: module_file_name(PROGRESS_MODULE),
@@ -5478,13 +5564,20 @@ fn progress_module() -> GeneratedModule {
         // A name is declared in exactly one module. `Authority`, `EpochMillis`
         // and `SpoolSequence` are the Runs lane's declarations of the *same*
         // domains — a frame's sequence is a spool sequence, not a second kind
-        // of number — and `RunId` is the admin lane's. Re-declaring any of them
-        // would make the name ambiguous through the barrel and give the surface
-        // two copies to drift apart.
+        // of number — `RunId` is the admin lane's, and `WireCounter` is the
+        // admin status lane's, which is where the capability integer the
+        // greeting carries is also declared. Re-declaring any of them would
+        // make the name ambiguous through the barrel and give the surface two
+        // copies to drift apart.
         imports: vec![
             ModuleImport {
                 module: ADMIN_COMMAND_MODULE.to_owned(),
                 values: vec!["RunId".to_owned()],
+                types: Vec::new(),
+            },
+            ModuleImport {
+                module: ADMIN_STATUS_MODULE.to_owned(),
+                values: vec![WIRE_COUNTER.to_owned()],
                 types: Vec::new(),
             },
             ModuleImport {
@@ -5507,6 +5600,15 @@ fn progress_module() -> GeneratedModule {
                 value: ConstantValue::Count(crate::progress_api::MAX_PROGRESS_CANONICAL_BYTES),
             },
             Constant {
+                name: "MAX_PROGRESS_STREAM_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical bytes of one encoded stream message: one frame plus \
+                      its envelope."
+                    .to_owned(),
+                value: ConstantValue::Count(
+                    crate::progress_api::MAX_PROGRESS_STREAM_CANONICAL_BYTES,
+                ),
+            },
+            Constant {
                 name: "MAX_RETRY_AFTER_MS".to_owned(),
                 doc: "Longest wait a retry context may advertise. A delay past it is refused \
                       rather than clamped: a wait nobody will sit through is a refusal wearing a \
@@ -5517,6 +5619,13 @@ fn progress_module() -> GeneratedModule {
                 ),
             },
             Constant {
+                name: "MAX_SUBSCRIBE_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical bytes of one subscription request. A peer that sent \
+                      anything approaching a frame's size did not send a subscription."
+                    .to_owned(),
+                value: ConstantValue::Count(crate::progress_api::MAX_SUBSCRIBE_CANONICAL_BYTES),
+            },
+            Constant {
                 name: "PROGRESS_API_SCHEMA_V1".to_owned(),
                 doc: "Stable schema identifier for the version-one frame.".to_owned(),
                 value: ConstantValue::Text(crate::progress_api::PROGRESS_API_SCHEMA_V1.to_owned()),
@@ -5525,6 +5634,23 @@ fn progress_module() -> GeneratedModule {
                 name: "PROGRESS_PROTOCOL".to_owned(),
                 doc: "Stable protocol name for the normalized progress stream.".to_owned(),
                 value: ConstantValue::Text(crate::progress_api::PROGRESS_PROTOCOL.to_owned()),
+            },
+            Constant {
+                name: "PROGRESS_STREAM_PROTOCOL".to_owned(),
+                doc: "Stable protocol name for the live stream transport. Separate from the \
+                      frame's own name, because a build can grow a stream message without \
+                      changing a single frame."
+                    .to_owned(),
+                value: ConstantValue::Text(
+                    crate::progress_api::PROGRESS_STREAM_PROTOCOL.to_owned(),
+                ),
+            },
+            Constant {
+                name: "PROGRESS_STREAM_SCHEMA_V1".to_owned(),
+                doc: "Stable schema identifier for the version-one stream message.".to_owned(),
+                value: ConstantValue::Text(
+                    crate::progress_api::PROGRESS_STREAM_SCHEMA_V1.to_owned(),
+                ),
             },
         ],
         bounded_strings: vec![BoundedString {
@@ -5548,11 +5674,23 @@ fn progress_module() -> GeneratedModule {
                 min: 0,
                 max: i64::try_from(MAX_RETRY_AFTER_MS).expect("the retry ceiling fits the wire"),
             },
+            BoundedInteger {
+                // Zero is admitted here and refused by `SpoolSequence`, and the
+                // difference is the whole point: this is an *exclusive* cursor —
+                // the last sequence a subscriber received — so zero is what a
+                // subscriber that has received nothing truthfully reports, and a
+                // window that retains nothing reports as a pair of them.
+                name: "ProgressCursor".to_owned(),
+                min: 0,
+                max: i64::MAX,
+            },
         ],
         enums: vec![
             progress_enum("EventKind", event_kind_values()),
             progress_enum("RetryCategory", retry_category_values()),
             progress_enum("StepStatus", step_status_values()),
+            progress_enum("StreamMessageKind", stream_message_kind_values()),
+            progress_enum("StreamRefusal", stream_refusal_values()),
         ],
         interfaces: vec![
             Interface {
@@ -5594,9 +5732,126 @@ fn progress_module() -> GeneratedModule {
                     required("sequence", "SpoolSequence"),
                 ],
             },
+            Interface {
+                name: "SubscribeRequest".to_owned(),
+                doc: "What one subscriber asks for. `cursor` is exclusive — the last sequence \
+                      this subscriber received — so a subscriber that has received nothing \
+                      sends zero."
+                    .to_owned(),
+                fields: vec![
+                    required("cursor", "ProgressCursor"),
+                    required("run_id", "RunId"),
+                ],
+            },
+            Interface {
+                name: "StreamGreeting".to_owned(),
+                doc: "What the endpoint is, written before it reads a request byte, so a \
+                      client decides whether it understands the endpoint without disclosing \
+                      what it wanted."
+                    .to_owned(),
+                fields: vec![required("capability", WIRE_COUNTER)],
+            },
+            Interface {
+                name: "StreamLive".to_owned(),
+                doc: "Delivery begins. `from` is the first sequence this subscriber will \
+                      receive: its cursor plus one."
+                    .to_owned(),
+                fields: vec![required("from", "SpoolSequence")],
+            },
+            Interface {
+                name: "StreamResync".to_owned(),
+                doc: "The cursor is below what is retained. Both coordinates are zero when the \
+                      endpoint retains nothing at all for the attempt, and the durable spool is \
+                      then the only record there is."
+                    .to_owned(),
+                fields: vec![
+                    required("snapshot_from", "ProgressCursor"),
+                    required("snapshot_to", "ProgressCursor"),
+                ],
+            },
+            Interface {
+                name: "StreamStop".to_owned(),
+                doc: "How a live stream ended, carried by both `lagged` and `retired`. \
+                      `delivered_through` is the last sequence this subscriber actually \
+                      received, which is the cursor it reconnects with."
+                    .to_owned(),
+                fields: vec![required("delivered_through", "ProgressCursor")],
+            },
+            Interface {
+                name: "StreamRefused".to_owned(),
+                doc: "Why a subscription was refused. The category is a closed spelling and \
+                      carries nothing the peer supplied."
+                    .to_owned(),
+                fields: vec![required("category", "StreamRefusal")],
+            },
         ],
+        unions: vec![Union {
+            name: "StreamMessage".to_owned(),
+            discriminant: "kind".to_owned(),
+            variants: stream_message_variants(),
+        }],
         ..GeneratedModule::default()
     }
+}
+
+/// The declared [`StreamMessageKind`] spellings, pinned to the Rust strings.
+///
+/// [`StreamMessageKind`]: crate::progress_api::StreamMessageKind
+fn stream_message_kind_values() -> Vec<String> {
+    StreamMessageKind::ALL
+        .into_iter()
+        .map(|kind| match kind {
+            StreamMessageKind::Greeting
+            | StreamMessageKind::Live
+            | StreamMessageKind::ResyncRequired
+            | StreamMessageKind::Frame
+            | StreamMessageKind::Lagged
+            | StreamMessageKind::Retired
+            | StreamMessageKind::Refused => kind.as_str().to_owned(),
+        })
+        .collect()
+}
+
+/// The declared [`StreamRefusal`] spellings, pinned to the Rust strings.
+///
+/// [`StreamRefusal`]: crate::progress_api::StreamRefusal
+fn stream_refusal_values() -> Vec<String> {
+    StreamRefusal::ALL
+        .into_iter()
+        .map(|refusal| match refusal {
+            StreamRefusal::SubscriberLimit
+            | StreamRefusal::MalformedRequest
+            | StreamRefusal::FieldInvalid
+            | StreamRefusal::Internal => refusal.as_str().to_owned(),
+        })
+        .collect()
+}
+
+/// The stream message arms, each carrying its body under one shared key.
+///
+/// Written as a match over the closed kind set rather than a list, so a kind
+/// added to the vocabulary fails to compile here instead of quietly generating
+/// a union that cannot represent it.
+fn stream_message_variants() -> Vec<UnionVariant> {
+    StreamMessageKind::ALL
+        .into_iter()
+        .map(|kind| {
+            let body = match kind {
+                StreamMessageKind::Greeting => "StreamGreeting",
+                StreamMessageKind::Live => "StreamLive",
+                StreamMessageKind::ResyncRequired => "StreamResync",
+                StreamMessageKind::Frame => "ProgressFrame",
+                // One shape for both endings: they differ in what they mean and
+                // in what a client does next, not in what they carry.
+                StreamMessageKind::Lagged | StreamMessageKind::Retired => "StreamStop",
+                StreamMessageKind::Refused => "StreamRefused",
+            };
+            UnionVariant {
+                tag: kind.as_str().to_owned(),
+                payload: Some(("body".to_owned(), body.to_owned())),
+            }
+        })
+        .collect()
 }
 
 /// Every maintained module, in file-name order.

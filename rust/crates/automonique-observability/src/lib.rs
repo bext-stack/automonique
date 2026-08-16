@@ -39,10 +39,25 @@ pub enum MetricName {
     OutboxDeadLettered,
     TelegramPollersLive,
     TelegramPollersExpired,
+    /// Most bytes one live-progress subscriber's queue has ever held.
+    ///
+    /// The bound it is measured against is the fan-out's, not this crate's:
+    /// what this reports is how close the busiest subscriber came to being
+    /// disconnected for falling behind.
+    ProgressQueueHighWaterBytes,
+    /// Frames discarded from subscriber queues, cumulative.
+    ProgressFramesDropped,
+    /// Subscribers disconnected for falling behind, cumulative.
+    ProgressLagDisconnects,
+    /// Age of the oldest frame still retained for replay.
+    ///
+    /// The live window's depth in time. It is not a claim about the durable
+    /// record, which retains everything and has no age.
+    ProgressOldestRetainedAgeMs,
 }
 
 impl MetricName {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 23] = [
         Self::DaemonReady,
         Self::IntakeEnabled,
         Self::InboxPending,
@@ -62,6 +77,10 @@ impl MetricName {
         Self::OutboxDeadLettered,
         Self::TelegramPollersLive,
         Self::TelegramPollersExpired,
+        Self::ProgressQueueHighWaterBytes,
+        Self::ProgressFramesDropped,
+        Self::ProgressLagDisconnects,
+        Self::ProgressOldestRetainedAgeMs,
     ];
 
     #[must_use]
@@ -86,6 +105,10 @@ impl MetricName {
             Self::OutboxDeadLettered => "automonique_outbox_dead_lettered_total",
             Self::TelegramPollersLive => "automonique_telegram_pollers_live",
             Self::TelegramPollersExpired => "automonique_telegram_pollers_expired",
+            Self::ProgressQueueHighWaterBytes => "automonique_progress_queue_high_water_bytes",
+            Self::ProgressFramesDropped => "automonique_progress_frames_dropped_total",
+            Self::ProgressLagDisconnects => "automonique_progress_lag_disconnects_total",
+            Self::ProgressOldestRetainedAgeMs => "automonique_progress_oldest_retained_age_ms",
         }
     }
 
@@ -176,6 +199,14 @@ impl StoreProjection {
                 MetricName::TelegramPollersExpired,
                 status.telegram_pollers_expired(),
             )?,
+            // The live fan-out is in the daemon's memory, not in this database.
+            // A store snapshot cannot see it, so it says so rather than
+            // reporting four zeroes that would read as a quiet endpoint.
+            // [`StoreProjection::with_progress`] is where a measurement arrives.
+            unavailable(MetricName::ProgressQueueHighWaterBytes),
+            unavailable(MetricName::ProgressFramesDropped),
+            unavailable(MetricName::ProgressLagDisconnects),
+            unavailable(MetricName::ProgressOldestRetainedAgeMs),
         ];
         let metrics = MetricsSnapshot::new(observed_ms, generation.generation_id(), samples)?;
         let assessment = if reconciliation_pending > 0 {
@@ -189,6 +220,46 @@ impl StoreProjection {
         })
     }
 
+    /// Attach what the live progress fan-out observed, replacing the four
+    /// samples a store snapshot cannot measure.
+    ///
+    /// Additive and narrow by construction: it can only measure metrics that
+    /// [`StoreProjection::from_status`] declared unavailable, so it cannot
+    /// overwrite a durable reading with a memory one. The assessment is
+    /// untouched — a busy fan-out is not evidence about the store, and this
+    /// crate's whole discipline is that a projection reports what its source
+    /// saw and nothing more.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObservabilityError::DuplicateMetric`] if one of the four was
+    /// already measured, which would mean this projection was being assembled
+    /// from two readings taken at different moments.
+    pub fn with_progress(
+        mut self,
+        observation: ProgressObservation,
+    ) -> Result<Self, ObservabilityError> {
+        self.metrics.measure([
+            (
+                MetricName::ProgressQueueHighWaterBytes,
+                observation.queue_high_water_bytes,
+            ),
+            (
+                MetricName::ProgressFramesDropped,
+                observation.frames_dropped,
+            ),
+            (
+                MetricName::ProgressLagDisconnects,
+                observation.lag_disconnects,
+            ),
+            (
+                MetricName::ProgressOldestRetainedAgeMs,
+                observation.oldest_retained_age_ms,
+            ),
+        ])?;
+        Ok(self)
+    }
+
     #[must_use]
     pub const fn metrics(&self) -> &MetricsSnapshot {
         &self.metrics
@@ -198,6 +269,24 @@ impl StoreProjection {
     pub const fn assessment(&self) -> StoreAssessment {
         self.assessment
     }
+}
+
+/// What one live progress fan-out has observed since the process started.
+///
+/// Four numbers and no identifiers: which attempt a subscriber was watching,
+/// which peer it was, and what it was shown are all things this crate refuses
+/// to represent, and none of them is needed to answer the question these
+/// metrics exist for — whether the live tier is keeping up.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProgressObservation {
+    /// Most bytes one subscriber's queue has ever held.
+    pub queue_high_water_bytes: u64,
+    /// Frames discarded from subscriber queues, cumulative.
+    pub frames_dropped: u64,
+    /// Subscribers disconnected for falling behind, cumulative.
+    pub lag_disconnects: u64,
+    /// Age of the oldest frame still retained for replay.
+    pub oldest_retained_age_ms: u64,
 }
 
 /// Closed reason why a value could not be measured.
@@ -303,6 +392,30 @@ impl MetricsSnapshot {
     #[must_use]
     pub fn value(&self, name: MetricName) -> MetricValue {
         self.values[&name]
+    }
+
+    /// Record a real measurement for a metric this snapshot declared missing.
+    ///
+    /// Private, and it stays that way: a snapshot is a point-in-time projection
+    /// of one source, and a public setter would let a caller assemble one out of
+    /// readings taken at different moments. The one composition this crate
+    /// admits is [`StoreProjection::with_progress`], which is why the guard is
+    /// exactly "the sample must currently be unavailable" — a durable reading
+    /// can never be overwritten by a later one.
+    fn measure(
+        &mut self,
+        samples: impl IntoIterator<Item = (MetricName, u64)>,
+    ) -> Result<(), ObservabilityError> {
+        for (name, value) in samples {
+            let sample = MetricSample::new(name, value)?;
+            match self.values.get(&name) {
+                Some(MetricValue::Unavailable(_)) => {
+                    self.values.insert(name, sample.value());
+                }
+                _ => return Err(ObservabilityError::DuplicateMetric(name)),
+            }
+        }
+        Ok(())
     }
 
     /// Iterate in the closed canonical metric order.

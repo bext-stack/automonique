@@ -269,3 +269,117 @@ fn store_projection_uses_real_snapshot_and_never_invents_readiness() {
         MetricValue::Unavailable(UnavailableReason::NotIntegrated)
     );
 }
+
+/// The four live-progress metrics: absent from a store snapshot, and present
+/// once the fan-out reports.
+///
+/// The pairing is the whole point. A database has never seen a subscriber
+/// queue, so a store projection says `unavailable` rather than zero — because
+/// zero drops and zero lag disconnects is a real reading an operator would act
+/// on, and it is not the reading a database can take.
+#[test]
+fn progress_metrics_are_unavailable_until_the_fan_out_reports_them() {
+    use automonique_observability::ProgressObservation;
+
+    const PROGRESS: [MetricName; 4] = [
+        MetricName::ProgressQueueHighWaterBytes,
+        MetricName::ProgressFramesDropped,
+        MetricName::ProgressLagDisconnects,
+        MetricName::ProgressOldestRetainedAgeMs,
+    ];
+
+    let directory = tempfile::tempdir().expect("directory");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("private directory");
+    let mut store = Store::open(directory.path().join("store.sqlite3")).expect("store");
+    store
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            now_ms: 1,
+            ttl_ms: 100,
+        })
+        .expect("generation");
+    let status = store
+        .status_snapshot_at("generation-a", 2)
+        .expect("status snapshot");
+
+    let projection = StoreProjection::from_status(&status).expect("projection");
+    for name in PROGRESS {
+        assert_eq!(
+            projection.metrics().value(name),
+            MetricValue::Unavailable(UnavailableReason::NotIntegrated),
+            "{} was answered from a source that cannot see it",
+            name.as_str()
+        );
+    }
+
+    let observed = projection
+        .clone()
+        .with_progress(ProgressObservation {
+            queue_high_water_bytes: 4_096,
+            frames_dropped: 17,
+            lag_disconnects: 1,
+            oldest_retained_age_ms: 250,
+        })
+        .expect("the fan-out's observation attaches");
+    assert_eq!(
+        observed
+            .metrics()
+            .value(MetricName::ProgressQueueHighWaterBytes),
+        MetricValue::Measured(4_096)
+    );
+    assert_eq!(
+        observed.metrics().value(MetricName::ProgressFramesDropped),
+        MetricValue::Measured(17)
+    );
+    assert_eq!(
+        observed.metrics().value(MetricName::ProgressLagDisconnects),
+        MetricValue::Measured(1)
+    );
+    assert_eq!(
+        observed
+            .metrics()
+            .value(MetricName::ProgressOldestRetainedAgeMs),
+        MetricValue::Measured(250)
+    );
+    // The durable half is untouched: attaching a memory reading cannot
+    // overwrite a reading of the store, and the assessment is still the store's.
+    assert_eq!(
+        observed.metrics().value(MetricName::InboxPending),
+        projection.metrics().value(MetricName::InboxPending)
+    );
+    assert_eq!(observed.assessment(), projection.assessment());
+
+    // And a second attachment is refused: a snapshot is one reading, not two
+    // taken at different moments.
+    assert_eq!(
+        observed.with_progress(ProgressObservation::default()),
+        Err(ObservabilityError::DuplicateMetric(
+            MetricName::ProgressQueueHighWaterBytes
+        ))
+    );
+}
+
+/// The metric names are the exported strings, and they are all distinct.
+#[test]
+fn every_metric_name_is_exported_once() {
+    let mut names: Vec<&str> = MetricName::ALL
+        .into_iter()
+        .map(MetricName::as_str)
+        .collect();
+    assert_eq!(names.len(), MetricName::ALL.len());
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(
+        names.len(),
+        MetricName::ALL.len(),
+        "two metrics export the same name"
+    );
+    assert!(
+        MetricName::ALL
+            .into_iter()
+            .all(|name| name.as_str().starts_with("automonique_")),
+        "a metric escaped the product's own namespace"
+    );
+}

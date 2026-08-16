@@ -430,6 +430,19 @@ impl DaemonConfig {
         self.runtime_dir().join(ADMIN_SOCKET_NAME)
     }
 
+    /// Live progress endpoint, a sibling of [`DaemonConfig::admin_socket`].
+    ///
+    /// A second socket rather than a seventh protocol on the first, and the
+    /// reason is the admin socket's framing: one request, one response, one
+    /// connection, served on the serve thread. A subscription is the opposite
+    /// shape — one request and an unbounded stream of answers — and folding it
+    /// into that loop would mean the serve thread could be held by a client
+    /// watching a run. See [`crate::progress_hub`].
+    #[must_use]
+    pub fn progress_socket(&self) -> PathBuf {
+        self.runtime_dir().join(progress_hub::PROGRESS_SOCKET_NAME)
+    }
+
     /// Durable database path.
     #[must_use]
     pub fn database_path(&self) -> PathBuf {
@@ -934,6 +947,14 @@ pub enum DaemonError {
     /// launch is composed against, and a daemon that ignored a malformed one
     /// would compose against a policy nobody wrote.
     ApprovalPolicyRefused(&'static str),
+    /// The live progress endpoint could not be bound or started. The payload is
+    /// the stable category from [`progress_hub`].
+    ///
+    /// Fatal at startup for the reason a refused admin socket is: the two are
+    /// one endpoint as far as a client is concerned, and a daemon that answered
+    /// status while nothing could watch a run would be reporting a capability
+    /// it does not have.
+    ProgressEndpointFailed(&'static str),
 }
 
 impl DaemonError {
@@ -963,6 +984,7 @@ impl DaemonError {
             Self::SlackRefused(category) => category,
             Self::ApprovalRequestsFailed(category) => category,
             Self::ApprovalPolicyRefused(category) => category,
+            Self::ProgressEndpointFailed(category) => category,
         }
     }
 }
@@ -1026,6 +1048,9 @@ impl fmt::Display for DaemonError {
             }
             Self::ApprovalPolicyRefused(category) => {
                 write!(formatter, "approval configuration refused: {category}")
+            }
+            Self::ProgressEndpointFailed(category) => {
+                write!(formatter, "progress endpoint failed: {category}")
             }
         }
     }
@@ -1202,6 +1227,15 @@ pub struct Daemon {
     /// [`ticket_intake::TicketIntakeHost::Disabled`]: no credential was read, no
     /// client was constructed and no ticket store file was created.
     ticket_intake: ticket_intake::TicketIntakeHost,
+    /// The live progress endpoint, bound beside the admin socket.
+    ///
+    /// `Option` for the reason [`Daemon::execution`] is one: it owns threads
+    /// that must be joined *while the generation is still held*, and joining is
+    /// an ordered operation rather than disposal a drop can perform. Binding it
+    /// happens in [`Daemon::open`] and starting its accept thread happens in
+    /// [`Daemon::serve`], which is the same split every other worker here has:
+    /// a process that opened a daemon and never served has answered nobody.
+    progress_endpoint: Option<progress_hub::ProgressEndpoint>,
 }
 
 struct SocketCleanup {
@@ -1495,6 +1529,21 @@ impl Daemon {
         let approval_lifetime =
             approval_policy::ApprovalPolicyConfig::lifetime_or_default(&state_dir)
                 .map_err(|error| DaemonError::ApprovalPolicyRefused(error.category()))?;
+        // THE PROGRESS ENDPOINT BINDS LAST, AND STARTS NO THREAD.
+        //
+        // Last because it serves the execution lane's hub, which has to exist
+        // first; and beneath the same fence as everything above, so a host that
+        // cannot bind it refuses startup rather than publishing an admin socket
+        // beside a progress socket that silently is not there. It is bound
+        // before the admin socket guard is disarmed for that reason.
+        //
+        // A failure to bind is fatal, and deliberately: the two sockets are one
+        // endpoint from a client's point of view, and a daemon that answered
+        // status but could not be watched would be a daemon whose capability
+        // integer is a lie.
+        let progress_endpoint =
+            progress_hub::ProgressEndpoint::bind(config.progress_socket(), execution.progress())
+                .map_err(|error| DaemonError::ProgressEndpointFailed(error.category()))?;
         socket_cleanup.disarm();
 
         Ok(Self {
@@ -1525,6 +1574,7 @@ impl Daemon {
             approval_lifetime,
             execution: Some(execution),
             ticket_intake,
+            progress_endpoint: Some(progress_endpoint),
         })
     }
 
@@ -1618,6 +1668,17 @@ impl Daemon {
                 self.ticket_intake
                     .start()
                     .map_err(|error| DaemonError::TicketIntakeRefused(error.category()))
+            })
+            // LIVE PROGRESS FAN-OUT BEGINS HERE, AND NOWHERE ELSE. The endpoint
+            // was bound in `open`; this is what puts its accept loop on a
+            // thread, so a process that opened a daemon and never served has
+            // accepted no subscriber.
+            .and_then(|()| {
+                self.progress_endpoint.as_mut().map_or(Ok(()), |endpoint| {
+                    endpoint
+                        .start()
+                        .map_err(|error| DaemonError::ProgressEndpointFailed(error.category()))
+                })
             });
         let result = match started {
             Err(error) => Err(error),
@@ -1691,6 +1752,19 @@ impl Daemon {
         // answering for it. The lane is moved out and consumed rather than
         // borrowed, because ending it also releases its own reference to the
         // attempt host, which is what makes the unwrap below possible.
+        // SUBSCRIBERS ARE DISCONNECTED FIRST, AND DISCONNECTING THEM CANCELS
+        // NOTHING.
+        //
+        // Before the execution lane, because a writer thread holds a subscriber
+        // slot on the lane's hub and this daemon must not join the lane while a
+        // thread is still reaching into something it owns. Every attempt that
+        // was running is still running when this returns: a transport
+        // disconnect is not a cancellation, here or anywhere else — see
+        // [`progress_hub`] — and cancellation remains the explicit dispatcher
+        // path through [`Daemon::cancel_run`].
+        if let Some(progress_endpoint) = self.progress_endpoint.take() {
+            progress_endpoint.shutdown();
+        }
         if let Some(execution) = self.execution.take() {
             execution.shutdown();
         }
@@ -2021,8 +2095,20 @@ impl Daemon {
                 // and the status reports both so an operator can tell which
                 // one they are looking at.
                 let paused = self.store.intake_paused(GENERATION_ID, now_ms)?.is_some();
+                // The live fan-out is in this process's memory rather than in
+                // the database, so it is measured here and attached rather than
+                // projected from the snapshot. A daemon with no execution lane
+                // attaches nothing, and the four samples stay `unavailable` —
+                // which is the truthful answer for a host that cannot run
+                // anything, and is why they are not defaulted to zero.
                 let projection = StoreProjection::from_status(&snapshot)
                     .map_err(|_| DaemonError::ProtocolRefused("operational_projection"))?;
+                let projection = match self.progress() {
+                    Some(hub) => projection
+                        .with_progress(hub.observation())
+                        .map_err(|_| DaemonError::ProtocolRefused("operational_projection"))?,
+                    None => projection,
+                };
                 let operational = operational_status(&projection)?;
                 // Counted here, beside the projection, and not in it: these are
                 // reads of four other databases, and this daemon opens no

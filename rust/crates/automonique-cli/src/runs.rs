@@ -145,9 +145,10 @@ fn answer(runtime: Option<&OsStr>, request: RunsRequest) -> Result<String, RunsE
 /// The consequence is worth stating plainly rather than hiding: while the
 /// attempt is live its writer holds an exclusive lock and appends as it goes, so
 /// a read here is a *prefix* of what the run will eventually have said. Watching
-/// a live run frame-by-frame is a subscription, and a subscription needs a
-/// transport this build does not have; running `tail` again is what advances the
-/// prefix in the meantime.
+/// a live run frame-by-frame is a subscription, and that is
+/// `automonique progress subscribe` — the daemon's bounded fan-out, which is a
+/// window rather than a record. The two are the same sequence read from the two
+/// tiers: `tail` for completeness, `subscribe` for immediacy.
 ///
 /// Every rendered byte came out of the protocol's own decoder, so a frame the
 /// spool holds and this build cannot read is reported rather than guessed at.
@@ -186,7 +187,12 @@ fn tail(spool_root: &OsStr, run_id: &OsStr, cursor: Option<&OsStr>) -> Result<St
 }
 
 /// One frame, as one line.
-fn render_frame(frame: &ProgressFrame) -> String {
+///
+/// Shared with [`crate::progress`], which renders the same frames off the live
+/// socket: the two surfaces read one record and a window onto it, and an
+/// operator comparing them should not have to notice that they were formatted
+/// by two functions.
+pub(crate) fn render_frame(frame: &ProgressFrame) -> String {
     let step = frame
         .body()
         .step()

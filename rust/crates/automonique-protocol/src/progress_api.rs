@@ -43,10 +43,13 @@
 //!   already sanitized (`automonique_agents::UnknownEventKind`).
 //! - **No credential, no path, no environment.** Nothing in this shape has a
 //!   member one could travel through.
-//! - **No transport.** These are canonical payload bytes. The framing, the
-//!   socket and the subscriber machinery are deliberately elsewhere — a live
-//!   fan-out authority with cursors and bounded per-subscriber queues is its own
-//!   change, and this module is what it will carry.
+//! - **No transport in the frame itself.** A [`ProgressFrame`] is canonical
+//!   payload bytes and nothing else. What a live subscriber says and is told —
+//!   [`SubscribeRequest`] and [`StreamMessage`] — is a second, strictly larger
+//!   vocabulary in the back half of this module, and a frame travels *inside*
+//!   it rather than knowing about it. The socket, the queues and the writer
+//!   threads that carry those messages are the daemon's
+//!   (`automonique_daemon::progress_hub`); this module owns only their shapes.
 //! - **No terminal claim.** A [`crate::event::EventKind::RunTerminal`] frame is
 //!   the provider stream's end, not the supervisor's verdict. The run's terminal
 //!   state is the spool's `terminal` event, written by the backend from a
@@ -66,7 +69,7 @@ use std::error::Error;
 use crate::codec::{CodecError, SecuritySensitiveEnum, decode_security_enum};
 use crate::event::{
     Authority, EventError, EventKind, MAX_RETRY_AFTER_MS, MemberRule, RetryCategory, RetryContext,
-    StepStatus,
+    StepStatus, SubscriptionStart,
 };
 use crate::primitives::{EpochMillis, ValueError, bounded_value};
 use crate::tools::{MAX_TOOL_FIELD_BYTES, RunId};
@@ -161,6 +164,20 @@ pub enum ProgressApiError {
         /// Bytes the frame encoded to.
         actual_bytes: usize,
     },
+    /// The encoded stream message is larger than
+    /// [`MAX_PROGRESS_STREAM_CANONICAL_BYTES`].
+    ///
+    /// Kept apart from [`ProgressApiError::FrameTooLarge`] because the two
+    /// ceilings answer to different owners: a frame must fit one runner spool
+    /// payload, and a message must fit one transport frame. Collapsing them
+    /// would report a message this build wrapped badly as a frame the producer
+    /// built badly.
+    MessageTooLarge {
+        /// Maximum canonical bytes.
+        max_bytes: usize,
+        /// Bytes the message encoded to.
+        actual_bytes: usize,
+    },
 }
 
 impl ProgressApiError {
@@ -176,6 +193,7 @@ impl ProgressApiError {
             Self::UnwrittenSequence => "progress_unwritten_sequence",
             Self::TimeBeforeEpoch => "progress_time_before_epoch",
             Self::FrameTooLarge { .. } => "progress_frame_too_large",
+            Self::MessageTooLarge { .. } => "progress_message_too_large",
         }
     }
 }
@@ -203,6 +221,13 @@ impl fmt::Display for ProgressApiError {
             } => write!(
                 formatter,
                 "frame is {actual_bytes} canonical bytes; the maximum is {max_bytes}"
+            ),
+            Self::MessageTooLarge {
+                max_bytes,
+                actual_bytes,
+            } => write!(
+                formatter,
+                "stream message is {actual_bytes} canonical bytes; the maximum is {max_bytes}"
             ),
         }
     }
@@ -776,4 +801,541 @@ pub fn member_rules() -> Vec<(EventKind, MemberRule, MemberRule, MemberRule)> {
 /// Returns the bounded-value refusal.
 pub fn admit_identifier(value: &str) -> Result<(), ValueError> {
     bounded_value(value, MAX_TOOL_FIELD_BYTES)
+}
+
+/// Stable protocol name for the live progress-stream transport.
+///
+/// Deliberately not [`PROGRESS_PROTOCOL`]. That names the *frame*, which also
+/// travels as a runner spool payload where no subscriber, cursor or socket
+/// exists; this names the conversation a subscriber has, and the two version
+/// independently. A build could grow a stream message without changing a single
+/// frame, and it would be wrong for that to renumber the frame.
+pub const PROGRESS_STREAM_PROTOCOL: &str = "automonique.progress.stream";
+
+/// Stable schema identifier for the version-one stream message.
+pub const PROGRESS_STREAM_SCHEMA_V1: &str = "automonique.progress.stream/v1";
+
+/// Maximum canonical bytes of one encoded stream message.
+///
+/// One frame plus its envelope. The assertion below is what keeps this related
+/// to [`MAX_PROGRESS_CANONICAL_BYTES`] rather than merely larger than it today.
+pub const MAX_PROGRESS_STREAM_CANONICAL_BYTES: usize = MAX_PROGRESS_CANONICAL_BYTES + 256;
+
+/// Worst-case canonical bytes a stream envelope adds to the body it carries:
+/// both key names, the longest closed `kind` spelling, and the punctuation.
+const STREAM_SCAFFOLD_BYTES: usize = 64;
+
+const _: () = assert!(
+    MAX_PROGRESS_CANONICAL_BYTES + STREAM_SCAFFOLD_BYTES <= MAX_PROGRESS_STREAM_CANONICAL_BYTES,
+    "a maximal frame must fit inside one stream message"
+);
+
+/// Maximum canonical bytes of one encoded [`SubscribeRequest`].
+///
+/// Small, and checked rather than assumed: a subscription is a run identifier
+/// and a number, so a peer that sent anything approaching a frame's size did not
+/// send a subscription.
+pub const MAX_SUBSCRIBE_CANONICAL_BYTES: usize = RUN_ID_ENCODED_BYTES + 128;
+
+const _: () = assert!(
+    MAX_SUBSCRIBE_CANONICAL_BYTES < MAX_PROGRESS_STREAM_CANONICAL_BYTES,
+    "the request ceiling must be the smaller of the two, so a subscription cannot \
+     be spelled as large as a frame and an endpoint can bound its read before it \
+     knows what it is reading"
+);
+
+/// Why a subscription was refused before, or instead of, any delivery.
+///
+/// Closed, and every spelling is a `'static` word: a refusal carries its
+/// category and nothing a peer supplied.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum StreamRefusal {
+    /// The endpoint already serves every subscriber it will serve at once.
+    SubscriberLimit,
+    /// The request was not one canonical [`SubscribeRequest`] message.
+    MalformedRequest,
+    /// A field was outside its bounded grammar.
+    FieldInvalid,
+    /// An endpoint invariant failed. Nothing the peer sent caused it.
+    Internal,
+}
+
+impl StreamRefusal {
+    /// Every refusal, for coverage checks.
+    pub const ALL: [Self; 4] = [
+        Self::SubscriberLimit,
+        Self::MalformedRequest,
+        Self::FieldInvalid,
+        Self::Internal,
+    ];
+
+    /// Stable lowercase wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SubscriberLimit => "subscriber_limit",
+            Self::MalformedRequest => "malformed_request",
+            Self::FieldInvalid => "field_invalid",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// Parse the exact stable spelling, or nothing.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|refusal| refusal.as_str() == value)
+    }
+}
+
+impl fmt::Display for StreamRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl SecuritySensitiveEnum for StreamRefusal {
+    const FIELD: &'static str = "category";
+
+    fn from_wire(value: &str) -> Option<Self> {
+        Self::from_spelling(value)
+    }
+}
+
+/// What one subscriber asks for: an attempt, and where it got to.
+///
+/// The cursor is *exclusive*: it is the last sequence this subscriber received,
+/// so the first frame it wants is `cursor + 1`, and a subscriber that has
+/// received nothing sends zero. That is the convention every renderer in this
+/// build already holds — a progress view's cursor is what it last folded — and
+/// stating it here is what keeps [`resume_from`] from being an off-by-one
+/// somebody has to rediscover.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscribeRequest {
+    run_id: RunId,
+    cursor: u64,
+}
+
+impl SubscribeRequest {
+    /// Ask for everything after `cursor` on `run_id`.
+    #[must_use]
+    pub const fn new(run_id: RunId, cursor: u64) -> Self {
+        Self { run_id, cursor }
+    }
+
+    /// The attempt being watched.
+    #[must_use]
+    pub const fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    /// The last sequence this subscriber received.
+    #[must_use]
+    pub const fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
+    /// Encode to canonical payload bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgressApiError::CounterOutOfRange`] for a cursor above the
+    /// wire's signed ceiling, and [`ProgressApiError::MessageTooLarge`] for an
+    /// encoding above [`MAX_SUBSCRIBE_CANONICAL_BYTES`].
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, ProgressApiError> {
+        let encoded = JsonValue::Object(vec![
+            ("cursor".to_owned(), integer("cursor", self.cursor)?),
+            (
+                "run_id".to_owned(),
+                JsonValue::String(self.run_id.as_str().to_owned()),
+            ),
+        ])
+        .to_canonical_bytes();
+        admit_message_size(encoded.len(), MAX_SUBSCRIBE_CANONICAL_BYTES)?;
+        Ok(encoded)
+    }
+
+    /// Decode one subscription request from canonical payload bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the parse refusal, [`ProgressApiError::InvalidBody`] for a shape
+    /// that is not exact, and [`ProgressApiError::Field`] for a run identifier
+    /// outside its grammar.
+    pub fn from_canonical_bytes(payload: &[u8]) -> Result<Self, ProgressApiError> {
+        admit_message_size(payload.len(), MAX_SUBSCRIBE_CANONICAL_BYTES)?;
+        let value = parse_canonical(payload)?;
+        exact_fields(&value, &["cursor", "run_id"])?;
+        Ok(Self {
+            run_id: RunId::new(required_string(&value, "run_id")?).map_err(|error| {
+                ProgressApiError::Field {
+                    field: "run_id",
+                    error,
+                }
+            })?,
+            cursor: unsigned(&value, "cursor")?,
+        })
+    }
+}
+
+/// The closed vocabulary of what an endpoint says on a live stream.
+///
+/// Seven kinds, four of which end the conversation. The set is closed for the
+/// reason every vocabulary in this crate is: a subscriber that retained a kind
+/// this build does not define would have to decide whether the stream is still
+/// running, and the reassuring guess is the wrong one.
+///
+/// # Why `lagged` and `retired` are two kinds and not one
+///
+/// They are the two ways a live stream stops, and a client must act
+/// differently:
+///
+/// - [`StreamMessageKind::Lagged`] means *this subscriber* fell behind and its
+///   queued frames were discarded. Frames exist that it did not receive. It
+///   reconnects with the cursor the message carries and either resumes exactly
+///   or is told to resync.
+/// - [`StreamMessageKind::Retired`] means *the attempt* is over and the hub has
+///   stopped retaining it. Everything queued was delivered first. There is
+///   nothing further to receive live, and the durable spool is the record.
+///
+/// Both are also distinct from [`EventKind::RunTerminal`], which travels inside
+/// a [`StreamMessageKind::Frame`] and is the *provider stream's* end rather
+/// than either the supervisor's verdict or the transport's. Three different
+/// endings, three different things to draw.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum StreamMessageKind {
+    /// The endpoint's opening statement, before it has read a request byte.
+    Greeting,
+    /// The subscription was accepted; delivery begins.
+    Live,
+    /// The cursor is outside what is retained; the spool is where to read.
+    ResyncRequired,
+    /// One normalized progress frame.
+    Frame,
+    /// This subscriber fell behind and was disconnected.
+    Lagged,
+    /// The attempt is terminal and is no longer retained live.
+    Retired,
+    /// The subscription was refused.
+    Refused,
+}
+
+impl StreamMessageKind {
+    /// Every kind, for coverage checks.
+    pub const ALL: [Self; 7] = [
+        Self::Greeting,
+        Self::Live,
+        Self::ResyncRequired,
+        Self::Frame,
+        Self::Lagged,
+        Self::Retired,
+        Self::Refused,
+    ];
+
+    /// Stable lowercase wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Greeting => "greeting",
+            Self::Live => "live",
+            Self::ResyncRequired => "resync_required",
+            Self::Frame => "frame",
+            Self::Lagged => "lagged",
+            Self::Retired => "retired",
+            Self::Refused => "refused",
+        }
+    }
+
+    /// Parse the exact stable spelling, or nothing.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == value)
+    }
+
+    /// Whether nothing further arrives on this connection after this kind.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::ResyncRequired | Self::Lagged | Self::Retired | Self::Refused
+        )
+    }
+}
+
+impl fmt::Display for StreamMessageKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl SecuritySensitiveEnum for StreamMessageKind {
+    const FIELD: &'static str = "kind";
+
+    fn from_wire(value: &str) -> Option<Self> {
+        Self::from_spelling(value)
+    }
+}
+
+/// One message an endpoint writes to one subscriber.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StreamMessage {
+    /// What this endpoint is, and which capability it serves.
+    ///
+    /// Written before the request is read, so a client decides whether it is
+    /// talking to something it understands without disclosing what it wanted.
+    Greeting {
+        /// The endpoint's [`crate::admin::ADMIN_CAPABILITY`].
+        capability: u32,
+    },
+    /// Delivery begins with `from`.
+    Live {
+        /// First sequence this subscriber will receive: its cursor plus one.
+        from: u64,
+    },
+    /// The cursor is below what is retained.
+    ///
+    /// `snapshot_from` and `snapshot_to` are both zero when the endpoint
+    /// retains nothing at all for the attempt — zero names no appended event,
+    /// so the pair is unambiguous — and the durable spool is then the only
+    /// record there is.
+    ResyncRequired {
+        /// Lowest sequence still retained.
+        snapshot_from: u64,
+        /// Highest sequence still retained.
+        snapshot_to: u64,
+    },
+    /// One normalized progress frame.
+    Frame(ProgressFrame),
+    /// This subscriber fell behind; its queue was discarded.
+    Lagged {
+        /// Last sequence this subscriber actually received.
+        delivered_through: u64,
+    },
+    /// The attempt is terminal and no longer retained live.
+    Retired {
+        /// Last sequence this subscriber actually received.
+        delivered_through: u64,
+    },
+    /// The subscription was refused.
+    Refused {
+        /// Why.
+        refusal: StreamRefusal,
+    },
+}
+
+impl StreamMessage {
+    /// Which kind this message is.
+    #[must_use]
+    pub const fn kind(&self) -> StreamMessageKind {
+        match self {
+            Self::Greeting { .. } => StreamMessageKind::Greeting,
+            Self::Live { .. } => StreamMessageKind::Live,
+            Self::ResyncRequired { .. } => StreamMessageKind::ResyncRequired,
+            Self::Frame(_) => StreamMessageKind::Frame,
+            Self::Lagged { .. } => StreamMessageKind::Lagged,
+            Self::Retired { .. } => StreamMessageKind::Retired,
+            Self::Refused { .. } => StreamMessageKind::Refused,
+        }
+    }
+
+    /// Whether nothing further arrives on this connection after this message.
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        self.kind().is_terminal()
+    }
+
+    /// The message answering one subscription decision.
+    ///
+    /// The two arms of [`SubscriptionStart`] map onto the two arms this
+    /// endpoint can answer with, so no caller re-derives the mapping and the
+    /// two vocabularies cannot drift into disagreeing about which is which.
+    #[must_use]
+    pub const fn from_subscription(start: SubscriptionStart) -> Self {
+        match start {
+            SubscriptionStart::Live { from } => Self::Live { from },
+            SubscriptionStart::ResyncRequired {
+                snapshot_from,
+                snapshot_to,
+            } => Self::ResyncRequired {
+                snapshot_from,
+                snapshot_to,
+            },
+        }
+    }
+
+    /// Encode to canonical payload bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgressApiError::CounterOutOfRange`] for a counter above the
+    /// wire's signed ceiling, the frame's own refusals for a frame that will
+    /// not encode, and [`ProgressApiError::MessageTooLarge`] above
+    /// [`MAX_PROGRESS_STREAM_CANONICAL_BYTES`].
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, ProgressApiError> {
+        let body = match self {
+            Self::Greeting { capability } => JsonValue::Object(vec![(
+                "capability".to_owned(),
+                JsonValue::Integer(i64::from(*capability)),
+            )]),
+            Self::Live { from } => {
+                JsonValue::Object(vec![("from".to_owned(), integer("from", *from)?)])
+            }
+            Self::ResyncRequired {
+                snapshot_from,
+                snapshot_to,
+            } => JsonValue::Object(vec![
+                (
+                    "snapshot_from".to_owned(),
+                    integer("snapshot_from", *snapshot_from)?,
+                ),
+                (
+                    "snapshot_to".to_owned(),
+                    integer("snapshot_to", *snapshot_to)?,
+                ),
+            ]),
+            // Re-parsed rather than re-derived: the frame owns its own encoding,
+            // and a second rendering here would be a second thing to keep equal.
+            Self::Frame(frame) => parse_canonical(&frame.to_canonical_bytes()?)?,
+            Self::Lagged { delivered_through } | Self::Retired { delivered_through } => {
+                JsonValue::Object(vec![(
+                    "delivered_through".to_owned(),
+                    integer("delivered_through", *delivered_through)?,
+                )])
+            }
+            Self::Refused { refusal } => JsonValue::Object(vec![(
+                "category".to_owned(),
+                JsonValue::String(refusal.as_str().to_owned()),
+            )]),
+        };
+        let encoded = JsonValue::Object(vec![
+            ("body".to_owned(), body),
+            (
+                "kind".to_owned(),
+                JsonValue::String(self.kind().as_str().to_owned()),
+            ),
+        ])
+        .to_canonical_bytes();
+        admit_message_size(encoded.len(), MAX_PROGRESS_STREAM_CANONICAL_BYTES)?;
+        Ok(encoded)
+    }
+
+    /// Decode one stream message from canonical payload bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the parse refusal, [`ProgressApiError::Codec`] wrapping
+    /// [`CodecError::UnknownEnumValue`] for a kind this build does not define,
+    /// and [`ProgressApiError::InvalidBody`] for a body that is not the exact
+    /// shape its kind declares.
+    pub fn from_canonical_bytes(payload: &[u8]) -> Result<Self, ProgressApiError> {
+        admit_message_size(payload.len(), MAX_PROGRESS_STREAM_CANONICAL_BYTES)?;
+        let value = parse_canonical(payload)?;
+        exact_fields(&value, &["body", "kind"])?;
+        let kind = decode_security_enum::<StreamMessageKind>(&required_string(&value, "kind")?)?;
+        let body = value.get("body").ok_or(ProgressApiError::InvalidBody)?;
+        match kind {
+            StreamMessageKind::Greeting => {
+                exact_fields(body, &["capability"])?;
+                Ok(Self::Greeting {
+                    capability: u32::try_from(unsigned(body, "capability")?).map_err(|_| {
+                        ProgressApiError::CounterOutOfRange {
+                            field: "capability",
+                        }
+                    })?,
+                })
+            }
+            StreamMessageKind::Live => {
+                exact_fields(body, &["from"])?;
+                Ok(Self::Live {
+                    from: unsigned(body, "from")?,
+                })
+            }
+            StreamMessageKind::ResyncRequired => {
+                exact_fields(body, &["snapshot_from", "snapshot_to"])?;
+                let snapshot_from = unsigned(body, "snapshot_from")?;
+                let snapshot_to = unsigned(body, "snapshot_to")?;
+                // A window that ends below where it starts retains nothing, and
+                // the one spelling of "nothing" this shape admits is the pair of
+                // zeroes; every other inversion is a message nobody could act on.
+                if snapshot_to < snapshot_from {
+                    return Err(ProgressApiError::InvalidBody);
+                }
+                Ok(Self::ResyncRequired {
+                    snapshot_from,
+                    snapshot_to,
+                })
+            }
+            StreamMessageKind::Frame => Ok(Self::Frame(ProgressFrame::from_canonical_bytes(
+                &body.to_canonical_bytes(),
+            )?)),
+            StreamMessageKind::Lagged | StreamMessageKind::Retired => {
+                exact_fields(body, &["delivered_through"])?;
+                let delivered_through = unsigned(body, "delivered_through")?;
+                Ok(if matches!(kind, StreamMessageKind::Lagged) {
+                    Self::Lagged { delivered_through }
+                } else {
+                    Self::Retired { delivered_through }
+                })
+            }
+            StreamMessageKind::Refused => {
+                exact_fields(body, &["category"])?;
+                Ok(Self::Refused {
+                    refusal: decode_security_enum::<StreamRefusal>(&required_string(
+                        body, "category",
+                    )?)?,
+                })
+            }
+        }
+    }
+}
+
+/// Where a subscriber holding `delivered_through` may resume.
+///
+/// `retained` is the endpoint's window, inclusive at both ends, or `None` when
+/// it holds nothing for the attempt.
+///
+/// # The off-by-one, stated once
+///
+/// This module's cursor is *exclusive* — see [`SubscribeRequest`] — so the
+/// frame a subscriber needs next is `delivered_through + 1`, and that is what
+/// the window is judged against. [`crate::event::resolve_subscription`] takes
+/// the *inclusive* form, because a [`crate::event::ConsumerCursor`] position is
+/// the next position wanted rather than the last one received. The two rules
+/// therefore differ by exactly one, which is why this converts rather than
+/// restating; `tests/progress_api.rs` pins the agreement across the whole
+/// shared domain so the conversion cannot quietly become a second rule.
+///
+/// An empty window answers [`SubscriptionStart::ResyncRequired`] with both
+/// coordinates zero for any subscriber that has received something, and
+/// [`SubscriptionStart::Live`] for one that has not: a subscriber at zero is
+/// asking for everything there is, and nothing is a truthful answer to that,
+/// whereas a subscriber at ten is claiming continuity this endpoint cannot
+/// support.
+#[must_use]
+pub fn resume_from(delivered_through: u64, retained: Option<(u64, u64)>) -> SubscriptionStart {
+    let wanted = delivered_through.saturating_add(1);
+    match retained {
+        Some((first, _)) if wanted >= first => SubscriptionStart::Live { from: wanted },
+        Some((first, last)) => SubscriptionStart::ResyncRequired {
+            snapshot_from: first,
+            snapshot_to: last,
+        },
+        None if delivered_through == 0 => SubscriptionStart::Live { from: wanted },
+        None => SubscriptionStart::ResyncRequired {
+            snapshot_from: 0,
+            snapshot_to: 0,
+        },
+    }
+}
+
+/// Refuse an encoding or a payload above the ceiling its shape is held to.
+fn admit_message_size(actual_bytes: usize, max_bytes: usize) -> Result<(), ProgressApiError> {
+    if actual_bytes > max_bytes {
+        return Err(ProgressApiError::MessageTooLarge {
+            max_bytes,
+            actual_bytes,
+        });
+    }
+    Ok(())
 }

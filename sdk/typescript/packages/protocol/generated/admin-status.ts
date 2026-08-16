@@ -11,11 +11,23 @@
 
 import {ValidationError, byteLength} from "./runtime.ts";
 
+/** What this build's local endpoints can do, as one monotonic integer. A client compares it against the number it was written for; it never assumes the two must be equal. */
+export const ADMIN_CAPABILITY = 1;
+
 /** Stable protocol name for local daemon administration. */
 export const ADMIN_PROTOCOL = "automonique.admin";
 
+/** Endpoints still served and going away. New clients use their replacements. */
+export const DEPRECATED_ENDPOINTS: readonly string[] = [];
+
+/** Endpoints that may change shape or disappear. Depend on one deliberately. */
+export const EXPERIMENTAL_ENDPOINTS: readonly string[] = ["automonique.admin/status", "automonique.admin/submit_synthetic", "automonique.admin/submit_run", "automonique.admin/inspect_reconciliation", "automonique.admin/fail_reconciliation", "automonique.admin/inspect_outbox", "automonique.admin/reconcile_outbox", "automonique.admin/pause_intake", "automonique.admin/resume_intake", "automonique.admin/shutdown", "automonique.runs/list_runs", "automonique.runs/run_detail", "automonique.execute/execute_run", "automonique.execute/cancel_run", "automonique.automation/register_automation", "automonique.automation/set_enablement", "automonique.automation/list_automations", "automonique.automation/automation_detail", "automonique.approval/record_approval", "automonique.approval/list_approvals", "automonique.approval/approval_detail", "automonique.approval/approvals_by_subject", "automonique.approval/decide_request", "automonique.batch/register_batch", "automonique.batch/advance_member", "automonique.batch/list_batches", "automonique.batch/batch_detail", "automonique.progress.stream/subscribe"];
+
 /** Maximum canonical message bytes the local admin transport accepts. */
 export const MAX_ADMIN_CANONICAL_BYTES = 65536;
+
+/** Endpoints that will not change shape incompatibly. A removal is a deprecation first and a capability bump second. */
+export const STABLE_ENDPOINTS: readonly string[] = [];
 
 /** Branded identifier, at most 128 UTF-8 bytes. */
 export type AdminInstanceId = string & {readonly __brand: "AdminInstanceId"};
@@ -57,6 +69,16 @@ export function decodeExecutionState(value: string): ExecutionState {
   return value as ExecutionState;
 }
 
+export type Maturity = "deprecated" | "experimental" | "stable";
+export const Maturity_VALUES: readonly Maturity[] = ["deprecated", "experimental", "stable"];
+/** Security-sensitive: an undefined value is refused. */
+export function decodeMaturity(value: string): Maturity {
+  if (!(Maturity_VALUES as readonly string[]).includes(value)) {
+    throw new ValidationError("Maturity", "unknown_enum_value");
+  }
+  return value as Maturity;
+}
+
 export type TelegramState = "disabled_no_client" | "lease_owned_no_client" | "polling_live";
 export const TelegramState_VALUES: readonly TelegramState[] = ["disabled_no_client", "lease_owned_no_client", "polling_live"];
 /** Security-sensitive: an undefined value is refused. */
@@ -75,9 +97,10 @@ export function assertNeverOperationalMetric(value: never): never {
   throw new ValidationError("OperationalMetric", `unhandled variant: ${JSON.stringify(value)}`);
 }
 
-/** One consistent snapshot. `operational` and `durable_state` are always present; only `telegram_poller_epoch` may be null. */
+/** One consistent snapshot. `operational` and `durable_state` are always present; only `telegram_poller_epoch` may be null. `capability` is the answering daemon's, which is not necessarily this client's `ADMIN_CAPABILITY`. */
 export interface DaemonStatus {
   readonly accepting_intake: boolean;
+  readonly capability: WireCounter;
   readonly durable_state: DurableStateCounts;
   readonly event_cursor: WireCounter;
   readonly execution_state: ExecutionState;
@@ -94,6 +117,7 @@ export interface DaemonStatus {
 }
 export const DaemonStatus_FIELDS: readonly string[] = [
   "accepting_intake",
+  "capability",
   "durable_state",
   "event_cursor",
   "execution_state",

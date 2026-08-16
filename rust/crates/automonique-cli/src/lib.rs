@@ -20,6 +20,7 @@ mod cancel;
 mod diagnostics;
 mod kernel;
 mod parity;
+mod progress;
 mod release;
 mod run_submit;
 mod runs;
@@ -46,7 +47,7 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
-const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique runs tail <spool-root> <run-id> [cursor]\n       automonique automation register <automation-id> <actor>\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique batch register <batch-id> [--label <label>] [--sequential | --parallel <ceiling>] <member-key>...\n       automonique batch advance <batch-id> <member-key> <revision> <state> <last-sequence>\n       automonique batch list [--cursor <entry-id>] [--page <size>]\n       automonique batch detail <batch-id>\n       automonique parity compare <database> <scope> [--registry <path>] [--category <category>]\n       automonique parity score <database> <scope>\n       automonique parity gate <database> <scope> <decision-key> <decider> [--registry <path>]\n       automonique audit verify <database>\n       automonique cancel <run-id> <request-ref> [observed-sequence]\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique shutdown\n";
+const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique runs tail <spool-root> <run-id> [cursor]\n       automonique automation register <automation-id> <actor>\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique batch register <batch-id> [--label <label>] [--sequential | --parallel <ceiling>] <member-key>...\n       automonique batch advance <batch-id> <member-key> <revision> <state> <last-sequence>\n       automonique batch list [--cursor <entry-id>] [--page <size>]\n       automonique batch detail <batch-id>\n       automonique parity compare <database> <scope> [--registry <path>] [--category <category>]\n       automonique parity score <database> <scope>\n       automonique parity gate <database> <scope> <decision-key> <decider> [--registry <path>]\n       automonique audit verify <database>\n       automonique cancel <run-id> <request-ref> [observed-sequence]\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique progress subscribe <socket-path> <run-id> [cursor]\n       automonique shutdown\n";
 
 #[derive(Clone)]
 enum Command {
@@ -86,6 +87,7 @@ enum Command {
     },
     Shutdown,
     Attempt(attempt::Operation),
+    Progress(progress::Operation),
     Runs(runs::Operation),
     Automation(automation::Operation),
     Approval(approval::Operation),
@@ -469,6 +471,23 @@ where
                 }
             }
         }
+        (Some(command), Some(operation), Some(socket_path), Some(run_id))
+            if command == "progress" =>
+        {
+            let cursor = arguments.next();
+            let extra = arguments.next();
+            match (operation.to_str(), extra) {
+                (Some("subscribe"), None) => Command::Progress(progress::Operation::Subscribe {
+                    socket_path,
+                    run_id,
+                    cursor,
+                }),
+                _ => {
+                    let _ = stderr.write_all(USAGE.as_bytes());
+                    return 2;
+                }
+            }
+        }
         (Some(command), None, None, None) if command == "shutdown" => Command::Shutdown,
         _ => {
             let _ = stderr.write_all(USAGE.as_bytes());
@@ -576,6 +595,9 @@ where
         }
         Command::Attempt(operation) => {
             return attempt::run(operation, &mut stdout, &mut stderr);
+        }
+        Command::Progress(operation) => {
+            return progress::run(&operation, &mut stdout, &mut stderr);
         }
         Command::Doctor { json } => json,
     };

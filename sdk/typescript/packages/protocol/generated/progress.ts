@@ -10,20 +10,33 @@
 // ergonomics; it may not redefine anything in this file.
 
 import {RunId} from "./admin-command.ts";
+import {WireCounter} from "./admin-status.ts";
 import {Authority, EpochMillis, SpoolSequence} from "./runs.ts";
 import {ValidationError, byteLength} from "./runtime.ts";
 
 /** Maximum canonical bytes of one encoded frame. It is inside the runner spool's own payload ceiling, because a frame is stored as one spool event's payload. */
 export const MAX_PROGRESS_CANONICAL_BYTES = 40960;
 
+/** Maximum canonical bytes of one encoded stream message: one frame plus its envelope. */
+export const MAX_PROGRESS_STREAM_CANONICAL_BYTES = 41216;
+
 /** Longest wait a retry context may advertise. A delay past it is refused rather than clamped: a wait nobody will sit through is a refusal wearing a promise. */
 export const MAX_RETRY_AFTER_MS = 300000;
+
+/** Maximum canonical bytes of one subscription request. A peer that sent anything approaching a frame's size did not send a subscription. */
+export const MAX_SUBSCRIBE_CANONICAL_BYTES = 640;
 
 /** Stable schema identifier for the version-one frame. */
 export const PROGRESS_API_SCHEMA_V1 = "automonique.progress/v1";
 
 /** Stable protocol name for the normalized progress stream. */
 export const PROGRESS_PROTOCOL = "automonique.progress";
+
+/** Stable protocol name for the live stream transport. Separate from the frame's own name, because a build can grow a stream message without changing a single frame. */
+export const PROGRESS_STREAM_PROTOCOL = "automonique.progress.stream";
+
+/** Stable schema identifier for the version-one stream message. */
+export const PROGRESS_STREAM_SCHEMA_V1 = "automonique.progress.stream/v1";
 
 /** Bounded string, at most 16384 UTF-8 bytes. */
 export type ProgressText = string & {readonly __brand: "ProgressText"};
@@ -34,6 +47,15 @@ export function ProgressText(value: string): ProgressText {
   if (byteLength(value) > 16384) throw new ValidationError("ProgressText", "too_long");
   if (!ProgressText_PATTERN.test(value)) throw new ValidationError("ProgressText", "invalid_character");
   return value as ProgressText;
+}
+
+/** Bounded integer in [0, 9223372036854775807]. */
+export type ProgressCursor = bigint & {readonly __brand: "ProgressCursor"};
+export const ProgressCursor_MIN = 0n;
+export const ProgressCursor_MAX = 9223372036854775807n;
+export function ProgressCursor(value: bigint): ProgressCursor {
+  if (value < 0n || value > 9223372036854775807n) throw new ValidationError("ProgressCursor", "out_of_range");
+  return value as ProgressCursor;
 }
 
 /** Bounded integer in [0, 300000]. */
@@ -84,6 +106,39 @@ export function decodeStepStatus(value: string): StepStatus {
   return value as StepStatus;
 }
 
+export type StreamMessageKind = "frame" | "greeting" | "lagged" | "live" | "refused" | "resync_required" | "retired";
+export const StreamMessageKind_VALUES: readonly StreamMessageKind[] = ["frame", "greeting", "lagged", "live", "refused", "resync_required", "retired"];
+/** Security-sensitive: an undefined value is refused. */
+export function decodeStreamMessageKind(value: string): StreamMessageKind {
+  if (!(StreamMessageKind_VALUES as readonly string[]).includes(value)) {
+    throw new ValidationError("StreamMessageKind", "unknown_enum_value");
+  }
+  return value as StreamMessageKind;
+}
+
+export type StreamRefusal = "field_invalid" | "internal" | "malformed_request" | "subscriber_limit";
+export const StreamRefusal_VALUES: readonly StreamRefusal[] = ["field_invalid", "internal", "malformed_request", "subscriber_limit"];
+/** Security-sensitive: an undefined value is refused. */
+export function decodeStreamRefusal(value: string): StreamRefusal {
+  if (!(StreamRefusal_VALUES as readonly string[]).includes(value)) {
+    throw new ValidationError("StreamRefusal", "unknown_enum_value");
+  }
+  return value as StreamRefusal;
+}
+
+export type StreamMessage =
+  | {readonly kind: "frame"; readonly body: ProgressFrame}
+  | {readonly kind: "greeting"; readonly body: StreamGreeting}
+  | {readonly kind: "lagged"; readonly body: StreamStop}
+  | {readonly kind: "live"; readonly body: StreamLive}
+  | {readonly kind: "refused"; readonly body: StreamRefused}
+  | {readonly kind: "resync_required"; readonly body: StreamResync}
+  | {readonly kind: "retired"; readonly body: StreamStop};
+
+export function assertNeverStreamMessage(value: never): never {
+  throw new ValidationError("StreamMessage", `unhandled variant: ${JSON.stringify(value)}`);
+}
+
 /** What one frame says beyond its kind. Every member is present and may be null; which of them a kind requires and which it forbids is a cross-field rule only the Rust constructor applies. */
 export interface ProgressBody {
   readonly retry: RetryContext | null;
@@ -126,4 +181,56 @@ export const RetryContext_FIELDS: readonly string[] = [
   "category",
   "retry_after_ms",
   "retryable",
+];
+
+/** What the endpoint is, written before it reads a request byte, so a client decides whether it understands the endpoint without disclosing what it wanted. */
+export interface StreamGreeting {
+  readonly capability: WireCounter;
+}
+export const StreamGreeting_FIELDS: readonly string[] = [
+  "capability",
+];
+
+/** Delivery begins. `from` is the first sequence this subscriber will receive: its cursor plus one. */
+export interface StreamLive {
+  readonly from: SpoolSequence;
+}
+export const StreamLive_FIELDS: readonly string[] = [
+  "from",
+];
+
+/** Why a subscription was refused. The category is a closed spelling and carries nothing the peer supplied. */
+export interface StreamRefused {
+  readonly category: StreamRefusal;
+}
+export const StreamRefused_FIELDS: readonly string[] = [
+  "category",
+];
+
+/** The cursor is below what is retained. Both coordinates are zero when the endpoint retains nothing at all for the attempt, and the durable spool is then the only record there is. */
+export interface StreamResync {
+  readonly snapshot_from: ProgressCursor;
+  readonly snapshot_to: ProgressCursor;
+}
+export const StreamResync_FIELDS: readonly string[] = [
+  "snapshot_from",
+  "snapshot_to",
+];
+
+/** How a live stream ended, carried by both `lagged` and `retired`. `delivered_through` is the last sequence this subscriber actually received, which is the cursor it reconnects with. */
+export interface StreamStop {
+  readonly delivered_through: ProgressCursor;
+}
+export const StreamStop_FIELDS: readonly string[] = [
+  "delivered_through",
+];
+
+/** What one subscriber asks for. `cursor` is exclusive — the last sequence this subscriber received — so a subscriber that has received nothing sends zero. */
+export interface SubscribeRequest {
+  readonly cursor: ProgressCursor;
+  readonly run_id: RunId;
+}
+export const SubscribeRequest_FIELDS: readonly string[] = [
+  "cursor",
+  "run_id",
 ];

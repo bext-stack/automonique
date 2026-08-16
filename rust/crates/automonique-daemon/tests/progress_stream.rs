@@ -13,6 +13,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use automonique_agents::{
     ExecutionMode, ProviderItemKind, RecordedKind, RunCoordinates, SessionScope,
@@ -21,7 +22,9 @@ use automonique_daemon::progress::{
     PREVIEW_FLUSH_BYTES, ProviderProgressMapper, STREAM_REFUSED_PREFIX, frame_kind,
     item_frame_authority, item_frame_kind,
 };
-use automonique_daemon::progress_hub::{HUB_ATTEMPT_FRAMES, HUB_ATTEMPTS, ProgressHub};
+use automonique_daemon::progress_hub::{
+    HUB_ATTEMPT_FRAMES, HUB_ATTEMPTS, HUB_TERMINAL_RETENTION, ProgressHub,
+};
 use automonique_daemon::slack::{MAX_TASK_CARD_LINES, RunTaskCard};
 use automonique_daemon::telegram_bridge::{MAX_PROGRESS_STEP_LINES, RunProgressView};
 use automonique_protocol::event::{
@@ -425,12 +428,28 @@ mod hub {
         );
     }
 
+    /// A retired attempt is kept for its retention window and then forgotten.
+    ///
+    /// The window is what makes a bridge restart free: a connector that dies
+    /// after the run ends and comes back inside it still resumes from its
+    /// cursor. After it, the durable spool is the only record — which is the
+    /// whole of what the live tier promises.
     #[test]
-    fn retiring_an_attempt_forgets_it() {
+    fn retiring_an_attempt_keeps_it_for_the_retention_window() {
         let hub = ProgressHub::new();
+        let start = Instant::now();
         publish(&hub, RUN, &preview(1, "draft"));
         assert_eq!(hub.retained_attempts(), 1);
-        hub.retire(RUN);
+
+        hub.retire_at(RUN, start);
+        assert_eq!(hub.retained_attempts(), 1, "a retirement is not an erasure");
+        assert_eq!(hub.frames_after(RUN, 0).len(), 1);
+        assert_eq!(hub.oldest_retained(RUN), Some(1));
+
+        // One millisecond before the window closes, and one after it.
+        hub.sweep_at(start + HUB_TERMINAL_RETENTION - Duration::from_millis(1));
+        assert_eq!(hub.retained_attempts(), 1);
+        hub.sweep_at(start + HUB_TERMINAL_RETENTION);
         assert_eq!(hub.retained_attempts(), 0);
         assert!(hub.frames_after(RUN, 0).is_empty());
         assert_eq!(hub.oldest_retained(RUN), None);

@@ -2155,3 +2155,254 @@ mod local_dispatch {
         );
     }
 }
+
+/// The capability integer and the maturity table: what a client is promised,
+/// and the rule that keeps a promise from being unsaid.
+mod capability {
+    use super::*;
+    use automonique_protocol::admin::{
+        ADMIN_CAPABILITY, AdminCommand, ENDPOINT_MATURITY, Maturity,
+    };
+
+    /// The whole changelog, as it stood when each entry landed.
+    ///
+    /// **Append-only.** A landed entry is never edited: a client that read it
+    /// and shipped against it cannot be reached to be told it changed. Adding a
+    /// capability appends one line here and increments [`ADMIN_CAPABILITY`], in
+    /// the same commit as the change it describes. Editing an existing line
+    /// fails this test, which is the point — the rule is enforced rather than
+    /// requested in a review.
+    const CHANGELOG: &[(u32, &str)] = &[(
+        1,
+        "the six lanes of the local admin socket and the live progress stream",
+    )];
+
+    /// Every endpoint, at the maturity it had when it landed.
+    ///
+    /// **Append-only in the same sense.** A row's maturity may move forward —
+    /// experimental to stable, stable to deprecated — because that is what
+    /// maturity is for, and this snapshot records where each started rather
+    /// than pinning where it is. What it does pin is the *set*: a row that
+    /// vanished or was renamed would tell a client the endpoint never existed,
+    /// and that fails here.
+    const LANDED_ENDPOINTS: &[&str] = &[
+        "automonique.admin/status",
+        "automonique.admin/submit_synthetic",
+        "automonique.admin/submit_run",
+        "automonique.admin/inspect_reconciliation",
+        "automonique.admin/fail_reconciliation",
+        "automonique.admin/inspect_outbox",
+        "automonique.admin/reconcile_outbox",
+        "automonique.admin/pause_intake",
+        "automonique.admin/resume_intake",
+        "automonique.admin/shutdown",
+        "automonique.runs/list_runs",
+        "automonique.runs/run_detail",
+        "automonique.execute/execute_run",
+        "automonique.execute/cancel_run",
+        "automonique.automation/register_automation",
+        "automonique.automation/set_enablement",
+        "automonique.automation/list_automations",
+        "automonique.automation/automation_detail",
+        "automonique.approval/record_approval",
+        "automonique.approval/list_approvals",
+        "automonique.approval/approval_detail",
+        "automonique.approval/approvals_by_subject",
+        "automonique.approval/decide_request",
+        "automonique.batch/register_batch",
+        "automonique.batch/advance_member",
+        "automonique.batch/list_batches",
+        "automonique.batch/batch_detail",
+        "automonique.progress.stream/subscribe",
+    ];
+
+    #[test]
+    fn the_changelog_is_append_only_and_names_the_current_capability() {
+        assert!(
+            !CHANGELOG.is_empty(),
+            "a capability integer with no changelog explains nothing"
+        );
+        // Contiguous from one: a gap would be a capability nobody can look up,
+        // and a repeat would be two meanings for one number.
+        for (index, (number, note)) in CHANGELOG.iter().enumerate() {
+            assert_eq!(
+                *number,
+                u32::try_from(index).expect("a small index") + 1,
+                "the changelog skipped or repeated a number"
+            );
+            assert!(!note.is_empty(), "capability {number} says nothing");
+        }
+        let latest = CHANGELOG.last().expect("a non-empty changelog").0;
+        assert_eq!(
+            ADMIN_CAPABILITY, latest,
+            "the constant and its changelog disagree: bump one when you bump the other"
+        );
+    }
+
+    /// The declared set is exactly what the snapshot says, so nothing can be
+    /// removed or renamed without saying so here.
+    #[test]
+    fn the_maturity_table_is_append_only() {
+        let declared: Vec<&str> = ENDPOINT_MATURITY
+            .iter()
+            .map(|(endpoint, _)| *endpoint)
+            .collect();
+        assert_eq!(
+            declared, LANDED_ENDPOINTS,
+            "an endpoint was removed, renamed or reordered; a client reading the old \
+             name would be told it never existed"
+        );
+        // One row per endpoint. A duplicate would be two promises about one
+        // thing, and a client could read either.
+        let mut sorted = declared.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            declared.len(),
+            "an endpoint is declared twice"
+        );
+    }
+
+    /// The admin lane's own commands are covered exhaustively, by walking the
+    /// closed set rather than by reading the table.
+    #[test]
+    fn every_admin_command_is_declared() {
+        assert_eq!(AdminCommand::ALL.len(), 10);
+        for command in AdminCommand::ALL {
+            let endpoint = format!("automonique.admin/{}", command.kind());
+            assert!(
+                ENDPOINT_MATURITY
+                    .iter()
+                    .any(|(declared, _)| *declared == endpoint),
+                "{endpoint} is served and never declared"
+            );
+        }
+    }
+
+    /// Every lane the local socket routes is represented, so a whole protocol
+    /// cannot be forgotten.
+    #[test]
+    fn every_local_lane_appears_in_the_table() {
+        for protocol in [
+            ADMIN_PROTOCOL,
+            "automonique.runs",
+            "automonique.execute",
+            "automonique.automation",
+            "automonique.approval",
+            "automonique.batch",
+            "automonique.progress.stream",
+        ] {
+            let prefix = format!("{protocol}/");
+            assert!(
+                ENDPOINT_MATURITY
+                    .iter()
+                    .any(|(endpoint, _)| endpoint.starts_with(&prefix)),
+                "{protocol} has no declared endpoint"
+            );
+        }
+        // Every name is `<protocol>/<kind>` and nothing else: one slash, and
+        // neither half empty.
+        for (endpoint, _) in ENDPOINT_MATURITY {
+            let mut halves = endpoint.split('/');
+            let protocol = halves.next().unwrap_or_default();
+            let kind = halves.next().unwrap_or_default();
+            assert!(protocol.starts_with("automonique."), "{endpoint}");
+            assert!(!kind.is_empty(), "{endpoint}");
+            assert!(halves.next().is_none(), "{endpoint} has two slashes");
+        }
+    }
+
+    #[test]
+    fn maturity_is_a_closed_vocabulary() {
+        assert_eq!(Maturity::ALL.len(), 3);
+        assert_eq!(
+            Maturity::ALL
+                .into_iter()
+                .map(Maturity::as_str)
+                .collect::<Vec<_>>(),
+            vec!["experimental", "stable", "deprecated"]
+        );
+        for maturity in Maturity::ALL {
+            assert_eq!(Maturity::from_spelling(maturity.as_str()), Some(maturity));
+        }
+        assert_eq!(Maturity::from_spelling("beta"), None);
+        assert_eq!(Maturity::from_spelling("Stable"), None);
+    }
+
+    /// An encoder reports this build's capability, and a decoder reports the
+    /// peer's.
+    #[test]
+    fn the_status_carries_the_answering_daemons_capability() {
+        let status = status();
+        assert_eq!(status.capability(), ADMIN_CAPABILITY);
+
+        let payload = AdminResponse::Status {
+            request_id: request_id(),
+            status,
+        }
+        .to_message()
+        .expect("known literals")
+        .to_canonical_bytes();
+        assert!(
+            String::from_utf8_lossy(&payload)
+                .contains(&format!("\"capability\":{ADMIN_CAPABILITY}")),
+            "the capability did not reach the wire"
+        );
+        let AdminResponse::Status { status, .. } =
+            AdminResponse::from_canonical_bytes(&payload).expect("admitted response")
+        else {
+            panic!("wrong response variant")
+        };
+        assert_eq!(status.capability(), ADMIN_CAPABILITY);
+    }
+
+    /// A future daemon's number is carried through, not replaced by this
+    /// build's.
+    ///
+    /// This is the whole reason the field is decoded rather than defaulted: a
+    /// client that read its own constant back would learn nothing about the
+    /// daemon it is talking to.
+    #[test]
+    fn a_peers_capability_survives_the_decode() {
+        let payload = AdminResponse::Status {
+            request_id: request_id(),
+            status: status(),
+        }
+        .to_message()
+        .expect("known literals")
+        .to_canonical_bytes();
+        let rewritten = String::from_utf8(payload)
+            .expect("canonical JSON is UTF-8")
+            .replace(
+                &format!("\"capability\":{ADMIN_CAPABILITY}"),
+                "\"capability\":9001",
+            );
+        let AdminResponse::Status { status, .. } =
+            AdminResponse::from_canonical_bytes(rewritten.as_bytes()).expect("admitted response")
+        else {
+            panic!("wrong response variant")
+        };
+        assert_eq!(status.capability(), 9001);
+        assert_ne!(status.capability(), ADMIN_CAPABILITY);
+    }
+
+    /// A status body missing the capability is refused whole.
+    #[test]
+    fn a_status_without_a_capability_refuses_the_whole_decode() {
+        let payload = AdminResponse::Status {
+            request_id: request_id(),
+            status: status(),
+        }
+        .to_message()
+        .expect("known literals")
+        .to_canonical_bytes();
+        let stripped = String::from_utf8(payload)
+            .expect("canonical JSON is UTF-8")
+            .replace(&format!("\"capability\":{ADMIN_CAPABILITY},"), "");
+        assert_eq!(
+            AdminResponse::from_canonical_bytes(stripped.as_bytes()),
+            Err(AdminError::InvalidBody)
+        );
+    }
+}

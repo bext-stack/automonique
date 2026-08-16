@@ -140,6 +140,176 @@ const _: () = assert!(
     "a maximal submit_run message must fit one admin frame"
 );
 
+/// What this build's local endpoints can do, as one monotonic integer.
+///
+/// # Why a number rather than a version
+///
+/// A semantic version answers "is this newer?", which is not the question a
+/// client has. The question is "can I use the thing I am about to use", and the
+/// only honest form of that is a number a client compares against the number it
+/// was written for. So this is not the daemon's version, not the protocol's
+/// major, and not derived from either: it is a counter of *observable
+/// capability*, and the changelog below is the whole of its meaning.
+///
+/// # When it moves
+///
+/// Three cases, and they are the same three every time:
+///
+/// - an endpoint, field, kind or vocabulary member was **added**;
+/// - one was **removed** or narrowed;
+/// - a behaviour a client could correctly depend on was **fixed**, which is a
+///   change to what the endpoint does whatever the diff says.
+///
+/// It does **not** move for prose, tests, refactoring, or a performance change
+/// no client can observe. A build whose capability did not move is a build a
+/// client written against the previous number can use unchanged.
+///
+/// # Changelog
+///
+/// **Append-only.** An entry is written once and never edited: a client that
+/// read entry 3 and shipped against it cannot be reached to be told it changed.
+/// `tests/admin.rs` holds the prefix of this list fixed, so editing a landed
+/// entry fails a test rather than a review. A new capability appends a line and
+/// increments the constant, in the same commit as the change it describes.
+///
+/// - **1** — the first numbered surface: the six lanes of the local admin
+///   socket (`admin`, `runs`, `automation`, `approval`, `batch`, `execute`) and
+///   the live progress stream, with [`ENDPOINT_MATURITY`] as their declared
+///   maturity and [`DaemonStatus::capability`] reporting this number.
+pub const ADMIN_CAPABILITY: u32 = 1;
+
+/// How much of a promise an endpoint is.
+///
+/// Three states, and the middle one is the only one that is a commitment.
+/// Closed, because a client's decision to depend on an endpoint rests on this
+/// and a spelling it did not recognise would have to be guessed at.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Maturity {
+    /// May change shape or disappear without the capability integer being a
+    /// warning anybody had time to act on. Depend on it deliberately.
+    Experimental,
+    /// Will not change shape incompatibly. A removal is a capability bump and
+    /// a deprecation first.
+    Stable,
+    /// Still served, and going away. New clients use its replacement.
+    Deprecated,
+}
+
+impl Maturity {
+    /// Every maturity, from least to most committed and then out again.
+    pub const ALL: [Self; 3] = [Self::Experimental, Self::Stable, Self::Deprecated];
+
+    /// Stable lowercase wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Experimental => "experimental",
+            Self::Stable => "stable",
+            Self::Deprecated => "deprecated",
+        }
+    }
+
+    /// Parse the exact stable spelling, or nothing.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|maturity| maturity.as_str() == value)
+    }
+}
+
+impl fmt::Display for Maturity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Every endpoint this build serves locally, and what it promises about each.
+///
+/// The name is `<protocol>/<kind>` — the two coordinates that already route a
+/// request, spelled as one string rather than invented. Nothing consults this
+/// table to *decide* anything: it is a declaration a client reads, exactly as
+/// [`ADMIN_CAPABILITY`] is, and a daemon that served an endpoint absent from it
+/// would be serving something it never promised.
+///
+/// **Append-only, in the same sense the changelog is.** An entry's maturity may
+/// move forward — experimental to stable, stable to deprecated — because that
+/// is what maturity is for. An entry may not be deleted, renamed, or moved
+/// backwards, and `tests/admin.rs` holds every landed row to that. Removing an
+/// endpoint means marking it deprecated and bumping the capability; a row that
+/// vanished would tell a client the endpoint never existed.
+///
+/// Every lane here is [`Maturity::Experimental`] at capability 1, and that is
+/// the honest reading rather than modesty: nothing in this build has shipped to
+/// a client that could be broken by a change, so promising stability would be
+/// promising something no one has yet needed.
+pub const ENDPOINT_MATURITY: &[(&str, Maturity)] = &[
+    ("automonique.admin/status", Maturity::Experimental),
+    ("automonique.admin/submit_synthetic", Maturity::Experimental),
+    ("automonique.admin/submit_run", Maturity::Experimental),
+    (
+        "automonique.admin/inspect_reconciliation",
+        Maturity::Experimental,
+    ),
+    (
+        "automonique.admin/fail_reconciliation",
+        Maturity::Experimental,
+    ),
+    ("automonique.admin/inspect_outbox", Maturity::Experimental),
+    ("automonique.admin/reconcile_outbox", Maturity::Experimental),
+    ("automonique.admin/pause_intake", Maturity::Experimental),
+    ("automonique.admin/resume_intake", Maturity::Experimental),
+    ("automonique.admin/shutdown", Maturity::Experimental),
+    ("automonique.runs/list_runs", Maturity::Experimental),
+    ("automonique.runs/run_detail", Maturity::Experimental),
+    ("automonique.execute/execute_run", Maturity::Experimental),
+    ("automonique.execute/cancel_run", Maturity::Experimental),
+    (
+        "automonique.automation/register_automation",
+        Maturity::Experimental,
+    ),
+    (
+        "automonique.automation/set_enablement",
+        Maturity::Experimental,
+    ),
+    (
+        "automonique.automation/list_automations",
+        Maturity::Experimental,
+    ),
+    (
+        "automonique.automation/automation_detail",
+        Maturity::Experimental,
+    ),
+    (
+        "automonique.approval/record_approval",
+        Maturity::Experimental,
+    ),
+    (
+        "automonique.approval/list_approvals",
+        Maturity::Experimental,
+    ),
+    (
+        "automonique.approval/approval_detail",
+        Maturity::Experimental,
+    ),
+    (
+        "automonique.approval/approvals_by_subject",
+        Maturity::Experimental,
+    ),
+    (
+        "automonique.approval/decide_request",
+        Maturity::Experimental,
+    ),
+    ("automonique.batch/register_batch", Maturity::Experimental),
+    ("automonique.batch/advance_member", Maturity::Experimental),
+    ("automonique.batch/list_batches", Maturity::Experimental),
+    ("automonique.batch/batch_detail", Maturity::Experimental),
+    (
+        "automonique.progress.stream/subscribe",
+        Maturity::Experimental,
+    ),
+];
+
 /// A refusal while constructing or decoding an administration message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdminError {
@@ -409,7 +579,27 @@ pub enum AdminCommand {
 }
 
 impl AdminCommand {
-    const fn kind(self) -> &'static str {
+    /// Every command, for coverage checks.
+    ///
+    /// Published so [`ENDPOINT_MATURITY`] can be held exhaustive over this lane
+    /// by a test rather than by inspection: a command added here without a row
+    /// there is a surface the daemon serves and never declared.
+    pub const ALL: [Self; 10] = [
+        Self::Status,
+        Self::SubmitSynthetic,
+        Self::SubmitRun,
+        Self::InspectReconciliation,
+        Self::FailReconciliation,
+        Self::InspectOutbox,
+        Self::ReconcileOutbox,
+        Self::PauseIntake,
+        Self::ResumeIntake,
+        Self::Shutdown,
+    ];
+
+    /// Stable wire spelling of this command's message kind.
+    #[must_use]
+    pub const fn kind(self) -> &'static str {
         match self {
             Self::Status => "status",
             Self::SubmitSynthetic => "submit_synthetic",
@@ -1729,6 +1919,14 @@ impl LocalRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonStatus {
     instance_id: AdminInstanceId,
+    /// What the answering endpoint can do, as [`ADMIN_CAPABILITY`] defines it.
+    ///
+    /// Not a constructor argument, and deliberately: an encoder reports the
+    /// capability of the build it is running, and there is no argument through
+    /// which a caller could report a different one. A *decoder* carries what the
+    /// peer said, which is the whole point — that number is about the daemon
+    /// answering, not about the process reading the answer.
+    capability: u32,
     state: DaemonState,
     generation: u64,
     event_cursor: u64,
@@ -2261,6 +2459,7 @@ impl DaemonStatus {
         }
         Ok(Self {
             instance_id,
+            capability: ADMIN_CAPABILITY,
             state,
             generation,
             event_cursor,
@@ -2399,6 +2598,27 @@ impl DaemonStatus {
         &self.instance_id
     }
 
+    /// What the daemon that answered can do.
+    ///
+    /// [`ADMIN_CAPABILITY`] on a snapshot this process built, and the peer's own
+    /// number on one it decoded. A client compares it against the number it was
+    /// written for; it never compares it against its own constant and assumes
+    /// they must match.
+    #[must_use]
+    pub const fn capability(&self) -> u32 {
+        self.capability
+    }
+
+    /// Carry the capability a peer reported, rather than this build's.
+    ///
+    /// Private, and there is no public route to it: the only caller is
+    /// [`Self::from_body`], so a snapshot this process *encodes* always reports
+    /// what this process can actually do.
+    const fn with_capability(mut self, capability: u32) -> Self {
+        self.capability = capability;
+        self
+    }
+
     /// Lifecycle state.
     #[must_use]
     pub const fn state(&self) -> DaemonState {
@@ -2486,6 +2706,10 @@ impl DaemonStatus {
                 JsonValue::Bool(self.accepting_intake),
             ),
             (
+                "capability".to_owned(),
+                JsonValue::Integer(i64::from(self.capability)),
+            ),
+            (
                 "durable_state".to_owned(),
                 self.durable_state
                     .as_ref()
@@ -2544,8 +2768,9 @@ impl DaemonStatus {
     }
 
     fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
-        const FIELDS: [&str; 14] = [
+        const FIELDS: [&str; 15] = [
             "accepting_intake",
+            "capability",
             "durable_state",
             "event_cursor",
             "execution_state",
@@ -2582,6 +2807,11 @@ impl DaemonStatus {
             .get("instance_id")
             .and_then(JsonValue::as_str)
             .ok_or(AdminError::InvalidBody)?;
+        let capability = u32::try_from(unsigned(body, "capability")?).map_err(|_| {
+            AdminError::CounterOutOfRange {
+                field: "capability",
+            }
+        })?;
         let state = body
             .get("state")
             .and_then(JsonValue::as_str)
@@ -2596,6 +2826,7 @@ impl DaemonStatus {
             unsigned(body, "running")?,
             accepting_intake,
         )
+        .map(|status| status.with_capability(capability))
         .and_then(|status| status.with_intake_pause(intake_paused))
         .and_then(|status| {
             status.with_telegram(

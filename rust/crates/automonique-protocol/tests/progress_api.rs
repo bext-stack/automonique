@@ -528,6 +528,10 @@ mod refusals {
                 max_bytes: 1,
                 actual_bytes: 2,
             },
+            ProgressApiError::MessageTooLarge {
+                max_bytes: 1,
+                actual_bytes: 2,
+            },
         ]
         .iter()
         .map(ProgressApiError::category)
@@ -541,6 +545,7 @@ mod refusals {
                 "progress_unwritten_sequence",
                 "progress_time_before_epoch",
                 "progress_frame_too_large",
+                "progress_message_too_large",
             ]
         );
         // The two wrapping arms report the wrapped category rather than a
@@ -553,5 +558,324 @@ mod refusals {
             ProgressApiError::Event(EventError::RunAlreadyTerminal).category(),
             EventError::RunAlreadyTerminal.category()
         );
+    }
+}
+
+/// The live stream: what a subscriber says, what it is told, and where it may
+/// resume.
+mod stream {
+    use super::*;
+    use automonique_protocol::event::{ConsumerCursor, SubscriptionStart, resolve_subscription};
+    use automonique_protocol::progress_api::{
+        MAX_PROGRESS_STREAM_CANONICAL_BYTES, MAX_SUBSCRIBE_CANONICAL_BYTES,
+        PROGRESS_STREAM_PROTOCOL, PROGRESS_STREAM_SCHEMA_V1, StreamMessage, StreamMessageKind,
+        StreamRefusal, SubscribeRequest, resume_from,
+    };
+
+    /// One message of every kind, so a coverage check has something to walk.
+    fn message(kind: StreamMessageKind) -> StreamMessage {
+        match kind {
+            StreamMessageKind::Greeting => StreamMessage::Greeting { capability: 3 },
+            StreamMessageKind::Live => StreamMessage::Live { from: 12 },
+            StreamMessageKind::ResyncRequired => StreamMessage::ResyncRequired {
+                snapshot_from: 4,
+                snapshot_to: 9,
+            },
+            StreamMessageKind::Frame => {
+                StreamMessage::Frame(frame(EventKind::AssistantMessageCompleted, 7))
+            }
+            StreamMessageKind::Lagged => StreamMessage::Lagged {
+                delivered_through: 5,
+            },
+            StreamMessageKind::Retired => StreamMessage::Retired {
+                delivered_through: 5,
+            },
+            StreamMessageKind::Refused => StreamMessage::Refused {
+                refusal: StreamRefusal::SubscriberLimit,
+            },
+        }
+    }
+
+    #[test]
+    fn every_kind_round_trips_and_reports_itself() {
+        assert_eq!(StreamMessageKind::ALL.len(), 7);
+        for kind in StreamMessageKind::ALL {
+            let message = message(kind);
+            assert_eq!(message.kind(), kind);
+            let encoded = message.to_canonical_bytes().expect("it encodes");
+            assert_eq!(
+                StreamMessage::from_canonical_bytes(&encoded).expect("it decodes"),
+                message,
+                "{kind} did not round-trip"
+            );
+            // Canonical means one spelling, so re-encoding a decode is the same
+            // bytes rather than merely the same value.
+            assert_eq!(
+                StreamMessage::from_canonical_bytes(&encoded)
+                    .expect("it decodes")
+                    .to_canonical_bytes()
+                    .expect("it re-encodes"),
+                encoded
+            );
+        }
+    }
+
+    /// The exact bytes of the two endings, so a change to either is visible in
+    /// review rather than only in a client's failure.
+    #[test]
+    fn the_two_endings_have_exactly_these_bytes() {
+        assert_eq!(
+            StreamMessage::Lagged {
+                delivered_through: 5
+            }
+            .to_canonical_bytes()
+            .expect("it encodes"),
+            br#"{"body":{"delivered_through":5},"kind":"lagged"}"#
+        );
+        assert_eq!(
+            StreamMessage::Retired {
+                delivered_through: 5
+            }
+            .to_canonical_bytes()
+            .expect("it encodes"),
+            br#"{"body":{"delivered_through":5},"kind":"retired"}"#
+        );
+    }
+
+    /// Four kinds end the conversation and three do not, and the run's own
+    /// terminal is none of them.
+    #[test]
+    fn the_terminal_set_is_the_four_that_end_a_subscription() {
+        let terminal: Vec<&str> = StreamMessageKind::ALL
+            .into_iter()
+            .filter(|kind| kind.is_terminal())
+            .map(StreamMessageKind::as_str)
+            .collect();
+        assert_eq!(
+            terminal,
+            vec!["resync_required", "lagged", "retired", "refused"]
+        );
+        // A `run_terminal` frame ends the *run*'s provider stream and not the
+        // subscription: the two are different endings and the wire says so.
+        let run_end = StreamMessage::Frame(frame(EventKind::RunTerminal, 3));
+        assert!(!run_end.is_terminal());
+        assert!(matches!(&run_end, StreamMessage::Frame(inner) if inner.kind().is_terminal()));
+    }
+
+    #[test]
+    fn an_undefined_kind_or_category_fails_closed() {
+        for payload in [
+            br#"{"body":{"from":1},"kind":"live_v2"}"#.as_slice(),
+            br#"{"body":{"delivered_through":1},"kind":"stalled"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                StreamMessage::from_canonical_bytes(payload),
+                Err(ProgressApiError::Codec(CodecError::UnknownEnumValue {
+                    field: "kind"
+                }))
+            );
+        }
+        assert_eq!(
+            StreamMessage::from_canonical_bytes(
+                br#"{"body":{"category":"too_busy"},"kind":"refused"}"#
+            ),
+            Err(ProgressApiError::Codec(CodecError::UnknownEnumValue {
+                field: "category"
+            }))
+        );
+    }
+
+    #[test]
+    fn a_body_that_is_not_its_kinds_shape_is_refused() {
+        for payload in [
+            // The wrong body for the kind.
+            br#"{"body":{"from":1},"kind":"lagged"}"#.as_slice(),
+            // A member the kind does not declare, alongside one it does.
+            br#"{"body":{"delivered_through":1,"why":"slow"},"kind":"lagged"}"#.as_slice(),
+            // A window that ends below where it starts retains nothing, and the
+            // one spelling of nothing this shape admits is the pair of zeroes.
+            br#"{"body":{"snapshot_from":9,"snapshot_to":4},"kind":"resync_required"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                StreamMessage::from_canonical_bytes(payload),
+                Err(ProgressApiError::InvalidBody),
+                "{}",
+                String::from_utf8_lossy(payload)
+            );
+        }
+    }
+
+    #[test]
+    fn a_subscription_round_trips_and_bounds_itself() {
+        let request = SubscribeRequest::new(run_id(), 41);
+        let encoded = request.to_canonical_bytes().expect("it encodes");
+        assert_eq!(encoded, br#"{"cursor":41,"run_id":"run-progress-1"}"#);
+        assert_eq!(
+            SubscribeRequest::from_canonical_bytes(&encoded).expect("it decodes"),
+            request
+        );
+        assert_eq!(request.cursor(), 41);
+        assert_eq!(request.run_id().as_str(), "run-progress-1");
+
+        // A payload past the request ceiling is refused on its length, before
+        // anything is parsed.
+        let oversized = vec![b'{'; MAX_SUBSCRIBE_CANONICAL_BYTES + 1];
+        assert_eq!(
+            SubscribeRequest::from_canonical_bytes(&oversized),
+            Err(ProgressApiError::MessageTooLarge {
+                max_bytes: MAX_SUBSCRIBE_CANONICAL_BYTES,
+                actual_bytes: oversized.len(),
+            })
+        );
+    }
+
+    /// A maximal frame still fits one stream message.
+    #[test]
+    fn the_largest_frame_fits_inside_a_message() {
+        let text = "t".repeat(MAX_PROGRESS_TEXT_BYTES);
+        let frame = ProgressFrame::new(ProgressFrameParts {
+            run_id: run_id(),
+            sequence: u64::MAX >> 1,
+            at_ms: EpochMillis::from_millis(i64::MAX),
+            authority: Authority::Authoritative,
+            kind: EventKind::AssistantMessageCompleted,
+            body: ProgressBody::new(
+                EventKind::AssistantMessageCompleted,
+                ProgressBodyParts {
+                    text: Some(ProgressText::new(text).expect("plain text")),
+                    step: None,
+                    retry: None,
+                },
+            )
+            .expect("a message with its text"),
+        })
+        .expect("a stamped frame");
+        let encoded = StreamMessage::Frame(frame)
+            .to_canonical_bytes()
+            .expect("a maximal frame still fits one message");
+        assert!(encoded.len() <= MAX_PROGRESS_STREAM_CANONICAL_BYTES);
+        assert!(encoded.len() > MAX_PROGRESS_TEXT_BYTES);
+    }
+
+    /// The exclusive cursor and the inclusive one differ by exactly one, and
+    /// that is a fact rather than a comment.
+    ///
+    /// `resume_from` converts rather than restating the rule, so this walks the
+    /// whole shared domain and checks the conversion against
+    /// `event::resolve_subscription` — the module the plan says already carries
+    /// this shape.
+    #[test]
+    fn resuming_agrees_with_the_event_lanes_own_decision_shifted_by_one() {
+        for first in 1_u64..=6 {
+            for last in first..=8 {
+                for delivered_through in 0_u64..=10 {
+                    let ours = resume_from(delivered_through, Some((first, last)));
+                    let theirs = resolve_subscription(
+                        &ConsumerCursor::new("subscriber", "run", delivered_through + 1)
+                            .expect("a cursor"),
+                        first,
+                        last,
+                    );
+                    assert_eq!(
+                        ours, theirs,
+                        "cursor {delivered_through} against {first}..={last}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_cursor_at_the_boundary_resumes_and_one_below_it_does_not() {
+        // The window holds 5..=9. A subscriber that received four wants five,
+        // which is held; one that received three wants four, which is not.
+        assert_eq!(
+            resume_from(4, Some((5, 9))),
+            SubscriptionStart::Live { from: 5 }
+        );
+        assert_eq!(
+            resume_from(3, Some((5, 9))),
+            SubscriptionStart::ResyncRequired {
+                snapshot_from: 5,
+                snapshot_to: 9,
+            }
+        );
+        // A subscriber that is already past the window is live, not ahead: the
+        // next frame it wants simply has not been produced.
+        assert_eq!(
+            resume_from(20, Some((5, 9))),
+            SubscriptionStart::Live { from: 21 }
+        );
+    }
+
+    #[test]
+    fn an_empty_window_answers_by_what_the_subscriber_claims() {
+        // Nothing retained and nothing received: everything there is, is
+        // nothing, and that is a truthful live answer.
+        assert_eq!(resume_from(0, None), SubscriptionStart::Live { from: 1 });
+        // Nothing retained and something received: a claim of continuity this
+        // endpoint cannot support, answered with the empty window.
+        assert_eq!(
+            resume_from(1, None),
+            SubscriptionStart::ResyncRequired {
+                snapshot_from: 0,
+                snapshot_to: 0,
+            }
+        );
+    }
+
+    /// The mapping from a decision to a message is the protocol's, not a
+    /// caller's.
+    #[test]
+    fn a_subscription_decision_becomes_exactly_one_message() {
+        assert_eq!(
+            StreamMessage::from_subscription(SubscriptionStart::Live { from: 8 }),
+            StreamMessage::Live { from: 8 }
+        );
+        assert_eq!(
+            StreamMessage::from_subscription(SubscriptionStart::ResyncRequired {
+                snapshot_from: 2,
+                snapshot_to: 6,
+            }),
+            StreamMessage::ResyncRequired {
+                snapshot_from: 2,
+                snapshot_to: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn every_refusal_spelling_is_closed_and_round_trips() {
+        assert_eq!(StreamRefusal::ALL.len(), 4);
+        let spellings: Vec<&str> = StreamRefusal::ALL
+            .into_iter()
+            .map(StreamRefusal::as_str)
+            .collect();
+        assert_eq!(
+            spellings,
+            vec![
+                "subscriber_limit",
+                "malformed_request",
+                "field_invalid",
+                "internal"
+            ]
+        );
+        for refusal in StreamRefusal::ALL {
+            assert_eq!(
+                StreamRefusal::from_spelling(refusal.as_str()),
+                Some(refusal)
+            );
+        }
+        assert_eq!(StreamRefusal::from_spelling("subscriber_limit "), None);
+        assert_eq!(StreamRefusal::from_spelling("SUBSCRIBER_LIMIT"), None);
+    }
+
+    /// The stream's names are its own, and are not the frame's.
+    #[test]
+    fn the_stream_names_itself_apart_from_the_frame() {
+        assert_eq!(PROGRESS_STREAM_PROTOCOL, "automonique.progress.stream");
+        assert_eq!(PROGRESS_STREAM_SCHEMA_V1, "automonique.progress.stream/v1");
+        assert_ne!(PROGRESS_STREAM_PROTOCOL, PROGRESS_PROTOCOL);
+        assert_ne!(PROGRESS_STREAM_SCHEMA_V1, PROGRESS_API_SCHEMA_V1);
     }
 }
