@@ -504,6 +504,35 @@ impl Fixture {
         .expect("knowledge catalog mode");
     }
 
+    fn seed_company_manager_knowledge(&self) {
+        let parent = self.local_knowledge_path.parent().expect("knowledge root");
+        std::fs::create_dir(parent).expect("knowledge root");
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .expect("knowledge root mode");
+        std::fs::write(
+            &self.local_knowledge_path,
+            r#"{
+              "schema":"automonique.local-knowledge/v1",
+              "entities":[{
+                "id":"company-manager",
+                "name":"Company Manager",
+                "aliases":["companymanager","manage.inklura.fr","Inklura Manage"],
+                "description":{"text":"Company Manager user administration is available from /manage/users.","basis":"primary_source","source":"authorized Company Manager user-management source"},
+                "facts":[
+                  {"text":"Creating a user requires users:write and first name, last name, email, and role identifiers; phone and title are optional.","basis":"primary_source","source":"authorized users router and service contract"},
+                  {"text":"The current create path creates the user and role links but does not send an invitation or set a password.","basis":"primary_source","source":"authorized user service implementation"}
+                ]
+              }]
+            }"#,
+        )
+        .expect("knowledge catalog");
+        std::fs::set_permissions(
+            &self.local_knowledge_path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("knowledge catalog mode");
+    }
+
     fn seed_prism_sites(&self, sites: &[&str]) {
         for (index, site) in sites.iter().enumerate() {
             let app = self
@@ -2142,16 +2171,16 @@ fn named_slack_and_github_facts_are_read_live_before_fast_operational_answer() {
 #[test]
 fn natural_language_slack_post_composes_then_uses_the_typed_channel_effect() {
     let fixture = Fixture::new(&[]);
-    let slack = FakeSlack::posting("Posted to #jean (ts 1786903071.699).")
-        .with_channels(&["deploiements", "jean"]);
+    let slack = FakeSlack::posting("Posted to #poetry (ts 1786903071.699).")
+        .with_channels(&["deploiements", "poetry"]);
     let outbound = FakeOutbound::default();
     let client = FakeClient::new([updates(&[(
         1,
         OPERATOR,
-        "can you send a poème about Monique in #jean channel?",
+        "can you send a poème about Monique in #poetry channel?",
     )])]);
     let lane = FakeRunLane::answering(
-        "{\"kind\":\"slack_post\",\"channel\":\"jean\",\"text\":\"Monique veille au fil des jours,\\nEt sème en silence un peu de lumière.\"}\n\nNote: The admin explicitly asked to post this poem to #jean.",
+        "{\"kind\":\"slack_post\",\"channel\":\"poetry\",\"text\":\"Monique veille au fil des jours,\\nEt sème en silence un peu de lumière.\"}\n\nNote: The admin explicitly asked to post this poem to #poetry.",
     );
     let mut bridge = bridge_with_slack(
         &fixture,
@@ -2192,7 +2221,7 @@ fn natural_language_slack_post_composes_then_uses_the_typed_channel_effect() {
     assert_eq!(
         slack.posts(),
         [(
-            String::from("jean"),
+            String::from("poetry"),
             String::from("Monique veille au fil des jours,\nEt sème en silence un peu de lumière."),
         )]
     );
@@ -2210,23 +2239,23 @@ fn natural_language_slack_post_composes_then_uses_the_typed_channel_effect() {
     assert_eq!(prompts.len(), 1, "composition and intent share one turn");
     assert!(prompts[0].contains("AUTOMONIQUE_CONVERSATIONAL_TOOL_ROUTER_V1"));
     assert!(prompts[0].contains(r#""kind":"slack_post""#));
-    assert!(prompts[0].contains("slack_channels=deploiements,jean"));
+    assert!(prompts[0].contains("slack_channels=deploiements,poetry"));
     assert!(
         outbound
             .messages()
             .iter()
-            .any(|message| message.contains("Posted to #jean"))
+            .any(|message| message.contains("Posted to #poetry"))
     );
 }
 
 #[test]
 fn denying_a_natural_language_slack_preview_posts_nothing() {
     let fixture = Fixture::new(&[]);
-    let slack = FakeSlack::posting("must not post").with_channels(&["jean"]);
+    let slack = FakeSlack::posting("must not post").with_channels(&["poetry"]);
     let outbound = FakeOutbound::default();
-    let client = FakeClient::new([updates(&[(1, OPERATOR, "send a poem to #jean")])]);
+    let client = FakeClient::new([updates(&[(1, OPERATOR, "send a poem to #poetry")])]);
     let lane = FakeRunLane::answering(
-        r#"{"kind":"slack_post","channel":"jean","text":"Monique veille sur nos chemins."}"#,
+        r#"{"kind":"slack_post","channel":"poetry","text":"Monique veille sur nos chemins."}"#,
     );
     let mut bridge = bridge_with_slack(
         &fixture,
@@ -2265,21 +2294,21 @@ fn denying_a_natural_language_slack_preview_posts_nothing() {
         outbound
             .messages()
             .iter()
-            .any(|message| message.contains("Denied. Nothing was posted to #jean"))
+            .any(|message| message.contains("Denied. Nothing was posted to #poetry"))
     );
 }
 
 #[test]
 fn model_cannot_post_to_a_channel_the_current_message_did_not_name() {
     let fixture = Fixture::new(&[]);
-    let slack = FakeSlack::posting("must not post").with_channels(&["deploiements", "jean"]);
+    let slack = FakeSlack::posting("must not post").with_channels(&["deploiements", "poetry"]);
     let outbound = FakeOutbound::default();
     let lane = FakeRunLane::answering(
         r#"{"kind":"slack_post","channel":"deploiements","text":"wrong destination"}"#,
     );
     let mut bridge = bridge_with_slack(
         &fixture,
-        FakeClient::new([updates(&[(1, OPERATOR, "send a poem to #jean")])]),
+        FakeClient::new([updates(&[(1, OPERATOR, "send a poem to #poetry")])]),
         outbound.clone(),
         FakeSink::default(),
         lane,
@@ -2471,6 +2500,58 @@ fn conversational_entity_questions_retrieve_typed_runtime_facts_without_capturin
     assert!(support.contains("not legal ownership"));
     assert!(!support.contains("route="));
     assert!(support.contains("support.inklura.fr"));
+}
+
+#[test]
+fn named_site_entities_skip_the_router_and_receive_the_typed_inventory() {
+    let fixture = Fixture::new(&[]);
+    let mut sites = (0..80)
+        .map(|index| {
+            format!(
+                "irrelevant-{index:03}-{}.example",
+                "ordinary-name-padding".repeat(3)
+            )
+        })
+        .collect::<Vec<_>>();
+    sites.extend([
+        String::from("zzzz-webdesign29.example"),
+        String::from("zzzz-activ.example"),
+    ]);
+    fixture.seed_prism_sites(&sites.iter().map(String::as_str).collect::<Vec<_>>());
+    let outbound = FakeOutbound::default();
+    let lane =
+        FakeRunLane::answering("Webdesign29 and Activ are present in the managed site inventory.");
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        FakeClient::new([updates(&[(
+            1,
+            OPERATOR,
+            "What do you know about Webdesign29 and Activ?",
+        )])]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+
+    assert_eq!(
+        poll(&mut bridge).expect("question queues").questions_queued,
+        1
+    );
+    assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
+
+    let prompts = lane.tasks();
+    assert_eq!(
+        prompts.len(),
+        1,
+        "the conversational router must be skipped"
+    );
+    assert!(prompts[0].contains("AUTOMONIQUE_READ_ONLY_QA_V1"));
+    assert!(prompts[0].contains("selected_sources.sites=yes"));
+    assert!(prompts[0].contains("zzzz-webdesign29.example"));
+    assert!(prompts[0].contains("zzzz-activ.example"));
+    assert!(prompts[0].contains("hostnames_omitted="));
+    assert!(!prompts[0].contains("AUTOMONIQUE_CONVERSATIONAL_TOOL_ROUTER_V1"));
+    assert!(outbound.messages()[0].contains("managed site inventory"));
 }
 
 #[test]
@@ -2764,6 +2845,47 @@ fn an_administrator_may_ask_a_read_only_question_from_durable_facts() {
         !messages[0].contains(r#""entities""#),
         "Q&A is ordinary text, not a preformatted command dump: {messages:?}"
     );
+}
+
+#[test]
+fn company_manager_howto_retrieves_the_authorized_product_contract() {
+    let fixture = Fixture::new(&[]);
+    fixture.seed_company_manager_knowledge();
+    let outbound = FakeOutbound::default();
+    // Deliberately simulate a coarse model selection. The typed entity
+    // retriever must still add the exact provenance-bearing procedure.
+    let lane = FakeRunLane::answering_sequence(&[
+        r#"{"kind":"read","sources":["sites"],"slack_channel":null,"github_issues":false,"depth":"deep"}"#,
+        "Go to /manage/users and create the user with the required identity and role fields.",
+    ]);
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        FakeClient::new([updates(&[(
+            1,
+            OPERATOR,
+            "do you know how to create accounts in company manager?",
+        )])]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+
+    assert_eq!(
+        poll(&mut bridge).expect("question queues").questions_queued,
+        1
+    );
+    assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
+
+    let prompts = lane.tasks();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("Select knowledge for questions about how a named local product"));
+    let answer_prompt = &prompts[1];
+    assert!(answer_prompt.contains("selected_sources.sites=yes"));
+    assert!(answer_prompt.contains("selected_sources.knowledge=yes"));
+    assert!(answer_prompt.contains("name=Company Manager"));
+    assert!(answer_prompt.contains("Creating a user requires users:write"));
+    assert!(answer_prompt.contains("does not send an invitation or set a password"));
+    assert!(outbound.messages()[0].contains("/manage/users"));
 }
 
 #[test]
