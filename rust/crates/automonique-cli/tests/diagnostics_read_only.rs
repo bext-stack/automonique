@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-use automonique_cli::{
-    inspect_admin_socket, inspect_database_health, inspect_foreground_generation,
-    inspect_process_control,
-};
+use automonique_cli::{inspect_admin_socket, inspect_control_plane, inspect_process_control};
 use automonique_protocol::CheckStatus;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
@@ -23,7 +20,7 @@ fn private_runtime() -> tempfile::TempDir {
 fn private_unix_admin_socket_and_process_control_are_healthy() {
     let runtime = private_runtime();
     let socket = runtime.path().join("automonique/admin.sock");
-    let _listener = UnixListener::bind(&socket).expect("socket");
+    let listener = UnixListener::bind(&socket).expect("socket");
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
         .expect("private socket");
     let before = std::fs::symlink_metadata(&socket)
@@ -37,14 +34,13 @@ fn private_unix_admin_socket_and_process_control_are_healthy() {
     );
     assert_eq!(inspect_process_control().status(), CheckStatus::Healthy);
     let admin = inspect_admin_socket(Some(runtime.path().as_os_str()));
-    assert_eq!(
-        inspect_database_health(&admin).status(),
-        CheckStatus::Unavailable
-    );
-    assert_eq!(
-        inspect_foreground_generation(&admin).status(),
-        CheckStatus::Unavailable
-    );
+    let responder = std::thread::spawn(move || {
+        let _connection = listener.accept().expect("doctor connects");
+    });
+    let [database, generation] = inspect_control_plane(Some(runtime.path().as_os_str()), &admin);
+    responder.join().expect("responder");
+    assert_eq!(database.status(), CheckStatus::Unavailable);
+    assert_eq!(generation.status(), CheckStatus::Unavailable);
     assert_eq!(
         std::fs::symlink_metadata(&socket)
             .expect("metadata")

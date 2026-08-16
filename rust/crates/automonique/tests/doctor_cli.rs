@@ -41,7 +41,7 @@ fn run(runtime: &Path, args: &[&str]) -> Output {
 }
 
 #[test]
-fn doctor_human_mode_reports_unavailable_rpcs_for_a_private_runtime() {
+fn doctor_human_mode_reports_an_unanswered_status_rpc_for_a_private_runtime() {
     let runtime = private_runtime();
     let output = run(runtime.path(), &["doctor"]);
 
@@ -59,7 +59,7 @@ fn doctor_human_mode_reports_unavailable_rpcs_for_a_private_runtime() {
         assert!(stdout.contains("degraded"), "{stdout}");
     }
     assert!(
-        stdout.contains("database.health-rpc-unavailable"),
+        stdout.contains("database.status-rpc-unavailable"),
         "{stdout}"
     );
     assert!(stdout.contains("release.missing"), "{stdout}");
@@ -95,7 +95,7 @@ fn doctor_json_mode_uses_the_versioned_schema() {
         assert!(stdout.contains("\"status\":\"degraded\""), "{stdout}");
     }
     assert!(
-        stdout.contains("\"code\":\"database.health-rpc-unavailable\""),
+        stdout.contains("\"code\":\"database.status-rpc-unavailable\""),
         "{stdout}"
     );
     assert!(stdout.contains("\"code\":\"release.missing\""), "{stdout}");

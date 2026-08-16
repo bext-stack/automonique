@@ -2,6 +2,8 @@
 
 //! Bounded read-only host and local-control diagnostics.
 
+use crate::admin_client::{self, Operation};
+use automonique_protocol::admin::{AdminResponse, DaemonStatus, OperationalMetric};
 use automonique_protocol::{CheckStatus, DoctorCheck, DoctorReason, FindingCode, FindingMessage};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
@@ -80,38 +82,112 @@ pub fn inspect_process_control() -> DoctorCheck {
     )
 }
 
-/// Report database health as unavailable until the authenticated admin RPC exists.
-pub fn inspect_database_health(admin_socket: &DoctorCheck) -> DoctorCheck {
-    if admin_socket.status() == CheckStatus::Healthy {
-        unavailable_for(
-            "control-plane.database-health",
-            "database.health-rpc-unavailable",
-            "Database health RPC is not available in this release",
-        )
-    } else {
-        unavailable_for(
-            "control-plane.database-health",
+/// Read database and generation health from one authenticated status snapshot.
+///
+/// The two checks deliberately share one request. Two status calls could
+/// straddle a generation change and make the doctor combine facts that were
+/// never true together. The local client also re-checks the socket owner and
+/// mode before connecting, so a healthy metadata check is a prerequisite, not
+/// a substitute for peer authentication.
+pub fn inspect_control_plane(
+    runtime: Option<&OsStr>,
+    admin_socket: &DoctorCheck,
+) -> [DoctorCheck; 2] {
+    if admin_socket.status() != CheckStatus::Healthy {
+        return control_plane_unavailable(
             "database.control-plane-unavailable",
             "Database health is unavailable without the control plane",
-        )
+            "foreground.admin-endpoint-unavailable",
+            "Foreground generation identity is unavailable without the admin endpoint",
+        );
+    }
+
+    match admin_client::request(runtime, Operation::Status) {
+        Ok(AdminResponse::Status { status, .. }) => status_checks(&status),
+        Ok(_) => control_plane_unavailable(
+            "database.status-response-mismatch",
+            "Database health is unavailable because the admin endpoint returned the wrong response",
+            "foreground.status-response-mismatch",
+            "Foreground generation identity is unavailable because the admin endpoint returned the wrong response",
+        ),
+        Err(_) => control_plane_unavailable(
+            "database.status-rpc-unavailable",
+            "Database health is unavailable because the status RPC could not be completed",
+            "foreground.status-rpc-unavailable",
+            "Foreground generation identity is unavailable because the status RPC could not be completed",
+        ),
     }
 }
 
-/// Report foreground generation identity as unavailable until the admin RPC exists.
-pub fn inspect_foreground_generation(admin_socket: &DoctorCheck) -> DoctorCheck {
-    if admin_socket.status() == CheckStatus::Healthy {
-        unavailable_for(
+fn status_checks(status: &DaemonStatus) -> [DoctorCheck; 2] {
+    let database = match (status.operational(), status.durable_state()) {
+        (Some(_), Some(durable)) => {
+            let complete = [
+                durable.approvals_recorded(),
+                durable.automations_registered(),
+                durable.open_tenure_epoch(),
+                durable.open_tenures(),
+                durable.runs_registered(),
+                durable.tenures_recorded(),
+            ]
+            .into_iter()
+            .all(|metric| metric.value().is_some());
+            let tenure_matches = matches!(
+                (durable.open_tenures(), durable.open_tenure_epoch()),
+                (
+                    OperationalMetric::Measured(1),
+                    OperationalMetric::Measured(epoch)
+                ) if epoch == status.generation()
+            );
+            if complete && tenure_matches {
+                healthy("control-plane.database-health")
+            } else {
+                non_healthy(
+                    "control-plane.database-health",
+                    CheckStatus::Finding,
+                    "database.status-incomplete",
+                    "One or more durable stores could not be read from the live status snapshot",
+                )
+            }
+        }
+        _ => unavailable_for(
+            "control-plane.database-health",
+            "database.status-projection-unavailable",
+            "The live daemon did not provide the database status projection",
+        ),
+    };
+
+    let generation = if status.generation() == 0 {
+        non_healthy(
             "runtime.foreground-generation",
-            "foreground.identity-rpc-unavailable",
-            "Foreground generation identity RPC is not available in this release",
+            CheckStatus::Finding,
+            "foreground.generation-invalid",
+            "The live daemon reported an invalid zero generation",
         )
     } else {
+        healthy("runtime.foreground-generation")
+    };
+    [database, generation]
+}
+
+fn control_plane_unavailable(
+    database_code: &str,
+    database_message: &str,
+    generation_code: &str,
+    generation_message: &str,
+) -> [DoctorCheck; 2] {
+    [
+        unavailable_for(
+            "control-plane.database-health",
+            database_code,
+            database_message,
+        ),
         unavailable_for(
             "runtime.foreground-generation",
-            "foreground.admin-endpoint-unavailable",
-            "Foreground generation identity is unavailable without the admin endpoint",
-        )
-    }
+            generation_code,
+            generation_message,
+        ),
+    ]
 }
 
 fn valid_absolute_path(path: &Path) -> bool {
@@ -220,4 +296,74 @@ fn non_healthy(
         )),
     )
     .expect("constant non-healthy check is coherent")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_checks;
+    use automonique_protocol::CheckStatus;
+    use automonique_protocol::admin::{
+        AdminInstanceId, DaemonState, DaemonStatus, DurableStateCounts, DurableStateCountsParts,
+        OperationalMetric, OperationalStatus, OperationalStatusParts,
+    };
+
+    fn status(runs: OperationalMetric) -> DaemonStatus {
+        let operational = OperationalStatus::new(OperationalStatusParts {
+            observed_ms: 1,
+            reconciliation_pending: 0,
+            outbox_pending_ready: 0,
+            outbox_pending_delayed: 0,
+            outbox_in_flight_live: 0,
+            outbox_in_flight_ambiguous: 0,
+            outbox_delivered: 0,
+            outbox_dead_lettered: 0,
+            outbox_oldest_ready_age_ms: 0,
+            telegram_pollers_live: 0,
+            telegram_pollers_expired: 0,
+            telegram_offset_lag: OperationalMetric::Unavailable,
+            provider_available: OperationalMetric::Unavailable,
+            sandbox_launch_refusals: OperationalMetric::Unavailable,
+        })
+        .expect("operational status");
+        let durable = DurableStateCounts::new(DurableStateCountsParts {
+            approvals_recorded: OperationalMetric::Measured(2),
+            automations_registered: OperationalMetric::Measured(3),
+            open_tenure_epoch: OperationalMetric::Measured(7),
+            open_tenures: OperationalMetric::Measured(1),
+            runs_registered: runs,
+            tenures_recorded: OperationalMetric::Measured(4),
+        })
+        .expect("durable status");
+        DaemonStatus::new(
+            AdminInstanceId::new("doctor-fixture").expect("instance"),
+            DaemonState::Ready,
+            7,
+            0,
+            0,
+            0,
+            0,
+            true,
+        )
+        .and_then(|status| status.with_operational(operational))
+        .and_then(|status| status.with_durable_state(durable))
+        .expect("complete status")
+    }
+
+    #[test]
+    fn a_complete_live_snapshot_makes_both_control_plane_checks_healthy() {
+        let [database, generation] = status_checks(&status(OperationalMetric::Measured(9)));
+        assert_eq!(database.status(), CheckStatus::Healthy);
+        assert_eq!(generation.status(), CheckStatus::Healthy);
+    }
+
+    #[test]
+    fn an_unreadable_store_is_a_finding_without_erasing_generation_identity() {
+        let [database, generation] = status_checks(&status(OperationalMetric::Unavailable));
+        assert_eq!(database.status(), CheckStatus::Finding);
+        assert_eq!(
+            database.reason().expect("reason").code().as_str(),
+            "database.status-incomplete"
+        );
+        assert_eq!(generation.status(), CheckStatus::Healthy);
+    }
 }

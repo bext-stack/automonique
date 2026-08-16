@@ -245,6 +245,7 @@ fn the_whole_doctor_report_is_read_only_with_the_kernel_checks_wired_in() {
     for code in [
         "kernel.landlock-support",
         "kernel.cgroup-v2.delegation",
+        "kernel.cgroup-v2.controllers-enabled",
         "kernel.cgroup-v2.controllers",
         "kernel.max-user-namespaces-setting",
     ] {

@@ -27,7 +27,7 @@ use automonique_protocol::{CheckStatus, DoctorCheck, DoctorReason, FindingCode, 
 use automonique_runner::capability::{
     ContainmentFinding, ContainmentUnavailable, LANDLOCK_ABI_TCP, LandlockFinding,
 };
-use automonique_runner::{ContainmentDomain, ContainmentError};
+use automonique_runner::{ContainmentDomain, ContainmentError, Controller};
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
 use nix::sys::stat::{Mode, SFlag, fstat};
@@ -138,6 +138,52 @@ pub fn inspect_max_user_namespaces(path: &Path) -> DoctorCheck {
 #[must_use]
 pub fn inspect_cgroup_v2_delegation() -> DoctorCheck {
     delegation_check(ContainmentDomain::discover())
+}
+
+/// Inspect whether this process's delegated domain enables resource controls.
+///
+/// A controller listed in `cgroup.controllers` is merely available to the
+/// delegated domain. It constrains child cgroups only after it also appears in
+/// `cgroup.subtree_control`. Reading both through [`ContainmentDomain`] keeps
+/// this check aligned with the exact hierarchy the runner will use.
+#[must_use]
+pub fn inspect_cgroup_v2_enabled_controllers() -> DoctorCheck {
+    let Ok(domain) = ContainmentDomain::discover() else {
+        return non_healthy(
+            "kernel.cgroup-v2.controllers-enabled",
+            CheckStatus::Unavailable,
+            "kernel.cgroup-v2.controllers-enabled-domain-unavailable",
+            "Enabled child controllers are unavailable without a delegated cgroup v2 domain",
+        );
+    };
+    enabled_controller_check(&domain)
+}
+
+fn enabled_controller_check(domain: &ContainmentDomain) -> DoctorCheck {
+    let (Ok(available), Ok(enabled)) =
+        (domain.available_controllers(), domain.enabled_controllers())
+    else {
+        return non_healthy(
+            "kernel.cgroup-v2.controllers-enabled",
+            CheckStatus::Unavailable,
+            "kernel.cgroup-v2.controllers-enabled-unreadable",
+            "The delegated cgroup controller state could not be read",
+        );
+    };
+    const REQUIRED: [Controller; 3] = [Controller::Cpu, Controller::Memory, Controller::Pids];
+    if REQUIRED
+        .iter()
+        .all(|controller| available.contains(controller) && enabled.contains(controller))
+    {
+        healthy("kernel.cgroup-v2.controllers-enabled")
+    } else {
+        non_healthy(
+            "kernel.cgroup-v2.controllers-enabled",
+            CheckStatus::Finding,
+            "kernel.cgroup-v2.controllers-enabled-incomplete",
+            "Required cgroup controllers are not enabled for child workloads",
+        )
+    }
 }
 
 /// Project a discovery outcome into a doctor check.
@@ -363,7 +409,7 @@ fn non_healthy(
 
 #[cfg(test)]
 mod tests {
-    use super::{delegation_check, landlock_check};
+    use super::{delegation_check, enabled_controller_check, landlock_check};
     use automonique_protocol::CheckStatus;
     use automonique_runner::ContainmentDomain;
     use automonique_runner::capability::{
@@ -383,6 +429,38 @@ mod tests {
             .expect("a non-healthy check must carry a reason")
             .code()
             .as_str()
+    }
+
+    fn controller_domain(available: &str, enabled: &str) -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("cgroup fixture");
+        for (name, content) in [
+            ("cgroup.procs", ""),
+            ("cgroup.kill", ""),
+            ("cgroup.controllers", available),
+            ("cgroup.subtree_control", enabled),
+        ] {
+            std::fs::write(root.path().join(name), content).expect("fixture interface");
+        }
+        root
+    }
+
+    #[test]
+    fn child_controller_readback_distinguishes_available_from_enabled() {
+        let complete = controller_domain("cpu memory pids", "cpu memory pids");
+        let complete = ContainmentDomain::at(complete.path()).expect("complete domain");
+        assert_eq!(
+            enabled_controller_check(&complete).status(),
+            CheckStatus::Healthy
+        );
+
+        let inert = controller_domain("cpu memory pids", "pids");
+        let inert = ContainmentDomain::at(inert.path()).expect("inert domain");
+        let check = enabled_controller_check(&inert);
+        assert_eq!(check.status(), CheckStatus::Finding);
+        assert_eq!(
+            reason_code(&check),
+            "kernel.cgroup-v2.controllers-enabled-incomplete"
+        );
     }
 
     /// A kernel that refuses every Landlock access right must never produce a
