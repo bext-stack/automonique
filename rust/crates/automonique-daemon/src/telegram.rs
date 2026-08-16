@@ -99,7 +99,7 @@ use crate::telegram_bridge::{
     BridgeParts, HostFacts, OperatorRoster, StoreControlSurface, TelegramControlBridge,
 };
 use automonique_protocol::admin::{ExecutionState, TelegramState};
-use automonique_store::Store;
+use automonique_store::{LeaseTimeSource, Store};
 use automonique_transport_runtime::{
     CancellationToken, MAX_ALLOWED_USERS, OpaqueBotToken, PollerLease, RuntimeError,
     StoreTelegramDurableSink, SystemClock, TelegramHostState, TelegramHttpsClient,
@@ -491,6 +491,8 @@ pub(crate) struct TelegramHostParams<'a> {
     pub(crate) state_dir: &'a Path,
     /// The daemon's main database, which carries the bot lease and the status.
     pub(crate) database_path: &'a Path,
+    /// Same boot-inclusive source used by the owning daemon store.
+    pub(crate) lease_time_source: Arc<dyn LeaseTimeSource>,
     /// The runs read model a `/runs` reply lists from, and that a `/run` waits
     /// on.
     pub(crate) run_index_path: &'a Path,
@@ -659,8 +661,11 @@ impl TelegramHost {
         else {
             return Ok(Self::Disabled);
         };
-        let store =
-            Store::open(params.database_path).map_err(|_| TelegramHostError::StoreUnavailable)?;
+        let store = Store::open_with_lease_time_source(
+            params.database_path,
+            Arc::clone(&params.lease_time_source),
+        )
+        .map_err(|_| TelegramHostError::StoreUnavailable)?;
         let sink = StoreTelegramDurableSink::new(store, SystemClock);
         let mut coordinator =
             TelegramLeaseCoordinator::disabled(sink, params.authority_lease_epoch, params.ttl_ms)
@@ -709,7 +714,7 @@ impl TelegramHost {
             ManageConfig::load(params.state_dir).map_err(TelegramHostError::ManageConfig)?;
         let memory_tenant = crate::memory_config::MemoryConfig::tenant_or_default(params.state_dir)
             .map_err(TelegramHostError::MemoryConfig)?;
-        let surface = StoreControlSurface::open(
+        let surface = StoreControlSurface::open_with_lease_time_source(
             params.database_path,
             params.run_index_path,
             HostFacts {
@@ -719,6 +724,7 @@ impl TelegramHost {
                 bot_id,
                 execution_state: params.execution_state,
             },
+            Arc::clone(&params.lease_time_source),
         )
         .map_err(|_| TelegramHostError::SurfaceUnavailable)?
         .with_support_tickets(params.support_tickets_path)
@@ -729,8 +735,11 @@ impl TelegramHost {
             Some(profile_app) => surface.with_manage_profiles(profile_app.clone()),
             None => surface,
         };
-        let poller_store =
-            Store::open(params.database_path).map_err(|_| TelegramHostError::StoreUnavailable)?;
+        let poller_store = Store::open_with_lease_time_source(
+            params.database_path,
+            Arc::clone(&params.lease_time_source),
+        )
+        .map_err(|_| TelegramHostError::StoreUnavailable)?;
         // The lane opens successfully on a deployment that has not configured
         // `/run` at all and refuses every one with `not configured`; only an
         // unopenable read model is a startup refusal, because a lane that could
@@ -1146,7 +1155,11 @@ mod tests {
             // administrators have never added anybody.
             let operator_members_path = state_dir.join(crate::OPERATOR_MEMBERS_NAME);
             let admin_socket = state_dir.join("admin.sock");
-            let mut store = Store::open(&database_path).expect("store opens");
+            let mut store = Store::open_with_lease_time_source(
+                &database_path,
+                Arc::new(crate::lease_time::BootTimeSource),
+            )
+            .expect("store opens");
             let lease = store
                 .acquire_generation_lease(automonique_store::LeaseRequest {
                     generation_id: crate::GENERATION_ID,
@@ -1171,6 +1184,7 @@ mod tests {
             TelegramHostParams {
                 state_dir: &self.state_dir,
                 database_path: &self.database_path,
+                lease_time_source: Arc::new(crate::lease_time::BootTimeSource),
                 run_index_path: &self.run_index_path,
                 support_tickets_path: &self.support_tickets_path,
                 operator_members_path: &self.operator_members_path,
@@ -1538,7 +1552,7 @@ mod tests {
     fn the_long_poll_fits_inside_one_renewal_interval() {
         let deadline_ms = i64::from(TELEGRAM_LONG_POLL_SECONDS) * 1_000
             + automonique_transport_runtime::TELEGRAM_HTTP_LEASE_MARGIN_MS;
-        let renewal_ms = i64::try_from(crate::LEASE_RENEW_INTERVAL.as_millis()).expect("interval");
+        let renewal_ms = crate::LEASE_RENEW_INTERVAL_MS;
         assert!(
             deadline_ms < renewal_ms,
             "a poll deadline of {deadline_ms}ms cannot fit a {renewal_ms}ms renewal interval"
@@ -1558,7 +1572,7 @@ mod tests {
     /// to sleep holding.
     #[test]
     fn a_pause_outlives_a_bot_lease_and_the_renewal_cadence_covers_it() {
-        let renewal_ms = i64::try_from(crate::LEASE_RENEW_INTERVAL.as_millis()).expect("interval");
+        let renewal_ms = crate::LEASE_RENEW_INTERVAL_MS;
         let longest_pause = automonique_transport_runtime::MAX_PAUSE_MS;
         assert!(
             longest_pause > crate::TELEGRAM_LEASE_TTL_MS,

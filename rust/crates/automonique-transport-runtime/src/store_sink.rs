@@ -271,6 +271,7 @@ fn map_read_error(error: StoreError) -> SinkFailure {
         StoreError::InsecurePath(_)
         | StoreError::SchemaVersion { .. }
         | StoreError::MigrationInvariant(_)
+        | StoreError::LeaseClock(_)
         | StoreError::Io(_)
         | StoreError::Sqlite(_) => SinkFailure::Unavailable,
     }
@@ -294,6 +295,7 @@ fn map_lifecycle_error(error: StoreError) -> SinkFailure {
         StoreError::InsecurePath(_)
         | StoreError::SchemaVersion { .. }
         | StoreError::MigrationInvariant(_)
+        | StoreError::LeaseClock(_)
         | StoreError::Io(_)
         | StoreError::Sqlite(_) => SinkFailure::Unavailable,
     }
@@ -317,7 +319,8 @@ fn map_commit_error(error: StoreError) -> SinkFailure {
         StoreError::Io(_) | StoreError::Sqlite(_) => SinkFailure::AmbiguousCommit,
         StoreError::InsecurePath(_)
         | StoreError::SchemaVersion { .. }
-        | StoreError::MigrationInvariant(_) => SinkFailure::Unavailable,
+        | StoreError::MigrationInvariant(_)
+        | StoreError::LeaseClock(_) => SinkFailure::Unavailable,
     }
 }
 

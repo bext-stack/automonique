@@ -33,6 +33,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use automonique_protocol::provenance::{CausationId, CorrelationId, Provenance, TraceId};
@@ -42,7 +43,7 @@ use rusqlite::{
 };
 
 /// The only database schema this build can read and write.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 /// SQLite lock contention is bounded rather than waiting indefinitely.
 pub const BUSY_TIMEOUT: Duration = Duration::from_millis(2_000);
 
@@ -494,6 +495,28 @@ UPDATE telegram_poller_leases SET expires_ms = 0;
 UPDATE outbox SET lease_expires_ms = 0 WHERE state = 'in_flight';
 "#;
 
+/// Change every lease deadline from caller wall time to absolute Linux
+/// `CLOCK_BOOTTIME` milliseconds. Values in the old domain are deliberately
+/// not converted: no conversion can recover the sampling relationship, so
+/// every outstanding lease is expired at the boundary.
+const MIGRATE_V9_TO_V10: &str = r#"
+UPDATE generations SET lease_expires_ms = 0;
+UPDATE work_locks SET expires_ms = 0;
+UPDATE telegram_poller_leases SET expires_ms = 0;
+UPDATE outbox SET lease_expires_ms = 0 WHERE state = 'in_flight';
+"#;
+
+/// Source of absolute lease-authority time.
+///
+/// Audit timestamps remain caller-supplied Unix milliseconds. A daemon opens
+/// the store with this source so lease comparisons and deadline arithmetic
+/// cannot consume wall time. [`Store::open`] retains caller-supplied time for
+/// deterministic fixtures and non-daemon compatibility callers.
+pub trait LeaseTimeSource: Send + Sync {
+    /// Current milliseconds from the boot-inclusive monotonic clock.
+    fn now_boottime_ms(&self) -> Result<i64, &'static str>;
+}
+
 /// A durable store error with stable refusal categories.
 #[derive(Debug)]
 pub enum StoreError {
@@ -513,6 +536,8 @@ pub enum StoreError {
     StaleEpoch,
     /// The caller's current authority lease is no longer live.
     AuthorityLost,
+    /// The boot-inclusive lease clock could not be sampled.
+    LeaseClock(&'static str),
     /// Another live run holds the requested scope.
     ScopeLocked,
     /// A prior run's scope lease expired and its execution must be reconciled.
@@ -551,6 +576,7 @@ impl StoreError {
             Self::LeaseHeld => "lease_held",
             Self::StaleEpoch => "stale_epoch",
             Self::AuthorityLost => "authority_lost",
+            Self::LeaseClock(_) => "lease_clock",
             Self::ScopeLocked => "scope_locked",
             Self::ReconciliationRequired { .. } => "reconciliation_required",
             Self::OutboxReconciliationRequired { .. } => "outbox_reconciliation_required",
@@ -588,6 +614,7 @@ impl fmt::Display for StoreError {
             Self::LeaseHeld => formatter.write_str("generation lease is held"),
             Self::StaleEpoch => formatter.write_str("generation lease epoch is stale or expired"),
             Self::AuthorityLost => formatter.write_str("current generation authority was lost"),
+            Self::LeaseClock(category) => write!(formatter, "lease clock failed: {category}"),
             Self::ScopeLocked => formatter.write_str("work scope is locked"),
             Self::ReconciliationRequired { run_id } => {
                 write!(
@@ -646,6 +673,7 @@ pub struct GenerationLease {
     pub generation_id: String,
     pub holder_id: String,
     pub epoch: u64,
+    /// Absolute boot-inclusive deadline when the store has a lease-time source.
     pub expires_ms: i64,
     pub boot_id: String,
     pub holder_pid: u32,
@@ -664,6 +692,8 @@ pub struct LeaseOwnerIdentity<'a> {
 pub struct LeaseRequest<'a> {
     pub generation_id: &'a str,
     pub holder_id: &'a str,
+    /// Unix milliseconds for audit rows. Lease arithmetic uses the store's
+    /// boot-inclusive source when one was supplied at open.
     pub now_ms: i64,
     pub ttl_ms: i64,
 }
@@ -673,6 +703,7 @@ pub struct LeaseRenewal<'a> {
     pub generation_id: &'a str,
     pub holder_id: &'a str,
     pub epoch: u64,
+    /// Unix audit time; never a production lease-authority input.
     pub now_ms: i64,
     pub ttl_ms: i64,
 }
@@ -1347,6 +1378,7 @@ impl GenerationSnapshot {
 pub struct StatusSnapshot {
     schema_version: u32,
     observed_ms: i64,
+    lease_observed_boottime_ms: i64,
     generation: Option<GenerationSnapshot>,
     event_cursor: u64,
     inbox_pending: u64,
@@ -1372,6 +1404,12 @@ impl StatusSnapshot {
     #[must_use]
     pub const fn observed_ms(&self) -> i64 {
         self.observed_ms
+    }
+    /// Boot-inclusive authority time used for every lease classification in
+    /// this exact database snapshot.
+    #[must_use]
+    pub const fn lease_observed_boottime_ms(&self) -> i64 {
+        self.lease_observed_boottime_ms
     }
     #[must_use]
     pub const fn generation(&self) -> Option<&GenerationSnapshot> {
@@ -1439,6 +1477,7 @@ impl StatusSnapshot {
 pub struct Store {
     connection: Connection,
     path: PathBuf,
+    lease_time_source: Option<Arc<dyn LeaseTimeSource>>,
 }
 
 impl Store {
@@ -1447,7 +1486,22 @@ impl Store {
     /// The parent must be owned by the effective user and deny all group/other
     /// access. Existing database paths must be regular, owned, non-symlinks.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let path = path.as_ref();
+        Self::open_inner(path.as_ref(), None)
+    }
+
+    /// Open a daemon store whose lease authority comes only from an absolute
+    /// boot-inclusive clock. Caller `now_ms` values remain audit wall time.
+    pub fn open_with_lease_time_source(
+        path: impl AsRef<Path>,
+        source: Arc<dyn LeaseTimeSource>,
+    ) -> Result<Self, StoreError> {
+        Self::open_inner(path.as_ref(), Some(source))
+    }
+
+    fn open_inner(
+        path: &Path,
+        lease_time_source: Option<Arc<dyn LeaseTimeSource>>,
+    ) -> Result<Self, StoreError> {
         validate_database_path(path)?;
         if !path.exists() {
             OpenOptions::new()
@@ -1477,7 +1531,17 @@ impl Store {
         Ok(Self {
             connection,
             path: path.to_path_buf(),
+            lease_time_source,
         })
+    }
+
+    fn lease_now_ms(&self, caller_now_ms: i64) -> Result<i64, StoreError> {
+        let now_ms = self.lease_time_source.as_ref().map_or_else(
+            || Ok(caller_now_ms),
+            |source| source.now_boottime_ms().map_err(StoreError::LeaseClock),
+        )?;
+        validate_time(now_ms)?;
+        Ok(now_ms)
     }
 
     /// Exact path opened by this store.
@@ -1510,7 +1574,9 @@ impl Store {
         validate_id(request.generation_id, "generation_id")?;
         validate_id(request.holder_id, "holder_id")?;
         validate_id(owner.boot_id, "boot_id")?;
-        let expires_ms = checked_expiry(request.now_ms, request.ttl_ms)?;
+        validate_time(request.now_ms)?;
+        let lease_now_ms = self.lease_now_ms(request.now_ms)?;
+        let expires_ms = checked_expiry(lease_now_ms, request.ttl_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1563,7 +1629,7 @@ impl Store {
             )) => {
                 let epoch = from_db_u64(raw_epoch, "lease_epoch")?;
                 let revision = from_db_u64(raw_revision, "revision")?;
-                if old_expiry > request.now_ms {
+                if old_expiry > lease_now_ms {
                     if holder == request.holder_id
                         && old_boot_id == owner.boot_id
                         && u32::try_from(raw_pid)
@@ -1611,7 +1677,7 @@ impl Store {
                         old_boot_id,
                         raw_pid,
                         raw_starttime,
-                        request.now_ms
+                        lease_now_ms
                     ],
                 )?;
                 if changed != 1 {
@@ -1650,7 +1716,9 @@ impl Store {
     ) -> Result<GenerationLease, StoreError> {
         validate_id(renewal.generation_id, "generation_id")?;
         validate_id(renewal.holder_id, "holder_id")?;
-        let expires_ms = checked_expiry(renewal.now_ms, renewal.ttl_ms)?;
+        validate_time(renewal.now_ms)?;
+        let lease_now_ms = self.lease_now_ms(renewal.now_ms)?;
+        let expires_ms = checked_expiry(lease_now_ms, renewal.ttl_ms)?;
         let epoch = to_db_u64(renewal.epoch, "lease_epoch")?;
         let transaction = self
             .connection
@@ -1664,7 +1732,7 @@ impl Store {
                 renewal.holder_id,
                 epoch,
                 expires_ms,
-                renewal.now_ms
+                lease_now_ms
             ],
         )?;
         if changed != 1 {
@@ -1713,6 +1781,7 @@ impl Store {
         validate_id(request.holder_id, "holder_id")?;
         validate_id(request.owner.boot_id, "boot_id")?;
         validate_time(request.now_ms)?;
+        let lease_now_ms = self.lease_now_ms(request.now_ms)?;
         let epoch = to_db_u64(request.epoch, "lease_epoch")?;
         let starttime = to_db_u64(request.owner.starttime, "holder_starttime")?;
         let transaction = self
@@ -1731,7 +1800,7 @@ impl Store {
                     request.owner.boot_id,
                     i64::from(request.owner.pid),
                     starttime,
-                    request.now_ms
+                    lease_now_ms
                 ],
                 |row| row.get::<_, i64>(0),
             )
@@ -1752,7 +1821,7 @@ impl Store {
                 request.owner.boot_id,
                 i64::from(request.owner.pid),
                 starttime,
-                request.now_ms,
+                lease_now_ms,
                 to_db_u64(next_revision, "generation_revision")?
             ],
         )?;
@@ -1762,7 +1831,7 @@ impl Store {
         transaction.execute(
             "UPDATE work_locks SET expires_ms = ?4
              WHERE generation_id = ?1 AND lease_epoch = ?2 AND expires_ms > ?3",
-            params![request.generation_id, epoch, request.now_ms, request.now_ms],
+            params![request.generation_id, epoch, lease_now_ms, lease_now_ms],
         )?;
         transaction.execute(
             "UPDATE telegram_poller_leases SET revision = revision + 1, expires_ms = ?5
@@ -1772,15 +1841,15 @@ impl Store {
                 request.generation_id,
                 request.holder_id,
                 epoch,
-                request.now_ms,
-                request.now_ms
+                lease_now_ms,
+                lease_now_ms
             ],
         )?;
         transaction.execute(
             "UPDATE outbox SET lease_expires_ms = ?4
              WHERE state = 'in_flight' AND lease_generation_id = ?1
                AND lease_epoch = ?2 AND lease_expires_ms > ?3",
-            params![request.generation_id, epoch, request.now_ms, request.now_ms],
+            params![request.generation_id, epoch, lease_now_ms, lease_now_ms],
         )?;
         append_event(
             &transaction,
@@ -1810,6 +1879,7 @@ impl Store {
         validate_id(generation_id, "generation_id")?;
         validate_id(holder_id, "holder_id")?;
         validate_time(now_ms)?;
+        let lease_now_ms = self.lease_now_ms(now_ms)?;
         let epoch = to_db_u64(epoch, "lease_epoch")?;
         let transaction = self
             .connection
@@ -1819,7 +1889,7 @@ impl Store {
                 "SELECT revision FROM generations
                  WHERE generation_id = ?1 AND lease_holder = ?2 AND lease_epoch = ?3
                  AND lease_expires_ms > ?4",
-                params![generation_id, holder_id, epoch, now_ms],
+                params![generation_id, holder_id, epoch, lease_now_ms],
                 |row| row.get::<_, i64>(0),
             )
             .optional()?
@@ -1835,13 +1905,13 @@ impl Store {
                 holder_id,
                 epoch,
                 to_db_u64(revision, "generation_revision")?,
-                now_ms
+                lease_now_ms
             ],
         )?;
         transaction.execute(
             "UPDATE work_locks SET expires_ms = ?3
              WHERE generation_id = ?1 AND lease_epoch = ?2",
-            params![generation_id, epoch, now_ms],
+            params![generation_id, epoch, lease_now_ms],
         )?;
         append_event(
             &transaction,
@@ -1873,6 +1943,7 @@ impl Store {
         validate_id(request.actor, "intake_pause_actor")?;
         validate_id(request.reason, "intake_pause_reason")?;
         validate_time(request.now_ms)?;
+        let lease_now_ms = self.lease_now_ms(request.now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1884,8 +1955,8 @@ impl Store {
             request.generation_id,
             request.holder_id,
             request.authority_lease_epoch,
-            request.now_ms,
-            request.now_ms,
+            lease_now_ms,
+            lease_now_ms,
         )?;
         if let Some(live) = live_intake_pause(&transaction, request.generation_id, request.now_ms)?
         {
@@ -1938,6 +2009,7 @@ impl Store {
         validate_id(request.holder_id, "holder_id")?;
         validate_id(request.actor, "intake_resume_actor")?;
         validate_time(request.now_ms)?;
+        let lease_now_ms = self.lease_now_ms(request.now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1946,8 +2018,8 @@ impl Store {
             request.generation_id,
             request.holder_id,
             request.authority_lease_epoch,
-            request.now_ms,
-            request.now_ms,
+            lease_now_ms,
+            lease_now_ms,
         )?;
         let Some(live) = live_intake_pause(&transaction, request.generation_id, request.now_ms)?
         else {
@@ -2043,6 +2115,7 @@ impl Store {
         if request.resume_after_ms < request.now_ms {
             return Err(StoreError::InvalidField("transport_pause_resume_after_ms"));
         }
+        let lease_now_ms = self.lease_now_ms(request.now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2054,8 +2127,8 @@ impl Store {
             request.generation_id,
             request.holder_id,
             request.authority_lease_epoch,
-            request.now_ms,
-            request.now_ms,
+            lease_now_ms,
+            lease_now_ms,
         )?;
         let existing = transport_pause_row(
             &transaction,
@@ -2246,7 +2319,8 @@ impl Store {
             request.holder_id,
             request.now_ms,
         )?;
-        let expires_ms = checked_expiry(request.now_ms, request.ttl_ms)?;
+        let lease_now_ms = self.lease_now_ms(request.now_ms)?;
+        let expires_ms = checked_expiry(lease_now_ms, request.ttl_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2255,7 +2329,7 @@ impl Store {
             request.generation_id,
             request.holder_id,
             request.authority_lease_epoch,
-            request.now_ms,
+            lease_now_ms,
             expires_ms,
         )?;
         let current = transaction
@@ -2268,7 +2342,7 @@ impl Store {
                                  AND g.lease_epoch = p.authority_lease_epoch
                                  AND g.lease_expires_ms > ?2)
                  FROM telegram_poller_leases p WHERE p.bot_id = ?1",
-                params![request.bot_id, request.now_ms],
+                params![request.bot_id, lease_now_ms],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -2308,7 +2382,7 @@ impl Store {
                 owner_authority_live,
             )) => {
                 let epoch = from_db_u64(raw_epoch, "telegram_poller_epoch")?;
-                if old_expiry > request.now_ms && owner_authority_live {
+                if old_expiry > lease_now_ms && owner_authority_live {
                     if generation_id == request.generation_id
                         && holder_id == request.holder_id
                         && from_db_u64(raw_authority_epoch, "authority_lease_epoch")?
@@ -2378,7 +2452,8 @@ impl Store {
             renewal.holder_id,
             renewal.now_ms,
         )?;
-        let expires_ms = checked_expiry(renewal.now_ms, renewal.ttl_ms)?;
+        let lease_now_ms = self.lease_now_ms(renewal.now_ms)?;
+        let expires_ms = checked_expiry(lease_now_ms, renewal.ttl_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2387,7 +2462,7 @@ impl Store {
             renewal.generation_id,
             renewal.holder_id,
             renewal.authority_lease_epoch,
-            renewal.now_ms,
+            lease_now_ms,
             expires_ms,
         )?;
         let changed = transaction.execute(
@@ -2403,7 +2478,7 @@ impl Store {
                 to_db_u64(renewal.poller_epoch, "telegram_poller_epoch")?,
                 renewal.expected_expires_ms,
                 expires_ms,
-                renewal.now_ms
+                lease_now_ms
             ],
         )?;
         if changed != 1 {
@@ -2425,10 +2500,11 @@ impl Store {
         identity: TelegramPollerLeaseIdentity<'_>,
     ) -> Result<(), StoreError> {
         validate_telegram_poller_identity(&identity)?;
+        let lease_now_ms = self.lease_now_ms(identity.now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_exact_telegram_poller(&transaction, &identity, identity.now_ms)?;
+        require_exact_telegram_poller(&transaction, &identity, lease_now_ms)?;
         let changed = transaction.execute(
             "UPDATE telegram_poller_leases SET revision = revision + 1, expires_ms = ?6
              WHERE bot_id = ?1 AND generation_id = ?2 AND holder_id = ?3
@@ -2439,7 +2515,7 @@ impl Store {
                 identity.holder_id,
                 to_db_u64(identity.poller_epoch, "telegram_poller_epoch")?,
                 identity.expected_expires_ms,
-                identity.now_ms
+                lease_now_ms
             ],
         )?;
         if changed != 1 {
@@ -2455,10 +2531,11 @@ impl Store {
         identity: TelegramPollerLeaseIdentity<'_>,
     ) -> Result<TelegramOffsetReceipt, StoreError> {
         validate_telegram_poller_identity(&identity)?;
+        let lease_now_ms = self.lease_now_ms(identity.now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
-        require_exact_telegram_poller(&transaction, &identity, identity.now_ms)?;
+        require_exact_telegram_poller(&transaction, &identity, lease_now_ms)?;
         let next_offset = transaction
             .query_row(
                 "SELECT next_offset FROM telegram_offsets WHERE bot_id = ?1",
@@ -2487,6 +2564,7 @@ impl Store {
         if commit.batch.bot_id != commit.lease.bot_id {
             return Err(StoreError::InvalidField("telegram_bot_id"));
         }
+        let lease_now_ms = self.lease_now_ms(commit.lease.now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2494,10 +2572,10 @@ impl Store {
             transaction.commit()?;
             return Ok(receipt);
         }
-        if commit.lease.now_ms >= commit.lease.expected_expires_ms {
+        if lease_now_ms >= commit.lease.expected_expires_ms {
             return Err(StoreError::StaleEpoch);
         }
-        if commit.commit_before_ms <= commit.lease.now_ms
+        if commit.commit_before_ms <= lease_now_ms
             || commit.commit_before_ms > commit.lease.expected_expires_ms
         {
             return Err(StoreError::InvalidField("telegram_commit_deadline"));
@@ -2691,6 +2769,7 @@ impl Store {
         if claim.inbox_id <= 0 {
             return Err(StoreError::InvalidField("inbox_id"));
         }
+        let lease_now_ms = self.lease_now_ms(claim.now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2699,7 +2778,7 @@ impl Store {
             claim.generation_id,
             claim.holder_id,
             claim.lease_epoch,
-            claim.now_ms,
+            lease_now_ms,
         )?;
 
         if let Some((run_id, inbox_id, scope, generation_id, epoch)) = transaction
@@ -2756,7 +2835,7 @@ impl Store {
             )
             .optional()?
         {
-            if expires_ms > claim.now_ms {
+            if expires_ms > lease_now_ms {
                 return Err(StoreError::ScopeLocked);
             }
             return Err(StoreError::ReconciliationRequired { run_id: old_run_id });
@@ -2842,6 +2921,7 @@ impl Store {
         validate_id(claim.generation_id, "generation_id")?;
         validate_id(claim.holder_id, "holder_id")?;
         validate_time(claim.now_ms)?;
+        let lease_now_ms = self.lease_now_ms(claim.now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2850,7 +2930,7 @@ impl Store {
             claim.generation_id,
             claim.holder_id,
             claim.lease_epoch,
-            claim.now_ms,
+            lease_now_ms,
         )?;
 
         let outstanding = transaction
@@ -2910,7 +2990,7 @@ impl Store {
             )
             .optional()?
         {
-            return Err(if expires_ms > claim.now_ms {
+            return Err(if expires_ms > lease_now_ms {
                 StoreError::ScopeLocked
             } else {
                 StoreError::ReconciliationRequired { run_id }
@@ -3001,10 +3081,17 @@ impl Store {
         validate_id(generation_id, "generation_id")?;
         validate_id(holder_id, "holder_id")?;
         validate_time(now_ms)?;
+        let lease_now_ms = self.lease_now_ms(now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
-        require_live_lease(&transaction, generation_id, holder_id, lease_epoch, now_ms)?;
+        require_live_lease(
+            &transaction,
+            generation_id,
+            holder_id,
+            lease_epoch,
+            lease_now_ms,
+        )?;
         let claimed = transaction
             .query_row(
                 "SELECT i.inbox_id, i.transport, i.transport_key, i.scope, i.payload,
@@ -3149,6 +3236,7 @@ impl Store {
         validate_time(request.now_ms)?;
         let ReconciliationDecision::Fail { reason } = request.decision;
         validate_id(reason, "reconciliation_reason")?;
+        let lease_now_ms = self.lease_now_ms(request.now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3157,7 +3245,7 @@ impl Store {
             request.authority_generation_id,
             request.authority_holder_id,
             request.authority_lease_epoch,
-            request.now_ms,
+            lease_now_ms,
         )?;
         let run = transaction
             .query_row(
@@ -3206,7 +3294,7 @@ impl Store {
         if revision != request.expected_revision {
             return Err(StoreError::IdempotencyConflict("expected_revision"));
         }
-        if run.10.is_none_or(|expires_ms| expires_ms > request.now_ms) {
+        if run.10.is_none_or(|expires_ms| expires_ms > lease_now_ms) {
             return Err(StoreError::LeaseHeld);
         }
         let outcome_rows: bool = transaction.query_row(
@@ -3444,6 +3532,7 @@ impl Store {
         if terminal.run_id <= 0 {
             return Err(StoreError::InvalidField("run_id"));
         }
+        let lease_now_ms = self.lease_now_ms(terminal.now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3452,7 +3541,7 @@ impl Store {
             terminal.generation_id,
             terminal.holder_id,
             terminal.lease_epoch,
-            terminal.now_ms,
+            lease_now_ms,
         )?;
 
         let run = transaction
@@ -3719,6 +3808,7 @@ impl Store {
         validate_id(request.generation_id, "generation_id")?;
         validate_id(request.holder_id, "holder_id")?;
         validate_time(request.now_ms)?;
+        let lease_now_ms = self.lease_now_ms(request.now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3727,7 +3817,7 @@ impl Store {
             request.generation_id,
             request.holder_id,
             request.lease_epoch,
-            request.now_ms,
+            lease_now_ms,
         )?;
         if let Some((outbox_id, event_id, kind, payload)) = transaction
             .query_row(
@@ -3821,7 +3911,8 @@ impl Store {
         validate_id(request.generation_id, "generation_id")?;
         validate_id(request.holder_id, "holder_id")?;
         validate_time(request.now_ms)?;
-        let requested_expiry = checked_expiry(request.now_ms, request.ttl_ms)?;
+        let lease_now_ms = self.lease_now_ms(request.now_ms)?;
+        let requested_expiry = checked_expiry(lease_now_ms, request.ttl_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3830,7 +3921,7 @@ impl Store {
             request.generation_id,
             request.holder_id,
             request.lease_epoch,
-            request.now_ms,
+            lease_now_ms,
         )?;
         let row = transaction
             .query_row(
@@ -3872,7 +3963,7 @@ impl Store {
             let expires_ms = row.12.ok_or(StoreError::MigrationInvariant(
                 "in_flight_outbox_without_expiry",
             ))?;
-            if expires_ms <= request.now_ms {
+            if expires_ms <= lease_now_ms {
                 return Err(StoreError::OutboxReconciliationRequired { outbox_id: row.0 });
             }
             if row.9.as_deref() != Some(request.generation_id)
@@ -3958,6 +4049,7 @@ impl Store {
             request.lease_token,
             request.now_ms,
         )?;
+        let lease_now_ms = self.lease_now_ms(request.now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
@@ -3966,7 +4058,7 @@ impl Store {
             request.generation_id,
             request.holder_id,
             request.lease_epoch,
-            request.now_ms,
+            lease_now_ms,
         )?;
         let payload = transaction
             .query_row(
@@ -3981,7 +4073,7 @@ impl Store {
                     request.holder_id,
                     to_db_u64(request.lease_epoch, "outbox_lease_epoch")?,
                     request.lease_token,
-                    request.now_ms
+                    lease_now_ms
                 ],
                 |row| {
                     Ok(LeasedOutboxPayload {
@@ -4010,6 +4102,7 @@ impl Store {
             delivery.now_ms,
         )?;
         validate_id(delivery.receipt_key, "outbox_receipt_key")?;
+        let lease_now_ms = self.lease_now_ms(delivery.now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4018,7 +4111,7 @@ impl Store {
             delivery.generation_id,
             delivery.holder_id,
             delivery.lease_epoch,
-            delivery.now_ms,
+            lease_now_ms,
         )?;
         let row = outbox_delivery_row(&transaction, delivery.outbox_id)?;
         let revision = from_db_u64(row.1, "outbox_revision")?;
@@ -4054,7 +4147,7 @@ impl Store {
                 lease_epoch: delivery.lease_epoch,
                 lease_token: delivery.lease_token,
                 expected_attempt: delivery.expected_attempt,
-                now_ms: delivery.now_ms,
+                now_ms: lease_now_ms,
             },
         )?;
         let next_revision = revision
@@ -4119,6 +4212,7 @@ impl Store {
             OutboxFailureDecision::DeadLetter { reason } => ("dead_lettered", reason, None),
         };
         validate_id(reason, "outbox_failure_reason")?;
+        let lease_now_ms = self.lease_now_ms(failure.now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4127,7 +4221,7 @@ impl Store {
             failure.generation_id,
             failure.holder_id,
             failure.lease_epoch,
-            failure.now_ms,
+            lease_now_ms,
         )?;
         let row = outbox_delivery_row(&transaction, failure.outbox_id)?;
         require_exact_outbox_lease(
@@ -4139,7 +4233,7 @@ impl Store {
                 lease_epoch: failure.lease_epoch,
                 lease_token: failure.lease_token,
                 expected_attempt: failure.expected_attempt,
-                now_ms: failure.now_ms,
+                now_ms: lease_now_ms,
             },
         )?;
         let revision = from_db_u64(row.1, "outbox_revision")?;
@@ -4345,6 +4439,7 @@ impl Store {
                 ("dead_lettered", reason)
             }
         };
+        let lease_now_ms = self.lease_now_ms(request.now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4353,7 +4448,7 @@ impl Store {
             request.authority_generation_id,
             request.authority_holder_id,
             request.authority_lease_epoch,
-            request.now_ms,
+            lease_now_ms,
         )?;
         let row = outbox_delivery_row(&transaction, request.outbox_id)?;
         let revision = from_db_u64(row.1, "outbox_revision")?;
@@ -4401,7 +4496,7 @@ impl Store {
         {
             return Err(StoreError::StaleEpoch);
         }
-        if row.9.is_none_or(|expires_ms| expires_ms > request.now_ms) {
+        if row.9.is_none_or(|expires_ms| expires_ms > lease_now_ms) {
             return Err(StoreError::LeaseHeld);
         }
         let next_revision = revision
@@ -4489,6 +4584,7 @@ impl Store {
     ) -> Result<StatusSnapshot, StoreError> {
         validate_id(generation_id, "generation_id")?;
         validate_time(now_ms)?;
+        let lease_now_ms = self.lease_now_ms(now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
@@ -4548,7 +4644,7 @@ impl Store {
             "SELECT count(DISTINCT r.run_id) FROM runs r
              JOIN work_locks w ON w.run_id = r.run_id
              WHERE r.state = 'running' AND w.expires_ms <= ?1",
-            [now_ms],
+            [lease_now_ms],
             |row| row.get(0),
         )?;
         let outbox_counts: (i64, i64, i64, i64, i64, i64, Option<i64>) =
@@ -4556,13 +4652,13 @@ impl Store {
                 "SELECT
                     COALESCE(sum(CASE WHEN state = 'pending' AND available_ms <= ?1 THEN 1 ELSE 0 END), 0),
                     COALESCE(sum(CASE WHEN state = 'pending' AND available_ms > ?1 THEN 1 ELSE 0 END), 0),
-                    COALESCE(sum(CASE WHEN state = 'in_flight' AND lease_expires_ms > ?1 THEN 1 ELSE 0 END), 0),
-                    COALESCE(sum(CASE WHEN state = 'in_flight' AND lease_expires_ms <= ?1 THEN 1 ELSE 0 END), 0),
+                    COALESCE(sum(CASE WHEN state = 'in_flight' AND lease_expires_ms > ?2 THEN 1 ELSE 0 END), 0),
+                    COALESCE(sum(CASE WHEN state = 'in_flight' AND lease_expires_ms <= ?2 THEN 1 ELSE 0 END), 0),
                     COALESCE(sum(CASE WHEN state = 'delivered' THEN 1 ELSE 0 END), 0),
                     COALESCE(sum(CASE WHEN state = 'dead_lettered' THEN 1 ELSE 0 END), 0),
                     min(CASE WHEN state = 'pending' AND available_ms <= ?1 THEN created_ms END)
                  FROM outbox",
-                [now_ms],
+                params![now_ms, lease_now_ms],
                 |row| {
                     Ok((
                         row.get(0)?,
@@ -4586,13 +4682,14 @@ impl Store {
              FROM telegram_poller_leases p
              JOIN generations g ON g.generation_id = p.generation_id
              WHERE p.generation_id = ?2",
-            params![now_ms, generation_id],
+            params![lease_now_ms, generation_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         transaction.commit()?;
         Ok(StatusSnapshot {
             schema_version: SCHEMA_VERSION,
             observed_ms: now_ms,
+            lease_observed_boottime_ms: lease_now_ms,
             generation,
             event_cursor,
             inbox_pending,
@@ -4703,7 +4800,8 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
         migrate_v5_to_v6(connection)?;
         migrate_v6_to_v7(connection)?;
         migrate_v7_to_v8(connection)?;
-        return migrate_v8_to_v9(connection);
+        migrate_v8_to_v9(connection)?;
+        return migrate_v9_to_v10(connection);
     }
     if version == 2 {
         migrate_v2_to_v3(connection)?;
@@ -4712,7 +4810,8 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
         migrate_v5_to_v6(connection)?;
         migrate_v6_to_v7(connection)?;
         migrate_v7_to_v8(connection)?;
-        return migrate_v8_to_v9(connection);
+        migrate_v8_to_v9(connection)?;
+        return migrate_v9_to_v10(connection);
     }
     if version == 3 {
         migrate_v3_to_v4(connection)?;
@@ -4720,32 +4819,41 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
         migrate_v5_to_v6(connection)?;
         migrate_v6_to_v7(connection)?;
         migrate_v7_to_v8(connection)?;
-        return migrate_v8_to_v9(connection);
+        migrate_v8_to_v9(connection)?;
+        return migrate_v9_to_v10(connection);
     }
     if version == 4 {
         migrate_v4_to_v5(connection)?;
         migrate_v5_to_v6(connection)?;
         migrate_v6_to_v7(connection)?;
         migrate_v7_to_v8(connection)?;
-        return migrate_v8_to_v9(connection);
+        migrate_v8_to_v9(connection)?;
+        return migrate_v9_to_v10(connection);
     }
     if version == 5 {
         migrate_v5_to_v6(connection)?;
         migrate_v6_to_v7(connection)?;
         migrate_v7_to_v8(connection)?;
-        return migrate_v8_to_v9(connection);
+        migrate_v8_to_v9(connection)?;
+        return migrate_v9_to_v10(connection);
     }
     if version == 6 {
         migrate_v6_to_v7(connection)?;
         migrate_v7_to_v8(connection)?;
-        return migrate_v8_to_v9(connection);
+        migrate_v8_to_v9(connection)?;
+        return migrate_v9_to_v10(connection);
     }
     if version == 7 {
         migrate_v7_to_v8(connection)?;
-        return migrate_v8_to_v9(connection);
+        migrate_v8_to_v9(connection)?;
+        return migrate_v9_to_v10(connection);
     }
     if version == 8 {
-        return migrate_v8_to_v9(connection);
+        migrate_v8_to_v9(connection)?;
+        return migrate_v9_to_v10(connection);
+    }
+    if version == 9 {
+        return migrate_v9_to_v10(connection);
     }
     if version != 0 {
         return Err(StoreError::SchemaVersion {
@@ -4773,6 +4881,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
     transaction.execute_batch(MIGRATE_V6_TO_V7)?;
     transaction.execute_batch(MIGRATE_V7_TO_V8)?;
     transaction.execute_batch(MIGRATE_V8_TO_V9)?;
+    transaction.execute_batch(MIGRATE_V9_TO_V10)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -4829,6 +4938,14 @@ fn migrate_v7_to_v8(connection: &mut Connection) -> Result<(), StoreError> {
 fn migrate_v8_to_v9(connection: &mut Connection) -> Result<(), StoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(MIGRATE_V8_TO_V9)?;
+    transaction.pragma_update(None, "user_version", 9)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v9_to_v10(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(MIGRATE_V9_TO_V10)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -5947,6 +6064,16 @@ mod migration_tests {
             .expect("v8 marker");
     }
 
+    fn canonical_v9(connection: &mut Connection) {
+        canonical_v8(connection);
+        connection
+            .execute_batch(MIGRATE_V8_TO_V9)
+            .expect("canonical v9 schema");
+        connection
+            .pragma_update(None, "user_version", 9)
+            .expect("v9 marker");
+    }
+
     #[test]
     fn v8_ownerless_leases_migrate_expired_with_explicit_legacy_identity() {
         let mut connection = Connection::open_in_memory().expect("memory database");
@@ -5960,7 +6087,7 @@ mod migration_tests {
             )
             .expect("v8 lease");
 
-        initialize_or_validate_schema(&mut connection).expect("v9 migration");
+        initialize_or_validate_schema(&mut connection).expect("current migration");
         let row: (i64, String, i64, i64) = connection
             .query_row(
                 "SELECT lease_expires_ms, boot_id, holder_pid, holder_starttime
@@ -5973,6 +6100,34 @@ mod migration_tests {
     }
 
     #[test]
+    fn v9_wall_time_lease_is_expired_at_the_boottime_domain_boundary() {
+        let mut connection = Connection::open_in_memory().expect("memory database");
+        canonical_v9(&mut connection);
+        connection
+            .execute(
+                "INSERT INTO generations
+                 (generation_id, revision, state, lease_holder, lease_epoch, lease_expires_ms,
+                  boot_id, holder_pid, holder_starttime)
+                 VALUES ('foreground', 4, 'active', 'old-holder', 7, 900,
+                         'boot-a', 42, 99)",
+                [],
+            )
+            .expect("v9 wall-time lease");
+
+        initialize_or_validate_schema(&mut connection).expect("v10 time-domain migration");
+        let row: (u32, i64, String) = connection
+            .query_row(
+                "SELECT (SELECT user_version FROM pragma_user_version),
+                        lease_expires_ms, boot_id
+                 FROM generations WHERE generation_id = 'foreground'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("migrated lease");
+        assert_eq!(row, (SCHEMA_VERSION, 0, "boot-a".to_owned()));
+    }
+
+    #[test]
     fn fresh_database_initializes_at_the_pause_bearing_version() {
         let mut connection = Connection::open_in_memory().expect("memory database");
         initialize_or_validate_schema(&mut connection).expect("fresh initialization");
@@ -5980,7 +6135,7 @@ mod migration_tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         let transport_pauses: i64 = connection
             .query_row("SELECT count(*) FROM transport_pauses", [], |row| {
                 row.get(0)

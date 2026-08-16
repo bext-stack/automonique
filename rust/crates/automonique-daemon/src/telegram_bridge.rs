@@ -9000,7 +9000,32 @@ impl StoreControlSurface {
         run_index_path: &Path,
         facts: HostFacts,
     ) -> Result<Self, SurfaceRefusal> {
-        let store = Store::open(database_path).map_err(|_| SurfaceRefusal::Unavailable)?;
+        Self::open_store(
+            Store::open(database_path).map_err(|_| SurfaceRefusal::Unavailable)?,
+            run_index_path,
+            facts,
+        )
+    }
+
+    pub(crate) fn open_with_lease_time_source(
+        database_path: &Path,
+        run_index_path: &Path,
+        facts: HostFacts,
+        source: Arc<dyn automonique_store::LeaseTimeSource>,
+    ) -> Result<Self, SurfaceRefusal> {
+        Self::open_store(
+            Store::open_with_lease_time_source(database_path, source)
+                .map_err(|_| SurfaceRefusal::Unavailable)?,
+            run_index_path,
+            facts,
+        )
+    }
+
+    fn open_store(
+        store: Store,
+        run_index_path: &Path,
+        facts: HostFacts,
+    ) -> Result<Self, SurfaceRefusal> {
         let run_index = RunIndex::open(run_index_path).map_err(|_| SurfaceRefusal::Unavailable)?;
         Ok(Self {
             store,
@@ -9168,7 +9193,7 @@ impl ControlSurface for StoreControlSurface {
         let generation = snapshot.generation().ok_or(SurfaceRefusal::Unavailable)?;
         if generation.holder_id() != self.facts.holder_id
             || generation.lease_epoch() != self.facts.lease_epoch
-            || generation.lease_expires_ms() <= now_ms
+            || generation.lease_expires_ms() <= snapshot.lease_observed_boottime_ms()
         {
             return Err(SurfaceRefusal::Unavailable);
         }
@@ -9177,7 +9202,9 @@ impl ControlSurface for StoreControlSurface {
             .intake_paused(&self.facts.generation_id, now_ms)
             .map_err(|_| SurfaceRefusal::Unavailable)?
             .is_some();
-        let remaining_ms = generation.lease_expires_ms().saturating_sub(now_ms);
+        let remaining_ms = generation
+            .lease_expires_ms()
+            .saturating_sub(snapshot.lease_observed_boottime_ms());
         Ok(format!(
             "Automonique status\n\
              generation {} epoch {} held by {}\n\

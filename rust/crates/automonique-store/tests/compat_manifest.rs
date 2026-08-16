@@ -26,7 +26,7 @@ fn the_schema_versions_this_crate_owns_match_the_compat_matrix_rows() {
     // drifted from the authoritative constant — update both together.
     assert_eq!(
         automonique_store::SCHEMA_VERSION,
-        9,
+        10,
         "store SCHEMA_VERSION moved: update the compat matrix's store_schema \
          row in automonique-protocol/src/compat.rs together with this pin"
     );

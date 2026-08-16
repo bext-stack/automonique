@@ -1029,7 +1029,7 @@ mod versions {
         fn the_asserted_foreign_versions_are_the_ones_this_wave_recorded() {
             let matrix = shipped_matrix();
             let recorded = [
-                (Component::StoreSchema, 1, 8),
+                (Component::StoreSchema, 1, 10),
                 (Component::CancelLedgerSchema, 1, 1),
                 (Component::GenerationAuditSchema, 1, 1),
                 (Component::ProviderJournalSchema, 1, 3),

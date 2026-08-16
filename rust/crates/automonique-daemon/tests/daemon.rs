@@ -15,10 +15,24 @@ use automonique_protocol::admin::{
 };
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_store::{
-    InboxSubmission, LeaseOwnerIdentity, LeaseRequest, OutboxClaimRequest, SchedulerClaim, Store,
-    TelegramPollerLeaseIdentity, TelegramPollerLeaseRequest, TerminalRun, TerminalState, WorkClaim,
+    InboxSubmission, LeaseOwnerIdentity, LeaseRequest, LeaseTimeSource, OutboxClaimRequest,
+    SchedulerClaim, Store, TelegramPollerLeaseIdentity, TelegramPollerLeaseRequest, TerminalRun,
+    TerminalState, WorkClaim,
 };
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
+use nix::sys::time::TimeValLike;
+use nix::time::ClockId;
+
+struct BootClock;
+
+impl LeaseTimeSource for BootClock {
+    fn now_boottime_ms(&self) -> Result<i64, &'static str> {
+        ClockId::CLOCK_BOOTTIME
+            .now()
+            .map(|value| value.num_milliseconds())
+            .map_err(|_| "clock_gettime")
+    }
+}
 
 fn fixture() -> (tempfile::TempDir, DaemonConfig) {
     let root = tempfile::tempdir().expect("temporary root");
@@ -568,7 +582,7 @@ fn losing_the_durable_fence_ends_serving_without_false_ready() {
             .as_millis(),
     )
     .expect("bounded time");
-    Store::open(config.database_path())
+    Store::open_with_lease_time_source(config.database_path(), Arc::new(BootClock))
         .expect("competing store")
         .release_generation_lease(
             "foreground",

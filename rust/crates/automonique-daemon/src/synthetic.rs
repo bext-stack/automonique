@@ -14,6 +14,7 @@ use automonique_store::{
 pub(crate) struct StoreScheduler<'a> {
     store: &'a mut Store,
     now_ms: i64,
+    lease_now_ms: i64,
     ttl_ms: i64,
     lease_expires_ms: &'a mut i64,
     active: Option<(i64, String)>,
@@ -23,12 +24,14 @@ impl<'a> StoreScheduler<'a> {
     pub(crate) fn new(
         store: &'a mut Store,
         now_ms: i64,
+        lease_now_ms: i64,
         ttl_ms: i64,
         lease_expires_ms: &'a mut i64,
     ) -> Self {
         Self {
             store,
             now_ms,
+            lease_now_ms,
             ttl_ms,
             lease_expires_ms,
             active: None,
@@ -42,7 +45,7 @@ impl DurableScheduler for StoreScheduler<'_> {
         // `finish_run`. Avoid turning an idle 25 ms poll into a durable lease
         // renewal/event storm; renew only as the lease enters its normal
         // renewal window.
-        if *self.lease_expires_ms > self.now_ms.saturating_add(self.ttl_ms / 3) {
+        if *self.lease_expires_ms > self.lease_now_ms.saturating_add(self.ttl_ms / 3) {
             return Ok(());
         }
         let lease = self

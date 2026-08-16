@@ -4,18 +4,20 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use automonique_store::{
     InboxSubmission, IntakePauseRequest, IntakeResumeRequest, LeaseExpiryRequest,
-    LeaseOwnerIdentity, LeaseRenewal, LeaseRequest, MAX_TRANSPORT_KEY_BYTES, OutboxClaimRequest,
-    OutboxDelivery, OutboxEnqueue, OutboxFailure, OutboxFailureDecision, OutboxPayloadRequest,
-    OutboxReconciliationDecision, OutboxReconciliationRequest, ReconciliationDecision,
-    ReconciliationInboxState, ReconciliationRequest, ReconciliationRunState, SCHEMA_VERSION,
-    SchedulerClaim, Store, TelegramBatchIngestion, TelegramPollerCommit,
-    TelegramPollerLeaseIdentity, TelegramPollerLeaseRenewal, TelegramPollerLeaseRequest,
-    TelegramStoreDisposition, TelegramStoreUpdate, TerminalRun, TerminalState,
-    TransportPauseRequest, WorkClaim,
+    LeaseOwnerIdentity, LeaseRenewal, LeaseRequest, LeaseTimeSource, MAX_TRANSPORT_KEY_BYTES,
+    OutboxClaimRequest, OutboxDelivery, OutboxEnqueue, OutboxFailure, OutboxFailureDecision,
+    OutboxPayloadRequest, OutboxReconciliationDecision, OutboxReconciliationRequest,
+    ReconciliationDecision, ReconciliationInboxState, ReconciliationRequest,
+    ReconciliationRunState, SCHEMA_VERSION, SchedulerClaim, Store, TelegramBatchIngestion,
+    TelegramPollerCommit, TelegramPollerLeaseIdentity, TelegramPollerLeaseRenewal,
+    TelegramPollerLeaseRequest, TelegramStoreDisposition, TelegramStoreUpdate, TerminalRun,
+    TerminalState, TransportPauseRequest, WorkClaim,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -24,6 +26,14 @@ const ZOMBIE_HELPER: &str = "AUTOMONIQUE_STORE_ZOMBIE_HELPER";
 const ZOMBIE_DATABASE: &str = "AUTOMONIQUE_STORE_ZOMBIE_DATABASE";
 const ZOMBIE_READY: &str = "AUTOMONIQUE_STORE_ZOMBIE_READY";
 const ZOMBIE_RESULT: &str = "AUTOMONIQUE_STORE_ZOMBIE_RESULT";
+
+struct FixedLeaseClock(AtomicI64);
+
+impl LeaseTimeSource for FixedLeaseClock {
+    fn now_boottime_ms(&self) -> Result<i64, &'static str> {
+        Ok(self.0.load(Ordering::Acquire))
+    }
+}
 
 struct PrivateDatabase {
     _directory: TempDir,
@@ -698,6 +708,51 @@ fn a_dead_owner_sweep_is_exact_and_the_old_epoch_cannot_write_after_takeover() {
         "running"
     );
     assert_eq!(store.outbox_count().expect("no zombie effect"), 0);
+}
+
+#[test]
+fn external_lease_deadlines_ignore_every_wall_clock_value() {
+    let database = PrivateDatabase::new();
+    let clock = Arc::new(FixedLeaseClock(AtomicI64::new(1_000)));
+    let mut store = Store::open_with_lease_time_source(database.path(), clock.clone())
+        .expect("boot-time store");
+    let first = store
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            now_ms: 1_800_000_000_000,
+            ttl_ms: 100,
+        })
+        .expect("first lease");
+    assert_eq!(first.expires_ms, 1_100);
+
+    clock.0.store(1_050, Ordering::Release);
+    let renewed = store
+        .renew_generation_lease(LeaseRenewal {
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            epoch: first.epoch,
+            now_ms: 1,
+            ttl_ms: 200,
+        })
+        .expect("renewed lease");
+    assert_eq!(renewed.expires_ms, 1_250);
+    let snapshot = store
+        .status_snapshot_at("generation-a", 9_000_000_000_000)
+        .expect("status");
+    assert_eq!(snapshot.lease_observed_boottime_ms(), 1_050);
+
+    clock.0.store(1_250, Ordering::Release);
+    let successor = store
+        .acquire_generation_lease(LeaseRequest {
+            generation_id: "generation-a",
+            holder_id: "holder-b",
+            now_ms: 2,
+            ttl_ms: 100,
+        })
+        .expect("expired lease is replaceable");
+    assert!(successor.epoch > first.epoch);
+    assert_eq!(successor.expires_ms, 1_350);
 }
 
 #[test]

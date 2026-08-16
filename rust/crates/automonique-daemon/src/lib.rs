@@ -167,6 +167,7 @@ pub mod improvement_publish;
 pub mod improvement_worker;
 pub mod improvements;
 mod lease_identity;
+mod lease_time;
 pub mod manage_config;
 pub mod memory_config;
 mod model_inventory;
@@ -384,7 +385,7 @@ const MAX_READ_SPOOL_BYTES: u64 = 64 * 1024 * 1024;
 
 const GENERATION_ID: &str = "foreground";
 const LEASE_TTL_MS: i64 = 30_000;
-const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
+const LEASE_RENEW_INTERVAL_MS: i64 = 10_000;
 /// Bot-lease TTL, strictly inside the generation TTL: the store refuses a bot
 /// lease that would outlive its generation authority, and the bot lease is
 /// always acquired or renewed moments after the generation lease.
@@ -988,6 +989,10 @@ pub enum DaemonError {
     ServiceManagerFailed(&'static str),
     /// The control lock path was unsafe or another live daemon holds it.
     ControlLockFailed(&'static str),
+    /// Boot-inclusive lease time could not be sampled safely.
+    LeaseClockFailed(&'static str),
+    /// A suspend/resume boundary invalidated every lease held by this process.
+    LeaseSuspended,
 }
 
 impl DaemonError {
@@ -1020,6 +1025,8 @@ impl DaemonError {
             Self::ProgressEndpointFailed(category) => category,
             Self::ServiceManagerFailed(category) => category,
             Self::ControlLockFailed(category) => category,
+            Self::LeaseClockFailed(_) => "lease_clock",
+            Self::LeaseSuspended => "lease_suspended",
         }
     }
 }
@@ -1093,6 +1100,8 @@ impl fmt::Display for DaemonError {
             Self::ControlLockFailed(category) => {
                 write!(formatter, "daemon control lock refused: {category}")
             }
+            Self::LeaseClockFailed(category) => write!(formatter, "lease clock failed: {category}"),
+            Self::LeaseSuspended => formatter.write_str("lease authority was lost across suspend"),
         }
     }
 }
@@ -1128,6 +1137,7 @@ pub struct Daemon {
     instance_id: AdminInstanceId,
     lease_epoch: u64,
     lease_expires_ms: i64,
+    lease_time: lease_time::SuspendFence,
     socket_identity: (u64, u64),
     controller: automonique_core::Controller,
     reconciliation_run_id: Option<i64>,
@@ -1341,7 +1351,15 @@ impl Daemon {
                     DaemonError::ControlLockFailed(category)
                 }
             })?;
-        let mut store = Store::open(config.database_path())?;
+        let mut lease_time =
+            lease_time::SuspendFence::system().map_err(DaemonError::LeaseClockFailed)?;
+        let lease_now_ms = lease_time
+            .require_authority()
+            .map_err(map_lease_authority_error)?;
+        let mut store = Store::open_with_lease_time_source(
+            config.database_path(),
+            Arc::new(lease_time::BootTimeSource),
+        )?;
 
         let socket_path = config.admin_socket();
         prepare_socket_path(&socket_path)?;
@@ -1368,7 +1386,7 @@ impl Daemon {
         if let Some(previous) = store
             .status_snapshot_at(GENERATION_ID, now_ms)?
             .generation()
-            && previous.lease_expires_ms() > now_ms
+            && previous.lease_expires_ms() > lease_now_ms
         {
             let previous_identity = lease_identity::ProcessIdentity {
                 boot_id: previous.boot_id().to_owned(),
@@ -1508,6 +1526,7 @@ impl Daemon {
                 &telegram::TelegramHostParams {
                     state_dir: &state_dir,
                     database_path: &config.database_path(),
+                    lease_time_source: Arc::new(lease_time::BootTimeSource),
                     run_index_path: &config.run_index_path(),
                     support_tickets_path: &config.support_tickets_path(),
                     operator_members_path: &config.operator_members_path(),
@@ -1678,6 +1697,7 @@ impl Daemon {
             instance_id,
             lease_epoch: lease.epoch,
             lease_expires_ms: lease.expires_ms,
+            lease_time,
             socket_identity,
             controller: automonique_core::Controller::new(),
             reconciliation_run_id: None,
@@ -1762,7 +1782,19 @@ impl Daemon {
     pub fn serve(mut self, stop: &AtomicBool) -> Result<(), DaemonError> {
         let mut service_manager = systemd::Notifier::from_environment()
             .map_err(|error| DaemonError::ServiceManagerFailed(error.category()))?;
-        let mut next_renewal = std::time::Instant::now() + LEASE_RENEW_INTERVAL;
+        let initial_lease = self
+            .lease_time
+            .require_authority()
+            .map_err(map_lease_authority_error);
+        let mut self_end_kind = if initial_lease.is_ok() {
+            SelfEndKind::Released
+        } else {
+            SelfEndKind::Expired
+        };
+        let mut next_renewal_boottime_ms = initial_lease
+            .as_ref()
+            .map_or(0, |now_boottime_ms| *now_boottime_ms)
+            .saturating_add(LEASE_RENEW_INTERVAL_MS);
         // The first sweep runs immediately: a daemon that just took over a
         // generation is exactly the one most likely to be holding proposals
         // that expired while nobody was serving.
@@ -1784,10 +1816,12 @@ impl Daemon {
         // this is a no-op; one with a configuration puts its worker on a thread
         // here and nowhere else, so a process that opened a daemon and never
         // served has issued no request to the fleet either.
-        let started = self
-            .slack_tickets
-            .start()
-            .map_err(|error| DaemonError::SlackRefused(error.category()))
+        let started = initial_lease
+            .and_then(|_| {
+                self.slack_tickets
+                    .start()
+                    .map_err(|error| DaemonError::SlackRefused(error.category()))
+            })
             .and_then(|()| {
                 self.telegram
                     .start()
@@ -1818,6 +1852,17 @@ impl Daemon {
                     break 'serving Err(DaemonError::ServiceManagerFailed(error.category()));
                 }
                 loop {
+                    let lease_now_ms = match self.lease_time.require_authority() {
+                        Ok(now_ms) => now_ms,
+                        Err(lease_time::LeaseAuthorityError::Suspended) => {
+                            self_end_kind = SelfEndKind::Expired;
+                            break 'serving Err(DaemonError::LeaseSuspended);
+                        }
+                        Err(lease_time::LeaseAuthorityError::Clock(category)) => {
+                            self_end_kind = SelfEndKind::Expired;
+                            break 'serving Err(DaemonError::LeaseClockFailed(category));
+                        }
+                    };
                     if let Some(notifier) = service_manager.as_mut()
                         && let Err(error) = notifier.watchdog_if_due()
                     {
@@ -1826,7 +1871,7 @@ impl Daemon {
                     if stop.load(Ordering::Acquire) {
                         break 'serving Ok(());
                     }
-                    if std::time::Instant::now() >= next_renewal {
+                    if lease_now_ms >= next_renewal_boottime_ms {
                         if let Err(error) = self.renew_lease() {
                             break 'serving Err(error);
                         }
@@ -1838,11 +1883,12 @@ impl Daemon {
                         if let Err(error) = self.telegram.renew() {
                             break 'serving Err(DaemonError::TelegramRefused(error.category()));
                         }
-                        next_renewal = std::time::Instant::now() + LEASE_RENEW_INTERVAL;
+                        next_renewal_boottime_ms =
+                            lease_now_ms.saturating_add(LEASE_RENEW_INTERVAL_MS);
                     }
                     if !self.disconnected_recovery
                         && self.reconciliation_run_id.is_none()
-                        && let Err(error) = self.tick_synthetic()
+                        && let Err(error) = self.tick_synthetic(lease_now_ms)
                     {
                         break 'serving Err(error);
                     }
@@ -1964,14 +2010,11 @@ impl Daemon {
         // main database still fences writes to it, to the gap between these
         // two statements.
         //
-        // ONLY THE CLEAN PATH WRITES `released`. There is no unclean path here
-        // that writes `expired` instead: this daemon breaks its serve loop on a
-        // lost fence and then still reaches this line, so the honest self-claim
-        // is the one it can make — it stood down. A process that dies without
-        // reaching here writes nothing at all, and its row stays open until the
-        // successor closes it `superseded`. That is the design, not a gap:
-        // `superseded` is the successor's observation, and it is the only end
-        // kind anybody can honestly write about a process that stopped.
+        // A clean stop writes `released`. Suspend detection writes `expired`:
+        // the process is still alive to report why it self-fenced, but it no
+        // longer claims continuous lease authority. A process that dies before
+        // this point writes nothing; its successor closes the open row as
+        // `superseded` when it observes the abandoned tenure.
         let tenure_close = unix_millis().and_then(|now_ms| {
             self.generation_audit
                 .end_tenure(TenureEnding {
@@ -1980,7 +2023,7 @@ impl Daemon {
                     lease_epoch: self.lease_epoch,
                     expected_revision: self.tenure_revision,
                     ended_at_ms: now_ms,
-                    end_kind: SelfEndKind::Released,
+                    end_kind: self_end_kind,
                 })
                 .map(|_| ())
                 .map_err(generation_audit_failed)
@@ -2127,7 +2170,7 @@ impl Daemon {
         Ok(())
     }
 
-    fn tick_synthetic(&mut self) -> Result<(), DaemonError> {
+    fn tick_synthetic(&mut self, lease_now_ms: i64) -> Result<(), DaemonError> {
         use automonique_core::{SchedulerFence, TickOutcome};
 
         let now_ms = unix_millis()?;
@@ -2136,6 +2179,7 @@ impl Daemon {
         let mut durable = synthetic::StoreScheduler::new(
             &mut self.store,
             now_ms,
+            lease_now_ms,
             LEASE_TTL_MS,
             &mut self.lease_expires_ms,
         );
@@ -2258,7 +2302,7 @@ impl Daemon {
                 if generation.holder_id() != self.instance_id.as_str()
                     || generation.lease_epoch() != self.lease_epoch
                     || generation.lease_expires_ms() != self.lease_expires_ms
-                    || generation.lease_expires_ms() <= now_ms
+                    || generation.lease_expires_ms() <= snapshot.lease_observed_boottime_ms()
                 {
                     return Err(DaemonError::Store(StoreError::StaleEpoch));
                 }
@@ -2332,7 +2376,7 @@ impl Daemon {
                 if generation.holder_id() != self.instance_id.as_str()
                     || generation.lease_epoch() != self.lease_epoch
                     || generation.lease_expires_ms() != self.lease_expires_ms
-                    || generation.lease_expires_ms() <= now_ms
+                    || generation.lease_expires_ms() <= snapshot.lease_observed_boottime_ms()
                 {
                     return Err(DaemonError::Store(StoreError::StaleEpoch));
                 }
@@ -2475,7 +2519,7 @@ impl Daemon {
                 if generation.holder_id() != self.instance_id.as_str()
                     || generation.lease_epoch() != self.lease_epoch
                     || generation.lease_expires_ms() != self.lease_expires_ms
-                    || generation.lease_expires_ms() <= now_ms
+                    || generation.lease_expires_ms() <= snapshot.lease_observed_boottime_ms()
                 {
                     return Err(DaemonError::Store(StoreError::StaleEpoch));
                 }
@@ -2899,7 +2943,7 @@ impl Daemon {
         if generation.holder_id() != self.instance_id.as_str()
             || generation.lease_epoch() != self.lease_epoch
             || generation.lease_expires_ms() != self.lease_expires_ms
-            || generation.lease_expires_ms() <= now_ms
+            || generation.lease_expires_ms() <= snapshot.lease_observed_boottime_ms()
         {
             return Err(DaemonError::Store(StoreError::StaleEpoch));
         }
@@ -3295,7 +3339,7 @@ impl Daemon {
         if generation.holder_id() != self.instance_id.as_str()
             || generation.lease_epoch() != self.lease_epoch
             || generation.lease_expires_ms() != self.lease_expires_ms
-            || generation.lease_expires_ms() <= now_ms
+            || generation.lease_expires_ms() <= snapshot.lease_observed_boottime_ms()
         {
             return Err(DaemonError::Store(StoreError::StaleEpoch));
         }
@@ -4306,7 +4350,7 @@ impl Daemon {
         if generation.holder_id() != self.instance_id.as_str()
             || generation.lease_epoch() != self.lease_epoch
             || generation.lease_expires_ms() != self.lease_expires_ms
-            || generation.lease_expires_ms() <= now_ms
+            || generation.lease_expires_ms() <= snapshot.lease_observed_boottime_ms()
         {
             return Err(DaemonError::Store(StoreError::StaleEpoch));
         }
@@ -4534,7 +4578,7 @@ impl Daemon {
         if generation.holder_id() != self.instance_id.as_str()
             || generation.lease_epoch() != self.lease_epoch
             || generation.lease_expires_ms() != self.lease_expires_ms
-            || generation.lease_expires_ms() <= now_ms
+            || generation.lease_expires_ms() <= snapshot.lease_observed_boottime_ms()
         {
             return Err(DaemonError::Store(StoreError::StaleEpoch));
         }
@@ -4827,7 +4871,7 @@ impl Daemon {
         if generation.holder_id() != self.instance_id.as_str()
             || generation.lease_epoch() != self.lease_epoch
             || generation.lease_expires_ms() != self.lease_expires_ms
-            || generation.lease_expires_ms() <= now_ms
+            || generation.lease_expires_ms() <= snapshot.lease_observed_boottime_ms()
         {
             return Err(DaemonError::Store(StoreError::StaleEpoch));
         }
@@ -5549,6 +5593,13 @@ fn index_failed(error: RunIndexError) -> DaemonError {
 
 fn generation_audit_failed(error: GenerationAuditError) -> DaemonError {
     DaemonError::GenerationAuditFailed(error.category())
+}
+
+fn map_lease_authority_error(error: lease_time::LeaseAuthorityError) -> DaemonError {
+    match error {
+        lease_time::LeaseAuthorityError::Clock(category) => DaemonError::LeaseClockFailed(category),
+        lease_time::LeaseAuthorityError::Suspended => DaemonError::LeaseSuspended,
+    }
 }
 
 /// Record this daemon's tenure over the generation it has just leased.
