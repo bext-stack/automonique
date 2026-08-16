@@ -76,7 +76,9 @@ const PROMPT_SLOT: &str = "prompt-slot-1";
 const ENV_NAME: &str = "AUTOMONIQUE_TEST_TOKEN";
 const ENV_VALUE: &str = "admitted-value";
 const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
+const CPU_MILLICORES: u64 = 1_000;
 const PROCESSES: u64 = 64;
+const DESCRIPTORS: u64 = 256;
 const TIMEOUT_MILLIS: u64 = 5_000;
 const SPOOL_BYTES: u64 = 1024 * 1024;
 
@@ -147,9 +149,9 @@ fn sandbox_parts() -> SandboxSpecParts {
         credentials: CredentialDescriptors::declare(&[]).unwrap(),
         budgets: Budgets::declare(BudgetQuantities {
             cgroup_memory_bytes: MEMORY_BYTES,
-            cgroup_cpu_millicores: 1_000,
+            cgroup_cpu_millicores: CPU_MILLICORES,
             rlimit_processes: PROCESSES,
-            rlimit_descriptors: 256,
+            rlimit_descriptors: DESCRIPTORS,
             timeout_millis: TIMEOUT_MILLIS,
             temporary_storage_bytes: 1024 * 1024,
             spool_bytes: SPOOL_BYTES,
@@ -332,6 +334,8 @@ fn a_fully_mappable_spec_admits_the_exact_plan_limits_and_outputs() {
     // environment, and the prompt.
     let expected = LaunchPlan::new(BUSYBOX, "1".repeat(64))
         .unwrap()
+        .rlimit_descriptors(DESCRIPTORS)
+        .unwrap()
         .argument("sh")
         .unwrap()
         .argument("-c")
@@ -358,6 +362,7 @@ fn a_fully_mappable_spec_admits_the_exact_plan_limits_and_outputs() {
     assert_eq!(frame.matches("grant=").count(), 2, "{frame}");
     assert_eq!(frame.matches("env=").count(), 1, "{frame}");
     assert_eq!(frame.matches("prompt_hex=").count(), 1, "{frame}");
+    assert_eq!(frame.matches("rlimit_nofile=").count(), 1, "{frame}");
     assert!(!frame.contains("connect_port="), "{frame}");
     assert!(!frame.contains("bind_port="), "{frame}");
     assert!(!frame.contains("socket="), "{frame}");
@@ -368,10 +373,11 @@ fn a_fully_mappable_spec_admits_the_exact_plan_limits_and_outputs() {
         ContainmentLimits::none()
             .with_memory_max_bytes(MEMORY_BYTES)
             .with_pids_max(PROCESSES)
+            .with_cpu_max_millicores(CPU_MILLICORES)
     );
     assert_eq!(
         admitted.limits().required_controllers(),
-        vec![Controller::Pids, Controller::Memory]
+        vec![Controller::Pids, Controller::Memory, Controller::Cpu]
     );
 
     // The document the launch was derived from is named by its own digest.
@@ -428,6 +434,8 @@ fn declared_path_grants_map_by_access_in_declared_order() {
     let admitted = admit(&spec, &mappable_context(workspace.path())).unwrap();
 
     let expected = LaunchPlan::new(BUSYBOX, "1".repeat(64))
+        .unwrap()
+        .rlimit_descriptors(DESCRIPTORS)
         .unwrap()
         .argument("sh")
         .unwrap()
@@ -1000,7 +1008,9 @@ fn quotas_map_exactly_and_a_zero_ceiling_is_refused() {
         ContainmentLimits::none()
             .with_memory_max_bytes(7 * 1024 * 1024 + 1)
             .with_pids_max(13)
+            .with_cpu_max_millicores(1_500)
     );
+    assert_eq!(admitted.plan().descriptor_limit(), Some(256));
 
     let error = admit_with_sandbox(root, |sandbox| {
         sandbox.budgets = Budgets::declare(BudgetQuantities {
@@ -1020,6 +1030,50 @@ fn quotas_map_exactly_and_a_zero_ceiling_is_refused() {
         matches!(
             error,
             AdmissionRefusal::QuotaRejected("sandbox.budgets.cgroup_memory")
+        ),
+        "got {error:?}"
+    );
+
+    let error = admit_with_sandbox(root, |sandbox| {
+        sandbox.budgets = Budgets::declare(BudgetQuantities {
+            cgroup_memory_bytes: MEMORY_BYTES,
+            cgroup_cpu_millicores: 0,
+            rlimit_processes: PROCESSES,
+            rlimit_descriptors: DESCRIPTORS,
+            timeout_millis: TIMEOUT_MILLIS,
+            temporary_storage_bytes: 1024 * 1024,
+            spool_bytes: SPOOL_BYTES,
+            artifact_bytes: 1024 * 1024,
+        })
+        .unwrap();
+    })
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AdmissionRefusal::QuotaRejected("sandbox.budgets.cgroup_cpu")
+        ),
+        "got {error:?}"
+    );
+
+    let error = admit_with_sandbox(root, |sandbox| {
+        sandbox.budgets = Budgets::declare(BudgetQuantities {
+            cgroup_memory_bytes: MEMORY_BYTES,
+            cgroup_cpu_millicores: CPU_MILLICORES,
+            rlimit_processes: PROCESSES,
+            rlimit_descriptors: 2,
+            timeout_millis: TIMEOUT_MILLIS,
+            temporary_storage_bytes: 1024 * 1024,
+            spool_bytes: SPOOL_BYTES,
+            artifact_bytes: 1024 * 1024,
+        })
+        .unwrap();
+    })
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AdmissionRefusal::QuotaRejected("sandbox.budgets.rlimit_descriptors")
         ),
         "got {error:?}"
     );
@@ -1052,8 +1106,8 @@ fn every_budget_without_an_enforcement_surface_must_be_acknowledged() {
     let workspace = TempDir::new("unenforced");
     let root = workspace.path();
 
-    // The CPU quota is the one this crate has no writer for at all; nothing
-    // may be admitted while it is unacknowledged, whatever its value.
+    // Only the two declarations with no enforcement surface remain in this
+    // vocabulary. CPU and descriptor limits are absent by construction.
     for missing in UnenforcedBudget::ALL {
         let error = admit_with_context(root, |context| {
             context.unenforced_budgets = UnenforcedBudget::ALL
@@ -1077,10 +1131,7 @@ fn every_budget_without_an_enforcement_surface_must_be_acknowledged() {
         admitted.unenforced_budgets(),
         UnenforcedBudget::ALL.as_slice()
     );
-    assert_eq!(
-        UnenforcedBudget::CgroupCpu.as_str(),
-        "sandbox.budgets.cgroup_cpu"
-    );
+    assert_eq!(UnenforcedBudget::ALL.len(), 2);
 }
 
 #[test]
@@ -1243,7 +1294,10 @@ fn a_context_resolution_must_be_absolute_canonical_and_inside_the_workspace() {
 
     // One budget acknowledged twice is a malformed context, not a stronger one.
     let mut parts = context_parts(root);
-    parts.unenforced_budgets = vec![UnenforcedBudget::CgroupCpu, UnenforcedBudget::CgroupCpu];
+    parts.unenforced_budgets = vec![
+        UnenforcedBudget::TemporaryStorage,
+        UnenforcedBudget::TemporaryStorage,
+    ];
     let error = AdmissionContext::new(parts).unwrap_err();
     assert!(
         matches!(
@@ -1351,13 +1405,13 @@ fn an_admitted_plan_runs_under_the_full_composed_sandbox() {
         return;
     };
     // The admitted ceilings are real ceilings, so the domain must be able to
-    // distribute both controllers; where it cannot, the ceiling genuinely
+    // distribute all three controllers; where it cannot, the ceiling genuinely
     // cannot be applied and the proof cannot run.
     if domain
-        .prepare(&[Controller::Pids, Controller::Memory])
+        .prepare(&[Controller::Pids, Controller::Memory, Controller::Cpu])
         .is_err()
     {
-        eprintln!("[admission] NOT PROVEN: the domain cannot distribute pids and memory");
+        eprintln!("[admission] NOT PROVEN: the domain cannot distribute pids, memory and cpu");
         return;
     }
 

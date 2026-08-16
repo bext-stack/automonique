@@ -21,8 +21,9 @@
 //! ```
 
 use automonique_runner::{
-    BoundaryRequirement, CGROUP_DIR_ENV, ContainmentDomain, ContainmentError, ContainmentEvidence,
-    ContainmentLimits, Controller, RunContainment, Runner, process_is_live,
+    BoundaryRequirement, CGROUP_DIR_ENV, CPU_MAX_PERIOD_MICROS, ContainmentDomain,
+    ContainmentError, ContainmentEvidence, ContainmentLimits, Controller, RunContainment, Runner,
+    process_is_live,
 };
 use nix::unistd::Pid;
 use std::fs;
@@ -148,6 +149,16 @@ fn wait_for(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
 fn read_pid(path: &Path) -> Option<Pid> {
     let raw = fs::read_to_string(path).ok()?;
     raw.trim().parse::<i32>().ok().map(Pid::from_raw)
+}
+
+fn cpu_stat(path: &Path, field: &str) -> Option<u64> {
+    fs::read_to_string(path.join("cpu.stat"))
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            (name == field).then(|| value.parse::<u64>().ok()).flatten()
+        })
 }
 
 /// Reap the direct child without trusting containment to have killed it.
@@ -445,6 +456,44 @@ fn a_prepared_domain_enforces_a_process_ceiling() {
         members.len() <= 4,
         "pids.max must bound the subtree; saw {} members",
         members.len()
+    );
+
+    containment.dispose(DRAIN_DEADLINE).unwrap();
+    reap_bounded(&mut child);
+}
+
+#[test]
+fn a_prepared_domain_enforces_an_exact_cpu_ceiling() {
+    let Some(domain) = enforcement_domain("a_prepared_domain_enforces_an_exact_cpu_ceiling") else {
+        return;
+    };
+    if domain.prepare(&[Controller::Cpu]).is_err() {
+        return;
+    }
+    const MILLICORES: u64 = 10;
+    let containment = RunContainment::create(
+        &domain,
+        &run_id("cpumax"),
+        ContainmentLimits::none().with_cpu_max_millicores(MILLICORES),
+    )
+    .unwrap();
+    let written = fs::read_to_string(containment.path().join("cpu.max")).unwrap();
+    assert_eq!(
+        written.trim(),
+        format!(
+            "{} {CPU_MAX_PERIOD_MICROS}",
+            MILLICORES * (CPU_MAX_PERIOD_MICROS / 1_000)
+        ),
+        "the exact millicore ceiling must reach the kernel"
+    );
+
+    let before = cpu_stat(containment.path(), "nr_throttled").unwrap_or(0);
+    let mut child = launch_in(&containment, "while :; do :; done");
+    assert!(
+        wait_for(Duration::from_secs(5), || {
+            cpu_stat(containment.path(), "nr_throttled").is_some_and(|count| count > before)
+        }),
+        "a CPU-bound workload was never throttled by cpu.max"
     );
 
     containment.dispose(DRAIN_DEADLINE).unwrap();

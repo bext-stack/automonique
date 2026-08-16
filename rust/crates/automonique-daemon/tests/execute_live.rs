@@ -43,7 +43,7 @@
 //!   answers `containment_unavailable`, so the proof would silently degrade to
 //!   the fail-closed one. (The same limitation is why
 //!   `automonique-runner`'s own `admission` proof reports "the domain cannot
-//!   distribute pids and memory" when it is run through cargo under a scope.)
+//!   distribute pids, memory and CPU" when it is run through cargo under a scope.)
 //!
 //! `--test-threads=1` is required for a third reason: preparing a delegated
 //! domain moves *this process* into a supervisor leaf, and two daemons doing

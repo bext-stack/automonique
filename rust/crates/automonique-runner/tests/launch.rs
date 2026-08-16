@@ -589,16 +589,16 @@ fn frames_round_trip_and_refuse_corruption() {
         .replace("program=", "programme=");
     assert!(LaunchPlan::decode(unknown.as_bytes()).is_err());
 
-    // Version 1 and a v2 frame without one canonical digest are both closed:
+    // Version 2 and a v3 frame without one canonical digest are both closed:
     // neither can fall back to path execution.
     let text = String::from_utf8(frame).unwrap();
-    let version_one = text
+    let version_two = text
         .replace(
+            "schema=automonique.launch/v3",
             "schema=automonique.launch/v2",
-            "schema=automonique.launch/v1",
         )
-        .replace("end=automonique.launch/v2", "end=automonique.launch/v1");
-    assert!(LaunchPlan::decode(version_one.as_bytes()).is_err());
+        .replace("end=automonique.launch/v3", "end=automonique.launch/v2");
+    assert!(LaunchPlan::decode(version_two.as_bytes()).is_err());
     let missing_digest = text
         .lines()
         .filter(|line| !line.starts_with("program_sha256="))
@@ -611,6 +611,43 @@ fn frames_round_trip_and_refuse_corruption() {
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     );
     assert!(LaunchPlan::decode(malformed_digest.as_bytes()).is_err());
+}
+
+#[test]
+fn descriptor_limits_round_trip_and_reject_ambiguous_values() {
+    let plan = busybox_plan("true", |plan| plan.rlimit_descriptors(32).unwrap());
+    let frame = plan.encode().unwrap();
+    assert!(String::from_utf8_lossy(&frame).contains("rlimit_nofile=32\n"));
+    assert_eq!(
+        LaunchPlan::decode(&frame).unwrap().descriptor_limit(),
+        Some(32)
+    );
+
+    for refused in [0, 1, 2, 65_537] {
+        assert!(
+            LaunchPlan::new(BUSYBOX, busybox_sha256())
+                .unwrap()
+                .rlimit_descriptors(refused)
+                .is_err(),
+            "descriptor ceiling {refused} must be refused"
+        );
+    }
+    assert!(plan.clone().rlimit_descriptors(64).is_err());
+}
+
+#[test]
+fn the_workload_observes_the_declared_descriptor_ceiling() {
+    let Some(domain) = enforcement_domain("the_workload_observes_the_declared_descriptor_ceiling")
+    else {
+        return;
+    };
+    let containment =
+        RunContainment::create(&domain, &run_id("nofile"), ContainmentLimits::none()).unwrap();
+    let plan = busybox_plan("ulimit -n", |plan| plan.rlimit_descriptors(3).unwrap());
+    let (code, stdout, stderr) = launch_and_capture(&plan, &containment);
+    assert_eq!(code, 0, "helper stderr: {stderr}");
+    assert_eq!(stdout.trim(), "3");
+    containment.dispose(DRAIN_DEADLINE).unwrap();
 }
 
 // The bounds below are the module's own constants, written out rather than
@@ -676,7 +713,7 @@ fn prompt_bytes_reach_the_workload_byte_exact() {
     prompt.extend_from_slice(b"first line\nsecond=line:with separators\n");
     prompt.push(0);
     prompt.push(0xff);
-    prompt.extend_from_slice(b"\nend=automonique.launch/v2\ntrailing without newline");
+    prompt.extend_from_slice(b"\nend=automonique.launch/v3\ntrailing without newline");
 
     // `busybox cat` copies stdin to stdout with no shell to reinterpret it.
     let plan = busybox_applet_plan("cat", |plan| plan.prompt(&prompt).unwrap());

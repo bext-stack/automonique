@@ -130,7 +130,7 @@ fn a_plan_grants_exactly_what_it_names_and_nothing_else() {
 
     // The frame is what the entry helper enforces, so pin it byte for byte.
     let expected = format!(
-        "schema=automonique.launch/v2\n\
+        "schema=automonique.launch/v3\n\
          program={executable}\n\
          program_sha256={program_sha256}\n\
          arg={exec}\n\
@@ -140,7 +140,7 @@ fn a_plan_grants_exactly_what_it_names_and_nothing_else() {
          grant=read-execute:{loader}\n\
          grant=read-write:{workspace}\n\
          grant=read:{devnull}\n\
-         end=automonique.launch/v2\n",
+         end=automonique.launch/v3\n",
         executable = hex(fixture.executable.as_os_str().as_encoded_bytes()),
         program_sha256 = fixture.executable_digest,
         exec = hex(b"exec"),

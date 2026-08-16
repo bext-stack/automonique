@@ -57,6 +57,8 @@ pub enum Controller {
     Pids,
     /// Bounds the resident memory of the whole subtree.
     Memory,
+    /// Bounds CPU time consumed by the whole subtree.
+    Cpu,
 }
 
 impl Controller {
@@ -66,6 +68,7 @@ impl Controller {
         match self {
             Self::Pids => "pids",
             Self::Memory => "memory",
+            Self::Cpu => "cpu",
         }
     }
 
@@ -74,6 +77,7 @@ impl Controller {
         match self {
             Self::Pids => "pids.max",
             Self::Memory => "memory.max",
+            Self::Cpu => "cpu.max",
         }
     }
 }
@@ -161,7 +165,14 @@ impl From<std::io::Error> for ContainmentError {
 pub struct ContainmentLimits {
     pids_max: Option<u64>,
     memory_max_bytes: Option<u64>,
+    cpu_max_millicores: Option<u64>,
 }
+
+/// CFS period used to translate exact millicores into `cpu.max` microseconds.
+///
+/// One second makes the protocol's minimum of one millicore exactly 1,000
+/// microseconds, which is accepted by the kernel rather than being rounded up.
+pub const CPU_MAX_PERIOD_MICROS: u64 = 1_000_000;
 
 impl ContainmentLimits {
     /// No ceilings. Termination remains descendant-complete regardless.
@@ -170,6 +181,7 @@ impl ContainmentLimits {
         Self {
             pids_max: None,
             memory_max_bytes: None,
+            cpu_max_millicores: None,
         }
     }
 
@@ -187,6 +199,13 @@ impl ContainmentLimits {
         self
     }
 
+    /// Require an exact CPU ceiling in thousandths of one core.
+    #[must_use]
+    pub const fn with_cpu_max_millicores(mut self, value: u64) -> Self {
+        self.cpu_max_millicores = Some(value);
+        self
+    }
+
     /// Controllers this ceiling set requires.
     #[must_use]
     pub fn required_controllers(&self) -> Vec<Controller> {
@@ -196,6 +215,9 @@ impl ContainmentLimits {
         }
         if self.memory_max_bytes.is_some() {
             required.push(Controller::Memory);
+        }
+        if self.cpu_max_millicores.is_some() {
+            required.push(Controller::Cpu);
         }
         required
     }
@@ -361,6 +383,18 @@ impl RunContainment {
             }
             write_interface(&file, value.to_string().as_bytes())
                 .map_err(|_| ContainmentError::ControllerUnavailable(controller))?;
+        }
+        if let Some(millicores) = limits.cpu_max_millicores {
+            let quota = millicores
+                .checked_mul(CPU_MAX_PERIOD_MICROS / 1_000)
+                .ok_or(ContainmentError::ControllerUnavailable(Controller::Cpu))?;
+            let file = self.path.join(Controller::Cpu.limit_file());
+            if !file.is_file() {
+                return Err(ContainmentError::ControllerUnavailable(Controller::Cpu));
+            }
+            let value = format!("{quota} {CPU_MAX_PERIOD_MICROS}");
+            write_interface(&file, value.as_bytes())
+                .map_err(|_| ContainmentError::ControllerUnavailable(Controller::Cpu))?;
         }
         Ok(())
     }
@@ -593,6 +627,7 @@ fn parse_controllers(text: &str) -> Vec<Controller> {
         .filter_map(|token| match token {
             "pids" => Some(Controller::Pids),
             "memory" => Some(Controller::Memory),
+            "cpu" => Some(Controller::Cpu),
             _ => None,
         })
         .collect()

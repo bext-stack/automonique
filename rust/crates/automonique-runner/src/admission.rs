@@ -233,13 +233,6 @@ pub const INFORMATIONAL_FIELDS: [&str; 30] = [
 /// or re-check it.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum UnenforcedBudget {
-    /// `cgroup_cpu_millicores`. Nothing in [`ContainmentLimits`] writes
-    /// `cpu.max`, and there is no other CPU ceiling in this crate.
-    CgroupCpu,
-    /// `rlimit_descriptors`. The launch closes every descriptor but the
-    /// standard streams; it never sets `RLIMIT_NOFILE`, so a workload that
-    /// opens more is bounded by the host, not by this budget.
-    RlimitDescriptors,
     /// `temporary_storage_bytes`. No temporary filesystem is created or
     /// quota-bounded here.
     TemporaryStorage,
@@ -249,19 +242,12 @@ pub enum UnenforcedBudget {
 
 impl UnenforcedBudget {
     /// Every unenforced budget, in the order admission checks them.
-    pub const ALL: [Self; 4] = [
-        Self::CgroupCpu,
-        Self::RlimitDescriptors,
-        Self::TemporaryStorage,
-        Self::Artifact,
-    ];
+    pub const ALL: [Self; 2] = [Self::TemporaryStorage, Self::Artifact];
 
     /// The exact spec field this budget names.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::CgroupCpu => "sandbox.budgets.cgroup_cpu",
-            Self::RlimitDescriptors => "sandbox.budgets.rlimit_descriptors",
             Self::TemporaryStorage => "sandbox.budgets.temporary_storage",
             Self::Artifact => "sandbox.budgets.artifact",
         }
@@ -1191,11 +1177,11 @@ fn check_egress(
 
 /// Map the cgroup quotas, and refuse every declared budget with no mechanism.
 ///
-/// `cgroup_memory` becomes the subtree's `memory.max`. `rlimit_processes`
+/// `cgroup_memory` becomes the subtree's `memory.max`, and
+/// `cgroup_cpu_millicores` becomes an exact `cpu.max` quota. `rlimit_processes`
 /// becomes the subtree's `pids.max`: a cgroup ceiling over the whole tree is
 /// strictly stronger than a per-process `RLIMIT_NPROC`, so the mapping cannot
-/// permit anything the budget denies, and no `RLIMIT_NPROC` is installed. Both
-/// are documented interpretations, pinned by tests, never silent.
+/// permit anything the budget denies, and no `RLIMIT_NPROC` is installed.
 fn map_quotas(
     spec: &RunSpec,
     context: &AdmissionContext,
@@ -1215,6 +1201,18 @@ fn map_quotas(
             "sandbox.budgets.rlimit_processes",
         ));
     }
+    let cpu = budgets.cgroup_cpu().quantity();
+    if cpu == 0 {
+        return Err(AdmissionRefusal::QuotaRejected(
+            "sandbox.budgets.cgroup_cpu",
+        ));
+    }
+    let descriptors = budgets.rlimit_descriptors().quantity();
+    if descriptors < crate::MIN_LAUNCH_NOFILE {
+        return Err(AdmissionRefusal::QuotaRejected(
+            "sandbox.budgets.rlimit_descriptors",
+        ));
+    }
     for budget in UnenforcedBudget::ALL {
         if !context.unenforced_budgets().contains(&budget) {
             return Err(AdmissionRefusal::UnenforcedBudgetUnacknowledged(budget));
@@ -1222,7 +1220,8 @@ fn map_quotas(
     }
     Ok(ContainmentLimits::none()
         .with_memory_max_bytes(memory)
-        .with_pids_max(processes))
+        .with_pids_max(processes)
+        .with_cpu_max_millicores(cpu))
 }
 
 /// Bind the spec's prompt transport to the caller's resolution, and verify it.
@@ -1274,6 +1273,12 @@ fn build_plan(
             error,
         }
     })?;
+    plan = plan
+        .rlimit_descriptors(spec.sandbox().budgets().rlimit_descriptors().quantity())
+        .map_err(|error| AdmissionRefusal::Plan {
+            field: "sandbox.budgets.rlimit_descriptors",
+            error,
+        })?;
     for argument in spec.arguments() {
         plan = plan
             .argument(argument.as_encoded_bytes())

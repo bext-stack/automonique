@@ -683,10 +683,9 @@ impl ExecutionLane {
             // Naming a budget is not waiving it: `admission` requires each
             // unenforced budget to be acknowledged in advance, and republishes
             // the acknowledgement on the admitted launch. This daemon
-            // acknowledges all four because it installs no CPU ceiling, no
-            // `RLIMIT_NOFILE`, no temporary filesystem quota and no artifact
-            // accounting, and saying so is the only alternative to pretending
-            // otherwise.
+            // acknowledges the two remaining gaps: no temporary filesystem
+            // quota and no artifact accounting. CPU and descriptor limits are
+            // now applied by the cgroup and launch helper respectively.
             unenforced_budgets: UnenforcedBudget::ALL.to_vec(),
             // The destinations this deployment resolves brokered egress to.
             // A document that denies egress is refused if this is non-empty and
@@ -840,16 +839,16 @@ impl ExecutionLane {
     /// Discover and prepare this process's delegated domain, once.
     ///
     /// The controllers are required rather than optional: the admitted limits
-    /// carry a memory ceiling and a process ceiling, and a domain that cannot
-    /// distribute those controllers cannot apply them. Running anyway would be
-    /// running *outside the document's declared budget*, which is the exact
+    /// carry memory, process and CPU ceilings, and a domain that cannot
+    /// distribute those controllers cannot apply them. Running anyway would
+    /// be running *outside the document's declared budget*, which is the exact
     /// silent downgrade this build refuses everywhere else.
     fn domain(&mut self) -> Result<&ContainmentDomain, ExecuteRefusal> {
         if self.domain.is_none() {
             let domain = ContainmentDomain::discover()
                 .map_err(|_| ExecuteRefusal::ContainmentUnavailable)?;
             domain
-                .prepare(&[Controller::Pids, Controller::Memory])
+                .prepare(&[Controller::Pids, Controller::Memory, Controller::Cpu])
                 .map_err(|_| ExecuteRefusal::ContainmentUnavailable)?;
             self.domain = Some(domain);
         }

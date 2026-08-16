@@ -24,7 +24,9 @@
 //!    which denies creating every socket shape the plan does not grant —
 //!    including UDP, raw and packet sockets, and non-TCP stream protocols
 //!    that Landlock's TCP rules cannot see;
-//! 8. `execveat`s the sealed descriptor with exactly the environment the plan
+//! 8. applies the plan's per-process resource limits and verifies their kernel
+//!    readback;
+//! 9. `execveat`s the sealed descriptor with exactly the environment the plan
 //!    names. The path is not resolved again.
 //!
 //! Any failure at any step exits with [`crate::HELPER_REFUSED_EXIT`] before
@@ -131,8 +133,9 @@
 //! prompt can never crowd the rest of a plan out of the frame: at
 //! [`MAX_LAUNCH_PROMPT_BYTES`] = 16 KiB the line costs `11 + 2×16384 + 1 =
 //! 32780` bytes of the 65536-byte budget, which alongside the 29-byte header
-//! and 26-byte terminator plus the required 80-byte program-digest line leaves
-//! 32621 bytes for the program, argv, grants, ports and environment.
+//! and 26-byte terminator plus the required 80-byte program-digest line and a
+//! maximal 22-byte descriptor-limit line leaves 32599 bytes for the program,
+//! argv, grants, ports and environment.
 //!
 //! Per-item ceilings bound shape; the frame bound is separate and binding.
 //! Neither 64 maximal argv entries (`64 × 8197 = 524608`) nor four maximal
@@ -141,8 +144,8 @@
 //! [`LaunchPlanError::FrameTooLarge`] rather than truncating it.
 //!
 //! The frame version is deliberately not backward compatible. The supervisor
-//! and entry helper are release-pinned together, and accepting a v1 frame
-//! would reintroduce path execution without a digest.
+//! and entry helper are release-pinned together; accepting an earlier frame
+//! would silently mix releases with different enforcement vocabularies.
 
 use crate::containment::join_and_confirm_membership;
 use crate::descriptors::{DescriptorAllowlist, close_all_except, verify_only_allowlist_open};
@@ -152,6 +155,7 @@ use crate::seccomp::SocketFamilyPolicy;
 use crate::{HELPER_REFUSED_EXIT, RunContainment};
 use nix::fcntl::{AtFlags, FcntlArg, OFlag, SealFlag};
 use nix::sys::memfd::MemFdCreateFlag;
+use nix::sys::resource::{Resource, getrlimit, setrlimit};
 use sha2::{Digest as _, Sha256};
 use std::ffi::CString;
 use std::fmt;
@@ -164,9 +168,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 
 /// Exact first line of every launch plan frame.
-pub const FRAME_HEADER: &str = "schema=automonique.launch/v2";
+pub const FRAME_HEADER: &str = "schema=automonique.launch/v3";
 /// Exact final line of every complete launch plan frame.
-pub const FRAME_TERMINATOR: &str = "end=automonique.launch/v2";
+pub const FRAME_TERMINATOR: &str = "end=automonique.launch/v3";
 /// Upper bound on one encoded frame, matching the spool's event bound.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Upper bound on workload argv entries, beyond the program itself.
@@ -186,6 +190,10 @@ pub const MAX_LAUNCH_ENV_VALUE_BYTES: usize = 4096;
 pub const MAX_LAUNCH_PROMPT_BYTES: usize = 16 * 1024;
 /// Largest executable the helper will copy, verify, seal, and execute.
 pub const MAX_PROGRAM_BYTES: u64 = 128 * 1024 * 1024;
+/// Smallest descriptor ceiling that can retain stdin, stdout and stderr.
+pub const MIN_LAUNCH_NOFILE: u64 = 3;
+/// Largest descriptor ceiling admitted by the run-spec budget grammar.
+pub const MAX_LAUNCH_NOFILE: u64 = 65_536;
 
 const SHA256_HEX_BYTES: usize = 64;
 
@@ -213,6 +221,8 @@ pub enum LaunchPlanError {
     EnvironmentRejected(&'static str),
     /// The prompt is empty, repeated, or exceeds [`MAX_LAUNCH_PROMPT_BYTES`].
     PromptRejected,
+    /// The descriptor limit is repeated or outside the closed launch range.
+    ResourceLimitRejected,
     /// The encoded frame exceeds [`MAX_FRAME_BYTES`].
     FrameTooLarge,
     /// The frame is malformed, truncated, or carries an unknown key.
@@ -239,6 +249,8 @@ impl fmt::Display for LaunchPlanError {
                 "prompt must be present at most once, non-empty, and at most \
                  {MAX_LAUNCH_PROMPT_BYTES} bytes"
             ),
+            Self::ResourceLimitRejected => formatter
+                .write_str("descriptor limit must be unique and retain the three standard streams"),
             Self::FrameTooLarge => write!(
                 formatter,
                 "encoded launch frame exceeds {MAX_FRAME_BYTES} bytes"
@@ -267,6 +279,7 @@ pub struct LaunchPlan {
     socket_grants: Vec<SocketGrant>,
     environment: Vec<(String, Vec<u8>)>,
     prompt: Option<Vec<u8>>,
+    rlimit_nofile: Option<u64>,
 }
 
 /// Redacting: a derived `Debug` would print environment values and prompt
@@ -288,6 +301,7 @@ impl fmt::Debug for LaunchPlan {
                 &self.environment_names().collect::<Vec<_>>(),
             )
             .field("prompt_bytes", &self.prompt_len())
+            .field("rlimit_nofile", &self.rlimit_nofile)
             .finish()
     }
 }
@@ -368,6 +382,7 @@ impl LaunchPlan {
             socket_grants: Vec::new(),
             environment: Vec::new(),
             prompt: None,
+            rlimit_nofile: None,
         })
     }
 
@@ -511,6 +526,20 @@ impl LaunchPlan {
         Ok(self)
     }
 
+    /// Bound the workload's open descriptors with `RLIMIT_NOFILE`.
+    ///
+    /// The limit counts the three standard streams the launch deliberately
+    /// retains. A lower value would make the workload begin over budget, so it
+    /// is refused rather than silently raised.
+    pub fn rlimit_descriptors(mut self, value: u64) -> Result<Self, LaunchPlanError> {
+        if self.rlimit_nofile.is_some() || !(MIN_LAUNCH_NOFILE..=MAX_LAUNCH_NOFILE).contains(&value)
+        {
+            return Err(LaunchPlanError::ResourceLimitRejected);
+        }
+        self.rlimit_nofile = Some(value);
+        Ok(self)
+    }
+
     /// Exact workload program path.
     #[must_use]
     pub fn program(&self) -> &Path {
@@ -535,6 +564,12 @@ impl LaunchPlan {
     #[must_use]
     pub fn prompt_len(&self) -> Option<usize> {
         self.prompt.as_ref().map(Vec::len)
+    }
+
+    /// Exact `RLIMIT_NOFILE` ceiling, when this plan declares one.
+    #[must_use]
+    pub const fn descriptor_limit(&self) -> Option<u64> {
+        self.rlimit_nofile
     }
 
     fn tcp_policy(&self) -> Result<TcpBindConnectPolicy, LaunchPlanError> {
@@ -609,6 +644,12 @@ impl LaunchPlan {
         {
             return Err(LaunchPlanError::PromptRejected);
         }
+        if self
+            .rlimit_nofile
+            .is_some_and(|value| !(MIN_LAUNCH_NOFILE..=MAX_LAUNCH_NOFILE).contains(&value))
+        {
+            return Err(LaunchPlanError::ResourceLimitRejected);
+        }
         Ok(())
     }
 
@@ -623,6 +664,9 @@ impl LaunchPlan {
             hex(self.program.as_os_str().as_encoded_bytes())
         ));
         frame.push_str(&format!("program_sha256={}\n", self.program_sha256));
+        if let Some(limit) = self.rlimit_nofile {
+            frame.push_str(&format!("rlimit_nofile={limit}\n"));
+        }
         for argument in &self.arguments {
             frame.push_str(&format!("arg={}\n", hex(argument)));
         }
@@ -695,6 +739,12 @@ impl LaunchPlan {
                 ("arg", Some(current)) => {
                     let bytes = unhex(value).ok_or(LaunchPlanError::FrameRejected)?;
                     *current = current.clone().argument(bytes)?;
+                }
+                ("rlimit_nofile", Some(current)) => {
+                    let value = value
+                        .parse::<u64>()
+                        .map_err(|_| LaunchPlanError::FrameRejected)?;
+                    *current = current.clone().rlimit_descriptors(value)?;
                 }
                 ("grant", Some(current)) => {
                     let (intent, path_hex) = value
@@ -1039,7 +1089,13 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         .apply_to_current_thread()
         .map_err(|error| error.to_string())?;
 
-    // 8. Exact program, exact argv, exactly the named environment — which is
+    // 8. Apply the workload's process-local descriptor ceiling only after the
+    //    helper has finished opening policy and executable descriptors. The
+    //    hard limit is lowered with the soft limit so the workload cannot raise
+    //    it again; readback makes a silent kernel no-op a refusal.
+    apply_resource_limits(&plan)?;
+
+    // 9. Exact program, exact argv, exactly the named environment — which is
     //    empty when the plan named none, as every plan did before `env=`
     //    existed.
     let program = CString::new(plan.program.as_os_str().as_encoded_bytes().to_vec())
@@ -1068,6 +1124,23 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
     )
     .map_err(|error| format!("execveat failed: {error}"))?;
     unreachable!("execveat returned without an error")
+}
+
+/// Install and verify the process limits that survive `execveat`.
+fn apply_resource_limits(plan: &LaunchPlan) -> Result<(), String> {
+    let Some(limit) = plan.rlimit_nofile else {
+        return Ok(());
+    };
+    let limit =
+        nix::libc::rlim_t::try_from(limit).map_err(|_| "descriptor limit rejected".to_owned())?;
+    setrlimit(Resource::RLIMIT_NOFILE, limit, limit)
+        .map_err(|_| "descriptor limit unavailable".to_owned())?;
+    let observed =
+        getrlimit(Resource::RLIMIT_NOFILE).map_err(|_| "descriptor limit unreadable".to_owned())?;
+    if observed != (limit, limit) {
+        return Err("descriptor limit unconfirmed".to_owned());
+    }
+    Ok(())
 }
 
 /// Read exactly one launch frame without waiting for EOF or consuming bytes

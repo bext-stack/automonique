@@ -35,16 +35,16 @@ pub use boundary::{
     descriptor_closure_helper_main,
 };
 pub use containment::{
-    CGROUP_DIR_ENV, ContainmentDomain, ContainmentError, ContainmentLimits, Controller,
-    HELPER_REFUSED_EXIT, MAX_RUN_ID_BYTES, RunContainment, containment_entry_helper_main,
-    domain_is_owned, process_is_live,
+    CGROUP_DIR_ENV, CPU_MAX_PERIOD_MICROS, ContainmentDomain, ContainmentError, ContainmentLimits,
+    Controller, HELPER_REFUSED_EXIT, MAX_RUN_ID_BYTES, RunContainment,
+    containment_entry_helper_main, domain_is_owned, process_is_live,
 };
 pub use launch::{
     FRAME_HEADER, FRAME_TERMINATOR, LaunchError, LaunchPlan, LaunchPlanError, MAX_FRAME_BYTES,
     MAX_LAUNCH_ARG_BYTES, MAX_LAUNCH_ARGS, MAX_LAUNCH_ENV_ENTRIES, MAX_LAUNCH_ENV_NAME_BYTES,
-    MAX_LAUNCH_ENV_VALUE_BYTES, MAX_LAUNCH_PROMPT_BYTES, MAX_PROGRAM_BYTES, SandboxedSession,
-    SocketGrant, StdoutCapture, launch_entry_helper_main, spawn_sandboxed, spawn_sandboxed_session,
-    spawn_sandboxed_with_stdout,
+    MAX_LAUNCH_ENV_VALUE_BYTES, MAX_LAUNCH_NOFILE, MAX_LAUNCH_PROMPT_BYTES, MAX_PROGRAM_BYTES,
+    MIN_LAUNCH_NOFILE, SandboxedSession, SocketGrant, StdoutCapture, launch_entry_helper_main,
+    spawn_sandboxed, spawn_sandboxed_session, spawn_sandboxed_with_stdout,
 };
 pub use runner::{CancellationToken, ContainmentEvidence, Runner, RunnerError};
 pub use simulation::{
