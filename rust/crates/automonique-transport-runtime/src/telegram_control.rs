@@ -103,7 +103,7 @@ pub const MAX_ALLOWED_USERS: usize = 256;
 /// being read rather than after an allocation.
 pub const MAX_USER_ID_BYTES: usize = 20;
 /// Number of commands in the closed registry.
-pub const COMMAND_COUNT: usize = 27;
+pub const COMMAND_COUNT: usize = 29;
 
 const _: () = assert!(COMMAND_COUNT == CommandKind::ALL.len());
 const _: () = assert!(MAX_COMMAND_NAME_BYTES <= MAX_COMMAND_TEXT_BYTES);
@@ -150,6 +150,13 @@ pub enum ArgumentShape {
     ChannelMessage,
     /// A closed memory subcommand with an optional bounded query.
     MemoryDirective,
+    /// A closed mute window, or the word that lifts one.
+    ///
+    /// Closed rather than a parsed duration for the reason [`Self::Directive`]
+    /// is closed on its verb: "how long should this bot stay quiet" has a small
+    /// number of honest answers, and admitting a free duration would mean
+    /// deciding here what `1w`, `0s` and `-3h` mean to a session.
+    MuteDirective,
     /// One configured GitHub repository alias and a bounded free-text request.
     GitHubRepositoryRequest,
     /// One exact GitHub issue URL and a bounded reply or checklist item.
@@ -238,6 +245,10 @@ pub enum CommandKind {
     Forget,
     /// Start a fresh conversation while preserving long-term memory.
     New,
+    /// Silence this thread's session for a bounded window, or lift the silence.
+    Mute,
+    /// Close this thread's session, keeping every message it carried.
+    Archive,
     /// Run one explicitly authorized public-web research question.
     Research,
     /// Create one GitHub issue in a configured repository.
@@ -274,6 +285,8 @@ impl CommandKind {
         Self::Remember,
         Self::Forget,
         Self::New,
+        Self::Mute,
+        Self::Archive,
         Self::Research,
         Self::GitHubCreate,
         Self::GitHubReply,
@@ -313,6 +326,8 @@ impl CommandKind {
     /// | `/approve` | admin | a decision with an effect behind it |
     /// | `/deny` | admin | the same decision, the other way |
     /// | `/admin` | admin | decides who may be here at all |
+    /// | `/mute` | allowed | only ever *stops* this bot spending or speaking |
+    /// | `/archive` | allowed | closes the caller's own session, spends nothing |
     ///
     /// The line between the two is *spend and effect*, not sensitivity: a member
     /// can already read everything the reads report, and the thing an owner
@@ -323,6 +338,17 @@ impl CommandKind {
     /// here — and it is still admin-only, because it is the only command whose
     /// effect is visible to people who are not operators of this system at all.
     /// An unsend does not exist.
+    ///
+    /// `/mute` and `/archive` are the clearest case on the *allowed* side, and
+    /// they are the two rows where "effect" and "admin" come apart. Both write
+    /// durable state, and neither can spend anything or be seen by anybody
+    /// outside this system: `/mute` only ever makes the bot quieter and cheaper,
+    /// and `/archive` closes the caller's own session while keeping every
+    /// message in it. Making them admin-only would mean a member being talked at
+    /// by a bot they cannot ask to stop, which is a worse failure than either
+    /// verb being reachable. `/new` stays admin because it is the one session
+    /// verb that leaves the old conversation live and starts a fresh context a
+    /// provider call will be composed from.
     #[must_use]
     pub const fn spec(self) -> CommandSpec {
         match self {
@@ -391,6 +417,18 @@ impl CommandKind {
                 description: "Start a new conversation",
                 argument: ArgumentShape::None,
                 tier: CommandTier::Admin,
+            },
+            Self::Mute => CommandSpec {
+                name: "mute",
+                description: "Silence this conversation for a while, or /mute off",
+                argument: ArgumentShape::MuteDirective,
+                tier: CommandTier::Allowed,
+            },
+            Self::Archive => CommandSpec {
+                name: "archive",
+                description: "Close this conversation, keeping its history",
+                argument: ArgumentShape::None,
+                tier: CommandTier::Allowed,
             },
             Self::Research => CommandSpec {
                 name: "research",
@@ -583,6 +621,7 @@ pub fn help_text() -> String {
             ArgumentShape::MemoryDirective => String::from(
                 " [search <query>|show <id>|proposals|approve <id>|deny <id>|sources <id>|link]",
             ),
+            ArgumentShape::MuteDirective => String::from(" [15m|1h|8h|24h|off]"),
             ArgumentShape::GitHubRepositoryRequest => String::from(" <repository> <request>"),
             ArgumentShape::GitHubIssueRequest => match entry.kind {
                 CommandKind::GitHubReply => String::from(" <issue-url> <reply>"),
@@ -644,6 +683,89 @@ impl RunTask {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// How long one `/mute` silences a session.
+///
+/// Closed at four, and the four are the windows somebody actually means: the
+/// rest of a meeting, the rest of an hour, the rest of a working day, the rest
+/// of a day. A free duration would put the parsing of `0`, `-3h`, `1y` and
+/// `999999h` in the path of a verb whose whole job is to be reachable in a
+/// hurry.
+///
+/// There is deliberately no unbounded mute. A session silenced forever is one
+/// nobody remembers silencing, and the recovery for it is an operator
+/// wondering why the bot stopped answering; a window that expires on its own
+/// cannot strand anybody.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum MuteWindow {
+    /// A quarter of an hour.
+    Quarter,
+    /// One hour.
+    Hour,
+    /// One working day.
+    Workday,
+    /// One day.
+    Day,
+}
+
+impl MuteWindow {
+    /// Every window, shortest first.
+    pub const ALL: [Self; 4] = [Self::Quarter, Self::Hour, Self::Workday, Self::Day];
+
+    /// The window an operator gets by typing `/mute` with no argument.
+    ///
+    /// The shortest one. A bare verb should do the least surprising thing, and
+    /// the least surprising thing for "be quiet" is to come back soon.
+    pub const DEFAULT: Self = Self::Quarter;
+
+    /// The exact token an operator types. One spelling per window.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Quarter => "15m",
+            Self::Hour => "1h",
+            Self::Workday => "8h",
+            Self::Day => "24h",
+        }
+    }
+
+    /// How long this window lasts, in milliseconds.
+    #[must_use]
+    pub const fn duration_ms(self) -> i64 {
+        match self {
+            Self::Quarter => 15 * 60 * 1_000,
+            Self::Hour => 60 * 60 * 1_000,
+            Self::Workday => 8 * 60 * 60 * 1_000,
+            Self::Day => 24 * 60 * 60 * 1_000,
+        }
+    }
+
+    /// Look one window token up in the closed set.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|window| window.as_str().eq_ignore_ascii_case(token))
+    }
+}
+
+impl fmt::Display for MuteWindow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// One closed `/mute` operation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum MuteDirective {
+    /// Silence this session for a bounded window.
+    For {
+        /// How long the silence lasts.
+        window: MuteWindow,
+    },
+    /// Lift the silence now.
+    Off,
 }
 
 /// One closed `/memory` operation.
@@ -1205,6 +1327,17 @@ pub enum ControlCommand {
     Forget { memory_ref: ControlRef },
     /// Reset the active conversation projection, not long-term memory.
     New,
+    /// Silence this thread's session, or lift the silence.
+    ///
+    /// Mute means both halves or neither: the reply is suppressed *and* the
+    /// provider call that would have produced it is never made. Suppressing
+    /// only the reply would spend exactly what the operator asked to stop.
+    Mute {
+        /// What was asked for.
+        directive: MuteDirective,
+    },
+    /// Close this thread's session, keeping every message it carried.
+    Archive,
     /// Spend one contained run with live public-web search enabled.
     Research {
         /// The exact bounded question whose public-web lookup is authorized.
@@ -1314,6 +1447,8 @@ impl ControlCommand {
             Self::Remember { .. } => CommandKind::Remember,
             Self::Forget { .. } => CommandKind::Forget,
             Self::New => CommandKind::New,
+            Self::Mute { .. } => CommandKind::Mute,
+            Self::Archive => CommandKind::Archive,
             Self::Research { .. } => CommandKind::Research,
             Self::GitHubCreate { .. } => CommandKind::GitHubCreate,
             Self::GitHubReply { .. } => CommandKind::GitHubReply,
@@ -1489,7 +1624,8 @@ pub fn command_refusal_text(text: &str, refusal: CommandRefusal) -> String {
             | CommandKind::Status
             | CommandKind::Runs
             | CommandKind::Tickets
-            | CommandKind::New => {
+            | CommandKind::New
+            | CommandKind::Archive => {
                 format!(
                     "/{} takes no arguments. Usage: {}.",
                     kind.name(),
@@ -1541,6 +1677,8 @@ const fn command_usage(kind: CommandKind) -> &'static str {
         CommandKind::Remember => "/remember <fact>",
         CommandKind::Forget => "/forget <id>",
         CommandKind::New => "/new",
+        CommandKind::Mute => "/mute [15m|1h|8h|24h|off]",
+        CommandKind::Archive => "/archive",
         CommandKind::GitHubCreate => "/github_create <repository> <request>",
         CommandKind::GitHubReply => "/github_reply <issue-url> <reply>",
         CommandKind::GitHubCheck => "/github_check <issue-url> <item>",
@@ -1909,6 +2047,10 @@ fn parse_arguments(kind: CommandKind, rest: &str) -> Result<ControlCommand, Comm
             one_reference(rest).map(|memory_ref| ControlCommand::Forget { memory_ref })
         }
         CommandKind::New => no_argument(rest).map(|()| ControlCommand::New),
+        CommandKind::Mute => {
+            one_mute_directive(rest).map(|directive| ControlCommand::Mute { directive })
+        }
+        CommandKind::Archive => no_argument(rest).map(|()| ControlCommand::Archive),
         CommandKind::Research => {
             RunTask::new(rest).map(|question| ControlCommand::Research { question })
         }
@@ -1970,6 +2112,37 @@ fn parse_arguments(kind: CommandKind, rest: &str) -> Result<ControlCommand, Comm
             one_directive(rest).map(|directive| ControlCommand::Admin { directive })
         }
     }
+}
+
+/// Accept exactly one `/mute` directive.
+///
+/// The grammar is closed on one token: a window from [`MuteWindow::ALL`], the
+/// word `off`, or nothing at all — which means [`MuteWindow::DEFAULT`], so the
+/// verb an operator reaches for in a hurry needs no argument to work.
+///
+/// An unrecognized token is [`CommandRefusal::ArgumentInvalid`] rather than
+/// silently rounded to the nearest window. Somebody who typed `/mute 2h` asked
+/// for two hours; answering with fifteen minutes or a day would both be wrong,
+/// and the refusal names the set they can choose from.
+fn one_mute_directive(rest: &str) -> Result<MuteDirective, CommandRefusal> {
+    let mut tokens = rest.split_whitespace();
+    let Some(token) = tokens.next() else {
+        return Ok(MuteDirective::For {
+            window: MuteWindow::DEFAULT,
+        });
+    };
+    if tokens.next().is_some() {
+        return Err(CommandRefusal::UnexpectedArgument);
+    }
+    if token.len() > MAX_COMMAND_NAME_BYTES {
+        return Err(CommandRefusal::ArgumentTooLong);
+    }
+    if token.eq_ignore_ascii_case("off") {
+        return Ok(MuteDirective::Off);
+    }
+    MuteWindow::from_token(token)
+        .map(|window| MuteDirective::For { window })
+        .ok_or(CommandRefusal::ArgumentInvalid)
 }
 
 fn one_memory_directive(rest: &str) -> Result<MemoryDirective, CommandRefusal> {
@@ -2309,6 +2482,104 @@ mod tests {
         assert_eq!(CommandKind::Remember.tier(), CommandTier::Admin);
         assert_eq!(CommandKind::Forget.tier(), CommandTier::Admin);
         assert_eq!(CommandKind::New.tier(), CommandTier::Admin);
+    }
+
+    /// The three session verbs are one family and three different things, and
+    /// nothing but the name keeps them apart at dispatch.
+    #[test]
+    fn the_session_lifecycle_verbs_are_closed_and_distinct() {
+        assert_eq!(parse_command("/new"), Ok(ControlCommand::New));
+        assert_eq!(parse_command("/archive"), Ok(ControlCommand::Archive));
+        assert_eq!(
+            parse_command("/mute"),
+            Ok(ControlCommand::Mute {
+                directive: MuteDirective::For {
+                    window: MuteWindow::Quarter
+                }
+            })
+        );
+        for command in [
+            parse_command("/new"),
+            parse_command("/archive"),
+            parse_command("/mute"),
+        ] {
+            assert!(command.is_ok());
+        }
+        assert_ne!(parse_command("/new"), parse_command("/archive"));
+
+        // The window set is closed, ordered, and each window has exactly one
+        // spelling — matched case-insensitively, because `15M` off a phone
+        // keyboard is the same quarter of an hour.
+        assert_eq!(MuteWindow::ALL.len(), 4);
+        let mut previous = 0;
+        for window in MuteWindow::ALL {
+            assert!(
+                window.duration_ms() > previous,
+                "{window} is out of order or empty"
+            );
+            previous = window.duration_ms();
+            assert_eq!(MuteWindow::from_token(window.as_str()), Some(window));
+            assert_eq!(
+                MuteWindow::from_token(&window.as_str().to_ascii_uppercase()),
+                Some(window)
+            );
+            assert_eq!(
+                parse_command(&format!("/mute {window}")),
+                Ok(ControlCommand::Mute {
+                    directive: MuteDirective::For { window }
+                })
+            );
+        }
+        assert_eq!(MuteWindow::DEFAULT, MuteWindow::Quarter);
+        assert_eq!(MuteWindow::Day.duration_ms(), 24 * 60 * 60 * 1_000);
+
+        for spelling in ["off", "OFF", "Off"] {
+            assert_eq!(
+                parse_command(&format!("/mute {spelling}")),
+                Ok(ControlCommand::Mute {
+                    directive: MuteDirective::Off
+                }),
+                "{spelling}"
+            );
+        }
+        // A window nobody wrote down is refused, never rounded to a neighbour.
+        for token in ["2h", "0", "-3h", "1w", "forever", "15", "m15", "15 m"] {
+            assert!(
+                matches!(
+                    parse_command(&format!("/mute {token}")),
+                    Err(CommandRefusal::ArgumentInvalid | CommandRefusal::UnexpectedArgument)
+                ),
+                "/mute {token}"
+            );
+        }
+        assert_eq!(
+            parse_command("/mute 1h now"),
+            Err(CommandRefusal::UnexpectedArgument)
+        );
+        assert_eq!(
+            parse_command(&format!("/mute {}", "h".repeat(MAX_COMMAND_NAME_BYTES + 1))),
+            Err(CommandRefusal::ArgumentTooLong)
+        );
+        assert_eq!(
+            parse_command("/archive now"),
+            Err(CommandRefusal::UnexpectedArgument)
+        );
+        assert_eq!(
+            command_refusal_text("/archive now", CommandRefusal::UnexpectedArgument),
+            "/archive takes no arguments. Usage: /archive."
+        );
+
+        // Both verbs are reachable by a member, and `/new` is not: the whole
+        // point of the tier split on this family.
+        assert_eq!(CommandKind::Mute.tier(), CommandTier::Allowed);
+        assert_eq!(CommandKind::Archive.tier(), CommandTier::Allowed);
+        assert_eq!(CommandKind::New.tier(), CommandTier::Admin);
+        assert_eq!(CommandKind::from_name("mute"), Some(CommandKind::Mute));
+        assert_eq!(
+            CommandKind::from_name("archive"),
+            Some(CommandKind::Archive)
+        );
+        assert_eq!(CommandKind::from_name("archives"), None);
     }
 
     #[test]
@@ -2734,6 +3005,44 @@ mod tests {
                         entry.name
                     );
                 }
+                ArgumentShape::MuteDirective => {
+                    // The bare verb is the whole point: it works with no
+                    // argument, and it means the shortest window.
+                    assert_eq!(
+                        bare,
+                        Ok(ControlCommand::Mute {
+                            directive: MuteDirective::For {
+                                window: MuteWindow::DEFAULT
+                            }
+                        }),
+                        "{}",
+                        entry.name
+                    );
+                    assert_eq!(
+                        with_argument,
+                        Err(CommandRefusal::ArgumentInvalid),
+                        "{}",
+                        entry.name
+                    );
+                    for window in MuteWindow::ALL {
+                        assert_eq!(
+                            parse_command(&format!("/{} {window}", entry.name)),
+                            Ok(ControlCommand::Mute {
+                                directive: MuteDirective::For { window }
+                            }),
+                            "{} {window}",
+                            entry.name
+                        );
+                    }
+                    assert_eq!(
+                        parse_command(&format!("/{} off", entry.name)),
+                        Ok(ControlCommand::Mute {
+                            directive: MuteDirective::Off
+                        }),
+                        "{}",
+                        entry.name
+                    );
+                }
                 ArgumentShape::GitHubRepositoryRequest => {
                     assert_eq!(bare, Err(CommandRefusal::MissingArgument), "{}", entry.name);
                     assert_eq!(
@@ -2794,6 +3103,8 @@ mod tests {
             (CommandKind::Remember, CommandTier::Admin),
             (CommandKind::Forget, CommandTier::Admin),
             (CommandKind::New, CommandTier::Admin),
+            (CommandKind::Mute, CommandTier::Allowed),
+            (CommandKind::Archive, CommandTier::Allowed),
             (CommandKind::Research, CommandTier::Admin),
             (CommandKind::GitHubCreate, CommandTier::Admin),
             (CommandKind::GitHubReply, CommandTier::Admin),
@@ -2816,8 +3127,23 @@ mod tests {
         for (kind, tier) in expected {
             assert_eq!(kind.tier(), tier, "/{}", kind.name());
         }
-        // Every spend or effect is admin-only, and the reads are not. This is
-        // the property the table exists to hold, stated independently of it.
+        // Every command that can spend, or that anybody but the caller can
+        // observe, is admin-only. That is the property the table exists to
+        // hold, stated independently of it.
+        //
+        // `/mute` and `/archive` are the two durable writes deliberately on the
+        // other side, and the carve-out is narrow on purpose: each acts only on
+        // the caller's own session, neither can be seen from outside this
+        // system, and `/mute` can only ever *reduce* spend. A third command
+        // added here would have to prove all three.
+        for kind in [CommandKind::Mute, CommandKind::Archive] {
+            assert_eq!(
+                kind.tier(),
+                CommandTier::Allowed,
+                "/{} is a self-scoped, non-spending session verb",
+                kind.name()
+            );
+        }
         for kind in CommandKind::ALL {
             let effectful = matches!(
                 kind,
@@ -2972,6 +3298,7 @@ mod tests {
                 ArgumentShape::Reference => format!("/{} SUP-1042", kind.name()),
                 ArgumentShape::Directive => format!("/{} list", kind.name()),
                 ArgumentShape::MemoryDirective => format!("/{} proposals", kind.name()),
+                ArgumentShape::MuteDirective => format!("/{} 1h", kind.name()),
                 ArgumentShape::Channel => format!("/{} ops", kind.name()),
                 ArgumentShape::ChannelMessage => format!("/{} ops bonjour", kind.name()),
                 ArgumentShape::GitHubRepositoryRequest => {

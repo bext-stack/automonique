@@ -70,6 +70,11 @@ const MEMBER: i64 = 5_550_001;
 const NEWCOMER: i64 = 4_440_002;
 /// Somebody who is not on any list here.
 const OUTSIDER: i64 = 9_999_999;
+/// A forum supergroup the operator commands the bot from.
+const FORUM_CHAT: i64 = -1_002_003_004;
+/// Two topics of that forum, which are two rooms to the people in them.
+const TOPIC_A: i64 = 11;
+const TOPIC_B: i64 = 12;
 /// The exact credential, so a test can prove no rendering contains it.
 const TOKEN: &str = "123456:AAFixtureSecretNeverPrinted";
 /// A fixed poller clock. The read surface uses the real one; the two never meet.
@@ -661,6 +666,73 @@ fn callback_updates(rows: &[(u64, i64, &str)]) -> ClientBehavior {
         .collect::<Vec<_>>()
         .join(",");
     ClientBehavior::Body(format!("{{\"ok\":true,\"result\":[{body}]}}"))
+}
+
+/// One `getUpdates` response from a forum supergroup.
+///
+/// `topic` of `Some` renders the pair Telegram sends for a message in a forum
+/// topic; `None` renders the same chat with no thread at all, which is the
+/// group's own shared session.
+fn forum_updates(rows: &[(u64, Option<i64>, &str)]) -> ClientBehavior {
+    let body = rows
+        .iter()
+        .map(|(update_id, topic, text)| {
+            let thread = topic.map_or_else(String::new, |topic| {
+                format!(r#""message_thread_id":{topic},"is_topic_message":true,"#)
+            });
+            format!(
+                r#"{{"update_id":{update_id},"message":{{"message_id":{update_id},"chat":{{"id":{FORUM_CHAT}}},"from":{{"id":{OPERATOR}}},{thread}"text":{}}}}}"#,
+                serde_json_string(text)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    ClientBehavior::Body(format!("{{\"ok\":true,\"result\":[{body}]}}"))
+}
+
+/// The roster a forum fixture composes: one administrator, commanding from one
+/// group chat rather than from a direct message.
+fn forum_roster() -> OperatorRoster {
+    OperatorRoster::new(
+        TelegramBotId::new(BOT_ID).expect("bot id"),
+        [TelegramPrincipal::new(FORUM_CHAT, OPERATOR).expect("principal")],
+        [OPERATOR],
+        [OPERATOR],
+    )
+    .expect("roster")
+}
+
+fn bridge_with_memory(
+    fixture: &Fixture,
+    client: FakeClient,
+    outbound: FakeOutbound,
+    sink: FakeSink,
+    roster: OperatorRoster,
+    memory: StoreMemorySurface,
+) -> Bridge {
+    TelegramControlBridge::new(BridgeParts {
+        client,
+        question_outbound: outbound.clone(),
+        outbound,
+        sink,
+        surface: fixture.surface(),
+        lane: FakeRunLane::default(),
+        slack: None,
+        github: None,
+        github_actions: None,
+        improvements: None,
+        ticket_actions: None,
+        email_actions: None,
+        memory: Some(Box::new(memory) as Box<dyn MemorySurface + Send>),
+        improvement_github: None,
+        improvement_worker: None,
+        roster,
+        inbound_token: token(),
+        outbound_token: token(),
+        question_outbound_token: token(),
+        long_poll_seconds: LONG_POLL_SECONDS,
+    })
+    .expect("bridge composes")
 }
 
 fn updates_with_reply(
@@ -4788,6 +4860,7 @@ fn durable_memory_survives_reopen_redacts_secrets_and_resets_only_conversation_h
         .capture_user(
             OPERATOR,
             OPERATOR,
+            None,
             "telegram:update:1",
             "I prefer concise answers in French.",
             NOW_MS,
@@ -4819,6 +4892,7 @@ fn durable_memory_survives_reopen_redacts_secrets_and_resets_only_conversation_h
         .capture_user(
             OPERATOR,
             OPERATOR,
+            None,
             "telegram:update:4",
             "temporary token sk-123456789012345678901234",
             NOW_MS + 3,
@@ -4828,7 +4902,7 @@ fn durable_memory_survives_reopen_redacts_secrets_and_resets_only_conversation_h
 
     let mut memory = StoreMemorySurface::open(&path, BOT_ID, "primary").expect("memory reopens");
     let context = memory
-        .context(OPERATOR, OPERATOR, "what do I prefer?", NOW_MS + 4)
+        .context(OPERATOR, OPERATOR, None, "what do I prefer?", NOW_MS + 4)
         .expect("context");
     assert!(context.contains("[recent_conversation]"));
     assert!(context.contains("[durable_memory]"));
@@ -4837,10 +4911,10 @@ fn durable_memory_survives_reopen_redacts_secrets_and_resets_only_conversation_h
     assert!(!context.contains("sk-123456789012345678901234"));
 
     memory
-        .start_conversation(OPERATOR, OPERATOR, NOW_MS + 5)
+        .start_conversation(OPERATOR, OPERATOR, None, NOW_MS + 5)
         .expect("new conversation");
     let reset = memory
-        .context(OPERATOR, OPERATOR, "what do I prefer?", NOW_MS + 6)
+        .context(OPERATOR, OPERATOR, None, "what do I prefer?", NOW_MS + 6)
         .expect("reset context");
     assert!(!reset.contains("[recent_conversation]"));
     assert!(reset.contains("M-1"), "long-term memory survives /new");
@@ -4896,5 +4970,262 @@ fn durable_memory_survives_reopen_redacts_secrets_and_resets_only_conversation_h
             .expect("replacement exists")
             .status,
         MemoryStatus::Active
+    );
+}
+
+/// Thread-granular sessions, end to end through the bridge.
+///
+/// Two topics of one forum and the forum's own chat are three sessions, and the
+/// lifecycle verbs act on exactly the one the message arrived in. Nothing here
+/// spends a provider call: every message is a command, so the whole scenario is
+/// deterministic and the store is the assertion.
+#[test]
+fn forum_topics_are_separate_sessions_and_the_lifecycle_verbs_act_on_one() {
+    let fixture = Fixture::new(&[]);
+    let root = tempfile::tempdir().expect("memory root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private memory root");
+    let path = root.path().join("agent-memory.sqlite3");
+    let memory = StoreMemorySurface::open(&path, BOT_ID, "primary").expect("memory surface");
+
+    let client = FakeClient::new(vec![
+        forum_updates(&[
+            (1, Some(TOPIC_A), "/new"),
+            (2, Some(TOPIC_B), "/new"),
+            (3, None, "/new"),
+            (4, Some(TOPIC_A), "/mute 1h"),
+            // Muted: this reaches no renderer and spends nothing.
+            (5, Some(TOPIC_A), "/status"),
+            // The sibling topic and the chat are untouched by the mute.
+            (6, Some(TOPIC_B), "/status"),
+            (7, None, "/status"),
+            // The recovery verb always reaches dispatch, mute or no mute.
+            (8, Some(TOPIC_A), "/mute off"),
+        ]),
+        forum_updates(&[(9, Some(TOPIC_A), "/archive")]),
+    ]);
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge_with_memory(
+        &fixture,
+        client,
+        outbound.clone(),
+        FakeSink::default(),
+        forum_roster(),
+        memory,
+    );
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.updates, 8);
+    assert_eq!(report.ignored, 1, "exactly the muted message is dropped");
+
+    let actor = format!("telegram:{OPERATOR}");
+    let chat_scope = format!("chat:{FORUM_CHAT}");
+    let topic_a_scope = format!("chat:{FORUM_CHAT}:topic:{TOPIC_A}");
+    let topic_b_scope = format!("chat:{FORUM_CHAT}:topic:{TOPIC_B}");
+    let head = |scope: &str| {
+        AgentMemoryStore::open(&path)
+            .expect("canonical store")
+            .current_conversation("primary", &actor, "telegram", scope)
+            .expect("head")
+    };
+    let state = |scope: &str| {
+        AgentMemoryStore::open(&path)
+            .expect("canonical store")
+            .conversation_state("primary", &actor, "telegram", scope)
+            .expect("state")
+    };
+
+    // Three scopes, three sessions, none of them the same.
+    let chat_head = head(&chat_scope).expect("the chat has its own session");
+    let topic_a_head = head(&topic_a_scope).expect("topic A has its own session");
+    let topic_b_head = head(&topic_b_scope).expect("topic B has its own session");
+    assert_ne!(chat_head, topic_a_head);
+    assert_ne!(chat_head, topic_b_head);
+    assert_ne!(topic_a_head, topic_b_head);
+
+    // The mute landed on exactly the room it was typed in. It has since been
+    // lifted by `/mute off`, and the lifting is what proves the recovery verb
+    // reached dispatch through the silence.
+    for scope in [&chat_scope, &topic_b_scope, &topic_a_scope] {
+        assert_eq!(
+            state(scope).expect("session").muted_until_ms,
+            None,
+            "{scope} is muted after /mute off"
+        );
+    }
+    // Two `/status` replies left the bot and the muted one did not.
+    assert_eq!(
+        outbound
+            .messages()
+            .into_iter()
+            .filter(|body| body.contains("Automonique status"))
+            .count(),
+        2,
+        "only the two unmuted rooms were answered"
+    );
+
+    // `/archive` closes the session it was typed in and nothing else. The next
+    // message in that room — here the bot's own confirmation — opens a fresh
+    // one, which is exactly what the reply promises.
+    let report = poll(&mut bridge).expect("second poll commits");
+    assert_eq!(report.updates, 1);
+    assert_ne!(
+        head(&topic_a_scope).expect("a fresh session"),
+        topic_a_head,
+        "the archived session is not the one still being written to"
+    );
+    assert_eq!(
+        head(&topic_b_scope),
+        Some(topic_b_head),
+        "the sibling topic was not archived from another room"
+    );
+    assert_eq!(
+        head(&chat_scope),
+        Some(chat_head),
+        "the chat was not archived from a topic"
+    );
+}
+
+/// A modifier is read off the front of a message, routes it, and never reaches
+/// the command registry as text.
+#[test]
+fn a_leading_modifier_routes_a_message_and_an_unknown_one_is_refused() {
+    let fixture = Fixture::new(&[]);
+    let root = tempfile::tempdir().expect("memory root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private memory root");
+    let path = root.path().join("agent-memory.sqlite3");
+    let memory = StoreMemorySurface::open(&path, BOT_ID, "primary").expect("memory surface");
+
+    let client = FakeClient::new(vec![forum_updates(&[
+        // Composes with the slash registry rather than replacing it.
+        (1, Some(TOPIC_A), "!new /status"),
+        // A leading token outside the closed set is a content-free refusal that
+        // names the whole vocabulary.
+        (2, Some(TOPIC_A), "!nope do the thing"),
+        // Case-variants are not modifiers, and this one is refused rather than
+        // being folded into `!fast`.
+        (3, Some(TOPIC_A), "!Fast do the thing"),
+        // A `!token` in the middle of a message is content.
+        (4, Some(TOPIC_A), "/status wow !fast"),
+    ])]);
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge_with_memory(
+        &fixture,
+        client,
+        outbound.clone(),
+        FakeSink::default(),
+        forum_roster(),
+        memory,
+    );
+
+    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(report.updates, 4);
+    assert_eq!(
+        report.refused, 3,
+        "two modifier refusals and one /status abuse"
+    );
+
+    let messages = outbound.messages();
+    let refusals: Vec<&String> = messages
+        .iter()
+        .filter(|body| body.contains("Modifiers:"))
+        .collect();
+    assert_eq!(refusals.len(), 2, "both unknown modifiers were named");
+    for refusal in refusals {
+        for keyword in ["!new", "!fast", "!ask", "!think", "!model"] {
+            assert!(refusal.contains(keyword), "{keyword} is missing: {refusal}");
+        }
+        assert!(
+            !refusal.contains("nope") && !refusal.contains("do the thing"),
+            "a refusal must not echo the sender's text: {refusal}"
+        );
+    }
+
+    // `!new /status` reached the registry as a `/status`, and rotated the head
+    // on its way there.
+    let store = AgentMemoryStore::open(&path).expect("canonical store");
+    let actor = format!("telegram:{OPERATOR}");
+    assert!(
+        store
+            .current_conversation(
+                "primary",
+                &actor,
+                "telegram",
+                &format!("chat:{FORUM_CHAT}:topic:{TOPIC_A}")
+            )
+            .expect("head")
+            .is_some(),
+        "!new opened a session in the topic it was typed in"
+    );
+}
+
+/// `!new` rotates the head *before* the message that carried it is captured.
+///
+/// The ordering is the whole meaning of the modifier: `!new ask this` says the
+/// asking is the first turn of a fresh conversation, not the last turn of the
+/// one being left behind.
+#[test]
+fn a_new_modifier_files_its_own_message_in_the_conversation_it_opened() {
+    let fixture = Fixture::new(&[]);
+    let root = tempfile::tempdir().expect("memory root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private memory root");
+    let path = root.path().join("agent-memory.sqlite3");
+    let memory = StoreMemorySurface::open(&path, BOT_ID, "primary").expect("memory surface");
+
+    let client = FakeClient::new(vec![
+        forum_updates(&[(1, Some(TOPIC_A), "première question")]),
+        forum_updates(&[(2, Some(TOPIC_A), "!new deuxième question")]),
+    ]);
+    let mut bridge = bridge_with_memory(
+        &fixture,
+        client,
+        FakeOutbound::default(),
+        FakeSink::default(),
+        forum_roster(),
+        memory,
+    );
+
+    let scope = format!("chat:{FORUM_CHAT}:topic:{TOPIC_A}");
+    let actor = format!("telegram:{OPERATOR}");
+    let head = || {
+        AgentMemoryStore::open(&path)
+            .expect("canonical store")
+            .current_conversation("primary", &actor, "telegram", &scope)
+            .expect("head")
+            .expect("a session")
+    };
+    let history = |conversation: &str| {
+        AgentMemoryStore::open(&path)
+            .expect("canonical store")
+            .recent_messages("primary", &actor, conversation, NOW_MS, 10)
+            .expect("history")
+            .into_iter()
+            .map(|message| message.content)
+            .collect::<Vec<_>>()
+    };
+
+    poll(&mut bridge).expect("first poll commits");
+    await_question_completion(&mut bridge);
+    let first = head();
+    assert_eq!(history(&first), vec![String::from("première question")]);
+
+    poll(&mut bridge).expect("second poll commits");
+    await_question_completion(&mut bridge);
+    let second = head();
+    assert_ne!(second, first, "!new opened a fresh conversation");
+
+    // The modifiers are stripped from what is remembered — they are control,
+    // not something the operator said — and the message is in the *new*
+    // conversation.
+    assert!(
+        history(&second).contains(&String::from("deuxième question")),
+        "the message that carried !new belongs to the conversation it opened"
+    );
+    assert_eq!(
+        history(&first),
+        vec![String::from("première question")],
+        "the conversation being left behind gained nothing"
     );
 }

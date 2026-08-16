@@ -194,6 +194,7 @@ pub struct TelegramIngress {
     update_id: u64,
     message_id: Option<i64>,
     reply_to_message_id: Option<i64>,
+    forum_topic_id: Option<i64>,
     source_key: String,
     scope: String,
     principal: Option<TelegramPrincipal>,
@@ -220,6 +221,7 @@ impl fmt::Debug for TelegramIngress {
                 "reply_to_message_id",
                 &self.reply_to_message_id.map(|_| "<redacted>"),
             )
+            .field("forum_topic_id", &self.forum_topic_id.map(|_| "<redacted>"))
             .field("source_key", &"<redacted>")
             .field("scope", &"<redacted>")
             .field("principal", &self.principal.map(|_| "<redacted>"))
@@ -261,6 +263,23 @@ impl TelegramIngress {
     #[must_use]
     pub const fn reply_to_message_id(&self) -> Option<i64> {
         self.reply_to_message_id
+    }
+
+    /// The forum topic this message belongs to, when it belongs to one.
+    ///
+    /// `Some` only for a message Telegram marked `is_topic_message`, which is
+    /// the one case where a `message_thread_id` names a room the people in it
+    /// experience as separate. A reply chain inside an ordinary supergroup also
+    /// carries a `message_thread_id`, and reporting that here would split one
+    /// group conversation into a session per reply chain — so it is deliberately
+    /// not reported.
+    ///
+    /// `None` for a direct message, an ordinary group, and every update that is
+    /// not a message, which is what makes the bare chat scope the primary
+    /// session everywhere a thread does not really exist.
+    #[must_use]
+    pub const fn forum_topic_id(&self) -> Option<i64> {
+        self.forum_topic_id
     }
 
     /// Stable transport deduplication key.
@@ -477,6 +496,7 @@ fn parse_fresh_update(
                 update_id,
                 message_id: None,
                 reply_to_message_id: None,
+                forum_topic_id: None,
                 source_key: format!("telegram:{}:update:{update_id}", policy.bot_id().get()),
                 scope: format!("telegram:{}:{chat_id}", policy.bot_id().get()),
                 principal: None,
@@ -516,12 +536,26 @@ fn parse_fresh_update(
                 string(callback, "data")?,
                 Some(nested_i64(callback, &["message", "message_id"])?),
                 None,
+                forum_topic(
+                    callback
+                        .get("message")
+                        .and_then(Value::as_object)
+                        .ok_or(TelegramError::InvalidResponse)?,
+                )?,
                 None,
             ))
         }
         _ => None,
     };
-    let Some((principal, kind, content, message_id, reply_to_message_id, attachment_kind)) = parsed
+    let Some((
+        principal,
+        kind,
+        content,
+        message_id,
+        reply_to_message_id,
+        forum_topic_id,
+        attachment_kind,
+    )) = parsed
     else {
         return Ok(unsupported_ingress(update_id, policy));
     };
@@ -537,6 +571,7 @@ fn parse_fresh_update(
         update_id,
         message_id,
         reply_to_message_id,
+        forum_topic_id,
         source_key: format!("telegram:{}:update:{update_id}", policy.bot_id().get()),
         scope: format!("telegram:{}:{}", policy.bot_id().get(), principal.chat_id()),
         principal: Some(principal),
@@ -563,6 +598,7 @@ type ParsedTelegramInput<'a> = (
     TelegramPrincipal,
     TelegramInputKind,
     &'a str,
+    Option<i64>,
     Option<i64>,
     Option<i64>,
     Option<TelegramAttachmentKind>,
@@ -639,6 +675,7 @@ fn parse_message_update<'a>(
         content,
         message_id,
         reply_to_message_id,
+        forum_topic(message)?,
         attachment_kind,
     )))
 }
@@ -648,6 +685,7 @@ fn unsupported_ingress(update_id: u64, policy: &TelegramAccessPolicy) -> Telegra
         update_id,
         message_id: None,
         reply_to_message_id: None,
+        forum_topic_id: None,
         source_key: format!("telegram:{}:update:{update_id}", policy.bot_id().get()),
         scope: format!("telegram:{}:unsupported", policy.bot_id().get()),
         principal: None,
@@ -657,6 +695,38 @@ fn unsupported_ingress(update_id: u64, policy: &TelegramAccessPolicy) -> Telegra
         content: None,
         disposition: TelegramDisposition::IgnoredUnsupported,
     }
+}
+
+/// The forum topic one message belongs to, if Telegram says it belongs to one.
+///
+/// Two fields have to agree before this reports a topic. `message_thread_id`
+/// alone is also set on a reply chain in an ordinary supergroup, where the
+/// people talking experience one room; only `is_topic_message` says the message
+/// was sent *to a forum topic*, which is the separate room this product binds a
+/// separate session to.
+///
+/// A `message_thread_id` that is not a positive integer, or an
+/// `is_topic_message` that is not a boolean, is a refusal rather than a fall
+/// back to the bare chat: a malformed coordinate that quietly became the
+/// primary session would put a topic's messages in the chat's own history.
+fn forum_topic(message: &serde_json::Map<String, Value>) -> Result<Option<i64>, TelegramError> {
+    let is_topic_message = match message.get("is_topic_message") {
+        None => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => return Err(TelegramError::InvalidField("is_topic_message")),
+    };
+    if !is_topic_message {
+        return Ok(None);
+    }
+    message
+        .get("message_thread_id")
+        .map(|value| {
+            value
+                .as_i64()
+                .ok_or(TelegramError::InvalidResponse)
+                .and_then(|id| positive(id, "message_thread_id"))
+        })
+        .transpose()
 }
 
 fn principal(message: &serde_json::Map<String, Value>) -> Result<TelegramPrincipal, TelegramError> {

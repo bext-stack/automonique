@@ -112,9 +112,9 @@ use automonique_protocol::event::EventKind;
 use automonique_protocol::execute_api::CancelRunOutcome;
 use automonique_protocol::progress_api::ProgressFrame;
 use automonique_store::agent_memory::{
-    AgentMemoryError, AgentMemoryStore, ExternalIdentity, MemoryInput, MemoryKind, MemoryRecord,
-    MemorySensitivity, MemoryStatus, MemorySupersession, MemoryVisibility, MessageInput,
-    redact_content,
+    AgentMemoryError, AgentMemoryStore, ConversationScope, ExternalIdentity, MemoryInput,
+    MemoryKind, MemoryRecord, MemorySensitivity, MemoryStatus, MemorySupersession,
+    MemoryVisibility, MessageInput, redact_content,
 };
 use automonique_store::improvements::{ApprovalKind, ImprovementState};
 use automonique_store::operator_members::{
@@ -134,14 +134,16 @@ use automonique_support_connector::{
     TicketDispatchRequest, TicketJobStatus, TicketStatus, TicketStatusRequest, TicketWorkspace,
 };
 use automonique_transport_runtime::{
-    AdminDirective, AllowedUsers, AnswerCallbackQueryRequest, ApprovalKeyboard, CancellationToken,
-    ChannelName, ControlCommand, EditMessageReplyMarkupRequest, HttpFailure, InlineButtonLabel,
-    MAX_ALLOWED_USERS, MAX_COMMAND_TEXT_BYTES, MAX_SEND_MESSAGE_TEXT_UNITS, MemoryDirective,
-    OpaqueBotToken, OperatorAuthority, PollOutcome, PollerLease, RuntimeError, SendMessageRequest,
-    SetMessageReactionRequest, SetMyCommandsRequest, TelegramBotCommand, TelegramDurableSink,
-    TelegramHttpClient, TelegramHttpPlan, TelegramHttpResponse, TelegramOutbound,
-    TelegramOutboundClient, TelegramOutboundPlan, TelegramPoller, TelegramTextStyle,
-    authorize_and_parse_tiered, command_manifest, command_refusal_text, help_text,
+    ALL_MODIFIERS, AdminDirective, AllowedUsers, AnswerCallbackQueryRequest, ApprovalKeyboard,
+    CancellationToken, ChannelName, CommandRefusal, ControlCommand, EditMessageReplyMarkupRequest,
+    HttpFailure, InlineButtonLabel, MAX_ALLOWED_USERS, MAX_COMMAND_TEXT_BYTES,
+    MAX_SEND_MESSAGE_TEXT_UNITS, MemoryDirective, MessageModifiers, ModelAlias, ModifierKind,
+    MuteDirective, OpaqueBotToken, OperatorAuthority, PollOutcome, PollerLease, RuntimeError,
+    SendMessageRequest, SetMessageReactionRequest, SetMyCommandsRequest, TelegramBotCommand,
+    TelegramDurableSink, TelegramHttpClient, TelegramHttpPlan, TelegramHttpResponse,
+    TelegramOutbound, TelegramOutboundClient, TelegramOutboundPlan, TelegramPoller,
+    TelegramTextStyle, authorize_and_parse_tiered, command_manifest, command_refusal_text,
+    help_text, parse_command, parse_modifiers,
 };
 use automonique_transports::{
     TelegramAccessPolicy, TelegramBotId, TelegramDisposition, TelegramIngress, TelegramInputKind,
@@ -875,6 +877,8 @@ impl Unavailable {
             | ControlCommand::Remember { .. }
             | ControlCommand::Forget { .. }
             | ControlCommand::New
+            | ControlCommand::Mute { .. }
+            | ControlCommand::Archive
             | ControlCommand::Research { .. }
             | ControlCommand::Say { .. }
             | ControlCommand::Work { .. }
@@ -1140,11 +1144,20 @@ impl EmailActionSurface for FleetClient {
 }
 
 /// Durable conversational memory behind Telegram.
+///
+/// The session-facing methods take a `topic_id` beside the chat: `None` is the
+/// chat's own session — a direct message, an ordinary group — and `Some` is one
+/// forum topic, which the people in it experience as a separate room and this
+/// surface therefore binds to a separate conversation. It travels as a
+/// parameter rather than as surface state because an answer is captured on a
+/// worker thread, after the bridge has moved on to another update: state would
+/// file a topic's answer in whichever chat happened to arrive next.
 pub trait MemorySurface {
     fn capture_user(
         &mut self,
         actor_id: i64,
         chat_id: i64,
+        topic_id: Option<i64>,
         source_key: &str,
         text: &str,
         at_ms: i64,
@@ -1154,10 +1167,37 @@ pub trait MemorySurface {
         &mut self,
         actor_id: i64,
         chat_id: i64,
+        topic_id: Option<i64>,
         source_key: &str,
         text: &str,
         at_ms: i64,
     ) -> Result<(), String>;
+
+    /// Silence this session for a bounded window, or lift the silence.
+    fn mute(
+        &mut self,
+        actor_id: i64,
+        chat_id: i64,
+        topic_id: Option<i64>,
+        directive: MuteDirective,
+        at_ms: i64,
+    ) -> Result<String, String>;
+
+    /// Close this session, keeping every message it carried.
+    fn archive(
+        &mut self,
+        actor_id: i64,
+        chat_id: i64,
+        topic_id: Option<i64>,
+        at_ms: i64,
+    ) -> Result<String, String>;
+
+    /// Whether this session is silenced at `at_ms`.
+    ///
+    /// A surface that cannot answer reports `false`: a memory failure must not
+    /// be able to silence a bot, because the operator would have no way to tell
+    /// that from the bot being broken.
+    fn is_muted(&mut self, actor_id: i64, chat_id: i64, topic_id: Option<i64>, at_ms: i64) -> bool;
 
     fn assistant_reply(
         &mut self,
@@ -1192,6 +1232,7 @@ pub trait MemorySurface {
         &mut self,
         actor_id: i64,
         chat_id: i64,
+        topic_id: Option<i64>,
         at_ms: i64,
     ) -> Result<String, String>;
 
@@ -1199,6 +1240,7 @@ pub trait MemorySurface {
         &mut self,
         actor_id: i64,
         chat_id: i64,
+        topic_id: Option<i64>,
         query: &str,
         at_ms: i64,
     ) -> Result<String, String>;
@@ -1238,8 +1280,17 @@ impl StoreMemorySurface {
         format!("telegram:{actor_id}")
     }
 
-    fn external_scope(chat_id: i64) -> String {
-        format!("chat:{chat_id}")
+    /// The session key for one chat, at thread granularity.
+    ///
+    /// Derived by the store rather than formatted here: the head rows are keyed
+    /// by this string, so a surface that composed its own spelling could
+    /// silently open a second session for a conversation that already had one.
+    /// A refusal falls back to nothing — the caller reports
+    /// `memory_conversation_unavailable` rather than writing under a key it
+    /// guessed.
+    fn external_scope(chat_id: i64, topic_id: Option<i64>) -> Result<ConversationScope, String> {
+        ConversationScope::telegram(chat_id, topic_id)
+            .map_err(|_| String::from("memory_conversation_unavailable"))
     }
 
     fn bind(&mut self, actor_id: i64, at_ms: i64) -> Result<String, String> {
@@ -1269,27 +1320,45 @@ impl StoreMemorySurface {
         Ok(actor)
     }
 
-    fn conversation(&mut self, actor: &str, chat_id: i64, at_ms: i64) -> Result<String, String> {
-        let scope = Self::external_scope(chat_id);
+    fn conversation(
+        &mut self,
+        actor: &str,
+        chat_id: i64,
+        topic_id: Option<i64>,
+        at_ms: i64,
+    ) -> Result<String, String> {
+        let scope = Self::external_scope(chat_id, topic_id)?;
         if let Some(conversation) = self
             .store
-            .current_conversation(&self.tenant, actor, "telegram", &scope)
+            .current_conversation(&self.tenant, actor, "telegram", scope.as_str())
             .map_err(|_| String::from("memory_conversation_unavailable"))?
         {
             return Ok(conversation);
         }
-        let conversation = format!("telegram:{chat_id}:{at_ms}");
+        let conversation = Self::conversation_id(chat_id, topic_id, at_ms);
         self.store
             .start_conversation(
                 &self.tenant,
                 actor,
                 "telegram",
-                &scope,
+                scope.as_str(),
                 &conversation,
                 at_ms,
             )
             .map_err(|_| String::from("memory_conversation_unavailable"))?;
         Ok(conversation)
+    }
+
+    /// The identifier one fresh conversation is opened under.
+    ///
+    /// The topic is part of it, so two topics of one chat opened in the same
+    /// millisecond cannot collide on a primary key — which would make the
+    /// second one fail to open rather than merely share a name.
+    fn conversation_id(chat_id: i64, topic_id: Option<i64>, at_ms: i64) -> String {
+        topic_id.map_or_else(
+            || format!("telegram:{chat_id}:{at_ms}"),
+            |topic_id| format!("telegram:{chat_id}:topic:{topic_id}:{at_ms}"),
+        )
     }
 
     fn memory_id(reference: &str) -> Result<i64, String> {
@@ -1360,6 +1429,7 @@ impl MemorySurface for StoreMemorySurface {
         &mut self,
         actor_id: i64,
         chat_id: i64,
+        topic_id: Option<i64>,
         source_key: &str,
         text: &str,
         at_ms: i64,
@@ -1368,7 +1438,7 @@ impl MemorySurface for StoreMemorySurface {
             return Ok(());
         }
         let actor = self.bind(actor_id, at_ms)?;
-        let conversation = self.conversation(&actor, chat_id, at_ms)?;
+        let conversation = self.conversation(&actor, chat_id, topic_id, at_ms)?;
         let content = redact_content(text);
         self.store
             .record_message(&MessageInput {
@@ -1376,7 +1446,7 @@ impl MemorySurface for StoreMemorySurface {
                 actor: &actor,
                 conversation_id: &conversation,
                 transport: "telegram",
-                external_scope: &Self::external_scope(chat_id),
+                external_scope: Self::external_scope(chat_id, topic_id)?.as_str(),
                 transport_key: source_key,
                 role: "user",
                 content: &content,
@@ -1412,12 +1482,13 @@ impl MemorySurface for StoreMemorySurface {
         &mut self,
         actor_id: i64,
         chat_id: i64,
+        topic_id: Option<i64>,
         source_key: &str,
         text: &str,
         at_ms: i64,
     ) -> Result<(), String> {
         let actor = self.bind(actor_id, at_ms)?;
-        let conversation = self.conversation(&actor, chat_id, at_ms)?;
+        let conversation = self.conversation(&actor, chat_id, topic_id, at_ms)?;
         let content = redact_content(text);
         self.store
             .record_message(&MessageInput {
@@ -1425,7 +1496,7 @@ impl MemorySurface for StoreMemorySurface {
                 actor: &actor,
                 conversation_id: &conversation,
                 transport: "telegram",
-                external_scope: &Self::external_scope(chat_id),
+                external_scope: Self::external_scope(chat_id, topic_id)?.as_str(),
                 transport_key: source_key,
                 role: "assistant",
                 content: &content,
@@ -1627,17 +1698,18 @@ impl MemorySurface for StoreMemorySurface {
         &mut self,
         actor_id: i64,
         chat_id: i64,
+        topic_id: Option<i64>,
         at_ms: i64,
     ) -> Result<String, String> {
         let actor = self.bind(actor_id, at_ms)?;
-        let conversation = format!("telegram:{chat_id}:{at_ms}");
+        let conversation = Self::conversation_id(chat_id, topic_id, at_ms);
         let revision = self
             .store
             .start_conversation(
                 &self.tenant,
                 &actor,
                 "telegram",
-                &Self::external_scope(chat_id),
+                Self::external_scope(chat_id, topic_id)?.as_str(),
                 &conversation,
                 at_ms,
             )
@@ -1647,15 +1719,95 @@ impl MemorySurface for StoreMemorySurface {
         ))
     }
 
+    fn mute(
+        &mut self,
+        actor_id: i64,
+        chat_id: i64,
+        topic_id: Option<i64>,
+        directive: MuteDirective,
+        at_ms: i64,
+    ) -> Result<String, String> {
+        let actor = self.bind(actor_id, at_ms)?;
+        let scope = Self::external_scope(chat_id, topic_id)?;
+        // A `/mute` in a chat nobody has written in yet has no session to
+        // silence, so one is opened first. Muting must not depend on having
+        // said something to the bot already.
+        self.conversation(&actor, chat_id, topic_id, at_ms)?;
+        let until_ms = match directive {
+            MuteDirective::Off => None,
+            MuteDirective::For { window } => Some(
+                at_ms
+                    .checked_add(window.duration_ms())
+                    .ok_or_else(|| String::from("memory_mute_refused"))?,
+            ),
+        };
+        let state = self
+            .store
+            .mute_conversation(
+                &self.tenant,
+                &actor,
+                "telegram",
+                scope.as_str(),
+                until_ms,
+                at_ms,
+            )
+            .map_err(|_| String::from("memory_mute_refused"))?;
+        Ok(match directive {
+            MuteDirective::Off => String::from(
+                "Unmuted. This conversation will be answered again from the next message.",
+            ),
+            MuteDirective::For { window } => format!(
+                "Muted for {window} (revision {}). No reply and no provider call until it expires; /mute off lifts it.",
+                state.revision
+            ),
+        })
+    }
+
+    fn archive(
+        &mut self,
+        actor_id: i64,
+        chat_id: i64,
+        topic_id: Option<i64>,
+        at_ms: i64,
+    ) -> Result<String, String> {
+        let actor = self.bind(actor_id, at_ms)?;
+        let scope = Self::external_scope(chat_id, topic_id)?;
+        let (_, revision) = self
+            .store
+            .archive_conversation(&self.tenant, &actor, "telegram", scope.as_str(), at_ms)
+            .map_err(|error| {
+                String::from(match error {
+                    AgentMemoryError::NotFound => "memory_conversation_absent",
+                    _ => "memory_archive_refused",
+                })
+            })?;
+        Ok(format!(
+            "Archived this conversation (revision {revision}). Its messages are kept; the next message starts a fresh one."
+        ))
+    }
+
+    fn is_muted(&mut self, actor_id: i64, chat_id: i64, topic_id: Option<i64>, at_ms: i64) -> bool {
+        let Ok(scope) = Self::external_scope(chat_id, topic_id) else {
+            return false;
+        };
+        let actor = Self::actor(actor_id);
+        self.store
+            .conversation_state(&self.tenant, &actor, "telegram", scope.as_str())
+            .ok()
+            .flatten()
+            .is_some_and(|state| state.is_muted(at_ms))
+    }
+
     fn context(
         &mut self,
         actor_id: i64,
         chat_id: i64,
+        topic_id: Option<i64>,
         query: &str,
         at_ms: i64,
     ) -> Result<String, String> {
         let actor = self.bind(actor_id, at_ms)?;
-        let conversation = self.conversation(&actor, chat_id, at_ms)?;
+        let conversation = self.conversation(&actor, chat_id, topic_id, at_ms)?;
         let messages = self
             .store
             .recent_messages(&self.tenant, &actor, &conversation, at_ms, 12)
@@ -1952,6 +2104,11 @@ pub enum QuestionProfile {
 struct QuestionJob {
     actor_id: i64,
     chat_id: i64,
+    /// The forum topic this question was asked in, if it was asked in one.
+    ///
+    /// Carried all the way to the answer because the answer is captured on a
+    /// worker thread, long after the bridge has moved on to another update.
+    topic_id: Option<i64>,
     message_id: i64,
     prompt: String,
     profile: QuestionProfile,
@@ -1964,6 +2121,7 @@ struct QuestionJob {
 struct QuestionCompletion {
     actor_id: i64,
     chat_id: i64,
+    topic_id: Option<i64>,
     message_id: i64,
     text: String,
     answered: bool,
@@ -2070,6 +2228,7 @@ where
                         .send(QuestionCompletion {
                             actor_id: job.actor_id,
                             chat_id: job.chat_id,
+                            topic_id: job.topic_id,
                             message_id: job.message_id,
                             text,
                             answered,
@@ -2151,6 +2310,7 @@ where
                 Some(QuestionCompletion {
                     actor_id,
                     chat_id: 0,
+                    topic_id: None,
                     message_id: 0,
                     text: String::from(QUESTION_WORKER_UNAVAILABLE),
                     answered: false,
@@ -3168,6 +3328,12 @@ pub struct BridgeTotals {
     pub roster_refresh_failures: usize,
     /// Whether the advertised command menu was published.
     pub menu_published: bool,
+    /// Messages dropped because their session was muted.
+    ///
+    /// Counted rather than reported into the chat: a muted session that
+    /// answered "I am muted" would be answering, which is the thing the
+    /// operator asked to stop.
+    pub muted: usize,
 }
 
 /// Records the exact bytes of each response on their way to the poller.
@@ -3506,6 +3672,7 @@ where
                 self.capture_assistant(
                     completion.actor_id,
                     completion.chat_id,
+                    completion.topic_id,
                     &source_key,
                     &answer,
                 );
@@ -3748,6 +3915,7 @@ where
             self.deliver(
                 answer,
                 update.principal().map(TelegramPrincipal::actor_id),
+                update.forum_topic_id(),
                 update.message_id(),
                 cancellation,
                 &mut report,
@@ -3888,18 +4056,55 @@ where
                     return Answer::Ignore;
                 };
                 let at_ms = crate::unix_millis().unwrap_or_default();
+                let topic_id = update.forum_topic_id();
+                // Modifiers are read before anything else looks at the text, so
+                // the command registry and the question path both see the same
+                // residual. They compose with the slash grammar rather than
+                // replacing it: `!new /status` is still a `/status`.
+                let (modifiers, body) = match parse_modifiers(text) {
+                    Ok(parsed) => parsed,
+                    Err(refusal) => {
+                        return Answer::Refused {
+                            chat_id: principal.chat_id(),
+                            text: modifier_refusal_text(refusal),
+                        };
+                    }
+                };
+                // A muted session is silent on both halves: no reply leaves, and
+                // no provider call is made. `/mute off` is the one thing that
+                // still reaches dispatch, or the silence could not be lifted
+                // from the chat it was asked for in.
+                if self.session_is_muted(principal, topic_id, &body, at_ms) {
+                    self.totals.muted += 1;
+                    return Answer::Ignore;
+                }
+                // The rotation precedes the capture. `!new` means *this* message
+                // opens the fresh conversation, so filing it in the one being
+                // left behind would put the first turn of a new session in the
+                // history the operator just asked to stop carrying.
+                if modifiers.rotates_conversation()
+                    && let Some(memory) = self.memory.as_deref_mut()
+                {
+                    let _ = memory.start_conversation(
+                        principal.actor_id(),
+                        principal.chat_id(),
+                        topic_id,
+                        at_ms,
+                    );
+                }
                 if let Some(memory) = self.memory.as_deref_mut()
                     && memory
                         .capture_user(
                             principal.actor_id(),
                             principal.chat_id(),
+                            topic_id,
                             update.source_key(),
-                            text,
+                            &body,
                             at_ms,
                         )
                         .is_ok()
                 {}
-                let trimmed = text.trim();
+                let trimmed = body.trim();
                 if !trimmed.is_empty() && !trimmed.starts_with('/') {
                     if !self.authority.is_admin(principal.actor_id()) {
                         return Answer::Refused {
@@ -3910,14 +4115,26 @@ where
                     return self.answer_question(
                         principal.actor_id(),
                         principal.chat_id(),
+                        topic_id,
                         update.message_id(),
                         update.reply_to_message_id(),
                         update.source_key(),
-                        text,
+                        trimmed,
+                        &modifiers,
                     );
+                }
+                // A message that was nothing but modifiers asked for the
+                // modifiers and nothing else, and `!new` was carried out above.
+                if trimmed.is_empty() && !modifiers.is_empty() {
+                    return Answer::Answered {
+                        chat_id: principal.chat_id(),
+                        text: modifiers_acknowledgement(&modifiers),
+                        preformatted: false,
+                    };
                 }
                 // Bound as a statement so the gate's borrow of `self` ends
                 // before a rendered answer needs `self` mutably.
+                let text: &str = &body;
                 let parsed =
                     authorize_and_parse_tiered(&self.authority, principal.actor_id(), text);
                 match parsed {
@@ -3975,6 +4192,38 @@ where
                                 memory.start_conversation(
                                     principal.actor_id(),
                                     principal.chat_id(),
+                                    topic_id,
+                                    at_ms,
+                                )
+                            });
+                        memory_answer(principal.chat_id(), text)
+                    }
+                    Ok(ControlCommand::Mute { directive }) => {
+                        let text = self
+                            .memory
+                            .as_deref_mut()
+                            .ok_or_else(|| String::from("memory_not_configured"))
+                            .and_then(|memory| {
+                                memory.mute(
+                                    principal.actor_id(),
+                                    principal.chat_id(),
+                                    topic_id,
+                                    directive,
+                                    at_ms,
+                                )
+                            });
+                        memory_answer(principal.chat_id(), text)
+                    }
+                    Ok(ControlCommand::Archive) => {
+                        let text = self
+                            .memory
+                            .as_deref_mut()
+                            .ok_or_else(|| String::from("memory_not_configured"))
+                            .and_then(|memory| {
+                                memory.archive(
+                                    principal.actor_id(),
+                                    principal.chat_id(),
+                                    topic_id,
                                     at_ms,
                                 )
                             });
@@ -3983,6 +4232,7 @@ where
                     Ok(ControlCommand::Research { question }) => self.answer_web_research(
                         principal.actor_id(),
                         principal.chat_id(),
+                        topic_id,
                         update.message_id(),
                         question.as_str(),
                     ),
@@ -3992,6 +4242,7 @@ where
                     }) => self.github_action_answer(
                         principal.actor_id(),
                         principal.chat_id(),
+                        topic_id,
                         update.source_key(),
                         GitHubActionRequest::Create {
                             alias: repo_alias.as_str().to_owned(),
@@ -4003,6 +4254,7 @@ where
                         .github_action_answer(
                             principal.actor_id(),
                             principal.chat_id(),
+                            topic_id,
                             update.source_key(),
                             GitHubActionRequest::Reply {
                                 issue_url: issue_url.as_str().to_owned(),
@@ -4014,6 +4266,7 @@ where
                         .github_action_answer(
                             principal.actor_id(),
                             principal.chat_id(),
+                            topic_id,
                             update.source_key(),
                             GitHubActionRequest::Check {
                                 issue_url: issue_url.as_str().to_owned(),
@@ -4027,6 +4280,7 @@ where
                         .github_action_answer(
                             principal.actor_id(),
                             principal.chat_id(),
+                            topic_id,
                             update.source_key(),
                             GitHubActionRequest::Check {
                                 issue_url: issue_url.as_str().to_owned(),
@@ -4039,6 +4293,7 @@ where
                     Ok(ControlCommand::GitHubIssue { request }) => self.github_action_answer(
                         principal.actor_id(),
                         principal.chat_id(),
+                        topic_id,
                         update.source_key(),
                         GitHubActionRequest::Manage {
                             domain: GitHubManagementDomain::Issue,
@@ -4049,6 +4304,7 @@ where
                     Ok(ControlCommand::GitHubLabel { request }) => self.github_action_answer(
                         principal.actor_id(),
                         principal.chat_id(),
+                        topic_id,
                         update.source_key(),
                         GitHubActionRequest::Manage {
                             domain: GitHubManagementDomain::Label,
@@ -4059,6 +4315,7 @@ where
                     Ok(ControlCommand::GitHubMilestone { request }) => self.github_action_answer(
                         principal.actor_id(),
                         principal.chat_id(),
+                        topic_id,
                         update.source_key(),
                         GitHubActionRequest::Manage {
                             domain: GitHubManagementDomain::Milestone,
@@ -4069,6 +4326,7 @@ where
                     Ok(ControlCommand::GitHubEpic { request }) => self.github_action_answer(
                         principal.actor_id(),
                         principal.chat_id(),
+                        topic_id,
                         update.source_key(),
                         GitHubActionRequest::Manage {
                             domain: GitHubManagementDomain::Epic,
@@ -4079,6 +4337,7 @@ where
                     Ok(ControlCommand::GitHubProject { request }) => self.github_action_answer(
                         principal.actor_id(),
                         principal.chat_id(),
+                        topic_id,
                         update.source_key(),
                         GitHubActionRequest::Manage {
                             domain: GitHubManagementDomain::Project,
@@ -4775,14 +5034,43 @@ where
     /// and malformed-command refusals. One explicit ticket-action grammar is
     /// admitted before Q&A; every other model answer has no route to command
     /// dispatch.
+    /// Whether this session is silenced, and this message is not the thing
+    /// that lifts the silence.
+    ///
+    /// `/mute off` and `/archive` always reach dispatch. A mute that swallowed
+    /// its own recovery verb would leave an operator with a bot that is not
+    /// broken, cannot be told so, and looks exactly like one that is.
+    fn session_is_muted(
+        &mut self,
+        principal: TelegramPrincipal,
+        topic_id: Option<i64>,
+        body: &str,
+        at_ms: i64,
+    ) -> bool {
+        if matches!(
+            parse_command(body),
+            Ok(ControlCommand::Mute {
+                directive: MuteDirective::Off
+            } | ControlCommand::Archive)
+        ) {
+            return false;
+        }
+        self.memory.as_deref_mut().is_some_and(|memory| {
+            memory.is_muted(principal.actor_id(), principal.chat_id(), topic_id, at_ms)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn answer_question(
         &mut self,
         actor_id: i64,
         chat_id: i64,
+        topic_id: Option<i64>,
         message_id: Option<i64>,
         reply_to_message_id: Option<i64>,
         source_key: &str,
         question: &str,
+        modifiers: &MessageModifiers,
     ) -> Answer {
         // Start end-to-end timing before any named live source is read. Slack
         // and GitHub latency must not disappear from the footer merely because
@@ -4850,8 +5138,9 @@ where
         if let Some(actions) = self.github_actions.as_ref() {
             match actions.natural_request(question) {
                 Ok(Some(request)) => {
-                    return self
-                        .github_action_answer(actor_id, chat_id, source_key, request, question);
+                    return self.github_action_answer(
+                        actor_id, chat_id, topic_id, source_key, request, question,
+                    );
                 }
                 Ok(None) => {}
                 Err(text) => return Answer::Refused { chat_id, text },
@@ -4898,11 +5187,21 @@ where
                 preformatted: false,
             };
         }
-        let profile = question_profile(question);
+        // A modifier overrides the local classifier and nothing else: it can
+        // move a question between the profiles this daemon already routes to,
+        // and it deliberately cannot reach `WebResearch`, which needs the
+        // explicit `/research` consent rather than a switch typed in front of a
+        // sentence.
+        let profile =
+            modifier_question_profile(modifiers).unwrap_or_else(|| question_profile(question));
         let memory_context = self
             .memory
             .as_deref_mut()
-            .and_then(|memory| memory.context(actor_id, chat_id, question, at_ms).ok())
+            .and_then(|memory| {
+                memory
+                    .context(actor_id, chat_id, topic_id, question, at_ms)
+                    .ok()
+            })
             .unwrap_or_default();
         let context = match profile {
             QuestionProfile::Conversation | QuestionProfile::WebResearch => memory_context,
@@ -4952,6 +5251,7 @@ where
         Answer::QuestionReady {
             actor_id,
             chat_id,
+            topic_id,
             message_id,
             prompt,
             profile,
@@ -4969,6 +5269,7 @@ where
         &mut self,
         actor_id: i64,
         chat_id: i64,
+        topic_id: Option<i64>,
         message_id: Option<i64>,
         question: &str,
     ) -> Answer {
@@ -4978,7 +5279,11 @@ where
         let memory_context = self
             .memory
             .as_deref_mut()
-            .and_then(|memory| memory.context(actor_id, chat_id, question, at_ms).ok())
+            .and_then(|memory| {
+                memory
+                    .context(actor_id, chat_id, topic_id, question, at_ms)
+                    .ok()
+            })
             .unwrap_or_default();
         let Some(prompt) = question_prompt(
             question,
@@ -5001,6 +5306,7 @@ where
         Answer::QuestionReady {
             actor_id,
             chat_id,
+            topic_id,
             message_id,
             prompt,
             profile: QuestionProfile::WebResearch,
@@ -5009,10 +5315,12 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn github_action_answer(
         &mut self,
         actor_id: i64,
         chat_id: i64,
+        topic_id: Option<i64>,
         source_key: &str,
         request: GitHubActionRequest,
         instruction: &str,
@@ -5029,7 +5337,11 @@ where
         let memory = self
             .memory
             .as_deref_mut()
-            .and_then(|memory| memory.context(actor_id, chat_id, instruction, at_ms).ok())
+            .and_then(|memory| {
+                memory
+                    .context(actor_id, chat_id, topic_id, instruction, at_ms)
+                    .ok()
+            })
             .unwrap_or_default();
         let administrators = self.roster.admins().to_vec();
         let configured = self.roster.configured().to_vec();
@@ -5323,6 +5635,8 @@ where
             | ControlCommand::Remember { .. }
             | ControlCommand::Forget { .. }
             | ControlCommand::New
+            | ControlCommand::Mute { .. }
+            | ControlCommand::Archive
             | ControlCommand::Say { .. }
             | ControlCommand::Admin { .. }
             | ControlCommand::Approve { .. }
@@ -5627,10 +5941,19 @@ where
     }
 
     /// Send one decided answer and count what happened to it.
+    /// Send one answer and record it in the session it belongs to.
+    ///
+    /// `topic_id` is the forum topic the update being dispatched arrived in, so
+    /// the assistant's own message is captured in the same conversation the
+    /// operator's was. It is a parameter rather than bridge state for the reason
+    /// it is one on [`MemorySurface`]: this method recurses, and a field would
+    /// have to be right for every arm of that recursion.
+    #[allow(clippy::too_many_arguments)]
     fn deliver(
         &mut self,
         answer: Answer,
         actor_id: Option<i64>,
+        topic_id: Option<i64>,
         reply_to_message_id: Option<i64>,
         cancellation: &CancellationToken,
         report: &mut DispatchReport,
@@ -5643,6 +5966,7 @@ where
         if let Answer::QuestionReady {
             actor_id,
             chat_id,
+            topic_id,
             message_id,
             prompt,
             profile,
@@ -5667,6 +5991,7 @@ where
             match self.questions.submit(QuestionJob {
                 actor_id,
                 chat_id,
+                topic_id,
                 message_id,
                 prompt,
                 profile,
@@ -5683,6 +6008,7 @@ where
                             text: String::from(QUESTION_BUSY),
                         },
                         Some(actor_id),
+                        topic_id,
                         reply_to_message_id,
                         cancellation,
                         report,
@@ -5694,6 +6020,7 @@ where
                         text: String::from(QUESTION_WORKER_UNAVAILABLE),
                     },
                     Some(actor_id),
+                    topic_id,
                     reply_to_message_id,
                     cancellation,
                     report,
@@ -5730,6 +6057,7 @@ where
                         text: String::from(TICKET_ACTION_BUSY),
                     },
                     actor_id,
+                    topic_id,
                     reply_to_message_id,
                     cancellation,
                     report,
@@ -5740,6 +6068,7 @@ where
                         text: String::from(TICKET_ACTION_UNAVAILABLE),
                     },
                     actor_id,
+                    topic_id,
                     reply_to_message_id,
                     cancellation,
                     report,
@@ -5767,6 +6096,7 @@ where
                         text: String::from(TICKET_ACTION_BUSY),
                     },
                     actor_id,
+                    topic_id,
                     reply_to_message_id,
                     cancellation,
                     report,
@@ -5777,6 +6107,7 @@ where
                         text: String::from(TICKET_ACTION_UNAVAILABLE),
                     },
                     actor_id,
+                    topic_id,
                     reply_to_message_id,
                     cancellation,
                     report,
@@ -5838,6 +6169,7 @@ where
                     preformatted: false,
                 },
                 actor_id,
+                topic_id,
                 reply_to_message_id,
                 cancellation,
                 report,
@@ -5868,6 +6200,7 @@ where
                         text: String::from(TICKET_ACTION_BUSY),
                     },
                     actor_id,
+                    topic_id,
                     reply_to_message_id,
                     cancellation,
                     report,
@@ -5878,6 +6211,7 @@ where
                         text: String::from(TICKET_ACTION_UNAVAILABLE),
                     },
                     actor_id,
+                    topic_id,
                     reply_to_message_id,
                     cancellation,
                     report,
@@ -5916,6 +6250,7 @@ where
                         text: String::from(EMAIL_ACTION_BUSY),
                     },
                     actor_id,
+                    topic_id,
                     reply_to_message_id,
                     cancellation,
                     report,
@@ -5926,6 +6261,7 @@ where
                         text: String::from(EMAIL_ACTION_UNAVAILABLE),
                     },
                     actor_id,
+                    topic_id,
                     reply_to_message_id,
                     cancellation,
                     report,
@@ -6053,19 +6389,26 @@ where
                 },
                 |message_id| telegram_outbound_message_key(self.bot_id, chat_id, message_id),
             );
-            self.capture_assistant(actor_id, chat_id, &source_key, &answer);
+            self.capture_assistant(actor_id, chat_id, topic_id, &source_key, &answer);
             if let Some(message_id) = outbound_message_id {
                 self.remember_answer(actor_id, chat_id, message_id, answer);
             }
         }
     }
 
-    fn capture_assistant(&mut self, actor_id: i64, chat_id: i64, source_key: &str, text: &str) {
+    fn capture_assistant(
+        &mut self,
+        actor_id: i64,
+        chat_id: i64,
+        topic_id: Option<i64>,
+        source_key: &str,
+        text: &str,
+    ) {
         let Some(memory) = self.memory.as_deref_mut() else {
             return;
         };
         let at_ms = crate::unix_millis().unwrap_or_default();
-        let _ = memory.capture_assistant(actor_id, chat_id, source_key, text, at_ms);
+        let _ = memory.capture_assistant(actor_id, chat_id, topic_id, source_key, text, at_ms);
     }
 
     /// Issue one outbound call, counting its outcome.
@@ -6444,6 +6787,7 @@ enum Answer {
     QuestionReady {
         actor_id: i64,
         chat_id: i64,
+        topic_id: Option<i64>,
         message_id: i64,
         prompt: String,
         profile: QuestionProfile,
@@ -6882,6 +7226,74 @@ impl RunProgressView {
         }
         bounded_text_to(out.trim_end(), MAX_RUN_ANSWER_UNITS)
     }
+}
+
+/// The profile one message's modifiers selected, if they selected one.
+///
+/// Two axes reach the same seam in this build, because this daemon has exactly
+/// two configured deployments and the profile is how it addresses them: a
+/// profile modifier says how much effort, and `!model` names the deployment.
+/// A profile modifier wins when both are present — it is the more specific
+/// statement about *this* message — and `!model` decides on its own otherwise.
+///
+/// `!model` never becomes a model string. It selects a profile whose deployment
+/// the owner's configuration defines, which is the only path from a chat to a
+/// provider this daemon has.
+fn modifier_question_profile(modifiers: &MessageModifiers) -> Option<QuestionProfile> {
+    if let Some(kind) = modifiers.profile() {
+        return match kind {
+            ModifierKind::Fast => Some(QuestionProfile::Conversation),
+            ModifierKind::Ask => Some(QuestionProfile::OperationalLookup),
+            ModifierKind::Think => Some(QuestionProfile::Operational),
+            // Neither of these selects a profile; `ModifierKind::selects_profile`
+            // is what keeps this arm unreachable, and it is written out rather
+            // than swept into a wildcard so a new modifier has to be placed.
+            ModifierKind::New | ModifierKind::Model => None,
+        };
+    }
+    modifiers.model().map(|alias| match alias {
+        ModelAlias::Flash => QuestionProfile::Conversation,
+        ModelAlias::Codex => QuestionProfile::Operational,
+    })
+}
+
+/// The reply for a message whose leading modifier was not in the closed set.
+///
+/// Names the whole vocabulary and nothing of the sender's text — the refusal is
+/// content-free like every other one on this surface, and the set it names is
+/// the same array the parser reads.
+fn modifier_refusal_text(refusal: CommandRefusal) -> String {
+    let vocabulary = ALL_MODIFIERS
+        .iter()
+        .map(|kind: &ModifierKind| {
+            if kind.takes_alias() {
+                format!("{kind} <{}>", model_alias_list())
+            } else {
+                kind.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{} Modifiers: {vocabulary}.", refusal.operator_reply())
+}
+
+fn model_alias_list() -> String {
+    ModelAlias::ALL
+        .iter()
+        .map(|alias: &ModelAlias| alias.as_str())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// The reply for a message that carried modifiers and no body.
+fn modifiers_acknowledgement(modifiers: &MessageModifiers) -> String {
+    let applied = modifiers
+        .as_slice()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("Applied {applied}. Send a message to use it.")
 }
 
 fn memory_answer(chat_id: i64, outcome: Result<String, String>) -> Answer {

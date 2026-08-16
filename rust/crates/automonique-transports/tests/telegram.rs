@@ -49,6 +49,53 @@ fn direct_reply_identity_is_retained() {
     assert_eq!(batch.updates()[0].reply_to_message_id(), Some(55));
 }
 
+/// A forum topic is a separate room, and a reply chain in an ordinary
+/// supergroup is not — even though Telegram spells both with a
+/// `message_thread_id`. Only the flag tells them apart, so only the flag is
+/// allowed to.
+#[test]
+fn only_a_flagged_forum_topic_reports_a_thread_coordinate() {
+    let topic = parse_telegram_updates(
+        br#"{"ok":true,"result":[{"update_id":9,"message":{"message_id":77,"chat":{"id":-100},"from":{"id":42},"message_thread_id":31,"is_topic_message":true,"text":"in the topic"}}]}"#,
+        9,
+        &policy(),
+    )
+    .expect("topic");
+    assert_eq!(topic.updates()[0].forum_topic_id(), Some(31));
+
+    // The same coordinate without the flag is a reply chain, and reporting it
+    // would split one group conversation into a session per chain.
+    let reply_chain = parse_telegram_updates(
+        br#"{"ok":true,"result":[{"update_id":9,"message":{"message_id":77,"chat":{"id":-100},"from":{"id":42},"message_thread_id":31,"text":"in a reply chain"}}]}"#,
+        9,
+        &policy(),
+    )
+    .expect("reply chain");
+    assert_eq!(reply_chain.updates()[0].forum_topic_id(), None);
+
+    // A direct message has no thread at all, which is what keeps the bare chat
+    // scope the primary session.
+    let direct = parse_telegram_updates(
+        br#"{"ok":true,"result":[{"update_id":9,"message":{"message_id":77,"chat":{"id":-100},"from":{"id":42},"text":"hello"}}]}"#,
+        9,
+        &policy(),
+    )
+    .expect("direct");
+    assert_eq!(direct.updates()[0].forum_topic_id(), None);
+
+    // A malformed coordinate is refused rather than folded into the chat.
+    for payload in [
+        br#"{"ok":true,"result":[{"update_id":9,"message":{"message_id":77,"chat":{"id":-100},"from":{"id":42},"message_thread_id":0,"is_topic_message":true,"text":"hi"}}]}"#.as_slice(),
+        br#"{"ok":true,"result":[{"update_id":9,"message":{"message_id":77,"chat":{"id":-100},"from":{"id":42},"message_thread_id":"31","is_topic_message":true,"text":"hi"}}]}"#.as_slice(),
+        br#"{"ok":true,"result":[{"update_id":9,"message":{"message_id":77,"chat":{"id":-100},"from":{"id":42},"message_thread_id":31,"is_topic_message":"yes","text":"hi"}}]}"#.as_slice(),
+    ] {
+        assert!(
+            parse_telegram_updates(payload, 9, &policy()).is_err(),
+            "a malformed thread coordinate must not become the chat scope"
+        );
+    }
+}
+
 #[test]
 fn edits_attachments_and_business_deletes_have_closed_semantics() {
     let edited = parse_telegram_updates(

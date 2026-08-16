@@ -88,7 +88,7 @@ use automonique_slack_connector::{
     SlackUser, TriggerId, UserId, UsersInfoRequest,
 };
 use automonique_store::agent_memory::{
-    AgentMemoryStore, ExternalIdentity, MessageInput, redact_content,
+    AgentMemoryStore, ConversationScope, ExternalIdentity, MessageInput, redact_content,
 };
 use automonique_store::approval_requests::{ApprovalRequests, ApprovalState};
 use automonique_store::slack_interactions::{
@@ -2410,7 +2410,13 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                 crate::unix_millis().unwrap_or_default(),
             )
             .map_err(|_| ())?;
-        let external_scope = format!("channel:{}:thread:{}", event.channel, event.parent);
+        // Derived rather than formatted here: this is byte-identical to the
+        // scope this bridge has always written, and going through the store's
+        // versioned producer is what keeps it that way as the grammar grows.
+        let external_scope =
+            ConversationScope::slack(event.channel.as_str(), Some(event.parent.as_str()))
+                .map_err(|_| ())?;
+        let external_scope = external_scope.as_str();
         let conversation_id = format!(
             "slack:{}:{}:{}:{}",
             event.team_id, event.channel, event.parent, event.user
@@ -2422,7 +2428,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                 actor: &actor,
                 conversation_id: &conversation_id,
                 transport: "slack",
-                external_scope: &external_scope,
+                external_scope,
                 transport_key: &event.source_key,
                 role: "user",
                 content: &content,
@@ -2470,7 +2476,12 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             | GitHubActionRequest::Check { instruction, .. }
             | GitHubActionRequest::Manage { instruction, .. } => redact_content(instruction),
         };
-        let external_scope = format!("channel:{}:github-command", command.channel);
+        // A slash command is not a thread: it belongs to the channel's own
+        // session, which is the unthreaded scope. The literal suffix stays
+        // because it is a distinct session, not a thread coordinate.
+        let channel_scope =
+            ConversationScope::slack(command.channel.as_str(), None).map_err(|_| ())?;
+        let external_scope = format!("{channel_scope}:github-command");
         let conversation_id = format!(
             "slack:{}:{}:github-command:{}",
             command.team_id, command.channel, command.user
@@ -4695,6 +4706,86 @@ mod tests {
                 .resolve_identity("slack", "automonique-slack", "T0RESERVED", "U0REQUEST01")
                 .expect("no binding"),
             None
+        );
+    }
+
+    /// Two threads of one Slack channel are two sessions, and the scope this
+    /// bridge writes is byte-identical to the one it wrote before the
+    /// derivation was versioned — so no existing head is orphaned.
+    #[test]
+    fn slack_threads_are_separate_sessions_under_the_scope_this_bridge_already_wrote() {
+        let root = tempfile::tempdir().expect("memory root");
+        std::fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private memory root");
+        let mut memory =
+            AgentMemoryStore::open(root.path().join("agent-memory.sqlite3")).expect("memory store");
+        let router = SlackTicketRouter {
+            poster: FakeTicketPoster::default(),
+            manage: Box::new(FakeManage::default()),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
+            channels: ChannelMap(vec![(
+                name("ops"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![SlackFeature::Approvals, SlackFeature::Conversation],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+            approvals: None,
+            approval_lane: None,
+        };
+        let mut in_thread = |thread_ts: &str, event_id: &str| {
+            let mut event = ticket_event("U0ADMIN001", "bonjour", event_id);
+            event.parent = MessageTs::new(thread_ts).expect("timestamp");
+            router
+                .capture_memory(&mut memory, &event)
+                .expect("captured");
+        };
+        in_thread("1723542000.000100", "Thread1");
+        in_thread("1723542900.000200", "Thread2");
+
+        let actor = "slack:T0RESERVED:U0ADMIN001";
+        // The exact string this bridge has always written, spelled out here so
+        // a change to the derivation cannot pass silently.
+        let first = memory
+            .current_conversation(
+                "primary",
+                actor,
+                "slack",
+                "channel:C0RESERVED01:thread:1723542000.000100",
+            )
+            .expect("first head")
+            .expect("the first thread has its own session");
+        let second = memory
+            .current_conversation(
+                "primary",
+                actor,
+                "slack",
+                "channel:C0RESERVED01:thread:1723542900.000200",
+            )
+            .expect("second head")
+            .expect("the second thread has its own session");
+        assert_ne!(first, second);
+        // And the channel's own unthreaded scope is not either of them.
+        assert_eq!(
+            memory
+                .current_conversation("primary", actor, "slack", "channel:C0RESERVED01")
+                .expect("channel head"),
+            None
+        );
+        assert_eq!(
+            ConversationScope::slack("C0RESERVED01", Some("1723542000.000100"))
+                .expect("derived")
+                .as_str(),
+            "channel:C0RESERVED01:thread:1723542000.000100"
         );
     }
 

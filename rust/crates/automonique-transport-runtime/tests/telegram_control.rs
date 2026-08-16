@@ -392,6 +392,8 @@ fn the_manifest_is_exhaustive_over_the_registry_and_round_trips() {
             "remember",
             "forget",
             "new",
+            "mute",
+            "archive",
             "research",
             "github_create",
             "github_reply",
@@ -418,6 +420,7 @@ fn the_manifest_is_exhaustive_over_the_registry_and_round_trips() {
             ArgumentShape::Reference => format!("/{} reference-1", entry.name),
             ArgumentShape::Directive => format!("/{} list", entry.name),
             ArgumentShape::MemoryDirective => format!("/{} proposals", entry.name),
+            ArgumentShape::MuteDirective => format!("/{} 1h", entry.name),
             ArgumentShape::Channel => format!("/{} ops", entry.name),
             ArgumentShape::ChannelMessage => format!("/{} ops bonjour", entry.name),
             ArgumentShape::GitHubRepositoryRequest => {

@@ -16,12 +16,32 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 
 use crate::{BUSY_TIMEOUT, StoreError, validate_database_path};
 
-pub const AGENT_MEMORY_SCHEMA_VERSION: u32 = 1;
+pub const AGENT_MEMORY_SCHEMA_VERSION: u32 = 2;
 pub const MAX_MEMORY_CONTENT_BYTES: usize = 8 * 1024;
 pub const MAX_MESSAGE_CONTENT_BYTES: usize = 32 * 1024;
 pub const MAX_MEMORY_FIELD_BYTES: usize = 512;
 pub const MAX_SEARCH_RESULTS: usize = 32;
 pub const DEFAULT_RAW_RETENTION_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
+
+/// Which derivation produced the `external_scope` strings this build writes.
+///
+/// Version 1 wrote exactly one scope per chat or channel. Version 2 keeps that
+/// spelling unchanged for every surface that has no thread — direct messages,
+/// ordinary groups, a Slack channel addressed outside a thread — and only
+/// *extends* it with a thread segment where the transport really has one.
+///
+/// That is the whole migration story, and it is deliberately not a data
+/// rewrite: a row written by version 1 is a version 2 scope for the same
+/// session, so an existing head keeps answering for the conversation it always
+/// named. Nothing is orphaned, nothing is rewritten, and a deployment can be
+/// rolled back without stranding the rows it wrote while it was ahead.
+pub const CONVERSATION_SCOPE_VERSION: u32 = 2;
+
+/// Longest external scope segment this derivation will accept.
+///
+/// Well below [`MAX_MEMORY_FIELD_BYTES`], because a whole derived scope is
+/// several segments and the field bound applies to the composed string.
+pub const MAX_SCOPE_SEGMENT_BYTES: usize = 128;
 
 #[must_use]
 pub fn redact_content(text: &str) -> String {
@@ -211,6 +231,168 @@ CREATE TABLE memory_audit (
 
 CREATE INDEX memory_audit_by_memory ON memory_audit(memory_id, audit_id);
 "#;
+
+/// The one ladder step that gives a conversation a mute deadline.
+///
+/// An added column rather than a second table: mute is a property of the
+/// conversation the head already names, and a side table would make "is this
+/// session muted" a join that every inbound message would have to perform
+/// before deciding whether to spend anything.
+///
+/// `NULL` is the only spelling of "not muted", so an expired mute is left as
+/// the deadline it was rather than being rewritten to `NULL` by a reader —
+/// [`ConversationState::is_muted`] compares against the clock instead. A reader
+/// that cleared it would be writing durable state on a read path.
+const MIGRATE_V1_TO_V2: &str = r#"
+ALTER TABLE conversations
+ADD COLUMN muted_until_ms INTEGER CHECK (muted_until_ms IS NULL OR muted_until_ms >= 0);
+"#;
+
+/// One derived session key, as the `external_scope` column spells it.
+///
+/// The daemon must not format this string itself. Two transports and two
+/// granularities is already four spellings, and a surface that composed its own
+/// would be free to disagree with the one the head was written under — which
+/// does not fail, it silently starts a second session.
+///
+/// # The grammar
+///
+/// | surface | scope |
+/// |---|---|
+/// | Telegram chat (direct message, ordinary group) | `chat:<chat_id>` |
+/// | Telegram forum topic | `chat:<chat_id>:topic:<topic_id>` |
+/// | Slack channel | `channel:<channel>` |
+/// | Slack thread | `channel:<channel>:thread:<thread_ts>` |
+///
+/// The unthreaded spellings are byte-identical to what
+/// [`CONVERSATION_SCOPE_VERSION`] 1 wrote, which is the point: a direct message
+/// keeps the one shared session it has always had, and only a surface that
+/// really has threads gets one session per thread.
+///
+/// The separator is `:` throughout, matching every other durable key in this
+/// store. A scope is never parsed back apart — it is an opaque key — so the
+/// segments exist to keep two different sessions from colliding, not to be
+/// read.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConversationScope {
+    scope: String,
+    threaded: bool,
+}
+
+impl ConversationScope {
+    /// Derive one Telegram session key.
+    ///
+    /// `forum_topic_id` is `Some` only for a message a caller has already
+    /// established is in a forum topic. A direct message and an ordinary group
+    /// both pass `None` and share one session per chat, which is what an
+    /// operator means by "the conversation with the bot"; a forum topic is a
+    /// separate room to the people in it, so it is a separate session here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentMemoryError::InvalidField`] for a zero chat id or a
+    /// non-positive topic id. Telegram spells neither, so both are refused
+    /// rather than folded into the bare scope — a malformed coordinate that
+    /// quietly became the primary session would put a group's messages in a
+    /// direct-message history.
+    pub fn telegram(chat_id: i64, forum_topic_id: Option<i64>) -> Kept<Self> {
+        if chat_id == 0 {
+            return Err(AgentMemoryError::InvalidField("chat_id"));
+        }
+        let Some(topic_id) = forum_topic_id else {
+            return Self::bounded(format!("chat:{chat_id}"), false);
+        };
+        if topic_id <= 0 {
+            return Err(AgentMemoryError::InvalidField("forum_topic_id"));
+        }
+        Self::bounded(format!("chat:{chat_id}:topic:{topic_id}"), true)
+    }
+
+    /// Derive one Slack session key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentMemoryError::InvalidField`] for a channel or thread
+    /// timestamp outside the accepted segment grammar.
+    pub fn slack(channel: &str, thread_ts: Option<&str>) -> Kept<Self> {
+        validate_scope_segment(channel, "channel")?;
+        let Some(thread_ts) = thread_ts else {
+            return Self::bounded(format!("channel:{channel}"), false);
+        };
+        validate_scope_segment(thread_ts, "thread_ts")?;
+        Self::bounded(format!("channel:{channel}:thread:{thread_ts}"), true)
+    }
+
+    fn bounded(scope: String, threaded: bool) -> Kept<Self> {
+        validate_field(&scope, "external_scope")?;
+        Ok(Self { scope, threaded })
+    }
+
+    /// The exact key to store and look up.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.scope
+    }
+
+    /// Whether this scope isolates one thread rather than a whole chat.
+    ///
+    /// Reported rather than re-derived from the string: a caller that wants to
+    /// treat threads differently should not be parsing a key apart to find out.
+    #[must_use]
+    pub const fn is_threaded(&self) -> bool {
+        self.threaded
+    }
+}
+
+impl fmt::Display for ConversationScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.scope)
+    }
+}
+
+/// The durable lifecycle of one conversation.
+///
+/// Read as a whole rather than field by field, because the two lifecycle verbs
+/// are decided together: an archived conversation is finished, a muted one is
+/// merely quiet, and a caller that read only one of the two would answer a
+/// message it should have skipped.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConversationState {
+    pub conversation_id: String,
+    pub tenant: String,
+    pub actor: String,
+    pub transport: String,
+    pub external_scope: String,
+    pub created_at_ms: i64,
+    pub last_message_at_ms: i64,
+    pub archived_at_ms: Option<i64>,
+    pub muted_until_ms: Option<i64>,
+    pub revision: u32,
+}
+
+impl ConversationState {
+    /// Whether this conversation is muted at `at_ms`.
+    ///
+    /// The deadline is compared, never rewritten: an expired mute stays on the
+    /// row as the deadline it was, so the fact that somebody muted this session
+    /// until a moment that has now passed remains legible. Mute means *suppress
+    /// the outbound reply and skip the provider spend*, so a caller that reads
+    /// `true` here must do both — answering into a muted thread and merely not
+    /// sending it would spend exactly what the operator asked to stop.
+    #[must_use]
+    pub const fn is_muted(&self, at_ms: i64) -> bool {
+        match self.muted_until_ms {
+            Some(until_ms) => at_ms < until_ms,
+            None => false,
+        }
+    }
+
+    /// Whether this conversation has been closed by `/archive`.
+    #[must_use]
+    pub const fn is_archived(&self) -> bool {
+        self.archived_at_ms.is_some()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryKind {
@@ -786,6 +968,164 @@ impl AgentMemoryStore {
         Ok(revision)
     }
 
+    /// The durable lifecycle of whichever conversation this scope currently
+    /// heads.
+    ///
+    /// `None` means no session has been opened for the scope yet, which is not
+    /// an error: a chat nobody has written in has nothing to be muted or
+    /// archived, and it is also the state a scope is left in by
+    /// [`Self::archive_conversation`].
+    pub fn conversation_state(
+        &self,
+        tenant: &str,
+        actor: &str,
+        transport: &str,
+        external_scope: &str,
+    ) -> Kept<Option<ConversationState>> {
+        for (value, field) in [
+            (tenant, "tenant"),
+            (actor, "actor"),
+            (transport, "transport"),
+            (external_scope, "external_scope"),
+        ] {
+            validate_field(value, field)?;
+        }
+        self.connection
+            .query_row(
+                "SELECT c.conversation_id,c.tenant,c.actor,c.transport,c.external_scope,
+                        c.created_at_ms,c.last_message_at_ms,c.archived_at_ms,c.muted_until_ms,
+                        c.revision
+                 FROM conversation_heads h JOIN conversations c
+                   ON c.conversation_id=h.conversation_id
+                 WHERE h.tenant=?1 AND h.actor=?2 AND h.transport=?3 AND h.external_scope=?4",
+                params![tenant, actor, transport, external_scope],
+                read_conversation_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Mute the session this scope heads until `until_ms`, or lift the mute.
+    ///
+    /// `until_ms` of `None` is the unmute, and it is the same verb rather than
+    /// a second one because both are one compare-and-set on the same column: a
+    /// separate `unmute` would be a second write path to the same field that a
+    /// future reader would have to prove agrees with this one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentMemoryError::NotFound`] when the scope heads no
+    /// conversation, [`AgentMemoryError::Conflict`] for an archived one — a
+    /// finished session cannot be muted, because nothing will speak into it
+    /// anyway — and [`AgentMemoryError::StaleRevision`] when the row moved
+    /// under the read.
+    pub fn mute_conversation(
+        &mut self,
+        tenant: &str,
+        actor: &str,
+        transport: &str,
+        external_scope: &str,
+        until_ms: Option<i64>,
+        at_ms: i64,
+    ) -> Kept<ConversationState> {
+        for (value, field) in [
+            (tenant, "tenant"),
+            (actor, "actor"),
+            (transport, "transport"),
+            (external_scope, "external_scope"),
+        ] {
+            validate_field(value, field)?;
+        }
+        validate_time(at_ms, "at_ms")?;
+        if let Some(until_ms) = until_ms {
+            validate_time(until_ms, "muted_until_ms")?;
+            if until_ms <= at_ms {
+                return Err(AgentMemoryError::InvalidField("muted_until_ms"));
+            }
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current =
+            read_head_conversation(&transaction, tenant, actor, transport, external_scope)?
+                .ok_or(AgentMemoryError::NotFound)?;
+        if current.is_archived() {
+            return Err(AgentMemoryError::Conflict);
+        }
+        let changed = transaction.execute(
+            "UPDATE conversations SET muted_until_ms=?1, revision=revision+1
+             WHERE conversation_id=?2 AND tenant=?3 AND revision=?4",
+            params![until_ms, current.conversation_id, tenant, current.revision],
+        )?;
+        if changed != 1 {
+            return Err(AgentMemoryError::StaleRevision);
+        }
+        let state = read_head_conversation(&transaction, tenant, actor, transport, external_scope)?
+            .ok_or(AgentMemoryError::Corrupt("muted_conversation"))?;
+        transaction.commit()?;
+        Ok(state)
+    }
+
+    /// Close the session this scope heads.
+    ///
+    /// The conversation is tombstoned with `archived_at_ms` and its head row is
+    /// removed, so the next message in the scope opens a fresh session while
+    /// every message of the closed one stays exactly where it was. That is the
+    /// difference from [`Self::start_conversation`]: `/new` moves the head on
+    /// and leaves the old conversation live, `/archive` says this one is
+    /// finished.
+    ///
+    /// Returns the archived conversation's identifier and its new revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentMemoryError::NotFound`] when the scope heads no
+    /// conversation — including a scope already archived, because archiving
+    /// removed its head — and [`AgentMemoryError::Conflict`] when the
+    /// conversation the head still names was already archived.
+    pub fn archive_conversation(
+        &mut self,
+        tenant: &str,
+        actor: &str,
+        transport: &str,
+        external_scope: &str,
+        at_ms: i64,
+    ) -> Kept<(String, u32)> {
+        for (value, field) in [
+            (tenant, "tenant"),
+            (actor, "actor"),
+            (transport, "transport"),
+            (external_scope, "external_scope"),
+        ] {
+            validate_field(value, field)?;
+        }
+        validate_time(at_ms, "at_ms")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current =
+            read_head_conversation(&transaction, tenant, actor, transport, external_scope)?
+                .ok_or(AgentMemoryError::NotFound)?;
+        if current.is_archived() {
+            return Err(AgentMemoryError::Conflict);
+        }
+        let changed = transaction.execute(
+            "UPDATE conversations SET archived_at_ms=?1, revision=revision+1
+             WHERE conversation_id=?2 AND tenant=?3 AND revision=?4",
+            params![at_ms, current.conversation_id, tenant, current.revision],
+        )?;
+        if changed != 1 {
+            return Err(AgentMemoryError::StaleRevision);
+        }
+        transaction.execute(
+            "DELETE FROM conversation_heads
+             WHERE tenant=?1 AND actor=?2 AND transport=?3 AND external_scope=?4",
+            params![tenant, actor, transport, external_scope],
+        )?;
+        transaction.commit()?;
+        Ok((current.conversation_id, current.revision + 1))
+    }
+
     pub fn recent_messages(
         &self,
         tenant: &str,
@@ -1279,6 +1619,25 @@ fn validate_field(value: &str, field: &'static str) -> Kept<()> {
     Ok(())
 }
 
+/// Validate one segment a derived scope is composed from.
+///
+/// Narrower than [`validate_field`] on purpose: a segment carrying the `:` this
+/// grammar separates on could make two different sessions compose the same key,
+/// so the separator is refused inside a segment rather than escaped. Whitespace
+/// and control characters go the same way, for the reason they do everywhere
+/// else on an untrusted boundary.
+fn validate_scope_segment(value: &str, field: &'static str) -> Kept<()> {
+    if value.is_empty()
+        || value.len() > MAX_SCOPE_SEGMENT_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(AgentMemoryError::InvalidField(field));
+    }
+    Ok(())
+}
+
 fn validate_content(value: &str, max: usize, field: &'static str) -> Kept<()> {
     let value = value.trim();
     if value.is_empty() || value.len() > max || value.contains('\0') {
@@ -1321,6 +1680,9 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Kept<()> {
     if version == AGENT_MEMORY_SCHEMA_VERSION {
         return Ok(());
     }
+    if version == 1 {
+        return migrate_v1_to_v2(connection);
+    }
     if version != 0 {
         return Err(AgentMemoryError::SchemaVersion {
             found: version,
@@ -1338,11 +1700,60 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Kept<()> {
             supported: AGENT_MEMORY_SCHEMA_VERSION,
         });
     }
+    // A fresh database walks the same ladder an upgraded one does, so the two
+    // cannot describe different schemas wearing the same `user_version`.
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(SCHEMA_V1)?;
+    transaction.execute_batch(MIGRATE_V1_TO_V2)?;
     transaction.pragma_update(None, "user_version", AGENT_MEMORY_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
+}
+
+fn migrate_v1_to_v2(connection: &mut Connection) -> Kept<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(MIGRATE_V1_TO_V2)?;
+    transaction.pragma_update(None, "user_version", AGENT_MEMORY_SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn read_head_conversation(
+    connection: &Connection,
+    tenant: &str,
+    actor: &str,
+    transport: &str,
+    external_scope: &str,
+) -> Kept<Option<ConversationState>> {
+    connection
+        .query_row(
+            "SELECT c.conversation_id,c.tenant,c.actor,c.transport,c.external_scope,
+                    c.created_at_ms,c.last_message_at_ms,c.archived_at_ms,c.muted_until_ms,
+                    c.revision
+             FROM conversation_heads h JOIN conversations c
+               ON c.conversation_id=h.conversation_id
+             WHERE h.tenant=?1 AND h.actor=?2 AND h.transport=?3 AND h.external_scope=?4",
+            params![tenant, actor, transport, external_scope],
+            read_conversation_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn read_conversation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationState> {
+    let revision: i64 = row.get(9)?;
+    Ok(ConversationState {
+        conversation_id: row.get(0)?,
+        tenant: row.get(1)?,
+        actor: row.get(2)?,
+        transport: row.get(3)?,
+        external_scope: row.get(4)?,
+        created_at_ms: row.get(5)?,
+        last_message_at_ms: row.get(6)?,
+        archived_at_ms: row.get(7)?,
+        muted_until_ms: row.get(8)?,
+        revision: u32::try_from(revision).map_err(|_| rusqlite::Error::InvalidQuery)?,
+    })
 }
 
 fn read_memory_by_source(
@@ -1648,6 +2059,380 @@ mod tests {
             store.activate("primary", "ben", candidate.id, 1, "stale", 2_200),
             Err(AgentMemoryError::StaleRevision)
         ));
+    }
+
+    /// The derivation, stated as the table its doc comment claims it is. The
+    /// unthreaded spellings are the version 1 strings byte for byte, which is
+    /// the whole of the migration: a head written before this change still
+    /// names the session an operator is in.
+    #[test]
+    fn the_scope_derivation_extends_version_one_without_rewriting_it() {
+        for (scope, expected, threaded) in [
+            (
+                ConversationScope::telegram(7, None).expect("chat"),
+                "chat:7",
+                false,
+            ),
+            (
+                ConversationScope::telegram(-100_123, None).expect("group"),
+                "chat:-100123",
+                false,
+            ),
+            (
+                ConversationScope::telegram(-100_123, Some(42)).expect("topic"),
+                "chat:-100123:topic:42",
+                true,
+            ),
+            (
+                ConversationScope::slack("C0RESERVED", None).expect("channel"),
+                "channel:C0RESERVED",
+                false,
+            ),
+            (
+                ConversationScope::slack("C0RESERVED", Some("1723542000.000100")).expect("thread"),
+                "channel:C0RESERVED:thread:1723542000.000100",
+                true,
+            ),
+        ] {
+            assert_eq!(scope.as_str(), expected);
+            assert_eq!(scope.to_string(), expected);
+            assert_eq!(scope.is_threaded(), threaded, "{expected}");
+        }
+        // The bare Telegram scope is exactly what `StoreMemorySurface` wrote
+        // before threads existed, and the threaded Slack scope is exactly what
+        // the Slack bridge already wrote. Neither is a new spelling, so no row
+        // is orphaned by this version.
+        assert_eq!(
+            ConversationScope::telegram(7, None)
+                .expect("legacy")
+                .as_str(),
+            "chat:7"
+        );
+        assert_eq!(
+            ConversationScope::slack("C0RESERVED", Some("1723542000.000100"))
+                .expect("legacy")
+                .as_str(),
+            "channel:C0RESERVED:thread:1723542000.000100"
+        );
+        assert_eq!(CONVERSATION_SCOPE_VERSION, 2);
+
+        // A coordinate no transport spells is refused rather than folded into
+        // the primary session.
+        assert!(matches!(
+            ConversationScope::telegram(0, None),
+            Err(AgentMemoryError::InvalidField("chat_id"))
+        ));
+        for topic in [0, -1] {
+            assert!(matches!(
+                ConversationScope::telegram(7, Some(topic)),
+                Err(AgentMemoryError::InvalidField("forum_topic_id"))
+            ));
+        }
+        // A segment carrying the separator could compose the key of a session
+        // it does not name, so it is refused rather than escaped.
+        for channel in ["", "C0:thread:1", "C0 RESERVED", "C0/RESERVED"] {
+            assert!(
+                matches!(
+                    ConversationScope::slack(channel, None),
+                    Err(AgentMemoryError::InvalidField("channel"))
+                ),
+                "{channel}"
+            );
+        }
+        assert!(matches!(
+            ConversationScope::slack("C0RESERVED", Some("172:100")),
+            Err(AgentMemoryError::InvalidField("thread_ts"))
+        ));
+        assert!(matches!(
+            ConversationScope::slack(&"c".repeat(MAX_SCOPE_SEGMENT_BYTES + 1), None),
+            Err(AgentMemoryError::InvalidField("channel"))
+        ));
+    }
+
+    /// A forum topic is its own session and a direct message is not, and both
+    /// survive a reopen — the head is a durable row, so "stable session across
+    /// restarts" is a property of the table rather than of a cache.
+    #[test]
+    fn threads_are_isolated_sessions_while_a_direct_message_shares_one() {
+        let root = TempDir::new().expect("temp root");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private root");
+        let database = root.path().join("memory.sqlite3");
+        let direct = ConversationScope::telegram(7, None).expect("direct message");
+        let first_topic = ConversationScope::telegram(-100_123, Some(11)).expect("first topic");
+        let second_topic = ConversationScope::telegram(-100_123, Some(12)).expect("second topic");
+        {
+            let mut store = AgentMemoryStore::open(&database).expect("store");
+            for (scope, conversation) in [
+                (&direct, "telegram:7:1"),
+                (&first_topic, "telegram:-100123:11:1"),
+                (&second_topic, "telegram:-100123:12:1"),
+            ] {
+                store
+                    .start_conversation(
+                        "primary",
+                        "ben",
+                        "telegram",
+                        scope.as_str(),
+                        conversation,
+                        10,
+                    )
+                    .expect("conversation");
+            }
+        }
+        let store = AgentMemoryStore::open(&database).expect("reopened store");
+        // Three scopes, three heads, and no two of them the same session.
+        for (scope, expected) in [
+            (&direct, "telegram:7:1"),
+            (&first_topic, "telegram:-100123:11:1"),
+            (&second_topic, "telegram:-100123:12:1"),
+        ] {
+            assert_eq!(
+                store
+                    .current_conversation("primary", "ben", "telegram", scope.as_str())
+                    .expect("head"),
+                Some(String::from(expected)),
+                "{scope}"
+            );
+        }
+        // The bare chat scope is one shared session however many messages the
+        // chat carries, which is what a direct message means.
+        assert_eq!(
+            store
+                .current_conversation("primary", "ben", "telegram", "chat:7")
+                .expect("legacy head"),
+            store
+                .current_conversation("primary", "ben", "telegram", direct.as_str())
+                .expect("derived head"),
+            "a version 1 head and a version 2 direct-message scope are one session"
+        );
+    }
+
+    /// Mute and archive are the two lifecycle verbs, and both are
+    /// revision-checked writes on the conversation the head names.
+    #[test]
+    fn muting_expires_on_its_own_and_archiving_ends_the_session() {
+        let (_root, mut store) = store();
+        let scope = ConversationScope::telegram(-100_123, Some(11)).expect("topic");
+        assert!(
+            matches!(
+                store.mute_conversation("primary", "ben", "telegram", scope.as_str(), None, 10),
+                Err(AgentMemoryError::NotFound)
+            ),
+            "a scope nobody has written in heads nothing to mute"
+        );
+        let opening = store
+            .start_conversation("primary", "ben", "telegram", scope.as_str(), "first", 10)
+            .expect("first conversation");
+        assert_eq!(opening, 1);
+
+        let muted = store
+            .mute_conversation(
+                "primary",
+                "ben",
+                "telegram",
+                scope.as_str(),
+                Some(1_000),
+                10,
+            )
+            .expect("muted");
+        assert_eq!(muted.muted_until_ms, Some(1_000));
+        assert_eq!(muted.revision, 2, "the write is revision-checked");
+        assert!(muted.is_muted(999));
+        assert!(!muted.is_muted(1_000), "the deadline is exclusive");
+        assert!(!muted.is_muted(1_001));
+        assert!(!muted.is_archived());
+        // An expired mute is left on the row rather than cleared by a reader:
+        // reading must not write.
+        let read_back = store
+            .conversation_state("primary", "ben", "telegram", scope.as_str())
+            .expect("state")
+            .expect("present");
+        assert_eq!(read_back, muted);
+
+        // A deadline that has already passed is not a mute at all, and neither
+        // is one at the instant it is set.
+        for until_ms in [10, 9, 0] {
+            assert!(matches!(
+                store.mute_conversation(
+                    "primary",
+                    "ben",
+                    "telegram",
+                    scope.as_str(),
+                    Some(until_ms),
+                    10
+                ),
+                Err(AgentMemoryError::InvalidField("muted_until_ms"))
+            ));
+        }
+
+        let unmuted = store
+            .mute_conversation("primary", "ben", "telegram", scope.as_str(), None, 20)
+            .expect("unmuted");
+        assert_eq!(unmuted.muted_until_ms, None);
+        assert_eq!(unmuted.revision, 3);
+
+        let (archived_id, revision) = store
+            .archive_conversation("primary", "ben", "telegram", scope.as_str(), 30)
+            .expect("archived");
+        assert_eq!(archived_id, "first");
+        assert_eq!(revision, 4);
+        // Archiving removes the head, so the scope is open for a fresh session
+        // and the closed one keeps every message it carried.
+        assert_eq!(
+            store
+                .current_conversation("primary", "ben", "telegram", scope.as_str())
+                .expect("head"),
+            None
+        );
+        assert!(matches!(
+            store.archive_conversation("primary", "ben", "telegram", scope.as_str(), 40),
+            Err(AgentMemoryError::NotFound)
+        ));
+        // The other scopes of the same chat are untouched by either verb.
+        let sibling = ConversationScope::telegram(-100_123, Some(12)).expect("sibling topic");
+        assert!(matches!(
+            store.conversation_state("primary", "ben", "telegram", sibling.as_str()),
+            Ok(None)
+        ));
+    }
+
+    /// A muted session must not be *archived*-adjacent by accident: the two
+    /// verbs are ordered, and a finished conversation refuses to be muted.
+    #[test]
+    fn an_archived_conversation_refuses_the_mute_verb() {
+        let (_root, mut store) = store();
+        let scope = ConversationScope::telegram(7, None).expect("direct message");
+        store
+            .start_conversation("primary", "ben", "telegram", scope.as_str(), "first", 10)
+            .expect("conversation");
+        // Re-heading the archived conversation is the only way to reach a head
+        // that names an already-archived row, and that is the case the refusal
+        // exists for.
+        store
+            .archive_conversation("primary", "ben", "telegram", scope.as_str(), 20)
+            .expect("archived");
+        store
+            .start_conversation("primary", "ben", "telegram", scope.as_str(), "first", 30)
+            .expect_err("an archived conversation id cannot be reopened under its own name");
+        store
+            .start_conversation("primary", "ben", "telegram", scope.as_str(), "second", 30)
+            .expect("a fresh session");
+        assert_eq!(
+            store
+                .current_conversation("primary", "ben", "telegram", scope.as_str())
+                .expect("head"),
+            Some(String::from("second"))
+        );
+    }
+
+    /// The ladder, replayed. A database written by version 1 must become the
+    /// exact schema a fresh database initializes to — not merely a schema with
+    /// the same `user_version`.
+    #[test]
+    fn a_version_one_database_migrates_to_the_schema_a_fresh_one_initializes() {
+        let root = TempDir::new().expect("temp root");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private root");
+
+        let legacy = root.path().join("legacy.sqlite3");
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&legacy)
+            .expect("legacy file");
+        {
+            let connection = Connection::open(&legacy).expect("legacy connection");
+            connection.execute_batch(SCHEMA_V1).expect("version 1");
+            connection
+                .pragma_update(None, "user_version", 1u32)
+                .expect("version marker");
+            connection
+                .execute(
+                    "INSERT INTO conversations
+                 (conversation_id,tenant,actor,transport,external_scope,created_at_ms,
+                  last_message_at_ms)
+                 VALUES ('legacy','primary','ben','telegram','chat:7',10,10)",
+                    [],
+                )
+                .expect("legacy conversation");
+            connection
+                .execute(
+                    "INSERT INTO conversation_heads
+                 (tenant,actor,transport,external_scope,conversation_id)
+                 VALUES ('primary','ben','telegram','chat:7','legacy')",
+                    [],
+                )
+                .expect("legacy head");
+        }
+
+        let mut migrated = AgentMemoryStore::open(&legacy).expect("migrated store");
+        let fresh = AgentMemoryStore::open(root.path().join("fresh.sqlite3")).expect("fresh store");
+        assert_eq!(schema_fingerprint(&migrated), schema_fingerprint(&fresh));
+        for store in [&migrated, &fresh] {
+            let version: u32 = store
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("version");
+            assert_eq!(version, AGENT_MEMORY_SCHEMA_VERSION);
+            assert_eq!(version, 2);
+        }
+
+        // The version 1 head is the direct-message session of version 2, and
+        // the added column starts unmuted rather than absent.
+        let state = migrated
+            .conversation_state("primary", "ben", "telegram", "chat:7")
+            .expect("state")
+            .expect("legacy head is still a session");
+        assert_eq!(state.conversation_id, "legacy");
+        assert_eq!(state.muted_until_ms, None);
+        assert!(!state.is_muted(1_000_000));
+        let derived = ConversationScope::telegram(7, None).expect("derived");
+        assert_eq!(state.external_scope, derived.as_str());
+        // And the new verbs act on it without the row having been rewritten.
+        let muted = migrated
+            .mute_conversation("primary", "ben", "telegram", derived.as_str(), Some(50), 20)
+            .expect("muted legacy session");
+        assert_eq!(muted.conversation_id, "legacy");
+        assert!(muted.is_muted(49));
+
+        // A version this build has never written is refused, not guessed at.
+        let ahead = root.path().join("ahead.sqlite3");
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&ahead)
+            .expect("ahead file");
+        {
+            let connection = Connection::open(&ahead).expect("ahead connection");
+            connection.execute_batch(SCHEMA_V1).expect("base");
+            connection
+                .pragma_update(None, "user_version", AGENT_MEMORY_SCHEMA_VERSION + 1)
+                .expect("ahead marker");
+        }
+        assert!(matches!(
+            AgentMemoryStore::open(&ahead),
+            Err(AgentMemoryError::SchemaVersion { .. })
+        ));
+    }
+
+    /// Every object's `sql`, in name order — the comparison a "same schema"
+    /// claim has to survive.
+    fn schema_fingerprint(store: &AgentMemoryStore) -> Vec<(String, Option<String>)> {
+        let mut statement = store
+            .connection
+            .prepare(
+                "SELECT name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .expect("schema query");
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("schema rows");
+        rows.collect::<Result<Vec<_>, _>>().expect("schema")
     }
 
     #[test]

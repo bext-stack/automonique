@@ -20,6 +20,7 @@ use automonique_transports::{
 use sha2::{Digest, Sha256};
 
 mod https_client;
+mod modifier;
 mod slack_sink;
 mod store_sink;
 mod telegram_control;
@@ -31,6 +32,10 @@ pub use https_client::{
     MAX_INLINE_BUTTONS, MAX_SEND_MESSAGE_TEXT_UNITS, OutboundRefusal, SendMessageRequest,
     SetMessageReactionRequest, SetMyCommandsRequest, TelegramBotCommand, TelegramHttpsClient,
     TelegramOutbound, TelegramOutboundClient, TelegramOutboundPlan, TelegramTextStyle,
+};
+pub use modifier::{
+    ALL_MODIFIERS, MAX_MODEL_ALIAS_BYTES, MAX_MODIFIER_TOKEN_BYTES, MODIFIER_COUNT, MODIFIER_SIGIL,
+    MessageModifier, MessageModifiers, ModelAlias, ModifierKind, parse_modifiers,
 };
 pub use slack_sink::{
     SlackDurableReceipt, SlackSinkFailure, StoreSlackDurableSink, slack_content_digest,
@@ -44,8 +49,9 @@ pub use telegram_control::{
     MAX_COMMAND_NAME_BYTES, MAX_COMMAND_TEXT_BYTES, MAX_CONTROL_REF_BYTES,
     MAX_GITHUB_CHECKLIST_ITEM_BYTES, MAX_GITHUB_ISSUE_URL_BYTES, MAX_GITHUB_REPO_ALIAS_BYTES,
     MAX_GITHUB_REQUEST_BYTES, MAX_RUN_TASK_BYTES, MAX_SAY_TEXT_BYTES, MAX_USER_ID_BYTES,
-    MemoryDirective, OperatorAuthority, OperatorUserId, RunTask, SayText, authorize_and_parse,
-    authorize_and_parse_tiered, command_manifest, command_refusal_text, help_text, parse_command,
+    MemoryDirective, MuteDirective, MuteWindow, OperatorAuthority, OperatorUserId, RunTask,
+    SayText, authorize_and_parse, authorize_and_parse_tiered, command_manifest,
+    command_refusal_text, help_text, parse_command,
 };
 
 const MAX_LEASE_ID_BYTES: usize = 256;
