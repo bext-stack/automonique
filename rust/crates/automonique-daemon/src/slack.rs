@@ -926,6 +926,16 @@ fn socket_envelope_id(text: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Slack opens every Socket Mode connection with a control frame that has no
+/// acknowledgement key. It is connection metadata, not a malformed event.
+fn socket_hello(text: &str) -> bool {
+    let Ok(frame) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    frame.get("type").and_then(serde_json::Value::as_str) == Some("hello")
+        && frame.get("envelope_id").is_none()
+}
+
 fn slack_ticket_event(text: &str) -> Option<SlackTicketEvent> {
     let outer: serde_json::Value = serde_json::from_str(text).ok()?;
     if outer.get("type")?.as_str()? != "events_api" {
@@ -3294,8 +3304,10 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
             let Ok(envelope) = connection.receive_envelope() else {
                 break;
             };
-            let Some(envelope_id) = socket_envelope_id(envelope.as_str()) else {
-                break;
+            let envelope_id = match socket_envelope_id(envelope.as_str()) {
+                Some(envelope_id) => envelope_id,
+                None if socket_hello(envelope.as_str()) => continue,
+                None => break,
             };
             let mut event = slack_ticket_event(envelope.as_str());
             let app_home_user = match slack_app_home_user(envelope.as_str()) {
@@ -5750,6 +5762,20 @@ mod tests {
             "\"type\":\"message\",\"bot_id\":\"B0BOT00001\"",
         );
         assert!(slack_ticket_event(&bot).is_none());
+    }
+
+    #[test]
+    fn socket_hello_is_connection_control_not_a_failed_envelope() {
+        let hello = r#"{"type":"hello","num_connections":1,"debug_info":{"host":"example"}}"#;
+        assert!(socket_hello(hello));
+        assert!(socket_envelope_id(hello).is_none());
+        assert!(!socket_hello(
+            r#"{"type":"disconnect","reason":"refresh_requested"}"#
+        ));
+        assert!(!socket_hello(
+            r#"{"type":"hello","envelope_id":"unexpected"}"#
+        ));
+        assert!(!socket_hello("not json"));
     }
 
     #[test]
