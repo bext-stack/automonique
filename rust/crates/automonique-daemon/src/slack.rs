@@ -79,6 +79,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use automonique_github_connector::IssueLocator;
 use automonique_protocol::event::EventKind;
 use automonique_protocol::progress_api::ProgressFrame;
 use automonique_slack_connector::{
@@ -108,6 +109,7 @@ use automonique_transports::{
     parse_slack_envelope,
 };
 
+use crate::github::{GitHubSurface, IssueFactDetail};
 use crate::github_actions::{
     GitHubActionEngine, GitHubActionRequest, GitHubManagementDomain, is_github_capability_question,
 };
@@ -1878,11 +1880,16 @@ struct SlackTicketRouter<P> {
 
 trait SlackQuestionAnswerer: Send {
     fn answer(&mut self, question: &str, context: &str) -> String;
+
+    fn issue_status(&mut self, _issue_url: &str) -> String {
+        String::from("Monique's GitHub issue reader is unavailable right now.")
+    }
 }
 
 struct LiveSlackQuestionAnswerer {
     surface: StoreControlSurface,
     lane: SocketRunLane,
+    github: Option<Box<dyn GitHubSurface + Send>>,
     administrators: Vec<i64>,
     configured: Vec<i64>,
 }
@@ -1899,6 +1906,72 @@ impl SlackQuestionAnswerer for LiveSlackQuestionAnswerer {
             "slack_question_worker",
         )
     }
+
+    fn issue_status(&mut self, issue_url: &str) -> String {
+        let Some(locator) = IssueLocator::parse(issue_url) else {
+            return String::from("That is not a canonical GitHub issue URL.");
+        };
+        let Some(github) = self.github.as_deref_mut() else {
+            return String::from("Monique's GitHub issue reader is not configured.");
+        };
+        match github.issue_facts(&locator, IssueFactDetail::Summary) {
+            Ok(facts) => github_issue_status_answer(&locator, &facts),
+            Err(error) if error.contains("repository_not_configured") => String::from(
+                "That GitHub repository is not in Monique's configured read allowlist.",
+            ),
+            Err(_) => String::from("Monique could not read that GitHub issue right now."),
+        }
+    }
+}
+
+fn github_issue_status_answer(locator: &IssueLocator, facts: &str) -> String {
+    let value = |key: &str| {
+        facts
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .unwrap_or_default()
+    };
+    let state = value("state=");
+    let updated = value("updated=");
+    let summary = match state {
+        "closed" => "Yes — GitHub marks this issue as closed.",
+        "open" => "No — GitHub still marks this issue as open.",
+        _ => "GitHub returned the issue, but its state was not recognizable.",
+    };
+    format!(
+        "{summary}\n{}#{}\nLast updated: {updated}",
+        locator.target(),
+        locator.number()
+    )
+}
+
+fn is_github_issue_status_question(text: &str) -> bool {
+    let normalized = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    [
+        "is this done",
+        "is it done",
+        "is this complete",
+        "is this completed",
+        "is this closed",
+        "is this resolved",
+        "has this been done",
+        "has this been completed",
+        "what is the status",
+        "what's the status",
+        "status of this",
+        "est-ce terminé",
+        "est ce termine",
+        "est-ce fini",
+        "est ce fini",
+        "est-ce fait",
+        "est ce fait",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
 }
 
 impl<P: SlackTicketPoster> SlackTicketRouter<P> {
@@ -2659,6 +2732,13 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
         {
             return;
         }
+        // With both `message.channels` and `app_mention` enabled Slack emits a
+        // general message copy and a dedicated mention copy for the same post.
+        // Only the dedicated copy may route a message that carries a user
+        // mention; otherwise one human post can dispatch or answer twice.
+        if !event.app_mention && event.text.contains("<@") {
+            return;
+        }
         let mention_text = event
             .app_mention
             .then(|| slack_app_mention_text(&event.text));
@@ -2682,6 +2762,18 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                     "GitHub actions are not configured on this daemon, so I can only read configured issues here."
                 };
                 let _ = self.poster.post_thread(&event.channel, &event.parent, text);
+                return;
+            }
+            if is_github_issue_status_question(trimmed)
+                && let Ok(Some(issue_url)) = one_issue_url(trimmed)
+            {
+                let answer = self.question_answerer.as_mut().map_or_else(
+                    || String::from("Monique's GitHub issue reader is unavailable right now."),
+                    |answerer| answerer.issue_status(&issue_url),
+                );
+                let _ = self
+                    .poster
+                    .post_thread(&event.channel, &event.parent, &answer);
                 return;
             }
             if self.admins.contains(&event.user)
@@ -3127,6 +3219,9 @@ impl SlackTicketHost {
             .and_then(|config| config.url().cloned());
         let memory_tenant = crate::memory_config::MemoryConfig::tenant_or_default(state_dir)
             .map_err(SlackConfigError::MemoryConfig)?;
+        let github_reader = crate::github::GitHubHost::load(state_dir)
+            .map_err(|_| SlackConfigError::GitHubActionsUnavailable)?
+            .into_surface();
         let github_actions = match crate::github::GitHubHost::load(state_dir)
             .map_err(|_| SlackConfigError::GitHubActionsUnavailable)?
             .into_action_surface()
@@ -3166,6 +3261,7 @@ impl SlackTicketHost {
             Some(Box::new(LiveSlackQuestionAnswerer {
                 surface,
                 lane,
+                github: github_reader,
                 administrators: question_administrators.clone(),
                 configured: question_configured.clone(),
             }) as Box<dyn SlackQuestionAnswerer>)
@@ -5119,6 +5215,24 @@ mod tests {
         }
     }
 
+    struct FakeIssueStatusAnswerer {
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SlackQuestionAnswerer for FakeIssueStatusAnswerer {
+        fn answer(&mut self, _question: &str, _context: &str) -> String {
+            panic!("status questions must use the typed GitHub issue reader")
+        }
+
+        fn issue_status(&mut self, issue_url: &str) -> String {
+            self.seen
+                .lock()
+                .expect("issue reads")
+                .push(issue_url.to_owned());
+            String::from("No — GitHub still marks this issue as open.")
+        }
+    }
+
     fn ticket_receipt(approved: bool) -> automonique_support_connector::TicketDispatchReceipt {
         automonique_support_connector::TicketDispatchReceipt {
             issue_id: String::from("issue-fixture"),
@@ -5840,6 +5954,72 @@ mod tests {
             messages.lock().expect("messages").as_slice(),
             [String::from("Monique intelligent answer")]
         );
+    }
+
+    #[test]
+    fn github_status_mentions_read_once_and_never_enter_ticket_intake() {
+        let poster = FakeTicketPoster::default();
+        let messages = Arc::clone(&poster.messages);
+        let manage = FakeManage::default();
+        let opened = Arc::clone(&manage.opened);
+        let issue_reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut router = SlackTicketRouter {
+            poster,
+            manage: Box::new(manage),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
+            channels: ChannelMap(vec![(
+                name("ops"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![SlackFeature::Approvals, SlackFeature::Conversation],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+            approvals: None,
+            approval_lane: None,
+            question_answerer: Some(Box::new(FakeIssueStatusAnswerer {
+                seen: Arc::clone(&issue_reads),
+            })),
+        };
+        let text = "<@B0APP> https://github.com/example/project/issues/42 is this done?";
+
+        // Slack's broad message subscription copy carries the same mention but
+        // is not the event that owns conversational routing.
+        router.handle_with_context(ticket_event("U0ADMIN001", text, "EvMessageCopy"), "");
+        assert!(messages.lock().expect("messages").is_empty());
+        assert!(opened.lock().expect("opened").is_empty());
+
+        let mut mention = ticket_event("U0ADMIN001", text, "EvMentionCopy");
+        mention.app_mention = true;
+        router.handle_with_context(mention, "");
+
+        assert_eq!(
+            issue_reads.lock().expect("issue reads").as_slice(),
+            [String::from("https://github.com/example/project/issues/42")]
+        );
+        assert_eq!(
+            messages.lock().expect("messages").as_slice(),
+            [String::from("No — GitHub still marks this issue as open.")]
+        );
+        assert!(opened.lock().expect("opened").is_empty());
+    }
+
+    #[test]
+    fn typed_github_issue_facts_render_done_from_state() {
+        let locator =
+            IssueLocator::parse("https://github.com/example/project/issues/42").expect("locator");
+        let answer = github_issue_status_answer(
+            &locator,
+            "status=available\nstate=closed\ntitle_untrusted=Delivered change\nupdated=2026-08-16T22:00:00Z",
+        );
+        assert!(answer.starts_with("Yes — GitHub marks this issue as closed."));
+        assert!(answer.contains("example/project#42"));
+        assert!(!answer.contains("Delivered change"));
     }
 
     #[test]
