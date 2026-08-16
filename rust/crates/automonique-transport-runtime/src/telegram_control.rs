@@ -86,7 +86,7 @@ pub const MAX_CHANNEL_NAME_BYTES: usize = 80;
 /// somebody wrote, to a channel other people read, is the worst available
 /// answer.
 pub const MAX_SAY_TEXT_BYTES: usize = 900;
-/// Longest configured GitHub repository alias accepted by `/github_create`.
+/// Longest configured GitHub repository alias accepted by `/gh create`.
 pub const MAX_GITHUB_REPO_ALIAS_BYTES: usize = 32;
 /// Longest canonical GitHub issue URL accepted by an issue action command.
 pub const MAX_GITHUB_ISSUE_URL_BYTES: usize = 512;
@@ -103,7 +103,7 @@ pub const MAX_ALLOWED_USERS: usize = 256;
 /// being read rather than after an allocation.
 pub const MAX_USER_ID_BYTES: usize = 20;
 /// Number of commands in the closed registry.
-pub const COMMAND_COUNT: usize = 29;
+pub const COMMAND_COUNT: usize = 21;
 
 const _: () = assert!(COMMAND_COUNT == CommandKind::ALL.len());
 const _: () = assert!(MAX_COMMAND_NAME_BYTES <= MAX_COMMAND_TEXT_BYTES);
@@ -157,10 +157,8 @@ pub enum ArgumentShape {
     /// number of honest answers, and admitting a free duration would mean
     /// deciding here what `1w`, `0s` and `-3h` mean to a session.
     MuteDirective,
-    /// One configured GitHub repository alias and a bounded free-text request.
-    GitHubRepositoryRequest,
-    /// One exact GitHub issue URL and a bounded reply or checklist item.
-    GitHubIssueRequest,
+    /// One closed GitHub subcommand with its typed arguments.
+    GitHubDirective,
 }
 
 /// Which tier of operator a command belongs to.
@@ -251,24 +249,8 @@ pub enum CommandKind {
     Archive,
     /// Run one explicitly authorized public-web research question.
     Research,
-    /// Create one GitHub issue in a configured repository.
-    GitHubCreate,
-    /// Reply to one exact GitHub issue.
-    GitHubReply,
-    /// Check one checklist item on an exact GitHub issue.
-    GitHubCheck,
-    /// Uncheck one checklist item on an exact GitHub issue.
-    GitHubUncheck,
-    /// Manage issue and pull-request metadata without entering `/ticket`.
-    GitHubIssue,
-    /// Manage repository label definitions or assignments.
-    GitHubLabel,
-    /// Manage repository milestone definitions or assignments.
-    GitHubMilestone,
-    /// Manage native parent, sub-issue, and dependency relationships.
-    GitHubEpic,
-    /// Manage GitHub Projects, fields, views, and items.
-    GitHubProject,
+    /// Run one typed GitHub operation selected by a closed subcommand.
+    GitHub,
 }
 
 impl CommandKind {
@@ -288,15 +270,7 @@ impl CommandKind {
         Self::Mute,
         Self::Archive,
         Self::Research,
-        Self::GitHubCreate,
-        Self::GitHubReply,
-        Self::GitHubCheck,
-        Self::GitHubUncheck,
-        Self::GitHubIssue,
-        Self::GitHubLabel,
-        Self::GitHubMilestone,
-        Self::GitHubEpic,
-        Self::GitHubProject,
+        Self::GitHub,
         Self::Work,
         Self::Run,
         Self::Say,
@@ -436,43 +410,12 @@ impl CommandKind {
                 argument: ArgumentShape::Task,
                 tier: CommandTier::Admin,
             },
-            Self::GitHubCreate => CommandSpec {
-                name: "github_create",
-                description: "Create an issue in a configured GitHub repository",
-                argument: ArgumentShape::GitHubRepositoryRequest,
+            Self::GitHub => CommandSpec {
+                name: "gh",
+                description: "Run a typed GitHub operation",
+                argument: ArgumentShape::GitHubDirective,
                 tier: CommandTier::Admin,
             },
-            Self::GitHubReply => CommandSpec {
-                name: "github_reply",
-                description: "Reply to an exact GitHub issue URL",
-                argument: ArgumentShape::GitHubIssueRequest,
-                tier: CommandTier::Admin,
-            },
-            Self::GitHubCheck => CommandSpec {
-                name: "github_check",
-                description: "Check one item on an exact GitHub issue",
-                argument: ArgumentShape::GitHubIssueRequest,
-                tier: CommandTier::Admin,
-            },
-            Self::GitHubUncheck => CommandSpec {
-                name: "github_uncheck",
-                description: "Uncheck one item on an exact GitHub issue",
-                argument: ArgumentShape::GitHubIssueRequest,
-                tier: CommandTier::Admin,
-            },
-            Self::GitHubIssue => {
-                github_management_spec("github_issue", "Manage GitHub issues or pull requests")
-            }
-            Self::GitHubLabel => github_management_spec("github_label", "Manage GitHub labels"),
-            Self::GitHubMilestone => {
-                github_management_spec("github_milestone", "Manage GitHub milestones")
-            }
-            Self::GitHubEpic => {
-                github_management_spec("github_epic", "Manage GitHub native epics and dependencies")
-            }
-            Self::GitHubProject => {
-                github_management_spec("github_project", "Manage GitHub Projects")
-            }
             Self::Work => CommandSpec {
                 name: "work",
                 description: "Draft an answer to the support ticket with the given reference",
@@ -549,15 +492,6 @@ impl CommandKind {
     }
 }
 
-const fn github_management_spec(name: &'static str, description: &'static str) -> CommandSpec {
-    CommandSpec {
-        name,
-        description,
-        argument: ArgumentShape::Task,
-        tier: CommandTier::Admin,
-    }
-}
-
 /// One entry of the advertised command menu.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandManifestEntry {
@@ -622,14 +556,9 @@ pub fn help_text() -> String {
                 " [search <query>|show <id>|proposals|approve <id>|deny <id>|sources <id>|link]",
             ),
             ArgumentShape::MuteDirective => String::from(" [15m|1h|8h|24h|off]"),
-            ArgumentShape::GitHubRepositoryRequest => String::from(" <repository> <request>"),
-            ArgumentShape::GitHubIssueRequest => match entry.kind {
-                CommandKind::GitHubReply => String::from(" <issue-url> <reply>"),
-                CommandKind::GitHubCheck | CommandKind::GitHubUncheck => {
-                    String::from(" <issue-url> <item>")
-                }
-                _ => String::from(" <issue-url> <request>"),
-            },
+            ArgumentShape::GitHubDirective => {
+                String::from(" <create|reply|check|uncheck|issue|label|milestone|epic|project> …")
+            }
         };
         let mark = match entry.tier {
             CommandTier::Allowed => "",
@@ -640,6 +569,9 @@ pub fn help_text() -> String {
             entry.name, usage, entry.description, mark
         ));
     }
+    text.push_str(
+        "\n  /gh create <repository> <request>\n  /gh reply <issue-url> <reply>\n  /gh check <issue-url> <item>\n  /gh uncheck <issue-url> <item>\n  /gh issue <request>\n  /gh label <request>\n  /gh milestone <request>\n  /gh epic <request>\n  /gh project <request>",
+    );
     text.push_str(
         "\n\nAdministrators can also ask read-only questions in ordinary language. Answers use the daemon's current ticket and status snapshot; actions still require an explicit command.",
     );
@@ -1450,15 +1382,15 @@ impl ControlCommand {
             Self::Mute { .. } => CommandKind::Mute,
             Self::Archive => CommandKind::Archive,
             Self::Research { .. } => CommandKind::Research,
-            Self::GitHubCreate { .. } => CommandKind::GitHubCreate,
-            Self::GitHubReply { .. } => CommandKind::GitHubReply,
-            Self::GitHubCheck { .. } => CommandKind::GitHubCheck,
-            Self::GitHubUncheck { .. } => CommandKind::GitHubUncheck,
-            Self::GitHubIssue { .. } => CommandKind::GitHubIssue,
-            Self::GitHubLabel { .. } => CommandKind::GitHubLabel,
-            Self::GitHubMilestone { .. } => CommandKind::GitHubMilestone,
-            Self::GitHubEpic { .. } => CommandKind::GitHubEpic,
-            Self::GitHubProject { .. } => CommandKind::GitHubProject,
+            Self::GitHubCreate { .. }
+            | Self::GitHubReply { .. }
+            | Self::GitHubCheck { .. }
+            | Self::GitHubUncheck { .. }
+            | Self::GitHubIssue { .. }
+            | Self::GitHubLabel { .. }
+            | Self::GitHubMilestone { .. }
+            | Self::GitHubEpic { .. }
+            | Self::GitHubProject { .. } => CommandKind::GitHub,
             Self::Say { .. } => CommandKind::Say,
             Self::Work { .. } => CommandKind::Work,
             Self::Run { .. } => CommandKind::Run,
@@ -1594,25 +1526,8 @@ pub fn command_refusal_text(text: &str, refusal: CommandRefusal) -> String {
             }
             CommandKind::Remember => String::from("Missing the fact. Usage: /remember <fact>."),
             CommandKind::Forget => String::from("Missing the memory id. Usage: /forget <id>."),
-            CommandKind::GitHubCreate => String::from(
-                "Missing the repository alias or request. Usage: /github_create <repository> <request>.",
-            ),
-            CommandKind::GitHubReply => String::from(
-                "Missing the issue URL or reply. Usage: /github_reply <issue-url> <reply>.",
-            ),
-            CommandKind::GitHubCheck => String::from(
-                "Missing the issue URL or checklist item. Usage: /github_check <issue-url> <item>.",
-            ),
-            CommandKind::GitHubUncheck => String::from(
-                "Missing the issue URL or checklist item. Usage: /github_uncheck <issue-url> <item>.",
-            ),
-            CommandKind::GitHubIssue
-            | CommandKind::GitHubLabel
-            | CommandKind::GitHubMilestone
-            | CommandKind::GitHubEpic
-            | CommandKind::GitHubProject => format!(
-                "Missing the GitHub management request. Usage: {}.",
-                command_usage(kind)
+            CommandKind::GitHub => String::from(
+                "Missing the GitHub operation or its arguments. Usage: /gh <create|reply|check|uncheck|issue|label|milestone|epic|project> ….",
             ),
             _ => format!("Missing the reference. Usage: {}.", command_usage(kind)),
         },
@@ -1679,15 +1594,9 @@ const fn command_usage(kind: CommandKind) -> &'static str {
         CommandKind::New => "/new",
         CommandKind::Mute => "/mute [15m|1h|8h|24h|off]",
         CommandKind::Archive => "/archive",
-        CommandKind::GitHubCreate => "/github_create <repository> <request>",
-        CommandKind::GitHubReply => "/github_reply <issue-url> <reply>",
-        CommandKind::GitHubCheck => "/github_check <issue-url> <item>",
-        CommandKind::GitHubUncheck => "/github_uncheck <issue-url> <item>",
-        CommandKind::GitHubIssue => "/github_issue <request>",
-        CommandKind::GitHubLabel => "/github_label <request>",
-        CommandKind::GitHubMilestone => "/github_milestone <request>",
-        CommandKind::GitHubEpic => "/github_epic <request>",
-        CommandKind::GitHubProject => "/github_project <request>",
+        CommandKind::GitHub => {
+            "/gh <create|reply|check|uncheck|issue|label|milestone|epic|project> …"
+        }
         CommandKind::Work => "/work <reference>",
         CommandKind::Run => "/run <task>",
         CommandKind::Research => "/research <question>",
@@ -2054,44 +1963,7 @@ fn parse_arguments(kind: CommandKind, rest: &str) -> Result<ControlCommand, Comm
         CommandKind::Research => {
             RunTask::new(rest).map(|question| ControlCommand::Research { question })
         }
-        CommandKind::GitHubCreate => {
-            one_github_repository_request(rest).map(|(repo_alias, request)| {
-                ControlCommand::GitHubCreate {
-                    repo_alias,
-                    request,
-                }
-            })
-        }
-        CommandKind::GitHubReply => {
-            let (issue_url, request) = one_github_issue_and_text(rest)?;
-            GitHubRequest::new(request)
-                .map(|request| ControlCommand::GitHubReply { issue_url, request })
-        }
-        CommandKind::GitHubCheck => {
-            let (issue_url, item) = one_github_issue_and_text(rest)?;
-            GitHubChecklistItem::new(item)
-                .map(|item| ControlCommand::GitHubCheck { issue_url, item })
-        }
-        CommandKind::GitHubUncheck => {
-            let (issue_url, item) = one_github_issue_and_text(rest)?;
-            GitHubChecklistItem::new(item)
-                .map(|item| ControlCommand::GitHubUncheck { issue_url, item })
-        }
-        CommandKind::GitHubIssue => {
-            GitHubRequest::new(rest).map(|request| ControlCommand::GitHubIssue { request })
-        }
-        CommandKind::GitHubLabel => {
-            GitHubRequest::new(rest).map(|request| ControlCommand::GitHubLabel { request })
-        }
-        CommandKind::GitHubMilestone => {
-            GitHubRequest::new(rest).map(|request| ControlCommand::GitHubMilestone { request })
-        }
-        CommandKind::GitHubEpic => {
-            GitHubRequest::new(rest).map(|request| ControlCommand::GitHubEpic { request })
-        }
-        CommandKind::GitHubProject => {
-            GitHubRequest::new(rest).map(|request| ControlCommand::GitHubProject { request })
-        }
+        CommandKind::GitHub => one_github_directive(rest),
         CommandKind::Say => {
             one_channel_message(rest).map(|(channel, text)| ControlCommand::Say { channel, text })
         }
@@ -2311,6 +2183,59 @@ fn one_directive(rest: &str) -> Result<AdminDirective, CommandRefusal> {
     }
 }
 
+fn one_github_directive(rest: &str) -> Result<ControlCommand, CommandRefusal> {
+    let (operation, arguments) = match rest.find(char::is_whitespace) {
+        Some(boundary) => {
+            let (operation, arguments) = rest.split_at(boundary);
+            (operation, arguments.trim())
+        }
+        None if rest.is_empty() => return Err(CommandRefusal::MissingArgument),
+        None => (rest, ""),
+    };
+    if operation.len() > MAX_COMMAND_NAME_BYTES {
+        return Err(CommandRefusal::ArgumentTooLong);
+    }
+    match operation.to_ascii_lowercase().as_str() {
+        "create" => one_github_repository_request(arguments).map(|(repo_alias, request)| {
+            ControlCommand::GitHubCreate {
+                repo_alias,
+                request,
+            }
+        }),
+        "reply" => {
+            let (issue_url, request) = one_github_issue_and_text(arguments)?;
+            GitHubRequest::new(request)
+                .map(|request| ControlCommand::GitHubReply { issue_url, request })
+        }
+        "check" => {
+            let (issue_url, item) = one_github_issue_and_text(arguments)?;
+            GitHubChecklistItem::new(item)
+                .map(|item| ControlCommand::GitHubCheck { issue_url, item })
+        }
+        "uncheck" => {
+            let (issue_url, item) = one_github_issue_and_text(arguments)?;
+            GitHubChecklistItem::new(item)
+                .map(|item| ControlCommand::GitHubUncheck { issue_url, item })
+        }
+        "issue" => {
+            GitHubRequest::new(arguments).map(|request| ControlCommand::GitHubIssue { request })
+        }
+        "label" => {
+            GitHubRequest::new(arguments).map(|request| ControlCommand::GitHubLabel { request })
+        }
+        "milestone" => {
+            GitHubRequest::new(arguments).map(|request| ControlCommand::GitHubMilestone { request })
+        }
+        "epic" => {
+            GitHubRequest::new(arguments).map(|request| ControlCommand::GitHubEpic { request })
+        }
+        "project" => {
+            GitHubRequest::new(arguments).map(|request| ControlCommand::GitHubProject { request })
+        }
+        _ => Err(CommandRefusal::ArgumentInvalid),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2352,10 +2277,10 @@ mod tests {
         assert!(text.contains("/say <channel> <message>"));
         assert!(text.contains("/cancel <reference>"));
         assert!(text.contains("/ticket <reference>"));
-        assert!(text.contains("/github_create <repository> <request>"));
-        assert!(text.contains("/github_reply <issue-url> <reply>"));
-        assert!(text.contains("/github_check <issue-url> <item>"));
-        assert!(text.contains("/github_uncheck <issue-url> <item>"));
+        assert!(text.contains("/gh create <repository> <request>"));
+        assert!(text.contains("/gh reply <issue-url> <reply>"));
+        assert!(text.contains("/gh check <issue-url> <item>"));
+        assert!(text.contains("/gh uncheck <issue-url> <item>"));
         assert!(!text.contains("/status <"));
         // The two ticket commands differ by one character and by their argument
         // shape, so the help an operator reads has to keep them apart.
@@ -2587,30 +2512,28 @@ mod tests {
         let issue_url =
             GitHubIssueUrl::new("https://github.com/acme/widgets/issues/42").expect("issue URL");
         assert_eq!(
-            parse_command("/github_create Automonique corriger le menu mobile"),
+            parse_command("/gh create Automonique corriger le menu mobile"),
             Ok(ControlCommand::GitHubCreate {
                 repo_alias: GitHubRepoAlias::new("automonique").expect("alias"),
                 request: GitHubRequest::new("corriger le menu mobile").expect("request"),
             })
         );
         assert_eq!(
-            parse_command("/github_reply https://github.com/acme/widgets/issues/42 réponse prête"),
+            parse_command("/gh reply https://github.com/acme/widgets/issues/42 réponse prête"),
             Ok(ControlCommand::GitHubReply {
                 issue_url: issue_url.clone(),
                 request: GitHubRequest::new("réponse prête").expect("request"),
             })
         );
         assert_eq!(
-            parse_command("/github_check https://github.com/acme/widgets/issues/42 tests validés"),
+            parse_command("/gh check https://github.com/acme/widgets/issues/42 tests validés"),
             Ok(ControlCommand::GitHubCheck {
                 issue_url: issue_url.clone(),
                 item: GitHubChecklistItem::new("tests validés").expect("item"),
             })
         );
         assert_eq!(
-            parse_command(
-                "/github_uncheck https://github.com/acme/widgets/issues/42 tests validés"
-            ),
+            parse_command("/gh uncheck https://github.com/acme/widgets/issues/42 tests validés"),
             Ok(ControlCommand::GitHubUncheck {
                 issue_url,
                 item: GitHubChecklistItem::new("tests validés").expect("item"),
@@ -2618,12 +2541,12 @@ mod tests {
         );
 
         for command in [
-            "/github_create",
-            "/github_create automonique",
-            "/github_reply",
-            "/github_reply https://github.com/acme/widgets/issues/42",
-            "/github_check https://github.com/acme/widgets/issues/42",
-            "/github_uncheck https://github.com/acme/widgets/issues/42",
+            "/gh create",
+            "/gh create automonique",
+            "/gh reply",
+            "/gh reply https://github.com/acme/widgets/issues/42",
+            "/gh check https://github.com/acme/widgets/issues/42",
+            "/gh uncheck https://github.com/acme/widgets/issues/42",
         ] {
             assert_eq!(
                 parse_command(command),
@@ -2637,32 +2560,30 @@ mod tests {
             "a GitHub URL must not become an internal support-ticket reference"
         );
         assert_ne!(
-            parse_command("/github_check https://github.com/acme/widgets/issues/42 tests validés"),
-            parse_command(
-                "/github_uncheck https://github.com/acme/widgets/issues/42 tests validés"
-            )
+            parse_command("/gh check https://github.com/acme/widgets/issues/42 tests validés"),
+            parse_command("/gh uncheck https://github.com/acme/widgets/issues/42 tests validés")
         );
 
         for (command, kind) in [
             (
-                "/github_issue ferme https://github.com/acme/widgets/issues/42",
-                CommandKind::GitHubIssue,
+                "/gh issue ferme https://github.com/acme/widgets/issues/42",
+                CommandKind::GitHub,
             ),
             (
-                "/github_label crée le label bug dans widgets",
-                CommandKind::GitHubLabel,
+                "/gh label crée le label bug dans widgets",
+                CommandKind::GitHub,
             ),
             (
-                "/github_milestone crée le jalon v2 dans widgets",
-                CommandKind::GitHubMilestone,
+                "/gh milestone crée le jalon v2 dans widgets",
+                CommandKind::GitHub,
             ),
             (
-                "/github_epic ajoute 42 comme sous-ticket de 10",
-                CommandKind::GitHubEpic,
+                "/gh epic ajoute 42 comme sous-ticket de 10",
+                CommandKind::GitHub,
             ),
             (
-                "/github_project crée un projet privé roadmap",
-                CommandKind::GitHubProject,
+                "/gh project crée un projet privé roadmap",
+                CommandKind::GitHub,
             ),
         ] {
             assert_eq!(
@@ -2672,6 +2593,15 @@ mod tests {
             assert_ne!(kind, CommandKind::Ticket);
             assert_eq!(kind.tier(), CommandTier::Admin);
         }
+        assert_eq!(
+            parse_command("/gh frobnicate widgets"),
+            Err(CommandRefusal::ArgumentInvalid)
+        );
+        assert_eq!(
+            parse_command("/github_create automonique obsolete spelling"),
+            Err(CommandRefusal::UnknownCommand)
+        );
+        assert!(!help_text().contains("/github_"));
     }
 
     #[test]
@@ -2692,7 +2622,7 @@ mod tests {
                 "{invalid}"
             );
             assert_eq!(
-                parse_command(&format!("/github_reply {invalid} reply")),
+                parse_command(&format!("/gh reply {invalid} reply")),
                 Err(CommandRefusal::ArgumentInvalid),
                 "{invalid}"
             );
@@ -2707,20 +2637,20 @@ mod tests {
         );
         assert_eq!(
             parse_command(&format!(
-                "/github_reply https://github.com/acme/widgets/issues/42 {}",
+                "/gh reply https://github.com/acme/widgets/issues/42 {}",
                 "r".repeat(MAX_GITHUB_REQUEST_BYTES + 1)
             )),
             Err(CommandRefusal::ArgumentTooLong)
         );
         assert_eq!(
             parse_command(&format!(
-                "/github_check https://github.com/acme/widgets/issues/42 {}",
+                "/gh check https://github.com/acme/widgets/issues/42 {}",
                 "i".repeat(MAX_GITHUB_CHECKLIST_ITEM_BYTES + 1)
             )),
             Err(CommandRefusal::ArgumentTooLong)
         );
         assert_eq!(
-            parse_command("/github_create automonique bell\u{7}"),
+            parse_command("/gh create automonique bell\u{7}"),
             Err(CommandRefusal::ArgumentInvalid)
         );
     }
@@ -3043,37 +2973,17 @@ mod tests {
                         entry.name
                     );
                 }
-                ArgumentShape::GitHubRepositoryRequest => {
+                ArgumentShape::GitHubDirective => {
                     assert_eq!(bare, Err(CommandRefusal::MissingArgument), "{}", entry.name);
                     assert_eq!(
                         with_argument,
-                        Err(CommandRefusal::MissingArgument),
+                        Err(CommandRefusal::ArgumentInvalid),
                         "{}",
                         entry.name
                     );
                     assert_eq!(
                         parse_command(&format!(
-                            "/{} automonique create a concise issue",
-                            entry.name
-                        ))
-                        .as_ref()
-                        .map(ControlCommand::kind),
-                        Ok(entry.kind),
-                        "{}",
-                        entry.name
-                    );
-                }
-                ArgumentShape::GitHubIssueRequest => {
-                    assert_eq!(bare, Err(CommandRefusal::MissingArgument), "{}", entry.name);
-                    assert_eq!(
-                        with_argument,
-                        Err(CommandRefusal::MissingArgument),
-                        "{}",
-                        entry.name
-                    );
-                    assert_eq!(
-                        parse_command(&format!(
-                            "/{} https://github.com/acme/widgets/issues/42 do the thing",
+                            "/{} create automonique create a concise issue",
                             entry.name
                         ))
                         .as_ref()
@@ -3106,15 +3016,7 @@ mod tests {
             (CommandKind::Mute, CommandTier::Allowed),
             (CommandKind::Archive, CommandTier::Allowed),
             (CommandKind::Research, CommandTier::Admin),
-            (CommandKind::GitHubCreate, CommandTier::Admin),
-            (CommandKind::GitHubReply, CommandTier::Admin),
-            (CommandKind::GitHubCheck, CommandTier::Admin),
-            (CommandKind::GitHubUncheck, CommandTier::Admin),
-            (CommandKind::GitHubIssue, CommandTier::Admin),
-            (CommandKind::GitHubLabel, CommandTier::Admin),
-            (CommandKind::GitHubMilestone, CommandTier::Admin),
-            (CommandKind::GitHubEpic, CommandTier::Admin),
-            (CommandKind::GitHubProject, CommandTier::Admin),
+            (CommandKind::GitHub, CommandTier::Admin),
             (CommandKind::Work, CommandTier::Admin),
             (CommandKind::Run, CommandTier::Admin),
             (CommandKind::Say, CommandTier::Admin),
@@ -3153,15 +3055,7 @@ mod tests {
                     | CommandKind::Forget
                     | CommandKind::New
                     | CommandKind::Research
-                    | CommandKind::GitHubCreate
-                    | CommandKind::GitHubReply
-                    | CommandKind::GitHubCheck
-                    | CommandKind::GitHubUncheck
-                    | CommandKind::GitHubIssue
-                    | CommandKind::GitHubLabel
-                    | CommandKind::GitHubMilestone
-                    | CommandKind::GitHubEpic
-                    | CommandKind::GitHubProject
+                    | CommandKind::GitHub
                     | CommandKind::Work
                     | CommandKind::Say
                     | CommandKind::Cancel
@@ -3301,13 +3195,9 @@ mod tests {
                 ArgumentShape::MuteDirective => format!("/{} 1h", kind.name()),
                 ArgumentShape::Channel => format!("/{} ops", kind.name()),
                 ArgumentShape::ChannelMessage => format!("/{} ops bonjour", kind.name()),
-                ArgumentShape::GitHubRepositoryRequest => {
-                    format!("/{} automonique create a concise issue", kind.name())
+                ArgumentShape::GitHubDirective => {
+                    format!("/{} create automonique create a concise issue", kind.name())
                 }
-                ArgumentShape::GitHubIssueRequest => format!(
-                    "/{} https://github.com/acme/widgets/issues/42 do the thing",
-                    kind.name()
-                ),
             };
             // The administrator's parse is exactly the untiered one.
             assert_eq!(

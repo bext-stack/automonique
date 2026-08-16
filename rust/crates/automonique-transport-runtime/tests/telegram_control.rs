@@ -89,7 +89,7 @@ fn surface_forms_an_operator_actually_types_are_accepted() {
 
 #[test]
 fn github_commands_keep_the_repository_target_and_action_text_typed() {
-    let create = parse_command("/github_create Automonique corriger le menu mobile")
+    let create = parse_command("/gh create Automonique corriger le menu mobile")
         .expect("GitHub create command");
     let ControlCommand::GitHubCreate {
         repo_alias,
@@ -101,10 +101,9 @@ fn github_commands_keep_the_repository_target_and_action_text_typed() {
     assert_eq!(repo_alias.as_str(), "automonique");
     assert_eq!(request.as_str(), "corriger le menu mobile");
 
-    let reply = parse_command(
-        "/github_reply https://github.com/acme/widgets/issues/42 publier cette réponse",
-    )
-    .expect("GitHub reply command");
+    let reply =
+        parse_command("/gh reply https://github.com/acme/widgets/issues/42 publier cette réponse")
+            .expect("GitHub reply command");
     let ControlCommand::GitHubReply { issue_url, request } = reply else {
         panic!("expected GitHub reply");
     };
@@ -116,12 +115,12 @@ fn github_commands_keep_the_repository_target_and_action_text_typed() {
 
     for (text, expected) in [
         (
-            "/github_check https://github.com/acme/widgets/issues/42 tests validés",
-            CommandKind::GitHubCheck,
+            "/gh check https://github.com/acme/widgets/issues/42 tests validés",
+            CommandKind::GitHub,
         ),
         (
-            "/github_uncheck https://github.com/acme/widgets/issues/42 tests validés",
-            CommandKind::GitHubUncheck,
+            "/gh uncheck https://github.com/acme/widgets/issues/42 tests validés",
+            CommandKind::GitHub,
         ),
     ] {
         assert_eq!(
@@ -382,35 +381,9 @@ fn the_manifest_is_exhaustive_over_the_registry_and_round_trips() {
     assert_eq!(
         manifest.map(|entry| entry.name),
         [
-            "help",
-            "status",
-            "runs",
-            "tickets",
-            "ticket",
-            "slack",
-            "memory",
-            "remember",
-            "forget",
-            "new",
-            "mute",
-            "archive",
-            "research",
-            "github_create",
-            "github_reply",
-            "github_check",
-            "github_uncheck",
-            "github_issue",
-            "github_label",
-            "github_milestone",
-            "github_epic",
-            "github_project",
-            "work",
-            "run",
-            "say",
-            "cancel",
-            "approve",
-            "deny",
-            "admin"
+            "help", "status", "runs", "tickets", "ticket", "slack", "memory", "remember", "forget",
+            "new", "mute", "archive", "research", "gh", "work", "run", "say", "cancel", "approve",
+            "deny", "admin"
         ]
     );
     for entry in manifest {
@@ -423,13 +396,9 @@ fn the_manifest_is_exhaustive_over_the_registry_and_round_trips() {
             ArgumentShape::MuteDirective => format!("/{} 1h", entry.name),
             ArgumentShape::Channel => format!("/{} ops", entry.name),
             ArgumentShape::ChannelMessage => format!("/{} ops bonjour", entry.name),
-            ArgumentShape::GitHubRepositoryRequest => {
-                format!("/{} automonique create a concise issue", entry.name)
+            ArgumentShape::GitHubDirective => {
+                format!("/{} create automonique create a concise issue", entry.name)
             }
-            ArgumentShape::GitHubIssueRequest => format!(
-                "/{} https://github.com/acme/widgets/issues/42 do the thing",
-                entry.name
-            ),
         };
         assert_eq!(
             parse_command(&typed).as_ref().map(ControlCommand::kind),

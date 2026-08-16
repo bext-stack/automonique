@@ -1651,7 +1651,7 @@ fn telegram_github_create_reaches_the_action_surface_not_ticket_intake() {
         FakeClient::new([updates(&[(
             1,
             OPERATOR,
-            "/github_create automonique repair retries",
+            "/gh create automonique repair retries",
         )])]),
         outbound.clone(),
         lane,
