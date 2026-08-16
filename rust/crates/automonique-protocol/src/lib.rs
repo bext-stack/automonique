@@ -32,6 +32,7 @@ pub mod models;
 pub mod namespace;
 pub mod parity;
 pub mod primitives;
+pub mod progress_api;
 pub mod protocols;
 pub mod provider;
 pub mod provider_catalog;

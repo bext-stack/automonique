@@ -732,6 +732,32 @@ impl From<std::io::Error> for LaunchError {
     }
 }
 
+/// What the supervisor does with the workload's stdout.
+///
+/// Deliberately a choice rather than a default. A piped stdout that nobody
+/// reads fills its kernel buffer and stops the workload mid-write, so the
+/// decision to pipe and the obligation to read are the same decision, and this
+/// enum is where a caller states it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StdoutCapture {
+    /// The workload writes to the supervisor's own stdout.
+    ///
+    /// The historical behaviour, and still the right one for a workload nobody
+    /// is normalizing: it costs no pipe, no thread and no buffer.
+    Inherit,
+    /// The supervisor holds the read end and must drain it.
+    Piped,
+}
+
+impl StdoutCapture {
+    fn stdio(self) -> Stdio {
+        match self {
+            Self::Inherit => Stdio::inherit(),
+            Self::Piped => Stdio::piped(),
+        }
+    }
+}
+
 /// Spawn the entry helper for `plan` inside `containment`.
 ///
 /// The returned [`Child`] is the entry helper, which becomes the workload on
@@ -741,17 +767,40 @@ impl From<std::io::Error> for LaunchError {
 /// `helper` is the path to the `automonique-launch-enter` binary. The caller
 /// chooses it deliberately — a production supervisor must pass a
 /// release-pinned path, and this function does not guess one.
+///
+/// The workload's stdout is inherited. To read it instead, see
+/// [`spawn_sandboxed_with_stdout`] — and read it, or the workload stops.
 pub fn spawn_sandboxed(
     helper: &Path,
     plan: &LaunchPlan,
     containment: &RunContainment,
+) -> Result<Child, LaunchError> {
+    spawn_sandboxed_with_stdout(helper, plan, containment, StdoutCapture::Inherit)
+}
+
+/// Spawn the entry helper, choosing what becomes of the workload's stdout.
+///
+/// Everything else is [`spawn_sandboxed`]: same frame on the same piped stdin,
+/// same cleared environment, same single containment variable, and stderr still
+/// the supervisor's own — a diagnostic line is a diagnostic line whether or not
+/// anyone is normalizing the transcript.
+///
+/// # Errors
+///
+/// Returns [`LaunchError::Plan`] for a plan that will not encode and
+/// [`LaunchError::Io`] for a spawn or a frame write that fails.
+pub fn spawn_sandboxed_with_stdout(
+    helper: &Path,
+    plan: &LaunchPlan,
+    containment: &RunContainment,
+    stdout: StdoutCapture,
 ) -> Result<Child, LaunchError> {
     let frame = plan.encode()?;
     let mut child = Command::new(helper)
         .env_clear()
         .env(crate::CGROUP_DIR_ENV, containment.path())
         .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
+        .stdout(stdout.stdio())
         .stderr(Stdio::inherit())
         .spawn()?;
     let mut stdin = child.stdin.take().expect("stdin was requested piped");

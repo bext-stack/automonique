@@ -301,7 +301,7 @@ use crate::batch_api::{BatchApiError, BatchRefusal};
 use crate::batch_runner::{BatchError, BatchState, ConcurrencyKind, MemberProgress};
 use crate::codec::CodecError;
 use crate::digest::Sha256;
-use crate::event::Authority;
+use crate::event::{Authority, EventKind, MAX_RETRY_AFTER_MS, RetryCategory, StepStatus};
 use crate::primitives::ValueError;
 use crate::runs_api::{
     LIFECYCLE_AUTHORITIES, LifecycleCoverage, RunState, RunsApiError, RunsRefusal, SpoolEventKind,
@@ -799,6 +799,9 @@ pub const APPROVAL_MODULE: &str = "approval";
 
 /// The `automonique.batch.control` registration surface.
 pub const BATCH_MODULE: &str = "batch";
+
+/// The `automonique.progress/v1` frame surface.
+pub const PROGRESS_MODULE: &str = "progress";
 
 /// The file one module is written to.
 #[must_use]
@@ -5408,6 +5411,194 @@ fn batch_module() -> GeneratedModule {
     }
 }
 
+/// The declared [`EventKind`] spellings, pinned to the Rust wire strings.
+///
+/// Read off `EventKind::ALL`, whose own length is a compile-time array bound —
+/// a kind added to the enum and left out of the table fails to compile there
+/// rather than silently narrowing the generated union here.
+fn event_kind_values() -> Vec<String> {
+    EventKind::ALL
+        .into_iter()
+        .map(|kind| kind.as_str().to_owned())
+        .collect()
+}
+
+/// The declared [`StepStatus`] spellings, pinned to the Rust wire strings.
+fn step_status_values() -> Vec<String> {
+    StepStatus::ALL
+        .into_iter()
+        .map(|status| match status {
+            StepStatus::Pending
+            | StepStatus::InProgress
+            | StepStatus::Completed
+            | StepStatus::Error => status.as_str().to_owned(),
+        })
+        .collect()
+}
+
+/// The declared [`RetryCategory`] spellings, pinned to the Rust wire strings.
+fn retry_category_values() -> Vec<String> {
+    RetryCategory::ALL
+        .into_iter()
+        .map(|category| match category {
+            RetryCategory::RateLimited
+            | RetryCategory::Overloaded
+            | RetryCategory::Timeout
+            | RetryCategory::Transport
+            | RetryCategory::Rejected
+            | RetryCategory::Internal => category.as_str().to_owned(),
+        })
+        .collect()
+}
+
+/// A closed progress vocabulary, refused rather than retained when undefined.
+fn progress_enum(name: &str, values: Vec<String>) -> GeneratedEnum {
+    GeneratedEnum {
+        name: name.to_owned(),
+        // Every one of these is a `SecuritySensitiveEnum` in Rust. A client that
+        // retained an undefined step status would have to decide whether the
+        // step is still running, and the reassuring guess is the wrong one.
+        sensitivity: EnumSensitivity::SecuritySensitive,
+        values,
+        wire_order: None,
+    }
+}
+
+/// The `automonique.progress/v1` frame surface.
+///
+/// A read surface with no command surface, like [`doctor_module`]: a frame is
+/// something a client decodes, and there is no request on this schema for a
+/// client to build. The transport that will carry them — a bounded fan-out with
+/// cursors — is a separate change, and it will carry exactly this shape.
+fn progress_module() -> GeneratedModule {
+    GeneratedModule {
+        file_name: module_file_name(PROGRESS_MODULE),
+        doc: "One normalized progress frame, as every surface renders a live run from.".to_owned(),
+        source: "automonique_protocol::progress_api".to_owned(),
+        // A name is declared in exactly one module. `Authority`, `EpochMillis`
+        // and `SpoolSequence` are the Runs lane's declarations of the *same*
+        // domains — a frame's sequence is a spool sequence, not a second kind
+        // of number — and `RunId` is the admin lane's. Re-declaring any of them
+        // would make the name ambiguous through the barrel and give the surface
+        // two copies to drift apart.
+        imports: vec![
+            ModuleImport {
+                module: ADMIN_COMMAND_MODULE.to_owned(),
+                values: vec!["RunId".to_owned()],
+                types: Vec::new(),
+            },
+            ModuleImport {
+                module: RUNS_MODULE.to_owned(),
+                values: vec![
+                    "Authority".to_owned(),
+                    EPOCH_MILLIS.to_owned(),
+                    "SpoolSequence".to_owned(),
+                ],
+                types: Vec::new(),
+            },
+        ],
+        constants: vec![
+            Constant {
+                name: "MAX_PROGRESS_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical bytes of one encoded frame. It is inside the runner \
+                      spool's own payload ceiling, because a frame is stored as one spool \
+                      event's payload."
+                    .to_owned(),
+                value: ConstantValue::Count(crate::progress_api::MAX_PROGRESS_CANONICAL_BYTES),
+            },
+            Constant {
+                name: "MAX_RETRY_AFTER_MS".to_owned(),
+                doc: "Longest wait a retry context may advertise. A delay past it is refused \
+                      rather than clamped: a wait nobody will sit through is a refusal wearing a \
+                      promise."
+                    .to_owned(),
+                value: ConstantValue::Count(
+                    usize::try_from(MAX_RETRY_AFTER_MS).expect("the retry ceiling fits a usize"),
+                ),
+            },
+            Constant {
+                name: "PROGRESS_API_SCHEMA_V1".to_owned(),
+                doc: "Stable schema identifier for the version-one frame.".to_owned(),
+                value: ConstantValue::Text(crate::progress_api::PROGRESS_API_SCHEMA_V1.to_owned()),
+            },
+            Constant {
+                name: "PROGRESS_PROTOCOL".to_owned(),
+                doc: "Stable protocol name for the normalized progress stream.".to_owned(),
+                value: ConstantValue::Text(crate::progress_api::PROGRESS_PROTOCOL.to_owned()),
+            },
+        ],
+        bounded_strings: vec![BoundedString {
+            name: "ProgressText".to_owned(),
+            max_bytes: crate::progress_api::MAX_PROGRESS_TEXT_BYTES,
+            // One step looser than the crate's usual no-control-character rule:
+            // a newline and a tab are content in a model's prose and in a tool's
+            // output, and every other control character is an instruction to
+            // some renderer rather than a character to show.
+            pattern: Some("^(?:[^\\p{Cc}]|[\\n\\t])+$".to_owned()),
+        }],
+        bounded_integers: vec![
+            BoundedInteger {
+                // Counted from one: attempt zero names an attempt nobody made.
+                name: "RetryAttempt".to_owned(),
+                min: 1,
+                max: i64::from(u32::MAX),
+            },
+            BoundedInteger {
+                name: "RetryAfterMillis".to_owned(),
+                min: 0,
+                max: i64::try_from(MAX_RETRY_AFTER_MS).expect("the retry ceiling fits the wire"),
+            },
+        ],
+        enums: vec![
+            progress_enum("EventKind", event_kind_values()),
+            progress_enum("RetryCategory", retry_category_values()),
+            progress_enum("StepStatus", step_status_values()),
+        ],
+        interfaces: vec![
+            Interface {
+                name: "RetryContext".to_owned(),
+                doc: "Why a warning or a fault might be tried again, and when. A wait is present \
+                      only on a retryable context; the Rust constructor refuses the other \
+                      combination."
+                    .to_owned(),
+                fields: vec![
+                    required("attempt", "RetryAttempt"),
+                    required("category", "RetryCategory"),
+                    nullable("retry_after_ms", "RetryAfterMillis"),
+                    required("retryable", "boolean"),
+                ],
+            },
+            Interface {
+                name: "ProgressBody".to_owned(),
+                doc: "What one frame says beyond its kind. Every member is present and may be \
+                      null; which of them a kind requires and which it forbids is a cross-field \
+                      rule only the Rust constructor applies."
+                    .to_owned(),
+                fields: vec![
+                    nullable("retry", "RetryContext"),
+                    nullable("step", "StepStatus"),
+                    nullable("text", "ProgressText"),
+                ],
+            },
+            Interface {
+                name: "ProgressFrame".to_owned(),
+                doc: "One normalized progress event. `sequence` is the runner spool's own \
+                      position, which is what makes it a resumption cursor rather than a counter."
+                    .to_owned(),
+                fields: vec![
+                    required("at_ms", EPOCH_MILLIS),
+                    required("authority", "Authority"),
+                    required("body", "ProgressBody"),
+                    required("kind", "EventKind"),
+                    required("run_id", "RunId"),
+                    required("sequence", "SpoolSequence"),
+                ],
+            },
+        ],
+        ..GeneratedModule::default()
+    }
+}
+
 /// Every maintained module, in file-name order.
 #[must_use]
 pub fn maintained_modules() -> Vec<GeneratedModule> {
@@ -5420,6 +5611,7 @@ pub fn maintained_modules() -> Vec<GeneratedModule> {
         automation_module(),
         approval_module(),
         batch_module(),
+        progress_module(),
     ];
     modules.sort_by(|left, right| left.file_name.cmp(&right.file_name));
     modules

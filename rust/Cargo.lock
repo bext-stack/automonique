@@ -87,6 +87,7 @@ version = "0.1.0"
 name = "automonique-daemon"
 version = "0.1.0"
 dependencies = [
+ "automonique-agents",
  "automonique-core",
  "automonique-egress-broker",
  "automonique-github-connector",

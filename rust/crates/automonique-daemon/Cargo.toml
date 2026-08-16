@@ -8,6 +8,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The provider grammar, for the one thing this daemon does with a live run's
+# stdout: normalize it. The dependency runs this way because it cannot run the
+# other — `automonique-agents` depends on `automonique-runner`, so the runner
+# cannot own a normalizer, and the daemon is the composition root that holds
+# both. See `progress`. No third-party crate enters the graph with it.
+automonique-agents = { path = "../automonique-agents" }
 automonique-core = { path = "../automonique-core" }
 # The execution lane starts one loopback CONNECT broker per run that needs
 # egress, so the daemon composes the broker rather than merely describing one.

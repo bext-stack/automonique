@@ -78,6 +78,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use automonique_protocol::event::EventKind;
+use automonique_protocol::progress_api::ProgressFrame;
 use automonique_slack_connector::{
     AppsConnectionsOpenClient, ChannelId, ConversationsHistoryRequest, HomeView, MAX_PAGE_LIMIT,
     MessageBlocks, MessagePage, MessageText, MessageTs, ModalView, OpenViewRequest,
@@ -106,6 +108,7 @@ use crate::github_actions::{
     GitHubActionEngine, GitHubActionRequest, GitHubManagementDomain, is_github_capability_question,
 };
 use crate::manage_config::ManageUrl;
+use crate::progress_hub::ProgressHub;
 use crate::run_lane::SocketRunLane;
 use crate::telegram_bridge::{
     ApprovalDecisionAnswer, ApprovalDecisionFailure, RunLane as _, SlackSurface,
@@ -3375,6 +3378,110 @@ fn repair(rejection: &SlackRejection, name: &ChannelName) -> String {
         SlackErrorKind::UserNotFound => String::from("Slack refused: it knows no such user."),
         SlackErrorKind::Invalid => String::from("Slack refused the request as malformed."),
         SlackErrorKind::Other => String::from("Slack refused the request."),
+    }
+}
+
+/// Markdown lines one appended task-card chunk may carry.
+///
+/// Slack's own limit is on the message, not on an append; this bound is on how
+/// much one drain turns into, so a burst of frames becomes one readable chunk
+/// rather than a wall.
+pub const MAX_TASK_CARD_LINES: usize = 16;
+
+/// One Slack thread's view of a run in progress, folded from the same frames.
+///
+/// # Why this is a different fold from Telegram's
+///
+/// Because the two surfaces mean different things by an update. A Telegram
+/// draft is *replaced*, so its renderer keeps the latest snapshot; a Slack
+/// stream is *appended to*, so this one emits the lines that are new since the
+/// last drain and never repeats one. Sharing a fold between them would have
+/// forced one of the two to redraw what its reader had already seen.
+///
+/// # What this is not
+///
+/// Not the transport. Nothing here opens a stream, appends to one, or builds
+/// Block Kit. The three native stream calls, the fallback for a workspace whose
+/// app class lacks them, and the rule that rich formatting exists only at the
+/// end are a separate change; this is the seam it will render through and an
+/// in-process consumer ([`Self::poll`]) that proves the fold runs against a live
+/// hub.
+#[derive(Clone, Debug, Default)]
+pub struct RunTaskCard {
+    cursor: u64,
+    /// The last assistant text emitted, so an unchanged snapshot is not
+    /// appended a second time.
+    last_text: Option<String>,
+}
+
+impl RunTaskCard {
+    /// Start a card that has seen nothing.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The highest frame sequence this card has folded in.
+    #[must_use]
+    pub const fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
+    /// Fold frames in and answer with the markdown lines that are new.
+    ///
+    /// Empty means there is nothing a reader has not already seen, which is a
+    /// reason to append nothing rather than to append an empty chunk.
+    pub fn absorb(&mut self, frames: &[ProgressFrame]) -> Vec<String> {
+        let mut lines = Vec::new();
+        for frame in frames {
+            if frame.sequence() <= self.cursor {
+                continue;
+            }
+            self.cursor = frame.sequence();
+            if let Some(line) = self.line_for(frame) {
+                lines.push(line);
+            }
+        }
+        // Oldest first, and the newest kept: a chunk that had to be cut is
+        // better cut at the end a reader has already scrolled past.
+        while lines.len() > MAX_TASK_CARD_LINES {
+            lines.remove(0);
+        }
+        lines
+    }
+
+    /// Fold whatever a live hub has retained past this card's cursor.
+    pub fn poll(&mut self, hub: &ProgressHub, run_id: &str) -> Vec<String> {
+        let frames = hub.frames_after(run_id, self.cursor);
+        self.absorb(&frames)
+    }
+
+    fn line_for(&mut self, frame: &ProgressFrame) -> Option<String> {
+        let text = frame.body().text().map(|text| text.as_str().to_owned());
+        match frame.kind() {
+            EventKind::AssistantMessageDelta | EventKind::AssistantMessageCompleted => {
+                let text = text?;
+                // A coalesced preview carries the message *so far*, so two in a
+                // row differ by a suffix; appending the whole thing twice would
+                // show the reader the same sentence again.
+                if self.last_text.as_deref() == Some(text.as_str()) {
+                    return None;
+                }
+                self.last_text = Some(text.clone());
+                Some(text)
+            }
+            EventKind::ProviderWarning | EventKind::ProviderFault => Some(format!(
+                ":warning: {}",
+                text.unwrap_or_else(|| frame.kind().as_str().to_owned())
+            )),
+            // The thinking step, drawn from the status the frame carries rather
+            // than from which kind arrived.
+            kind => {
+                let status = frame.body().step()?;
+                let label = text.unwrap_or_else(|| kind.as_str().to_owned());
+                Some(format!("• {label} _{}_", status.as_str()))
+            }
+        }
     }
 }
 

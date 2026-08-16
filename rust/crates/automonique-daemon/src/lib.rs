@@ -163,6 +163,8 @@ pub mod manage_config;
 pub mod memory_config;
 mod model_inventory;
 pub mod parity_trace;
+pub mod progress;
+pub mod progress_hub;
 pub mod release_activation;
 pub mod release_builder;
 pub mod run_lane;
@@ -1546,6 +1548,24 @@ impl Daemon {
     #[must_use]
     pub fn attempt_host(&self) -> Option<&DaemonAttemptHost> {
         self.attempt_host.as_deref()
+    }
+
+    /// This daemon's live progress replay, when it has an execution lane.
+    ///
+    /// The seam a renderer holds. Shared rather than lent: a chat bridge polls
+    /// it from its own thread while an attempt's supervisor publishes into it
+    /// from another, and the alternative — handing out a reference bound to the
+    /// daemon's own lifetime — would make the two lifetimes one.
+    ///
+    /// `None` on a daemon with no lane, which is a host that can run nothing
+    /// and therefore has nothing to show. Reading from it is never a substitute
+    /// for the durable record: see [`crate::progress_hub`] for the two tiers
+    /// and which of them a decision may rest on.
+    #[must_use]
+    pub fn progress(&self) -> Option<Arc<progress_hub::ProgressHub>> {
+        self.execution
+            .as_ref()
+            .map(execute::ExecutionLane::progress)
     }
 
     /// Serve until the supplied stop flag is set or an authenticated shutdown

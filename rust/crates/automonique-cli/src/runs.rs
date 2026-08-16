@@ -30,11 +30,14 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
+use std::path::Path;
 
+use automonique_protocol::progress_api::ProgressFrame;
 use automonique_protocol::runs_api::{
     ListRuns, PageSize, RunCursor, RunState, RunStateFilter, RunSummary, RunsRequest, RunsResponse,
 };
 use automonique_protocol::tools::RunId;
+use automonique_runner::{EventKind as SpoolKind, SpoolError};
 
 use crate::admin_client;
 
@@ -45,6 +48,15 @@ pub(crate) enum Operation {
     List { flags: Vec<OsString> },
     /// One run in full.
     Detail { run_id: OsString },
+    /// One run's normalized progress frames, read from its durable spool.
+    Tail {
+        /// The attempt's spool directory.
+        spool_root: OsString,
+        /// The run the spool must name.
+        run_id: OsString,
+        /// Render only what follows this sequence.
+        cursor: Option<OsString>,
+    },
 }
 
 /// Why one Runs read produced no output.
@@ -82,15 +94,23 @@ pub(crate) fn run<W: Write, E: Write>(
     stdout: &mut W,
     stderr: &mut E,
 ) -> u8 {
-    let request = match operation {
-        Operation::List { flags } => list_request(flags),
-        Operation::Detail { run_id } => detail_request(run_id),
+    // `tail` is the one verb on this surface that opens no socket: the frames it
+    // renders are in the run's own durable spool, and reading them is a local
+    // read of a hash-chained file rather than a question for the daemon. It is
+    // dispatched first for that reason — nothing below it applies.
+    let rendered = match operation {
+        Operation::Tail {
+            spool_root,
+            run_id,
+            cursor,
+        } => tail(spool_root, run_id, cursor.as_deref()),
+        Operation::List { flags } => {
+            list_request(flags).and_then(|request| answer(runtime, request))
+        }
+        Operation::Detail { run_id } => {
+            detail_request(run_id).and_then(|request| answer(runtime, request))
+        }
     };
-    let rendered = request.and_then(|request| {
-        let response = admin_client::runs_request(runtime, &request)
-            .map_err(|error| RunsError::Endpoint(error.category().to_owned()))?;
-        render(&request, response)
-    });
     match rendered {
         Ok(text) => {
             if stdout.write_all(text.as_bytes()).is_err() {
@@ -102,6 +122,120 @@ pub(crate) fn run<W: Write, E: Write>(
             let _ = writeln!(stderr, "automonique runs refused: {}", error.category());
             error.exit_code()
         }
+    }
+}
+
+/// Send one request and render the answer it earns.
+fn answer(runtime: Option<&OsStr>, request: RunsRequest) -> Result<String, RunsError> {
+    let response = admin_client::runs_request(runtime, &request)
+        .map_err(|error| RunsError::Endpoint(error.category().to_owned()))?;
+    render(&request, response)
+}
+
+/// Render one attempt's normalized progress, from the record that holds it.
+///
+/// # Why this reads a file and not a socket
+///
+/// The runner spool *is* the progress record: each frame is the payload of one
+/// hash-chained `adapter_event`, and its position in the chain is the cursor a
+/// reader resumes from. So a complete, verified replay needs no daemon at all —
+/// it needs the file, which this opens read-only and without taking the writer's
+/// lock.
+///
+/// The consequence is worth stating plainly rather than hiding: while the
+/// attempt is live its writer holds an exclusive lock and appends as it goes, so
+/// a read here is a *prefix* of what the run will eventually have said. Watching
+/// a live run frame-by-frame is a subscription, and a subscription needs a
+/// transport this build does not have; running `tail` again is what advances the
+/// prefix in the meantime.
+///
+/// Every rendered byte came out of the protocol's own decoder, so a frame the
+/// spool holds and this build cannot read is reported rather than guessed at.
+fn tail(spool_root: &OsStr, run_id: &OsStr, cursor: Option<&OsStr>) -> Result<String, RunsError> {
+    let run_id = run_id.to_str().ok_or(RunsError::Field("invalid_run_id"))?;
+    RunId::new(run_id).map_err(|_| RunsError::Field("invalid_run_id"))?;
+    let cursor = match cursor {
+        Some(value) => value
+            .to_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(RunsError::Field("invalid_cursor"))?,
+        None => 0,
+    };
+    let events = automonique_runner::read_events(Path::new(spool_root), run_id)
+        .map_err(|error| RunsError::Endpoint(spool_category(&error).to_owned()))?;
+    let mut rendered = String::new();
+    let mut frames = 0_usize;
+    for event in events.iter().filter(|event| event.sequence() > cursor) {
+        // The spool carries five event kinds and exactly one of them is a
+        // frame. The others are the run's lifecycle, which the detail view
+        // already reports; rendering them here would be a second, worse copy of
+        // that view.
+        if event.kind() != SpoolKind::AdapterEvent {
+            continue;
+        }
+        let frame = ProgressFrame::from_canonical_bytes(event.payload())
+            .map_err(|error| RunsError::Endpoint(error.category().to_owned()))?;
+        rendered.push_str(&render_frame(&frame));
+        rendered.push('\n');
+        frames += 1;
+    }
+    Ok(format!(
+        "Automonique progress: run_id={run_id} frames={frames} last_sequence={}\n{rendered}",
+        events.last().map_or(0, automonique_runner::Event::sequence)
+    ))
+}
+
+/// One frame, as one line.
+fn render_frame(frame: &ProgressFrame) -> String {
+    let step = frame
+        .body()
+        .step()
+        .map_or_else(|| "-".to_owned(), |status| status.as_str().to_owned());
+    let retry = frame.body().retry().map_or_else(
+        || "-".to_owned(),
+        |retry| {
+            format!(
+                "{}/{}/attempt={}",
+                retry.category().as_str(),
+                if retry.retryable() {
+                    "retryable"
+                } else {
+                    "final"
+                },
+                retry.attempt()
+            )
+        },
+    );
+    format!(
+        "seq={} at_ms={} authority={} kind={} step={step} retry={retry} text={}",
+        frame.sequence(),
+        frame.at_ms().as_millis(),
+        frame.authority().as_str(),
+        frame.kind().as_str(),
+        // One line per frame, so an embedded newline is escaped rather than
+        // allowed to forge a second frame in the output.
+        frame.body().text().map_or_else(
+            || "-".to_owned(),
+            |text| text.as_str().escape_debug().to_string()
+        ),
+    )
+}
+
+/// The stable category one spool refusal reports.
+///
+/// The runner's error type carries no `category()`, and a `Display` string is a
+/// sentence rather than a word a script can branch on — so the mapping is
+/// written here, closed, beside the only reader that needs it.
+const fn spool_category(error: &SpoolError) -> &'static str {
+    match error {
+        SpoolError::Io(_) => "spool_unreadable",
+        SpoolError::UnsafeDirectory => "spool_unsafe_directory",
+        SpoolError::UnsafeFile => "spool_unsafe_file",
+        SpoolError::AlreadyOpen => "spool_already_open",
+        SpoolError::Corrupt => "spool_corrupt",
+        SpoolError::LimitExceeded => "spool_limit_exceeded",
+        SpoolError::AlreadyTerminal => "spool_already_terminal",
+        SpoolError::CursorAhead { .. } => "spool_cursor_ahead",
     }
 }
 

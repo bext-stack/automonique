@@ -2,7 +2,7 @@
 
 use crate::types::{
     AdapterError, ExecutionMode, MAX_EVENT_TEXT_BYTES, NormalizedEvent, ProviderDisposition,
-    RecordedEvent, RecordedKind, ResumeBinding, RunCoordinates, UnknownEventKind,
+    ProviderItemKind, RecordedEvent, RecordedKind, ResumeBinding, RunCoordinates, UnknownEventKind,
     validate_coordinate, validate_provider_session,
 };
 use automonique_connector_substrate::json::strict_json;
@@ -14,9 +14,15 @@ pub(crate) struct NormalizedRun {
     pub disposition: ProviderDisposition,
 }
 
-pub(crate) struct Normalizer<'a> {
-    coordinates: &'a RunCoordinates,
-    mode: &'a ExecutionMode,
+/// The state machine, which owns the coordinates it normalizes against.
+///
+/// Owned rather than borrowed, and the clone is the point: a normalizer that
+/// borrowed its coordinates could not be moved onto a reader thread, and the
+/// live progress stream is exactly a normalizer on a reader thread. The cost is
+/// five short strings per run, paid once.
+pub(crate) struct Normalizer {
+    coordinates: RunCoordinates,
+    mode: ExecutionMode,
     session: Option<String>,
     turn_started: bool,
     active_item: Option<String>,
@@ -25,11 +31,11 @@ pub(crate) struct Normalizer<'a> {
     events: Vec<NormalizedEvent>,
 }
 
-impl<'a> Normalizer<'a> {
-    pub fn new(coordinates: &'a RunCoordinates, mode: &'a ExecutionMode) -> Self {
+impl Normalizer {
+    pub fn new(coordinates: &RunCoordinates, mode: &ExecutionMode) -> Self {
         Self {
-            coordinates,
-            mode,
+            coordinates: coordinates.clone(),
+            mode: mode.clone(),
             session: None,
             turn_started: false,
             active_item: None,
@@ -81,7 +87,7 @@ impl<'a> Normalizer<'a> {
         }
         let session = string(object, "thread_id")?.to_owned();
         validate_provider_session(&session)?;
-        let kind = match self.mode {
+        let kind = match &self.mode {
             ExecutionMode::NewSession => RecordedKind::SessionCreated,
             ExecutionMode::Resume(binding) => {
                 if binding.provider_session_id() != session {
@@ -240,14 +246,17 @@ impl<'a> Normalizer<'a> {
 /// transcript while discarding the items it does not model would produce a
 /// normalized event list that is a strict, unannounced subset of what the
 /// provider actually did.
+///
+/// The admitted set is [`ProviderItemKind`] rather than a literal, so the
+/// vocabulary a consumer maps over and the vocabulary this grammar enforces are
+/// one declaration.
 fn require_agent_message(item: &Map<String, Value>) -> Result<(), AdapterError> {
     let item_type = string(item, "type")?;
-    if item_type == "agent_message" {
-        Ok(())
-    } else {
-        Err(AdapterError::UnknownEvent(UnknownEventKind::item(
+    match ProviderItemKind::from_spelling(item_type) {
+        Some(ProviderItemKind::AgentMessage) => Ok(()),
+        None => Err(AdapterError::UnknownEvent(UnknownEventKind::item(
             item_type,
-        )))
+        ))),
     }
 }
 

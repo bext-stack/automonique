@@ -10,7 +10,13 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MAX_EVENT_PAYLOAD_BYTES: usize = 64 * 1024;
+/// Largest payload one spool event may carry.
+///
+/// Public because it is a producer's bound as much as this module's: whatever
+/// is appended has to fit, so a producer that composes a payload needs the
+/// number before it composes one rather than a refusal after.
+pub const MAX_EVENT_PAYLOAD_BYTES: usize = 64 * 1024;
+
 const GENESIS_DIGEST: [u8; 32] = [0; 32];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -336,6 +342,17 @@ impl Spool {
         self.terminal
     }
 
+    /// Bytes still admissible under this attempt's budget.
+    ///
+    /// Exposed so an optional producer — normalized progress, which a run must
+    /// never fail for having too much of — can stop before it competes with the
+    /// terminal event for the last of the budget. Reading it is not a promise
+    /// that the next append fits: the number is what the encoded line is
+    /// measured against, and the line is longer than its payload.
+    pub const fn remaining_bytes(&self) -> u64 {
+        self.max_bytes.saturating_sub(self.bytes)
+    }
+
     fn write_status(&mut self, state: RunState) -> Result<(), SpoolError> {
         let sequence = self.events.last().map_or(0, Event::sequence);
         let content = format!(
@@ -364,6 +381,46 @@ impl Spool {
         File::open(&self.root)?.sync_all()?;
         Ok(())
     }
+}
+
+/// Read one attempt's durable events without becoming its writer.
+///
+/// [`Spool::open`] takes the exclusive lock, which is what makes the writer
+/// single — and what makes a reader that merely wants to *look* unable to,
+/// including while the attempt is still running. This is that reader: it opens
+/// the file read-only, takes no lock, writes nothing, and truncates the
+/// trailing partial line **in its own copy** rather than on disk.
+///
+/// The verification is the writer's, unchanged: every line's chain is checked
+/// against its predecessor, so a file altered under a reader is refused as
+/// [`SpoolError::Corrupt`] rather than partially believed. What a reader does
+/// not get is atomicity — a live attempt may append between two reads — which
+/// is exactly why the durable record is the thing being read and not the thing
+/// being subscribed to.
+///
+/// # Errors
+///
+/// Returns [`SpoolError::Io`] when the file cannot be opened or read,
+/// [`SpoolError::UnsafeFile`] for anything that is not a private regular file
+/// this user owns, and [`SpoolError::Corrupt`] for a chain that does not verify
+/// or a line naming another run.
+pub fn read_events(root: impl AsRef<Path>, run_id: &str) -> Result<Vec<Event>, SpoolError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(root.as_ref().join("events.ndjson"))?;
+    validate_private_file(&file)?;
+    let mut raw = Vec::new();
+    // Bounded by the attempt's own budget, which the writer enforced on the way
+    // in: a file larger than any budget admits is already corrupt, and reading
+    // it to the end is how that is discovered.
+    let mut file = file;
+    file.read_to_end(&mut raw)?;
+    let complete_bytes = raw
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |position| position + 1);
+    parse_events(&raw[..complete_bytes], run_id)
 }
 
 fn create_or_validate_directory(path: &Path) -> Result<(), SpoolError> {

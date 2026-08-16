@@ -82,21 +82,22 @@ pub const MAX_STREAM_EVENTS: usize = 4096;
 
 /// Incremental parser over one provider process's stdout bytes.
 ///
-/// Construction is free and starts no work. The parser borrows the run
+/// Construction is free and starts no work. The parser *copies* the run
 /// coordinates and execution mode it normalizes against, so the events it
 /// produces carry the caller's run and turn identity rather than anything the
-/// provider claimed about itself.
-pub struct ProviderEventStream<'a> {
-    normalizer: Normalizer<'a>,
+/// provider claimed about itself — and so a stream can be moved onto the reader
+/// thread that drains a live process, which a borrowing one could not be.
+pub struct ProviderEventStream {
+    normalizer: Normalizer,
     pending: Vec<u8>,
     total_bytes: usize,
     refusal: Option<AdapterError>,
 }
 
-impl<'a> ProviderEventStream<'a> {
+impl ProviderEventStream {
     /// Start a stream for one turn.
     #[must_use]
-    pub fn new(coordinates: &'a RunCoordinates, mode: &'a ExecutionMode) -> Self {
+    pub fn new(coordinates: &RunCoordinates, mode: &ExecutionMode) -> Self {
         Self {
             normalizer: Normalizer::new(coordinates, mode),
             pending: Vec::new(),

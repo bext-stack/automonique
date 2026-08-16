@@ -253,6 +253,73 @@ pub enum RecordedKind {
     TurnCompleted,
 }
 
+impl RecordedKind {
+    /// Every kind this normalizer can produce, in the order a transcript
+    /// produces them.
+    ///
+    /// Published because it is the domain of a mapping somebody else owns: a
+    /// consumer that projects these onto a rendering vocabulary needs a closed
+    /// set to be exhaustive over, and a set it restated by hand would be a set
+    /// that silently stopped covering a kind added here.
+    pub const ALL: [Self; 7] = [
+        Self::SessionCreated,
+        Self::SessionLoaded,
+        Self::TurnStarted,
+        Self::AssistantMessageCompleted,
+        Self::UsageUpdated,
+        Self::ProviderFault,
+        Self::TurnCompleted,
+    ];
+
+    /// Stable lowercase spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionCreated => "session_created",
+            Self::SessionLoaded => "session_loaded",
+            Self::TurnStarted => "turn_started",
+            Self::AssistantMessageCompleted => "assistant_message_completed",
+            Self::UsageUpdated => "usage_updated",
+            Self::ProviderFault => "provider_fault",
+            Self::TurnCompleted => "turn_completed",
+        }
+    }
+}
+
+/// The provider item types this normalizer admits.
+///
+/// One member, and that is the fact rather than an oversight: the grammar
+/// accepts `agent_message` and refuses every other item type by name — a tool
+/// call, a reasoning summary, a patch — because a transcript that dropped the
+/// items it does not model would be a strict, unannounced subset of what the
+/// provider did. The enum exists so a consumer mapping items onto a rendering
+/// vocabulary is exhaustive over a *declared* set, and gains a compile error
+/// rather than a silent gap when a second item type is admitted here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderItemKind {
+    /// An assistant message.
+    AgentMessage,
+}
+
+impl ProviderItemKind {
+    /// Every admitted item type.
+    pub const ALL: [Self; 1] = [Self::AgentMessage];
+
+    /// The provider's own spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentMessage => "agent_message",
+        }
+    }
+
+    /// Parse the provider's spelling, or nothing.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == value)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordedEvent {
     pub(crate) sequence: u64,

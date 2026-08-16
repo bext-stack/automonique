@@ -108,7 +108,9 @@ use std::time::{Duration, Instant};
 use automonique_github_connector::IssueLocator;
 use automonique_protocol::admin::ExecutionState;
 use automonique_protocol::digest::Sha256;
+use automonique_protocol::event::EventKind;
 use automonique_protocol::execute_api::CancelRunOutcome;
+use automonique_protocol::progress_api::ProgressFrame;
 use automonique_store::agent_memory::{
     AgentMemoryError, AgentMemoryStore, ExternalIdentity, MemoryInput, MemoryKind, MemoryRecord,
     MemorySensitivity, MemoryStatus, MemorySupersession, MemoryVisibility, MessageInput,
@@ -155,6 +157,7 @@ use crate::improvement_worker::ImprovementWorker;
 use crate::improvements::{
     ImprovementCoordinator, ImprovementIntent, ImprovementPlan, PreparedRenderedPlan,
 };
+use crate::progress_hub::ProgressHub;
 
 const MEMORY_RECENT_LIMIT: usize = 8;
 const MEMORY_REVIEW_AFTER_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
@@ -6755,6 +6758,131 @@ pub const MAX_RUN_ANSWER_UNITS: usize = MAX_SEND_MESSAGE_TEXT_UNITS - 64;
 /// Marked rather than silent: an operator reading a provider's answer has to be
 /// able to tell "this is the whole thing" from "this is the part that fit".
 pub const TRUNCATION_MARK: &str = "\n[…truncated]";
+
+/// Step lines one progress snapshot carries.
+///
+/// A snapshot replaces its predecessor, so old lines are not history a reader
+/// loses — they are lines that were already shown. Keeping the most recent ones
+/// is what makes a long run render as "what is happening now".
+pub const MAX_PROGRESS_STEP_LINES: usize = 8;
+
+/// One chat's view of a run in progress, folded from the normalized stream.
+///
+/// # What this is, and what it is not
+///
+/// It is the **renderer seam**: frames in, one bounded snapshot out, with a
+/// cursor so the next poll continues where this one stopped. It is a pure fold
+/// with no clock, no client and no I/O, which is what lets the whole of it be
+/// exercised from a fixed frame sequence.
+///
+/// It is *not* the transport. Nothing here calls Telegram. Sending a snapshot
+/// as a native draft — and the call budget that decides whether it may be sent
+/// at all — is a separate change; what lands here is the shape that change will
+/// render, and an in-process consumer ([`Self::poll`]) that proves the fold runs
+/// against a live hub.
+///
+/// # Why a snapshot rather than an append
+///
+/// Because a draft is replaced, not extended: the transport carries the whole
+/// message each time. So the fold keeps the latest assistant text rather than
+/// concatenating deltas — which is also what the provider's own updates mean —
+/// and returns `None` when nothing a reader would see has changed, so a caller
+/// never spends a call to redraw the same words.
+#[derive(Clone, Debug, Default)]
+pub struct RunProgressView {
+    cursor: u64,
+    latest_text: Option<String>,
+    steps: VecDeque<String>,
+    warning: Option<String>,
+    rendered: Option<String>,
+}
+
+impl RunProgressView {
+    /// Start a view that has seen nothing.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The highest frame sequence this view has folded in.
+    #[must_use]
+    pub const fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
+    /// Fold frames in and answer with the snapshot to show, when it changed.
+    ///
+    /// Frames at or below the cursor are ignored rather than refused: a
+    /// re-delivery is a fact about a poll, not about a run.
+    pub fn absorb(&mut self, frames: &[ProgressFrame]) -> Option<String> {
+        for frame in frames {
+            if frame.sequence() <= self.cursor {
+                continue;
+            }
+            self.cursor = frame.sequence();
+            self.fold(frame);
+        }
+        let snapshot = self.snapshot();
+        if snapshot.is_empty() || self.rendered.as_deref() == Some(snapshot.as_str()) {
+            return None;
+        }
+        self.rendered = Some(snapshot.clone());
+        Some(snapshot)
+    }
+
+    /// Fold whatever a live hub has retained past this view's cursor.
+    ///
+    /// The in-process consumer. A bridge calls it beside the poll it already
+    /// runs; what it does with the snapshot is the transport's business.
+    pub fn poll(&mut self, hub: &ProgressHub, run_id: &str) -> Option<String> {
+        let frames = hub.frames_after(run_id, self.cursor);
+        self.absorb(&frames)
+    }
+
+    fn fold(&mut self, frame: &ProgressFrame) {
+        let text = frame.body().text().map(|text| text.as_str().to_owned());
+        match frame.kind() {
+            EventKind::AssistantMessageDelta | EventKind::AssistantMessageCompleted => {
+                self.latest_text = text;
+            }
+            EventKind::ProviderWarning | EventKind::ProviderFault => {
+                self.warning = text.or_else(|| Some(frame.kind().as_str().to_owned()));
+            }
+            // A step carries its own status, so the line is drawn from what the
+            // frame says rather than re-derived from which kind arrived — which
+            // is the whole reason the status is on the body.
+            kind => {
+                if let Some(status) = frame.body().step() {
+                    let label = text.unwrap_or_else(|| kind.as_str().to_owned());
+                    self.steps
+                        .push_back(format!("{label} — {}", status.as_str()));
+                }
+            }
+        }
+        // The step list is a view, not a log: it is bounded here so a run with
+        // thousands of steps still renders one message.
+        while self.steps.len() > MAX_PROGRESS_STEP_LINES {
+            self.steps.pop_front();
+        }
+    }
+
+    fn snapshot(&self) -> String {
+        let mut out = String::new();
+        for step in &self.steps {
+            out.push_str(step);
+            out.push('\n');
+        }
+        if let Some(warning) = &self.warning {
+            out.push_str("⚠ ");
+            out.push_str(warning);
+            out.push('\n');
+        }
+        if let Some(text) = &self.latest_text {
+            out.push_str(text);
+        }
+        bounded_text_to(out.trim_end(), MAX_RUN_ANSWER_UNITS)
+    }
+}
 
 fn memory_answer(chat_id: i64, outcome: Result<String, String>) -> Answer {
     match outcome {

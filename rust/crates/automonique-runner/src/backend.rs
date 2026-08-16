@@ -36,13 +36,34 @@
 //! [`crate::capability::EnforcementMode`] — a mode is never credited with a
 //! guarantee its mechanisms do not deliver.
 //!
+//! # Normalized progress, when the caller asks for it
+//!
+//! An attempt may be given a [`ProgressCapture`]. When it is, stdout becomes a
+//! pipe rather than the supervisor's own, one reader thread drains it, and the
+//! [`ProgressMapper`] the caller supplied turns those bytes into frames that
+//! this supervisor appends as [`EventKind::AdapterEvent`]. Three properties are
+//! the point:
+//!
+//! - **The spool stays single-writer.** The reader thread parses; only the
+//!   supervision loop appends, and it already holds the spool's exclusive lock.
+//! - **This module owns no vocabulary.** `automonique-agents` holds the
+//!   provider grammar and depends on *this* crate, so a normalizer implemented
+//!   here would be a dependency cycle. [`ProgressMapper`] is the seam: bytes in,
+//!   frames out, and the runner's whole contribution is a durable position.
+//! - **A run never fails because it streamed too much.** Every progress append
+//!   is best-effort. A refused one — an exhausted budget, an oversized frame,
+//!   an unencodable body — stops progress and records one warning; it never
+//!   becomes the attempt's outcome. See [`PROGRESS_PREVIEW_RESERVE_BYTES`].
+//!
 //! # What this backend does **not** establish
 //!
 //! - **It is not provider execution.** Nothing here speaks a provider protocol,
 //!   negotiates a session, or understands a prompt. It runs a program.
-//! - **It captures no output.** [`crate::spawn_sandboxed`] hands the workload
-//!   the supervisor's stdout and stderr; this module never reads a byte the
-//!   workload wrote. Output capture is a separate slice.
+//! - **Captured output is not interpreted.** With no [`ProgressCapture`] the
+//!   workload still writes to the supervisor's own stdout and this module reads
+//!   nothing. With one, it reads bytes and hands them straight to the caller's
+//!   mapper; it does not parse them, and the answer a run produces still travels
+//!   the file the document names rather than this stream.
 //! - **It is not attestation.** Nothing here proves to a third party what ran.
 //! - **There is no restart, retry, or backoff policy.** An attempt runs once
 //!   and reaches one terminal state. Deciding whether to attempt again belongs
@@ -60,16 +81,37 @@
 //! Everything here is synchronous and blocking. The caller owns threads: to
 //! cancel a run, clone the [`CancellationToken`] and flip it from another
 //! thread while `execute` blocks.
+//!
+//! The one thread this module starts is the progress reader, and only when a
+//! [`ProgressCapture`] was supplied: exactly one per attempt, joined on every
+//! path out of [`PreparedRun::execute`], and bounded by the pipe it reads —
+//! after the tree is killed the write end is gone, the read returns zero, and
+//! the thread ends. Its queue to the supervisor is bounded too
+//! ([`PROGRESS_QUEUE_BATCHES`]), so a provider that outruns the spool is slowed
+//! by its own pipe rather than by growing a buffer in this process.
 
 use crate::containment::{ContainmentDomain, ContainmentError, ContainmentLimits, RunContainment};
-use crate::launch::{LaunchError, LaunchPlan, spawn_sandboxed};
+use crate::launch::{LaunchError, LaunchPlan, StdoutCapture, spawn_sandboxed_with_stdout};
 use crate::runner::CancellationToken;
 use crate::spool::{Authority, EventKind, Spool, SpoolError, Status};
+use automonique_protocol::event::{
+    Authority as FrameAuthority, EventKind as FrameKind, RetryCategory, RetryContext,
+};
+use automonique_protocol::primitives::EpochMillis;
+use automonique_protocol::progress_api::{
+    ProgressBody, ProgressBodyParts, ProgressFrame, ProgressFrameParts, ProgressText,
+};
+use automonique_protocol::tools::RunId;
 use nix::unistd::Pid;
 use std::fmt;
+use std::io::Read as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitStatus};
+use std::process::{Child, ChildStdout, ExitStatus};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Terminal spool payload for a workload that exited zero.
@@ -100,6 +142,155 @@ pub const SUPERVISION_POLL: Duration = Duration::from_millis(5);
 /// Draining is not instantaneous — a killed process leaves a cgroup only once
 /// it is reaped — so this is a deadline, not an expectation.
 pub const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How much of the workload's stdout one read may take.
+pub const PROGRESS_READ_CHUNK_BYTES: usize = 8 * 1024;
+
+/// How many mapped batches may wait between the reader and the supervisor.
+///
+/// The queue is bounded and the reader blocks on a full one, which pushes the
+/// backpressure into the pipe and from there onto the provider. An unbounded
+/// queue would instead let a provider that writes faster than the spool can
+/// absorb grow this process's memory without limit, which is the failure this
+/// module least wants to add to a supervisor.
+pub const PROGRESS_QUEUE_BATCHES: usize = 64;
+
+/// How many queued batches one supervision poll absorbs.
+///
+/// The loop that drains progress is the loop that checks the cancellation token
+/// and the deadline, so it may not become a drain loop: a run has to stay
+/// cancellable while it is talking.
+pub const PROGRESS_BATCHES_PER_POLL: usize = 8;
+
+/// Budget below which a preview frame is no longer persisted.
+///
+/// Progress spends the run's own admitted spool budget, and a preview is the
+/// part of it nobody promised: it is a thing that was *shown*. When the
+/// remaining budget falls here, previews stop, authoritative frames continue,
+/// and exactly one warning is recorded saying so — so a reader of the log can
+/// tell a stream that went quiet from a stream that was cut off.
+pub const PROGRESS_PREVIEW_RESERVE_BYTES: u64 = 16 * 1024;
+
+/// Budget below which nothing optional is persisted at all.
+///
+/// The terminal event is not optional, and this is the room kept for it. A run
+/// that streamed enough to crowd out its own terminal record would be a run
+/// that failed for having been watched, which is the one outcome progress
+/// capture must never produce.
+pub const PROGRESS_TERMINAL_RESERVE_BYTES: u64 = 2 * 1024;
+
+const _: () = assert!(
+    PROGRESS_PREVIEW_RESERVE_BYTES > PROGRESS_TERMINAL_RESERVE_BYTES,
+    "previews must stop before the terminal event's room is touched"
+);
+
+/// The text of the one warning an exhausted progress budget records.
+pub const PROGRESS_BUDGET_WARNING: &str =
+    "progress capture stopped: the run's spool budget is spent";
+
+/// One frame a [`ProgressMapper`] produced, before the spool places it.
+///
+/// It carries no sequence, because it has none yet: a frame's sequence is the
+/// position of the event that will hold it, and only the writer holding the
+/// spool's lock knows what that will be. See
+/// `automonique_protocol::progress_api`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedFrame {
+    /// How much this frame may be relied upon.
+    pub authority: FrameAuthority,
+    /// What happened.
+    pub kind: FrameKind,
+    /// What it says beyond its kind.
+    pub body: ProgressBody,
+}
+
+/// Turns workload stdout bytes into progress frames.
+///
+/// The seam that keeps the provider grammar out of this crate. `push` is called
+/// with whatever the pipe returned — chunks split anywhere, including mid
+/// multi-byte character — and returns whatever that completed; `finish` is
+/// called once, after end of file, and returns whatever coalescing held back.
+///
+/// Neither may block, and neither may panic: both run on the reader thread this
+/// module owns, and a panic there would leave an attempt with a live process
+/// tree and a supervisor waiting on a thread that will never send again.
+pub trait ProgressMapper: Send {
+    /// Map the next chunk of stdout. An empty answer is normal.
+    fn push(&mut self, chunk: &[u8]) -> Vec<CapturedFrame>;
+
+    /// Flush what coalescing was holding. Called once, at end of file.
+    fn finish(&mut self) -> Vec<CapturedFrame>;
+}
+
+/// Where an appended frame is republished for a live reader.
+///
+/// The spool holds an exclusive lock for the whole attempt, so nothing can read
+/// it while it is being written; this is how a daemon feeds an in-memory replay
+/// buffer without a second writer or a second copy of the truth. It is called
+/// on the supervision thread, immediately after the durable append, with the
+/// sequence the spool assigned.
+///
+/// An implementation must not block: it is between two polls of a live process
+/// tree. Dropping a frame it cannot take is the correct behaviour — the durable
+/// record already has it.
+pub trait ProgressPublisher: Send {
+    /// Publish one appended frame's canonical bytes at its durable sequence.
+    fn publish(&self, sequence: u64, payload: &[u8]);
+}
+
+/// One attempt's progress capture: what maps its output, and who sees it.
+pub struct ProgressCapture {
+    mapper: Box<dyn ProgressMapper>,
+    publisher: Option<Box<dyn ProgressPublisher>>,
+}
+
+impl fmt::Debug for ProgressCapture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProgressCapture")
+            .field("publishing", &self.publisher.is_some())
+            .finish()
+    }
+}
+
+impl ProgressCapture {
+    /// Capture stdout and map it with `mapper`, persisting only.
+    #[must_use]
+    pub fn new(mapper: Box<dyn ProgressMapper>) -> Self {
+        Self {
+            mapper,
+            publisher: None,
+        }
+    }
+
+    /// Also republish every appended frame to a live reader.
+    #[must_use]
+    pub fn publishing_to(mut self, publisher: Box<dyn ProgressPublisher>) -> Self {
+        self.publisher = Some(publisher);
+        self
+    }
+}
+
+/// The last spool sequence one attempt has appended, readable while it runs.
+///
+/// The spool itself is behind an exclusive lock and inside the supervisor, so a
+/// caller that needs the attempt's position — to report a state at the sequence
+/// the log actually reached rather than at a guessed one — reads it here.
+/// Monotonic, and zero until the first event is recorded.
+#[derive(Clone, Debug, Default)]
+pub struct ObservedSequence(Arc<AtomicU64>);
+
+impl ObservedSequence {
+    /// The highest sequence appended so far.
+    #[must_use]
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn observe(&self, sequence: u64) {
+        self.0.store(sequence, Ordering::Release);
+    }
+}
 
 /// How one supervised attempt ended.
 ///
@@ -214,6 +405,13 @@ pub enum BackendError {
     /// The spawned child's pid does not fit the kernel's `pid_t`, so the
     /// supervisor cannot name the process it just created.
     PidUnrepresentable,
+    /// Stdout was piped for a [`ProgressCapture`] and no reader could take it.
+    ///
+    /// A failure rather than a quietly disabled feature. The pipe exists by the
+    /// time this is decided, and an unread pipe stops the workload as soon as
+    /// its kernel buffer fills — so an attempt that could not start its reader
+    /// is an attempt that must not run.
+    ProgressUnreadable,
 }
 
 impl fmt::Display for BackendError {
@@ -234,6 +432,9 @@ impl fmt::Display for BackendError {
             Self::Wait(error) => write!(formatter, "backend wait failed: {error}"),
             Self::PidUnrepresentable => {
                 formatter.write_str("the spawned child's pid is not representable")
+            }
+            Self::ProgressUnreadable => {
+                formatter.write_str("the workload's stdout was piped and no reader could take it")
             }
         }
     }
@@ -348,13 +549,20 @@ impl DirectProcessBackend {
         // Encoding now means an oversized frame is refused before any kernel
         // state exists; `spawn_sandboxed` encodes again at launch time.
         plan.encode().map_err(LaunchError::Plan)?;
+        // A progress frame names its run, so a run identity the frame grammar
+        // will refuse is discovered here — before a cgroup exists — rather than
+        // silently disabling capture halfway through an attempt.
+        let frame_run_id = RunId::new(run_id).map_err(|_| BackendError::SpoolRunIdMismatch)?;
         let containment = RunContainment::create(domain, run_id, limits)?;
         Ok(PreparedRun {
             helper: self.helper.clone(),
             run_id: run_id.to_owned(),
+            frame_run_id,
             plan,
             containment,
             spool,
+            capture: None,
+            observed: ObservedSequence::default(),
         })
     }
 }
@@ -369,9 +577,12 @@ impl DirectProcessBackend {
 pub struct PreparedRun {
     helper: PathBuf,
     run_id: String,
+    frame_run_id: RunId,
     plan: LaunchPlan,
     containment: RunContainment,
     spool: Spool,
+    capture: Option<ProgressCapture>,
+    observed: ObservedSequence,
 }
 
 impl fmt::Debug for PreparedRun {
@@ -407,6 +618,28 @@ impl PreparedRun {
         self.plan.program()
     }
 
+    /// Read this attempt's stdout and record what `capture` maps it to.
+    ///
+    /// Without this call stdout is inherited and nothing is read, which is the
+    /// behaviour every existing caller keeps.
+    #[must_use]
+    pub fn with_progress(mut self, capture: ProgressCapture) -> Self {
+        self.capture = Some(capture);
+        self
+    }
+
+    /// A handle on the sequence this attempt's spool has reached.
+    ///
+    /// Cloned before [`Self::execute`] consumes the attempt, because the point
+    /// of it is to be readable *after* a supervision failure has taken the
+    /// report away: the spool still holds its terminal event at whatever
+    /// position it reached, and a reader that assumed a position instead would
+    /// publish a sequence no event has.
+    #[must_use]
+    pub fn observed_sequence(&self) -> ObservedSequence {
+        self.observed.clone()
+    }
+
     /// Run the workload to a terminal state.
     ///
     /// Blocks until the workload exits, `cancellation` is set, or `deadline`
@@ -424,15 +657,24 @@ impl PreparedRun {
     ) -> Result<ExecutionReport, BackendError> {
         let Self {
             helper,
+            frame_run_id,
             plan,
             containment,
             spool,
+            capture,
+            observed,
             ..
         } = self;
         let mut supervised = SupervisedRun {
             spool: Some(spool),
             containment: Some(containment),
             child: None,
+            reader: None,
+            publisher: None,
+            progress_stopped: false,
+            capture,
+            frame_run_id,
+            observed,
         };
 
         // No `?` between here and `finish`: a supervision failure must not be
@@ -472,6 +714,258 @@ struct SupervisedRun {
     spool: Option<Spool>,
     containment: Option<RunContainment>,
     child: Option<Child>,
+    /// The live reader, once stdout has been piped to one.
+    reader: Option<ProgressReader>,
+    /// Where appended frames are republished, for as long as anyone is reading.
+    publisher: Option<Box<dyn ProgressPublisher>>,
+    /// Set once progress has stopped, for whatever reason, so the warning that
+    /// says so is recorded exactly once and nothing is attempted after it.
+    progress_stopped: bool,
+    /// What will map this attempt's stdout, until the reader takes it.
+    capture: Option<ProgressCapture>,
+    frame_run_id: RunId,
+    observed: ObservedSequence,
+}
+
+/// The reader thread and the queue it fills.
+///
+/// Held apart from the publisher and the latch so that draining — which takes
+/// the reader — does not also take the state the drain needs.
+struct ProgressReader {
+    batches: Receiver<Vec<CapturedFrame>>,
+    handle: JoinHandle<()>,
+}
+
+impl SupervisedRun {
+    /// Persist one batch of mapped frames, best effort.
+    ///
+    /// Every refusal here is swallowed. That is the whole guarantee: an
+    /// exhausted budget, a body this build cannot encode, an oversized frame or
+    /// a spool that will not take another line all stop progress and are
+    /// recorded once as a warning, and none of them becomes the attempt's
+    /// outcome.
+    fn persist_progress(&mut self, frames: Vec<CapturedFrame>) {
+        for frame in frames {
+            if self.progress_stopped {
+                return;
+            }
+            let Some(spool) = self.spool.as_ref() else {
+                return;
+            };
+            let remaining = spool.remaining_bytes();
+            if remaining <= PROGRESS_TERMINAL_RESERVE_BYTES {
+                self.stop_progress();
+                return;
+            }
+            // A preview is the part of the stream nobody promised, so it is the
+            // part that yields first. An authoritative frame keeps going: it is
+            // a thing the provider decided, and the log is where decisions live.
+            if matches!(frame.authority, FrameAuthority::Synthetic)
+                && remaining <= PROGRESS_PREVIEW_RESERVE_BYTES
+            {
+                self.stop_progress();
+                return;
+            }
+            if self.append_frame(&frame).is_err() {
+                self.stop_progress();
+                return;
+            }
+        }
+    }
+
+    /// Encode one frame at the sequence the spool is about to give it, append
+    /// it, and republish it.
+    ///
+    /// The sequence is computed from the spool's own position rather than
+    /// counted here, so the number inside the payload and the number the event
+    /// is stored at are one fact rather than two that agree.
+    fn append_frame(&mut self, frame: &CapturedFrame) -> Result<(), ()> {
+        let spool = self.spool.as_mut().ok_or(())?;
+        let sequence = spool.status().last_sequence().checked_add(1).ok_or(())?;
+        let at_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| ())?
+                .as_millis(),
+        )
+        .map_err(|_| ())?;
+        let payload = ProgressFrame::new(ProgressFrameParts {
+            run_id: self.frame_run_id.clone(),
+            sequence,
+            at_ms: EpochMillis::from_millis(at_ms),
+            authority: frame.authority,
+            kind: frame.kind,
+            body: frame.body.clone(),
+        })
+        .and_then(|frame| frame.to_canonical_bytes())
+        .map_err(|_| ())?;
+        let appended = spool
+            .append(
+                EventKind::AdapterEvent,
+                spool_authority(frame.authority),
+                &payload,
+            )
+            .map_err(|_| ())?;
+        self.observed.observe(appended.sequence());
+        if let Some(publisher) = self.publisher.as_ref() {
+            publisher.publish(appended.sequence(), &payload);
+        }
+        Ok(())
+    }
+
+    /// Latch progress off and record the one warning that explains the silence.
+    ///
+    /// The warning is appended without consulting the preview reserve — it is
+    /// the reason the reserve exists — but still under the terminal reserve, so
+    /// the attempt's own last word is never the thing that gets crowded out.
+    fn stop_progress(&mut self) {
+        if self.progress_stopped {
+            return;
+        }
+        self.progress_stopped = true;
+        let Ok(body) = budget_warning_body() else {
+            return;
+        };
+        let frame = CapturedFrame {
+            authority: FrameAuthority::Synthetic,
+            kind: FrameKind::ProviderWarning,
+            body,
+        };
+        if self
+            .spool
+            .as_ref()
+            .is_some_and(|spool| spool.remaining_bytes() > PROGRESS_TERMINAL_RESERVE_BYTES)
+        {
+            // The latch is already set, so `append_frame` is called directly:
+            // going back through `persist_progress` would find `stopped` and
+            // drop the very frame that explains it.
+            let _ = self.append_frame(&frame);
+        }
+    }
+
+    /// Take everything the reader still has, then join it.
+    ///
+    /// Called after the tree is killed, so the pipe's write end is gone and the
+    /// reader reaches end of file rather than waiting on a live process. The
+    /// drain blocks until the sender is dropped, which is what makes the
+    /// transcript complete rather than merely current.
+    /// Take everything the reader still has, then let it go.
+    ///
+    /// Called after the tree is killed, so the pipe's write end is normally
+    /// gone and the reader reaches end of file rather than waiting on a live
+    /// process. **Normally**, and that word is why this is bounded: a cgroup
+    /// that would not drain is an error path this supervisor already reports,
+    /// and on it something may still hold the write end. A drain that waited
+    /// for that would hang the supervisor and lose the terminal event, so it
+    /// waits `deadline` and then leaves.
+    ///
+    /// A reader that reached end of file is joined; one that timed out is
+    /// deliberately *detached*, because there is no way to interrupt a blocking
+    /// read and a leaked thread on an already-failing path is the smaller harm.
+    fn drain_progress(&mut self, deadline: Duration) {
+        let Some(ProgressReader { batches, handle }) = self.reader.take() else {
+            return;
+        };
+        let until = Instant::now() + deadline;
+        let finished = loop {
+            let remaining = until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break false;
+            }
+            match batches.recv_timeout(remaining) {
+                Ok(frames) => self.persist_progress(frames),
+                // The sender is the reader's alone, so a disconnect is the
+                // reader having ended: the transcript is complete.
+                Err(RecvTimeoutError::Disconnected) => break true,
+                Err(RecvTimeoutError::Timeout) => break false,
+            }
+        };
+        drop(batches);
+        if finished {
+            // The reader owns no durable state, so a panicking one is not a
+            // reason to fail an attempt that already reached its outcome.
+            let _ = handle.join();
+        }
+    }
+
+    /// Take what the reader has ready, without waiting for more.
+    ///
+    /// Bounded per poll so the supervision loop keeps checking the cancellation
+    /// token and the deadline at its own interval: a run must stay cancellable
+    /// while it is talking.
+    fn poll_progress(&mut self) {
+        for _ in 0..PROGRESS_BATCHES_PER_POLL {
+            let Some(frames) = self
+                .reader
+                .as_ref()
+                .and_then(|reader| reader.batches.try_recv().ok())
+            else {
+                return;
+            };
+            self.persist_progress(frames);
+        }
+    }
+}
+
+/// Translate a frame's authority into the spool's own two words.
+///
+/// Two enums with the same two members, kept apart because they are two
+/// vocabularies: the spool's is what its durable format spells, and the frame's
+/// is the normalized event stream's. This is the one place they meet.
+const fn spool_authority(authority: FrameAuthority) -> Authority {
+    match authority {
+        FrameAuthority::Authoritative => Authority::Authoritative,
+        FrameAuthority::Synthetic => Authority::Synthetic,
+    }
+}
+
+/// The body of the one warning an exhausted progress budget records.
+fn budget_warning_body() -> Result<ProgressBody, ()> {
+    ProgressBody::new(
+        FrameKind::ProviderWarning,
+        ProgressBodyParts {
+            text: ProgressText::new(PROGRESS_BUDGET_WARNING).ok(),
+            step: None,
+            // Not retryable, and no wait: the budget is the document's, and
+            // nothing this attempt does will get more of it.
+            retry: RetryContext::new(RetryCategory::Internal, false, None, 1).ok(),
+        },
+    )
+    .map_err(|_| ())
+}
+
+/// The reader thread's whole body: read, map, hand over.
+///
+/// It parses and never appends, so the spool keeps exactly one writer. A send
+/// that fails means the supervisor has stopped listening, which is a reason to
+/// stop reading rather than an error to report — the attempt already has its
+/// outcome by then.
+fn read_progress(
+    mut stdout: ChildStdout,
+    mut mapper: Box<dyn ProgressMapper>,
+    batches: SyncSender<Vec<CapturedFrame>>,
+) {
+    let mut buffer = [0_u8; PROGRESS_READ_CHUNK_BYTES];
+    loop {
+        match stdout.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                let frames = mapper.push(buffer.get(..read).unwrap_or_default());
+                if !frames.is_empty() && batches.send(frames).is_err() {
+                    return;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            // A read that failed is a pipe this thread cannot use again. The
+            // mapper's held bytes are deliberately not flushed: an incomplete
+            // transcript is what the refusal-first normalizer refuses.
+            Err(_) => return,
+        }
+    }
+    let frames = mapper.finish();
+    if !frames.is_empty() {
+        let _ = batches.send(frames);
+    }
 }
 
 impl SupervisedRun {
@@ -494,18 +988,31 @@ impl SupervisedRun {
             .containment
             .as_ref()
             .expect("a supervised run holds its containment");
-        let child = spawn_sandboxed(helper, plan, containment)
+        // Piping stdout and reading it are the same decision, and this is where
+        // both are made: the capture the caller supplied is what turns the
+        // inherited descriptor into a pipe, and the reader below is what keeps
+        // that pipe from filling and stopping the workload mid-write.
+        let capture = self.capture.take();
+        let stdout = if capture.is_some() {
+            StdoutCapture::Piped
+        } else {
+            StdoutCapture::Inherit
+        };
+        let child = spawn_sandboxed_with_stdout(helper, plan, containment, stdout)
             .map_err(|error| (None, BackendError::Launch(error)))?;
         let raw = i32::try_from(child.id()).map_err(|_| (None, BackendError::PidUnrepresentable));
         self.child = Some(child);
         let pid = Pid::from_raw(raw?);
+        self.start_reader(capture)
+            .map_err(|error| (Some(pid), error))?;
 
         // The pid is the first fact this supervisor observed, so it is what the
         // Started event carries. It is recorded before the wait begins: a
         // supervisor that dies in the next instant still leaves evidence that a
         // process was created, and the cgroup that names it.
         let started = format!("{STARTED_PAYLOAD_PREFIX}{}", pid.as_raw());
-        self.spool
+        let recorded = self
+            .spool
             .as_mut()
             .expect("a supervised run holds its spool")
             .append(
@@ -514,6 +1021,10 @@ impl SupervisedRun {
                 started.as_bytes(),
             )
             .map_err(|error| (Some(pid), BackendError::Spool(error)))?;
+        // Published from the append rather than assumed, so a reader that has
+        // to report a position after a supervision failure reports the one the
+        // log actually holds.
+        self.observed.observe(recorded.sequence());
 
         let deadline_from = Instant::now();
         loop {
@@ -523,6 +1034,9 @@ impl SupervisedRun {
                 Ok(None) => {}
                 Err(error) => return Err((Some(pid), BackendError::Wait(error))),
             }
+            // The loop the supervisor already runs is where progress is
+            // absorbed, because it is the one place that holds the spool.
+            self.poll_progress();
             if cancellation.is_cancelled() {
                 return Ok((Some(pid), ExecutionOutcome::Cancelled));
             }
@@ -531,6 +1045,30 @@ impl SupervisedRun {
             }
             std::thread::sleep(SUPERVISION_POLL);
         }
+    }
+
+    /// Start the one reader thread this attempt may have.
+    ///
+    /// A capture that cannot get a thread is a supervisor failure rather than a
+    /// silently disabled feature: the pipe is already open and unread, and an
+    /// unread pipe stops the workload at the first buffer's worth of output.
+    fn start_reader(&mut self, capture: Option<ProgressCapture>) -> Result<(), BackendError> {
+        let Some(ProgressCapture { mapper, publisher }) = capture else {
+            return Ok(());
+        };
+        let stdout = self
+            .child
+            .as_mut()
+            .and_then(|child| child.stdout.take())
+            .ok_or(BackendError::ProgressUnreadable)?;
+        let (sender, batches) = sync_channel(PROGRESS_QUEUE_BATCHES);
+        let handle = std::thread::Builder::new()
+            .name("automonique-progress-reader".to_owned())
+            .spawn(move || read_progress(stdout, mapper, sender))
+            .map_err(|_| BackendError::ProgressUnreadable)?;
+        self.publisher = publisher;
+        self.reader = Some(ProgressReader { batches, handle });
+        Ok(())
     }
 
     /// Kill the tree, reap the direct child, and wait for the cgroup to drain.
@@ -562,10 +1100,18 @@ impl SupervisedRun {
     /// order of seriousness once all three have been attempted.
     fn finish(mut self, payload: &[u8], drain: Duration) -> Result<Status, BackendError> {
         let drained = self.terminate_tree(drain);
+        // Only now: the tree is dead, so the pipe's last writer is gone and the
+        // reader reaches end of file instead of waiting on a live process. What
+        // it still holds is part of this attempt's record and is appended before
+        // the terminal event, because nothing may follow that one. Bounded by
+        // the same deadline the cgroup drain gets, so a tree that would not die
+        // costs this attempt its progress rather than its terminal record.
+        self.drain_progress(drain);
 
         let mut spool = self.spool.take().expect("a supervised run holds its spool");
         let recorded = spool.append(EventKind::Terminal, Authority::Authoritative, payload);
         let status = spool.status();
+        self.observed.observe(status.last_sequence());
         // Dropping the spool releases its exclusive lock; the record is already
         // durable, so a reader may re-open and re-verify it immediately.
         drop(spool);
@@ -594,14 +1140,24 @@ impl Drop for SupervisedRun {
         if let Some(mut child) = self.child.take() {
             let _ = child.wait();
         }
+        // The receiver is dropped so a reader blocked on a full queue is freed
+        // and can end; the handle is dropped without joining, because a `Drop`
+        // that waits on a thread reading a pipe is a `Drop` that can hang. A
+        // backstop closes the log, it does not complete a transcript.
+        if let Some(ProgressReader { batches, handle }) = self.reader.take() {
+            drop(batches);
+            drop(handle);
+        }
         if let Some(spool) = self.spool.as_mut()
             && !spool.is_terminal()
         {
+            let sequence = spool.status().last_sequence();
             let _ = spool.append(
                 EventKind::Terminal,
                 Authority::Authoritative,
                 TERMINAL_FAILED,
             );
+            self.observed.observe(sequence.saturating_add(1));
         }
         // `RunContainment`'s own `Drop` drains and removes the cgroup.
     }

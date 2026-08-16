@@ -148,7 +148,9 @@ use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmittedLaunch, BrokeredDestination, PromptSource,
     ResolvedPrompt, UnenforcedBudget, admit,
 };
-use automonique_runner::backend::{DirectProcessBackend, PreparedRun};
+use automonique_runner::backend::{
+    DirectProcessBackend, ObservedSequence, PreparedRun, ProgressCapture,
+};
 use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
 use automonique_runner::control::{CancelSink, CancelUnavailable};
 use automonique_runner::dispatch::RegistrationHandle;
@@ -160,6 +162,8 @@ use automonique_store::run_index::{RunIndex, RunSpoolState, StateAdvance};
 use sha2::Digest as _;
 
 use crate::attempt_host::DaemonAttemptHost;
+use crate::progress::ProviderProgressMapper;
+use crate::progress_hub::ProgressHub;
 
 /// Environment variable naming the launch entry helper binary.
 ///
@@ -462,6 +466,12 @@ pub struct ExecutionLane {
     live: Arc<Mutex<BTreeSet<String>>>,
     /// One handle per live worker, joined before the generation is released.
     workers: Vec<JoinHandle<()>>,
+    /// Live replay for attempts whose spool nobody else can read yet.
+    ///
+    /// Shared with the backend's supervision thread, which publishes into it,
+    /// and with whatever renders progress, which polls it. See
+    /// [`crate::progress_hub`].
+    progress: Arc<ProgressHub>,
 }
 
 impl ExecutionLane {
@@ -502,7 +512,18 @@ impl ExecutionLane {
             domain: None,
             live: Arc::new(Mutex::new(BTreeSet::new())),
             workers: Vec::new(),
+            progress: Arc::new(ProgressHub::new()),
         }
+    }
+
+    /// Live progress replay for the attempts this lane is running.
+    ///
+    /// A renderer holds this, polls it with a cursor while an attempt is live,
+    /// and re-opens the durable spool once it is not. See
+    /// [`crate::progress_hub`] for why those are two different things.
+    #[must_use]
+    pub fn progress(&self) -> Arc<ProgressHub> {
+        Arc::clone(&self.progress)
     }
 
     /// The brokered destinations this lane was opened with.
@@ -739,6 +760,21 @@ impl ExecutionLane {
             )
             .map_err(|_| ExecuteRefusal::ContainmentUnavailable)?;
 
+        // Progress capture attaches to the documents that asked for it and to
+        // no others. A workload writing prose to stdout would poison the
+        // refusal-first normalizer on its first line — costing the run nothing
+        // and the operator a stream that never says anything — so the presence
+        // of the flag that makes stdout the normalized grammar is the gate.
+        let prepared = if emits_normalized_stream(spec) {
+            match progress_capture(spec, run_id, &self.progress) {
+                Some(capture) => prepared.with_progress(capture),
+                None => prepared,
+            }
+        } else {
+            prepared
+        };
+        let observed = prepared.observed_sequence();
+
         self.spawn(Attempt {
             run_id: run_id.to_owned(),
             submission_id,
@@ -747,6 +783,8 @@ impl ExecutionLane {
             cancellation,
             registration,
             prepared,
+            observed,
+            progress: Arc::clone(&self.progress),
             broker,
         })
     }
@@ -1012,6 +1050,12 @@ struct Attempt {
     /// including a panic — releases the attempt from the host's registry.
     registration: RegistrationHandle,
     prepared: PreparedRun,
+    /// The spool position this attempt has actually reached, readable after a
+    /// supervision failure has taken the report away.
+    observed: ObservedSequence,
+    /// Where live frames are retained while the spool is locked, and which is
+    /// told to forget this attempt once it is not.
+    progress: Arc<ProgressHub>,
     /// This run's own broker, when its document asked for egress. Owning it
     /// here is what bounds its lifetime to the run: every path out of this
     /// worker drops it, including a panic, and its drop stops the listener and
@@ -1028,17 +1072,23 @@ impl Attempt {
     /// could have read anyway.
     fn run(self, index_path: &Path) {
         let Self {
+            run_id,
             submission_id,
             revision,
             timeout,
             cancellation,
             registration,
             prepared,
+            observed,
+            progress,
             broker,
-            ..
         } = self;
 
         let report = prepared.execute(&cancellation, timeout);
+        // The spool's lock is free from here, so the durable record is readable
+        // and strictly better than the window this hub was holding: complete,
+        // hash-chain verified, and not subject to eviction.
+        progress.retire(&run_id);
         // THE BROKER OUTLIVES NO RUN.
         //
         // Torn down here, explicitly, on the one path every terminal state
@@ -1065,11 +1115,82 @@ impl Attempt {
             // A supervisor failure still left exactly one terminal event in the
             // spool — `execute` guarantees it on every path — and that event is
             // `failed`. The row says the same rather than staying open.
-            Err(_) => (RunSpoolState::Failed, 2),
+            //
+            // At *which* sequence is the question this arm used to answer with
+            // a literal 2, which assumed the spool held a `started` and a
+            // terminal and nothing else. That assumption is gone: an attempt
+            // that streamed progress reached a much higher position, and a row
+            // claiming sequence 2 would tell a reader the log ends where it does
+            // not. The supervisor publishes the position it actually reached.
+            Err(_) => (RunSpoolState::Failed, observed.get()),
         };
         advance(index_path, submission_id, revision, state, last_sequence);
     }
 }
+
+/// The argument that makes a workload's stdout the normalized event grammar.
+///
+/// The provider writes prose by default and one JSON object per line when this
+/// is present. Which of the two it is deciding is not something this daemon can
+/// discover from a document any other way: the event dialect a RunSpec declares
+/// has one member and says nothing about stdout, and the program is an opaque
+/// pinned path.
+pub const PROVIDER_JSON_STREAM_ARG: &str = "--json";
+
+/// Whether this document's workload writes a stream this daemon can normalize.
+///
+/// A conservative gate, and deliberately so. Capturing stdout from a workload
+/// that writes prose would pipe a descriptor that was previously the
+/// supervisor's own, hand the bytes to a refusal-first parser that rejects the
+/// first line, and produce one warning frame per run — all cost, no stream. The
+/// document has to ask.
+#[must_use]
+pub fn emits_normalized_stream(spec: &RunSpec) -> bool {
+    spec.arguments()
+        .iter()
+        .any(|argument| argument == PROVIDER_JSON_STREAM_ARG)
+}
+
+/// Build the capture one document's attempt gets, or answer that it gets none.
+///
+/// `None` for a run whose identity or scope the adapter's own coordinate
+/// grammar refuses. That is a reason to run without progress rather than a
+/// reason not to run: the coordinates are a rendering detail, and a document
+/// that admission accepted is a document this daemon executes.
+fn progress_capture(
+    spec: &RunSpec,
+    run_id: &str,
+    hub: &Arc<ProgressHub>,
+) -> Option<ProgressCapture> {
+    // The scope is this daemon's own deployment identity rather than anything
+    // the document supplies: it names where the events came from, and a
+    // document-supplied value would be a caller choosing how its own output is
+    // labelled.
+    let scope = automonique_agents::SessionScope::new(
+        PROGRESS_SCOPE_TENANT,
+        PROGRESS_SCOPE_ACCOUNT,
+        PROGRESS_SCOPE_NAMESPACE,
+    )
+    .ok()?;
+    let coordinates =
+        automonique_agents::RunCoordinates::new(run_id, spec.attempt_id().as_str(), scope).ok()?;
+    // Every run this lane starts is a fresh provider session: the composed
+    // invocation carries no resume binding, and claiming one would make the
+    // normalizer demand a session identity the provider will not report.
+    let mode = automonique_agents::ExecutionMode::NewSession;
+    Some(
+        ProgressCapture::new(Box::new(ProviderProgressMapper::new(&coordinates, &mode)))
+            .publishing_to(hub.publisher(run_id)),
+    )
+}
+
+/// The deployment identity progress events are labelled with.
+///
+/// Fixed rather than configured: it exists so the adapter's coordinate grammar
+/// has something well-formed to hold, and nothing downstream routes on it.
+const PROGRESS_SCOPE_TENANT: &str = "automonique";
+const PROGRESS_SCOPE_ACCOUNT: &str = "daemon";
+const PROGRESS_SCOPE_NAMESPACE: &str = "run-lane";
 
 /// Translate one registration failure into the refusal that names it.
 ///

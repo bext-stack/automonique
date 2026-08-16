@@ -42,8 +42,8 @@ pub use containment::{
 pub use launch::{
     FRAME_HEADER, FRAME_TERMINATOR, LaunchError, LaunchPlan, LaunchPlanError, MAX_FRAME_BYTES,
     MAX_LAUNCH_ARG_BYTES, MAX_LAUNCH_ARGS, MAX_LAUNCH_ENV_ENTRIES, MAX_LAUNCH_ENV_NAME_BYTES,
-    MAX_LAUNCH_ENV_VALUE_BYTES, MAX_LAUNCH_PROMPT_BYTES, SocketGrant, launch_entry_helper_main,
-    spawn_sandboxed,
+    MAX_LAUNCH_ENV_VALUE_BYTES, MAX_LAUNCH_PROMPT_BYTES, SocketGrant, StdoutCapture,
+    launch_entry_helper_main, spawn_sandboxed, spawn_sandboxed_with_stdout,
 };
 pub use runner::{CancellationToken, ContainmentEvidence, Runner, RunnerError};
 pub use simulation::{
@@ -70,4 +70,7 @@ pub use spec_fields::{
     RunnerEventDialect, SchedulerDecisionDigest, SchedulerReservationBinding,
     SchedulerReservationId, SkillsetDigest, ToolsetDigest, WorkspaceReservation,
 };
-pub use spool::{Authority, Event, EventKind, RunState, Spool, SpoolError, Status};
+pub use spool::{
+    Authority, Event, EventKind, MAX_EVENT_PAYLOAD_BYTES, RunState, Spool, SpoolError, Status,
+    read_events,
+};

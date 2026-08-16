@@ -7,8 +7,9 @@
 
 use automonique_protocol::event::{
     ApprovalClass, ApprovalDecision, ApprovalLedger, Authority, ConsumerCursor, EventCoordinates,
-    EventError, EventKind, MAX_INLINE_RAW_BYTES, PreviewEvent, ProviderApprovalRequest, RawPayload,
-    RawProviderRecord, RecordedEvent, RetentionPolicy, RunTimeline, SubscriptionStart,
+    EventError, EventKind, MAX_INLINE_RAW_BYTES, MAX_RETRY_AFTER_MS, MemberRule, PreviewEvent,
+    ProviderApprovalRequest, RawPayload, RawProviderRecord, RecordedEvent, RecordedEventParts,
+    RetentionPolicy, RetryCategory, RetryContext, RunTimeline, StepStatus, SubscriptionStart,
     resolve_subscription,
 };
 use automonique_protocol::primitives::EpochMillis;
@@ -34,16 +35,42 @@ fn at(millis: i64) -> EpochMillis {
     EpochMillis::from_millis(millis)
 }
 
+/// The exact members one kind requires, and nothing it merely allows.
+///
+/// Derived from the kind's own rules rather than from a table restated here, so
+/// a kind whose rules change is built correctly by every test that uses this.
+fn required_body(kind: EventKind) -> (Option<StepStatus>, Option<RetryContext>) {
+    (
+        matches!(kind.step_rule(), MemberRule::Required).then_some(StepStatus::InProgress),
+        matches!(kind.retry_rule(), MemberRule::Required).then(|| {
+            RetryContext::new(RetryCategory::Transport, true, None, 1).expect("a coherent context")
+        }),
+    )
+}
+
 fn recorded(sequence: u64, kind: EventKind, authority: Authority) -> RecordedEvent {
-    RecordedEvent::new(
+    let (step, retry) = required_body(kind);
+    RecordedEvent::new(RecordedEventParts {
         sequence,
-        coordinates(),
+        coordinates: coordinates(),
         kind,
         authority,
-        at(1_000 + i64::try_from(sequence).expect("small sequence")),
-        1,
-        None,
-    )
+        at: at(1_000 + i64::try_from(sequence).expect("small sequence")),
+        source_schema_version: 1,
+        raw: None,
+        step,
+        retry,
+    })
+    .expect("a kind paired with the body it requires")
+}
+
+/// The authority a kind can actually be recorded under.
+const fn admissible_authority(kind: EventKind) -> Authority {
+    if kind.is_preview_only() {
+        Authority::Synthetic
+    } else {
+        Authority::Authoritative
+    }
 }
 
 mod envelope_bounds {
@@ -205,7 +232,7 @@ mod kind_coverage {
 
     #[test]
     fn every_declared_kind_is_representable_with_a_distinct_spelling() {
-        assert_eq!(EventKind::ALL.len(), 23);
+        assert_eq!(EventKind::ALL.len(), 24);
         let mut spellings: Vec<&str> = EventKind::ALL.iter().map(|kind| kind.as_str()).collect();
         let total = spellings.len();
         spellings.sort_unstable();
@@ -213,10 +240,16 @@ mod kind_coverage {
         assert_eq!(spellings.len(), total, "two kinds share a wire spelling");
 
         for kind in EventKind::ALL {
-            let event = recorded(1, kind, Authority::Authoritative);
+            let event = recorded(1, kind, admissible_authority(kind));
             assert_eq!(event.kind(), kind);
             assert!(!kind.as_str().is_empty());
+            assert_eq!(
+                EventKind::from_spelling(kind.as_str()),
+                Some(kind),
+                "a kind does not parse back from its own spelling"
+            );
         }
+        assert_eq!(EventKind::from_spelling("assistant_message"), None);
     }
 
     #[test]
@@ -226,6 +259,219 @@ mod kind_coverage {
             .filter(|kind| kind.is_terminal())
             .collect();
         assert_eq!(terminal, vec![EventKind::RunTerminal]);
+    }
+
+    #[test]
+    fn exactly_one_kind_is_preview_only() {
+        let preview: Vec<EventKind> = EventKind::ALL
+            .into_iter()
+            .filter(|kind| kind.is_preview_only())
+            .collect();
+        assert_eq!(preview, vec![EventKind::AssistantMessageDelta]);
+    }
+}
+
+/// The body members a kind carries, and the refusals that keep them exact.
+mod body_members {
+    use super::*;
+
+    #[test]
+    fn every_kind_states_a_rule_for_all_three_members() {
+        for kind in EventKind::ALL {
+            for rule in [kind.step_rule(), kind.retry_rule(), kind.text_rule()] {
+                assert!(
+                    MemberRule::ALL.contains(&rule),
+                    "{} produced a rule outside the closed set",
+                    kind.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_step_kinds_are_exactly_the_tool_call_and_subagent_kinds() {
+        let required: Vec<EventKind> = EventKind::ALL
+            .into_iter()
+            .filter(|kind| matches!(kind.step_rule(), MemberRule::Required))
+            .collect();
+        assert_eq!(
+            required,
+            vec![
+                EventKind::ToolCallStarted,
+                EventKind::ToolCallUpdated,
+                EventKind::ToolCallCompleted,
+                EventKind::SubagentStarted,
+                EventKind::SubagentEvent,
+                EventKind::SubagentCompleted,
+            ]
+        );
+        // Nothing else may carry one: a session event with a step status would
+        // invite a renderer to draw a step that does not exist.
+        for kind in EventKind::ALL {
+            assert!(
+                matches!(
+                    kind.step_rule(),
+                    MemberRule::Required | MemberRule::Forbidden
+                ),
+                "a step status is never merely optional"
+            );
+        }
+    }
+
+    #[test]
+    fn the_retry_kinds_are_exactly_the_two_problem_kinds() {
+        let required: Vec<EventKind> = EventKind::ALL
+            .into_iter()
+            .filter(|kind| matches!(kind.retry_rule(), MemberRule::Required))
+            .collect();
+        assert_eq!(
+            required,
+            vec![EventKind::ProviderWarning, EventKind::ProviderFault]
+        );
+    }
+
+    #[test]
+    fn a_required_member_that_is_absent_is_refused_by_name() {
+        let error = RecordedEvent::new(RecordedEventParts {
+            sequence: 1,
+            coordinates: coordinates(),
+            kind: EventKind::ToolCallStarted,
+            authority: Authority::Authoritative,
+            at: at(1),
+            source_schema_version: 1,
+            raw: None,
+            step: None,
+            retry: None,
+        })
+        .expect_err("a tool call without a step status");
+        assert_eq!(
+            error,
+            EventError::BodyMemberRefused {
+                member: "step",
+                kind: EventKind::ToolCallStarted,
+                rule: MemberRule::Required,
+            }
+        );
+        assert_eq!(error.category(), "body_member_refused");
+    }
+
+    #[test]
+    fn a_forbidden_member_that_is_present_is_refused_by_name() {
+        let error = RecordedEvent::new(RecordedEventParts {
+            sequence: 1,
+            coordinates: coordinates(),
+            kind: EventKind::TurnStarted,
+            authority: Authority::Authoritative,
+            at: at(1),
+            source_schema_version: 1,
+            raw: None,
+            step: Some(StepStatus::Pending),
+            retry: None,
+        })
+        .expect_err("a turn start carrying a step status");
+        assert_eq!(
+            error,
+            EventError::BodyMemberRefused {
+                member: "step",
+                kind: EventKind::TurnStarted,
+                rule: MemberRule::Forbidden,
+            }
+        );
+    }
+
+    /// The one-way rule: a delta may never be authoritative, and every other
+    /// kind may still be synthetic.
+    #[test]
+    fn a_preview_only_kind_cannot_be_recorded_as_authoritative() {
+        let error = RecordedEvent::new(RecordedEventParts {
+            sequence: 1,
+            coordinates: coordinates(),
+            kind: EventKind::AssistantMessageDelta,
+            authority: Authority::Authoritative,
+            at: at(1),
+            source_schema_version: 1,
+            raw: None,
+            step: None,
+            retry: None,
+        })
+        .expect_err("an authoritative delta");
+        assert_eq!(
+            error,
+            EventError::PreviewClaimedAuthority {
+                kind: EventKind::AssistantMessageDelta,
+            }
+        );
+        for kind in EventKind::ALL {
+            let event = recorded(1, kind, Authority::Synthetic);
+            assert_eq!(event.authority(), Authority::Synthetic);
+        }
+    }
+
+    #[test]
+    fn a_step_status_settles_only_at_its_two_final_states() {
+        let settled: Vec<StepStatus> = StepStatus::ALL
+            .into_iter()
+            .filter(|status| status.is_settled())
+            .collect();
+        assert_eq!(settled, vec![StepStatus::Completed, StepStatus::Error]);
+        for status in StepStatus::ALL {
+            assert_eq!(StepStatus::from_spelling(status.as_str()), Some(status));
+        }
+        assert_eq!(StepStatus::from_spelling("in-progress"), None);
+    }
+
+    #[test]
+    fn a_retry_context_refuses_an_incoherent_wait() {
+        for category in RetryCategory::ALL {
+            assert_eq!(
+                RetryCategory::from_spelling(category.as_str()),
+                Some(category)
+            );
+        }
+        assert_eq!(RetryCategory::from_spelling("rate-limited"), None);
+
+        assert_eq!(
+            RetryContext::new(RetryCategory::RateLimited, true, Some(1_000), 0)
+                .expect_err("an attempt nobody made"),
+            EventError::RetryContextIncoherent { field: "attempt" }
+        );
+        assert_eq!(
+            RetryContext::new(RetryCategory::Rejected, false, Some(1_000), 1)
+                .expect_err("a wait for something that will not be retried"),
+            EventError::RetryContextIncoherent {
+                field: "retry_after_ms",
+            }
+        );
+        assert_eq!(
+            RetryContext::new(
+                RetryCategory::RateLimited,
+                true,
+                Some(MAX_RETRY_AFTER_MS + 1),
+                1
+            )
+            .expect_err("a wait past the ceiling"),
+            EventError::RetryContextIncoherent {
+                field: "retry_after_ms",
+            }
+        );
+        let context = RetryContext::new(
+            RetryCategory::RateLimited,
+            true,
+            Some(MAX_RETRY_AFTER_MS),
+            3,
+        )
+        .expect("exactly at the ceiling");
+        assert_eq!(context.retry_after_ms(), Some(MAX_RETRY_AFTER_MS));
+        assert_eq!(context.attempt(), 3);
+        assert!(context.retryable());
+        // A refusal with no advertised wait is coherent: it says "not this
+        // time" without pretending to know when.
+        assert!(
+            RetryContext::new(RetryCategory::Rejected, false, None, 1)
+                .expect("a plain refusal")
+                .retry_after_ms()
+                .is_none()
+        );
     }
 }
 

@@ -100,6 +100,13 @@ pub enum EventKind {
     TurnInterrupted,
     /// A turn finished.
     TurnCompleted,
+    /// An assistant message as it is still being written.
+    ///
+    /// The only kind that is preview by nature: it names text that was *shown*
+    /// and may still change, so [`EventKind::is_preview_only`] holds for it and
+    /// nothing else. A record of this kind is always [`Authority::Synthetic`],
+    /// which is what stops a coalesced delta from being read as a decision.
+    AssistantMessageDelta,
     /// An authoritative assistant message.
     AssistantMessageCompleted,
     /// A tool call began.
@@ -130,7 +137,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every kind, for coverage checks.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::ProviderConnected,
         Self::ProviderDisconnected,
         Self::SessionCreated,
@@ -141,6 +148,7 @@ impl EventKind {
         Self::TurnSteered,
         Self::TurnInterrupted,
         Self::TurnCompleted,
+        Self::AssistantMessageDelta,
         Self::AssistantMessageCompleted,
         Self::ToolCallStarted,
         Self::ToolCallUpdated,
@@ -170,6 +178,7 @@ impl EventKind {
             Self::TurnSteered => "turn_steered",
             Self::TurnInterrupted => "turn_interrupted",
             Self::TurnCompleted => "turn_completed",
+            Self::AssistantMessageDelta => "assistant_message_delta",
             Self::AssistantMessageCompleted => "assistant_message_completed",
             Self::ToolCallStarted => "tool_call_started",
             Self::ToolCallUpdated => "tool_call_updated",
@@ -186,10 +195,371 @@ impl EventKind {
         }
     }
 
+    /// Parse the exact stable spelling, or nothing.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == value)
+    }
+
     /// Whether this kind ends a run.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::RunTerminal)
+    }
+
+    /// Whether a record of this kind can only ever be [`Authority::Synthetic`].
+    ///
+    /// True for [`EventKind::AssistantMessageDelta`] alone. The rule is
+    /// one-way: every other kind may be synthetic — a warning Automonique
+    /// raises about its own budget is not something a provider said — and only
+    /// this one is forbidden from being authoritative.
+    #[must_use]
+    pub const fn is_preview_only(self) -> bool {
+        matches!(self, Self::AssistantMessageDelta)
+    }
+
+    /// Whether a step status is required, allowed or forbidden for this kind.
+    ///
+    /// Required exactly where a renderer would otherwise have to re-derive the
+    /// state from the kind's spelling: a Slack task card and the desktop client
+    /// each draw a tool call and a subagent from the status they are handed.
+    #[must_use]
+    pub const fn step_rule(self) -> MemberRule {
+        match self {
+            Self::ToolCallStarted
+            | Self::ToolCallUpdated
+            | Self::ToolCallCompleted
+            | Self::SubagentStarted
+            | Self::SubagentEvent
+            | Self::SubagentCompleted => MemberRule::Required,
+            Self::ProviderConnected
+            | Self::ProviderDisconnected
+            | Self::SessionCreated
+            | Self::SessionLoaded
+            | Self::SessionUpdated
+            | Self::TurnQueued
+            | Self::TurnStarted
+            | Self::TurnSteered
+            | Self::TurnInterrupted
+            | Self::TurnCompleted
+            | Self::AssistantMessageDelta
+            | Self::AssistantMessageCompleted
+            | Self::ApprovalRequested
+            | Self::ApprovalResolved
+            | Self::UsageUpdated
+            | Self::ProviderWarning
+            | Self::ProviderFault
+            | Self::RunTerminal => MemberRule::Forbidden,
+        }
+    }
+
+    /// Whether a retry context is required, allowed or forbidden for this kind.
+    ///
+    /// Required on both problem kinds, because "the provider said no" and "the
+    /// provider said no and will say yes in nine seconds" are different facts
+    /// and a consumer that had to guess which it held would guess wrong.
+    #[must_use]
+    pub const fn retry_rule(self) -> MemberRule {
+        match self {
+            Self::ProviderWarning | Self::ProviderFault => MemberRule::Required,
+            Self::ProviderConnected
+            | Self::ProviderDisconnected
+            | Self::SessionCreated
+            | Self::SessionLoaded
+            | Self::SessionUpdated
+            | Self::TurnQueued
+            | Self::TurnStarted
+            | Self::TurnSteered
+            | Self::TurnInterrupted
+            | Self::TurnCompleted
+            | Self::AssistantMessageDelta
+            | Self::AssistantMessageCompleted
+            | Self::ToolCallStarted
+            | Self::ToolCallUpdated
+            | Self::ToolCallCompleted
+            | Self::ApprovalRequested
+            | Self::ApprovalResolved
+            | Self::SubagentStarted
+            | Self::SubagentEvent
+            | Self::SubagentCompleted
+            | Self::UsageUpdated
+            | Self::RunTerminal => MemberRule::Forbidden,
+        }
+    }
+
+    /// Whether bounded display text is required, allowed or forbidden.
+    ///
+    /// Required for the two assistant-message kinds, whose whole content is the
+    /// text; allowed as a label where a renderer has something to name — a tool,
+    /// a subagent, the sentence a fault came with — and forbidden elsewhere, so
+    /// a kind that means nothing to display cannot become a channel for
+    /// provider bytes.
+    #[must_use]
+    pub const fn text_rule(self) -> MemberRule {
+        match self {
+            Self::AssistantMessageDelta | Self::AssistantMessageCompleted => MemberRule::Required,
+            Self::ToolCallStarted
+            | Self::ToolCallUpdated
+            | Self::ToolCallCompleted
+            | Self::SubagentStarted
+            | Self::SubagentEvent
+            | Self::SubagentCompleted
+            | Self::ProviderWarning
+            | Self::ProviderFault => MemberRule::Optional,
+            Self::ProviderConnected
+            | Self::ProviderDisconnected
+            | Self::SessionCreated
+            | Self::SessionLoaded
+            | Self::SessionUpdated
+            | Self::TurnQueued
+            | Self::TurnStarted
+            | Self::TurnSteered
+            | Self::TurnInterrupted
+            | Self::TurnCompleted
+            | Self::ApprovalRequested
+            | Self::ApprovalResolved
+            | Self::UsageUpdated
+            | Self::RunTerminal => MemberRule::Forbidden,
+        }
+    }
+}
+
+/// Whether one body member must, may, or must not accompany a kind.
+///
+/// Three states rather than a boolean because the middle one is real: a tool
+/// call carries a label when the provider named the tool and carries none when
+/// it did not, and collapsing that into "required" would force a renderer to
+/// invent a name.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum MemberRule {
+    /// The member must be present.
+    Required,
+    /// The member may be present or absent.
+    Optional,
+    /// The member must be absent.
+    Forbidden,
+}
+
+impl MemberRule {
+    /// Every rule, for coverage checks.
+    pub const ALL: [Self; 3] = [Self::Required, Self::Optional, Self::Forbidden];
+
+    /// Stable lowercase spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Optional => "optional",
+            Self::Forbidden => "forbidden",
+        }
+    }
+
+    /// Whether a presence satisfies this rule.
+    #[must_use]
+    pub const fn admits(self, present: bool) -> bool {
+        match self {
+            Self::Required => present,
+            Self::Optional => true,
+            Self::Forbidden => !present,
+        }
+    }
+}
+
+/// How far one step of work has got.
+///
+/// Carried rather than derived. A consumer can reach `ToolCallUpdated` without
+/// having seen `ToolCallStarted` — it subscribed late, or an earlier frame was
+/// coalesced away — and a renderer that inferred the state from the kind would
+/// then draw a step that never began.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum StepStatus {
+    /// Admitted, not begun.
+    Pending,
+    /// Running now.
+    InProgress,
+    /// Finished, and it worked.
+    Completed,
+    /// Finished, and it did not.
+    Error,
+}
+
+impl StepStatus {
+    /// Every status, in lifecycle order.
+    pub const ALL: [Self; 4] = [
+        Self::Pending,
+        Self::InProgress,
+        Self::Completed,
+        Self::Error,
+    ];
+
+    /// Stable lowercase wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Error => "error",
+        }
+    }
+
+    /// Parse the exact stable spelling, or nothing.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|status| status.as_str() == value)
+    }
+
+    /// Whether the step has stopped moving.
+    #[must_use]
+    pub const fn is_settled(self) -> bool {
+        matches!(self, Self::Completed | Self::Error)
+    }
+}
+
+impl fmt::Display for StepStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// What class of condition a warning or a fault reports.
+///
+/// Closed, and deliberately coarse: it exists so a consumer can decide whether
+/// to wait, to fall back, or to stop, and a vocabulary fine enough to name
+/// every provider's own error taxonomy would be a vocabulary nothing could act
+/// on uniformly.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RetryCategory {
+    /// The provider asked for the request rate to come down.
+    RateLimited,
+    /// The provider had no capacity to spare.
+    Overloaded,
+    /// Nothing answered within the time allowed.
+    Timeout,
+    /// The connection, not the provider, failed.
+    Transport,
+    /// The provider considered the request itself wrong.
+    Rejected,
+    /// Automonique's own machinery could not proceed.
+    Internal,
+}
+
+impl RetryCategory {
+    /// Every category, in canonical order.
+    pub const ALL: [Self; 6] = [
+        Self::RateLimited,
+        Self::Overloaded,
+        Self::Timeout,
+        Self::Transport,
+        Self::Rejected,
+        Self::Internal,
+    ];
+
+    /// Stable lowercase wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimited => "rate_limited",
+            Self::Overloaded => "overloaded",
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::Rejected => "rejected",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// Parse the exact stable spelling, or nothing.
+    #[must_use]
+    pub fn from_spelling(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|category| category.as_str() == value)
+    }
+}
+
+impl fmt::Display for RetryCategory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Longest wait a retry context may advertise.
+///
+/// The same five-minute ceiling the Telegram transport clamps `retry_after` to,
+/// for the same reason: a delay longer than any operator will wait through is
+/// indistinguishable from a refusal, and dressing one as the other costs a user
+/// the five minutes before they find out.
+pub const MAX_RETRY_AFTER_MS: u64 = 300_000;
+
+/// Why a warning or a fault might be tried again, and when.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RetryContext {
+    category: RetryCategory,
+    retryable: bool,
+    retry_after_ms: Option<u64>,
+    attempt: u32,
+}
+
+impl RetryContext {
+    /// Record the retry semantics of one problem.
+    ///
+    /// `attempt` is the ordinal of the attempt that met it, counted from one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventError::RetryContextIncoherent`] for an `attempt` of zero,
+    /// which names an attempt nobody made; for a `retry_after_ms` on a context
+    /// that is not retryable, which would be a wait for something that will
+    /// never happen; and for a wait above [`MAX_RETRY_AFTER_MS`].
+    pub const fn new(
+        category: RetryCategory,
+        retryable: bool,
+        retry_after_ms: Option<u64>,
+        attempt: u32,
+    ) -> Result<Self, EventError> {
+        if attempt == 0 {
+            return Err(EventError::RetryContextIncoherent { field: "attempt" });
+        }
+        match retry_after_ms {
+            Some(delay) if !retryable || delay > MAX_RETRY_AFTER_MS => {
+                return Err(EventError::RetryContextIncoherent {
+                    field: "retry_after_ms",
+                });
+            }
+            Some(_) | None => {}
+        }
+        Ok(Self {
+            category,
+            retryable,
+            retry_after_ms,
+            attempt,
+        })
+    }
+
+    /// The class of condition.
+    #[must_use]
+    pub const fn category(self) -> RetryCategory {
+        self.category
+    }
+
+    /// Whether trying again could succeed.
+    #[must_use]
+    pub const fn retryable(self) -> bool {
+        self.retryable
+    }
+
+    /// How long to wait first, when the provider said.
+    #[must_use]
+    pub const fn retry_after_ms(self) -> Option<u64> {
+        self.retry_after_ms
+    }
+
+    /// Which attempt met this condition, counted from one.
+    #[must_use]
+    pub const fn attempt(self) -> u32 {
+        self.attempt
     }
 }
 
@@ -243,6 +613,31 @@ pub enum EventError {
         /// Authoritative horizon in milliseconds.
         authoritative_ms: i64,
     },
+    /// A retry context described a retry that cannot be made.
+    RetryContextIncoherent {
+        /// The field that disagrees with the rest.
+        field: &'static str,
+    },
+    /// A body member was absent where its kind requires one, or present where
+    /// its kind forbids one.
+    BodyMemberRefused {
+        /// The member that broke the rule.
+        member: &'static str,
+        /// The kind whose rule it broke.
+        kind: EventKind,
+        /// What that kind requires of the member.
+        rule: MemberRule,
+    },
+    /// A record of a preview-only kind claimed authority.
+    ///
+    /// [`EventKind::AssistantMessageDelta`] names text that may still change.
+    /// A record of it marked [`Authority::Authoritative`] would be exactly the
+    /// confusion the two types exist to prevent, arriving through the one door
+    /// the type split leaves open.
+    PreviewClaimedAuthority {
+        /// The kind that cannot be authoritative.
+        kind: EventKind,
+    },
 }
 
 impl EventError {
@@ -258,6 +653,9 @@ impl EventError {
             Self::CursorWentBackwards { .. } => "cursor_went_backwards",
             Self::ApprovalConflict { .. } => "approval_conflict",
             Self::RetentionWouldOutliveEvidence { .. } => "retention_would_outlive_evidence",
+            Self::RetryContextIncoherent { .. } => "retry_context_incoherent",
+            Self::BodyMemberRefused { .. } => "body_member_refused",
+            Self::PreviewClaimedAuthority { .. } => "preview_claimed_authority",
         }
     }
 }
@@ -301,6 +699,20 @@ impl fmt::Display for EventError {
                 formatter,
                 "preview retention of {preview_ms}ms would outlive authoritative \
                  retention of {authoritative_ms}ms"
+            ),
+            Self::RetryContextIncoherent { field } => {
+                write!(formatter, "retry context field {field} is incoherent")
+            }
+            Self::BodyMemberRefused { member, kind, rule } => write!(
+                formatter,
+                "body member {member} is {} for {}",
+                rule.as_str(),
+                kind.as_str()
+            ),
+            Self::PreviewClaimedAuthority { kind } => write!(
+                formatter,
+                "{} is preview-only and cannot be authoritative",
+                kind.as_str()
             ),
         }
     }
@@ -479,6 +891,34 @@ impl PreviewEvent {
     }
 }
 
+/// Everything one recorded event is built from.
+///
+/// A struct rather than eight positional arguments: the two body members were
+/// added after the fact, and a caller that had silently gained two more
+/// `Option`s in a row of seven would be exactly the reader who gets them the
+/// wrong way round.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedEventParts {
+    /// Automonique sequence.
+    pub sequence: u64,
+    /// Where the event sits in provider coordinates.
+    pub coordinates: EventCoordinates,
+    /// What happened.
+    pub kind: EventKind,
+    /// How much the record may be relied upon.
+    pub authority: Authority,
+    /// When it happened.
+    pub at: EpochMillis,
+    /// The provider schema version it was normalized from.
+    pub source_schema_version: u32,
+    /// The bounded raw record, when one was retained.
+    pub raw: Option<RawProviderRecord>,
+    /// Step lifecycle, required by the tool-call and subagent kinds.
+    pub step: Option<StepStatus>,
+    /// Retry semantics, required by the two problem kinds.
+    pub retry: Option<RetryContext>,
+}
+
 /// An authoritative or synthetic event, which terminal reporting may use.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordedEvent {
@@ -489,24 +929,23 @@ pub struct RecordedEvent {
     at: EpochMillis,
     source_schema_version: u32,
     raw: Option<RawProviderRecord>,
+    step: Option<StepStatus>,
+    retry: Option<RetryContext>,
 }
 
 impl RecordedEvent {
-    /// Record an event with an explicit authority.
+    /// Record an event with an explicit authority and a body its kind admits.
     ///
-    /// Authority is a required argument. There is no constructor that infers or
+    /// Authority is a required field. There is no constructor that infers or
     /// defaults it.
-    #[must_use]
-    pub fn new(
-        sequence: u64,
-        coordinates: EventCoordinates,
-        kind: EventKind,
-        authority: Authority,
-        at: EpochMillis,
-        source_schema_version: u32,
-        raw: Option<RawProviderRecord>,
-    ) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventError::PreviewClaimedAuthority`] for an authoritative
+    /// record of a preview-only kind, and [`EventError::BodyMemberRefused`] for
+    /// a body member its kind requires and did not get, or forbids and did.
+    pub fn new(parts: RecordedEventParts) -> Result<Self, EventError> {
+        let RecordedEventParts {
             sequence,
             coordinates,
             kind,
@@ -514,7 +953,37 @@ impl RecordedEvent {
             at,
             source_schema_version,
             raw,
+            step,
+            retry,
+        } = parts;
+        if kind.is_preview_only() && matches!(authority, Authority::Authoritative) {
+            return Err(EventError::PreviewClaimedAuthority { kind });
         }
+        admit_member("step", kind, kind.step_rule(), step.is_some())?;
+        admit_member("retry", kind, kind.retry_rule(), retry.is_some())?;
+        Ok(Self {
+            sequence,
+            coordinates,
+            kind,
+            authority,
+            at,
+            source_schema_version,
+            raw,
+            step,
+            retry,
+        })
+    }
+
+    /// Step lifecycle, present exactly where the kind requires one.
+    #[must_use]
+    pub const fn step(&self) -> Option<StepStatus> {
+        self.step
+    }
+
+    /// Retry semantics, present exactly where the kind requires one.
+    #[must_use]
+    pub const fn retry(&self) -> Option<RetryContext> {
+        self.retry
     }
 
     /// Automonique sequence.
@@ -923,6 +1392,24 @@ impl RetentionPolicy {
         previews.retain(|preview| {
             now.as_millis().saturating_sub(preview.at().as_millis()) < self.preview_ms
         });
+    }
+}
+
+/// Hold one body member to the rule its kind states.
+///
+/// Shared by [`RecordedEvent`] and by [`crate::progress_api::ProgressBody`], so
+/// the in-memory record and the wire body cannot disagree about which members a
+/// kind carries.
+pub(crate) const fn admit_member(
+    member: &'static str,
+    kind: EventKind,
+    rule: MemberRule,
+    present: bool,
+) -> Result<(), EventError> {
+    if rule.admits(present) {
+        Ok(())
+    } else {
+        Err(EventError::BodyMemberRefused { member, kind, rule })
     }
 }
 
