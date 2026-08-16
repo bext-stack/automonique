@@ -295,13 +295,56 @@ bound the loop. The shipped pipeline is administrator-initiated rather than
 evidence-initiated, so it does not implement that loop and does not carry those
 limits.
 
-Resolving this is an owner decision with three shapes — raise the ceiling this
-document permits and say under what authority, lower the pipeline to
-`production_proposal` and hand activation to an external step, or record a
-scoped exemption for a single-operator deployment. It is assigned to the
-improvement program's **M4** milestone and is deliberately left open here.
-Until it is decided, treat the pipeline as operating outside this document's
-stated ceiling, with the deviation known and recorded rather than discovered.
+### Resolution — amended 2026-08-15
+
+This deviation is no longer open. The decision, its alternatives and its
+reasoning are recorded in
+[`plan/owner-decisions/2026-08-15-self-improvement-authority.md`](../../../plan/owner-decisions/2026-08-15-self-improvement-authority.md);
+what follows is the part that is a requirement.
+
+**The governed artifact is the daemon pipeline.** `improvement_executor`,
+`improvement_worker`, `improvement_github`, `improvement_publish`,
+`release_builder`, `release_activation`, the Telegram improvement handlers and
+the `improvements` store are what this section governs. The rest of
+`automonique-lab` — `harness_claim`, `program`, `build`, `state`, `controller`,
+`workspace_lease` and `worktree` — has no product call site and is a
+proposal-only control plane; it is not the pipeline any statement here is about,
+and nothing in it may be read as authorizing production behaviour.
+
+**The destination is the ladder, not an exemption from it.** The pipeline is to
+reach `development_branch` plus the two-step `prepare_promotion` /
+`approve_promotion` promotion this document already defines, and the ceiling
+table above gains no fourth entry. No new authority is created by this
+amendment.
+
+**Until that lands, the pipeline operates as one named, bounded lane** —
+*owner-gated direct integration* — rather than as an unresolved excess. The
+lane is defined by preconditions that are enforced in code, not asserted:
+
+- the candidate holds no GitHub, SSH-agent, deployment or production
+  credential, cannot create a commit, and is refused if it tries;
+- the approved plan is byte-bound by digest, and both gates are single-use
+  challenges bound to actor, chat, revision and artifact digest;
+- the merge refuses a head that moved after approval, and refuses a merged
+  tree that differs from the tested tree;
+- **the required-status policy this document names above is now real**: every
+  required check must have a completed, successful run on exactly the tested
+  commit before either the merge or the activation happens, recorded as durable
+  evidence on the improvement record. A check that was deleted, renamed or
+  never triggered refuses; it does not pass.
+
+The lane retires when the promotion path lands. Two things are still missing
+and are stated rather than implied: the merge target is protected `main` rather
+than a bot-owned branch, and `main` carries no branch protection — an owner
+GitHub-settings action that no code change in this repository can perform.
+Until both are addressed, the separation this document requires between the
+identity that proposes and the authority that integrates is achieved by
+credential isolation and two human approvals, and not by an external
+integration authority.
+
+The second, smaller deviation above is unchanged: the pipeline remains
+administrator-initiated rather than evidence-initiated, and does not implement
+the recursive improvement loop or carry its limits.
 
 ## Recovery and anti-corruption boundary
 

@@ -11,6 +11,8 @@ The approach adapts two useful ideas to Automonique:
 
 This is implementation infrastructure, not a production self-modification permission. Production Automonique never edits or activates its own release merely because an agent proposed a patch.
 
+**Amended 2026-08-15.** That sentence was written before a self-improvement pipeline shipped in the daemon, and it has since been read two ways: as "an agent's proposal is never sufficient", which is what it says, and as "production never self-modifies", which is not. The first reading is the one that binds, and it is now enforced rather than asserted — an agent's proposal reaches production only through two single-use human approvals bound to the exact plan digest and the exact tested commit, and only when every required check has passed on that commit. The pipeline this applies to, the lane it operates under and what is still missing from it are specified in [Self-hosting and bootstrap](self-hosting-and-bootstrap.md) § Shipped self-improvement pipeline; the decision is recorded in [`plan/owner-decisions/2026-08-15-self-improvement-authority.md`](../../../plan/owner-decisions/2026-08-15-self-improvement-authority.md). Nothing here permits activation on an agent's proposal alone, and no amendment may be read as creating that permission.
+
 The staged trust and promotion cycle that lets this harness build and reload Automonique itself is defined separately in [Self-hosting and bootstrap](self-hosting-and-bootstrap.md).
 
 ## Repository layout

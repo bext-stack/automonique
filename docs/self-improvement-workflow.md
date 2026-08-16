@@ -1,5 +1,12 @@
 # Self-improvement workflow
 
+This is an operator how-to. It carries no requirements authority: what this
+pipeline is permitted to do is specified in
+[`docs/product-plan/requirements/self-hosting-and-bootstrap.md`](product-plan/requirements/self-hosting-and-bootstrap.md)
+§ Shipped self-improvement pipeline, and the authority decision behind it is
+[`plan/owner-decisions/2026-08-15-self-improvement-authority.md`](../plan/owner-decisions/2026-08-15-self-improvement-authority.md).
+Where this file and those disagree, they win.
+
 Automonique accepts explicit self-change requests from a Telegram administrator,
 for example: `Improve Automonique by adding a durable status view.` Ordinary
 capability questions do not create work.
@@ -23,6 +30,36 @@ Requesting changes at either gate returns the item to a draft plan. The owner
 can send `IMP-000001: revision guidance`; the replacement plan receives a new
 revision, plan pull request, and first approval before another lab attempt.
 
+## What the candidate is verified against
+
+The host runs the same gate set the required CI jobs run, with the same flags,
+against the staged candidate — the formatting, workspace check, test and
+`clippy -D warnings` gates in `rust/`, plus the licence boundary, the
+publication scrub and the identifier rule from the worktree root. A gate added
+to CI and not to this list, or the reverse, fails the build.
+
+## The required-check gate
+
+The second approval does not merge on its own. Before anything is merged,
+Automonique reads the check runs GitHub recorded for exactly the tested commit
+and requires that every required check — `workspace`, `licence-boundary` and
+`development-scrub` — has a completed, successful run on that commit. Only then
+is the pull request merged and the release activated, and the evidence (the
+commit, and each check's run id, URL and completion time) is written to the
+improvement record.
+
+Anything else refuses without merging, and the reply says which check and why:
+
+| Reply says | Meaning | What to do |
+|---|---|---|
+| still running | the check has not finished on that commit | send `IMP-000001: continue` once it has |
+| did not pass | the check completed with a failure | request changes and revise the plan |
+| never ran | no run exists on that commit at all | the workflow was renamed, deleted or never triggered — fix CI, then `continue` |
+
+In all three cases the item stays at `release_approved`. The approval button is
+single-use and is not re-issued; `IMP-000001: continue` is how an approved
+release resumes, and it re-runs the same gate.
+
 The second approval merges only the recorded PR head. Skill-only releases
 switch an atomic digest link and are read again on every provider run. Code and
 mixed releases switch an atomic release link, restart the configured systemd
@@ -40,6 +77,13 @@ but subsequent service starts must resolve the `current` release link.
 The owner must create `bext-stack/automonique-plans` as a private repository.
 Automonique checks that it is private and that `bext-stack/automonique` is
 public; it does not create repositories or alter repository settings.
+
+Branch protection on the source repository's `main` is an owner action and is
+**not** enabled by anything here. Automonique cannot set it, and cannot verify
+it from the inside. Until the owner enables it, the required-check gate above
+is the only thing standing between an approved release and public `main`, and
+it is enforced by this daemon rather than by the remote. Enable it, requiring
+the same three checks, so that the remote refuses independently.
 
 The daemon state directory may contain a private `improvement-lab.json` file
 (owner-only mode such as `0600`):
