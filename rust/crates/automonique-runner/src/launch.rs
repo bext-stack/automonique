@@ -1081,13 +1081,16 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         }
     })?;
 
-    // 5–6. Landlock domains. Anything the crate opens here is close-on-exec
-    //      and dropped before execve, so it cannot reach the workload.
-    plan.filesystem_policy()
+    // 5–6. Landlock domains. The TCP policy confirms single-threadedness from
+    //      /proc while it is being installed, so it must precede the
+    //      filesystem domain that deliberately makes /proc unreadable.
+    //      Anything either policy opens is close-on-exec and dropped before
+    //      execve, so it cannot reach the workload.
+    plan.tcp_policy()
         .map_err(|error| error.to_string())?
         .enforce_on_current_thread()
         .map_err(|error| error.to_string())?;
-    plan.tcp_policy()
+    plan.filesystem_policy()
         .map_err(|error| error.to_string())?
         .enforce_on_current_thread()
         .map_err(|error| error.to_string())?;
