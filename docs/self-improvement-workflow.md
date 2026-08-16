@@ -66,6 +66,16 @@ mixed releases switch an atomic release link, restart the configured systemd
 user service, verify readiness, and restore the prior code and skill links if
 readiness fails.
 
+**The restart interrupts in-flight work, and this is a known temporary
+mechanism, not the design.** Every Telegram, Slack and Support turn in progress
+in the restarted generation is lost — nothing is drained and nothing is
+transferred. The specified mechanism is the generation handoff in
+[`reload-protocol.md`](product-plan/requirements/reload-protocol.md), which is
+not built yet. The deviation, its exact blast radius and its retirement
+condition are recorded in
+[`plan/owner-decisions/2026-08-15-restart-activation-deviation.md`](../plan/owner-decisions/2026-08-15-restart-activation-deviation.md).
+Activate code releases when the system is quiet.
+
 For code activation to switch the executable atomically, the configured unit's
 `ExecStart` must invoke
 `<state-directory>/improvement-code/current/bin/automonique daemon --foreground`.

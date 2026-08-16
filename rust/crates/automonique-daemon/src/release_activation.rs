@@ -88,6 +88,35 @@ pub struct ActivationReceipt {
     pub previous_target: Option<PathBuf>,
 }
 
+/// The boundary between "a release is approved and chosen" and "how the new
+/// code takes over".
+///
+/// There is one variant, and the point of naming the boundary while there is
+/// only one is that the generation handoff specified in
+/// `docs/product-plan/requirements/reload-protocol.md` — where the active
+/// generation reloads in place and in-flight work survives — becomes a second
+/// variant here rather than a second activation path somewhere else.
+/// Everything below this line is shared by both and does not move: verifying
+/// the release, the atomic `current` link, and the rollback discipline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActivationMechanism {
+    /// Switch the link, restart the supervised unit, verify readiness, and
+    /// restore the previous link if readiness fails.
+    ///
+    /// Every in-flight turn in the restarted generation is lost. A process
+    /// also cannot survive its own restart, which is why the improvement
+    /// worker performs this out of band in a transient unit — a property of
+    /// this variant, not of activation. Accepted as temporary; see
+    /// `plan/owner-decisions/2026-08-15-restart-activation-deviation.md`.
+    SupervisedRestart,
+}
+
+impl ActivationMechanism {
+    /// The mechanism in use. It stays `SupervisedRestart` until generation
+    /// handoff exists to be the other one.
+    pub const CURRENT: Self = Self::SupervisedRestart;
+}
+
 pub trait ReleaseSupervisor {
     fn restart(&mut self, unit: &str) -> Result<(), ReleaseActivationError>;
     fn ready(&mut self, unit: &str) -> Result<bool, ReleaseActivationError>;
@@ -154,10 +183,20 @@ impl<S: ReleaseSupervisor> CodeReleaseActivator<S> {
         })
     }
 
-    /// Select, restart and verify one exact code or mixed release. Skill-only
-    /// releases belong to `skill_runtime::activate` and are refused here.
+    /// Select, activate and verify one exact code or mixed release through the
+    /// current mechanism. Skill-only releases belong to
+    /// `skill_runtime::activate` and are refused here.
     pub fn activate(
         &mut self,
+        expected_manifest_digest: &str,
+    ) -> Result<ActivationReceipt, ReleaseActivationError> {
+        self.activate_with(ActivationMechanism::CURRENT, expected_manifest_digest)
+    }
+
+    /// The same activation, with the take-over mechanism named explicitly.
+    pub fn activate_with(
+        &mut self,
+        mechanism: ActivationMechanism,
         expected_manifest_digest: &str,
     ) -> Result<ActivationReceipt, ReleaseActivationError> {
         let release = self.verify(expected_manifest_digest)?;
@@ -166,14 +205,17 @@ impl<S: ReleaseSupervisor> CodeReleaseActivator<S> {
         }
         let current = self.root.join(CURRENT_NAME);
         let previous_target = read_current_target(&current)?;
+        // Owned, because the take-over step below needs `&mut self` and a
+        // borrow of `self.root` would outlive the point it is taken.
         let state_dir = self
             .root
             .parent()
-            .ok_or(ReleaseActivationError::UnsafePath("release root"))?;
+            .ok_or(ReleaseActivationError::UnsafePath("release root"))?
+            .to_path_buf();
         let skill_receipt = match release.kind {
             ReleaseKind::Mixed => Some(
                 crate::skill_runtime::activate_with_receipt(
-                    state_dir,
+                    &state_dir,
                     release.skill_manifest_digest.as_deref().ok_or(
                         ReleaseActivationError::InvalidManifest("skill_manifest_digest"),
                     )?,
@@ -185,15 +227,13 @@ impl<S: ReleaseSupervisor> CodeReleaseActivator<S> {
         };
         if let Err(error) = install_link(&self.root, &release.release_target, "activate") {
             if let Some(receipt) = &skill_receipt
-                && crate::skill_runtime::rollback(state_dir, receipt).is_err()
+                && crate::skill_runtime::rollback(&state_dir, receipt).is_err()
             {
                 return Err(ReleaseActivationError::RollbackFailed);
             }
             return Err(error);
         }
-        let accepted = self.supervisor.restart(&self.unit).is_ok()
-            && self.supervisor.ready(&self.unit).unwrap_or(false);
-        if accepted {
+        if self.take_over(mechanism) {
             return Ok(ActivationReceipt {
                 release,
                 previous_target,
@@ -202,13 +242,23 @@ impl<S: ReleaseSupervisor> CodeReleaseActivator<S> {
         restore_link(&self.root, previous_target.as_deref())?;
         let skill_rolled_back = skill_receipt
             .as_ref()
-            .is_none_or(|receipt| crate::skill_runtime::rollback(state_dir, receipt).is_ok());
-        let rollback_ready = self.supervisor.restart(&self.unit).is_ok()
-            && self.supervisor.ready(&self.unit).unwrap_or(false);
-        if rollback_ready && skill_rolled_back {
+            .is_none_or(|receipt| crate::skill_runtime::rollback(&state_dir, receipt).is_ok());
+        if self.take_over(mechanism) && skill_rolled_back {
             Err(ReleaseActivationError::ActivationRolledBack)
         } else {
             Err(ReleaseActivationError::RollbackFailed)
+        }
+    }
+
+    /// Hand control to whatever the `current` link now points at, and report
+    /// whether it came up. The link is already in place either way, so this is
+    /// the only step a second mechanism replaces.
+    fn take_over(&mut self, mechanism: ActivationMechanism) -> bool {
+        match mechanism {
+            ActivationMechanism::SupervisedRestart => {
+                self.supervisor.restart(&self.unit).is_ok()
+                    && self.supervisor.ready(&self.unit).unwrap_or(false)
+            }
         }
     }
 
@@ -583,6 +633,71 @@ mod tests {
             previous_target
         );
         assert_eq!(activator.supervisor.restarts, 2);
+    }
+
+    #[derive(Debug)]
+    struct RecordingSupervisor {
+        calls: Vec<&'static str>,
+        readiness: VecDeque<bool>,
+    }
+
+    impl ReleaseSupervisor for RecordingSupervisor {
+        fn restart(&mut self, _unit: &str) -> Result<(), ReleaseActivationError> {
+            self.calls.push("restart");
+            Ok(())
+        }
+        fn ready(&mut self, _unit: &str) -> Result<bool, ReleaseActivationError> {
+            self.calls.push("ready");
+            Ok(self.readiness.pop_front().unwrap_or(false))
+        }
+    }
+
+    /// The seam must not have changed what activation does. This pins the
+    /// restart variant's exact supervisor sequence, so a handoff variant added
+    /// later cannot quietly alter the one that exists.
+    #[test]
+    fn the_restart_mechanism_switches_the_link_then_restarts_and_verifies() {
+        assert_eq!(
+            ActivationMechanism::CURRENT,
+            ActivationMechanism::SupervisedRestart,
+            "the default entry point must still select the restart mechanism"
+        );
+
+        let root = tempfile::tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("private");
+        fs::create_dir(root.path().join(RELEASES_NAME)).expect("releases");
+        fs::set_permissions(
+            root.path().join(RELEASES_NAME),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("private");
+        let previous = add_release(root.path(), 'a');
+        let candidate = add_release(root.path(), 'c');
+        let previous_target = Path::new(RELEASES_NAME).join(previous.trim_start_matches("sha256:"));
+        let candidate_target =
+            Path::new(RELEASES_NAME).join(candidate.trim_start_matches("sha256:"));
+        symlink(&previous_target, root.path().join(CURRENT_NAME)).expect("current");
+
+        let mut activator = CodeReleaseActivator::new(
+            root.path(),
+            "automonique.service",
+            RecordingSupervisor {
+                calls: Vec::new(),
+                readiness: VecDeque::from([true]),
+            },
+        )
+        .expect("activator");
+        let receipt = activator
+            .activate_with(ActivationMechanism::SupervisedRestart, &candidate)
+            .expect("activated");
+
+        assert_eq!(activator.supervisor.calls, ["restart", "ready"]);
+        assert_eq!(
+            fs::read_link(root.path().join(CURRENT_NAME)).expect("current"),
+            candidate_target
+        );
+        assert_eq!(receipt.previous_target.as_deref(), Some(&*previous_target));
+        assert_eq!(receipt.release.manifest_digest, candidate);
     }
 
     #[test]

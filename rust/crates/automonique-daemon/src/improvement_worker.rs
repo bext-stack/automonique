@@ -223,7 +223,15 @@ impl ImprovementWorker {
             .join("improvement-code/releases")
             .join(digest);
         if code_release.is_dir() {
-            self.schedule_code_activation(improvement, manifest_digest)?;
+            match crate::release_activation::ActivationMechanism::CURRENT {
+                // Restart is the one mechanism that the process performing it
+                // cannot survive, so this variant — and only this variant —
+                // needs the out-of-band transient unit below. A handoff
+                // variant reloads in place and would not schedule anything.
+                crate::release_activation::ActivationMechanism::SupervisedRestart => {
+                    self.schedule_code_activation(improvement, manifest_digest)?;
+                }
+            }
             Ok(ActivationDisposition::Scheduled)
         } else {
             crate::skill_runtime::activate(&self.state_dir, manifest_digest)
