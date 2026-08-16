@@ -34,13 +34,127 @@ fn generated_path() -> PathBuf {
     package_root().join("generated/spike.ts")
 }
 
+/// A JavaScript runtime that can execute the `.ts` conformance scripts.
+///
+/// The capability rather than the name. Every caller hands this runtime a
+/// TypeScript file, so a `node` too old to strip types answers `--version`
+/// happily and then fails each caller with `ERR_UNKNOWN_FILE_EXTENSION` — a
+/// loud failure that names the wrong thing. Probing what the callers need
+/// turns that into an accurate report: a gap locally, and under
+/// [`REQUIRE_JS_TOOLCHAIN_ENV`] a failure that says the runtime is missing.
+///
+/// bun is probed first because it is the runtime `generated/VERDICT.md`
+/// measured under, and it is what CI pins.
 fn javascript_runtime() -> Option<&'static str> {
-    ["bun", "node"].into_iter().find(|candidate| {
-        Command::new(candidate)
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success())
-    })
+    ["bun", "node"]
+        .into_iter()
+        .find(|candidate| runs_typescript(candidate))
+}
+
+/// Whether `candidate` can execute a TypeScript file.
+fn runs_typescript(candidate: &str) -> bool {
+    static PROBE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    // Unique per call: these tests run as threads of one process, so a fixed
+    // name would let one probe delete the file another is about to run.
+    let probe = std::env::temp_dir().join(format!(
+        "automonique-runtime-probe-{}-{}.ts",
+        std::process::id(),
+        PROBE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    // The annotation is the point: a runtime that tolerates the extension but
+    // does not erase types is no more use here than one that refuses it.
+    if std::fs::write(&probe, "const ok: string = \"ok\";\nconsole.log(ok);\n").is_err() {
+        return false;
+    }
+    let ran = Command::new(candidate)
+        .arg(&probe)
+        .output()
+        .is_ok_and(|output| output.status.success());
+    let _ = std::fs::remove_file(&probe);
+    ran
+}
+
+/// Set to demand the JavaScript toolchain rather than tolerate its absence.
+///
+/// CI sets it, because on a runner a missing toolchain is a broken job
+/// definition, not a fact about the environment. Locally it is unset, so a
+/// contributor without bun installed still gets a green run.
+const REQUIRE_JS_TOOLCHAIN_ENV: &str = "AUTOMONIQUE_REQUIRE_JS_TOOLCHAIN";
+
+fn js_toolchain_required() -> bool {
+    std::env::var(REQUIRE_JS_TOOLCHAIN_ENV).is_ok_and(|value| !value.is_empty() && value != "0")
+}
+
+/// Record a claim that needed the JavaScript toolchain to measure.
+///
+/// The single choke point every JavaScript gap in this file routes through, so
+/// the policy is one decision rather than fifteen. Under
+/// [`REQUIRE_JS_TOOLCHAIN_ENV`] it panics with the gap text: a runner that
+/// never installed bun then fails the job instead of passing fifteen tests
+/// that measured nothing, which is the failure this whole arrangement exists
+/// to prevent — a skip and a pass are the same colour in a log.
+///
+/// Unset, it prints the gap as a `::warning::` annotation. Note that cargo
+/// captures test output unless `--nocapture` is passed, so the annotation is a
+/// belt-and-braces measure for the runs that do pass it; the env var is what
+/// actually makes CI honest.
+#[track_caller]
+fn record_js_gap(note: &str) {
+    assert!(
+        !js_toolchain_required(),
+        "GAP: {note}\n{REQUIRE_JS_TOOLCHAIN_ENV} is set, so an unmeasured claim is a \
+         failure: install the JavaScript toolchain or stop asking CI to prove this."
+    );
+    eprintln!("::warning::GAP: {note}");
+}
+
+/// The exact `typescript` version `package.json` pins, as a bare version.
+///
+/// Read out of the manifest rather than written here, so the pin has one
+/// spelling: bumping the dependency and forgetting this test is not a thing
+/// that can happen. The extraction is deliberately literal — the crate has no
+/// JSON dependency and this needs one field, not a parser.
+fn pinned_typescript_version() -> String {
+    let manifest_path = package_root().join("package.json");
+    let manifest =
+        std::fs::read_to_string(&manifest_path).expect("the package manifest is checked in");
+    let key = "\"typescript\": \"";
+    let start = manifest.find(key).unwrap_or_else(|| {
+        panic!(
+            "{} declares no typescript dependency",
+            manifest_path.display()
+        )
+    }) + key.len();
+    let rest = &manifest[start..];
+    let end = rest.find('"').unwrap_or_else(|| {
+        panic!(
+            "{} has an unterminated typescript pin",
+            manifest_path.display()
+        )
+    });
+    let version = &rest[..end];
+    assert!(
+        version.starts_with(|character: char| character.is_ascii_digit()),
+        "the typescript dependency is a range ({version:?}), not an exact pin; a range lets \
+         the compiler that measures the negative cases change without a commit"
+    );
+    version.to_owned()
+}
+
+/// What `npx --offline tsc --version` prints, or `None` when it cannot run.
+fn typescript_version() -> Option<String> {
+    let output = Command::new("npx")
+        .arg("--offline")
+        .arg("tsc")
+        .arg("--version")
+        .current_dir(package_root())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Run `tsc` over one or more files, returning whether they typechecked.
@@ -391,10 +505,41 @@ mod reproducibility {
 mod typescript_properties {
     use super::*;
 
+    /// The compiler that runs the checks below is the one the package pins.
+    ///
+    /// Every negative case in this module asserts exact TypeScript diagnostic
+    /// text, and a compiler major version can reword any of those sentences.
+    /// Before the package declared `typescript` as a dependency,
+    /// `npx --offline tsc` resolved whatever the ambient environment happened
+    /// to supply — a global npm cache on one machine, a runner image on
+    /// another — so a security-relevant conformance result could flip with no
+    /// commit touching the repository. This test is what closes that: it reads
+    /// the pin out of `package.json` and refuses a compiler that is not it.
+    ///
+    /// It is a test rather than a README line for the obvious reason — a
+    /// README cannot fail.
+    #[test]
+    fn the_typescript_compiler_is_the_pinned_one() {
+        let pinned = pinned_typescript_version();
+        let Some(reported) = typescript_version() else {
+            record_js_gap("tsc is unavailable; the pinned compiler version is unverified");
+            return;
+        };
+        assert_eq!(
+            reported.trim(),
+            format!("Version {pinned}"),
+            "npx resolved a TypeScript other than the pin in package.json.\n\
+             The negative cases below assert exact compiler diagnostic text, so \
+             a substituted compiler makes their result meaningless. Run \
+             `bun install --frozen-lockfile` in {package}.",
+            package = package_root().display()
+        );
+    }
+
     #[test]
     fn the_generated_file_typechecks() {
         let Some((ok, output)) = typechecks(&[generated_path()]) else {
-            eprintln!("GAP: tsc is unavailable; the codegen spike is unmeasured");
+            record_js_gap("tsc is unavailable; the codegen spike is unmeasured");
             return;
         };
         assert!(ok, "generated TypeScript does not typecheck:\n{output}");
@@ -420,7 +565,7 @@ mod typescript_properties {
             package_root().join("conformance/node-runtime.d.ts"),
         ];
         let Some((ok, output)) = typechecks(&files) else {
-            eprintln!("GAP: tsc is unavailable; the runtime conformance script is unmeasured");
+            record_js_gap("tsc is unavailable; the runtime conformance script is unmeasured");
             return;
         };
         assert!(
@@ -467,7 +612,7 @@ mod typescript_properties {
         for (file, diagnostic) in expected {
             let path = directory.join(file);
             let Some((ok, output)) = typechecks(&[path]) else {
-                eprintln!("GAP: tsc is unavailable; negative cases are unmeasured");
+                record_js_gap("tsc is unavailable; negative cases are unmeasured");
                 return;
             };
             assert!(!ok, "{file} compiled, so the property it guards was lost");
@@ -481,7 +626,7 @@ mod typescript_properties {
     #[test]
     fn the_runtime_behaviour_matches_the_rust_bounds() {
         let Some(run) = run_runtime_conformance() else {
-            eprintln!("GAP: no JavaScript runtime; runtime behaviour is unmeasured");
+            record_js_gap("no JavaScript runtime; runtime behaviour is unmeasured");
             return;
         };
         assert!(
@@ -685,7 +830,7 @@ mod verdict_quality {
             "carried"
         };
         let Some(run) = run_runtime_conformance() else {
-            eprintln!("GAP: no JavaScript runtime; the brand's runtime existence is unmeasured");
+            record_js_gap("no JavaScript runtime; the brand's runtime existence is unmeasured");
             return;
         };
         let observed = run
@@ -781,7 +926,8 @@ mod maintained_surface {
 
     use automonique_protocol::codegen::{
         ADMIN_STATUS_MODULE, BARREL_MODULE, DOCTOR_MODULE, GENERATED_DIRECTORY, REGENERATE_COMMAND,
-        REGENERATE_ENV, RUNTIME_MODULE, generated_files, maintained_modules, module_file_name,
+        REGENERATE_ENV, RUNTIME_MODULE, generated_files, generated_schema_digest,
+        maintained_modules, module_file_name,
     };
     use automonique_protocol::{
         MAX_DOCTOR_CHECKS, MAX_FINDING_CODE_BYTES, MAX_FINDING_MESSAGE_BYTES,
@@ -1244,14 +1390,117 @@ mod maintained_surface {
             "the barrel re-exports the spike, whose own ValidationError collides with the \
              runtime module's"
         );
-        // The barrel is a list of re-exports and nothing else; a declaration
-        // here would be surface no schema describes.
+        // The barrel is a list of re-exports plus the schema digest, and
+        // nothing else; any other declaration here would be surface no schema
+        // describes.
         for line in barrel.lines() {
             assert!(
-                line.is_empty() || line.starts_with("//") || line.starts_with("export * from "),
-                "{name} carries something other than a re-export: {line:?}"
+                line.is_empty()
+                    || line.starts_with("//")
+                    || line.starts_with("export * from ")
+                    || line.starts_with("export const SCHEMA_DIGEST"),
+                "{name} carries something other than a re-export or the schema digest: {line:?}"
             );
         }
+    }
+
+    /// The digest checked into the barrel is the one the generator computes.
+    ///
+    /// This is what makes the digest evidence rather than decoration: a schema
+    /// change that reaches the emitted surface moves the digest, and a barrel
+    /// that was not regenerated alongside it fails here by name instead of
+    /// somewhere downstream where the SDK is admitted against a surface it does
+    /// not have.
+    #[test]
+    fn the_barrel_digest_is_the_digest_of_the_generated_surface() {
+        if regenerating() {
+            // The barrel is being rewritten by a test running beside this one,
+            // so what is on disk is legitimately in flux. The ordinary run —
+            // the one CI makes — is the measurement.
+            eprintln!("GAP: skipped during regeneration; rerun without {REGENERATE_ENV}");
+            return;
+        }
+        let (algorithm, hex) = generated_schema_digest();
+        // Deliberately the checked-in file rather than `file(BARREL_MODULE)`:
+        // comparing the generator against itself would pass whatever is on
+        // disk. The claim is that the committed digest is current.
+        let path = generated_directory().join(module_file_name(BARREL_MODULE));
+        let barrel = std::fs::read_to_string(&path).expect("the barrel is checked in");
+        assert!(
+            barrel.contains(&format!(
+                "export const SCHEMA_DIGEST_ALGORITHM = \"{algorithm}\";"
+            )),
+            "the barrel does not name the digest algorithm; regenerate with: {REGENERATE_COMMAND}"
+        );
+        assert!(
+            barrel.contains(&format!("export const SCHEMA_DIGEST = \"{hex}\";")),
+            "the barrel's schema digest is not the digest of the generated surface; \
+             regenerate with: {REGENERATE_COMMAND}"
+        );
+        // The shape the release manifest will parse it back with.
+        assert_eq!(algorithm, "sha256");
+        assert_eq!(
+            hex.len(),
+            64,
+            "a sha256 digest is 64 hexadecimal characters"
+        );
+        assert!(
+            hex.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "the digest is not lowercase hexadecimal: {hex}"
+        );
+    }
+
+    /// A changed surface must move the digest.
+    ///
+    /// Without this, a digest computed over a constant — or over a subset of
+    /// the surface that happens to be stable — would pass the equality test
+    /// above forever while identifying nothing.
+    #[test]
+    fn the_digest_covers_the_surface_it_claims_to() {
+        let (_, hex) = generated_schema_digest();
+        let barrel_name = module_file_name(BARREL_MODULE);
+        let mut inputs: Vec<(String, String)> = generated_files()
+            .into_iter()
+            .filter(|(name, _)| name != &barrel_name)
+            .collect();
+        assert!(
+            inputs.len() > 1,
+            "the digest is computed over fewer modules than the surface has"
+        );
+        for index in 0..inputs.len() {
+            let mut mutated = inputs.clone();
+            mutated[index].1.push_str("\n// a schema change\n");
+            assert_ne!(
+                digest_of(&mutated),
+                hex,
+                "changing {} does not move the schema digest",
+                mutated[index].0
+            );
+        }
+        // Renaming a module moves it too: the name is part of the surface.
+        inputs[0].0.push_str(".renamed");
+        assert_ne!(
+            digest_of(&inputs),
+            hex,
+            "renaming a module does not move the schema digest"
+        );
+    }
+
+    /// The generator's digest fold, restated so the test measures the value
+    /// rather than calling the function it is checking.
+    fn digest_of(modules: &[(String, String)]) -> String {
+        use automonique_protocol::digest::Sha256;
+
+        let mut hasher = Sha256::new();
+        for (file_name, contents) in modules {
+            hasher.update(file_name.as_bytes());
+            hasher.update(b"\n");
+            hasher.update(contents.len().to_string().as_bytes());
+            hasher.update(b"\n");
+            hasher.update(contents.as_bytes());
+        }
+        hasher.finish().to_hex()
     }
 
     /// A generated file must say how to rewrite itself, and the command it
@@ -1327,7 +1576,7 @@ mod maintained_surface {
             .current_dir(package_root())
             .output();
         let Ok(output) = output else {
-            eprintln!("GAP: tsc is unavailable; the generated surface is untypechecked");
+            record_js_gap("tsc is unavailable; the generated surface is untypechecked");
             return;
         };
         let combined = format!(
@@ -2739,8 +2988,8 @@ mod command_surface {
     #[test]
     fn the_generated_typescript_agrees_with_rust_byte_for_byte() {
         let Some(runtime) = javascript_runtime() else {
-            eprintln!(
-                "GAP: no JavaScript runtime; the command surface is unmeasured across languages"
+            record_js_gap(
+                "no JavaScript runtime; the command surface is unmeasured across languages",
             );
             return;
         };
@@ -4646,7 +4895,7 @@ mod runs_surface {
             .current_dir(package_root())
             .output();
         let Ok(output) = output else {
-            eprintln!("GAP: tsc is unavailable; the runs surface is untypechecked");
+            record_js_gap("tsc is unavailable; the runs surface is untypechecked");
             return;
         };
         let combined = format!(
@@ -4677,10 +4926,7 @@ mod runs_surface {
     #[test]
     fn the_generated_typescript_agrees_with_rust_byte_for_byte() {
         let Some(runtime) = javascript_runtime() else {
-            eprintln!(
-                "GAP: no JavaScript runtime; the runs surface is unmeasured across \
-                       languages"
-            );
+            record_js_gap("no JavaScript runtime; the runs surface is unmeasured across languages");
             return;
         };
         let directory =
@@ -6947,7 +7193,7 @@ mod automation_surface {
             .current_dir(package_root())
             .output();
         let Ok(output) = output else {
-            eprintln!("GAP: tsc is unavailable; the automation surface is untypechecked");
+            record_js_gap("tsc is unavailable; the automation surface is untypechecked");
             return;
         };
         let combined = format!(
@@ -6978,8 +7224,8 @@ mod automation_surface {
     #[test]
     fn the_generated_typescript_agrees_with_rust_byte_for_byte() {
         let Some(runtime) = javascript_runtime() else {
-            eprintln!(
-                "GAP: no JavaScript runtime; the automation surface is unmeasured across languages"
+            record_js_gap(
+                "no JavaScript runtime; the automation surface is unmeasured across languages",
             );
             return;
         };
@@ -9272,7 +9518,7 @@ mod approval_surface {
             .current_dir(package_root())
             .output();
         let Ok(output) = output else {
-            eprintln!("GAP: tsc is unavailable; the approval surface is untypechecked");
+            record_js_gap("tsc is unavailable; the approval surface is untypechecked");
             return;
         };
         let combined = format!(
@@ -9303,8 +9549,8 @@ mod approval_surface {
     #[test]
     fn the_generated_typescript_agrees_with_rust_byte_for_byte() {
         let Some(runtime) = javascript_runtime() else {
-            eprintln!(
-                "GAP: no JavaScript runtime; the approval surface is unmeasured across languages"
+            record_js_gap(
+                "no JavaScript runtime; the approval surface is unmeasured across languages",
             );
             return;
         };
@@ -12772,7 +13018,7 @@ mod batch_surface {
             .current_dir(package_root())
             .output();
         let Ok(output) = output else {
-            eprintln!("GAP: tsc is unavailable; the batch surface is untypechecked");
+            record_js_gap("tsc is unavailable; the batch surface is untypechecked");
             return;
         };
         let combined = format!(
@@ -12803,8 +13049,8 @@ mod batch_surface {
     #[test]
     fn the_generated_typescript_agrees_with_rust_byte_for_byte() {
         let Some(runtime) = javascript_runtime() else {
-            eprintln!(
-                "GAP: no JavaScript runtime; the batch surface is unmeasured across languages"
+            record_js_gap(
+                "no JavaScript runtime; the batch surface is unmeasured across languages",
             );
             return;
         };

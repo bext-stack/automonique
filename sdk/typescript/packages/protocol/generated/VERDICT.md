@@ -21,8 +21,21 @@ the one-source-of-truth rule.
 | Unknown-event tolerance | pass | An unseen event kind decodes to an explicit unknown representation that preserves both kind and payload, neither throwing nor dropping, and remains bounded. |
 | Reproducibility | pass | Regeneration is byte-identical across repeated runs and across reordered input. No date, timestamp, host path or allocation-dependent ordering reaches the output. |
 
-Runtime behaviour measured under **bun 1.3.13**; type-level behaviour under the
-**TypeScript compiler resolved offline by `npx --offline tsc`**.
+Runtime behaviour measured under **bun 1.3.13**; type-level behaviour under
+**TypeScript 6.0.3**.
+
+Both are pinned rather than described. bun is pinned in
+`.github/workflows/rust.yml`; TypeScript is an exact devDependency of this
+package with a checked-in `bun.lock`, and `tests/codegen.rs`
+(`the_typescript_compiler_is_the_pinned_one`) reads the pin out of
+`package.json` and refuses any other compiler. This paragraph previously named
+no version, which meant the measurement below could not be reproduced: the
+negative cases assert exact compiler diagnostic text, and `npx --offline tsc`
+resolved whatever the ambient environment supplied — on the machine where this
+was first recorded, a `node_modules` in the developer's home directory, outside
+the repository entirely. A compiler major version can reword any of those
+sentences, so an unpinned compiler could have flipped a conformance result with
+no commit touching this tree.
 
 ## Constraints `R8B` must plan for
 
@@ -38,15 +51,20 @@ Runtime behaviour measured under **bun 1.3.13**; type-level behaviour under the
    missing variant into a compile error. If hand-written SDK code switches over
    a generated union without it, the property is lost at that call site rather
    than in the generator.
-4. **No content digest is embedded.** `automonique-protocol` has no
-   dependencies and therefore no hash implementation, so the generated file
-   carries no schema digest. `typescript-sdk.md` requires a released SDK to
-   record its exact schema digest, so `R8B` needs a hashing step *outside* this
-   crate — which is also where the `R1-10` digest comparison gets its input.
-5. **The zero-diff rule needs a CI step.** Reproducibility is asserted by the
-   spike's own tests, but nothing yet regenerates into a temporary tree during
-   CI and diffs. `R8B` should add that; the plan workflow's existing
-   derived-files check is the natural place.
+4. **~~No content digest is embedded.~~ Resolved.** The original premise —
+   that a dependency-free crate has no hash implementation — stopped being true
+   when `src/digest.rs` grew a hand-rolled SHA-256. `generated/index.ts` now
+   carries `SCHEMA_DIGEST_ALGORITHM` and `SCHEMA_DIGEST`, split the way
+   `release::ArtifactDigest` takes them, so a released SDK can declare the
+   surface it was generated against without a second computation and the
+   `R1-10` digest comparison has its input. The digest is computed over the
+   emitted maintained modules, barrel excluded, and
+   `the_barrel_digest_is_the_digest_of_the_generated_surface` checks the
+   committed value against a recomputation on every run.
+5. **~~The zero-diff rule needs a CI step.~~ Resolved.** `rust.yml` regenerates
+   with `AUTOMONIQUE_PROTOCOL_REGENERATE=1` and runs `git diff --exit-code`
+   over `generated/`, so a commit that changes the schema without regenerating
+   fails there rather than shipping a surface no schema describes.
 6. **The brand is compile-time only; it erases in the value.** This is the
    partial in the table above, and it is the one constraint that comes from a
    property the spike did not fully preserve. What it costs `R8B`: nothing that

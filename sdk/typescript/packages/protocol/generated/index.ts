@@ -17,3 +17,8 @@ export * from "./batch.ts";
 export * from "./doctor.ts";
 export * from "./runs.ts";
 export * from "./runtime.ts";
+
+// The digest of the surface re-exported above. It identifies the schema
+// these files were generated from; it is not a checksum of this file.
+export const SCHEMA_DIGEST_ALGORITHM = "sha256";
+export const SCHEMA_DIGEST = "1e0ef1a491220e70a4396a50ff28296d8a49483426a8abb50446676c7a5865c3";

@@ -14,6 +14,12 @@ permissions:
 jobs:
   workspace:
     runs-on: ubuntu-latest
+    env:
+      # On a runner a missing JavaScript toolchain is a broken job definition,
+      # not a fact about the environment. Without this the protocol suite's
+      # cross-language and codegen checks print a `GAP:` note and pass, which
+      # is the same colour in a log as measuring them.
+      AUTOMONIQUE_REQUIRE_JS_TOOLCHAIN: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -22,6 +28,34 @@ jobs:
           rustup set profile minimal
           rustup toolchain install 1.93.1 --component rustfmt,clippy
           rustup default 1.93.1
+
+      # The protocol suite shells out to a JavaScript runtime and to
+      # `npx --offline tsc`, so both are pinned rather than inherited. bun is
+      # the runtime `generated/VERDICT.md` recorded its measurements under; the
+      # compiler is an exact devDependency of each SDK package, because the
+      # negative cases assert exact TypeScript diagnostic text and a compiler
+      # major version can reword any of those sentences.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+
+      # node is here for `npx`, which is what resolves the pinned compiler out
+      # of the package's own node_modules.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+
+      - name: Install the pinned JavaScript toolchain
+        working-directory: sdk/typescript/packages
+        run: |
+          for package in protocol lab; do
+            (cd "$package" && bun install --frozen-lockfile)
+          done
+
+      - name: The compiler is the pin, not whatever the runner supplies
+        working-directory: sdk/typescript/packages/protocol
+        run: |
+          npx --offline tsc --version
 
       - name: Locked workspace checks
         working-directory: rust
@@ -39,3 +73,36 @@ jobs:
           cp Cargo.lock /tmp/automonique-Cargo.lock
           cargo generate-lockfile --offline
           cmp /tmp/automonique-Cargo.lock Cargo.lock
+
+      - name: TypeScript surface
+        working-directory: sdk/typescript/packages
+        run: |
+          (cd protocol && npm run typecheck)
+          (cd lab && npm run typecheck)
+          (cd lab && bun test ./test)
+
+      - name: Build the binary the interop test drives
+        working-directory: rust
+        run: cargo build --offline --locked -p automonique-lab --bins
+
+      # The one check that runs both implementations against each other rather
+      # than each against a fixture. It is double-gated in the test file, so
+      # nothing outside this step and a deliberate local run ever executes it.
+      - name: Rust and TypeScript interoperate over the real transport
+        working-directory: sdk/typescript/packages/lab
+        env:
+          AUTOMONIQUE_RUN_RUST_INTEROP: "1"
+          AUTOMONIQUE_LAB_BIN: ${{ github.workspace }}/rust/target/debug/automonique-lab
+        run: bun test ./test/rust-interop.test.ts
+
+      # `generated/VERDICT.md` constraint 5. Reproducibility is asserted by the
+      # crate's own tests; that the checked-in tree was regenerated is a claim
+      # no test inside the tree can make, because a test cannot see the commit.
+      - name: Regenerate the TypeScript surface
+        working-directory: rust
+        env:
+          AUTOMONIQUE_PROTOCOL_REGENERATE: "1"
+        run: cargo test --offline --locked -p automonique-protocol --test codegen
+
+      - name: Regeneration changed nothing
+        run: git diff --exit-code -- sdk/typescript/packages/protocol/generated/

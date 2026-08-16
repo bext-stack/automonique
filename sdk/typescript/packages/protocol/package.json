@@ -10,5 +10,8 @@
   "scripts": {
     "conformance": "bun run ./conformance/run.ts",
     "typecheck": "npx --offline tsc -p ./tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3"
   }
 }

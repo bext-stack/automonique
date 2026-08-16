@@ -300,6 +300,7 @@ use crate::automation_api::{
 use crate::batch_api::{BatchApiError, BatchRefusal};
 use crate::batch_runner::{BatchError, BatchState, ConcurrencyKind, MemberProgress};
 use crate::codec::CodecError;
+use crate::digest::Sha256;
 use crate::event::Authority;
 use crate::primitives::ValueError;
 use crate::runs_api::{
@@ -5613,12 +5614,45 @@ fn emit_banner(out: &mut String, source: &str, doc: &str) {
     out.push_str("// ergonomics; it may not redefine anything in this file.\n");
 }
 
+/// The digest identifying the schema this generated surface was emitted from.
+///
+/// Computed over the emitted maintained modules rather than over the
+/// [`GeneratedModule`] description structs, because the emitter is a total
+/// function of the description: every construct the schema declares that
+/// reaches the surface reaches this digest. A hand-written canonical encoder
+/// of the description types would be a second source of truth, and would go
+/// quietly stale the first time a descriptor gained a field nobody remembered
+/// to encode there — a digest that stops moving is worse than no digest,
+/// because a stale one is believed.
+///
+/// The barrel is excluded from the input for the obvious reason: it carries
+/// the digest.
+///
+/// Each module contributes `name \n byte length \n contents`. The length
+/// prefix is what makes the encoding injective — without it a file name
+/// ending in a newline could reproduce another surface's byte stream.
+fn schema_digest(modules: &[(String, String)]) -> String {
+    let mut hasher = Sha256::new();
+    for (file_name, contents) in modules {
+        hasher.update(file_name.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(contents.len().to_string().as_bytes());
+        hasher.update(b"\n");
+        hasher.update(contents.as_bytes());
+    }
+    hasher.finish().to_hex()
+}
+
 /// Emit the barrel that makes the maintained surface one import.
 ///
 /// `spike.ts` is deliberately absent. It is evidence for a decision rather
 /// than shipped surface, and its own `ValidationError` would collide with the
 /// runtime module's.
-fn emit_barrel(modules: &[GeneratedModule]) -> String {
+///
+/// The barrel also carries the schema digest, split into algorithm and hex the
+/// way [`crate::release::ArtifactDigest`] takes them, so a released SDK can
+/// declare the surface it was generated against without a second computation.
+fn emit_barrel(modules: &[GeneratedModule], digest: &str) -> String {
     let mut out = String::new();
     emit_banner(
         &mut out,
@@ -5634,6 +5668,15 @@ fn emit_barrel(modules: &[GeneratedModule]) -> String {
     for name in names {
         let _ = writeln!(out, "export * from \"./{name}\";");
     }
+    out.push('\n');
+    out.push_str("// The digest of the surface re-exported above. It identifies the schema\n");
+    out.push_str("// these files were generated from; it is not a checksum of this file.\n");
+    let _ = writeln!(
+        out,
+        "export const SCHEMA_DIGEST_ALGORITHM = \"{algorithm}\";",
+        algorithm = crate::digest::ALGORITHM
+    );
+    let _ = writeln!(out, "export const SCHEMA_DIGEST = \"{digest}\";");
     out
 }
 
@@ -6600,11 +6643,35 @@ pub fn emit_module(module: &GeneratedModule) -> String {
 #[must_use]
 pub fn generated_files() -> Vec<(String, String)> {
     let modules = maintained_modules();
-    let mut files: Vec<(String, String)> = modules
+    let mut files = maintained_files();
+    let digest = schema_digest(&files);
+    files.push((
+        module_file_name(BARREL_MODULE),
+        emit_barrel(&modules, &digest),
+    ));
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
+/// The maintained modules as `(file name, contents)`, barrel excluded.
+///
+/// This is the digest's input, so it is one function rather than two spellings
+/// of the same fold.
+fn maintained_files() -> Vec<(String, String)> {
+    let mut files: Vec<(String, String)> = maintained_modules()
         .iter()
         .map(|module| (module.file_name.clone(), emit_module(module)))
         .collect();
-    files.push((module_file_name(BARREL_MODULE), emit_barrel(&modules)));
     files.sort_by(|left, right| left.0.cmp(&right.0));
     files
+}
+
+/// The schema digest the barrel carries, as `(algorithm, hex)`.
+///
+/// Exposed so a consumer — a release manifest, a conformance test — can ask the
+/// generator for the digest rather than parsing TypeScript out of the
+/// checked-in barrel.
+#[must_use]
+pub fn generated_schema_digest() -> (&'static str, String) {
+    (crate::digest::ALGORITHM, schema_digest(&maintained_files()))
 }

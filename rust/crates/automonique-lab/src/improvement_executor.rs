@@ -708,6 +708,14 @@ mod tests {
             "the lockfile-reproducibility probe; it rewrites Cargo.lock, so it needs the scratch copy CI takes outside the tree and must not run against a candidate worktree",
         ),
         (
+            "cargo build --offline --locked -p automonique-lab --bins",
+            "produces the binary the Rust-to-TypeScript interop step drives; a prerequisite for the step after it, and wholly subsumed by the `cargo check --workspace` gate above",
+        ),
+        (
+            "cargo test --offline --locked -p automonique-protocol --test codegen",
+            "the codegen regeneration half of the zero-diff rule; the step sets AUTOMONIQUE_PROTOCOL_REGENERATE, so it rewrites sdk/typescript/packages/protocol/generated/ and must not run against a candidate worktree — the same reason the lockfile probe is here. The candidate still runs this suite in its ordinary read-only form under the `cargo test --workspace` gate",
+        ),
+        (
             "python3 -m unittest -v tools.test_check_licenses",
             "negative controls for the licence checker itself, not a property of the candidate's tree",
         ),

@@ -1,0 +1,3 @@
+# Installed by `bun install --frozen-lockfile` from the checked-in bun.lock.
+# The lockfile is the artifact under review; the tree it expands to is not.
+node_modules/

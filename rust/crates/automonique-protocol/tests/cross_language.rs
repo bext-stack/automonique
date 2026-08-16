@@ -362,13 +362,74 @@ fn normalize(raw: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A JavaScript runtime that can execute the `.ts` conformance runner.
+///
+/// The capability rather than the name: `run.ts` is TypeScript, so a `node`
+/// too old to strip types answers `--version` happily and then fails with
+/// `ERR_UNKNOWN_FILE_EXTENSION`, which names the wrong problem. bun is probed
+/// first because it is the runtime the conformance verdict was measured under.
 fn javascript_runtime() -> Option<&'static str> {
-    ["bun", "node"].into_iter().find(|candidate| {
-        Command::new(candidate)
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success())
-    })
+    ["bun", "node"]
+        .into_iter()
+        .find(|candidate| runs_typescript(candidate))
+}
+
+/// Whether `candidate` can execute a TypeScript file.
+fn runs_typescript(candidate: &str) -> bool {
+    static PROBE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    // Unique per call: these tests run as threads of one process, so a fixed
+    // name would let one probe delete the file another is about to run.
+    let probe = std::env::temp_dir().join(format!(
+        "automonique-xlang-runtime-probe-{}-{}.ts",
+        std::process::id(),
+        PROBE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    if std::fs::write(&probe, "const ok: string = \"ok\";\nconsole.log(ok);\n").is_err() {
+        return false;
+    }
+    let ran = Command::new(candidate)
+        .arg(&probe)
+        .output()
+        .is_ok_and(|output| output.status.success());
+    let _ = std::fs::remove_file(&probe);
+    ran
+}
+
+/// Set to demand the JavaScript toolchain rather than tolerate its absence.
+///
+/// CI sets it, because on a runner a missing toolchain is a broken job
+/// definition, not a fact about the environment. Locally it is unset, so a
+/// contributor without bun installed still gets a green run.
+///
+/// A second copy of the same three lines lives in `codegen.rs`, because each
+/// file in `tests/` is its own binary; `javascript_runtime` above is duplicated
+/// for the same reason. Both must move together.
+const REQUIRE_JS_TOOLCHAIN_ENV: &str = "AUTOMONIQUE_REQUIRE_JS_TOOLCHAIN";
+
+fn js_toolchain_required() -> bool {
+    std::env::var(REQUIRE_JS_TOOLCHAIN_ENV).is_ok_and(|value| !value.is_empty() && value != "0")
+}
+
+/// Record a claim that needed the JavaScript toolchain to measure.
+///
+/// Under [`REQUIRE_JS_TOOLCHAIN_ENV`] a missing runtime is a failure rather
+/// than a note: on a runner that never installed bun, this suite would
+/// otherwise write a `"measured":false` evidence file and pass, which is a
+/// green cross-language conformance result for a comparison that never
+/// happened.
+///
+/// Unset, it prints the gap as a `::warning::` annotation. Cargo captures test
+/// output without `--nocapture`, so the annotation is belt and braces; the env
+/// var is what makes CI honest.
+#[track_caller]
+fn record_js_gap(note: &str) {
+    assert!(
+        !js_toolchain_required(),
+        "GAP: {note}\n{REQUIRE_JS_TOOLCHAIN_ENV} is set, so an unmeasured claim is a \
+         failure: install the JavaScript toolchain or stop asking CI to prove this."
+    );
+    eprintln!("::warning::GAP: {note}");
 }
 
 /// A security-sensitive enum: an undefined value is refused, never defaulted.
@@ -819,11 +880,11 @@ fn both_directions_agree_across_languages() {
             "claim is unmeasured rather than passing\"}"
         );
         std::fs::write(&results_path, unmeasured).expect("write gap record");
-        eprintln!(
-            "GAP: no JavaScript runtime; cross-language conformance is unmeasured. \
+        record_js_gap(&format!(
+            "no JavaScript runtime; cross-language conformance is unmeasured. \
              Evidence written to {}",
             results_path.display()
-        );
+        ));
         return;
     };
 

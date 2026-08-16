@@ -10,5 +10,8 @@
   "scripts": {
     "test": "bun test ./test",
     "typecheck": "npx --offline tsc -p ./tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3"
   }
 }
