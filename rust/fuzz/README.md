@@ -57,9 +57,10 @@ cargo +nightly fuzz run <target> -- -runs=0
 
 ### Scheduled runs
 
-The intended CI shape is a weekly cron plus `workflow_dispatch` that installs
-nightly and runs each target for a bounded time, uploading `artifacts/` on
-failure:
+`.github/workflows/fuzz.yml` is the CI shape: a weekly cron plus
+`workflow_dispatch` that installs nightly and runs each target for a bounded
+time, uploading `artifacts/` on failure. It is what this section used to
+describe as intended.
 
 ```sh
 for target in $(cargo +nightly fuzz list); do
@@ -67,8 +68,15 @@ for target in $(cargo +nightly fuzz list); do
 done
 ```
 
-That workflow is not in this commit. `.github/` belongs to the CI-owning change
-in this milestone, so `fuzz.yml` lands there rather than here.
+The workflow puts each target in its own matrix job with `fail-fast: false`, so
+a finding names its decoder in the run list and the other four keep fuzzing.
+The corpus replay above runs on every pull request that touches this directory
+or one of the three crates the targets enter.
+
+Note that `rust/rust-toolchain.toml` pins stable for everything under `rust/`,
+this directory included. That is why every command here says `+nightly`
+explicitly: without it, cargo resolves the pinned stable toolchain and
+`cargo fuzz` refuses.
 
 ## Corpora
 

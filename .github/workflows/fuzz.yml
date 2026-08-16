@@ -1,0 +1,129 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+name: fuzz
+
+# `rust/fuzz/README.md` describes this shape and says the workflow belongs in
+# `.github/` rather than beside the crate. This is that workflow.
+#
+# The scheduled run is the one that finds things: coverage-guided fuzzing pays
+# off over minutes per target, not over the seconds a pull request can spare.
+# The pull-request job below replays the checked-in corpus instead, which is a
+# different and cheaper claim — that every seed still decodes the way it did
+# when it was added.
+on:
+  schedule:
+    # Sundays, 04:23 UTC. Off the hour because a scheduled job skipped under
+    # runner load is a gate that silently stops running.
+    - cron: "23 4 * * 0"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - rust/fuzz/**
+      # The crates the five targets enter. A decoder change with no fuzz-
+      # directory change is exactly the case the corpus replay is for.
+      - rust/crates/automonique-protocol/**
+      - rust/crates/automonique-slack-connector/**
+      - rust/crates/automonique-transports/**
+      - .github/workflows/fuzz.yml
+
+permissions:
+  contents: read
+
+jobs:
+  # Bounded coverage-guided fuzzing, one job per target so a finding names its
+  # decoder in the run list rather than in a log somewhere.
+  campaign:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      # One target crashing is a reason to keep fuzzing the other four, not to
+      # cancel them.
+      fail-fast: false
+      matrix:
+        target:
+          - automonique_fuzz_parse_canonical
+          - automonique_fuzz_decode_frame
+          - automonique_fuzz_envelope_decode
+          - automonique_fuzz_telegram_updates
+          - automonique_fuzz_slack_decode
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rust/fuzz` is its own workspace and needs nightly plus a sanitizer-
+      # instrumented build. `rust/rust-toolchain.toml` pins the stable path and
+      # applies to this directory too, so every invocation says `+nightly`
+      # explicitly rather than relying on a default.
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal
+
+      - uses: taiki-e/install-action@v2.86.1
+        with:
+          tool: cargo-fuzz@0.13.2
+
+      # Note that a campaign writes every input it finds interesting back into
+      # `corpus/<target>/`, so this step leaves the runner's checkout dirty by
+      # design. Nothing commits it: the checked-in corpus is derived from the
+      # protocol crate's golden fixtures by `rust/fuzz/seed_corpus.py`, and
+      # growing it is a deliberate act with that script, not a side effect of a
+      # cron.
+      #
+      # `--target` is not optional here, and the reason is easy to lose. The
+      # published cargo-fuzz binaries for Linux are musl builds, and cargo-fuzz
+      # defaults its target to the triple it was itself compiled for — so
+      # without this it would try to build the targets for musl, against a std
+      # the toolchain has not installed, and fail in the dependency graph with
+      # nothing pointing at the cause. Read from rustc rather than written out,
+      # so this keeps working on a runner of another architecture.
+      - name: Fuzz ${{ matrix.target }}
+        working-directory: rust/fuzz
+        run: |
+          host="$(rustc +nightly -vV | awk '/^host:/{print $2}')"
+          cargo +nightly fuzz run ${{ matrix.target }} --target "$host" \
+            -- -max_total_time=300 -max_len=8192
+
+      # `artifacts/` is gitignored, so it exists only when libFuzzer wrote a
+      # crashing input there. Without this the input that reproduces the finding
+      # dies with the runner.
+      - name: Keep the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: rust/fuzz/artifacts/
+          if-no-files-found: ignore
+
+  # Cheap enough for every pull request that touches a decoder: no mutation,
+  # just every checked-in seed through the target once.
+  corpus-replay:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal
+
+      - uses: taiki-e/install-action@v2.86.1
+        with:
+          tool: cargo-fuzz@0.13.2
+
+      # The target list comes from cargo-fuzz rather than from this file, so a
+      # sixth target starts being replayed the moment it is added. A list
+      # duplicated here would be a gate that quietly stops covering new work.
+      - name: Replay every corpus
+        working-directory: rust/fuzz
+        run: |
+          host="$(rustc +nightly -vV | awk '/^host:/{print $2}')"
+          for target in $(cargo +nightly fuzz list); do
+            echo "::group::$target"
+            cargo +nightly fuzz run "$target" --target "$host" -- -runs=0
+            echo "::endgroup::"
+          done
+
+      - name: Keep the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-corpus-replay
+          path: rust/fuzz/artifacts/
+          if-no-files-found: ignore
