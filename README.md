@@ -62,8 +62,8 @@ enables an external surface updates this section in the same pull request; see
 docs/product-plan/       product goals, requirements, architecture, migration
 rust/crates/             Rust product crates and tests
 sdk/                     Apache-2.0 client SDKs
-plan/                    optional roadmap and historical evidence
-tools/                   development and optional historical harness tools
+plan/                    archived executable-plan experiment
+tools/                   development and diagnostic tools
 
 AGENTS.md                direct development and safety policy
 GOVERNANCE.md            authority boundaries
@@ -73,18 +73,10 @@ PROVENANCE.md            clean-room provenance
 
 ## Start developing
 
-1. Read [`AGENTS.md`](AGENTS.md) and the relevant documents under
-   [`docs/product-plan/`](docs/product-plan/).
-2. Inspect the current implementation and tests for the area being changed.
-3. Make a coherent change directly; use parallel agents when their write paths
-   can be kept disjoint.
-4. Run the affected tests, formatting, linting, development scrub, and source
-   licence check.
-5. Commit normally and non-force-push when requested.
-
-No work claim, packet, lease, ready ID, per-item evidence file, or harness
-completion transaction is required. The former workflow remains documented in
-[`plan/README.md`](plan/README.md) for historical context and optional use.
+Read [`AGENTS.md`](AGENTS.md), inspect the relevant requirement, code, and
+tests, then make the requested change directly. Run checks that fit the change;
+commit normally and non-force-push when requested. The old material under
+`plan/` is historical and is not part of this workflow.
 
 Useful checks include:
 

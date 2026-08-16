@@ -1,5 +1,9 @@
 # Implementation plans (2026-08-15)
 
+These are point-in-time implementation notes for the linked issues, not a
+repository workflow or standing agent instructions. Re-check them against the
+current code before using them.
+
 Per-milestone implementation plans for the improvement program in
 [`../roadmap.md`](../roadmap.md), each grounded in the code at `c2f8b16` by a
 dedicated architect pass. Every work item is an existing GitHub issue

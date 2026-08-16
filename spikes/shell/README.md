@@ -1,10 +1,11 @@
 <!-- SPDX-License-Identifier: Elastic-2.0 -->
 
-# Shell decision fixture (`R0-11`)
+# Shell decision fixture
 
-`plan/contracts/R0-11.md` asks for a measurement of how interactive shell
-access and file transfer are actually used, and then a per-class decision:
-an accepted isolated compatibility boundary, or an explicit retirement.
+This historical spike explored how interactive shell access and file transfer
+could be measured before choosing an isolated compatibility boundary or
+retirement. The old plan called it `R0-11`; that contract is not a current
+development prerequisite.
 
 **The measurement does not exist and is not simulated here.** Nothing in this
 repository can reach a running instance of the predecessor system, and
@@ -19,9 +20,8 @@ three things that *can* be delivered without a host:
    recorded observations, with no host access, deterministically;
 3. **a decision memo** — `plan/decisions/R0-11-shell-boundary.md` and its
    machine-readable twin, which states the options per class and the evidence
-   each option would need. Every class is recorded `unresolved`. The contract
-   itself says the boundary-or-retirement choice needs an explicit owner
-   choice, and no measurement exists to inform one.
+   each option would need. Every class is recorded `unresolved`, and no
+   measurement exists to inform a product choice.
 
 `observations/2026-08-11-synthetic-example.json` is a worked example over
 **synthetic** data. It is labelled synthetic in three independent ways — corpus

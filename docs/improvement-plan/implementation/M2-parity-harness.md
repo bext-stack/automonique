@@ -569,11 +569,11 @@ derives the closed set as `{closes_gate where status == "done"}`, and
 text says so itself (`gates.md:225-226`): "no edit to this file can close it
 alone."
 
-`tools/oracle/` is a protected policy boundary: 74 adversarial tests green,
-`check_boundary.py` green, and `GOVERNANCE.md` § Protected policy changes
-reserves changes to `release.py`/`scan.py`/`vocabulary.py`/`fields.json` to an
-external exact-revision decision. Nothing in CI or `plan/check.py` runs it today
-(#15 fixes that).
+`tools/oracle/` is a security-sensitive boundary: 74 adversarial tests and
+`check_boundary.py` were green at the revision this plan audited. Changes to
+`release.py`, `scan.py`, `vocabulary.py`, or `fields.json` need risk-appropriate
+review and the boundary attack suite. Nothing in CI or `plan/check.py` ran it at
+that revision (#15 addresses that).
 
 **Owner-decision options.** **Path A (staff it):** name reviewers, run the
 configured review against the exact boundary candidate revision, complete

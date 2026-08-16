@@ -2,7 +2,8 @@
 
 # Parity-oracle boundary
 
-`BOOT-004`, closing condition for [`GATE-ORACLE`](../../plan/gates.md#gate-oracle).
+This tool supports the clean-room parity boundary. The old plan called the work
+`BOOT-004`/`GATE-ORACLE`; those labels are historical.
 
 [`PROVENANCE.md`](../../PROVENANCE.md) permits a parity oracle to run privately
 against the prior implementation provided it "must expose only bounded behavior
@@ -29,17 +30,15 @@ still runs in the contaminated process. Nothing downstream of it has ever held a
 byte the custody side produced.
 
 Changing `release.py`, `scan.py`, `vocabulary.py` or `fields.json` changes a
-security boundary. [`GOVERNANCE.md`](../../GOVERNANCE.md) § Protected policy
-changes reserves that class of change to an external exact-revision decision; a
-candidate cannot widen this vocabulary and use the widened one to certify
-itself.
+security boundary. Review the change at that risk level and run the boundary's
+attack suite; do not treat a newly widened vocabulary as proof of its own
+safety.
 
 ## The mechanism
 
-The obvious design filters the oracle's output. That design fails the way
-[`plan/contracts/BOOT-004.md`](../../plan/contracts/BOOT-004.md) predicts: it
-protects the paths somebody enumerated, and a traceback, a diff quote or a debug
-print arrives on a path nobody enumerated.
+The obvious design filters the oracle's output. That protects only the paths
+somebody enumerated, while a traceback, diff quote, or debug print can arrive on
+another path.
 
 This design removes the paths instead.
 
@@ -95,9 +94,7 @@ python3 tools/oracle/check_boundary.py --write                # regenerate vocab
 ```
 
 `check_boundary.py` is standalone and importable, with its own `main()`
-returning an exit code. Wiring it into `plan/check.py` is a follow-up for the
-integrator; it is not wired there yet, because several work items share that
-file.
+returning an exit code. It is not part of the archived plan checker.
 
 ## What this does not contain
 
@@ -125,9 +122,6 @@ turn uses the ordinary machinery.
 
 ## Out of scope
 
-Capturing any fixture. That is `R0-02` and `R0-07`, and this boundary is one of
-several conditions they wait on — see
-[`plan/gates.md`](../../plan/gates.md#gate-oracle) for what else they need.
-Comparison fidelity is a separate objective from containment: this directory
-decides what may be said about a comparison, never whether the comparison was
-right.
+Capturing fixtures is a separate, explicitly authorized custody operation.
+Comparison fidelity is also separate from containment: this directory decides
+what may be said about a comparison, never whether the comparison was right.

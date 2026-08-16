@@ -1,40 +1,22 @@
 # Automonique product plan
 
-This directory is the authoritative product specification available to
-Automonique's autonomous development control plane. The public repository does
-not fetch or mount the private planning archive at runtime.
+This directory describes the product Automonique is trying to build. It is a
+design reference, not a development workflow or a source of repository
+authority.
 
 ## Decision precedence
 
-When documents disagree, use this order and stop on an unresolved conflict:
+When documents disagree, use this order:
 
 | Layer | Authority | Where |
 |---|---|---|
-| 1 | licensing, governance, security, provenance, agent policy | `LICENSE-POLICY.md`, `GOVERNANCE.md`, `SECURITY.md`, `PROVENANCE.md`, `AGENTS.md` |
+| 1 | licensing, security, provenance, development safety | `LICENSE-POLICY.md`, `SECURITY.md`, `PROVENANCE.md`, `AGENTS.md` |
 | 2 | product intent and target architecture | this file, `architecture.md` |
 | 3 | product requirements and the capability ledger | `requirements/` |
 | 4 | historical context | `reference/` |
 
-No requirement can grant itself authority that a higher layer withholds. A
-lower layer may refine a higher one; it may never widen it.
-
-**Amended 2026-08-15.** `plan/gates.md` and the executable plan
-(`plan/work-graph.toml`, `plan/contracts/`) previously occupied blocking layers
-2 and 3. They no longer do, and they had already stopped doing so elsewhere:
-`AGENTS.md` § Automonique development policy and `GOVERNANCE.md` § Review both
-record that the harness under `plan/` is retained as planning history and is
-not a prerequisite for development or a governance boundary. This table was the
-last document still asserting the old order, which made it the one a reader
-would have obeyed. Requirements move up accordingly.
-
-`plan/gates.md` keeps one real and non-blocking role, the one its own header
-claims: it holds the **closing evidence a capability claim needs**. A gate no
-longer decides whether work may start, be committed, or be pushed; it decides
-whether a particular claim — "the scrub is complete", "identity separation is
-achieved" — is supported. Read it that way, and never as an admission control.
-`plan/check.py` may still interpret gates as blocking for someone who
-explicitly opts into the archived graph workflow; that is a tool mode, not this
-repository's decision order.
+No product requirement can grant authority withheld by the active policy.
+`plan/` is historical and has no place in this precedence order.
 
 `reference/` material describes the prior product and migration. It is context,
 never a source of new product requirements, and cannot override any higher
@@ -75,9 +57,8 @@ Historical GPL reference documents are marked superseded.
 `reference/corpus-index.md` is the former planning-tree index and carries the
 canonical-surface and licence notes.
 
-Any new private identifier entering this tree is a defect. `plan/gates.md`
-records the pre-publication scrub gate that must pass before the repository
-becomes public.
+Any new private identifier entering this tree is a defect. The public scanner
+helps detect regressions but cannot stand in for private-data review.
 
 Documents tied to the former implementation were not copied as source. The
 migration and parity documents now live under
@@ -114,24 +95,11 @@ reconcilable.
 - treating a green self-test as independent verification;
 - adding product breadth before the durable autonomy and recovery spine works.
 
-## How work starts
+## Working with the plan
 
-A ready work item receives an immutable base, leased paths, licence class,
-budget, verification contract and stop conditions. Completing an item may
-unlock its direct dependants after evidence is recorded; it never makes the
-whole graph implicitly ready.
-
-Selection happens in [`plan/`](../../plan/README.md), not here:
-
-- [`plan/ready.md`](../../plan/ready.md) — what is selectable right now;
-- [`plan/gates.md`](../../plan/gates.md) — what must be true first;
-- [`plan/contracts/`](../../plan/contracts/) — what a specific item means.
-
-The first executable item is
-[`BOOT-001`](../../plan/contracts/BOOT-001.md) — make the executable plan
-self-verifying. Everything else is blocked behind it, including every `R0`
-discovery ticket, because until the graph is checked in CI a claimed
-dependency set cannot be reviewed.
+Start with the requested outcome, then read the relevant requirement and the
+code that implements it. The roadmap and reference material can supply context;
+the historical graph, contracts, and gates under `plan/` are not prerequisites.
 
 ## Safety property specifications
 
@@ -170,8 +138,8 @@ each property is still waiting for.
 
 | If you are… | Start at |
 |---|---|
-| implementing | [`plan/ready.md`](../../plan/ready.md), then the contract |
-| reviewing an implementation | the contract, then `requirements/` |
+| implementing | the relevant file in `requirements/`, then current code and tests |
+| reviewing an implementation | the requirement and the exact change |
 | deciding whether a thing is in scope | Non-goals above, then `requirements/external-capability-ledger.md` |
 | new to the project | `architecture.md`, then `requirements/goals-and-invariants.md` |
 | implementing one of the four safety properties | Safety property specifications above, then its suite |

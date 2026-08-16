@@ -45,11 +45,9 @@ Agents implementing the clean product must not receive legacy implementation
 source. A parity oracle may execute privately against synthetic inputs, but it
 must expose only bounded behavior results and must not emit source, private
 data, credentials, proprietary identifiers, or implementation text. The
-enforcement mechanism for that boundary is built and measured — `tools/oracle/`,
-under `BOOT-004` — but is not yet accepted: it is tracked as `GATE-ORACLE` in
-`plan/gates.md`, which stays open on its fourth closing condition and states
-what it blocks. That statement is the authority for the scope; this paragraph
-does not restate it.
+enforcement mechanism for that boundary is built and measured in
+`tools/oracle/`. The historical `GATE-ORACLE` label remains open because the old
+plan never recorded external acceptance; it is not a development gate.
 
 ## Repository identity
 
@@ -68,7 +66,7 @@ the candidate-identity era; it no longer determines whether ordinary work may
 start or land.
 
 **Recorded candidate-bot state.** One identity, `Automonique Candidate`,
-performed every role in `GOVERNANCE.md` § Roles, so no role was separated and
+performed all roles in the former harness, so no role was separated and
 no commit was signed. Three commits predate that rule and are recorded as pinned
 exceptions in the register rather than rewritten: the root commit and the
 commit after it carry an owner bootstrap identity, and one later commit
@@ -88,7 +86,5 @@ external actions. The root commit ID, tree digest, signer identity when used,
 policy digest and legal approval receipt belong in an external immutable
 receipt.
 
-Identity hardening is tracked as `GATE-IDENTITY` in `plan/gates.md`. It is
-advisory and blocks only a claim that identity separation has been achieved; it
-does not block implementation, review, local commits, harness trials or
-owner-configured protected integration.
+`GATE-IDENTITY` is the archived label for optional identity hardening. It does
+not block repository work.
