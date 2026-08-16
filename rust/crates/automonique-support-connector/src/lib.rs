@@ -66,7 +66,16 @@ mod request;
 mod response;
 mod token;
 
+use automonique_connector_substrate::http::TransportFailure;
+use automonique_connector_substrate::json::StrictJsonError;
 use std::error::Error;
+// The JSON string escaper is shared: every connector was carrying a
+// byte-identical copy, and an escaping rule that differs between two of them is
+// a defect nobody would notice until a captured request carried a raw control
+// byte. Re-exported rather than imported at each call site so the crate's own
+// modules keep referring to it by the name they always used.
+pub(crate) use automonique_connector_substrate::json::push_json_string;
+
 use std::fmt;
 
 pub use base::{FleetBase, FleetInstanceId, MAX_FLEET_IDENTIFIER_BYTES};
@@ -247,6 +256,27 @@ impl fmt::Display for FleetFailure {
 
 impl Error for FleetFailure {}
 
+/// A response that is not strictly valid JSON is one refusal, not a taxonomy.
+///
+/// The distinction that matters to a caller is that the response cannot be
+/// trusted; which byte offended is a detail that would only reach a log line as
+/// a fragment of a response body.
+impl From<StrictJsonError> for FleetFailure {
+    fn from(_: StrictJsonError) -> Self {
+        Self::InvalidResponse
+    }
+}
+
+impl From<TransportFailure> for FleetFailure {
+    fn from(failure: TransportFailure) -> Self {
+        match failure {
+            TransportFailure::TimedOut => Self::TimedOut,
+            TransportFailure::ResponseTooLarge => Self::ResponseTooLarge,
+            TransportFailure::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
 /// A bounded, control-free message the fleet supplied with a refusal.
 ///
 /// Remote text, so it is bounded at [`MAX_SERVER_MESSAGE_BYTES`] and stripped
@@ -337,32 +367,6 @@ pub(crate) fn is_body_text(text: &str, max_bytes: usize) -> bool {
         && !text
             .chars()
             .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
-}
-
-/// Append one JSON string literal, escaping everything RFC 8259 requires.
-///
-/// Written out rather than delegated to a serializer so the body's field order
-/// is exactly the one this crate documents; a map-backed serializer would
-/// reorder it. `DEL` is escaped as well, so no C0/C1-adjacent byte reaches a
-/// captured request verbatim.
-pub(crate) fn push_json_string(out: &mut String, value: &str) {
-    out.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            control if control < '\u{20}' || control == '\u{7f}' => {
-                out.push_str(&format!("\\u{:04x}", control as u32));
-            }
-            plain => out.push(plain),
-        }
-    }
-    out.push('"');
 }
 
 #[cfg(test)]

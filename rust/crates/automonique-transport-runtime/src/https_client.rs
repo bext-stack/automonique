@@ -25,9 +25,10 @@
 
 use std::error::Error;
 use std::fmt;
-use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use automonique_connector_substrate::http::{map_ureq_error, read_bounded_body};
+use automonique_connector_substrate::json::push_json_string;
 use automonique_transports::MAX_TELEGRAM_INPUT_BYTES;
 use ureq::tls::{RootCerts, TlsConfig};
 
@@ -159,7 +160,7 @@ impl TelegramHttpsClient {
             .with_config()
             .limit((MAX_TELEGRAM_RESPONSE_BYTES + 1) as u64)
             .reader();
-        let body = read_bounded_body(reader)?;
+        let body = read_bounded_body(reader, MAX_TELEGRAM_RESPONSE_BYTES)?;
         if cancellation.is_cancelled() {
             return Err(HttpFailure::Cancelled);
         }
@@ -1206,26 +1207,6 @@ fn push_inline_keyboard(body: &mut String, buttons: &[(InlineButtonLabel, String
     body.push_str("]]}");
 }
 
-fn push_json_string(out: &mut String, value: &str) {
-    out.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            control if control < '\u{20}' || control == '\u{7f}' => {
-                out.push_str(&format!("\\u{:04x}", control as u32));
-            }
-            plain => out.push(plain),
-        }
-    }
-    out.push('"');
-}
-
 fn is_json_content_type(value: &str) -> bool {
     let mut fields = value.split(';');
     if !fields
@@ -1263,25 +1244,6 @@ fn retry_after_millis(value: Option<&str>) -> u64 {
         .unwrap_or(1)
         .clamp(1, MAX_RETRY_AFTER_SECONDS)
         .saturating_mul(1_000)
-}
-
-fn read_bounded_body(mut reader: impl Read) -> Result<Vec<u8>, HttpFailure> {
-    let mut body = Vec::new();
-    reader
-        .read_to_end(&mut body)
-        .map_err(|error| map_ureq_error(ureq::Error::from(error)))?;
-    if body.len() > MAX_TELEGRAM_RESPONSE_BYTES {
-        return Err(HttpFailure::ResponseTooLarge);
-    }
-    Ok(body)
-}
-
-fn map_ureq_error(error: ureq::Error) -> HttpFailure {
-    match error {
-        ureq::Error::Timeout(_) => HttpFailure::TimedOut,
-        ureq::Error::BodyExceedsLimit(_) => HttpFailure::ResponseTooLarge,
-        _ => HttpFailure::Unavailable,
-    }
 }
 
 fn unix_millis() -> Result<i64, HttpFailure> {
@@ -1400,12 +1362,17 @@ mod tests {
     fn response_body_cap_accepts_boundary_and_refuses_one_over() {
         let at_limit = vec![0_u8; MAX_TELEGRAM_RESPONSE_BYTES];
         assert_eq!(
-            read_bounded_body(std::io::Cursor::new(&at_limit)).expect("at limit"),
+            read_bounded_body(std::io::Cursor::new(&at_limit), MAX_TELEGRAM_RESPONSE_BYTES)
+                .expect("at limit"),
             at_limit
         );
         let over_limit = vec![0_u8; MAX_TELEGRAM_RESPONSE_BYTES + 1];
         assert_eq!(
-            read_bounded_body(std::io::Cursor::new(over_limit)),
+            read_bounded_body(
+                std::io::Cursor::new(over_limit),
+                MAX_TELEGRAM_RESPONSE_BYTES
+            )
+            .map_err(HttpFailure::from),
             Err(HttpFailure::ResponseTooLarge)
         );
     }

@@ -3187,22 +3187,8 @@ impl ApprovalRequest {
 }
 
 fn bounded(value: &str, field: &'static str) -> Result<(), SandboxError> {
-    let error = if value.is_empty() {
-        Some(ValueError::Empty)
-    } else if value.len() > MAX_SANDBOX_FIELD_BYTES {
-        Some(ValueError::TooLong {
-            max_bytes: MAX_SANDBOX_FIELD_BYTES,
-            actual_bytes: value.len(),
-        })
-    } else if value.chars().any(char::is_control) {
-        Some(ValueError::ControlCharacter)
-    } else {
-        None
-    };
-    match error {
-        Some(error) => Err(SandboxError::Field { field, error }),
-        None => Ok(()),
-    }
+    crate::primitives::bounded_value(value, MAX_SANDBOX_FIELD_BYTES)
+        .map_err(|error| SandboxError::Field { field, error })
 }
 
 fn bounded_len(length: usize, field: &'static str) -> Result<(), SandboxError> {

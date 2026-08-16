@@ -100,6 +100,8 @@ mod socket_mode;
 mod target;
 mod token;
 
+use automonique_connector_substrate::http::TransportFailure;
+use automonique_connector_substrate::json::StrictJsonError;
 use std::error::Error;
 use std::fmt;
 
@@ -320,6 +322,27 @@ impl fmt::Display for SlackFailure {
 }
 
 impl Error for SlackFailure {}
+
+/// A response that is not strictly valid JSON is one refusal, not a taxonomy.
+///
+/// The distinction that matters to a caller is that the response cannot be
+/// trusted; which byte offended is a detail that would only reach a log line as
+/// a fragment of a response body.
+impl From<StrictJsonError> for SlackFailure {
+    fn from(_: StrictJsonError) -> Self {
+        Self::InvalidResponse
+    }
+}
+
+impl From<TransportFailure> for SlackFailure {
+    fn from(failure: TransportFailure) -> Self {
+        match failure {
+            TransportFailure::TimedOut => Self::TimedOut,
+            TransportFailure::ResponseTooLarge => Self::ResponseTooLarge,
+            TransportFailure::Unavailable => Self::Unavailable,
+        }
+    }
+}
 
 /// The machine-readable `error` code Slack names a refusal with.
 ///

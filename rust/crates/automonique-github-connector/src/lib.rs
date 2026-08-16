@@ -98,7 +98,16 @@ mod ticket;
 mod token;
 mod version;
 
+use automonique_connector_substrate::http::TransportFailure;
+use automonique_connector_substrate::json::StrictJsonError;
 use std::error::Error;
+// The JSON string escaper is shared: every connector was carrying a
+// byte-identical copy, and an escaping rule that differs between two of them is
+// a defect nobody would notice until a captured request carried a raw control
+// byte. Re-exported rather than imported at each call site so the crate's own
+// modules keep referring to it by the name they always used.
+pub(crate) use automonique_connector_substrate::json::push_json_string;
+
 use std::fmt;
 
 pub use client::{GITHUB_ACCEPT, GITHUB_API_VERSION, GITHUB_USER_AGENT, GitHubClient};
@@ -341,6 +350,27 @@ impl fmt::Display for GitHubFailure {
 }
 
 impl Error for GitHubFailure {}
+
+/// A response that is not strictly valid JSON is one refusal, not a taxonomy.
+///
+/// The distinction that matters to a caller is that the response cannot be
+/// trusted; which byte offended is a detail that would only reach a log line as
+/// a fragment of a response body.
+impl From<StrictJsonError> for GitHubFailure {
+    fn from(_: StrictJsonError) -> Self {
+        Self::InvalidResponse
+    }
+}
+
+impl From<TransportFailure> for GitHubFailure {
+    fn from(failure: TransportFailure) -> Self {
+        match failure {
+            TransportFailure::TimedOut => Self::TimedOut,
+            TransportFailure::ResponseTooLarge => Self::ResponseTooLarge,
+            TransportFailure::Unavailable => Self::Unavailable,
+        }
+    }
+}
 
 /// A bounded, control-free message GitHub supplied with a rejection.
 ///
@@ -598,32 +628,6 @@ pub(crate) fn is_opaque_identifier(value: &str, max_bytes: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\'))
-}
-
-/// Append one JSON string literal, escaping everything RFC 8259 requires.
-///
-/// Written out rather than delegated to a serializer so a body's field order is
-/// exactly the one this crate documents; a map-backed serializer would reorder
-/// it. `DEL` is escaped as well, so no C0/C1-adjacent byte reaches a captured
-/// request verbatim.
-pub(crate) fn push_json_string(out: &mut String, value: &str) {
-    out.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            control if control < '\u{20}' || control == '\u{7f}' => {
-                out.push_str(&format!("\\u{:04x}", control as u32));
-            }
-            plain => out.push(plain),
-        }
-    }
-    out.push('"');
 }
 
 /// Append one query-string value, percent-encoding everything outside RFC 3986

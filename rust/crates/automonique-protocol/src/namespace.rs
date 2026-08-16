@@ -737,20 +737,6 @@ impl NamespaceGate {
 }
 
 fn bounded(value: &str, field: &'static str) -> Result<(), NamespaceError> {
-    let error = if value.is_empty() {
-        Some(ValueError::Empty)
-    } else if value.len() > MAX_NAMESPACE_FIELD_BYTES {
-        Some(ValueError::TooLong {
-            max_bytes: MAX_NAMESPACE_FIELD_BYTES,
-            actual_bytes: value.len(),
-        })
-    } else if value.chars().any(char::is_control) {
-        Some(ValueError::ControlCharacter)
-    } else {
-        None
-    };
-    match error {
-        Some(error) => Err(NamespaceError::Field { field, error }),
-        None => Ok(()),
-    }
+    crate::primitives::bounded_value(value, MAX_NAMESPACE_FIELD_BYTES)
+        .map_err(|error| NamespaceError::Field { field, error })
 }

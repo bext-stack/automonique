@@ -3826,20 +3826,6 @@ fn inert_token(value: &str) -> Result<(), ToolError> {
 }
 
 fn bounded(value: &str, field: &'static str) -> Result<(), ToolError> {
-    let error = if value.is_empty() {
-        Some(ValueError::Empty)
-    } else if value.len() > MAX_TOOL_FIELD_BYTES {
-        Some(ValueError::TooLong {
-            max_bytes: MAX_TOOL_FIELD_BYTES,
-            actual_bytes: value.len(),
-        })
-    } else if value.chars().any(char::is_control) {
-        Some(ValueError::ControlCharacter)
-    } else {
-        None
-    };
-    match error {
-        Some(error) => Err(ToolError::Field { field, error }),
-        None => Ok(()),
-    }
+    crate::primitives::bounded_value(value, MAX_TOOL_FIELD_BYTES)
+        .map_err(|error| ToolError::Field { field, error })
 }

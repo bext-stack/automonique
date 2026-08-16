@@ -8,9 +8,9 @@
 //! a configurable origin or a real credential-bearing call.
 
 use std::fmt;
-use std::io::Read;
 use std::time::Duration;
 
+use automonique_connector_substrate::http::{map_ureq_error, read_bounded_body};
 use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::{
@@ -185,7 +185,7 @@ impl ConnectionsOpenTransport for SlackConnectionsOpenTransport {
             status,
             content_type,
             retry_after_seconds,
-            read_bounded_body(reader)?,
+            read_bounded_body(reader, MAX_SLACK_RESPONSE_BYTES)?,
         ))
     }
 }
@@ -321,25 +321,6 @@ fn is_slack_json(value: &str) -> bool {
         name.trim().eq_ignore_ascii_case("charset")
             && value.trim().trim_matches('"').eq_ignore_ascii_case("utf-8")
     })
-}
-
-fn read_bounded_body(mut reader: impl Read) -> Result<Vec<u8>, SlackFailure> {
-    let mut body = Vec::new();
-    reader
-        .read_to_end(&mut body)
-        .map_err(|error| map_ureq_error(ureq::Error::from(error)))?;
-    if body.len() > MAX_SLACK_RESPONSE_BYTES {
-        return Err(SlackFailure::ResponseTooLarge);
-    }
-    Ok(body)
-}
-
-fn map_ureq_error(error: ureq::Error) -> SlackFailure {
-    match error {
-        ureq::Error::Timeout(_) => SlackFailure::TimedOut,
-        ureq::Error::BodyExceedsLimit(_) => SlackFailure::ResponseTooLarge,
-        _ => SlackFailure::Unavailable,
-    }
 }
 
 #[cfg(test)]

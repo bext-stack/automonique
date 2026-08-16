@@ -14,6 +14,7 @@
 use std::fmt;
 
 use crate::GitHubRefusal;
+use automonique_connector_substrate::secret::scrub_rendered;
 
 /// Longest bearer credential accepted.
 ///
@@ -90,22 +91,8 @@ impl GitHubAuthorization<'_> {
             header.push(char::from(*byte));
         }
         let result = consume(&header);
-        scrub(header);
+        scrub_rendered(header);
         result
-    }
-}
-
-/// Overwrite a temporary header rendering before its buffer is released.
-///
-/// `String::clear` keeps the allocation and the bytes in it, so the zeros are
-/// pushed back over the same capacity afterwards. This is the same best-effort
-/// hygiene [`GitHubToken`] applies on drop, and it needs no `unsafe` because
-/// `NUL` is valid UTF-8.
-fn scrub(mut header: String) {
-    let width = header.len();
-    header.clear();
-    for _ in 0..width {
-        header.push('\0');
     }
 }
 

@@ -12,6 +12,7 @@
 use std::fmt;
 
 use crate::{GitHubRefusal, MAX_URL_BYTES};
+use automonique_connector_substrate::url::{Scheme, split_port, split_scheme};
 
 /// The one production origin this connector may address.
 pub const GITHUB_API_ORIGIN: &str = "https://api.github.com";
@@ -149,56 +150,6 @@ impl fmt::Debug for GitHubBase {
             .field("plaintext_loopback", &self.plaintext_loopback)
             .finish()
     }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Scheme {
-    Https,
-    Http,
-}
-
-/// Split a scheme prefix, case-insensitively as RFC 3986 requires.
-fn split_scheme(base: &str) -> Option<(Scheme, &str)> {
-    let separator = base.find("://")?;
-    let (scheme, remainder) = base.split_at(separator);
-    let remainder = &remainder["://".len()..];
-    if scheme.eq_ignore_ascii_case("https") {
-        Some((Scheme::Https, remainder))
-    } else if scheme.eq_ignore_ascii_case("http") {
-        Some((Scheme::Http, remainder))
-    } else {
-        None
-    }
-}
-
-/// Split an optional `:<port>` off an authority.
-///
-/// The IPv6 literal is handled first so the colons inside it are not mistaken
-/// for a port separator. A port is decimal, in range, and without a leading
-/// zero, so one authority has exactly one spelling.
-fn split_port(authority: &str) -> Option<(&str, Option<u16>)> {
-    let search_from = if authority.starts_with('[') {
-        authority.find(']')? + 1
-    } else {
-        0
-    };
-    let Some(colon) = authority[search_from..].find(':') else {
-        return Some((authority, None));
-    };
-    let (host, port) = authority.split_at(search_from + colon);
-    let port = &port[1..];
-    if port.is_empty()
-        || port.len() > 5
-        || !port.bytes().all(|byte| byte.is_ascii_digit())
-        || (port.len() > 1 && port.starts_with('0'))
-    {
-        return None;
-    }
-    let port: u16 = port.parse().ok()?;
-    if port == 0 {
-        return None;
-    }
-    Some((host, Some(port)))
 }
 
 /// A validated repository owner — a user or an organization login.

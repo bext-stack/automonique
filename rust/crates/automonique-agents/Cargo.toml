@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+automonique-connector-substrate = { path = "../automonique-connector-substrate" }
 automonique-runner = { path = "../automonique-runner" }
 nix.workspace = true
 serde.workspace = true

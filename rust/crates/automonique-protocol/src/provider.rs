@@ -639,22 +639,8 @@ impl Selection {
 }
 
 fn bounded(value: &str, field: &'static str) -> Result<(), ProviderError> {
-    let error = if value.is_empty() {
-        Some(ValueError::Empty)
-    } else if value.len() > MAX_PROVIDER_ID_BYTES {
-        Some(ValueError::TooLong {
-            max_bytes: MAX_PROVIDER_ID_BYTES,
-            actual_bytes: value.len(),
-        })
-    } else if value.chars().any(char::is_control) {
-        Some(ValueError::ControlCharacter)
-    } else {
-        None
-    };
-    match error {
-        Some(error) => Err(ProviderError::Value { field, error }),
-        None => Ok(()),
-    }
+    crate::primitives::bounded_value(value, MAX_PROVIDER_ID_BYTES)
+        .map_err(|error| ProviderError::Value { field, error })
 }
 
 fn canonical_sha256(value: &str, field: &'static str) -> Result<(), ProviderError> {

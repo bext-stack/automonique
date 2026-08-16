@@ -4396,20 +4396,6 @@ fn bounded_within(
     field: &'static str,
     max_bytes: usize,
 ) -> Result<(), AutomationError> {
-    let error = if value.is_empty() {
-        Some(ValueError::Empty)
-    } else if value.len() > max_bytes {
-        Some(ValueError::TooLong {
-            max_bytes,
-            actual_bytes: value.len(),
-        })
-    } else if value.chars().any(char::is_control) {
-        Some(ValueError::ControlCharacter)
-    } else {
-        None
-    };
-    match error {
-        Some(error) => Err(AutomationError::Field { field, error }),
-        None => Ok(()),
-    }
+    crate::primitives::bounded_value(value, max_bytes)
+        .map_err(|error| AutomationError::Field { field, error })
 }

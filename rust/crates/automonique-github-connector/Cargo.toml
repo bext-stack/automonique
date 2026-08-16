@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+automonique-connector-substrate = { path = "../automonique-connector-substrate", features = ["automonique_http"] }
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true

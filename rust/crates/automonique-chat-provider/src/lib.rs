@@ -19,6 +19,8 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use automonique_connector_substrate::http::{TransportFailure, map_ureq_error};
+use automonique_connector_substrate::secret::scrub_rendered;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use ureq::tls::{RootCerts, TlsConfig};
@@ -165,9 +167,7 @@ impl ApiKey {
             header.push(char::from(*byte));
         }
         let result = consume(&header);
-        let width = header.len();
-        header.clear();
-        header.extend(std::iter::repeat_n('\0', width));
+        scrub_rendered(header);
         result
     }
 }
@@ -449,6 +449,22 @@ fn valid_decimal(value: &str) -> bool {
         })
 }
 
+/// Read a bounded response body.
+///
+/// Deliberately *not* delegated to
+/// `automonique_connector_substrate::http::read_bounded_body`, which every
+/// other HTTP caller in the workspace now uses. This one differs in a way that
+/// looks cosmetic and is not: it maps every read failure to `Transport`,
+/// including the one ureq raises when the body passes the `.limit()` set on the
+/// reader above. The shared helper routes that through `map_ureq_error`, which
+/// names it `ResponseTooLarge` — and because `ureq::Error::from` recovers a
+/// wrapped `BodyExceedsLimit` out of the `io::Error`, switching would silently
+/// change which refusal an oversized DeepSeek response reports.
+///
+/// The two spellings of "too large" in this crate disagree, and the ceiling
+/// below is only reachable when ureq's own limit does not trip first. That is
+/// worth an owner's decision rather than a refactor's assumption, so it is left
+/// exactly as it was and flagged here.
 fn read_bounded(mut reader: impl Read) -> Result<Vec<u8>, ChatProviderFailure> {
     let mut bytes = Vec::new();
     reader
@@ -489,11 +505,19 @@ fn is_json_content_type(value: &str) -> bool {
     })
 }
 
-fn map_ureq_error(error: ureq::Error) -> ChatProviderFailure {
-    if matches!(error, ureq::Error::Timeout(_)) {
-        ChatProviderFailure::TimedOut
-    } else {
-        ChatProviderFailure::Transport
+impl From<TransportFailure> for ChatProviderFailure {
+    /// This crate's request path has only ever distinguished a timeout.
+    ///
+    /// `ResponseTooLarge` folding into `Transport` is not an oversight in the
+    /// conversion: it is what the local mapping this replaced did, and the only
+    /// place it applies is the request itself, where a body-limit breach cannot
+    /// arise. `ChatProviderFailure::ResponseTooLarge` is still reported, by
+    /// `read_bounded` and by the decoders, on the paths that can observe it.
+    fn from(failure: TransportFailure) -> Self {
+        match failure {
+            TransportFailure::TimedOut => Self::TimedOut,
+            TransportFailure::ResponseTooLarge | TransportFailure::Unavailable => Self::Transport,
+        }
     }
 }
 

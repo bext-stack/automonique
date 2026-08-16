@@ -1051,22 +1051,8 @@ fn escaped(value: &str) -> String {
 }
 
 fn bounded(value: &str, field: &'static str) -> Result<(), CompatError> {
-    let error = if value.is_empty() {
-        Some(ValueError::Empty)
-    } else if value.len() > MAX_COMPAT_FIELD_BYTES {
-        Some(ValueError::TooLong {
-            max_bytes: MAX_COMPAT_FIELD_BYTES,
-            actual_bytes: value.len(),
-        })
-    } else if value.chars().any(char::is_control) {
-        Some(ValueError::ControlCharacter)
-    } else {
-        None
-    };
-    match error {
-        Some(error) => Err(CompatError::Field { field, error }),
-        None => Ok(()),
-    }
+    crate::primitives::bounded_value(value, MAX_COMPAT_FIELD_BYTES)
+        .map_err(|error| CompatError::Field { field, error })
 }
 
 /// Stable schema identifier for the rendered compatibility matrix.

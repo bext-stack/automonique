@@ -215,7 +215,23 @@ impl std::error::Error for RevisionError {}
 pub trait IdDomain {}
 
 /// Validate a non-empty, control-free UTF-8 value against a byte ceiling.
-fn validate_bounded(value: &str, max_bytes: usize) -> Result<(), ValueError> {
+///
+/// The one implementation of the rule every bounded field in this crate is
+/// checked against. It used to be twenty: each module carried its own
+/// `bounded()` differing only in which constant it read and which error it
+/// built, which meant "what counts as a control character" had twenty places to
+/// drift and no test that would notice if one did.
+///
+/// The ceiling stays an argument. The modules' ceilings differ on purpose — an
+/// interaction's text and a host's identifier are not the same size of thing —
+/// so each keeps its own constant and passes it here.
+///
+/// # Errors
+///
+/// Returns [`ValueError::ZeroBound`] for a ceiling of zero, and otherwise
+/// [`ValueError::Empty`], [`ValueError::TooLong`] or
+/// [`ValueError::ControlCharacter`] for the first rule the value breaks.
+pub fn bounded_value(value: &str, max_bytes: usize) -> Result<(), ValueError> {
     if max_bytes == 0 {
         return Err(ValueError::ZeroBound);
     }
@@ -267,7 +283,7 @@ impl<D: IdDomain, const MAX_BYTES: usize> OpaqueId<D, MAX_BYTES> {
     /// over the ceiling, or contains a control character.
     pub fn new(value: impl Into<String>) -> Result<Self, ValueError> {
         let value = value.into();
-        validate_bounded(&value, MAX_BYTES)?;
+        bounded_value(&value, MAX_BYTES)?;
         Ok(Self {
             value,
             domain: PhantomData,
@@ -356,7 +372,7 @@ impl<const MAX_BYTES: usize> BoundedString<MAX_BYTES> {
     /// over the ceiling, or contains a control character.
     pub fn new(value: impl Into<String>) -> Result<Self, ValueError> {
         let value = value.into();
-        validate_bounded(&value, MAX_BYTES)?;
+        bounded_value(&value, MAX_BYTES)?;
         Ok(Self(value))
     }
 
@@ -607,7 +623,7 @@ impl<const MAX_BYTES: usize> PublicHttpUrl<MAX_BYTES> {
     /// invalid port.
     pub fn new(value: impl Into<String>) -> Result<Self, UrlError> {
         let value = value.into();
-        validate_bounded(&value, MAX_BYTES)?;
+        bounded_value(&value, MAX_BYTES)?;
         if !value.is_ascii() {
             return Err(UrlError::NonAscii);
         }
@@ -699,7 +715,7 @@ impl<const MAX_BYTES: usize> SecretText<MAX_BYTES> {
     /// the submitted value.
     pub fn new(value: impl Into<String>) -> Result<Self, ValueError> {
         let value = value.into();
-        validate_bounded(&value, MAX_BYTES)?;
+        bounded_value(&value, MAX_BYTES)?;
         Ok(Self(value))
     }
 

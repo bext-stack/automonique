@@ -730,11 +730,8 @@ fn push_text(bytes: &mut Vec<u8>, value: &str) {
 }
 
 fn bounded(value: &str, field: &'static str) -> Result<(), SchemaError> {
-    if value.is_empty()
-        || value.len() > MAX_SCHEMA_FIELD_BYTES
-        || value.chars().any(char::is_control)
-    {
-        return Err(SchemaError::FieldInvalid { field });
-    }
-    Ok(())
+    // This module's error carries no violation class, so the class is
+    // dropped rather than translated — as it always was.
+    crate::primitives::bounded_value(value, MAX_SCHEMA_FIELD_BYTES)
+        .map_err(|_| SchemaError::FieldInvalid { field })
 }

@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
-use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use automonique_connector_substrate::json::{StrictJsonError, strict_json};
 use serde_json::Value;
 
 mod slack;
@@ -365,6 +365,17 @@ impl fmt::Display for TelegramError {
 
 impl Error for TelegramError {}
 
+/// A response that is not strictly valid JSON is one refusal, not a taxonomy.
+///
+/// The distinction that matters to a caller is that the response cannot be
+/// trusted; which byte offended is a detail that would only reach a log line as
+/// a fragment of a response body.
+impl From<StrictJsonError> for TelegramError {
+    fn from(_: StrictJsonError) -> Self {
+        Self::InvalidResponse
+    }
+}
+
 /// Parse an exact successful Telegram `getUpdates` response.
 ///
 /// Updates below `current_offset` are ignored as already durable. Every fresh
@@ -411,102 +422,6 @@ pub fn parse_telegram_updates(
         updates,
         next_offset,
     })
-}
-
-struct StrictJson;
-
-impl<'de> DeserializeSeed<'de> for StrictJson {
-    type Value = Value;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_any(StrictJsonVisitor)
-    }
-}
-
-struct StrictJsonVisitor;
-
-impl<'de> Visitor<'de> for StrictJsonVisitor {
-    type Value = Value;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("JSON without duplicate object keys or non-finite numbers")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
-        Ok(Value::Bool(value))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-        Ok(Value::Number(value.into()))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-        Ok(Value::Number(value.into()))
-    }
-
-    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        serde_json::Number::from_f64(value)
-            .map(Value::Number)
-            .ok_or_else(|| E::custom("non-finite floating-point value"))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
-        Ok(Value::String(value.to_owned()))
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
-        Ok(Value::String(value))
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(Value::Null)
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(Value::Null)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut values = Vec::new();
-        while let Some(value) = sequence.next_element_seed(StrictJson)? {
-            values.push(value);
-        }
-        Ok(Value::Array(values))
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut values = serde_json::Map::new();
-        while let Some(key) = map.next_key::<String>()? {
-            if values.contains_key(&key) {
-                return Err(de::Error::custom("duplicate object key"));
-            }
-            values.insert(key, map.next_value_seed(StrictJson)?);
-        }
-        Ok(Value::Object(values))
-    }
-}
-
-fn strict_json(bytes: &[u8]) -> Result<Value, TelegramError> {
-    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let value = StrictJson
-        .deserialize(&mut deserializer)
-        .map_err(|_| TelegramError::InvalidResponse)?;
-    deserializer
-        .end()
-        .map_err(|_| TelegramError::InvalidResponse)?;
-    Ok(value)
 }
 
 fn update_id(value: &Value) -> Result<u64, TelegramError> {

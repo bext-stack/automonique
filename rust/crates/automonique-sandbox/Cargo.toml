@@ -9,12 +9,7 @@ publish = false
 
 [dependencies]
 automonique-protocol = { path = "../automonique-protocol" }
-sha2 = "=0.10.9"
+sha2.workspace = true
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-dbg_macro = "forbid"
-todo = "forbid"
-unimplemented = "forbid"
+[lints]
+workspace = true

@@ -2610,20 +2610,6 @@ fn check_workspace_relative(path: &str) -> Result<(), ContextError> {
 }
 
 fn bounded(value: &str, field: &'static str) -> Result<(), ContextError> {
-    let error = if value.is_empty() {
-        Some(ValueError::Empty)
-    } else if value.len() > MAX_CONTEXT_FIELD_BYTES {
-        Some(ValueError::TooLong {
-            max_bytes: MAX_CONTEXT_FIELD_BYTES,
-            actual_bytes: value.len(),
-        })
-    } else if value.chars().any(char::is_control) {
-        Some(ValueError::ControlCharacter)
-    } else {
-        None
-    };
-    match error {
-        Some(error) => Err(ContextError::Field { field, error }),
-        None => Ok(()),
-    }
+    crate::primitives::bounded_value(value, MAX_CONTEXT_FIELD_BYTES)
+        .map_err(|error| ContextError::Field { field, error })
 }

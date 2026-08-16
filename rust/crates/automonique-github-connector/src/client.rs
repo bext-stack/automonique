@@ -21,9 +21,9 @@
 //! the decision about where its token goes to the response it just received.
 
 use std::fmt;
-use std::io::Read;
 use std::time::Duration;
 
+use automonique_connector_substrate::http::{map_ureq_error, read_bounded_body};
 use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::request::HttpMethod;
@@ -542,7 +542,7 @@ impl GitHubClient {
             retry_after_seconds,
             json,
             etag,
-            body: read_bounded_body(reader)?,
+            body: read_bounded_body(reader, MAX_GITHUB_RESPONSE_BYTES)?,
         })
     }
 
@@ -618,29 +618,6 @@ fn is_github_json(value: &str) -> bool {
         name.trim().eq_ignore_ascii_case("charset")
             && value.trim().trim_matches('"').eq_ignore_ascii_case("utf-8")
     })
-}
-
-fn read_bounded_body(mut reader: impl Read) -> Result<Vec<u8>, GitHubFailure> {
-    let mut body = Vec::new();
-    reader
-        .read_to_end(&mut body)
-        .map_err(|error| map_ureq_error(ureq::Error::from(error)))?;
-    if body.len() > MAX_GITHUB_RESPONSE_BYTES {
-        return Err(GitHubFailure::ResponseTooLarge);
-    }
-    Ok(body)
-}
-
-/// Map a transport error onto the closed vocabulary, borrowing nothing from it.
-///
-/// ureq's own error rendering can name the URL it was dialling; none of it is
-/// carried across this boundary.
-fn map_ureq_error(error: ureq::Error) -> GitHubFailure {
-    match error {
-        ureq::Error::Timeout(_) => GitHubFailure::TimedOut,
-        ureq::Error::BodyExceedsLimit(_) => GitHubFailure::ResponseTooLarge,
-        _ => GitHubFailure::Unavailable,
-    }
 }
 
 #[cfg(test)]
@@ -754,14 +731,16 @@ mod tests {
     fn the_body_cap_accepts_the_boundary_and_refuses_one_over() {
         let at_limit = vec![b'a'; MAX_GITHUB_RESPONSE_BYTES];
         assert_eq!(
-            read_bounded_body(std::io::Cursor::new(&at_limit)).expect("at limit"),
+            read_bounded_body(std::io::Cursor::new(&at_limit), MAX_GITHUB_RESPONSE_BYTES)
+                .expect("at limit"),
             at_limit
         );
         assert_eq!(
-            read_bounded_body(std::io::Cursor::new(vec![
-                b'a';
-                MAX_GITHUB_RESPONSE_BYTES + 1
-            ])),
+            read_bounded_body(
+                std::io::Cursor::new(vec![b'a'; MAX_GITHUB_RESPONSE_BYTES + 1]),
+                MAX_GITHUB_RESPONSE_BYTES,
+            )
+            .map_err(GitHubFailure::from),
             Err(GitHubFailure::ResponseTooLarge)
         );
     }

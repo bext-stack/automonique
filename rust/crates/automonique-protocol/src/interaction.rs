@@ -2693,20 +2693,6 @@ impl NamespacedProjection {
 }
 
 fn bounded(value: &str, field: &'static str) -> Result<(), InteractionError> {
-    let error = if value.is_empty() {
-        Some(ValueError::Empty)
-    } else if value.len() > MAX_INTERACTION_TEXT_BYTES {
-        Some(ValueError::TooLong {
-            max_bytes: MAX_INTERACTION_TEXT_BYTES,
-            actual_bytes: value.len(),
-        })
-    } else if value.chars().any(char::is_control) {
-        Some(ValueError::ControlCharacter)
-    } else {
-        None
-    };
-    match error {
-        Some(error) => Err(InteractionError::Field { field, error }),
-        None => Ok(()),
-    }
+    crate::primitives::bounded_value(value, MAX_INTERACTION_TEXT_BYTES)
+        .map_err(|error| InteractionError::Field { field, error })
 }

@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+[package]
+name = "automonique-connector-substrate"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# `ureq` is behind a feature so the two consumers that parse but never dial —
+# `automonique-transports` and `automonique-agents` — do not acquire an HTTP
+# client by depending on this crate. "The parsing crate cannot reach the
+# network" is a property worth keeping legible in a manifest, and
+# `cargo tree -p automonique-transports` is where it stays checkable.
+#
+# The name carries the project prefix because the namespace gate in
+# `automonique-protocol/tests/namespace.rs` scans manifest features alongside
+# binaries and crate names. There is deliberately no `default` key: Cargo
+# reserves that spelling, so it cannot be namespaced, and an implicit empty
+# default costs the five HTTP consumers one explicit `features = [...]` each.
+[features]
+automonique_http = ["dep:ureq"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ureq = { workspace = true, optional = true }
+
+[lints]
+workspace = true

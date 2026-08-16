@@ -21,10 +21,8 @@
 //! has added top-level fields over time and refusing them would couple this
 //! connector to a server release.
 
-use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use automonique_connector_substrate::json::strict_json;
 use serde_json::{Map, Value};
-
-use std::fmt;
 
 use crate::request::is_github_issue_url;
 use crate::{
@@ -642,109 +640,6 @@ fn timestamp(object: &Map<String, Value>, key: &str) -> Result<String, FleetFail
         return Err(FleetFailure::FieldOutOfBounds);
     }
     Ok(value.to_owned())
-}
-
-/// Parse JSON refusing duplicate object keys, non-finite numbers and trailing
-/// bytes.
-///
-/// The same discipline `automonique-transports` applies to Telegram and Slack
-/// frames. Duplicate keys matter most: without this, two `ok` fields would let
-/// the decoder and a reviewer reading the same bytes disagree about which one
-/// counted.
-fn strict_json(bytes: &[u8]) -> Result<Value, FleetFailure> {
-    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let value = StrictJson
-        .deserialize(&mut deserializer)
-        .map_err(|_| FleetFailure::InvalidResponse)?;
-    deserializer
-        .end()
-        .map_err(|_| FleetFailure::InvalidResponse)?;
-    Ok(value)
-}
-
-struct StrictJson;
-
-impl<'de> DeserializeSeed<'de> for StrictJson {
-    type Value = Value;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_any(StrictJsonVisitor)
-    }
-}
-
-struct StrictJsonVisitor;
-
-impl<'de> Visitor<'de> for StrictJsonVisitor {
-    type Value = Value;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("JSON without duplicate object keys or non-finite numbers")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
-        Ok(Value::Bool(value))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-        Ok(Value::Number(value.into()))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-        Ok(Value::Number(value.into()))
-    }
-
-    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        serde_json::Number::from_f64(value)
-            .map(Value::Number)
-            .ok_or_else(|| E::custom("non-finite floating-point value"))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
-        Ok(Value::String(value.to_owned()))
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
-        Ok(Value::String(value))
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(Value::Null)
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(Value::Null)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut values = Vec::new();
-        while let Some(value) = sequence.next_element_seed(StrictJson)? {
-            values.push(value);
-        }
-        Ok(Value::Array(values))
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut values = Map::new();
-        while let Some(key) = map.next_key::<String>()? {
-            if values.contains_key(&key) {
-                return Err(de::Error::custom("duplicate object key"));
-            }
-            values.insert(key, map.next_value_seed(StrictJson)?);
-        }
-        Ok(Value::Object(values))
-    }
 }
 
 #[cfg(test)]

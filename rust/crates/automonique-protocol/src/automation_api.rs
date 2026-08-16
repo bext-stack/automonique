@@ -2000,19 +2000,8 @@ fn actor(value: &str) -> Result<AutomationActor, AutomationApiError> {
 }
 
 fn bounded(value: &str, field: &'static str) -> Result<(), AutomationApiError> {
-    let error = if value.is_empty() {
-        ValueError::Empty
-    } else if value.len() > MAX_AUTOMATION_API_FIELD_BYTES {
-        ValueError::TooLong {
-            max_bytes: MAX_AUTOMATION_API_FIELD_BYTES,
-            actual_bytes: value.len(),
-        }
-    } else if value.chars().any(char::is_control) {
-        ValueError::ControlCharacter
-    } else {
-        return Ok(());
-    };
-    Err(AutomationApiError::Field { field, error })
+    crate::primitives::bounded_value(value, MAX_AUTOMATION_API_FIELD_BYTES)
+        .map_err(|error| AutomationApiError::Field { field, error })
 }
 
 fn integer(field: &'static str, value: u64) -> Result<JsonValue, AutomationApiError> {

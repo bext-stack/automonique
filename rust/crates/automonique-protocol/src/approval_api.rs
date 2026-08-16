@@ -2090,19 +2090,8 @@ fn supported_protocol() -> Result<SupportedProtocol, ApprovalApiError> {
 }
 
 fn bounded(value: &str, field: &'static str) -> Result<(), ApprovalApiError> {
-    let error = if value.is_empty() {
-        ValueError::Empty
-    } else if value.len() > MAX_APPROVAL_API_FIELD_BYTES {
-        ValueError::TooLong {
-            max_bytes: MAX_APPROVAL_API_FIELD_BYTES,
-            actual_bytes: value.len(),
-        }
-    } else if value.chars().any(char::is_control) {
-        ValueError::ControlCharacter
-    } else {
-        return Ok(());
-    };
-    Err(ApprovalApiError::Field { field, error })
+    crate::primitives::bounded_value(value, MAX_APPROVAL_API_FIELD_BYTES)
+        .map_err(|error| ApprovalApiError::Field { field, error })
 }
 
 /// The page size a listing body declares, judged against this protocol's bound.

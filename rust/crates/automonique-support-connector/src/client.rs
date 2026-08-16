@@ -15,9 +15,9 @@
 //! the hermetic tests reach an in-process fake without a certificate.
 
 use std::fmt;
-use std::io::Read;
 use std::time::Duration;
 
+use automonique_connector_substrate::http::{map_ureq_error, read_bounded_body};
 use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::response::{
@@ -290,7 +290,7 @@ impl FleetClient {
             .with_config()
             .limit((MAX_FLEET_RESPONSE_BYTES + 1) as u64)
             .reader();
-        read_bounded_body(reader)
+        read_bounded_body(reader, MAX_FLEET_RESPONSE_BYTES).map_err(FleetFailure::from)
     }
 }
 
@@ -322,29 +322,6 @@ fn is_json_content_type(value: &str) -> bool {
         name.trim().eq_ignore_ascii_case("charset")
             && value.trim().trim_matches('"').eq_ignore_ascii_case("utf-8")
     })
-}
-
-fn read_bounded_body(mut reader: impl Read) -> Result<Vec<u8>, FleetFailure> {
-    let mut body = Vec::new();
-    reader
-        .read_to_end(&mut body)
-        .map_err(|error| map_ureq_error(ureq::Error::from(error)))?;
-    if body.len() > MAX_FLEET_RESPONSE_BYTES {
-        return Err(FleetFailure::ResponseTooLarge);
-    }
-    Ok(body)
-}
-
-/// Map a transport error onto the closed vocabulary, borrowing nothing from it.
-///
-/// ureq's own error rendering can name the URL it was dialling; none of it is
-/// carried across this boundary.
-fn map_ureq_error(error: ureq::Error) -> FleetFailure {
-    match error {
-        ureq::Error::Timeout(_) => FleetFailure::TimedOut,
-        ureq::Error::BodyExceedsLimit(_) => FleetFailure::ResponseTooLarge,
-        _ => FleetFailure::Unavailable,
-    }
 }
 
 #[cfg(test)]
@@ -451,14 +428,16 @@ mod tests {
     fn the_body_cap_accepts_the_boundary_and_refuses_one_over() {
         let at_limit = vec![b'a'; MAX_FLEET_RESPONSE_BYTES];
         assert_eq!(
-            read_bounded_body(std::io::Cursor::new(&at_limit)).expect("at limit"),
+            read_bounded_body(std::io::Cursor::new(&at_limit), MAX_FLEET_RESPONSE_BYTES)
+                .expect("at limit"),
             at_limit
         );
         assert_eq!(
-            read_bounded_body(std::io::Cursor::new(vec![
-                b'a';
-                MAX_FLEET_RESPONSE_BYTES + 1
-            ])),
+            read_bounded_body(
+                std::io::Cursor::new(vec![b'a'; MAX_FLEET_RESPONSE_BYTES + 1]),
+                MAX_FLEET_RESPONSE_BYTES,
+            )
+            .map_err(FleetFailure::from),
             Err(FleetFailure::ResponseTooLarge)
         );
     }

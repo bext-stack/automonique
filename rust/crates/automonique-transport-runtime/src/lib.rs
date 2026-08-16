@@ -12,6 +12,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use automonique_connector_substrate::http::TransportFailure;
 use automonique_transports::{
     MAX_TELEGRAM_RESPONSE_BYTES, MAX_TELEGRAM_UPDATES, TelegramAccessPolicy, TelegramDisposition,
     TelegramError, TelegramIngress, TelegramInputKind, parse_telegram_updates,
@@ -204,6 +205,16 @@ pub enum HttpFailure {
     ResponseTooLarge,
     UnexpectedStatus,
     UnexpectedContentType,
+}
+
+impl From<TransportFailure> for HttpFailure {
+    fn from(failure: TransportFailure) -> Self {
+        match failure {
+            TransportFailure::TimedOut => Self::TimedOut,
+            TransportFailure::ResponseTooLarge => Self::ResponseTooLarge,
+            TransportFailure::Unavailable => Self::Unavailable,
+        }
+    }
 }
 
 /// An HTTP implementation consumes only the typed plan and cancellation flag.

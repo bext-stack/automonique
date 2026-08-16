@@ -6,6 +6,7 @@ members = [
     "crates/automonique",
     "crates/automonique-cli",
     "crates/automonique-chat-provider",
+    "crates/automonique-connector-substrate",
     "crates/automonique-core",
     "crates/automonique-daemon",
     "crates/automonique-egress-broker",

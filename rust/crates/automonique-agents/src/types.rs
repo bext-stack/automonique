@@ -470,6 +470,16 @@ impl fmt::Display for AdapterError {
 
 impl std::error::Error for AdapterError {}
 
+/// A stream line that is not strictly valid JSON is one refusal.
+///
+/// The provider's transcript is untrusted input; which byte offended is a
+/// detail that would only reach a log line as a fragment of a model's output.
+impl From<automonique_connector_substrate::json::StrictJsonError> for AdapterError {
+    fn from(_: automonique_connector_substrate::json::StrictJsonError) -> Self {
+        Self::InvalidJson
+    }
+}
+
 impl From<CoordinateError> for AdapterError {
     fn from(value: CoordinateError) -> Self {
         Self::Coordinate(value)

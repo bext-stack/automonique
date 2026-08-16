@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+automonique-connector-substrate = { path = "../automonique-connector-substrate", features = ["automonique_http"] }
 automonique-store = { path = "../automonique-store" }
 automonique-transports = { path = "../automonique-transports" }
 log.workspace = true

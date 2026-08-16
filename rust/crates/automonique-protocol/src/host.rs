@@ -709,20 +709,6 @@ impl ClaimRegistry {
 }
 
 fn bounded(value: &str, field: &'static str) -> Result<(), HostError> {
-    let error = if value.is_empty() {
-        Some(ValueError::Empty)
-    } else if value.len() > MAX_HOST_ID_BYTES {
-        Some(ValueError::TooLong {
-            max_bytes: MAX_HOST_ID_BYTES,
-            actual_bytes: value.len(),
-        })
-    } else if value.chars().any(char::is_control) {
-        Some(ValueError::ControlCharacter)
-    } else {
-        None
-    };
-    match error {
-        Some(error) => Err(HostError::Field { field, error }),
-        None => Ok(()),
-    }
+    crate::primitives::bounded_value(value, MAX_HOST_ID_BYTES)
+        .map_err(|error| HostError::Field { field, error })
 }

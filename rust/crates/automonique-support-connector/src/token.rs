@@ -13,6 +13,7 @@
 use std::fmt;
 
 use crate::FleetRefusal;
+use automonique_connector_substrate::secret::scrub_rendered;
 
 /// Longest bearer credential accepted.
 pub const MAX_FLEET_TOKEN_BYTES: usize = 512;
@@ -83,22 +84,8 @@ impl FleetAuthorization<'_> {
             header.push(char::from(*byte));
         }
         let result = consume(&header);
-        scrub(header);
+        scrub_rendered(header);
         result
-    }
-}
-
-/// Overwrite a temporary header rendering before its buffer is released.
-///
-/// `String::clear` keeps the allocation and the bytes in it, so the zeros are
-/// pushed back over the same capacity afterwards. This is the same best-effort
-/// hygiene [`FleetToken`] applies on drop, and it needs no `unsafe` because
-/// `NUL` is valid UTF-8.
-fn scrub(mut header: String) {
-    let width = header.len();
-    header.clear();
-    for _ in 0..width {
-        header.push('\0');
     }
 }
 

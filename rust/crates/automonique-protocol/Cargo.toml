@@ -19,10 +19,5 @@ publish = false
 proptest = { version = "=1.11.0", default-features = false, features = ["std", "bit-set"] }
 sha2.workspace = true
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-dbg_macro = "forbid"
-todo = "forbid"
-unimplemented = "forbid"
+[lints]
+workspace = true
