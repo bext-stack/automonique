@@ -15,7 +15,7 @@ use automonique_protocol::admin::{
 };
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_store::{
-    InboxSubmission, LeaseRequest, OutboxClaimRequest, SchedulerClaim, Store,
+    InboxSubmission, LeaseOwnerIdentity, LeaseRequest, OutboxClaimRequest, SchedulerClaim, Store,
     TelegramPollerLeaseIdentity, TelegramPollerLeaseRequest, TerminalRun, TerminalState, WorkClaim,
 };
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
@@ -39,6 +39,22 @@ fn fixture() -> (tempfile::TempDir, DaemonConfig) {
             state_root: state,
         },
     )
+}
+
+fn current_lease_owner() -> (String, u64) {
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .expect("boot identity")
+        .trim()
+        .to_owned();
+    let stat = std::fs::read_to_string("/proc/self/stat").expect("process stat");
+    let close = stat.rfind(')').expect("process name boundary");
+    let starttime = stat[close + 1..]
+        .split_whitespace()
+        .nth(19)
+        .expect("process starttime field")
+        .parse::<u64>()
+        .expect("numeric process starttime");
+    (boot_id, starttime)
 }
 
 fn call(config: &DaemonConfig, command: AdminCommand) -> AdminResponse {
@@ -440,6 +456,81 @@ fn an_active_endpoint_refuses_a_second_daemon() {
         "refused bind must not mutate generation state"
     );
     drop(first);
+}
+
+#[test]
+fn one_state_root_refuses_a_second_daemon_even_with_another_runtime_socket() {
+    let (root, config) = fixture();
+    let first = Daemon::open(&config).expect("first daemon");
+    let other_runtime = root.path().join("other-runtime");
+    std::fs::create_dir(&other_runtime).expect("second runtime root");
+    std::fs::set_permissions(&other_runtime, std::fs::Permissions::from_mode(0o700))
+        .expect("private second runtime");
+    let second_config = DaemonConfig {
+        runtime_root: other_runtime,
+        state_root: config.state_root.clone(),
+    };
+
+    assert!(matches!(
+        Daemon::open(&second_config),
+        Err(DaemonError::AlreadyRunning)
+    ));
+    assert!(
+        !second_config.admin_socket().exists(),
+        "state exclusion must happen before a competing endpoint is published"
+    );
+    drop(first);
+}
+
+#[test]
+fn startup_never_sweeps_an_exact_owner_the_kernel_still_reports_live() {
+    let (_root, config) = fixture();
+    std::fs::create_dir(config.state_dir()).expect("state directory");
+    std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
+        .expect("private state directory");
+    let now_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("forward clock")
+            .as_millis(),
+    )
+    .expect("millisecond clock fits");
+    let (boot_id, starttime) = current_lease_owner();
+    let mut store = Store::open(config.database_path()).expect("seed store");
+    let lease = store
+        .acquire_generation_lease_owned(
+            LeaseRequest {
+                generation_id: "foreground",
+                holder_id: "live-owner",
+                now_ms,
+                ttl_ms: 60_000,
+            },
+            LeaseOwnerIdentity {
+                boot_id: &boot_id,
+                pid: std::process::id(),
+                starttime,
+            },
+        )
+        .expect("live lease");
+    drop(store);
+
+    assert!(matches!(
+        Daemon::open(&config),
+        Err(DaemonError::AlreadyRunning)
+    ));
+    assert!(
+        !config.admin_socket().exists(),
+        "refused startup cleans its socket"
+    );
+
+    let mut store = Store::open(config.database_path()).expect("inspect store");
+    let snapshot = store
+        .status_snapshot_at("foreground", now_ms + 1)
+        .expect("snapshot");
+    let generation = snapshot.generation().expect("generation remains");
+    assert_eq!(generation.holder_id(), "live-owner");
+    assert_eq!(generation.lease_epoch(), lease.epoch);
+    assert_eq!(generation.lease_expires_ms(), lease.expires_ms);
 }
 
 #[test]

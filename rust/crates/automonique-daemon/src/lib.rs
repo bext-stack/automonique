@@ -140,7 +140,8 @@ use automonique_store::run_submissions::{
     RunSubmission, RunSubmissionError, RunSubmissionLog, RunSubmissionState,
 };
 use automonique_store::{
-    InboxSubmission, IntakePauseRequest, IntakeResumeRequest, LeaseRenewal, LeaseRequest,
+    InboxSubmission, IntakePauseRequest, IntakeResumeRequest, LeaseExpiryRequest,
+    LeaseOwnerIdentity, LeaseRenewal, LeaseRequest,
     OutboxReconciliationDecision as StoreOutboxDecision, OutboxReconciliationRequest,
     ReconciliationDecision, ReconciliationRequest, StatusSnapshot, Store, StoreError,
 };
@@ -155,6 +156,7 @@ pub mod attempt_host;
 pub mod cancel_custody;
 pub mod codex_usage;
 pub mod compose;
+mod control_lock;
 pub mod deepseek_balance;
 pub mod egress;
 pub mod execute;
@@ -164,6 +166,7 @@ pub mod improvement_github;
 pub mod improvement_publish;
 pub mod improvement_worker;
 pub mod improvements;
+mod lease_identity;
 pub mod manage_config;
 pub mod memory_config;
 mod model_inventory;
@@ -194,6 +197,9 @@ pub const ADMIN_SOCKET_NAME: &str = concat!("admin", ".sock");
 
 /// Database filename inside the private product state directory.
 pub const DATABASE_NAME: &str = concat!("automonique", ".sqlite3");
+
+/// Process-exclusion lock beside, never on, the SQLite files.
+pub const CONTROL_LOCK_NAME: &str = concat!("daemon", ".lock");
 
 /// Durable provider process/session/turn journal and GenAI usage source.
 pub const PROVIDER_JOURNAL_NAME: &str = concat!("provider-journal", ".sqlite3");
@@ -458,6 +464,12 @@ impl DaemonConfig {
     #[must_use]
     pub fn database_path(&self) -> PathBuf {
         self.state_dir().join(DATABASE_NAME)
+    }
+
+    /// Process-exclusion lock for the complete product state root.
+    #[must_use]
+    pub fn control_lock_path(&self) -> PathBuf {
+        self.state_dir().join(CONTROL_LOCK_NAME)
     }
 
     /// Durable provider journal and GenAI usage path.
@@ -974,6 +986,8 @@ pub enum DaemonError {
     ProgressEndpointFailed(&'static str),
     /// The service manager's readiness/watchdog notification channel failed.
     ServiceManagerFailed(&'static str),
+    /// The control lock path was unsafe or another live daemon holds it.
+    ControlLockFailed(&'static str),
 }
 
 impl DaemonError {
@@ -1005,6 +1019,7 @@ impl DaemonError {
             Self::ApprovalPolicyRefused(category) => category,
             Self::ProgressEndpointFailed(category) => category,
             Self::ServiceManagerFailed(category) => category,
+            Self::ControlLockFailed(category) => category,
         }
     }
 }
@@ -1074,6 +1089,9 @@ impl fmt::Display for DaemonError {
             }
             Self::ServiceManagerFailed(category) => {
                 write!(formatter, "service manager notification failed: {category}")
+            }
+            Self::ControlLockFailed(category) => {
+                write!(formatter, "daemon control lock refused: {category}")
             }
         }
     }
@@ -1261,6 +1279,8 @@ pub struct Daemon {
     progress_endpoint: Option<progress_hub::ProgressEndpoint>,
     /// Recovery mode never composes an external transport and refuses starts.
     disconnected_recovery: bool,
+    /// Held until every database and worker field above it has been dropped.
+    _control_lock: control_lock::ControlLock,
 }
 
 struct SocketCleanup {
@@ -1304,6 +1324,23 @@ impl Daemon {
         let state_dir = config.state_dir();
         ensure_private_dir(&runtime_dir, "runtime directory")?;
         ensure_private_dir(&state_dir, "state directory")?;
+        let control_lock =
+            control_lock::ControlLock::acquire(config.control_lock_path()).map_err(|error| {
+                match error {
+                    control_lock::ControlLockError::Held => DaemonError::AlreadyRunning,
+                    control_lock::ControlLockError::InsecurePath => {
+                        DaemonError::ControlLockFailed("insecure_path")
+                    }
+                    control_lock::ControlLockError::Io(error) => DaemonError::Io(error),
+                }
+            })?;
+        let process_identity =
+            lease_identity::ProcessIdentity::current().map_err(|error| match error {
+                lease_identity::ProcessIdentityError::Io(error) => DaemonError::Io(error),
+                lease_identity::ProcessIdentityError::Malformed(category) => {
+                    DaemonError::ControlLockFailed(category)
+                }
+            })?;
         let mut store = Store::open(config.database_path())?;
 
         let socket_path = config.admin_socket();
@@ -1328,15 +1365,53 @@ impl Daemon {
         // Establish endpoint exclusion before changing durable ownership. A
         // failed competing bind cannot leave a phantom generation lease.
         let now_ms = unix_millis()?;
+        if let Some(previous) = store
+            .status_snapshot_at(GENERATION_ID, now_ms)?
+            .generation()
+            && previous.lease_expires_ms() > now_ms
+        {
+            let previous_identity = lease_identity::ProcessIdentity {
+                boot_id: previous.boot_id().to_owned(),
+                pid: previous.holder_pid(),
+                starttime: previous.holder_starttime(),
+            };
+            let previous_live = previous_identity.is_live().map_err(|error| match error {
+                lease_identity::ProcessIdentityError::Io(error) => DaemonError::Io(error),
+                lease_identity::ProcessIdentityError::Malformed(category) => {
+                    DaemonError::ControlLockFailed(category)
+                }
+            })?;
+            if previous_live {
+                return Err(DaemonError::AlreadyRunning);
+            }
+            store.expire_generation_lease_owner(LeaseExpiryRequest {
+                generation_id: previous.generation_id(),
+                holder_id: previous.holder_id(),
+                epoch: previous.lease_epoch(),
+                owner: LeaseOwnerIdentity {
+                    boot_id: previous.boot_id(),
+                    pid: previous.holder_pid(),
+                    starttime: previous.holder_starttime(),
+                },
+                now_ms,
+            })?;
+        }
         let instance = format!("daemon-{}-{now_ms}", std::process::id());
         let instance_id = AdminInstanceId::new(instance)
             .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
-        let lease = match store.acquire_generation_lease(LeaseRequest {
-            generation_id: GENERATION_ID,
-            holder_id: instance_id.as_str(),
-            now_ms,
-            ttl_ms: LEASE_TTL_MS,
-        }) {
+        let lease = match store.acquire_generation_lease_owned(
+            LeaseRequest {
+                generation_id: GENERATION_ID,
+                holder_id: instance_id.as_str(),
+                now_ms,
+                ttl_ms: LEASE_TTL_MS,
+            },
+            LeaseOwnerIdentity {
+                boot_id: &process_identity.boot_id,
+                pid: process_identity.pid,
+                starttime: process_identity.starttime,
+            },
+        ) {
             Ok(lease) => lease,
             Err(error) => return Err(DaemonError::Store(error)),
         };
@@ -1626,6 +1701,7 @@ impl Daemon {
             ticket_intake,
             progress_endpoint: Some(progress_endpoint),
             disconnected_recovery,
+            _control_lock: control_lock,
         })
     }
 

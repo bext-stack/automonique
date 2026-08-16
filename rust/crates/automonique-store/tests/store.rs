@@ -3,19 +3,27 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 use automonique_store::{
-    InboxSubmission, IntakePauseRequest, IntakeResumeRequest, LeaseRenewal, LeaseRequest,
-    MAX_TRANSPORT_KEY_BYTES, OutboxClaimRequest, OutboxDelivery, OutboxEnqueue, OutboxFailure,
-    OutboxFailureDecision, OutboxPayloadRequest, OutboxReconciliationDecision,
-    OutboxReconciliationRequest, ReconciliationDecision, ReconciliationInboxState,
-    ReconciliationRequest, ReconciliationRunState, SCHEMA_VERSION, SchedulerClaim, Store,
-    TelegramBatchIngestion, TelegramPollerCommit, TelegramPollerLeaseIdentity,
-    TelegramPollerLeaseRenewal, TelegramPollerLeaseRequest, TelegramStoreDisposition,
-    TelegramStoreUpdate, TerminalRun, TerminalState, TransportPauseRequest, WorkClaim,
+    InboxSubmission, IntakePauseRequest, IntakeResumeRequest, LeaseExpiryRequest,
+    LeaseOwnerIdentity, LeaseRenewal, LeaseRequest, MAX_TRANSPORT_KEY_BYTES, OutboxClaimRequest,
+    OutboxDelivery, OutboxEnqueue, OutboxFailure, OutboxFailureDecision, OutboxPayloadRequest,
+    OutboxReconciliationDecision, OutboxReconciliationRequest, ReconciliationDecision,
+    ReconciliationInboxState, ReconciliationRequest, ReconciliationRunState, SCHEMA_VERSION,
+    SchedulerClaim, Store, TelegramBatchIngestion, TelegramPollerCommit,
+    TelegramPollerLeaseIdentity, TelegramPollerLeaseRenewal, TelegramPollerLeaseRequest,
+    TelegramStoreDisposition, TelegramStoreUpdate, TerminalRun, TerminalState,
+    TransportPauseRequest, WorkClaim,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
+
+const ZOMBIE_HELPER: &str = "AUTOMONIQUE_STORE_ZOMBIE_HELPER";
+const ZOMBIE_DATABASE: &str = "AUTOMONIQUE_STORE_ZOMBIE_DATABASE";
+const ZOMBIE_READY: &str = "AUTOMONIQUE_STORE_ZOMBIE_READY";
+const ZOMBIE_RESULT: &str = "AUTOMONIQUE_STORE_ZOMBIE_RESULT";
 
 struct PrivateDatabase {
     _directory: TempDir,
@@ -588,6 +596,239 @@ fn exact_fenced_release_allows_immediate_new_epoch_without_erasing_work() {
         })
         .expect_err("released work requires reconciliation");
     assert_eq!(refusal.category(), "reconciliation_required");
+}
+
+#[test]
+fn a_dead_owner_sweep_is_exact_and_the_old_epoch_cannot_write_after_takeover() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let old_owner = LeaseOwnerIdentity {
+        boot_id: "boot-a",
+        pid: 111,
+        starttime: 222,
+    };
+    let old = store
+        .acquire_generation_lease_owned(
+            LeaseRequest {
+                generation_id: "generation-a",
+                holder_id: "holder-a",
+                now_ms: 0,
+                ttl_ms: 100,
+            },
+            old_owner,
+        )
+        .expect("old lease");
+    let inbox_id = submit(&mut store, "delivery-zombie", "scope:zombie");
+    let run_id = claim(
+        &mut store,
+        inbox_id,
+        old.epoch,
+        "claim-zombie",
+        "scope:zombie",
+    );
+
+    let wrong_identity = store
+        .expire_generation_lease_owner(LeaseExpiryRequest {
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            epoch: old.epoch,
+            owner: LeaseOwnerIdentity {
+                starttime: 223,
+                ..old_owner
+            },
+            now_ms: 10,
+        })
+        .expect_err("PID-reuse identity must not sweep");
+    assert_eq!(wrong_identity.category(), "stale_epoch");
+    assert_eq!(
+        store
+            .status_snapshot("generation-a")
+            .expect("status")
+            .generation()
+            .expect("generation")
+            .lease_expires_ms(),
+        100
+    );
+
+    store
+        .expire_generation_lease_owner(LeaseExpiryRequest {
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            epoch: old.epoch,
+            owner: old_owner,
+            now_ms: 10,
+        })
+        .expect("exact dead owner sweep");
+    let successor = store
+        .acquire_generation_lease_owned(
+            LeaseRequest {
+                generation_id: "generation-a",
+                holder_id: "holder-new",
+                now_ms: 10,
+                ttl_ms: 100,
+            },
+            LeaseOwnerIdentity {
+                boot_id: "boot-a",
+                pid: 333,
+                starttime: 444,
+            },
+        )
+        .expect("successor");
+    assert!(successor.epoch > old.epoch);
+
+    let stale_write = store
+        .finish_run(TerminalRun {
+            run_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: old.epoch,
+            expected_revision: 1,
+            now_ms: 11,
+            state: TerminalState::Succeeded,
+            event_kind: "run.succeeded",
+            event_payload: b"zombie-result",
+            outbox_intent_key: "intent-zombie",
+            outbox_kind: "provider.reply",
+            outbox_payload: b"must-not-exist",
+        })
+        .expect_err("old holder write must be rejected");
+    assert_eq!(stale_write.category(), "stale_epoch");
+    assert_eq!(
+        store.run_snapshot(run_id).expect("run unchanged").state,
+        "running"
+    );
+    assert_eq!(store.outbox_count().expect("no zombie effect"), 0);
+}
+
+#[test]
+fn a_sigstopped_old_holder_cannot_commit_after_its_epoch_is_replaced() {
+    let database = PrivateDatabase::new();
+    // Open the successor before stopping the old process. `Store::open` also
+    // establishes WAL mode, which is setup work rather than part of the lease
+    // takeover this test is exercising.
+    let mut successor_store = Store::open(database.path()).expect("successor opens store");
+    let ready = database
+        .path()
+        .parent()
+        .expect("database parent")
+        .join("zombie.ready");
+    let result = ready.with_extension("result");
+    let mut child = Command::new(std::env::current_exe().expect("test executable"))
+        .arg("--exact")
+        .arg("zombie_holder_helper")
+        .env(ZOMBIE_HELPER, "1")
+        .env(ZOMBIE_DATABASE, database.path())
+        .env(ZOMBIE_READY, &ready)
+        .env(ZOMBIE_RESULT, &result)
+        .spawn()
+        .expect("spawn old holder");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "old holder never reached SIGSTOP"
+        );
+        assert!(
+            child.try_wait().expect("child status").is_none(),
+            "old holder exited before SIGSTOP"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let successor = successor_store
+        .acquire_generation_lease_owned(
+            LeaseRequest {
+                generation_id: "generation-a",
+                holder_id: "holder-successor",
+                now_ms: 100,
+                ttl_ms: 100,
+            },
+            LeaseOwnerIdentity {
+                boot_id: "boot-a",
+                pid: std::process::id(),
+                starttime: 999,
+            },
+        )
+        .expect("successor takes expired epoch");
+    assert!(successor.epoch > 1);
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("child pid")),
+        nix::sys::signal::Signal::SIGCONT,
+    )
+    .expect("resume old holder");
+    assert!(child.wait().expect("old holder status").success());
+    assert_eq!(
+        fs::read_to_string(&result).expect("stale result"),
+        "stale_epoch"
+    );
+    let run_id = fs::read_to_string(&ready)
+        .expect("run identity")
+        .parse::<i64>()
+        .expect("numeric run identity");
+    assert_eq!(
+        successor_store
+            .run_snapshot(run_id)
+            .expect("unchanged run")
+            .state,
+        "running"
+    );
+    assert_eq!(successor_store.outbox_count().expect("no zombie outbox"), 0);
+}
+
+#[test]
+fn zombie_holder_helper() {
+    if std::env::var_os(ZOMBIE_HELPER).is_none() {
+        return;
+    }
+    let database = PathBuf::from(std::env::var_os(ZOMBIE_DATABASE).expect("database path"));
+    let ready = PathBuf::from(std::env::var_os(ZOMBIE_READY).expect("ready path"));
+    let result = PathBuf::from(std::env::var_os(ZOMBIE_RESULT).expect("result path"));
+    let mut store = Store::open(&database).expect("old holder store");
+    let lease = store
+        .acquire_generation_lease_owned(
+            LeaseRequest {
+                generation_id: "generation-a",
+                holder_id: "holder-a",
+                now_ms: 0,
+                ttl_ms: 100,
+            },
+            LeaseOwnerIdentity {
+                boot_id: "boot-a",
+                pid: std::process::id(),
+                starttime: 111,
+            },
+        )
+        .expect("old holder lease");
+    let inbox_id = submit(&mut store, "delivery-sigstop", "scope:sigstop");
+    let run_id = claim(
+        &mut store,
+        inbox_id,
+        lease.epoch,
+        "claim-sigstop",
+        "scope:sigstop",
+    );
+    fs::write(&ready, run_id.to_string()).expect("publish ready");
+    nix::sys::signal::kill(nix::unistd::getpid(), nix::sys::signal::Signal::SIGSTOP)
+        .expect("self stop");
+    let category = store
+        .finish_run(TerminalRun {
+            run_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: lease.epoch,
+            expected_revision: 1,
+            now_ms: 3,
+            state: TerminalState::Succeeded,
+            event_kind: "run.succeeded",
+            event_payload: b"old-holder",
+            outbox_intent_key: "intent-sigstop",
+            outbox_kind: "provider.reply",
+            outbox_payload: b"must-not-exist",
+        })
+        .expect_err("stale old holder")
+        .category();
+    fs::write(result, category).expect("publish result");
 }
 
 #[test]

@@ -1194,9 +1194,9 @@ impl Component {
             // The generated admin command surface speaks `MajorVersion::FIRST`
             // and admits no other.
             Self::TypeScriptSdkSurface => (1, 1),
-            // `SCHEMA_VERSION` is 8, and the numbered migrations run an
-            // unbroken v1 -> v2 -> ... -> v8 chain, so a v1 file still opens.
-            Self::StoreSchema => (1, 8),
+            // `SCHEMA_VERSION` is 9, and the numbered migrations run an
+            // unbroken v1 -> v2 -> ... -> v9 chain, so a v1 file still opens.
+            Self::StoreSchema => (1, 9),
             // These sibling databases remain on their first schema.
             Self::CancelLedgerSchema | Self::GenerationAuditSchema | Self::RunSubmissionsSchema => {
                 (1, 1)

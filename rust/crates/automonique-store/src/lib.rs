@@ -42,7 +42,7 @@ use rusqlite::{
 };
 
 /// The only database schema this build can read and write.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 /// SQLite lock contention is bounded rather than waiting indefinitely.
 pub const BUSY_TIMEOUT: Duration = Duration::from_millis(2_000);
 
@@ -476,6 +476,24 @@ CREATE INDEX domain_events_by_trace ON domain_events(trace_id, event_id);
 CREATE INDEX outbox_by_trace ON outbox(trace_id, outbox_id);
 "#;
 
+/// Bind generation ownership to one kernel boot and one exact process.
+///
+/// Existing leases are expired during migration. Their owner identity was
+/// never recorded, so carrying them forward as live would turn an absence of
+/// evidence into authority. Subordinate leases remain as reconciliation
+/// evidence but become expired at the same boundary.
+const MIGRATE_V8_TO_V9: &str = r#"
+ALTER TABLE generations ADD COLUMN boot_id TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE generations ADD COLUMN holder_pid INTEGER NOT NULL DEFAULT 0
+    CHECK (holder_pid >= 0);
+ALTER TABLE generations ADD COLUMN holder_starttime INTEGER NOT NULL DEFAULT 0
+    CHECK (holder_starttime >= 0);
+UPDATE generations SET lease_expires_ms = 0;
+UPDATE work_locks SET expires_ms = 0;
+UPDATE telegram_poller_leases SET expires_ms = 0;
+UPDATE outbox SET lease_expires_ms = 0 WHERE state = 'in_flight';
+"#;
+
 /// A durable store error with stable refusal categories.
 #[derive(Debug)]
 pub enum StoreError {
@@ -629,6 +647,17 @@ pub struct GenerationLease {
     pub holder_id: String,
     pub epoch: u64,
     pub expires_ms: i64,
+    pub boot_id: String,
+    pub holder_pid: u32,
+    pub holder_starttime: u64,
+}
+
+/// Kernel identity bound to one generation lease holder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LeaseOwnerIdentity<'a> {
+    pub boot_id: &'a str,
+    pub pid: u32,
+    pub starttime: u64,
 }
 
 /// Parameters for acquiring a new or expired generation lease.
@@ -646,6 +675,15 @@ pub struct LeaseRenewal<'a> {
     pub epoch: u64,
     pub now_ms: i64,
     pub ttl_ms: i64,
+}
+
+/// Exact generation owner a startup sweep has proved is no longer live.
+pub struct LeaseExpiryRequest<'a> {
+    pub generation_id: &'a str,
+    pub holder_id: &'a str,
+    pub epoch: u64,
+    pub owner: LeaseOwnerIdentity<'a>,
+    pub now_ms: i64,
 }
 
 /// One live operator decision to close intake for a generation.
@@ -1242,6 +1280,9 @@ pub struct GenerationSnapshot {
     holder_id: String,
     lease_epoch: u64,
     lease_expires_ms: i64,
+    boot_id: String,
+    holder_pid: u32,
+    holder_starttime: u64,
 }
 
 impl GenerationSnapshot {
@@ -1268,6 +1309,18 @@ impl GenerationSnapshot {
     #[must_use]
     pub const fn lease_expires_ms(&self) -> i64 {
         self.lease_expires_ms
+    }
+    #[must_use]
+    pub fn boot_id(&self) -> &str {
+        &self.boot_id
+    }
+    #[must_use]
+    pub const fn holder_pid(&self) -> u32 {
+        self.holder_pid
+    }
+    #[must_use]
+    pub const fn holder_starttime(&self) -> u64 {
+        self.holder_starttime
     }
 }
 
@@ -1438,15 +1491,33 @@ impl Store {
         &mut self,
         request: LeaseRequest<'_>,
     ) -> Result<GenerationLease, StoreError> {
+        self.acquire_generation_lease_owned(
+            request,
+            LeaseOwnerIdentity {
+                boot_id: "untracked",
+                pid: 0,
+                starttime: 0,
+            },
+        )
+    }
+
+    /// Acquire a generation lease bound to an exact boot and process identity.
+    pub fn acquire_generation_lease_owned(
+        &mut self,
+        request: LeaseRequest<'_>,
+        owner: LeaseOwnerIdentity<'_>,
+    ) -> Result<GenerationLease, StoreError> {
         validate_id(request.generation_id, "generation_id")?;
         validate_id(request.holder_id, "holder_id")?;
+        validate_id(owner.boot_id, "boot_id")?;
         let expires_ms = checked_expiry(request.now_ms, request.ttl_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = transaction
             .query_row(
-                "SELECT lease_holder, lease_epoch, lease_expires_ms, revision
+                "SELECT lease_holder, lease_epoch, lease_expires_ms, revision,
+                        boot_id, holder_pid, holder_starttime
                  FROM generations WHERE generation_id = ?1",
                 [request.generation_id],
                 |row| {
@@ -1455,6 +1526,9 @@ impl Store {
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
                     ))
                 },
             )
@@ -1464,23 +1538,48 @@ impl Store {
             None => {
                 transaction.execute(
                     "INSERT INTO generations
-                     (generation_id, revision, state, lease_holder, lease_epoch, lease_expires_ms)
-                     VALUES (?1, 1, 'active', ?2, 1, ?3)",
-                    params![request.generation_id, request.holder_id, expires_ms],
+                     (generation_id, revision, state, lease_holder, lease_epoch,
+                      lease_expires_ms, boot_id, holder_pid, holder_starttime)
+                     VALUES (?1, 1, 'active', ?2, 1, ?3, ?4, ?5, ?6)",
+                    params![
+                        request.generation_id,
+                        request.holder_id,
+                        expires_ms,
+                        owner.boot_id,
+                        i64::from(owner.pid),
+                        to_db_u64(owner.starttime, "holder_starttime")?
+                    ],
                 )?;
                 (1_u64, 1_u64, true)
             }
-            Some((holder, raw_epoch, old_expiry, raw_revision)) => {
+            Some((
+                holder,
+                raw_epoch,
+                old_expiry,
+                raw_revision,
+                old_boot_id,
+                raw_pid,
+                raw_starttime,
+            )) => {
                 let epoch = from_db_u64(raw_epoch, "lease_epoch")?;
                 let revision = from_db_u64(raw_revision, "revision")?;
                 if old_expiry > request.now_ms {
-                    if holder == request.holder_id {
+                    if holder == request.holder_id
+                        && old_boot_id == owner.boot_id
+                        && u32::try_from(raw_pid)
+                            .map_err(|_| StoreError::MigrationInvariant("holder_pid"))?
+                            == owner.pid
+                        && from_db_u64(raw_starttime, "holder_starttime")? == owner.starttime
+                    {
                         transaction.commit()?;
                         return Ok(GenerationLease {
                             generation_id: request.generation_id.to_owned(),
                             holder_id: holder,
                             epoch,
                             expires_ms: old_expiry,
+                            boot_id: old_boot_id,
+                            holder_pid: owner.pid,
+                            holder_starttime: owner.starttime,
                         });
                     }
                     return Err(StoreError::LeaseHeld);
@@ -1489,17 +1588,35 @@ impl Store {
                 let next_revision = revision
                     .checked_add(1)
                     .ok_or(StoreError::InvalidField("generation_revision"))?;
-                transaction.execute(
+                let changed = transaction.execute(
                     "UPDATE generations SET revision = ?2, lease_holder = ?3,
-                     lease_epoch = ?4, lease_expires_ms = ?5 WHERE generation_id = ?1",
+                     lease_epoch = ?4, lease_expires_ms = ?5, boot_id = ?6,
+                     holder_pid = ?7, holder_starttime = ?8
+                     WHERE generation_id = ?1 AND lease_holder = ?9
+                       AND lease_epoch = ?10 AND lease_expires_ms = ?11
+                       AND boot_id = ?12 AND holder_pid = ?13
+                       AND holder_starttime = ?14 AND lease_expires_ms <= ?15",
                     params![
                         request.generation_id,
                         to_db_u64(next_revision, "generation_revision")?,
                         request.holder_id,
                         to_db_u64(next_epoch, "lease_epoch")?,
-                        expires_ms
+                        expires_ms,
+                        owner.boot_id,
+                        i64::from(owner.pid),
+                        to_db_u64(owner.starttime, "holder_starttime")?,
+                        holder,
+                        to_db_u64(epoch, "lease_epoch")?,
+                        old_expiry,
+                        old_boot_id,
+                        raw_pid,
+                        raw_starttime,
+                        request.now_ms
                     ],
                 )?;
+                if changed != 1 {
+                    return Err(StoreError::StaleEpoch);
+                }
                 (next_epoch, next_revision, true)
             }
         };
@@ -1520,6 +1637,9 @@ impl Store {
             holder_id: request.holder_id.to_owned(),
             epoch,
             expires_ms,
+            boot_id: owner.boot_id.to_owned(),
+            holder_pid: owner.pid,
+            holder_starttime: owner.starttime,
         })
     }
 
@@ -1550,6 +1670,18 @@ impl Store {
         if changed != 1 {
             return Err(StoreError::StaleEpoch);
         }
+        let owner = transaction.query_row(
+            "SELECT boot_id, holder_pid, holder_starttime FROM generations
+             WHERE generation_id = ?1 AND lease_holder = ?2 AND lease_epoch = ?3",
+            params![renewal.generation_id, renewal.holder_id, epoch],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
         transaction.execute(
             "UPDATE work_locks SET expires_ms = ?3
              WHERE generation_id = ?1 AND lease_epoch = ?2",
@@ -1561,7 +1693,106 @@ impl Store {
             holder_id: renewal.holder_id.to_owned(),
             epoch: renewal.epoch,
             expires_ms,
+            boot_id: owner.0,
+            holder_pid: u32::try_from(owner.1)
+                .map_err(|_| StoreError::MigrationInvariant("holder_pid"))?,
+            holder_starttime: from_db_u64(owner.2, "holder_starttime")?,
         })
+    }
+
+    /// Expire one exact owner identity after the caller proved it is dead.
+    ///
+    /// Every predicate is in the mutation itself. A PID-reuse race, a
+    /// successor acquisition, or any changed owner coordinate therefore turns
+    /// this into [`StoreError::StaleEpoch`] without writing a partial sweep.
+    pub fn expire_generation_lease_owner(
+        &mut self,
+        request: LeaseExpiryRequest<'_>,
+    ) -> Result<(), StoreError> {
+        validate_id(request.generation_id, "generation_id")?;
+        validate_id(request.holder_id, "holder_id")?;
+        validate_id(request.owner.boot_id, "boot_id")?;
+        validate_time(request.now_ms)?;
+        let epoch = to_db_u64(request.epoch, "lease_epoch")?;
+        let starttime = to_db_u64(request.owner.starttime, "holder_starttime")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let revision = transaction
+            .query_row(
+                "SELECT revision FROM generations
+                 WHERE generation_id = ?1 AND lease_holder = ?2 AND lease_epoch = ?3
+                   AND boot_id = ?4 AND holder_pid = ?5 AND holder_starttime = ?6
+                   AND lease_expires_ms > ?7",
+                params![
+                    request.generation_id,
+                    request.holder_id,
+                    epoch,
+                    request.owner.boot_id,
+                    i64::from(request.owner.pid),
+                    starttime,
+                    request.now_ms
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(StoreError::StaleEpoch)?;
+        let next_revision = from_db_u64(revision, "generation_revision")?
+            .checked_add(1)
+            .ok_or(StoreError::InvalidField("generation_revision"))?;
+        let changed = transaction.execute(
+            "UPDATE generations SET revision = ?8, lease_expires_ms = ?7
+             WHERE generation_id = ?1 AND lease_holder = ?2 AND lease_epoch = ?3
+               AND boot_id = ?4 AND holder_pid = ?5 AND holder_starttime = ?6
+               AND lease_expires_ms > ?7",
+            params![
+                request.generation_id,
+                request.holder_id,
+                epoch,
+                request.owner.boot_id,
+                i64::from(request.owner.pid),
+                starttime,
+                request.now_ms,
+                to_db_u64(next_revision, "generation_revision")?
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::StaleEpoch);
+        }
+        transaction.execute(
+            "UPDATE work_locks SET expires_ms = ?4
+             WHERE generation_id = ?1 AND lease_epoch = ?2 AND expires_ms > ?3",
+            params![request.generation_id, epoch, request.now_ms, request.now_ms],
+        )?;
+        transaction.execute(
+            "UPDATE telegram_poller_leases SET revision = revision + 1, expires_ms = ?5
+             WHERE generation_id = ?1 AND holder_id = ?2
+               AND authority_lease_epoch = ?3 AND expires_ms > ?4",
+            params![
+                request.generation_id,
+                request.holder_id,
+                epoch,
+                request.now_ms,
+                request.now_ms
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE outbox SET lease_expires_ms = ?4
+             WHERE state = 'in_flight' AND lease_generation_id = ?1
+               AND lease_epoch = ?2 AND lease_expires_ms > ?3",
+            params![request.generation_id, epoch, request.now_ms, request.now_ms],
+        )?;
+        append_event(
+            &transaction,
+            "generation",
+            request.generation_id,
+            next_revision,
+            request.now_ms,
+            "generation.lease_owner_dead",
+            request.holder_id.as_bytes(),
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Release one exact live generation lease without abandoning active work.
@@ -2098,10 +2329,13 @@ impl Store {
                 let next_revision = from_db_u64(raw_revision, "telegram_poller_revision")?
                     .checked_add(1)
                     .ok_or(StoreError::InvalidField("telegram_poller_revision"))?;
-                transaction.execute(
+                let changed = transaction.execute(
                     "UPDATE telegram_poller_leases SET revision = ?2, generation_id = ?3,
                      holder_id = ?4, authority_lease_epoch = ?5, poller_epoch = ?6,
-                     expires_ms = ?7 WHERE bot_id = ?1",
+                     expires_ms = ?7 WHERE bot_id = ?1
+                       AND generation_id = ?8 AND holder_id = ?9
+                       AND authority_lease_epoch = ?10 AND poller_epoch = ?11
+                       AND expires_ms = ?12",
                     params![
                         request.bot_id,
                         to_db_u64(next_revision, "telegram_poller_revision")?,
@@ -2109,9 +2343,17 @@ impl Store {
                         request.holder_id,
                         to_db_u64(request.authority_lease_epoch, "authority_lease_epoch")?,
                         to_db_u64(next_epoch, "telegram_poller_epoch")?,
-                        expires_ms
+                        expires_ms,
+                        generation_id,
+                        holder_id,
+                        raw_authority_epoch,
+                        raw_epoch,
+                        old_expiry
                     ],
                 )?;
+                if changed != 1 {
+                    return Err(StoreError::StaleEpoch);
+                }
                 next_epoch
             }
         };
@@ -3002,14 +3244,19 @@ impl Store {
 
         let run_changed = transaction.execute(
             "UPDATE runs SET state = ?2, revision = ?3, finished_ms = ?4,
-             terminal_payload = ?5, outbox_intent_key = ?6 WHERE run_id = ?1",
+             terminal_payload = ?5, outbox_intent_key = ?6
+             WHERE run_id = ?1 AND generation_id = ?7 AND lease_epoch = ?8
+               AND state = 'running' AND revision = ?9",
             params![
                 request.run_id,
                 "failed",
                 to_db_u64(next_revision, "run_revision")?,
                 request.now_ms,
                 payload,
-                request.decision_key
+                request.decision_key,
+                request.expected_generation_id,
+                to_db_u64(request.expected_lease_epoch, "lease_epoch")?,
+                to_db_u64(revision, "run_revision")?
             ],
         )?;
         if run_changed != 1 {
@@ -3125,8 +3372,15 @@ impl Store {
             return Err(StoreError::Sqlite(error));
         }
         let outbox_id = transaction.last_insert_rowid();
-        let lock_deleted =
-            transaction.execute("DELETE FROM work_locks WHERE run_id = ?1", [request.run_id])?;
+        let lock_deleted = transaction.execute(
+            "DELETE FROM work_locks WHERE run_id = ?1
+             AND generation_id = ?2 AND lease_epoch = ?3",
+            params![
+                request.run_id,
+                request.expected_generation_id,
+                to_db_u64(request.expected_lease_epoch, "lease_epoch")?
+            ],
+        )?;
         if lock_deleted != 1 {
             return Err(StoreError::StaleEpoch);
         }
@@ -3265,18 +3519,26 @@ impl Store {
             return Err(StoreError::StaleEpoch);
         }
 
-        transaction.execute(
+        let run_changed = transaction.execute(
             "UPDATE runs SET state = ?2, revision = ?3, finished_ms = ?4,
-             terminal_payload = ?5, outbox_intent_key = ?6 WHERE run_id = ?1",
+             terminal_payload = ?5, outbox_intent_key = ?6
+             WHERE run_id = ?1 AND generation_id = ?7 AND lease_epoch = ?8
+               AND state = 'running' AND revision = ?9",
             params![
                 terminal.run_id,
                 terminal.state.as_str(),
                 to_db_u64(next_revision, "run_revision")?,
                 terminal.now_ms,
                 terminal.event_payload,
-                terminal.outbox_intent_key
+                terminal.outbox_intent_key,
+                terminal.generation_id,
+                to_db_u64(terminal.lease_epoch, "lease_epoch")?,
+                to_db_u64(revision, "run_revision")?
             ],
         )?;
+        if run_changed != 1 {
+            return Err(StoreError::StaleEpoch);
+        }
         let inbox_state = match terminal.state {
             TerminalState::Succeeded => "completed",
             TerminalState::Failed => "failed",
@@ -3393,10 +3655,18 @@ impl Store {
             return Err(StoreError::Sqlite(error));
         }
         let outbox_id = transaction.last_insert_rowid();
-        transaction.execute(
-            "DELETE FROM work_locks WHERE run_id = ?1",
-            [terminal.run_id],
+        let lock_deleted = transaction.execute(
+            "DELETE FROM work_locks WHERE run_id = ?1
+             AND generation_id = ?2 AND lease_epoch = ?3",
+            params![
+                terminal.run_id,
+                terminal.generation_id,
+                to_db_u64(terminal.lease_epoch, "lease_epoch")?
+            ],
         )?;
+        if lock_deleted != 1 {
+            return Err(StoreError::StaleEpoch);
+        }
         transaction.commit()?;
         Ok(TerminalReceipt {
             event_id,
@@ -3793,13 +4063,20 @@ impl Store {
         let changed = transaction.execute(
             "UPDATE outbox SET state = 'delivered', revision = ?2,
                     delivery_receipt_key = ?3, delivered_ms = ?4
-             WHERE outbox_id = ?1 AND state = 'in_flight' AND revision = ?5",
+             WHERE outbox_id = ?1 AND state = 'in_flight' AND revision = ?5
+               AND lease_generation_id = ?6 AND lease_holder = ?7
+               AND lease_epoch = ?8 AND lease_token = ?9 AND attempts = ?10",
             params![
                 delivery.outbox_id,
                 to_db_u64(next_revision, "outbox_revision")?,
                 delivery.receipt_key,
                 delivery.now_ms,
-                row.1
+                row.1,
+                delivery.generation_id,
+                delivery.holder_id,
+                to_db_u64(delivery.lease_epoch, "outbox_lease_epoch")?,
+                delivery.lease_token,
+                to_db_u64(delivery.expected_attempt, "outbox_attempt")?
             ],
         );
         map_outbox_unique(changed)?;
@@ -3876,7 +4153,9 @@ impl Store {
                     lease_token = NULL, lease_generation_id = NULL,
                     lease_holder = NULL, lease_epoch = NULL, lease_expires_ms = NULL,
                     delivered_ms = ?5, last_error = ?6
-             WHERE outbox_id = ?1 AND state = 'in_flight' AND revision = ?7",
+             WHERE outbox_id = ?1 AND state = 'in_flight' AND revision = ?7
+               AND lease_generation_id = ?8 AND lease_holder = ?9
+               AND lease_epoch = ?10 AND lease_token = ?11 AND attempts = ?12",
             params![
                 failure.outbox_id,
                 state,
@@ -3884,7 +4163,12 @@ impl Store {
                 available_ms,
                 delivered_ms,
                 reason,
-                row.1
+                row.1,
+                failure.generation_id,
+                failure.holder_id,
+                to_db_u64(failure.lease_epoch, "outbox_lease_epoch")?,
+                failure.lease_token,
+                to_db_u64(failure.expected_attempt, "outbox_attempt")?
             ],
         )?;
         if changed != 1 {
@@ -4131,7 +4415,9 @@ impl Store {
         let changed = transaction.execute(
             "UPDATE outbox SET state = ?2, revision = ?3,
                     delivery_receipt_key = ?4, delivered_ms = ?5, last_error = ?6
-             WHERE outbox_id = ?1 AND state = 'in_flight' AND revision = ?7",
+             WHERE outbox_id = ?1 AND state = 'in_flight' AND revision = ?7
+               AND lease_generation_id = ?8 AND lease_epoch = ?9
+               AND lease_token = ?10 AND attempts = ?11",
             params![
                 request.outbox_id,
                 state,
@@ -4139,7 +4425,11 @@ impl Store {
                 receipt_key,
                 request.now_ms,
                 last_error,
-                row.1
+                row.1,
+                request.expected_generation_id,
+                to_db_u64(request.expected_lease_epoch, "outbox_lease_epoch")?,
+                request.expected_lease_token,
+                to_db_u64(request.expected_attempt, "outbox_attempt")?
             ],
         );
         map_outbox_unique(changed)?;
@@ -4205,7 +4495,7 @@ impl Store {
         let generation = transaction
             .query_row(
                 "SELECT generation_id, revision, state, lease_holder, lease_epoch,
-                        lease_expires_ms
+                        lease_expires_ms, boot_id, holder_pid, holder_starttime
                  FROM generations WHERE generation_id = ?1",
                 [generation_id],
                 |row| {
@@ -4216,6 +4506,9 @@ impl Store {
                         row.get::<_, String>(3)?,
                         row.get::<_, i64>(4)?,
                         row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
                     ))
                 },
             )
@@ -4228,6 +4521,10 @@ impl Store {
                     holder_id: row.3,
                     lease_epoch: from_db_u64(row.4, "lease_epoch")?,
                     lease_expires_ms: row.5,
+                    boot_id: row.6,
+                    holder_pid: u32::try_from(row.7)
+                        .map_err(|_| StoreError::MigrationInvariant("holder_pid"))?,
+                    holder_starttime: from_db_u64(row.8, "holder_starttime")?,
                 })
             })
             .transpose()?;
@@ -4405,7 +4702,8 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
         migrate_v4_to_v5(connection)?;
         migrate_v5_to_v6(connection)?;
         migrate_v6_to_v7(connection)?;
-        return migrate_v7_to_v8(connection);
+        migrate_v7_to_v8(connection)?;
+        return migrate_v8_to_v9(connection);
     }
     if version == 2 {
         migrate_v2_to_v3(connection)?;
@@ -4413,32 +4711,41 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
         migrate_v4_to_v5(connection)?;
         migrate_v5_to_v6(connection)?;
         migrate_v6_to_v7(connection)?;
-        return migrate_v7_to_v8(connection);
+        migrate_v7_to_v8(connection)?;
+        return migrate_v8_to_v9(connection);
     }
     if version == 3 {
         migrate_v3_to_v4(connection)?;
         migrate_v4_to_v5(connection)?;
         migrate_v5_to_v6(connection)?;
         migrate_v6_to_v7(connection)?;
-        return migrate_v7_to_v8(connection);
+        migrate_v7_to_v8(connection)?;
+        return migrate_v8_to_v9(connection);
     }
     if version == 4 {
         migrate_v4_to_v5(connection)?;
         migrate_v5_to_v6(connection)?;
         migrate_v6_to_v7(connection)?;
-        return migrate_v7_to_v8(connection);
+        migrate_v7_to_v8(connection)?;
+        return migrate_v8_to_v9(connection);
     }
     if version == 5 {
         migrate_v5_to_v6(connection)?;
         migrate_v6_to_v7(connection)?;
-        return migrate_v7_to_v8(connection);
+        migrate_v7_to_v8(connection)?;
+        return migrate_v8_to_v9(connection);
     }
     if version == 6 {
         migrate_v6_to_v7(connection)?;
-        return migrate_v7_to_v8(connection);
+        migrate_v7_to_v8(connection)?;
+        return migrate_v8_to_v9(connection);
     }
     if version == 7 {
-        return migrate_v7_to_v8(connection);
+        migrate_v7_to_v8(connection)?;
+        return migrate_v8_to_v9(connection);
+    }
+    if version == 8 {
+        return migrate_v8_to_v9(connection);
     }
     if version != 0 {
         return Err(StoreError::SchemaVersion {
@@ -4465,6 +4772,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
     transaction.execute_batch(MIGRATE_V5_TO_V6)?;
     transaction.execute_batch(MIGRATE_V6_TO_V7)?;
     transaction.execute_batch(MIGRATE_V7_TO_V8)?;
+    transaction.execute_batch(MIGRATE_V8_TO_V9)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -4513,6 +4821,14 @@ fn migrate_v6_to_v7(connection: &mut Connection) -> Result<(), StoreError> {
 fn migrate_v7_to_v8(connection: &mut Connection) -> Result<(), StoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(MIGRATE_V7_TO_V8)?;
+    transaction.pragma_update(None, "user_version", 8)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v8_to_v9(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(MIGRATE_V8_TO_V9)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -5618,6 +5934,44 @@ mod migration_tests {
             .expect("v6 marker");
     }
 
+    fn canonical_v8(connection: &mut Connection) {
+        canonical_v6(connection);
+        connection
+            .execute_batch(MIGRATE_V6_TO_V7)
+            .expect("canonical v7 schema");
+        connection
+            .execute_batch(MIGRATE_V7_TO_V8)
+            .expect("canonical v8 schema");
+        connection
+            .pragma_update(None, "user_version", 8)
+            .expect("v8 marker");
+    }
+
+    #[test]
+    fn v8_ownerless_leases_migrate_expired_with_explicit_legacy_identity() {
+        let mut connection = Connection::open_in_memory().expect("memory database");
+        canonical_v8(&mut connection);
+        connection
+            .execute(
+                "INSERT INTO generations
+                 (generation_id, revision, state, lease_holder, lease_epoch, lease_expires_ms)
+                 VALUES ('foreground', 4, 'active', 'old-holder', 7, 900)",
+                [],
+            )
+            .expect("v8 lease");
+
+        initialize_or_validate_schema(&mut connection).expect("v9 migration");
+        let row: (i64, String, i64, i64) = connection
+            .query_row(
+                "SELECT lease_expires_ms, boot_id, holder_pid, holder_starttime
+                 FROM generations WHERE generation_id = 'foreground'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("migrated identity");
+        assert_eq!(row, (0, "legacy".to_owned(), 0, 0));
+    }
+
     #[test]
     fn fresh_database_initializes_at_the_pause_bearing_version() {
         let mut connection = Connection::open_in_memory().expect("memory database");
@@ -5626,7 +5980,7 @@ mod migration_tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         let transport_pauses: i64 = connection
             .query_row("SELECT count(*) FROM transport_pauses", [], |row| {
                 row.get(0)
@@ -5801,7 +6155,11 @@ mod migration_tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .expect("preserved generation");
-        assert_eq!(generation, (3, "holder-v5".to_owned(), 4, 900));
+        assert_eq!(
+            generation,
+            (3, "holder-v5".to_owned(), 4, 0),
+            "a lease with no process identity must migrate expired"
+        );
         let poller: (i64, String, i64) = connection
             .query_row(
                 "SELECT revision, holder_id, poller_epoch FROM telegram_poller_leases
@@ -5961,7 +6319,7 @@ mod migration_tests {
             let version: u32 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap_or_else(|error| panic!("{label} version: {error}"));
-            assert_eq!(version, SCHEMA_VERSION, "{label} stopped short of v8");
+            assert_eq!(version, SCHEMA_VERSION, "{label} stopped short of v9");
             connection
                 .execute(
                     "INSERT INTO transport_pauses
