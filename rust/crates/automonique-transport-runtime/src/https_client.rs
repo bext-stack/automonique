@@ -219,6 +219,8 @@ enum WireMethod {
     SetMyCommands,
     AnswerCallbackQuery,
     EditMessageReplyMarkup,
+    SendMessageDraft,
+    EditMessageText,
 }
 
 impl WireMethod {
@@ -230,9 +232,50 @@ impl WireMethod {
             Self::SetMyCommands => "setMyCommands",
             Self::AnswerCallbackQuery => "answerCallbackQuery",
             Self::EditMessageReplyMarkup => "editMessageReplyMarkup",
+            Self::SendMessageDraft => "sendMessageDraft",
+            Self::EditMessageText => "editMessageText",
         }
     }
+
+    /// Every variant, in declaration order.
+    ///
+    /// Private, like the enum, and compiled only for the check it exists for:
+    /// the lock is *verified* against [`ALL_WIRE_METHOD_NAMES`], and through
+    /// that against the call budget's own closed vocabulary, without opening a
+    /// way to construct one from outside or shipping a census production never
+    /// reads.
+    #[cfg(test)]
+    const ALL: [Self; 8] = [
+        Self::GetUpdates,
+        Self::SendMessage,
+        Self::SetMessageReaction,
+        Self::SetMyCommands,
+        Self::AnswerCallbackQuery,
+        Self::EditMessageReplyMarkup,
+        Self::SendMessageDraft,
+        Self::EditMessageText,
+    ];
 }
+
+/// The complete set of method names this module can render, for the sibling
+/// module that has to budget every one of them.
+///
+/// Names rather than variants: [`WireMethod`] stays private, so what crosses to
+/// the budget's own tests is the observable half of the lock — what a host could
+/// see on the wire — and never a value a caller could hand back to build a
+/// request from. Compiled only under test, because it is evidence rather than
+/// machinery: nothing in production reads a method name from a list.
+#[cfg(test)]
+pub(crate) const ALL_WIRE_METHOD_NAMES: [&str; 8] = [
+    "getUpdates",
+    "sendMessage",
+    "setMessageReaction",
+    "setMyCommands",
+    "answerCallbackQuery",
+    "editMessageReplyMarkup",
+    "sendMessageDraft",
+    "editMessageText",
+];
 
 struct PreparedRequest {
     url: String,
@@ -827,6 +870,167 @@ impl EditMessageReplyMarkupRequest {
     }
 }
 
+/// A validated `sendMessageDraft` body.
+///
+/// # What a draft is
+///
+/// The text Telegram shows in a chat as *being composed*, rather than a message
+/// in the transcript. Each one replaces its predecessor and none of them is
+/// history, which is why this product streams a run's progress through it and
+/// still delivers the final answer as an ordinary message through the durable
+/// outbox: a draft that was skipped, superseded or refused costs nothing.
+///
+/// # The field set, and what could not be checked here
+///
+/// `chat_id` and `text`, and deliberately nothing else. The method is newer than
+/// the Bot API this build was written against and could not be exercised against
+/// `api.telegram.org` from the environment this was developed in, so the body is
+/// pinned to the two fields the method cannot mean anything without — the same
+/// pair [`SendMessageRequest`] renders in its plain form. Every optional field
+/// is omitted rather than guessed: a rendered field this module could not verify
+/// is a request Telegram may reject for a reason no refusal here would name.
+///
+/// A rejection is expected to be *detected*, not retried. See
+/// [`TelegramOutboundClient`]: a host that gets a non-200 for this method
+/// latches the fact and falls back to [`EditMessageTextRequest`], which is
+/// documented, long-standing, and the path the streaming tests exercise.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SendMessageDraftRequest {
+    chat_id: i64,
+    text: String,
+}
+
+impl SendMessageDraftRequest {
+    /// Validate one draft snapshot.
+    ///
+    /// The text is bounded exactly as a message's is — the same
+    /// [`MAX_SEND_MESSAGE_TEXT_UNITS`] UTF-16 ceiling and the same control-
+    /// character refusal — because a draft quotes provider output and a
+    /// transcript-shaped ceiling is the one Telegram enforces on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboundRefusal::ChatId`] for a zero chat and
+    /// [`OutboundRefusal::Text`] for text outside the message bounds.
+    pub fn new(chat_id: i64, text: impl Into<String>) -> Result<Self, OutboundRefusal> {
+        let text = text.into();
+        if chat_id == 0 {
+            return Err(OutboundRefusal::ChatId);
+        }
+        if !is_sendable_text(&text) {
+            return Err(OutboundRefusal::Text);
+        }
+        Ok(Self { chat_id, text })
+    }
+
+    /// Chat the draft is composed in.
+    #[must_use]
+    pub const fn chat_id(&self) -> i64 {
+        self.chat_id
+    }
+
+    /// The validated snapshot.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+/// A draft quotes a run's output, so `Debug` reports its size and never its
+/// bytes — the same discipline [`SendMessageRequest`] follows.
+impl fmt::Debug for SendMessageDraftRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SendMessageDraftRequest")
+            .field("chat_id", &self.chat_id)
+            .field(
+                "text",
+                &format_args!("<redacted:{} bytes>", self.text.len()),
+            )
+            .finish()
+    }
+}
+
+/// A validated `editMessageText` body.
+///
+/// The documented fallback for streaming, and the reason it ships beside
+/// [`SendMessageDraftRequest`] rather than after it: a host that discovers the
+/// draft method is unavailable has to have somewhere to go in the same build,
+/// not in the next one.
+///
+/// Only the three required fields are rendered. No `parse_mode` and no
+/// `entities`: the text is a run's own output and giving it markup semantics
+/// would let provider output decide how it is displayed.
+#[derive(Clone, Eq, PartialEq)]
+pub struct EditMessageTextRequest {
+    chat_id: i64,
+    message_id: i64,
+    text: String,
+}
+
+impl EditMessageTextRequest {
+    /// Validate one replacement of an existing message's text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboundRefusal::ChatId`] for a zero chat,
+    /// [`OutboundRefusal::MessageId`] for a non-positive message id, and
+    /// [`OutboundRefusal::Text`] for text outside the message bounds.
+    pub fn new(
+        chat_id: i64,
+        message_id: i64,
+        text: impl Into<String>,
+    ) -> Result<Self, OutboundRefusal> {
+        let text = text.into();
+        if chat_id == 0 {
+            return Err(OutboundRefusal::ChatId);
+        }
+        if message_id <= 0 {
+            return Err(OutboundRefusal::MessageId);
+        }
+        if !is_sendable_text(&text) {
+            return Err(OutboundRefusal::Text);
+        }
+        Ok(Self {
+            chat_id,
+            message_id,
+            text,
+        })
+    }
+
+    /// Chat holding the edited message.
+    #[must_use]
+    pub const fn chat_id(&self) -> i64 {
+        self.chat_id
+    }
+
+    /// Message whose text is replaced.
+    #[must_use]
+    pub const fn message_id(&self) -> i64 {
+        self.message_id
+    }
+
+    /// The validated replacement text.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+impl fmt::Debug for EditMessageTextRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EditMessageTextRequest")
+            .field("chat_id", &self.chat_id)
+            .field("message_id", &self.message_id)
+            .field(
+                "text",
+                &format_args!("<redacted:{} bytes>", self.text.len()),
+            )
+            .finish()
+    }
+}
+
 /// One entry of Telegram's advertised command menu.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TelegramBotCommand {
@@ -950,6 +1154,18 @@ pub enum TelegramOutbound {
     /// "the single-use coordinate refuses a second press" into something the
     /// operator can see rather than discover.
     EditMessageReplyMarkup(EditMessageReplyMarkupRequest),
+    /// Show one streaming snapshot as the chat's composing draft.
+    ///
+    /// Ephemeral by construction: it is replaced by the next snapshot and by
+    /// the final answer, and it is never staged in a durable outbox. See
+    /// [`SendMessageDraftRequest`] for the field set and for what a rejection
+    /// means.
+    SendMessageDraft(SendMessageDraftRequest),
+    /// Replace the text of one message this bot already sent.
+    ///
+    /// The streaming fallback, for a deployment whose Bot API does not offer
+    /// the draft method.
+    EditMessageText(EditMessageTextRequest),
 }
 
 impl TelegramOutbound {
@@ -960,6 +1176,8 @@ impl TelegramOutbound {
             Self::SetMyCommands(_) => WireMethod::SetMyCommands,
             Self::AnswerCallbackQuery(_) => WireMethod::AnswerCallbackQuery,
             Self::EditMessageReplyMarkup(_) => WireMethod::EditMessageReplyMarkup,
+            Self::SendMessageDraft(_) => WireMethod::SendMessageDraft,
+            Self::EditMessageText(_) => WireMethod::EditMessageText,
         }
     }
 
@@ -967,6 +1185,25 @@ impl TelegramOutbound {
     #[must_use]
     pub const fn method_name(&self) -> &'static str {
         self.wire_method().as_str()
+    }
+
+    /// The chat this request addresses, when it addresses one.
+    ///
+    /// `None` for the two methods that are about the bot rather than a
+    /// conversation — the command menu, and a callback acknowledgement, which
+    /// Telegram addresses by the press's own identifier. A call budget needs
+    /// this to know which per-chat ceiling to count against, and a method with
+    /// no chat counts against the bot-wide one alone.
+    #[must_use]
+    pub const fn chat_id(&self) -> Option<i64> {
+        match self {
+            Self::SendMessage(request) => Some(request.chat_id),
+            Self::SetMessageReaction(request) => Some(request.chat_id),
+            Self::EditMessageReplyMarkup(request) => Some(request.chat_id),
+            Self::SendMessageDraft(request) => Some(request.chat_id),
+            Self::EditMessageText(request) => Some(request.chat_id),
+            Self::SetMyCommands(_) | Self::AnswerCallbackQuery(_) => None,
+        }
     }
 
     /// The exact JSON body that will be sent, in a fixed field order.
@@ -1025,6 +1262,26 @@ impl TelegramOutbound {
                     // keyboard", and it is what strips a decided message.
                     None => body.push_str("{\"inline_keyboard\":[]}"),
                 }
+                body.push('}');
+            }
+            // The two streaming bodies carry no optional field at all: see
+            // `SendMessageDraftRequest` for why the draft's field set is pinned
+            // this narrowly, and `EditMessageTextRequest` for why the fallback
+            // renders no parse mode over a run's own output.
+            Self::SendMessageDraft(request) => {
+                body.push_str("{\"chat_id\":");
+                body.push_str(&request.chat_id.to_string());
+                body.push_str(",\"text\":");
+                push_json_string(&mut body, &request.text);
+                body.push('}');
+            }
+            Self::EditMessageText(request) => {
+                body.push_str("{\"chat_id\":");
+                body.push_str(&request.chat_id.to_string());
+                body.push_str(",\"message_id\":");
+                body.push_str(&request.message_id.to_string());
+                body.push_str(",\"text\":");
+                push_json_string(&mut body, &request.text);
                 body.push('}');
             }
             Self::SetMyCommands(request) => {
@@ -1384,6 +1641,37 @@ mod tests {
         assert!(timeout.as_millis() < crate::TELEGRAM_HTTP_LEASE_MARGIN_MS as u128 + 50_000);
     }
 
+    /// The streaming methods are outbound calls and are bounded like every other
+    /// one: a draft cannot hold a connection open long enough to eat into a
+    /// long poll's lease margin, because it is issued under the outbound budget
+    /// and never the long-poll one.
+    #[test]
+    fn streaming_calls_stay_inside_the_outbound_budget_and_the_lease_margin() {
+        let token = OpaqueBotToken::new(b"42:fixture-token".to_vec()).expect("token");
+        let outbound_budget = Duration::from_secs(OUTBOUND_REQUEST_TIMEOUT_SECONDS);
+        for request in [
+            TelegramOutbound::SendMessageDraft(
+                SendMessageDraftRequest::new(7, "thinking").expect("draft"),
+            ),
+            TelegramOutbound::EditMessageText(
+                EditMessageTextRequest::new(7, 3, "thinking").expect("edit"),
+            ),
+        ] {
+            let method = request.method_name();
+            // Every outbound plan this module prepares is issued with the same
+            // whole-request budget; there is no per-method timeout to drift.
+            PreparedRequest::from_outbound(&outbound_plan(&token, request))
+                .unwrap_or_else(|error| panic!("{method} prepares: {error:?}"));
+            assert!(
+                outbound_budget < request_timeout(50),
+                "{method} must never outlive an inbound long poll"
+            );
+            assert!(
+                outbound_budget.as_millis() < crate::TELEGRAM_HTTP_LEASE_MARGIN_MS as u128 + 50_000
+            );
+        }
+    }
+
     #[test]
     fn cancellation_before_io_is_closed() {
         let token = OpaqueBotToken::new(b"42:fixture-token".to_vec()).expect("token");
@@ -1501,6 +1789,171 @@ mod tests {
             WireMethod::EditMessageReplyMarkup.as_str(),
             "editMessageReplyMarkup"
         );
+        assert_eq!(WireMethod::SendMessageDraft.as_str(), "sendMessageDraft");
+        assert_eq!(WireMethod::EditMessageText.as_str(), "editMessageText");
+
+        let drafting = TelegramOutbound::SendMessageDraft(
+            SendMessageDraftRequest::new(-1_001, "thinking").expect("draft"),
+        );
+        let drafting = PreparedRequest::from_outbound(&outbound_plan(&token, drafting))
+            .expect("prepare draft");
+        assert_eq!(
+            drafting.url,
+            "https://api.telegram.org/bot42:fixture-token/sendMessageDraft"
+        );
+        let editing = TelegramOutbound::EditMessageText(
+            EditMessageTextRequest::new(-1_001, 17, "thinking").expect("edit"),
+        );
+        let editing =
+            PreparedRequest::from_outbound(&outbound_plan(&token, editing)).expect("prepare edit");
+        assert_eq!(
+            editing.url,
+            "https://api.telegram.org/bot42:fixture-token/editMessageText"
+        );
+    }
+
+    /// The lock's own census. Every variant renders exactly the name the sibling
+    /// budget module budgets it under, and the exported list is that census
+    /// rather than a second one somebody has to remember to update.
+    #[test]
+    fn the_exported_method_names_are_exactly_the_renderable_paths() {
+        let rendered: Vec<&str> = WireMethod::ALL
+            .iter()
+            .map(|method| method.as_str())
+            .collect();
+        assert_eq!(rendered, ALL_WIRE_METHOD_NAMES.to_vec());
+        let mut unique = rendered.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), WireMethod::ALL.len());
+        // Exhaustive by construction: a new variant that is not placed in `ALL`
+        // fails this match rather than silently escaping the census.
+        for method in WireMethod::ALL {
+            match method {
+                WireMethod::GetUpdates
+                | WireMethod::SendMessage
+                | WireMethod::SetMessageReaction
+                | WireMethod::SetMyCommands
+                | WireMethod::AnswerCallbackQuery
+                | WireMethod::EditMessageReplyMarkup
+                | WireMethod::SendMessageDraft
+                | WireMethod::EditMessageText => {}
+            }
+        }
+    }
+
+    /// Byte-exact, because the draft body could not be validated against a live
+    /// `api.telegram.org` and the fixture is therefore the whole specification
+    /// of what this build sends.
+    #[test]
+    fn a_draft_body_is_canonical_and_carries_only_the_pinned_fields() {
+        let draft = TelegramOutbound::SendMessageDraft(
+            SendMessageDraftRequest::new(-1_001, "run 7: reading files").expect("draft"),
+        );
+        assert_eq!(draft.method_name(), "sendMessageDraft");
+        assert_eq!(
+            draft.canonical_body(),
+            r#"{"chat_id":-1001,"text":"run 7: reading files"}"#
+        );
+        assert_eq!(draft.chat_id(), Some(-1_001));
+
+        let hostile = TelegramOutbound::SendMessageDraft(
+            SendMessageDraftRequest::new(7, "quote\" slash\\ line\n tab\t").expect("draft"),
+        );
+        assert_eq!(
+            hostile.canonical_body(),
+            r#"{"chat_id":7,"text":"quote\" slash\\ line\n tab\t"}"#
+        );
+
+        // The same bounds a message carries, because the same provider output
+        // reaches both.
+        assert_eq!(
+            SendMessageDraftRequest::new(0, "hi").err(),
+            Some(OutboundRefusal::ChatId)
+        );
+        assert_eq!(
+            SendMessageDraftRequest::new(7, "").err(),
+            Some(OutboundRefusal::Text)
+        );
+        assert_eq!(
+            SendMessageDraftRequest::new(7, "bell\u{7}").err(),
+            Some(OutboundRefusal::Text)
+        );
+        let at_limit = "a".repeat(MAX_SEND_MESSAGE_TEXT_UNITS);
+        assert!(SendMessageDraftRequest::new(7, at_limit.clone()).is_ok());
+        assert_eq!(
+            SendMessageDraftRequest::new(7, format!("{at_limit}a")).err(),
+            Some(OutboundRefusal::Text)
+        );
+        // Telegram counts UTF-16 units, so an astral character costs two — and a
+        // snapshot truncated between them would be a snapshot cut mid-escape.
+        let astral = "😀".repeat(MAX_SEND_MESSAGE_TEXT_UNITS / 2);
+        assert!(SendMessageDraftRequest::new(7, astral.clone()).is_ok());
+        assert_eq!(
+            SendMessageDraftRequest::new(7, format!("{astral}😀")).err(),
+            Some(OutboundRefusal::Text)
+        );
+    }
+
+    #[test]
+    fn an_edited_text_body_is_canonical_and_bounded() {
+        let edit = TelegramOutbound::EditMessageText(
+            EditMessageTextRequest::new(-1_001, 17, "run 7: writing the answer").expect("edit"),
+        );
+        assert_eq!(edit.method_name(), "editMessageText");
+        assert_eq!(
+            edit.canonical_body(),
+            r#"{"chat_id":-1001,"message_id":17,"text":"run 7: writing the answer"}"#
+        );
+        assert_eq!(edit.chat_id(), Some(-1_001));
+
+        let hostile = TelegramOutbound::EditMessageText(
+            EditMessageTextRequest::new(7, 3, "quote\" slash\\ line\n").expect("edit"),
+        );
+        assert_eq!(
+            hostile.canonical_body(),
+            r#"{"chat_id":7,"message_id":3,"text":"quote\" slash\\ line\n"}"#
+        );
+
+        assert_eq!(
+            EditMessageTextRequest::new(0, 3, "hi").err(),
+            Some(OutboundRefusal::ChatId)
+        );
+        assert_eq!(
+            EditMessageTextRequest::new(7, 0, "hi").err(),
+            Some(OutboundRefusal::MessageId)
+        );
+        assert_eq!(
+            EditMessageTextRequest::new(7, -1, "hi").err(),
+            Some(OutboundRefusal::MessageId)
+        );
+        assert_eq!(
+            EditMessageTextRequest::new(7, 3, "bell\u{7}").err(),
+            Some(OutboundRefusal::Text)
+        );
+    }
+
+    /// A draft quotes a run's output. It must reach the wire exactly and reach a
+    /// log never — the same pair `SendMessageRequest` already proves.
+    #[test]
+    fn streaming_bodies_never_render_their_text_or_the_token() {
+        let secret = "42:fixture-secret-never-print";
+        let token = OpaqueBotToken::new(secret.as_bytes().to_vec()).expect("token");
+        let draft = TelegramOutbound::SendMessageDraft(
+            SendMessageDraftRequest::new(7, "provider said something").expect("draft"),
+        );
+        let edit = TelegramOutbound::EditMessageText(
+            EditMessageTextRequest::new(7, 3, "provider said something").expect("edit"),
+        );
+        for request in [draft, edit] {
+            let plan = outbound_plan(&token, request);
+            let rendered = format!("{plan:?}");
+            assert!(!rendered.contains("provider said something"));
+            assert!(!rendered.contains(secret));
+            assert!(rendered.contains("<redacted"));
+            assert!(plan.canonical_body().contains("provider said something"));
+            assert!(!plan.canonical_body().contains(secret));
+        }
     }
 
     #[test]

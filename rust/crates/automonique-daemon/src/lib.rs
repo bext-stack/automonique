@@ -1350,7 +1350,7 @@ impl Daemon {
         .map_err(|error| DaemonError::SlackRefused(error.category()))?;
         let slack = slack::SlackHost::open(&state_dir)
             .map_err(|error| DaemonError::SlackRefused(error.category()))?;
-        let telegram = telegram::TelegramHost::open_with_ticket_gates(
+        let mut telegram = telegram::TelegramHost::open_with_ticket_gates(
             &telegram::TelegramHostParams {
                 state_dir: &state_dir,
                 database_path: &config.database_path(),
@@ -1463,6 +1463,13 @@ impl Daemon {
                 automonique_protocol::admin::ExecutionState::SandboxEnforceableNoLane
             ),
         );
+
+        // THE STREAM REACHES THE CHAT HERE, AND ONLY HERE. The Telegram host is
+        // composed above, before the lane that owns the progress hub exists, so
+        // the hub is handed over once the lane does — still inside `open`, and
+        // long before `serve` starts the poller thread, so no iteration can
+        // observe a half-attached lane. A host with no bridge ignores it.
+        telegram.attach_progress(execution.progress());
 
         // THE SUPPORT INTAKE GATE. An absent `support/fleet.conf` is the
         // disabled state: no credential is read, no fleet client is

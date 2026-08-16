@@ -19,17 +19,25 @@ use automonique_transports::{
 };
 use sha2::{Digest, Sha256};
 
+mod budget;
 mod https_client;
 mod modifier;
 mod slack_sink;
 mod store_sink;
 mod telegram_control;
 
+pub use budget::{
+    ALL_BUDGET_REFUSALS, ALL_BUDGETED_METHODS, ALL_CALL_PRIORITIES, BucketSpec, BudgetRefusal,
+    BudgetedMethod, CHAT_BURST_CALLS, CHAT_EPHEMERAL_HEADROOM, CallPriority, GLOBAL_CALLS,
+    GLOBAL_EPHEMERAL_HEADROOM, GROUP_CALLS, GROUP_EPHEMERAL_HEADROOM, MAX_PAUSE_MS,
+    MAX_TRACKED_CHATS, TOKEN_SCALE, TelegramCallBudget, TokenBucket,
+};
 pub use https_client::{
-    AnswerCallbackQueryRequest, ApprovalKeyboard, EditMessageReplyMarkupRequest, InlineButtonLabel,
-    MAX_BOT_COMMAND_DESCRIPTION_CHARS, MAX_BOT_COMMAND_NAME_CHARS, MAX_BOT_COMMANDS,
-    MAX_CALLBACK_ANSWER_BYTES, MAX_CALLBACK_DATA_BYTES, MAX_CALLBACK_QUERY_ID_BYTES,
-    MAX_INLINE_BUTTONS, MAX_SEND_MESSAGE_TEXT_UNITS, OutboundRefusal, SendMessageRequest,
+    AnswerCallbackQueryRequest, ApprovalKeyboard, EditMessageReplyMarkupRequest,
+    EditMessageTextRequest, InlineButtonLabel, MAX_BOT_COMMAND_DESCRIPTION_CHARS,
+    MAX_BOT_COMMAND_NAME_CHARS, MAX_BOT_COMMANDS, MAX_CALLBACK_ANSWER_BYTES,
+    MAX_CALLBACK_DATA_BYTES, MAX_CALLBACK_QUERY_ID_BYTES, MAX_INLINE_BUTTONS,
+    MAX_SEND_MESSAGE_TEXT_UNITS, OutboundRefusal, SendMessageDraftRequest, SendMessageRequest,
     SetMessageReactionRequest, SetMyCommandsRequest, TelegramBotCommand, TelegramHttpsClient,
     TelegramOutbound, TelegramOutboundClient, TelegramOutboundPlan, TelegramTextStyle,
 };

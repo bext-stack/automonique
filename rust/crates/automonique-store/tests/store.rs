@@ -12,7 +12,7 @@ use automonique_store::{
     ReconciliationRequest, ReconciliationRunState, SCHEMA_VERSION, SchedulerClaim, Store,
     TelegramBatchIngestion, TelegramPollerCommit, TelegramPollerLeaseIdentity,
     TelegramPollerLeaseRenewal, TelegramPollerLeaseRequest, TelegramStoreDisposition,
-    TelegramStoreUpdate, TerminalRun, TerminalState, WorkClaim,
+    TelegramStoreUpdate, TerminalRun, TerminalState, TransportPauseRequest, WorkClaim,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -3341,5 +3341,212 @@ fn a_null_never_slips_the_intake_pause_resume_coupling() {
             "a whole resume",
             resumption("resumed_at_ms = 10, resume_actor = 'operator-b'"),
         )],
+    );
+}
+
+fn pause_transport(
+    store: &mut Store,
+    epoch: u64,
+    now_ms: i64,
+    resume_after_ms: i64,
+) -> Result<automonique_store::TransportPause, automonique_store::StoreError> {
+    store.pause_transport(TransportPauseRequest {
+        transport: "telegram",
+        scope: "123456",
+        generation_id: "generation-a",
+        holder_id: "holder-a",
+        authority_lease_epoch: epoch,
+        reason: "rate_limited",
+        now_ms,
+        resume_after_ms,
+    })
+}
+
+/// A 429 is about the bot, so the pause it produces is about the bot: one row,
+/// a deadline, and an answer that survives the process that wrote it.
+#[test]
+fn a_transport_pause_is_durable_extended_only_and_lapses_on_its_own() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let epoch = lease(&mut store, "holder-a", 0);
+    assert_eq!(
+        store
+            .transport_pause("telegram", "123456", 1)
+            .expect("read"),
+        None,
+        "a bot nobody has rate limited is not paused"
+    );
+
+    let recorded = pause_transport(&mut store, epoch, 5, 30_005).expect("first pause");
+    assert_eq!(recorded.revision, 1);
+    assert_eq!(recorded.paused_at_ms, 5);
+    assert_eq!(recorded.resume_after_ms, 30_005);
+    assert_eq!(recorded.reason, "rate_limited");
+
+    let live = store
+        .transport_pause("telegram", "123456", 9)
+        .expect("read")
+        .expect("paused");
+    assert_eq!(live.resume_after_ms, 30_005);
+    assert_eq!(live.observed_ms, 9, "the record is stamped with the read");
+
+    // A shorter interval arriving second withdraws nothing: the deadline is the
+    // longer of the two, and the pause is one episode rather than two.
+    let shortened = pause_transport(&mut store, epoch, 10, 11).expect("second 429");
+    assert_eq!(shortened.revision, 2);
+    assert_eq!(shortened.resume_after_ms, 30_005);
+    assert_eq!(shortened.paused_at_ms, 5, "the episode began at the first");
+    let extended = pause_transport(&mut store, epoch, 12, 60_000).expect("third 429");
+    assert_eq!(extended.revision, 3);
+    assert_eq!(extended.resume_after_ms, 60_000);
+
+    // The pause lapses at its own deadline. Nothing sweeps it.
+    assert!(
+        store
+            .transport_pause("telegram", "123456", 59_999)
+            .expect("read")
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .transport_pause("telegram", "123456", 60_000)
+            .expect("read"),
+        None
+    );
+
+    // A different bot, and a different transport, are different questions.
+    assert_eq!(
+        store.transport_pause("telegram", "999", 100).expect("read"),
+        None
+    );
+    assert_eq!(
+        store.transport_pause("slack", "123456", 100).expect("read"),
+        None
+    );
+
+    // THE RESTART. The deadline is what the next process reads before it dials.
+    drop(store);
+    let mut reopened = Store::open(database.path()).expect("reopen");
+    let inherited = reopened
+        .transport_pause("telegram", "123456", 100)
+        .expect("read")
+        .expect("a restart honours the pause it inherited");
+    assert_eq!(inherited.resume_after_ms, 60_000);
+    assert_eq!(inherited.revision, 3);
+}
+
+/// The pause is state the next process reads before it dials, so a writer who
+/// no longer holds the generation must not be able to install one.
+#[test]
+fn a_transport_pause_is_fenced_and_refuses_every_malformed_field() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let epoch = lease(&mut store, "holder-a", 0);
+
+    assert_eq!(
+        pause_transport(&mut store, epoch + 1, 5, 10)
+            .expect_err("a stale epoch writes nothing")
+            .category(),
+        "stale_epoch"
+    );
+    assert_eq!(
+        store
+            .pause_transport(TransportPauseRequest {
+                transport: "telegram",
+                scope: "123456",
+                generation_id: "generation-a",
+                holder_id: "somebody-else",
+                authority_lease_epoch: epoch,
+                reason: "rate_limited",
+                now_ms: 5,
+                resume_after_ms: 10,
+            })
+            .expect_err("a different holder writes nothing")
+            .category(),
+        "stale_epoch"
+    );
+    // A deadline before the instant it was decided is not a pause.
+    assert_eq!(
+        pause_transport(&mut store, epoch, 10, 9)
+            .expect_err("a backwards deadline")
+            .category(),
+        "invalid_field"
+    );
+    for (label, request) in [
+        (
+            "an empty transport",
+            TransportPauseRequest {
+                transport: "",
+                scope: "123456",
+                generation_id: "generation-a",
+                holder_id: "holder-a",
+                authority_lease_epoch: epoch,
+                reason: "rate_limited",
+                now_ms: 5,
+                resume_after_ms: 10,
+            },
+        ),
+        (
+            "an empty scope",
+            TransportPauseRequest {
+                transport: "telegram",
+                scope: "",
+                generation_id: "generation-a",
+                holder_id: "holder-a",
+                authority_lease_epoch: epoch,
+                reason: "rate_limited",
+                now_ms: 5,
+                resume_after_ms: 10,
+            },
+        ),
+        (
+            "an empty reason",
+            TransportPauseRequest {
+                transport: "telegram",
+                scope: "123456",
+                generation_id: "generation-a",
+                holder_id: "holder-a",
+                authority_lease_epoch: epoch,
+                reason: "",
+                now_ms: 5,
+                resume_after_ms: 10,
+            },
+        ),
+        (
+            "a negative instant",
+            TransportPauseRequest {
+                transport: "telegram",
+                scope: "123456",
+                generation_id: "generation-a",
+                holder_id: "holder-a",
+                authority_lease_epoch: epoch,
+                reason: "rate_limited",
+                now_ms: -1,
+                resume_after_ms: 10,
+            },
+        ),
+    ] {
+        assert_eq!(
+            store
+                .pause_transport(request)
+                .map(|pause| pause.revision)
+                .map_err(|error| error.category()),
+            Err("invalid_field"),
+            "{label} must refuse"
+        );
+    }
+    assert_eq!(
+        store
+            .transport_pause("telegram", "123456", 5)
+            .expect("read"),
+        None,
+        "no refusal above wrote a row"
+    );
+    assert_eq!(
+        store
+            .transport_pause("", "123456", 5)
+            .expect_err("an empty transport is not readable either")
+            .category(),
+        "invalid_field"
     );
 }

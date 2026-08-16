@@ -40,7 +40,7 @@ use rusqlite::{
 };
 
 /// The only database schema this build can read and write.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 /// SQLite lock contention is bounded rather than waiting indefinitely.
 pub const BUSY_TIMEOUT: Duration = Duration::from_millis(2_000);
 
@@ -417,6 +417,42 @@ CREATE UNIQUE INDEX intake_pauses_one_live_per_generation
     ON intake_pauses(generation_id) WHERE resumed_at_ms IS NULL;
 "#;
 
+/// Transport pauses a remote peer imposed, in the database the transport's own
+/// offsets and outbox already live in.
+///
+/// # Why this is durable at all
+///
+/// Because a `429` is about the *bot*, not about the request that met it. A
+/// pause held only in memory would be forgotten by the next restart, and the
+/// first thing a restarted daemon does is poll — straight back into the rate
+/// limit it was told to wait out, from a peer that has by then started counting
+/// the offence again.
+///
+/// # One row per (transport, scope), updated in place
+///
+/// Unlike [`intake_pauses`](MIGRATE_V5_TO_V6), which keeps an episode per pause
+/// because *who closed intake and why* is history worth having, a transport
+/// pause is a deadline and nothing else. There is exactly one answer to "may
+/// this bot call Telegram right now", so there is exactly one row, and a second
+/// `429` moves its deadline rather than opening a second episode. The revision
+/// counts the moves, which is what makes the domain event chain over it total.
+///
+/// `resume_after_ms` is an instant on the same clock the offsets and leases use.
+/// A row whose deadline has passed is simply not live; nothing sweeps it,
+/// because a stale deadline answers the question correctly on its own.
+const MIGRATE_V6_TO_V7: &str = r#"
+CREATE TABLE transport_pauses (
+    transport TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    paused_at_ms INTEGER NOT NULL CHECK (paused_at_ms >= 0),
+    resume_after_ms INTEGER NOT NULL CHECK (resume_after_ms >= 0),
+    reason TEXT NOT NULL,
+    PRIMARY KEY (transport, scope),
+    CHECK (resume_after_ms >= paused_at_ms)
+) STRICT;
+"#;
+
 /// A durable store error with stable refusal categories.
 #[derive(Debug)]
 pub enum StoreError {
@@ -634,6 +670,44 @@ pub struct IntakeResumeRequest<'a> {
 pub struct IntakePauseReceipt {
     pub pause_id: i64,
     pub revision: u64,
+}
+
+/// One remote peer's live refusal to be called, for one transport and scope.
+///
+/// Unlike [`PauseRecord`] this has an expiry, because the peer named one. A
+/// record whose `resume_after_ms` is at or before the instant it was read is not
+/// returned at all: see [`Store::transport_pause`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransportPause {
+    pub transport: String,
+    /// The transport's own name for what was paused — for Telegram, the bot id.
+    pub scope: String,
+    pub revision: u64,
+    pub paused_at_ms: i64,
+    /// The instant calls may resume. Never in the past for a returned record.
+    pub resume_after_ms: i64,
+    /// A closed category the caller supplies. Recorded, never interpreted.
+    pub reason: String,
+    /// The instant this was read, so a reporter can say when it established it.
+    pub observed_ms: i64,
+}
+
+/// Record that a peer refused one transport scope until an instant.
+///
+/// A pause is only ever *extended*: presenting an earlier deadline than the one
+/// already recorded leaves the recorded one in force and still succeeds, because
+/// a shorter interval arriving second says nothing about the longer one.
+pub struct TransportPauseRequest<'a> {
+    pub transport: &'a str,
+    pub scope: &'a str,
+    pub generation_id: &'a str,
+    pub holder_id: &'a str,
+    pub authority_lease_epoch: u64,
+    /// Closed category, from the caller's own vocabulary.
+    pub reason: &'a str,
+    pub now_ms: i64,
+    /// Instant calls may resume. Must not precede `now_ms`.
+    pub resume_after_ms: i64,
 }
 
 /// One stable transport delivery.
@@ -1652,6 +1726,137 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
         let record = live_intake_pause(&transaction, generation_id, now_ms)?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    /// Durably record that a peer refused one transport scope until an instant.
+    ///
+    /// The deadline is the whole record. A second call whose `resume_after_ms`
+    /// is earlier than the one in force is accepted and changes nothing but the
+    /// revision — a peer that says "wait one second" while an earlier answer of
+    /// "wait five minutes" is still standing has not withdrawn the five minutes.
+    ///
+    /// Fenced by the same generation authority every other mutation here is,
+    /// and for the same reason: a pause is state the next process reads before
+    /// it dials, so a writer who no longer holds the generation must not be able
+    /// to install one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidField`] for an empty or over-long
+    /// transport, scope or reason, for a negative instant, or for a deadline
+    /// that precedes `now_ms`, and [`StoreError::StaleEpoch`] without live
+    /// generation authority.
+    pub fn pause_transport(
+        &mut self,
+        request: TransportPauseRequest<'_>,
+    ) -> Result<TransportPause, StoreError> {
+        validate_id(request.transport, "transport")?;
+        validate_id(request.scope, "transport_pause_scope")?;
+        validate_id(request.generation_id, "generation_id")?;
+        validate_id(request.holder_id, "holder_id")?;
+        validate_id(request.reason, "transport_pause_reason")?;
+        validate_time(request.now_ms)?;
+        validate_time(request.resume_after_ms)?;
+        if request.resume_after_ms < request.now_ms {
+            return Err(StoreError::InvalidField("transport_pause_resume_after_ms"));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A pause takes effect at an instant rather than holding a window open,
+        // so the lease need only be live now — the same reading `pause_intake`
+        // applies to its own decision.
+        require_generation_authority_through(
+            &transaction,
+            request.generation_id,
+            request.holder_id,
+            request.authority_lease_epoch,
+            request.now_ms,
+            request.now_ms,
+        )?;
+        let existing = transport_pause_row(
+            &transaction,
+            request.transport,
+            request.scope,
+            request.now_ms,
+        )?;
+        let (revision, paused_at_ms, resume_after_ms) = match &existing {
+            None => (1_u64, request.now_ms, request.resume_after_ms),
+            Some(live) => (
+                live.revision
+                    .checked_add(1)
+                    .ok_or(StoreError::InvalidField("transport_pause_revision"))?,
+                // The first refusal of an unbroken run is when the pause began.
+                live.paused_at_ms.min(request.now_ms),
+                live.resume_after_ms.max(request.resume_after_ms),
+            ),
+        };
+        transaction.execute(
+            "INSERT INTO transport_pauses
+             (transport, scope, revision, paused_at_ms, resume_after_ms, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(transport, scope) DO UPDATE SET
+                 revision = excluded.revision,
+                 paused_at_ms = excluded.paused_at_ms,
+                 resume_after_ms = excluded.resume_after_ms,
+                 reason = excluded.reason",
+            params![
+                request.transport,
+                request.scope,
+                to_db_u64(revision, "transport_pause_revision")?,
+                paused_at_ms,
+                resume_after_ms,
+                request.reason
+            ],
+        )?;
+        append_event(
+            &transaction,
+            "transport_pause",
+            &format!("{}:{}", request.transport, request.scope),
+            revision,
+            request.now_ms,
+            "transport.paused",
+            request.reason.as_bytes(),
+        )?;
+        transaction.commit()?;
+        Ok(TransportPause {
+            transport: request.transport.to_owned(),
+            scope: request.scope.to_owned(),
+            revision,
+            paused_at_ms,
+            resume_after_ms,
+            reason: request.reason.to_owned(),
+            observed_ms: request.now_ms,
+        })
+    }
+
+    /// The live pause for one transport scope, if a peer is still refusing it.
+    ///
+    /// `None` covers both "never paused" and "the deadline has passed", which
+    /// are the same answer to the only question a caller asks: may this call go
+    /// out now. Nothing sweeps an elapsed row, because an elapsed row already
+    /// answers correctly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidField`] for an empty or over-long transport
+    /// or scope, or a negative instant.
+    pub fn transport_pause(
+        &mut self,
+        transport: &str,
+        scope: &str,
+        now_ms: i64,
+    ) -> Result<Option<TransportPause>, StoreError> {
+        validate_id(transport, "transport")?;
+        validate_id(scope, "transport_pause_scope")?;
+        validate_time(now_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let record = transport_pause_row(&transaction, transport, scope, now_ms)?
+            .filter(|pause| pause.resume_after_ms > now_ms);
         transaction.commit()?;
         Ok(record)
     }
@@ -3865,25 +4070,33 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
         migrate_v2_to_v3(connection)?;
         migrate_v3_to_v4(connection)?;
         migrate_v4_to_v5(connection)?;
-        return migrate_v5_to_v6(connection);
+        migrate_v5_to_v6(connection)?;
+        return migrate_v6_to_v7(connection);
     }
     if version == 2 {
         migrate_v2_to_v3(connection)?;
         migrate_v3_to_v4(connection)?;
         migrate_v4_to_v5(connection)?;
-        return migrate_v5_to_v6(connection);
+        migrate_v5_to_v6(connection)?;
+        return migrate_v6_to_v7(connection);
     }
     if version == 3 {
         migrate_v3_to_v4(connection)?;
         migrate_v4_to_v5(connection)?;
-        return migrate_v5_to_v6(connection);
+        migrate_v5_to_v6(connection)?;
+        return migrate_v6_to_v7(connection);
     }
     if version == 4 {
         migrate_v4_to_v5(connection)?;
-        return migrate_v5_to_v6(connection);
+        migrate_v5_to_v6(connection)?;
+        return migrate_v6_to_v7(connection);
     }
     if version == 5 {
-        return migrate_v5_to_v6(connection);
+        migrate_v5_to_v6(connection)?;
+        return migrate_v6_to_v7(connection);
+    }
+    if version == 6 {
+        return migrate_v6_to_v7(connection);
     }
     if version != 0 {
         return Err(StoreError::SchemaVersion {
@@ -3908,6 +4121,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
     transaction.execute_batch(MIGRATE_V3_TO_V4)?;
     transaction.execute_batch(MIGRATE_V4_TO_V5)?;
     transaction.execute_batch(MIGRATE_V5_TO_V6)?;
+    transaction.execute_batch(MIGRATE_V6_TO_V7)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -3940,6 +4154,14 @@ fn migrate_v4_to_v5(connection: &mut Connection) -> Result<(), StoreError> {
 fn migrate_v5_to_v6(connection: &mut Connection) -> Result<(), StoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(MIGRATE_V5_TO_V6)?;
+    transaction.pragma_update(None, "user_version", 6)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v6_to_v7(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(MIGRATE_V6_TO_V7)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -4038,6 +4260,47 @@ fn live_intake_pause(
                 revision: from_db_u64(raw_revision, "intake_pause_revision")?,
                 paused_at_ms,
                 actor,
+                reason,
+                observed_ms,
+            })
+        })
+        .transpose()
+}
+
+/// One transport's pause row, live or elapsed, read inside a caller's
+/// transaction.
+///
+/// The primary key is what makes `query_row` the right shape: there is one row
+/// per transport and scope, so this cannot be reading the first of several.
+fn transport_pause_row(
+    transaction: &Transaction<'_>,
+    transport: &str,
+    scope: &str,
+    observed_ms: i64,
+) -> Result<Option<TransportPause>, StoreError> {
+    transaction
+        .query_row(
+            "SELECT revision, paused_at_ms, resume_after_ms, reason
+             FROM transport_pauses
+             WHERE transport = ?1 AND scope = ?2",
+            params![transport, scope],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(|(raw_revision, paused_at_ms, resume_after_ms, reason)| {
+            Ok(TransportPause {
+                transport: transport.to_owned(),
+                scope: scope.to_owned(),
+                revision: from_db_u64(raw_revision, "transport_pause_revision")?,
+                paused_at_ms,
+                resume_after_ms,
                 reason,
                 observed_ms,
             })
@@ -4808,6 +5071,18 @@ mod migration_tests {
             .expect("v5 marker");
     }
 
+    /// The canonical v6 shape, reached the same way: through the migrations
+    /// that produce it rather than a literal restating them.
+    fn canonical_v6(connection: &mut Connection) {
+        canonical_v5(connection);
+        connection
+            .execute_batch(MIGRATE_V5_TO_V6)
+            .expect("canonical v6 schema");
+        connection
+            .pragma_update(None, "user_version", 6)
+            .expect("v6 marker");
+    }
+
     #[test]
     fn fresh_database_initializes_at_the_pause_bearing_version() {
         let mut connection = Connection::open_in_memory().expect("memory database");
@@ -4816,7 +5091,13 @@ mod migration_tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
+        let transport_pauses: i64 = connection
+            .query_row("SELECT count(*) FROM transport_pauses", [], |row| {
+                row.get(0)
+            })
+            .expect("transport pause table exists");
+        assert_eq!(transport_pauses, 0);
         let pauses: i64 = connection
             .query_row("SELECT count(*) FROM intake_pauses", [], |row| row.get(0))
             .expect("pause table exists");
@@ -4960,13 +5241,14 @@ mod migration_tests {
             ("domain_events", 1),
             ("telegram_poller_leases", 1),
             ("intake_pauses", 0),
+            ("transport_pauses", 0),
         ] {
             let rows: i64 = connection
                 .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
                     row.get(0)
                 })
                 .unwrap_or_else(|error| panic!("count {table}: {error}"));
-            assert_eq!(rows, expected, "{table} row count changed across v5 -> v6");
+            assert_eq!(rows, expected, "{table} row count changed across v5 -> v7");
         }
         let inbox: (String, String, i64) = connection
             .query_row(
@@ -5017,6 +5299,143 @@ mod migration_tests {
             orphan.is_err(),
             "a pause must not name a generation that does not exist"
         );
+    }
+
+    /// The v6 → v7 replay. A database carrying the intake pause this ladder step
+    /// arrives on top of keeps every row it had, gains an empty transport pause
+    /// table, and the new table's own shape is what the daemon relies on: one
+    /// row per (transport, scope), and no deadline before the pause began.
+    #[test]
+    fn populated_canonical_v6_migrates_to_empty_transport_pause_state() {
+        let mut connection = Connection::open_in_memory().expect("memory database");
+        canonical_v6(&mut connection);
+        connection
+            .execute(
+                "INSERT INTO generations
+                 VALUES ('foreground', 3, 'active', 'holder-v6', 4, 900)",
+                [],
+            )
+            .expect("v6 generation");
+        connection
+            .execute(
+                "INSERT INTO intake_pauses
+                 (generation_id, revision, paused_at_ms, actor, reason,
+                  resumed_at_ms, resume_actor)
+                 VALUES ('foreground', 1, 10, 'operator:a', 'draining', NULL, NULL)",
+                [],
+            )
+            .expect("v6 intake pause");
+        connection
+            .execute(
+                "INSERT INTO inbox
+                 (transport, transport_key, scope, payload, received_ms, state, revision)
+                 VALUES ('local.synthetic', 'preserved-v6', 'scope:v6', X'01', 7, 'pending', 1)",
+                [],
+            )
+            .expect("v6 inbox");
+
+        initialize_or_validate_schema(&mut connection).expect("v7 migration");
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
+        for (table, expected) in [
+            ("generations", 1),
+            ("inbox", 1),
+            ("intake_pauses", 1),
+            ("transport_pauses", 0),
+        ] {
+            let rows: i64 = connection
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap_or_else(|error| panic!("count {table}: {error}"));
+            assert_eq!(rows, expected, "{table} row count changed across v6 -> v7");
+        }
+        let intake: (String, String) = connection
+            .query_row(
+                "SELECT actor, reason FROM intake_pauses WHERE generation_id = 'foreground'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("preserved intake pause");
+        assert_eq!(intake, ("operator:a".to_owned(), "draining".to_owned()));
+
+        // The migrated database is writable as v7, and the invariants that make
+        // "may this bot call out" a question with one answer are in the schema.
+        const INSERT: &str = "INSERT INTO transport_pauses
+             (transport, scope, revision, paused_at_ms, resume_after_ms, reason)
+             VALUES ('telegram', '123456', 1, 10, 20, 'rate_limited')";
+        connection.execute(INSERT, []).expect("pause writable");
+        assert!(
+            connection.execute(INSERT, []).is_err(),
+            "a transport and scope must not carry two pause rows"
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO transport_pauses
+                     (transport, scope, revision, paused_at_ms, resume_after_ms, reason)
+                     VALUES ('telegram', '999', 1, 30, 20, 'rate_limited')",
+                    [],
+                )
+                .is_err(),
+            "a pause must not end before it began"
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO transport_pauses
+                     (transport, scope, revision, paused_at_ms, resume_after_ms, reason)
+                     VALUES ('telegram', '998', 0, 10, 20, 'rate_limited')",
+                    [],
+                )
+                .is_err(),
+            "a pause revision starts at one"
+        );
+    }
+
+    /// Every schema path this build can reach carries the transport pause table,
+    /// which is what makes a restart on an inherited database honour a 429.
+    #[test]
+    fn every_schema_path_reaches_the_transport_pause_table() {
+        let mut fresh = Connection::open_in_memory().expect("memory database");
+        initialize_or_validate_schema(&mut fresh).expect("fresh initialization");
+        let mut from_v1 = Connection::open_in_memory().expect("memory database");
+        from_v1
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        from_v1.execute_batch(SCHEMA_V1).expect("v1 base");
+        from_v1
+            .pragma_update(None, "user_version", 1)
+            .expect("v1 marker");
+        initialize_or_validate_schema(&mut from_v1).expect("v1 migration");
+        let mut from_v5 = Connection::open_in_memory().expect("memory database");
+        canonical_v5(&mut from_v5);
+        initialize_or_validate_schema(&mut from_v5).expect("v5 migration");
+        let mut from_v6 = Connection::open_in_memory().expect("memory database");
+        canonical_v6(&mut from_v6);
+        initialize_or_validate_schema(&mut from_v6).expect("v6 migration");
+
+        for (label, connection) in [
+            ("fresh", &fresh),
+            ("from_v1", &from_v1),
+            ("from_v5", &from_v5),
+            ("from_v6", &from_v6),
+        ] {
+            let version: u32 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap_or_else(|error| panic!("{label} version: {error}"));
+            assert_eq!(version, SCHEMA_VERSION, "{label} stopped short of v7");
+            connection
+                .execute(
+                    "INSERT INTO transport_pauses
+                     (transport, scope, revision, paused_at_ms, resume_after_ms, reason)
+                     VALUES ('telegram', '123456', 1, 10, 20, 'rate_limited')",
+                    [],
+                )
+                .unwrap_or_else(|error| panic!("{label} stores a transport pause: {error}"));
+        }
     }
 
     #[test]

@@ -1194,9 +1194,9 @@ impl Component {
             // The generated admin command surface speaks `MajorVersion::FIRST`
             // and admits no other.
             Self::TypeScriptSdkSurface => (1, 1),
-            // `SCHEMA_VERSION` is 6, and the numbered migrations run an
-            // unbroken v1 -> v2 -> ... -> v6 chain, so a v1 file still opens.
-            Self::StoreSchema => (1, 6),
+            // `SCHEMA_VERSION` is 7, and the numbered migrations run an
+            // unbroken v1 -> v2 -> ... -> v7 chain, so a v1 file still opens.
+            Self::StoreSchema => (1, 7),
             // Each sibling database is at its first schema and has no migration
             // chain yet, so its only supported version is the one it creates.
             Self::CancelLedgerSchema

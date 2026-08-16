@@ -93,7 +93,8 @@
 //! already had. Nothing in this crate renders, logs or replies with it.
 
 use crate::manage_config::ManageConfig;
-use crate::run_lane::SocketRunLane;
+use crate::progress_hub::ProgressHub;
+use crate::run_lane::{DraftTransport, SocketRunLane};
 use crate::telegram_bridge::{
     BridgeParts, HostFacts, OperatorRoster, StoreControlSurface, TelegramControlBridge,
 };
@@ -234,11 +235,11 @@ pub(crate) enum TelegramEnablement {
 
 /// Everything live control needs, and nothing that does not belong to it.
 ///
-/// Three tokens because inbound polling, immediate outbound control, and
-/// background question answers each own one for their own lifetime. All are
-/// the same credential, independently constructed because the opaque type is
-/// deliberately not cloneable, and all are redacted, borrow-only and zeroed on
-/// drop.
+/// Four tokens because inbound polling, immediate outbound control, background
+/// question answers, and a run's streaming drafts each own one for their own
+/// lifetime. All are the same credential, independently constructed because the
+/// opaque type is deliberately not cloneable, and all are redacted, borrow-only
+/// and zeroed on drop.
 #[derive(Debug)]
 pub(crate) struct LiveControl {
     /// The configured operator roster, from which the transport policy and the
@@ -251,6 +252,11 @@ pub(crate) struct LiveControl {
     outbound_token: OpaqueBotToken,
     /// Credential background question answers spend.
     question_outbound_token: OpaqueBotToken,
+    /// Credential a run's live progress drafts spend.
+    ///
+    /// Its own, on its own client, because a draft is drawn from the thread the
+    /// run is blocking and must never queue behind an operator's reply.
+    draft_token: OpaqueBotToken,
 }
 
 impl TelegramBotConfig {
@@ -435,11 +441,14 @@ impl LiveControl {
             .map_err(|_| TelegramConfigError::TokenInvalid)?;
         let question_outbound_token = OpaqueBotToken::new(token_line.as_bytes().to_vec())
             .map_err(|_| TelegramConfigError::TokenInvalid)?;
+        let draft_token = OpaqueBotToken::new(token_line.as_bytes().to_vec())
+            .map_err(|_| TelegramConfigError::TokenInvalid)?;
         Ok(Self {
             roster,
             inbound_token,
             outbound_token,
             question_outbound_token,
+            draft_token,
         })
     }
 }
@@ -726,9 +735,17 @@ impl TelegramHost {
         // `/run` at all and refuses every one with `not configured`; only an
         // unopenable read model is a startup refusal, because a lane that could
         // not observe a run would report every one of them as unavailable.
-        let lane =
+        let mut lane =
             SocketRunLane::open(params.state_dir, params.admin_socket, params.run_index_path)
                 .map_err(|_| TelegramHostError::SurfaceUnavailable)?;
+        // The credential half of streaming. The hub and the call budget arrive
+        // later, in `TelegramHost::attach_progress`, because neither exists yet:
+        // this host is composed before the daemon's execution lane.
+        lane.with_draft_transport(DraftTransport {
+            client: Box::new(TelegramHttpsClient::new()),
+            token: live.draft_token,
+            bot_id,
+        });
         let ticket_actions = crate::ticket_intake::FleetConfig::load(params.state_dir)
             .map_err(|_| TelegramHostError::SurfaceUnavailable)?
             .map(|config| {
@@ -806,6 +823,22 @@ impl TelegramHost {
             ticket_gates,
         )
         .map_err(TelegramHostError::Runtime)
+    }
+
+    /// Give the composed bridge the daemon's live progress stream.
+    ///
+    /// Called once, from [`crate::Daemon::open`], after the execution lane that
+    /// owns the hub exists and before [`Self::start`] puts the bridge on a
+    /// thread — so no poller iteration ever observes a half-attached lane. A
+    /// no-op on a host with no bridge, and on one whose bridge has already been
+    /// started.
+    pub(crate) fn attach_progress(&mut self, hub: Arc<ProgressHub>) {
+        let Self::Live { control, .. } = self else {
+            return;
+        };
+        if let Some(bridge) = control.prepared.as_mut() {
+            bridge.attach_streaming(hub);
+        }
     }
 
     /// Put a composed bridge on its own thread. Idempotent, and a no-op unless
@@ -1511,5 +1544,38 @@ mod tests {
             "a poll deadline of {deadline_ms}ms cannot fit a {renewal_ms}ms renewal interval"
         );
         assert!(renewal_ms < crate::TELEGRAM_LEASE_TTL_MS);
+    }
+
+    /// A whole-bot pause outlasts the bot lease many times over — Telegram may
+    /// name five minutes — and that is safe for exactly one reason: waiting out
+    /// a pause is the poller's business, while renewing the lease is the serve
+    /// thread's, and the two do not share a thread.
+    ///
+    /// This is the arithmetic that makes it true. The serve loop renews well
+    /// inside the TTL, so a lease stays live for a pause of any admitted length;
+    /// and the poller re-reads the published lease on the iteration after the
+    /// wait, so what it polls under is the renewed one and never the one it went
+    /// to sleep holding.
+    #[test]
+    fn a_pause_outlives_a_bot_lease_and_the_renewal_cadence_covers_it() {
+        let renewal_ms = i64::try_from(crate::LEASE_RENEW_INTERVAL.as_millis()).expect("interval");
+        let longest_pause = automonique_transport_runtime::MAX_PAUSE_MS;
+        assert!(
+            longest_pause > crate::TELEGRAM_LEASE_TTL_MS,
+            "a pause that could not outlast a lease would need no reasoning at all"
+        );
+        // The renewal has to land twice inside a TTL, so a single missed
+        // renewal — a serve loop busy with one long request — does not expire a
+        // lease that a paused poller is about to poll under.
+        assert!(
+            renewal_ms * 2 <= crate::TELEGRAM_LEASE_TTL_MS,
+            "a {renewal_ms}ms cadence cannot keep a {}ms lease alive through a pause",
+            crate::TELEGRAM_LEASE_TTL_MS
+        );
+        // And the poll that follows a pause is bounded by the same deadline
+        // every other poll is: waiting changes nothing about the request.
+        let deadline_ms = i64::from(TELEGRAM_LONG_POLL_SECONDS) * 1_000
+            + automonique_transport_runtime::TELEGRAM_HTTP_LEASE_MARGIN_MS;
+        assert!(deadline_ms < renewal_ms);
     }
 }

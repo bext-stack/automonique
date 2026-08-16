@@ -126,7 +126,7 @@ use automonique_store::support_tickets::{
 };
 use automonique_store::{
     OutboxClaimRequest, OutboxDelivery, OutboxEnqueue, OutboxFailure, OutboxFailureDecision,
-    OutboxPayloadRequest, Store,
+    OutboxPayloadRequest, Store, TransportPauseRequest,
 };
 use automonique_support_connector::{
     FleetClient, FleetOutcome, SupportDelivery, SupportEmailRequest, TicketDecision,
@@ -135,11 +135,12 @@ use automonique_support_connector::{
 };
 use automonique_transport_runtime::{
     ALL_MODIFIERS, AdminDirective, AllowedUsers, AnswerCallbackQueryRequest, ApprovalKeyboard,
-    CancellationToken, ChannelName, CommandRefusal, ControlCommand, EditMessageReplyMarkupRequest,
-    HttpFailure, InlineButtonLabel, MAX_ALLOWED_USERS, MAX_COMMAND_TEXT_BYTES,
-    MAX_SEND_MESSAGE_TEXT_UNITS, MemoryDirective, MessageModifiers, ModelAlias, ModifierKind,
-    MuteDirective, OpaqueBotToken, OperatorAuthority, PollOutcome, PollerLease, RuntimeError,
-    SendMessageRequest, SetMessageReactionRequest, SetMyCommandsRequest, TelegramBotCommand,
+    BudgetRefusal, BudgetedMethod, CallPriority, CancellationToken, ChannelName, CommandRefusal,
+    ControlCommand, EditMessageReplyMarkupRequest, HttpFailure, InlineButtonLabel,
+    MAX_ALLOWED_USERS, MAX_COMMAND_TEXT_BYTES, MAX_PAUSE_MS, MAX_SEND_MESSAGE_TEXT_UNITS,
+    MemoryDirective, MessageModifiers, ModelAlias, ModifierKind, MuteDirective, OpaqueBotToken,
+    OperatorAuthority, PollOutcome, PollerLease, RuntimeError, SendMessageRequest,
+    SetMessageReactionRequest, SetMyCommandsRequest, TelegramBotCommand, TelegramCallBudget,
     TelegramDurableSink, TelegramHttpClient, TelegramHttpPlan, TelegramHttpResponse,
     TelegramOutbound, TelegramOutboundClient, TelegramOutboundPlan, TelegramPoller,
     TelegramTextStyle, authorize_and_parse_tiered, command_manifest, command_refusal_text,
@@ -689,6 +690,34 @@ pub trait ControlSurface {
         _now_ms: i64,
     ) -> Result<(), SurfaceRefusal> {
         Err(SurfaceRefusal::Unavailable)
+    }
+
+    /// Durably record that Telegram refused this whole bot until an instant.
+    ///
+    /// A `429` names the bot, not the request that met it, so the answer has to
+    /// outlive the process that received it: the first thing a restarted daemon
+    /// does is poll, and without this it would poll straight back into the limit
+    /// it was told to wait out.
+    ///
+    /// The default is the compatibility answer for an injected surface with no
+    /// durable store, exactly as [`ControlSurface::stage_telegram_outbound`]'s
+    /// is: the in-memory budget still holds the pause for this process, and
+    /// nothing claims it survived a restart.
+    fn record_transport_pause(
+        &mut self,
+        _resume_after_ms: i64,
+        _reason: &'static str,
+        _now_ms: i64,
+    ) -> Result<(), SurfaceRefusal> {
+        Ok(())
+    }
+
+    /// The instant a durably recorded pause on this bot ends, if one is live.
+    ///
+    /// Read once, when the bridge is composed. The default is "not paused",
+    /// which is the truth for a surface that records none.
+    fn live_transport_pause(&mut self, _now_ms: i64) -> Result<Option<i64>, SurfaceRefusal> {
+        Ok(None)
     }
 
     /// A bounded, read-only fact snapshot for one natural-language answer.
@@ -2018,6 +2047,27 @@ pub trait RunLane {
     fn question_runtime(&self, profile: QuestionProfile) -> QuestionRuntime {
         QuestionRuntime::codex(profile)
     }
+
+    /// Hand this lane the live progress stream and the bot's call budget.
+    ///
+    /// The default does nothing, which is the honest answer for a lane with no
+    /// transport of its own: an implementation that cannot draw a draft has
+    /// nothing to do with a hub. See [`crate::run_lane::SocketRunLane`] for the
+    /// one that can.
+    fn attach_streaming(&mut self, hub: Arc<ProgressHub>, budget: Arc<Mutex<TelegramCallBudget>>) {
+        let _ = (hub, budget);
+    }
+
+    /// Name the chat one run's progress should be drawn in, or clear it.
+    ///
+    /// Set immediately before a run and cleared immediately after, by the
+    /// caller that knows which conversation asked — the bridge for `/run`, the
+    /// question worker for a question. A lane with no target streams nothing,
+    /// which is what a run started by a background engine gets: nobody is
+    /// watching a chat for it.
+    fn set_draft_target(&mut self, chat_id: Option<i64>) {
+        let _ = chat_id;
+    }
 }
 
 /// Trusted diagnostic identity for the provider path serving one question.
@@ -2180,7 +2230,11 @@ where
                         match lane.lock() {
                         Ok(mut lane) => {
                             let runtime = lane.question_runtime(job.profile);
+                            // The asker's own chat is where this question's
+                            // progress is drawn, and only for as long as it runs.
+                            lane.set_draft_target(Some(job.chat_id));
                             let outcome = lane.run_question(&job.prompt, job.profile);
+                            lane.set_draft_target(None);
                             (runtime, outcome)
                         }
                         Err(_) => (
@@ -3328,6 +3382,17 @@ pub struct BridgeTotals {
     pub roster_refresh_failures: usize,
     /// Whether the advertised command menu was published.
     pub menu_published: bool,
+    /// Times Telegram's `429` opened or extended a whole-bot pause.
+    pub transport_pauses: usize,
+    /// Pauses that could not be written down, and therefore will not survive a
+    /// restart. The in-process pause still held.
+    pub transport_pause_write_failures: usize,
+    /// Iterations that issued no Telegram call because a pause was live.
+    ///
+    /// Counted rather than reported as a poll failure: nothing failed. The bot
+    /// was told to wait, waited, and kept its lease and its offset exactly where
+    /// they were.
+    pub paused_iterations: usize,
     /// Messages dropped because their session was muted.
     ///
     /// Counted rather than reported into the chat: a muted session that
@@ -3451,11 +3516,37 @@ pub struct TelegramControlBridge<C, O, S, R, L> {
     authority: OperatorAuthority,
     bot_id: i64,
     outbound_token: OpaqueBotToken,
+    /// Every Telegram call this bot makes is claimed here first, including the
+    /// long poll and every draft the run lane streams.
+    ///
+    /// Shared rather than owned because the run lane streams from its own
+    /// thread — a question is answered on the question worker's — and two
+    /// budgets for one bot would be two halves of an arithmetic that only means
+    /// anything whole. See [`Self::attach_streaming`].
+    budget: Arc<Mutex<TelegramCallBudget>>,
     last_answers: BTreeMap<(i64, i64, i64), (u64, String)>,
     memory_sequence: u64,
     totals: BridgeTotals,
     menu_attempted: bool,
     terminal: Option<&'static str>,
+}
+
+/// Read or update a shared budget, through a poisoned lock if it comes to that.
+///
+/// A [`TelegramCallBudget`] is arithmetic over integers and holds no invariant
+/// that spans two statements, so a thread that panicked while holding this lock
+/// left a budget that is merely *stale*, not inconsistent. Refusing to read it
+/// would mean either dropping every call or ignoring a live pause, and both are
+/// worse than continuing from the counters as they stand.
+pub(crate) fn with_budget<T>(
+    budget: &Mutex<TelegramCallBudget>,
+    act: impl FnOnce(&mut TelegramCallBudget) -> T,
+) -> T {
+    let mut guard = match budget.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    act(&mut guard)
 }
 
 impl<C, O, S, R, L> TelegramControlBridge<C, O, S, R, L>
@@ -3495,7 +3586,7 @@ where
             outbound,
             question_outbound,
             sink,
-            surface,
+            mut surface,
             lane,
             slack,
             github,
@@ -3516,6 +3607,21 @@ where
             .compose(&[])
             .map_err(|_| RuntimeError::InvalidConfiguration("operator_roster"))?;
         let bot_id = policy.bot_id().get();
+        // THE PAUSE A PREVIOUS PROCESS INHERITED. Read once, here, before any
+        // seam that could dial exists: a bridge composed inside a live pause
+        // starts paused, so the first thing a restarted daemon does is wait
+        // rather than walk back into the rate limit it was told to sit out.
+        //
+        // An unreadable pause row is not a startup refusal. It would take a
+        // whole control surface down over one deadline, and the answer if the
+        // bot is in fact still limited is another `429` — which is exactly the
+        // thing that writes the row again.
+        let now_ms = crate::unix_millis().unwrap_or_default();
+        let mut budget = TelegramCallBudget::new(now_ms);
+        if let Ok(Some(resume_after_ms)) = surface.live_transport_pause(now_ms) {
+            budget.restore_pause(resume_after_ms);
+        }
+        let budget = Arc::new(Mutex::new(budget));
         let lane = Arc::new(Mutex::new(lane));
         let questions = QuestionWorker::spawn(
             Arc::clone(&lane),
@@ -3565,12 +3671,73 @@ where
             authority,
             bot_id,
             outbound_token,
+            budget,
             last_answers: BTreeMap::new(),
             memory_sequence: 0,
             totals: BridgeTotals::default(),
             menu_attempted: false,
             terminal: None,
         })
+    }
+
+    /// Give the run lane the live progress stream and this bot's call budget.
+    ///
+    /// Called after the daemon's execution lane exists, which is later than the
+    /// bridge is composed — see [`crate::Daemon::open`]'s ordering — and before
+    /// the poller thread starts, so nothing observes a lane in between.
+    ///
+    /// The budget is shared rather than copied because the lane spends calls
+    /// from other threads: a `/run` blocks the poller thread, and a question is
+    /// answered on the question worker's. Two budgets for one bot would each be
+    /// counting half the traffic.
+    pub fn attach_streaming(&mut self, hub: Arc<ProgressHub>) {
+        if let Ok(mut lane) = self.lane.lock() {
+            lane.attach_streaming(hub, Arc::clone(&self.budget));
+        }
+    }
+
+    /// The instant a live whole-bot pause ends, if this bot is paused.
+    ///
+    /// The one question the run loop asks before it does anything: while a `429`
+    /// is in force this bridge issues no Telegram call at all — not the long
+    /// poll, not an outbox drain, not a draft.
+    #[must_use]
+    pub fn paused_until(&self, now_ms: i64) -> Option<i64> {
+        with_budget(&self.budget, |budget| budget.paused_until(now_ms))
+    }
+
+    /// Claim one call against this bot's budget.
+    fn claim(
+        &mut self,
+        method: BudgetedMethod,
+        chat_id: Option<i64>,
+        priority: CallPriority,
+        now_ms: i64,
+    ) -> Result<(), BudgetRefusal> {
+        with_budget(&self.budget, |budget| {
+            budget.claim(method, chat_id, priority, now_ms)
+        })
+    }
+
+    /// Record a `429` as a whole-bot pause, in memory and durably.
+    ///
+    /// Both, in that order: the in-memory deadline is what stops the very next
+    /// call on this thread, and the row is what stops the first call after a
+    /// restart. A row that could not be written leaves the in-process pause in
+    /// force and is counted — the durable half is what survives a restart, and
+    /// the answer if it did not survive is another `429`.
+    fn enter_transport_pause(&mut self, retry_after_ms: u64, now_ms: i64) {
+        let resume_after_ms = with_budget(&self.budget, |budget| {
+            budget.note_rate_limited(retry_after_ms, now_ms)
+        });
+        self.totals.transport_pauses += 1;
+        if self
+            .surface
+            .record_transport_pause(resume_after_ms, TRANSPORT_PAUSE_RATE_LIMITED, now_ms)
+            .is_err()
+        {
+            self.totals.transport_pause_write_failures += 1;
+        }
     }
 
     /// Who may command this bot right now, at which tier.
@@ -3847,6 +4014,16 @@ where
         if let Ok(mut slot) = self.captured.lock() {
             *slot = None;
         }
+        // THE WHOLE-BOT PAUSE, AHEAD OF EVERYTHING. A `429` is about the bot, so
+        // during it this cycle issues no Telegram call at all — not the drain,
+        // and not the long poll. Nothing is lost by waiting: the poll offset was
+        // committed before the pause, Telegram retains updates for a day, and
+        // the outbox holds the sends. What the caller keeps doing meanwhile is
+        // renewing the durable lease, which is a store write and not a call.
+        if self.paused_until(now_ms).is_some() {
+            self.totals.paused_iterations += 1;
+            return Ok(DispatchReport::default());
+        }
         // Before the request, never after: the policy an update is admitted
         // under has to be the one it was fetched under, and this is the only
         // point in the cycle where nothing is in flight.
@@ -3854,7 +4031,32 @@ where
         let mut recovered = DispatchReport::default();
         self.drain_telegram_outbox(cancellation, &mut recovered, None);
         self.totals.dispatch.add(recovered);
-        let outcome = self.poller.poll_once(lease, now_ms, cancellation)?;
+        // The drain may itself have met a `429` and paused the bot. Polling
+        // through it would be spending the one call the pause exists to stop.
+        if self.paused_until(now_ms).is_some() {
+            self.totals.paused_iterations += 1;
+            return Ok(recovered);
+        }
+        // The long poll is a call like any other and is accounted like one; a
+        // budget that skipped it would under-count by one call every few
+        // seconds forever. Only a live pause can refuse it, and that was
+        // checked above, so the claim here is the accounting.
+        let _ = self.claim(
+            BudgetedMethod::GetUpdates,
+            None,
+            CallPriority::Durable,
+            now_ms,
+        );
+        let outcome = match self.poller.poll_once(lease, now_ms, cancellation) {
+            Ok(outcome) => outcome,
+            Err(RuntimeError::Http(HttpFailure::RateLimited { retry_after_ms })) => {
+                self.enter_transport_pause(retry_after_ms, now_ms);
+                return Err(RuntimeError::Http(HttpFailure::RateLimited {
+                    retry_after_ms,
+                }));
+            }
+            Err(error) => return Err(error),
+        };
         self.totals.polls += 1;
         // A question may have completed while `getUpdates` was in flight. Free
         // its one-slot admission before this newly fetched batch is dispatched,
@@ -3951,6 +4153,20 @@ where
                 self.terminal = Some("lease_unpublishable");
                 break;
             };
+            // WAITING OUT A `429` IS NOT AN ERROR AND IS NOT A GAP IN CUSTODY.
+            // The lease is renewed by the serve thread on its own cadence — a
+            // store write, not a Telegram call — so it stays live and keeps its
+            // epoch throughout, and the committed offset is untouched because
+            // nothing was fetched. Telegram retains updates for twenty-four
+            // hours, so the only cost is up to `retry_after` of inbound latency.
+            if let Some(resume_after_ms) = self.paused_until(now_ms) {
+                self.totals.paused_iterations += 1;
+                let remaining = resume_after_ms
+                    .saturating_sub(now_ms)
+                    .clamp(1, MAX_PAUSE_MS);
+                back_off_for(stop, Duration::from_millis(remaining.unsigned_abs()));
+                continue;
+            }
             match self.poll_and_dispatch(&current, now_ms, cancellation) {
                 Ok(_) => {}
                 Err(RuntimeError::CommitReconciliationRequired { .. }) => {
@@ -3963,13 +4179,14 @@ where
                     self.terminal = Some("commit_reconciliation_required");
                     break;
                 }
-                Err(RuntimeError::Http(HttpFailure::RateLimited { retry_after_ms })) => {
+                Err(RuntimeError::Http(HttpFailure::RateLimited { .. })) => {
+                    // `poll_and_dispatch` has already turned this into the
+                    // whole-bot pause, in memory and durably. The wait happens
+                    // at the top of the next iteration, which is the one place
+                    // that knows how much of the deadline is left — and which a
+                    // 429 met by the *drain* reaches too.
                     self.totals.poll_failures += 1;
                     self.totals.rate_limited_polls += 1;
-                    back_off_for(
-                        stop,
-                        Duration::from_millis(retry_after_ms.clamp(1, 300_000)),
-                    );
                 }
                 Err(_) => {
                     self.totals.poll_failures += 1;
@@ -4354,7 +4571,16 @@ where
                             .lane
                             .try_lock()
                             .map_err(|_| RunFailure::Unavailable)
-                            .and_then(|mut lane| lane.run(task.as_str()));
+                            .and_then(|mut lane| {
+                                // The chat that asked is the chat the progress
+                                // is drawn in, and it is cleared on the way out
+                                // so a later run started by anything else does
+                                // not inherit an audience.
+                                lane.set_draft_target(Some(chat_id));
+                                let outcome = lane.run(task.as_str());
+                                lane.set_draft_target(None);
+                                outcome
+                            });
                         match outcome {
                             Ok(answer) => Answer::RunAnswered {
                                 chat_id,
@@ -6471,6 +6697,22 @@ where
                 }
             }
         }
+        // Everything that reaches here is durable traffic — a reaction, the
+        // menu, a callback acknowledgement, a keyboard strip — so the claim can
+        // only be refused by a live pause, and a paused bot must not send.
+        let now_ms = crate::unix_millis().unwrap_or_default();
+        if self
+            .claim(
+                BudgetedMethod::of(&request),
+                request.chat_id(),
+                CallPriority::Durable,
+                now_ms,
+            )
+            .is_err()
+        {
+            report.send_failed += 1;
+            return None;
+        }
         let Ok(plan) = TelegramOutboundPlan::new(self.bot_id, request, &self.outbound_token) else {
             report.send_refused += 1;
             return None;
@@ -6479,6 +6721,11 @@ where
             Ok(response) if telegram_response_ok(&response) => {
                 report.sent += 1;
                 Some(response)
+            }
+            Err(HttpFailure::RateLimited { retry_after_ms }) => {
+                self.enter_transport_pause(retry_after_ms, now_ms);
+                report.send_failed += 1;
+                None
             }
             Ok(_) | Err(_) => {
                 report.send_failed += 1;
@@ -6501,6 +6748,13 @@ where
         let mut wanted_response = None;
         for _ in 0..TELEGRAM_OUTBOX_MAX_DRAIN {
             let now_ms = crate::unix_millis().unwrap_or_default();
+            // A paused bot claims nothing from the outbox. Leaving the intents
+            // where they are is what makes the backlog absorb the pause: the
+            // rows stay ready, in order, and the first drain after the deadline
+            // sends them oldest-first exactly as if nothing had happened.
+            if self.paused_until(now_ms).is_some() {
+                break;
+            }
             let lease = match self.surface.claim_telegram_outbound(now_ms) {
                 Ok(Some(lease)) => lease,
                 Ok(None) => break,
@@ -6577,11 +6831,18 @@ where
                     continue;
                 }
             }
-            let Ok(plan) = TelegramOutboundPlan::new(
-                self.bot_id,
-                TelegramOutbound::SendMessage(request),
-                &self.outbound_token,
-            ) else {
+            let outbound = TelegramOutbound::SendMessage(request);
+            // Accounted before the call, at the priority that says a person is
+            // waiting for it. Nothing but a live pause refuses this, and a live
+            // pause already broke out of the loop above.
+            let _ = self.claim(
+                BudgetedMethod::of(&outbound),
+                outbound.chat_id(),
+                CallPriority::Durable,
+                now_ms,
+            );
+            let Ok(plan) = TelegramOutboundPlan::new(self.bot_id, outbound, &self.outbound_token)
+            else {
                 let _ = self
                     .surface
                     .fail_telegram_outbound(&lease, None, "invalid_plan", now_ms);
@@ -6621,17 +6882,24 @@ where
                         wanted_response = Some(response);
                     }
                 }
-                Err(HttpFailure::RateLimited { retry_after_ms }) => {
-                    let delay = i64::try_from(retry_after_ms)
-                        .unwrap_or(300_000)
-                        .clamp(1, 300_000);
+                Err(HttpFailure::RateLimited {
+                    retry_after_ms: retry_after,
+                }) => {
+                    let delay = i64::try_from(retry_after)
+                        .unwrap_or(MAX_PAUSE_MS)
+                        .clamp(1, MAX_PAUSE_MS);
                     let retry_after_ms = now_ms.saturating_add(delay);
+                    // The intent goes back into the queue at its head, ready
+                    // again at the same instant the bot is.
                     let _ = self.surface.fail_telegram_outbound(
                         &lease,
                         Some(retry_after_ms),
-                        "rate_limited",
+                        TRANSPORT_PAUSE_RATE_LIMITED,
                         now_ms,
                     );
+                    // And the refusal is about the bot, not this intent: it
+                    // stops the poll and every other chat's sends too, durably.
+                    self.enter_transport_pause(retry_after, now_ms);
                     report.send_failed += 1;
                     break;
                 }
@@ -6661,6 +6929,19 @@ where
 /// Named here rather than spelled at each call site, because a stager and a
 /// drainer that disagreed about it would produce rows nothing ever claims.
 pub(crate) const TELEGRAM_SEND_KIND: &str = "telegram.send_message";
+
+/// The transport a durable pause row is scoped under.
+///
+/// The same word the outbox already files Telegram intents under, named once so
+/// a writer and a reader cannot disagree about it.
+pub(crate) const TELEGRAM_TRANSPORT: &str = "telegram";
+
+/// The closed reason a Telegram pause is ever recorded for.
+///
+/// One word, because there is one cause: Telegram answered `429`. A second
+/// reason would be a second thing that stops a bot, and this product does not
+/// have one.
+pub(crate) const TRANSPORT_PAUSE_RATE_LIMITED: &str = "rate_limited";
 
 /// Build the durable payload for one plain notice this bridge would deliver.
 ///
@@ -6747,6 +7028,59 @@ fn telegram_response_ok(response: &TelegramHttpResponse) -> bool {
             .ok()
             .and_then(|value| value.get("ok").and_then(serde_json::Value::as_bool))
             == Some(true)
+}
+
+/// What one Telegram answer said, for a caller that has to tell "this method
+/// does not exist here" from "that did not work".
+///
+/// The distinction matters for exactly one path. `sendMessageDraft` is newer
+/// than the Bot API this build was written against, and a deployment whose
+/// `api.telegram.org` does not offer it answers every call the same way
+/// forever. Retrying that is a request loop; *detecting* it is a latch and a
+/// fallback. Every other outbound method in this product is documented and
+/// long-standing, so none of them needs this.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TelegramApiOutcome {
+    /// Telegram accepted it, and named a message when the method makes one.
+    Accepted { message_id: Option<i64> },
+    /// Telegram answered `ok: false`. The code is Telegram's own; it is carried
+    /// as a number and never as its description, which is free text from a
+    /// peer.
+    Rejected { error_code: i64 },
+    /// The status, the shape or the encoding was not one this build reads. It
+    /// is deliberately not a rejection: a truncated body says nothing about
+    /// whether the method exists.
+    Unreadable,
+}
+
+/// Decode one bounded Telegram answer.
+///
+/// The body is already capped by the transport at
+/// `MAX_TELEGRAM_RESPONSE_BYTES`, so this is a bounded parse of bounded input.
+pub(crate) fn telegram_api_outcome(response: &TelegramHttpResponse) -> TelegramApiOutcome {
+    if response.status != 200 {
+        return TelegramApiOutcome::Unreadable;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&response.body) else {
+        return TelegramApiOutcome::Unreadable;
+    };
+    match value.get("ok").and_then(serde_json::Value::as_bool) {
+        Some(true) => TelegramApiOutcome::Accepted {
+            message_id: value
+                .get("result")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|result| result.get("message_id"))
+                .and_then(serde_json::Value::as_i64)
+                .filter(|message_id| *message_id > 0),
+        },
+        Some(false) => TelegramApiOutcome::Rejected {
+            error_code: value
+                .get("error_code")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default(),
+        },
+        None => TelegramApiOutcome::Unreadable,
+    }
 }
 
 /// The fixed answer an unauthorized sender receives.
@@ -8983,6 +9317,36 @@ impl ControlSurface for StoreControlSurface {
                 decision,
             })
             .map(|_| ())
+            .map_err(|_| SurfaceRefusal::Unavailable)
+    }
+
+    /// The scope is this bot's own id, so two bots served from one database
+    /// pause independently — which they must, because a `429` names one of them.
+    fn record_transport_pause(
+        &mut self,
+        resume_after_ms: i64,
+        reason: &'static str,
+        now_ms: i64,
+    ) -> Result<(), SurfaceRefusal> {
+        self.store
+            .pause_transport(TransportPauseRequest {
+                transport: TELEGRAM_TRANSPORT,
+                scope: &self.facts.bot_id.to_string(),
+                generation_id: &self.facts.generation_id,
+                holder_id: &self.facts.holder_id,
+                authority_lease_epoch: self.facts.lease_epoch,
+                reason,
+                now_ms,
+                resume_after_ms,
+            })
+            .map(|_| ())
+            .map_err(|_| SurfaceRefusal::Unavailable)
+    }
+
+    fn live_transport_pause(&mut self, now_ms: i64) -> Result<Option<i64>, SurfaceRefusal> {
+        self.store
+            .transport_pause(TELEGRAM_TRANSPORT, &self.facts.bot_id.to_string(), now_ms)
+            .map(|pause| pause.map(|pause| pause.resume_after_ms))
             .map_err(|_| SurfaceRefusal::Unavailable)
     }
 

@@ -69,6 +69,7 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use automonique_protocol::admin::{AdminRequest, AdminResponse, SubmittedRunSpec};
@@ -83,13 +84,20 @@ use automonique_protocol::execute_api::{
 use automonique_protocol::tools::RunId;
 use automonique_store::run_index::{RunIndex, RunSpoolState};
 
+use automonique_transport_runtime::{
+    BudgetedMethod, CallPriority, CancellationToken, EditMessageTextRequest, OpaqueBotToken,
+    SendMessageDraftRequest, SendMessageRequest, TelegramCallBudget, TelegramOutbound,
+    TelegramOutboundClient, TelegramOutboundPlan,
+};
+
 use crate::compose::{
     ComposeRefusal, Composition, CompositionInputs, ProviderConfig, ProviderRunProfile, compose,
     compose_with_profile, read_answer,
 };
+use crate::progress_hub::ProgressHub;
 use crate::telegram_bridge::{
     ApprovalDecisionAnswer, ApprovalDecisionFailure, QuestionProfile, QuestionRuntime, RunFailure,
-    RunLane,
+    RunLane, RunProgressView, TelegramApiOutcome, telegram_api_outcome, with_budget,
 };
 
 /// Optional provider configuration used only for ordinary conversation.
@@ -141,6 +149,201 @@ impl core::fmt::Display for RunIndexUnavailable {
 
 impl std::error::Error for RunIndexUnavailable {}
 
+/// Shortest interval between two snapshots on the `editMessageText` fallback.
+///
+/// The draft method replaces a *composing* indicator, which costs a chat
+/// nothing; editing a real message is visible to everyone in it, so the
+/// fallback is deliberately slower than the budget alone would allow. Three
+/// seconds is the number the plan pins and it is a policy choice, not a
+/// Telegram bound.
+pub const FALLBACK_EDIT_INTERVAL_MS: i64 = 3_000;
+
+/// What one lane may draw a run's progress into.
+///
+/// A seam for the reason every other seam here is one: the whole streaming
+/// decision — claim a token, send a draft, notice a rejection, fall back — is
+/// exercisable from a fixed clock with no network. The production
+/// implementation is [`TelegramDraftSink`].
+pub trait DraftSink: Send {
+    /// Show `snapshot` as this chat's current progress.
+    ///
+    /// Never returns a failure a caller must handle: a snapshot that could not
+    /// be drawn is a snapshot the next one replaces. What it does report is
+    /// whether anything was sent, which is what a test asserts on.
+    fn draft(&mut self, chat_id: i64, snapshot: &str, now_ms: i64) -> bool;
+}
+
+/// The production draft transport: a budgeted Telegram client with a fallback.
+///
+/// # The latch
+///
+/// `sendMessageDraft` needs a Bot API this build cannot check for at startup
+/// without spending a call on a chat nobody asked about. So the first rejection
+/// *is* the check: an `ok:false` on the draft path latches "drafts unsupported"
+/// for the life of this process and every later snapshot goes through
+/// `editMessageText` instead. A rejection is never retried, because a method
+/// that does not exist will not start existing between two snapshots.
+///
+/// # The fallback's own message
+///
+/// Editing text needs a message to edit, so the first fallback snapshot sends
+/// one — directly, not through the durable outbox. That is the whole reason
+/// drafts are never staged: a progress indicator that a restart re-delivered
+/// would be a stale snapshot arriving after the answer it was describing. The
+/// final answer still travels the outbox, exactly as before.
+pub struct TelegramDraftSink {
+    client: Box<dyn TelegramOutboundClient + Send>,
+    token: OpaqueBotToken,
+    bot_id: i64,
+    budget: Arc<Mutex<TelegramCallBudget>>,
+    /// Set by the first `ok:false` on the draft path, never cleared.
+    drafts_unsupported: bool,
+    /// The message the fallback is editing, and the chat it lives in.
+    edited: Option<(i64, i64)>,
+    /// When the fallback last sent anything, for its own throttle.
+    last_edit_ms: Option<i64>,
+    /// Never fired. A draft is not worth cancelling; the run's own
+    /// cancellation is what ends the run.
+    cancellation: CancellationToken,
+}
+
+impl TelegramDraftSink {
+    /// Compose a sink over one bot's credential and its shared call budget.
+    #[must_use]
+    pub fn new(
+        client: Box<dyn TelegramOutboundClient + Send>,
+        token: OpaqueBotToken,
+        bot_id: i64,
+        budget: Arc<Mutex<TelegramCallBudget>>,
+    ) -> Self {
+        Self {
+            client,
+            token,
+            bot_id,
+            budget,
+            drafts_unsupported: false,
+            edited: None,
+            last_edit_ms: None,
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    /// Whether this process has latched the draft method as unavailable.
+    #[must_use]
+    pub const fn drafts_unsupported(&self) -> bool {
+        self.drafts_unsupported
+    }
+
+    /// Issue one already-validated request, if the budget admits it.
+    ///
+    /// Every streaming call is [`CallPriority::Ephemeral`], which is what keeps
+    /// it behind the configured headroom and therefore incapable of delaying the
+    /// final answer.
+    fn send(&mut self, request: TelegramOutbound, now_ms: i64) -> Option<TelegramApiOutcome> {
+        let method = BudgetedMethod::of(&request);
+        let chat_id = request.chat_id();
+        with_budget(&self.budget, |budget| {
+            budget.claim(method, chat_id, CallPriority::Ephemeral, now_ms)
+        })
+        .ok()?;
+        let plan = TelegramOutboundPlan::new(self.bot_id, request, &self.token).ok()?;
+        match self.client.send(&plan, &self.cancellation) {
+            Ok(response) => Some(telegram_api_outcome(&response)),
+            // A transport failure says nothing about whether the method exists,
+            // so it neither latches the fallback nor is retried: the next
+            // snapshot is the retry, and it carries newer words.
+            Err(_) => None,
+        }
+    }
+}
+
+impl DraftSink for TelegramDraftSink {
+    fn draft(&mut self, chat_id: i64, snapshot: &str, now_ms: i64) -> bool {
+        if !self.drafts_unsupported {
+            let Ok(request) = SendMessageDraftRequest::new(chat_id, snapshot) else {
+                return false;
+            };
+            match self.send(TelegramOutbound::SendMessageDraft(request), now_ms) {
+                Some(TelegramApiOutcome::Accepted { .. }) => return true,
+                // THE LATCH. Telegram said this method is not one it will serve
+                // here, and it will say so again for every snapshot of every
+                // run. Falling through to the fallback below means this run
+                // still streams rather than waiting for a restart.
+                Some(TelegramApiOutcome::Rejected { .. }) => self.drafts_unsupported = true,
+                Some(TelegramApiOutcome::Unreadable) | None => return false,
+            }
+        }
+        if self
+            .last_edit_ms
+            .is_some_and(|last| now_ms.saturating_sub(last) < FALLBACK_EDIT_INTERVAL_MS)
+        {
+            return false;
+        }
+        // A message in the wrong chat is not this run's progress message: a lane
+        // reused for a second conversation starts a fresh one.
+        let existing = self
+            .edited
+            .filter(|(existing_chat, _)| *existing_chat == chat_id);
+        let sent = match existing {
+            Some((_, message_id)) => {
+                let Ok(request) = EditMessageTextRequest::new(chat_id, message_id, snapshot) else {
+                    return false;
+                };
+                matches!(
+                    self.send(TelegramOutbound::EditMessageText(request), now_ms),
+                    Some(TelegramApiOutcome::Accepted { .. })
+                )
+            }
+            None => {
+                let Ok(request) = SendMessageRequest::new(chat_id, snapshot, None) else {
+                    return false;
+                };
+                match self.send(TelegramOutbound::SendMessage(request), now_ms) {
+                    Some(TelegramApiOutcome::Accepted {
+                        message_id: Some(message_id),
+                    }) => {
+                        self.edited = Some((chat_id, message_id));
+                        true
+                    }
+                    // Telegram accepted a message and did not name it, which
+                    // leaves nothing to edit. The next snapshot opens a fresh
+                    // one rather than editing a message this build cannot name.
+                    _ => false,
+                }
+            }
+        };
+        if sent {
+            self.last_edit_ms = Some(now_ms);
+        }
+        sent
+    }
+}
+
+/// One lane's live streaming apparatus, when a deployment has one.
+struct DraftStream {
+    hub: Arc<ProgressHub>,
+    sink: Box<dyn DraftSink>,
+    /// The chat the run in flight is being watched from, set per run.
+    target: Option<i64>,
+}
+
+/// What a lane holds between being composed and learning the call budget.
+///
+/// The Telegram host composes a lane before the bridge that owns the budget
+/// exists, and the bridge exists before the execution lane that owns the hub.
+/// So the credential is handed over first and the sink is assembled last, in
+/// [`RunLane::attach_streaming`], when both halves are finally available.
+pub struct DraftTransport {
+    /// This lane's own outbound client. Its own, not the bridge's: a draft sent
+    /// from a run's thread must never queue behind a reply.
+    pub client: Box<dyn TelegramOutboundClient + Send>,
+    /// The same bot credential, independently constructed as every other copy
+    /// in this daemon is — the opaque type is deliberately not cloneable.
+    pub token: OpaqueBotToken,
+    /// The bot the credential names.
+    pub bot_id: i64,
+}
+
 /// The production `/run` lane.
 ///
 /// Everything it needs is resolved once, at [`SocketRunLane::open`], and never
@@ -171,6 +374,14 @@ pub struct SocketRunLane {
     offered: Vec<automonique_protocol::sandbox::HostFeature>,
     /// Distinguishes two runs composed inside one millisecond.
     sequence: u64,
+    /// Live progress rendering, when a deployment composed one.
+    ///
+    /// `None` until [`RunLane::attach_streaming`] is called, and on every host
+    /// with no execution lane to stream from. A lane without it behaves exactly
+    /// as it did before drafts existed.
+    drafts: Option<DraftStream>,
+    /// The credential half of streaming, waiting for the budget half.
+    pending_transport: Option<DraftTransport>,
 }
 
 impl SocketRunLane {
@@ -213,7 +424,31 @@ impl SocketRunLane {
             egress_configured,
             offered: crate::execute::offered_host_features(),
             sequence: 0,
+            drafts: None,
+            pending_transport: None,
         })
+    }
+
+    /// Hand this lane the credential it will draw drafts with.
+    ///
+    /// Nothing streams from this alone: the sink is assembled in
+    /// [`RunLane::attach_streaming`], when the hub and the call budget exist.
+    /// A lane that is never given one streams nothing and is otherwise
+    /// unchanged, which is every deployment with no Telegram credential.
+    pub fn with_draft_transport(&mut self, transport: DraftTransport) {
+        self.pending_transport = Some(transport);
+    }
+
+    /// Install a hub and a sink directly.
+    ///
+    /// The seam a test drives, and the assembly path
+    /// [`RunLane::attach_streaming`] takes once both halves have arrived.
+    pub fn with_drafts(&mut self, hub: Arc<ProgressHub>, sink: Box<dyn DraftSink>) {
+        self.drafts = Some(DraftStream {
+            hub,
+            sink,
+            target: None,
+        });
     }
 
     /// Whether this lane could compose anything at all.
@@ -362,15 +597,34 @@ impl SocketRunLane {
         }
     }
 
-    /// Watch one run's read-model row until it is terminal.
+    /// Watch one run's read-model row until it is terminal, streaming as it goes.
     ///
     /// The row is this lane's evidence and the only thing it waits on. A row
     /// that never moves is [`RunFailure::Unavailable`] rather than a failure of
     /// the run: the attempt may well have finished, and saying it failed would
     /// be inventing an outcome.
-    fn await_terminal(&self, submission_id: u64) -> Result<RunSpoolState, RunFailure> {
+    ///
+    /// # The streaming seam
+    ///
+    /// This loop already wakes every [`POLL_INTERVAL`], so the progress stream
+    /// is drained here and nowhere else — no timer, no second thread, no async.
+    /// Each pass folds whatever the hub has retained past this view's cursor
+    /// into one bounded snapshot ([`RunProgressView`] does the folding and the
+    /// UTF-16 truncation) and offers it to the sink, which decides whether the
+    /// budget admits sending it. A snapshot that is skipped is not lost: the
+    /// next one is a superset, because a draft replaces rather than appends.
+    ///
+    /// Nothing here can fail the run. Every streaming outcome — no target, no
+    /// hub, an empty fold, a refused token, a rejected method — leaves the wait
+    /// exactly as it was.
+    fn await_terminal(
+        &mut self,
+        submission_id: u64,
+        run_id: &str,
+    ) -> Result<RunSpoolState, RunFailure> {
         let submission_id = i64::try_from(submission_id).map_err(|_| RunFailure::Unavailable)?;
         let deadline = Instant::now() + RUN_DEADLINE;
+        let mut view = RunProgressView::new();
         loop {
             let record = self
                 .run_index
@@ -380,11 +634,32 @@ impl SocketRunLane {
             if record.spool_state.is_terminal() {
                 return Ok(record.spool_state);
             }
+            self.stream_progress(&mut view, run_id);
             if Instant::now() >= deadline {
                 return Err(RunFailure::Unavailable);
             }
             std::thread::sleep(POLL_INTERVAL);
         }
+    }
+
+    /// Fold one pass of the live stream and offer the snapshot to the sink.
+    fn stream_progress(&mut self, view: &mut RunProgressView, run_id: &str) {
+        let Some(stream) = self.drafts.as_mut() else {
+            return;
+        };
+        let Some(chat_id) = stream.target else {
+            return;
+        };
+        let Some(snapshot) = view.poll(&stream.hub, run_id) else {
+            return;
+        };
+        // A clock this process cannot read is a budget it cannot account
+        // against, and drawing a draft anyway would be spending an untracked
+        // call. Skipping one snapshot costs nothing.
+        let Ok(now_ms) = crate::unix_millis() else {
+            return;
+        };
+        stream.sink.draft(chat_id, &snapshot, now_ms);
     }
 
     /// Ask the approval lane to record one operator decision.
@@ -523,6 +798,30 @@ impl RunLane for SocketRunLane {
         self.run_with_profile(task, run_profile)
     }
 
+    /// The last half. Both the hub and the budget arrive here, so this is where
+    /// the sink is finally assembled.
+    ///
+    /// A lane that was never given a credential takes the hub and still streams
+    /// nothing, which is exactly right for a deployment that has none — and is
+    /// why this is not a refusal.
+    fn attach_streaming(&mut self, hub: Arc<ProgressHub>, budget: Arc<Mutex<TelegramCallBudget>>) {
+        if let Some(stream) = self.drafts.as_mut() {
+            stream.hub = hub;
+            return;
+        }
+        if let Some(transport) = self.pending_transport.take() {
+            let sink =
+                TelegramDraftSink::new(transport.client, transport.token, transport.bot_id, budget);
+            self.with_drafts(hub, Box::new(sink));
+        }
+    }
+
+    fn set_draft_target(&mut self, chat_id: Option<i64>) {
+        if let Some(stream) = self.drafts.as_mut() {
+            stream.target = chat_id;
+        }
+    }
+
     fn question_runtime(&self, profile: QuestionProfile) -> QuestionRuntime {
         if matches!(
             profile,
@@ -604,10 +903,14 @@ impl SocketRunLane {
     ///
     /// Split out so [`RunLane::run`] has exactly one place that removes the
     /// slot, on every path including a refusal.
-    fn execute(&self, composition: &Composition) -> Result<String, RunFailure> {
+    fn execute(&mut self, composition: &Composition) -> Result<String, RunFailure> {
         let submission_id = self.submit(composition)?;
         self.start(composition)?;
-        match self.await_terminal(submission_id)? {
+        // The run identity is the hub's key as well as the cgroup's and the
+        // workspace's, which is what lets the wait below draw this run's own
+        // frames and nobody else's.
+        let run_id = composition.run_id().to_owned();
+        match self.await_terminal(submission_id, &run_id)? {
             RunSpoolState::Completed => {
                 read_answer(composition.answer_path()).ok_or(RunFailure::NoAnswer)
             }
