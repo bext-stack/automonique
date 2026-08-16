@@ -827,6 +827,7 @@ struct FakeRunLane {
 struct FakeRunLaneState {
     tasks: Vec<String>,
     answer: Option<String>,
+    answers: VecDeque<String>,
     failure: Option<RunFailure>,
     gate: Option<Arc<RunGate>>,
     /// Every `(run_ref, request_ref)` the bridge presented, in order.
@@ -859,6 +860,13 @@ impl FakeRunLane {
     fn answering(answer: &str) -> Self {
         let lane = Self::default();
         lane.state.lock().expect("lane state").answer = Some(answer.to_owned());
+        lane
+    }
+
+    fn answering_sequence(answers: &[&str]) -> Self {
+        let lane = Self::default();
+        lane.state.lock().expect("lane state").answers =
+            answers.iter().map(|answer| (*answer).to_owned()).collect();
         lane
     }
 
@@ -934,7 +942,8 @@ impl RunLane for FakeRunLane {
         let (answer, failure, gate) = {
             let mut state = self.state.lock().expect("lane state");
             state.tasks.push(task.to_owned());
-            (state.answer.clone(), state.failure, state.gate.clone())
+            let answer = state.answers.pop_front().or_else(|| state.answer.clone());
+            (answer, state.failure, state.gate.clone())
         };
         if let Some(gate) = gate {
             let mut flags = gate.flags.lock().expect("gate flags");
@@ -1897,9 +1906,10 @@ fn host_load_questions_measure_cpu_and_ram_without_a_provider_run() {
 fn composite_operational_questions_use_typed_reads_then_answer_in_general_language() {
     let fixture = Fixture::new(&[]);
     let outbound = FakeOutbound::default();
-    let lane = FakeRunLane::answering(
+    let lane = FakeRunLane::answering_sequence(&[
+        r#"{"kind":"read","sources":["status","host_load"],"slack_channel":null,"github_issues":false,"depth":"fast"}"#,
         "The daemon is healthy and the current CPU/RAM figures are in the supplied range.",
-    );
+    ]);
     let mut bridge = bridge_with_lane(
         &fixture,
         FakeClient::new([updates(&[(
@@ -1917,12 +1927,13 @@ fn composite_operational_questions_use_typed_reads_then_answer_in_general_langua
     assert_eq!(report.questions_queued, 1);
     assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
     let prompts = lane.tasks();
-    assert_eq!(prompts.len(), 1);
-    assert!(prompts[0].contains("deterministic typed read tools"));
-    assert!(prompts[0].contains("selected_sources.status=yes"));
-    assert!(prompts[0].contains("selected_sources.host_load=yes"));
-    assert!(prompts[0].contains("[daemon_status]"));
-    assert!(prompts[0].contains("[host_load]\nstatus=available"));
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("AUTOMONIQUE_CONVERSATIONAL_TOOL_ROUTER_V1"));
+    assert!(prompts[1].contains("deterministic typed read tools"));
+    assert!(prompts[1].contains("selected_sources.status=yes"));
+    assert!(prompts[1].contains("selected_sources.host_load=yes"));
+    assert!(prompts[1].contains("[daemon_status]"));
+    assert!(prompts[1].contains("[host_load]\nstatus=available"));
     assert!(outbound.messages()[0].contains("The daemon is healthy"));
 }
 
@@ -1978,7 +1989,7 @@ fn french_greeting_answers_immediately_without_a_provider_run() {
 fn ordinary_conversation_uses_the_small_prompt_without_reading_ticket_state() {
     let fixture = Fixture::new(&[]);
     let outbound = FakeOutbound::default();
-    let lane = FakeRunLane::answering("conversation answer");
+    let lane = FakeRunLane::answering(r#"{"kind":"answer","answer":"conversation answer"}"#);
     let mut bridge = bridge_with_lane(
         &fixture,
         FakeClient::new([updates(&[(1, OPERATOR, "Pourquoi le ciel est bleu ?")])]),
@@ -1995,17 +2006,11 @@ fn ordinary_conversation_uses_the_small_prompt_without_reading_ticket_state() {
     assert_eq!(completed.questions_answered, 1);
     let prompts = lane.tasks();
     assert_eq!(prompts.len(), 1);
-    assert!(prompts[0].contains("AUTOMONIQUE_FAST_CONVERSATION_V2"));
-    assert!(prompts[0].contains("BEGIN_TRUSTED_CLOCK"));
-    let current_utc = prompts[0]
-        .lines()
-        .find_map(|line| line.strip_prefix("current_utc="))
-        .expect("clock fact");
-    assert_ne!(current_utc, "unavailable");
-    assert!(current_utc.ends_with('Z'), "UTC RFC 3339: {current_utc}");
-    assert!(prompts[0].contains("timezone=UTC"));
-    assert!(prompts[0].contains("END_TRUSTED_CLOCK"));
+    assert!(prompts[0].contains("AUTOMONIQUE_CONVERSATIONAL_TOOL_ROUTER_V1"));
+    assert!(prompts[0].contains("For ordinary conversation or stable general knowledge"));
     assert!(!prompts[0].contains("BEGIN_READ_ONLY_FACT_SNAPSHOT"));
+    assert!(outbound.messages()[0].contains("conversation answer"));
+    assert!(!outbound.messages()[0].contains(r#"{"kind":"answer"#));
 }
 
 #[test]
@@ -2083,7 +2088,10 @@ fn named_slack_and_github_facts_are_read_live_before_fast_operational_answer() {
     .with_channels(&["ops", "deploiements"]);
     let github = FakeGitHub::default();
     let outbound = FakeOutbound::default();
-    let lane = FakeRunLane::answering("live operational answer");
+    let lane = FakeRunLane::answering_sequence(&[
+        r#"{"kind":"read","sources":[],"slack_channel":"ops","github_issues":true,"depth":"fast"}"#,
+        "live operational answer",
+    ]);
     let mut bridge = bridge_with_sources(
         &fixture,
         FakeClient::new([updates(&[(
@@ -2108,13 +2116,15 @@ fn named_slack_and_github_facts_are_read_live_before_fast_operational_answer() {
     assert_eq!(slack.reads(), ["ops"]);
     assert_eq!(github.seen(), ["example/repo#1007"]);
     let prompts = lane.tasks();
-    assert_eq!(prompts.len(), 1);
-    assert!(prompts[0].contains("[live_slack_channel]"));
-    assert!(prompts[0].contains("channel=ops"));
-    assert!(prompts[0].contains("à traiter https://github.com/example/repo/issues/1007"));
-    assert!(prompts[0].contains("[live_github_issues]"));
-    assert!(prompts[0].contains("reference=example/repo#1007"));
-    assert!(prompts[0].contains("state=open"));
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("AUTOMONIQUE_CONVERSATIONAL_TOOL_ROUTER_V1"));
+    assert!(prompts[0].contains("slack_channels=deploiements,ops"));
+    assert!(prompts[1].contains("[live_slack_channel]"));
+    assert!(prompts[1].contains("channel=ops"));
+    assert!(prompts[1].contains("à traiter https://github.com/example/repo/issues/1007"));
+    assert!(prompts[1].contains("[live_github_issues]"));
+    assert!(prompts[1].contains("reference=example/repo#1007"));
+    assert!(prompts[1].contains("state=open"));
     assert!(
         outbound.messages()[0].contains("route=operational_lookup_luna_none"),
         "the injected lane uses the fast fallback profile"
@@ -2272,7 +2282,7 @@ fn conversational_entity_questions_retrieve_typed_runtime_facts_without_capturin
     let prompts = lane.tasks();
     assert_eq!(prompts.len(), 1);
     let general = &prompts[0];
-    assert!(general.contains("AUTOMONIQUE_FAST_CONVERSATION_V2"));
+    assert!(general.contains("AUTOMONIQUE_CONVERSATIONAL_TOOL_ROUTER_V1"));
     assert!(general.contains("what colour is an elephant?"));
     assert!(!general.contains("BEGIN_READ_ONLY_FACT_SNAPSHOT"));
 
@@ -2505,9 +2515,10 @@ fn an_administrator_may_ask_a_read_only_question_from_durable_facts() {
     .at_site(Some("reserved-site.invalid"))
     .requested_by("Reserved Requester")]);
     let outbound = FakeOutbound::default();
-    let lane = FakeRunLane::answering(
+    let lane = FakeRunLane::answering_sequence(&[
+        r#"{"kind":"read","sources":["sites","tickets"],"slack_channel":null,"github_issues":false,"depth":"deep"}"#,
         "Ticket #1 is observed for reserved-site.invalid. https://reserved.invalid/ticket/1",
-    );
+    ]);
     let mut bridge = bridge_with_roster(
         &fixture,
         FakeClient::new([updates(&[(
@@ -2536,8 +2547,9 @@ fn an_administrator_may_ask_a_read_only_question_from_durable_facts() {
     assert_eq!(report.sent, 1);
 
     let prompts = lane.tasks();
-    assert_eq!(prompts.len(), 1);
-    let prompt = &prompts[0];
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("AUTOMONIQUE_CONVERSATIONAL_TOOL_ROUTER_V1"));
+    let prompt = &prompts[1];
     assert!(prompt.len() <= MAX_QUESTION_PROMPT_BYTES);
     assert!(prompt.contains("AUTOMONIQUE_READ_ONLY_QA_V1"));
     assert!(prompt.contains("perform or promise no action"));
@@ -2893,13 +2905,15 @@ fn question_context_is_bounded_and_marks_omitted_ticket_facts() {
     assert!(context.contains("snapshot_truncated=yes"));
 }
 
-/// An unreadable durable source prevents a partial context and therefore starts
-/// no provider run.
+/// An unreadable selected source prevents synthesis after the model has chosen
+/// the narrow read plan.
 #[test]
-fn a_question_context_failure_starts_no_run() {
+fn a_question_context_failure_starts_no_synthesis_run() {
     let fixture = Fixture::new(&[]);
     let outbound = FakeOutbound::default();
-    let lane = FakeRunLane::answering("must not be used");
+    let lane = FakeRunLane::answering_sequence(&[
+        r#"{"kind":"read","sources":["tickets"],"slack_channel":null,"github_issues":false,"depth":"fast"}"#,
+    ]);
     let mut bridge = bridge_with_lane(
         &fixture,
         FakeClient::new([updates(&[(1, OPERATOR, "What tickets are open?")])]),
@@ -2915,10 +2929,11 @@ fn a_question_context_failure_starts_no_run() {
     )
     .expect("private corrupt fixture");
 
-    let report = poll(&mut bridge).expect("poll commits");
+    assert_eq!(poll(&mut bridge).expect("poll commits").questions_queued, 1);
+    let report = await_question_completion(&mut bridge);
     assert_eq!(report.questions_failed, 1);
     assert_eq!(report.questions_answered, 0);
-    assert!(lane.tasks().is_empty());
+    assert_eq!(lane.tasks().len(), 1, "only the intent resolver ran");
     assert!(outbound.messages()[0].contains("reading is unavailable"));
 }
 
@@ -2933,7 +2948,10 @@ fn an_unselected_corrupt_source_does_not_block_a_narrow_snapshot() {
     )
     .expect("private corrupt fixture");
     let outbound = FakeOutbound::default();
-    let lane = FakeRunLane::answering("daemon-only answer");
+    let lane = FakeRunLane::answering_sequence(&[
+        r#"{"kind":"read","sources":["status"],"slack_channel":null,"github_issues":false,"depth":"fast"}"#,
+        "daemon-only answer",
+    ]);
     let mut bridge = bridge_with_lane(
         &fixture,
         FakeClient::new([updates(&[(1, OPERATOR, "What is the daemon status?")])]),
@@ -2945,10 +2963,10 @@ fn an_unselected_corrupt_source_does_not_block_a_narrow_snapshot() {
     assert_eq!(poll(&mut bridge).expect("poll commits").questions_queued, 1);
     assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
     let prompts = lane.tasks();
-    assert_eq!(prompts.len(), 1);
-    assert!(prompts[0].contains("selected_sources.status=yes"));
-    assert!(prompts[0].contains("selected_sources.tickets=no"));
-    assert!(!prompts[0].contains("not a sqlite database"));
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[1].contains("selected_sources.status=yes"));
+    assert!(prompts[1].contains("selected_sources.tickets=no"));
+    assert!(!prompts[1].contains("not a sqlite database"));
 }
 
 /// A typed provider failure is returned as itself and remains ordinary text.
@@ -3519,6 +3537,52 @@ fn natural_support_ticket_inventory_and_its_followup_use_the_local_store() {
         assert!(!message.contains("Refused before provider execution"));
         assert!(!message.contains("route="));
     }
+}
+
+#[test]
+fn semantic_followup_uses_recent_conversation_to_select_ticket_reads() {
+    let fixture = Fixture::new(&[]);
+    fixture.seed_tickets(&[
+        SeedTicket::new("SUP-SEM-1001", "Front desk printer is offline"),
+        SeedTicket::new("SUP-SEM-1002", "Attachments are rejected by mail relay"),
+    ]);
+    let root = tempfile::tempdir().expect("memory root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private memory root");
+    let memory =
+        StoreMemorySurface::open(&root.path().join("agent-memory.sqlite3"), BOT_ID, "primary")
+            .expect("memory surface");
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering_sequence(&[
+        r#"{"kind":"read","sources":["tickets"],"slack_channel":null,"github_issues":false,"depth":"fast"}"#,
+        "The two tracked requests are the printer outage and mail attachment rejection.",
+    ]);
+    let mut bridge = bridge_with_memory_and_lane(
+        &fixture,
+        FakeClient::new([
+            updates(&[(1, OPERATOR, "what support tickets do we have?")]),
+            updates(&[(2, OPERATOR, "could you pull those up for me?")]),
+        ]),
+        outbound.clone(),
+        FakeSink::default(),
+        single_tier_roster(),
+        memory,
+        lane.clone(),
+    );
+
+    assert_eq!(poll(&mut bridge).expect("inventory answer").answered, 1);
+    let queued = poll(&mut bridge).expect("semantic follow-up queues");
+    assert_eq!(queued.questions_queued, 1);
+    assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
+
+    let prompts = lane.tasks();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("AUTOMONIQUE_CONVERSATIONAL_TOOL_ROUTER_V1"));
+    assert!(prompts[0].contains("could you pull those up for me?"));
+    assert!(prompts[0].contains("Front desk printer is offline"));
+    assert!(prompts[1].contains("selected_sources.tickets=yes"));
+    assert!(prompts[1].contains("Attachments are rejected by mail relay"));
+    assert!(outbound.messages()[1].contains("two tracked requests"));
 }
 
 #[test]
