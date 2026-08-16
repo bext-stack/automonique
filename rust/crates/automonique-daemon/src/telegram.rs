@@ -831,6 +831,10 @@ impl TelegramHost {
                 long_poll_seconds: TELEGRAM_LONG_POLL_SECONDS,
             },
             ticket_gates,
+            crate::telegram_bridge::SlackPostApprovalRegistry::open(
+                params.state_dir.join("slack-post-approvals.v1.json"),
+            )
+            .map_err(|_| TelegramHostError::SurfaceUnavailable)?,
         )
         .map_err(TelegramHostError::Runtime)
     }

@@ -115,6 +115,14 @@ impl FakeClient {
     fn requested_offsets(&self) -> Vec<u64> {
         self.state.lock().expect("client state").offsets.clone()
     }
+
+    fn push(&self, behavior: ClientBehavior) {
+        self.state
+            .lock()
+            .expect("client state")
+            .behaviors
+            .push_back(behavior);
+    }
 }
 
 impl TelegramHttpClient for FakeClient {
@@ -2137,16 +2145,17 @@ fn natural_language_slack_post_composes_then_uses_the_typed_channel_effect() {
     let slack = FakeSlack::posting("Posted to #jean (ts 1786903071.699).")
         .with_channels(&["deploiements", "jean"]);
     let outbound = FakeOutbound::default();
+    let client = FakeClient::new([updates(&[(
+        1,
+        OPERATOR,
+        "can you send a poème about Monique in #jean channel?",
+    )])]);
     let lane = FakeRunLane::answering(
-        r#"{"kind":"slack_post","channel":"jean","text":"Monique veille au fil des jours,\nEt sème en silence un peu de lumière."}"#,
+        "{\"kind\":\"slack_post\",\"channel\":\"jean\",\"text\":\"Monique veille au fil des jours,\\nEt sème en silence un peu de lumière.\"}\n\nNote: The admin explicitly asked to post this poem to #jean.",
     );
     let mut bridge = bridge_with_slack(
         &fixture,
-        FakeClient::new([updates(&[(
-            1,
-            OPERATOR,
-            "can you send a poème about Monique in #jean channel?",
-        )])]),
+        client.clone(),
         outbound.clone(),
         FakeSink::default(),
         lane.clone(),
@@ -2157,10 +2166,29 @@ fn natural_language_slack_post_composes_then_uses_the_typed_channel_effect() {
     let queued = poll(&mut bridge).expect("natural post queues composition");
     assert_eq!(queued.questions_queued, 1);
     assert_eq!(queued.slack_posted, 0);
-    let completed = await_question_completion(&mut bridge);
-    assert_eq!(completed.questions_answered, 1);
-    assert_eq!(completed.slack_posted, 1);
-    assert_eq!(completed.slack_failed, 0);
+    let previewed = await_question_completion(&mut bridge);
+    assert_eq!(previewed.questions_answered, 1);
+    assert_eq!(previewed.slack_posted, 0);
+    assert_eq!(previewed.slack_failed, 0);
+    assert!(slack.posts().is_empty(), "a preview must not post");
+
+    let preview = outbound
+        .sent()
+        .into_iter()
+        .find(|call| call.method == "sendMessage")
+        .expect("approval preview");
+    assert!(preview.body.contains("Slack post awaiting approval"));
+    assert!(preview.body.contains("Monique veille au fil des jours"));
+    let preview_json: serde_json::Value =
+        serde_json::from_str(&preview.body).expect("preview JSON");
+    let approve_callback = preview_json["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        .as_str()
+        .expect("approve callback")
+        .to_owned();
+    client.push(callback_updates(&[(2, OPERATOR, &approve_callback)]));
+    let approved = poll(&mut bridge).expect("approval commits");
+    assert_eq!(approved.slack_posted, 1);
+    assert_eq!(approved.slack_failed, 0);
     assert_eq!(
         slack.posts(),
         [(
@@ -2168,12 +2196,77 @@ fn natural_language_slack_post_composes_then_uses_the_typed_channel_effect() {
             String::from("Monique veille au fil des jours,\nEt sème en silence un peu de lumière."),
         )]
     );
+    client.push(callback_updates(&[(3, OPERATOR, &approve_callback)]));
+    let repeated = poll(&mut bridge).expect("repeated approval commits");
+    assert_eq!(repeated.slack_posted, 0);
+    assert_eq!(slack.posts().len(), 1, "a repeated press must not repost");
+    assert!(
+        outbound
+            .messages()
+            .iter()
+            .any(|message| message.contains("no longer pending"))
+    );
     let prompts = lane.tasks();
     assert_eq!(prompts.len(), 1, "composition and intent share one turn");
     assert!(prompts[0].contains("AUTOMONIQUE_CONVERSATIONAL_TOOL_ROUTER_V1"));
     assert!(prompts[0].contains(r#""kind":"slack_post""#));
     assert!(prompts[0].contains("slack_channels=deploiements,jean"));
-    assert!(outbound.messages()[0].contains("Posted to #jean"));
+    assert!(
+        outbound
+            .messages()
+            .iter()
+            .any(|message| message.contains("Posted to #jean"))
+    );
+}
+
+#[test]
+fn denying_a_natural_language_slack_preview_posts_nothing() {
+    let fixture = Fixture::new(&[]);
+    let slack = FakeSlack::posting("must not post").with_channels(&["jean"]);
+    let outbound = FakeOutbound::default();
+    let client = FakeClient::new([updates(&[(1, OPERATOR, "send a poem to #jean")])]);
+    let lane = FakeRunLane::answering(
+        r#"{"kind":"slack_post","channel":"jean","text":"Monique veille sur nos chemins."}"#,
+    );
+    let mut bridge = bridge_with_slack(
+        &fixture,
+        client.clone(),
+        outbound.clone(),
+        FakeSink::default(),
+        lane,
+        single_tier_roster(),
+        Some(slack.clone()),
+    );
+
+    assert_eq!(
+        poll(&mut bridge)
+            .expect("composition queues")
+            .questions_queued,
+        1
+    );
+    assert_eq!(await_question_completion(&mut bridge).slack_posted, 0);
+    let preview = outbound
+        .sent()
+        .into_iter()
+        .find(|call| call.method == "sendMessage")
+        .expect("approval preview");
+    let preview_json: serde_json::Value =
+        serde_json::from_str(&preview.body).expect("preview JSON");
+    let deny_callback = preview_json["reply_markup"]["inline_keyboard"][0][1]["callback_data"]
+        .as_str()
+        .expect("deny callback")
+        .to_owned();
+    client.push(callback_updates(&[(2, OPERATOR, &deny_callback)]));
+    let denied = poll(&mut bridge).expect("denial commits");
+
+    assert_eq!(denied.slack_posted, 0);
+    assert!(slack.posts().is_empty());
+    assert!(
+        outbound
+            .messages()
+            .iter()
+            .any(|message| message.contains("Denied. Nothing was posted to #jean"))
+    );
 }
 
 #[test]

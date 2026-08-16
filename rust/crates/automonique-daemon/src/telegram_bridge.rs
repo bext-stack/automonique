@@ -15,16 +15,18 @@
 //! # Explicit effects are typed and separately routed
 //!
 //! `/say` posts to a Slack channel. An administrator's natural-language request
-//! can also ask the conversational model to compose a post, but provider output
-//! reaches only a closed `slack_post` plan whose channel must be configured and
-//! explicitly named in the current message. An explicit natural-language ticket
-//! request can separately create a durable Manage job. Three things follow and
-//! are worth stating together:
+//! can also ask the conversational model to compose a post, but that output only
+//! creates a private Telegram preview with approve / deny buttons. An approved
+//! preview reaches a closed `slack_post` plan whose channel must be configured
+//! and explicitly named in the original message. An explicit natural-language
+//! ticket request can separately create a durable Manage job. Three things
+//! follow and are worth stating together:
 //!
 //! - **The tier and explicit message are the gate.** `/say` is admin-only in the
 //!   registry, and prose reaches the model only for administrators. A generated
 //!   post is admitted only when that same current message explicitly binds one
 //!   configured channel; conversation memory can never supply the destination.
+//!   A second admin decision is required before the external effect.
 //! - **The destination is configuration, not input.** A sender names a label,
 //!   and only [`crate::slack`]'s configured map turns one into a channel id. The
 //!   reachable set is the file's, not the sender's.
@@ -2420,8 +2422,10 @@ enum QuestionSubmitFailure {
 ///
 /// `pending` is the queue bound: a slot remains occupied from successful send
 /// until the completion is taken. The worker performs no transport effect: it
-/// returns bounded text to the bridge, which stages the final exact-chat reply
-/// in the canonical outbox. Provider output has no path to command dispatch.
+/// returns bounded text or one closed plan to the bridge, which stages the
+/// final exact-chat reply in the canonical outbox. A Slack plan can only create
+/// an approval preview; provider output has no direct path to the external
+/// effect.
 struct QuestionWorker<L, O> {
     sender: Option<SyncSender<QuestionJob>>,
     completions: Receiver<QuestionCompletion>,
@@ -2669,6 +2673,223 @@ struct TicketOpenJob {
     message_id: i64,
     issue_url: String,
     source_key: String,
+}
+
+const SLACK_POST_APPROVAL_PREFIX: &str = "sp-";
+const SLACK_POST_APPROVAL_TTL_MS: i64 = 15 * 60 * 1_000;
+const MAX_PENDING_SLACK_POSTS: usize = 128;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingSlackPost {
+    key: String,
+    chat_id: i64,
+    channel: String,
+    text: String,
+    expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingSlackPostResolution {
+    Pending(PendingSlackPost),
+    Expired(PendingSlackPost),
+    Unknown,
+}
+
+/// Private, restart-safe custody for composed Slack posts awaiting a Telegram
+/// administrator's button press. A row is removed before the external effect,
+/// so a repeated press cannot post twice and an ambiguous Slack response is
+/// never retried automatically.
+#[derive(Debug, Default)]
+pub(crate) struct SlackPostApprovalRegistry {
+    posts: Vec<PendingSlackPost>,
+    path: Option<PathBuf>,
+}
+
+impl SlackPostApprovalRegistry {
+    pub(crate) fn open(path: PathBuf) -> Result<Self, ()> {
+        use std::os::unix::fs::MetadataExt as _;
+        let parent = path.parent().ok_or(())?;
+        let parent_metadata = std::fs::symlink_metadata(parent).map_err(|_| ())?;
+        if !parent_metadata.is_dir()
+            || parent_metadata.uid() != nix::unistd::Uid::effective().as_raw()
+            || parent_metadata.mode() & 0o077 != 0
+        {
+            return Err(());
+        }
+        if let Ok(metadata) = std::fs::symlink_metadata(&path)
+            && (!metadata.is_file()
+                || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+                || metadata.mode() & 0o077 != 0)
+        {
+            return Err(());
+        }
+        let posts = match std::fs::read(&path) {
+            Ok(bytes) => decode_pending_slack_posts(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(_) => return Err(()),
+        };
+        Ok(Self {
+            posts,
+            path: Some(path),
+        })
+    }
+
+    fn register(&mut self, post: PendingSlackPost) -> Result<(), ()> {
+        validate_pending_slack_post(&post)?;
+        let mut posts = self.posts.clone();
+        posts.retain(|existing| {
+            existing.expires_at_ms > post.expires_at_ms - SLACK_POST_APPROVAL_TTL_MS
+        });
+        if let Some(existing) = posts.iter().find(|existing| existing.key == post.key) {
+            if existing != &post {
+                return Err(());
+            }
+        } else {
+            if posts.len() >= MAX_PENDING_SLACK_POSTS {
+                posts.remove(0);
+            }
+            posts.push(post);
+        }
+        self.persist(&posts)?;
+        self.posts = posts;
+        Ok(())
+    }
+
+    fn take(
+        &mut self,
+        key: &str,
+        chat_id: i64,
+        now_ms: i64,
+    ) -> Result<PendingSlackPostResolution, ()> {
+        if !valid_slack_post_approval_key(key) || now_ms < 0 {
+            return Ok(PendingSlackPostResolution::Unknown);
+        }
+        let Some(index) = self
+            .posts
+            .iter()
+            .position(|post| post.key == key && post.chat_id == chat_id)
+        else {
+            return Ok(PendingSlackPostResolution::Unknown);
+        };
+        let mut posts = self.posts.clone();
+        let post = posts.remove(index);
+        self.persist(&posts)?;
+        self.posts = posts;
+        if post.expires_at_ms <= now_ms {
+            Ok(PendingSlackPostResolution::Expired(post))
+        } else {
+            Ok(PendingSlackPostResolution::Pending(post))
+        }
+    }
+
+    fn persist(&self, posts: &[PendingSlackPost]) -> Result<(), ()> {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+        let rows: Vec<serde_json::Value> = posts
+            .iter()
+            .map(|post| {
+                serde_json::json!({
+                    "key": post.key,
+                    "chat_id": post.chat_id,
+                    "channel": post.channel,
+                    "text": post.text,
+                    "expires_at_ms": post.expires_at_ms,
+                })
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&rows).map_err(|_| ())?;
+        let temporary = path.with_extension("v1.tmp");
+        use std::io::Write as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        if let Ok(metadata) = std::fs::symlink_metadata(&temporary) {
+            if !metadata.is_file()
+                || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+                || metadata.mode() & 0o077 != 0
+            {
+                return Err(());
+            }
+            std::fs::remove_file(&temporary).map_err(|_| ())?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|_| ())?;
+        file.write_all(&bytes).map_err(|_| ())?;
+        file.sync_all().map_err(|_| ())?;
+        std::fs::rename(&temporary, path).map_err(|_| ())?;
+        std::fs::File::open(path.parent().ok_or(())?)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| ())
+    }
+}
+
+fn decode_pending_slack_posts(bytes: &[u8]) -> Result<Vec<PendingSlackPost>, ()> {
+    if bytes.len() > 512 * 1024 {
+        return Err(());
+    }
+    let rows = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|_| ())?;
+    let rows = rows.as_array().ok_or(())?;
+    if rows.len() > MAX_PENDING_SLACK_POSTS {
+        return Err(());
+    }
+    rows.iter()
+        .map(|row| {
+            let row = row.as_object().ok_or(())?;
+            if row.len() != 5 {
+                return Err(());
+            }
+            let post = PendingSlackPost {
+                key: row
+                    .get("key")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?
+                    .to_owned(),
+                chat_id: row
+                    .get("chat_id")
+                    .and_then(serde_json::Value::as_i64)
+                    .ok_or(())?,
+                channel: row
+                    .get("channel")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?
+                    .to_owned(),
+                text: row
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?
+                    .to_owned(),
+                expires_at_ms: row
+                    .get("expires_at_ms")
+                    .and_then(serde_json::Value::as_i64)
+                    .ok_or(())?,
+            };
+            validate_pending_slack_post(&post)?;
+            Ok(post)
+        })
+        .collect()
+}
+
+fn validate_pending_slack_post(post: &PendingSlackPost) -> Result<(), ()> {
+    if !valid_slack_post_approval_key(&post.key)
+        || post.chat_id == 0
+        || post.expires_at_ms <= 0
+        || ChannelName::new(&post.channel).is_err()
+        || MessageText::new(&post.text).is_err()
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn valid_slack_post_approval_key(key: &str) -> bool {
+    key.len() == SLACK_POST_APPROVAL_PREFIX.len() + 32
+        && key.starts_with(SLACK_POST_APPROVAL_PREFIX)
+        && key[SLACK_POST_APPROVAL_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3791,6 +4012,7 @@ pub struct TelegramControlBridge<C, O, S, R, L> {
     improvement_worker: Option<ImprovementWorker>,
     memory: Option<Box<dyn MemorySurface + Send>>,
     slack: Option<Box<dyn SlackSurface + Send>>,
+    slack_post_approvals: SlackPostApprovalRegistry,
     github: Option<Box<dyn crate::github::GitHubSurface + Send>>,
     policy: TelegramAccessPolicy,
     roster: OperatorRoster,
@@ -3855,12 +4077,17 @@ where
     /// [`RuntimeError::InvalidConfiguration`] for a roster that cannot compose
     /// its own configuration.
     pub fn new(parts: BridgeParts<C, O, S, R, L>) -> Result<Self, RuntimeError> {
-        Self::new_with_ticket_gates(parts, Arc::new(Mutex::new(TicketGateRegistry::default())))
+        Self::new_with_ticket_gates(
+            parts,
+            Arc::new(Mutex::new(TicketGateRegistry::default())),
+            SlackPostApprovalRegistry::default(),
+        )
     }
 
     pub(crate) fn new_with_ticket_gates(
         parts: BridgeParts<C, O, S, R, L>,
         ticket_gates: Arc<Mutex<TicketGateRegistry>>,
+        slack_post_approvals: SlackPostApprovalRegistry,
     ) -> Result<Self, RuntimeError> {
         let BridgeParts {
             client,
@@ -3946,6 +4173,7 @@ where
             improvement_worker,
             memory,
             slack,
+            slack_post_approvals,
             github,
             policy,
             roster,
@@ -4090,6 +4318,7 @@ where
         let mut report = DispatchReport::default();
         let cancellation = CancellationToken::new();
         while let Some(mut completion) = self.questions.take_completion() {
+            let mut slack_approval_keyboard = None;
             if let Some(continuation) = completion.continuation.take() {
                 match continuation {
                     QuestionContinuation::Read(continuation) => {
@@ -4118,12 +4347,16 @@ where
                         }
                     }
                     QuestionContinuation::SlackPost(plan) => {
-                        match self.model_selected_slack_post(&plan) {
-                            Ok(text) => {
+                        match self.stage_model_selected_slack_post(
+                            completion.chat_id,
+                            completion.message_id,
+                            &plan,
+                        ) {
+                            Ok((text, keyboard)) => {
                                 completion.text = text;
                                 completion.answered = true;
                                 completion.remembered = None;
-                                report.slack_posted += 1;
+                                slack_approval_keyboard = Some(keyboard);
                             }
                             Err(text) => {
                                 completion.text = text;
@@ -4143,6 +4376,10 @@ where
                 Some(completion.message_id),
             )
             .ok()
+            .map(|request| match slack_approval_keyboard {
+                Some(keyboard) => request.with_approval_keyboard(keyboard),
+                None => request,
+            })
             .and_then(|request| {
                 self.send_outbound(
                     TelegramOutbound::SendMessage(request),
@@ -4191,6 +4428,63 @@ where
         }
         self.totals.dispatch.add(report);
         report
+    }
+
+    fn stage_model_selected_slack_post(
+        &mut self,
+        chat_id: i64,
+        message_id: i64,
+        plan: &QuestionSlackPostPlan,
+    ) -> Result<(String, ApprovalKeyboard), String> {
+        let configured = self.slack.as_ref().and_then(|slack| {
+            slack
+                .channel_labels()
+                .into_iter()
+                .find(|label| label.eq_ignore_ascii_case(&plan.channel))
+        });
+        let Some(channel) = configured else {
+            return Err(String::from(
+                "That Slack channel is no longer configured, so nothing was staged.",
+            ));
+        };
+        ChannelName::new(&channel).map_err(|_| {
+            String::from("That configured Slack channel is invalid, so nothing was staged.")
+        })?;
+        MessageText::new(&plan.text)
+            .map_err(|_| String::from("That Slack message is invalid, so nothing was staged."))?;
+        let now_ms = crate::unix_millis().map_err(|_| {
+            String::from("The Slack approval could not be timed safely, so nothing was staged.")
+        })?;
+        let key = slack_post_approval_key(chat_id, message_id, &channel, &plan.text);
+        let post = PendingSlackPost {
+            key: key.clone(),
+            chat_id,
+            channel: channel.clone(),
+            text: plan.text.clone(),
+            expires_at_ms: now_ms.saturating_add(SLACK_POST_APPROVAL_TTL_MS),
+        };
+        self.slack_post_approvals.register(post).map_err(|_| {
+            String::from("The Slack preview could not be retained safely, so nothing was staged.")
+        })?;
+        let keyboard = ApprovalKeyboard::decision(
+            slack_post_approval_callback_data(&key, true),
+            slack_post_approval_callback_data(&key, false),
+        )
+        .map_err(|_| {
+            String::from("The Slack approval buttons were invalid, so nothing was staged.")
+        })?;
+        let preview = bounded_text_to(&plan.text, 3_000);
+        let truncated = if preview == plan.text {
+            ""
+        } else {
+            "\n\n(Preview truncated; approval remains bound to the full composed message.)"
+        };
+        Ok((
+            format!(
+                "Slack post awaiting approval\nChannel: #{channel}\nExpires in 15 minutes\n\n{preview}{truncated}\n\nApprove posts it once. Deny posts nothing."
+            ),
+            keyboard,
+        ))
     }
 
     fn model_selected_slack_post(
@@ -4628,6 +4922,26 @@ where
                     let Some(callback) = update.content() else {
                         return Answer::Ignore;
                     };
+                    if let Some((approval_key, granted)) =
+                        parse_slack_post_approval_callback(callback)
+                    {
+                        let Some(callback_query_id) = update.callback_query_id() else {
+                            return Answer::Ignore;
+                        };
+                        if !self.authority.is_admin(principal.actor_id()) {
+                            return Answer::CallbackRefused {
+                                callback_query_id: callback_query_id.to_owned(),
+                                text: String::from(APPROVAL_CALLBACK_NOT_PERMITTED),
+                            };
+                        }
+                        return Answer::SlackPostDecisionReady {
+                            chat_id: principal.chat_id(),
+                            message_id: update.message_id(),
+                            callback_query_id: callback_query_id.to_owned(),
+                            approval_key: approval_key.to_owned(),
+                            granted,
+                        };
+                    }
                     // A press that carries an approval reference is answered
                     // *inside the button*: an operator who is not an approver
                     // learns it there, as a toast, rather than by a message
@@ -7133,6 +7447,78 @@ where
             );
             return;
         }
+        if let Answer::SlackPostDecisionReady {
+            chat_id,
+            message_id,
+            callback_query_id,
+            approval_key,
+            granted,
+        } = answer
+        {
+            self.acknowledge_callback(&callback_query_id, None, cancellation, report);
+            let now_ms = crate::unix_millis().unwrap_or_default();
+            let resolution = self
+                .slack_post_approvals
+                .take(&approval_key, chat_id, now_ms);
+            let Ok(resolution) = resolution else {
+                self.deliver(
+                    Answer::Unavailable {
+                        chat_id,
+                        text: String::from(
+                            "The Slack approval could not be resolved safely. Nothing was posted; the button remains available to retry.",
+                        ),
+                    },
+                    actor_id,
+                    topic_id,
+                    reply_to_message_id,
+                    cancellation,
+                    report,
+                );
+                return;
+            };
+            if let Some(message_id) = message_id {
+                self.strip_keyboard(chat_id, message_id, cancellation, report);
+            }
+            let answer = match resolution {
+                PendingSlackPostResolution::Unknown => Answer::Refused {
+                    chat_id,
+                    text: String::from(
+                        "That Slack approval is no longer pending. Nothing was posted.",
+                    ),
+                },
+                PendingSlackPostResolution::Expired(post) => Answer::Refused {
+                    chat_id,
+                    text: format!(
+                        "That Slack preview for #{} expired. Nothing was posted.",
+                        post.channel
+                    ),
+                },
+                PendingSlackPostResolution::Pending(post) if !granted => Answer::Answered {
+                    chat_id,
+                    text: format!("Denied. Nothing was posted to #{}.", post.channel),
+                    preformatted: false,
+                },
+                PendingSlackPostResolution::Pending(post) => {
+                    let plan = QuestionSlackPostPlan {
+                        channel: post.channel,
+                        text: post.text,
+                    };
+                    match self.model_selected_slack_post(&plan) {
+                        Ok(text) => Answer::SlackPosted { chat_id, text },
+                        Err(text) => Answer::SlackFailed { chat_id, text },
+                    }
+                }
+            };
+            self.deliver(
+                answer,
+                actor_id,
+                topic_id,
+                reply_to_message_id,
+                cancellation,
+                report,
+            );
+            return;
+        }
         if let Answer::TicketDenialReady {
             chat_id,
             message_id,
@@ -7269,6 +7655,7 @@ where
             Answer::TicketApprovalReady { .. }
             | Answer::TicketDenialReady { .. }
             | Answer::ApprovalDecisionReady { .. }
+            | Answer::SlackPostDecisionReady { .. }
             | Answer::CallbackRefused { .. } => {
                 unreachable!("handled before reply rendering")
             }
@@ -7886,6 +8273,14 @@ enum Answer {
         request_key: String,
         granted: bool,
         decider: String,
+    },
+    /// One admin decision on a composed, locally retained Slack post preview.
+    SlackPostDecisionReady {
+        chat_id: i64,
+        message_id: Option<i64>,
+        callback_query_id: String,
+        approval_key: String,
+        granted: bool,
     },
     /// One pressed button refused inside the button itself.
     ///
@@ -9943,7 +10338,7 @@ fn question_intent_prompt(
          Return exactly one compact JSON object and no markdown.\n\
          For ordinary conversation or stable general knowledge, return {{\"kind\":\"answer\",\"answer\":\"concise answer in the user's language\"}}.\n\
          When current Automonique facts are needed, return {{\"kind\":\"read\",\"sources\":[...],\"slack_channel\":null,\"github_issues\":false,\"depth\":\"fast\"}}.\n\
-         When and only when the current admin message explicitly asks to compose and send or post text to one configured Slack channel that it names, return {{\"kind\":\"slack_post\",\"channel\":\"exact configured label without #\",\"text\":\"final message to post\"}}. This is the only mutation schema. Distinguish asking about, reading, quoting, or discussing a channel from asking to post to it. Never select a channel solely from memory.\n\
+         When and only when the current admin message explicitly asks to compose and send or post text to one configured Slack channel that it names, return {{\"kind\":\"slack_post\",\"channel\":\"exact configured label without #\",\"text\":\"final message to preview\"}}. This schema creates a Telegram approval preview; it does not post by itself, so never claim it was sent. This is the only mutation schema. Distinguish asking about, reading, quoting, or discussing a channel from asking to post to it. Never select a channel solely from memory.\n\
          Allowed sources are status, host_load, operators, sites, knowledge, models, tickets, activity. Select only sources materially needed.\n\
          slack_channel may be one exact configured label listed below, or null. github_issues is true only when the question or recent conversation identifies concrete GitHub issue references to read.\n\
          Read plans are read-only. Never encode an action, command, mutation, recipient, shell instruction, filesystem path, or approval in them. Except for the exact slack_post schema above, requests to change, send, post, approve, run, or modify something must be answered conversationally unless the typed command layer already handled them before this prompt.\n\
@@ -9966,7 +10361,7 @@ fn model_question_intent(
     question: &str,
     slack_channels: &[String],
 ) -> Option<ModelQuestionIntent> {
-    let value: serde_json::Value = serde_json::from_str(answer.trim()).ok()?;
+    let value = model_question_intent_value(answer)?;
     let object = value.as_object()?;
     let kind = object.get("kind")?.as_str()?;
     match kind {
@@ -10081,6 +10476,28 @@ fn model_question_intent(
         }
         _ => None,
     }
+}
+
+/// Recover one unambiguous router object without trusting surrounding prose.
+///
+/// Providers occasionally append a short explanation despite the prompt's
+/// exact-JSON instruction. The object still passes the complete closed schema
+/// and, for mutations, the current-message channel binding below. Refuse any
+/// answer with more braces outside that single object so quoted or competing
+/// plans never become an action by accident.
+fn model_question_intent_value(answer: &str) -> Option<serde_json::Value> {
+    let answer = answer.trim();
+    if let Ok(value) = serde_json::from_str(answer) {
+        return Some(value);
+    }
+    let start = answer.find('{')?;
+    let end = answer.rfind('}')?;
+    let prefix = &answer[..start];
+    let suffix = &answer[end.saturating_add(1)..];
+    if prefix.contains('}') || suffix.contains('{') {
+        return None;
+    }
+    serde_json::from_str(&answer[start..=end]).ok()
 }
 
 fn question_explicitly_names_channel(question: &str, channel: &str) -> bool {
@@ -10222,6 +10639,33 @@ fn cancel_request_ref(update: &TelegramIngress, chat_id: i64) -> String {
 /// by literal: this module is a transport surface, and the one string it has to
 /// recognize is not a reason to take a dependency on another crate's grammar.
 const APPROVAL_REFERENCE_PREFIX: &str = "apr-";
+
+fn slack_post_approval_key(chat_id: i64, message_id: i64, channel: &str, text: &str) -> String {
+    let binding = format!("telegram-slack-post-v1\0{chat_id}\0{message_id}\0{channel}\0{text}");
+    let digest = Sha256::digest(binding.as_bytes()).to_hex();
+    format!("{SLACK_POST_APPROVAL_PREFIX}{}", &digest[..32])
+}
+
+fn slack_post_approval_callback_data(key: &str, granted: bool) -> String {
+    let verb = if granted {
+        APPROVAL_CALLBACK_GRANT
+    } else {
+        APPROVAL_CALLBACK_DENY
+    };
+    format!("{key}:{verb}")
+}
+
+fn parse_slack_post_approval_callback(callback: &str) -> Option<(&str, bool)> {
+    let (key, verb) = callback.rsplit_once(':')?;
+    if !valid_slack_post_approval_key(key) {
+        return None;
+    }
+    match verb {
+        APPROVAL_CALLBACK_GRANT => Some((key, true)),
+        APPROVAL_CALLBACK_DENY => Some((key, false)),
+        _ => None,
+    }
+}
 
 /// The toast a press by somebody who may not decide receives.
 ///
@@ -10380,7 +10824,8 @@ pub(crate) fn utc_rfc3339_from_unix_millis(unix_ms: i64) -> Option<String> {
 #[cfg(test)]
 mod clock_tests {
     use super::{
-        CapabilityTarget, HostLoadSnapshot, ModelQuestionIntent, QuestionProfile,
+        CapabilityTarget, HostLoadSnapshot, ModelQuestionIntent, PendingSlackPost,
+        PendingSlackPostResolution, QuestionProfile, SlackPostApprovalRegistry,
         deepseek_balance_text, github_issue_references, host_load_text, is_current_time_question,
         is_deepseek_balance_question, is_enabled_site_inventory_question,
         is_github_repository_inventory_question, is_host_load_followup, is_host_load_question,
@@ -10463,6 +10908,26 @@ mod clock_tests {
         assert_eq!(plan.channel, "jean");
         assert!(plan.text.contains("Monique"));
 
+        let explained = model_question_intent(
+            "Here is the action:\n{\"kind\":\"slack_post\",\"channel\":\"jean\",\"text\":\"Monique veille sur nos chemins.\"}\nNote: the requested channel is #jean.",
+            None,
+            "can you send a poème about Monique in #jean channel?",
+            &channels,
+        )
+        .expect("one explained typed Slack post");
+        assert!(matches!(explained, ModelQuestionIntent::SlackPost(_)));
+
+        assert!(
+            model_question_intent(
+                "{\"kind\":\"slack_post\",\"channel\":\"jean\",\"text\":\"one\"}\n{\"kind\":\"slack_post\",\"channel\":\"jean\",\"text\":\"two\"}",
+                None,
+                "post in #jean",
+                &channels,
+            )
+            .is_none(),
+            "competing objects must remain ambiguous"
+        );
+
         for (question, answer) in [
             (
                 "what was said in #jean?",
@@ -10486,6 +10951,39 @@ mod clock_tests {
                 Some(ModelQuestionIntent::Refused(_))
             ));
         }
+    }
+
+    #[test]
+    fn pending_slack_post_custody_survives_restart_and_is_single_use() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("private state");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private permissions");
+        let path = directory.path().join("slack-post-approvals.v1.json");
+        let post = PendingSlackPost {
+            key: String::from("sp-000102030405060708090a0b0c0d0e0f"),
+            chat_id: 42,
+            channel: String::from("jean"),
+            text: String::from("Monique veille sur nos chemins."),
+            expires_at_ms: 10_000,
+        };
+        let mut first = SlackPostApprovalRegistry::open(path.clone()).expect("open custody");
+        first.register(post.clone()).expect("retain preview");
+        drop(first);
+
+        let mut reopened = SlackPostApprovalRegistry::open(path.clone()).expect("reopen custody");
+        assert_eq!(
+            reopened.take(&post.key, post.chat_id, 9_000),
+            Ok(PendingSlackPostResolution::Pending(post.clone()))
+        );
+        drop(reopened);
+
+        let mut final_open = SlackPostApprovalRegistry::open(path).expect("reopen empty custody");
+        assert_eq!(
+            final_open.take(&post.key, post.chat_id, 9_000),
+            Ok(PendingSlackPostResolution::Unknown)
+        );
     }
 
     #[test]
