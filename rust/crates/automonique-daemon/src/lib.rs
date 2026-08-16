@@ -100,6 +100,7 @@ use automonique_protocol::execute_api::{
     CancelRunOutcome, ExecuteRefusal, ExecuteRequest, ExecuteResponse,
 };
 use automonique_protocol::journal::{CursorResume, RetainedRange};
+use automonique_protocol::provenance::{CausationId, CorrelationId, Provenance, TraceId};
 use automonique_protocol::runs_api::{
     Continuation, LifecycleCoverage, ListRuns, MAX_LIFECYCLE_EVENTS, RunCursor, RunDetailView,
     RunLifecycleEvent, RunListPage, RunState, RunSummary, RunsRefusal, RunsRequest, RunsResponse,
@@ -2462,19 +2463,30 @@ impl Daemon {
                     }
                     Err(error) => return Err(DaemonError::Store(error)),
                 };
+                let provenance = evidence.provenance.clone();
+                let mut admin_evidence = AdminReconciliationEvidence::new(
+                    u64::try_from(evidence.run_id)
+                        .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
+                    evidence.scope,
+                    evidence.generation_id,
+                    evidence.lease_epoch,
+                    evidence.run_revision,
+                    evidence.terminal_payload_present,
+                    evidence.outbox_count,
+                )
+                .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
+                if let Some(provenance) = provenance {
+                    admin_evidence = admin_evidence
+                        .with_provenance(
+                            provenance.trace_id,
+                            provenance.correlation_id,
+                            provenance.causation_id,
+                        )
+                        .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
+                }
                 AdminResponse::ReconciliationInspected {
                     request_id: request.request_id().clone(),
-                    evidence: AdminReconciliationEvidence::new(
-                        u64::try_from(evidence.run_id)
-                            .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
-                        evidence.scope,
-                        evidence.generation_id,
-                        evidence.lease_epoch,
-                        evidence.run_revision,
-                        evidence.terminal_payload_present,
-                        evidence.outbox_count,
-                    )
-                    .map_err(|error| DaemonError::ProtocolRefused(error.category()))?,
+                    evidence: admin_evidence,
                 }
             }
             automonique_protocol::admin::AdminCommand::FailReconciliation => {
@@ -2529,6 +2541,7 @@ impl Daemon {
                     }
                     Err(error) => return Err(DaemonError::Store(error)),
                 };
+                let provenance = evidence.provenance.clone();
                 AdminResponse::OutboxInspected {
                     request_id: request.request_id().clone(),
                     evidence: AdminOutboxEvidence::new(AdminOutboxEvidenceParts {
@@ -2550,6 +2563,11 @@ impl Daemon {
                             .transpose()
                             .map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))?,
                         delivery_receipt_key: evidence.delivery_receipt_key,
+                        trace_id: provenance.as_ref().map(|value| value.trace_id.clone()),
+                        correlation_id: provenance
+                            .as_ref()
+                            .map(|value| value.correlation_id.clone()),
+                        causation_id: provenance.as_ref().map(|value| value.causation_id.clone()),
                     })
                     .map_err(|error| DaemonError::ProtocolRefused(error.category()))?,
                 }
@@ -2858,7 +2876,8 @@ impl Daemon {
                 Vec::new(),
                 LifecycleCoverage::Complete,
             )
-            .map_err(runs_refused)?;
+            .map_err(runs_refused)?
+            .with_provenance(run_detail_provenance(record)?);
             return Ok(RunsResponse::RunDetail {
                 request_id: request_id.clone(),
                 view,
@@ -2892,7 +2911,8 @@ impl Daemon {
             carried,
             coverage,
         )
-        .map_err(runs_refused)?;
+        .map_err(runs_refused)?
+        .with_provenance(run_detail_provenance(record)?);
         Ok(RunsResponse::RunDetail {
             request_id: request_id.clone(),
             view,
@@ -4975,6 +4995,17 @@ fn checked_row_id(value: i64) -> Result<u64, DaemonError> {
 
 fn runs_refused(error: automonique_protocol::runs_api::RunsApiError) -> DaemonError {
     DaemonError::ProtocolRefused(error.category())
+}
+
+fn run_detail_provenance(record: &RunIndexRecord) -> Result<Provenance, DaemonError> {
+    let trace_id = TraceId::for_ingress("run", &record.run_id);
+    Ok(Provenance::new(
+        trace_id,
+        CorrelationId::new(format!("run-submission:{}", record.submission_id))
+            .map_err(|_| DaemonError::ProtocolRefused("run_provenance_invalid"))?,
+        CausationId::new(format!("submission:{}", record.submission_id))
+            .map_err(|_| DaemonError::ProtocolRefused("run_provenance_invalid"))?,
+    ))
 }
 
 fn automation_refused(

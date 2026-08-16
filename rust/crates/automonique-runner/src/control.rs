@@ -41,7 +41,8 @@
 //!
 //! ```text
 //! inspect   <attempt-id>                  -> status <attempt-id> <run-id> <state> <last-sequence>
-//! subscribe <attempt-id> <cursor>         -> event <sequence> <kind> <authority> <payload-hex>  (0..=8 lines)
+//! subscribe <attempt-id> <cursor>         -> provenance <trace-id> <correlation-id> <causation-id>
+//!                                            event <sequence> <kind> <authority> <payload-hex>  (0..=8 lines)
 //!                                            end <next-cursor> <more>
 //! heartbeat                               -> heartbeat <uptime-millis> <binding-count>
 //! cancel    <attempt-id> <request-ref> [<observed-sequence>]
@@ -172,6 +173,7 @@
 //! [`serve_once`]: ControlServer::serve_once
 
 use crate::{Authority, EventKind, RunState, Spool, SpoolError};
+use automonique_protocol::provenance::{CausationId, CorrelationId, TraceId};
 use nix::errno::Errno;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{getsockopt, sockopt};
@@ -189,7 +191,7 @@ use std::time::{Duration, Instant};
 
 /// Versioned greeting written to every admitted peer before any request byte
 /// is read.
-pub const CONTROL_GREETING: &str = "automonique.control/v1";
+pub const CONTROL_GREETING: &str = "automonique.control/v2";
 /// Longest accepted request line, excluding its newline terminator.
 pub const MAX_REQUEST_LINE_BYTES: usize = 4 * 1024;
 /// Largest response this server will assemble for one request.
@@ -220,6 +222,8 @@ const MAX_DRAIN_BYTES: usize = 64 * 1024;
 const MAX_EVENT_LINE_BYTES: usize = 64 + 2 * 64 * 1024;
 /// Ceiling on the `end` line that closes a subscription page.
 const MAX_END_LINE_BYTES: usize = 64;
+/// Ceiling on the provenance line that opens a subscription page.
+const MAX_PROVENANCE_LINE_BYTES: usize = 3 * 256 + 32;
 /// Answer for a cancellation this server handed to a sink.
 const DELIVERED_LINE: &str = "cancel_result delivered\n";
 /// Answer for a cancellation custody had already recorded.
@@ -228,7 +232,10 @@ const ALREADY_DELIVERED_LINE: &str = "cancel_result already_delivered\n";
 // A full page can never reach the response ceiling. The runtime preflight in
 // `subscribe` is defence in depth for a future change to either bound.
 const _: () = assert!(
-    MAX_SUBSCRIBE_PAGE_EVENTS * MAX_EVENT_LINE_BYTES + MAX_END_LINE_BYTES <= MAX_RESPONSE_BYTES
+    MAX_PROVENANCE_LINE_BYTES
+        + MAX_SUBSCRIBE_PAGE_EVENTS * MAX_EVENT_LINE_BYTES
+        + MAX_END_LINE_BYTES
+        <= MAX_RESPONSE_BYTES
 );
 
 /// Kernel-reported identity of a connected peer.
@@ -1033,7 +1040,13 @@ impl ControlServer {
                 _ => Refusal::Internal,
             }
         })?;
-        let mut body = String::new();
+        let status = binding.spool.status();
+        let trace_id = TraceId::for_ingress("run", status.run_id());
+        let correlation_id =
+            CorrelationId::new(format!("attempt:{attempt_id}")).map_err(|_| Refusal::Internal)?;
+        let causation_id =
+            CausationId::new(format!("run:{}", status.run_id())).map_err(|_| Refusal::Internal)?;
+        let mut body = format!("provenance {trace_id} {correlation_id} {causation_id}\n");
         let mut next_cursor = cursor;
         let mut emitted = 0_usize;
         for event in &events {

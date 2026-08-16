@@ -505,7 +505,7 @@ fn a_broken_ledger_refuses_cancel_as_internal_without_taking_the_endpoint_down()
     );
     assert_eq!(
         body(harness.path(), "subscribe attempt-1 0\n"),
-        "end 0 false\n"
+        "provenance 854a69b1c40d31f741e320be2150acd6 attempt:attempt-1 run:run-alpha\nend 0 false\n"
     );
     assert!(body(harness.path(), "heartbeat\n").starts_with("heartbeat "));
     // And a sound reference still cancels.

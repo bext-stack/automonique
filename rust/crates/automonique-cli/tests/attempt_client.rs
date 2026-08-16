@@ -356,7 +356,7 @@ fn heartbeat_inspect_and_events_round_trip_byte_for_byte() {
     assert!(stderr.is_empty());
     assert_eq!(
         stdout,
-        "Automonique attempt events: attempt_id=attempt-1 cursor=0\n\
+        "Automonique attempt events: attempt_id=attempt-1 cursor=0 trace_id=854a69b1c40d31f741e320be2150acd6 correlation_id=attempt:attempt-1 causation_id=run:run-alpha\n\
          - seq=1 kind=started authority=authoritative payload=-\n\
          - seq=2 kind=adapter_event authority=synthetic payload=text:hello\n\
          - seq=3 kind=cancel_requested authority=authoritative payload=hex:00ff\n\
@@ -372,7 +372,7 @@ fn heartbeat_inspect_and_events_round_trip_byte_for_byte() {
     assert_eq!(exit, 0);
     assert_eq!(
         stdout,
-        "Automonique attempt events: attempt_id=attempt-1 cursor=2\n\
+        "Automonique attempt events: attempt_id=attempt-1 cursor=2 trace_id=854a69b1c40d31f741e320be2150acd6 correlation_id=attempt:attempt-1 causation_id=run:run-alpha\n\
          - seq=3 kind=cancel_requested authority=authoritative payload=hex:00ff\n\
          next cursor: 3 more: false\n"
     );
@@ -399,8 +399,9 @@ fn a_page_is_bounded_and_the_printed_cursor_resumes_it() {
     builder.attempt("attempt-page", "run-page", &events);
     let mut endpoint = builder.start();
 
-    let mut expected =
-        String::from("Automonique attempt events: attempt_id=attempt-page cursor=0\n");
+    let mut expected = String::from(
+        "Automonique attempt events: attempt_id=attempt-page cursor=0 trace_id=42e287f8c6607add83687308ae257bd5 correlation_id=attempt:attempt-page causation_id=run:run-page\n",
+    );
     for sequence in 1..=MAX_SUBSCRIBE_PAGE_EVENTS {
         expected.push_str(&format!(
             "- seq={sequence} kind=adapter_event authority=synthetic payload=text:p{sequence}\n"
@@ -429,7 +430,7 @@ fn a_page_is_bounded_and_the_printed_cursor_resumes_it() {
     assert_eq!(exit, 0);
     assert_eq!(
         second_page,
-        "Automonique attempt events: attempt_id=attempt-page cursor=8\n\
+        "Automonique attempt events: attempt_id=attempt-page cursor=8 trace_id=42e287f8c6607add83687308ae257bd5 correlation_id=attempt:attempt-page causation_id=run:run-page\n\
          - seq=9 kind=adapter_event authority=synthetic payload=text:p9\n\
          - seq=10 kind=adapter_event authority=synthetic payload=text:p10\n\
          next cursor: 10 more: false\n"

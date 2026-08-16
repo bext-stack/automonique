@@ -28,6 +28,7 @@
 //! one bounded page per invocation, and the operator re-runs with the printed
 //! next cursor.
 
+use automonique_protocol::provenance::{CausationId, CorrelationId, TraceId};
 use automonique_runner::control::{
     CONTROL_GREETING, MAX_IDENTIFIER_BYTES, MAX_REQUEST_LINE_BYTES, MAX_RESPONSE_BYTES,
     MAX_SUBSCRIBE_PAGE_EVENTS, Refusal,
@@ -210,7 +211,21 @@ fn events(
     };
     let body = request(socket_path, &format!("subscribe {attempt_id} {cursor}"))?;
     let lines = response_lines(&body)?;
-    let Some((last, records)) = lines.split_last() else {
+    let Some((provenance, rest)) = lines.split_first() else {
+        return Err(AttemptError::Protocol("malformed_response"));
+    };
+    let provenance_fields: Vec<&str> = provenance.split(' ').collect();
+    let ["provenance", trace_id, correlation_id, causation_id] = provenance_fields.as_slice()
+    else {
+        return Err(AttemptError::Protocol("malformed_response"));
+    };
+    let trace_id = TraceId::new((*trace_id).to_owned())
+        .map_err(|_| AttemptError::Protocol("malformed_response"))?;
+    let correlation_id = CorrelationId::new((*correlation_id).to_owned())
+        .map_err(|_| AttemptError::Protocol("malformed_response"))?;
+    let causation_id = CausationId::new((*causation_id).to_owned())
+        .map_err(|_| AttemptError::Protocol("malformed_response"))?;
+    let Some((last, records)) = rest.split_last() else {
         return Err(AttemptError::Protocol("malformed_response"));
     };
     // The page bound is the endpoint's, so a server that overran it is not
@@ -218,8 +233,10 @@ fn events(
     if records.len() > MAX_SUBSCRIBE_PAGE_EVENTS {
         return Err(AttemptError::Protocol("page_too_large"));
     }
-    let mut rendered =
-        format!("Automonique attempt events: attempt_id={attempt_id} cursor={cursor}\n");
+    let mut rendered = format!(
+        "Automonique attempt events: attempt_id={attempt_id} cursor={cursor} \
+         trace_id={trace_id} correlation_id={correlation_id} causation_id={causation_id}\n"
+    );
     let mut previous = cursor;
     for record in records {
         let fields: Vec<&str> = record.split(' ').collect();

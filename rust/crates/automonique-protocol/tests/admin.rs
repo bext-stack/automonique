@@ -70,6 +70,9 @@ fn outbox_inspection_and_reconciliation_are_exact_correlated_and_redacted() {
         lease_epoch: Some(4),
         lease_expires_ms: Some(100),
         delivery_receipt_key: None,
+        trace_id: Some("trace:9".to_owned()),
+        correlation_id: Some("run:9".to_owned()),
+        causation_id: Some("event:9".to_owned()),
     })
     .expect("redacted evidence");
     let response = AdminResponse::OutboxInspected {
@@ -105,9 +108,17 @@ fn outbox_inspection_and_reconciliation_are_exact_correlated_and_redacted() {
         AdminRequest::from_canonical_bytes(widened).expect_err("extra field"),
         AdminError::InvalidBody
     );
-    let partial_lease = br#"{"body":{"attempt":1,"delivery_receipt_key":null,"intent_key":"i","kind":"fake.receipt","lease_epoch":null,"lease_expires_ms":null,"lease_generation_id":"foreground","lease_holder":null,"lease_token":null,"outbox_id":1,"revision":1,"state":"in_flight","transport":"fake"},"kind":"outbox_inspected","protocol":"automonique.admin","request_id":"r","version":1}"#;
+    let partial_lease = br#"{"body":{"attempt":1,"causation_id":null,"correlation_id":null,"delivery_receipt_key":null,"intent_key":"i","kind":"fake.receipt","lease_epoch":null,"lease_expires_ms":null,"lease_generation_id":"foreground","lease_holder":null,"lease_token":null,"outbox_id":1,"revision":1,"state":"in_flight","trace_id":null,"transport":"fake"},"kind":"outbox_inspected","protocol":"automonique.admin","request_id":"r","version":1}"#;
     assert_eq!(
         AdminResponse::from_canonical_bytes(partial_lease).expect_err("partial lease evidence"),
+        AdminError::InvalidBody
+    );
+    let invalid_provenance =
+        AdminReconciliationEvidence::new(1, "scope", "generation", 1, 1, false, 0)
+            .expect("evidence")
+            .with_provenance("trace has space", "run:1", "event:1");
+    assert_eq!(
+        invalid_provenance.expect_err("header-unsafe trace"),
         AdminError::InvalidBody
     );
 }
@@ -2206,6 +2217,7 @@ mod capability {
             "the six lanes of the local admin socket and the live progress stream",
         ),
         (2, "the authenticated local metrics scrape"),
+        (3, "provenance on reconciliation evidence"),
     ];
 
     /// Every endpoint, at the maturity it had when it landed.

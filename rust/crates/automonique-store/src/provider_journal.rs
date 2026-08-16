@@ -40,14 +40,17 @@ use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use automonique_protocol::provenance::Provenance;
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 
-use crate::{BUSY_TIMEOUT, StoreError, validate_database_path};
+use crate::{
+    BUSY_TIMEOUT, StoreError, StoredProvenance, stored_provenance, validate_database_path,
+};
 
 /// The only provider journal schema this build can read and write.
-pub const PROVIDER_JOURNAL_SCHEMA_VERSION: u32 = 2;
+pub const PROVIDER_JOURNAL_SCHEMA_VERSION: u32 = 3;
 
 /// Exact character count of a lowercase hex SHA-256 digest.
 pub const DIGEST_CHARS: usize = 64;
@@ -194,6 +197,13 @@ CREATE TABLE provider_turn_usage (
     output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
     finish_reason TEXT NOT NULL CHECK (finish_reason IN ('stop', 'error'))
 ) STRICT;
+"#;
+
+const SCHEMA_V3: &str = r#"
+ALTER TABLE provider_turns ADD COLUMN trace_id TEXT;
+ALTER TABLE provider_turns ADD COLUMN correlation_id TEXT;
+ALTER TABLE provider_turns ADD COLUMN causation_id TEXT;
+CREATE INDEX provider_turns_by_trace ON provider_turns(trace_id, turn_id);
 "#;
 
 /// A provider journal error with stable refusal categories.
@@ -673,6 +683,8 @@ pub struct TurnOpening<'a> {
     /// Stable retry key for this turn.
     pub turn_key: &'a str,
     pub opened_ms: i64,
+    /// Explicit ancestry of the work that caused this provider turn.
+    pub provenance: Option<&'a Provenance>,
 }
 
 /// Atomic close of one open turn with its settlements and cursor.
@@ -834,6 +846,7 @@ pub struct TurnRow {
     pub opened_ms: i64,
     pub closed_ms: Option<i64>,
     pub revision: u64,
+    pub provenance: Option<StoredProvenance>,
 }
 
 /// Validated durable usage attached to one turn.
@@ -1231,6 +1244,7 @@ impl ProviderJournal {
             if existing.state == TurnState::Open
                 && existing.ordinal == opening.ordinal
                 && existing.opened_ms == opening.opened_ms
+                && same_provenance(existing.provenance.as_ref(), opening.provenance)
             {
                 transaction.commit()?;
                 return Ok(TurnReceipt {
@@ -1256,13 +1270,21 @@ impl ProviderJournal {
         }
         transaction.execute(
             "INSERT INTO provider_turns
-             (session_id, ordinal, turn_key, state, opened_ms, closed_ms, revision)
-             VALUES (?1, ?2, ?3, 'open', ?4, NULL, 1)",
+             (session_id, ordinal, turn_key, state, opened_ms, closed_ms, revision,
+              trace_id, correlation_id, causation_id)
+             VALUES (?1, ?2, ?3, 'open', ?4, NULL, 1, ?5, ?6, ?7)",
             params![
                 opening.session_id,
                 to_db_u64(opening.ordinal, "ordinal")?,
                 opening.turn_key,
-                opening.opened_ms
+                opening.opened_ms,
+                opening.provenance.map(|value| value.trace_id().as_str()),
+                opening
+                    .provenance
+                    .map(|value| value.correlation_id().as_str()),
+                opening
+                    .provenance
+                    .map(|value| value.causation_id().as_str())
             ],
         )?;
         let turn_id = transaction.last_insert_rowid();
@@ -2112,6 +2134,9 @@ struct RawTurn {
     opened_ms: i64,
     closed_ms: Option<i64>,
     revision: i64,
+    trace_id: Option<String>,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
 }
 
 struct RawTurnUsage {
@@ -2126,7 +2151,7 @@ struct RawTurnUsage {
 }
 
 const TURN_COLUMNS: &str = "turn_id, session_id, ordinal, turn_key, state,
-     opened_ms, closed_ms, revision";
+     opened_ms, closed_ms, revision, trace_id, correlation_id, causation_id";
 
 fn raw_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTurn> {
     Ok(RawTurn {
@@ -2138,6 +2163,9 @@ fn raw_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTurn> {
         opened_ms: row.get(5)?,
         closed_ms: row.get(6)?,
         revision: row.get(7)?,
+        trace_id: row.get(8)?,
+        correlation_id: row.get(9)?,
+        causation_id: row.get(10)?,
     })
 }
 
@@ -2162,7 +2190,21 @@ fn validated_turn(raw: RawTurn) -> Journalled<TurnRow> {
             .map(|value| checked_time(value, "closed_ms"))
             .transpose()?,
         revision: checked_revision(raw.revision)?,
+        provenance: stored_provenance(raw.trace_id, raw.correlation_id, raw.causation_id)
+            .map_err(|_| ProviderJournalError::Corrupt("turn_provenance"))?,
     })
+}
+
+fn same_provenance(stored: Option<&StoredProvenance>, supplied: Option<&Provenance>) -> bool {
+    match (stored, supplied) {
+        (None, None) => true,
+        (Some(stored), Some(supplied)) => {
+            stored.trace_id == supplied.trace_id().as_str()
+                && stored.correlation_id == supplied.correlation_id().as_str()
+                && stored.causation_id == supplied.causation_id().as_str()
+        }
+        _ => false,
+    }
 }
 
 fn read_turn(connection: &Connection, turn_id: i64) -> Journalled<Option<TurnRow>> {
@@ -2611,6 +2653,14 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Journalled<()> 
     if version == 1 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA_V2)?;
+        transaction.execute_batch(SCHEMA_V3)?;
+        transaction.pragma_update(None, "user_version", PROVIDER_JOURNAL_SCHEMA_VERSION)?;
+        transaction.commit()?;
+        return Ok(());
+    }
+    if version == 2 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_V3)?;
         transaction.pragma_update(None, "user_version", PROVIDER_JOURNAL_SCHEMA_VERSION)?;
         transaction.commit()?;
         return Ok(());
@@ -2635,6 +2685,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Journalled<()> 
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(SCHEMA_V1)?;
     transaction.execute_batch(SCHEMA_V2)?;
+    transaction.execute_batch(SCHEMA_V3)?;
     transaction.pragma_update(None, "user_version", PROVIDER_JOURNAL_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())

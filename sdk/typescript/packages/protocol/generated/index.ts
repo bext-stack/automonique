@@ -22,4 +22,4 @@ export * from "./runtime.ts";
 // The digest of the surface re-exported above. It identifies the schema
 // these files were generated from; it is not a checksum of this file.
 export const SCHEMA_DIGEST_ALGORITHM = "sha256";
-export const SCHEMA_DIGEST = "1d48a580d90a2d87ca9bd88f0f9b4c5598b4850b8007a2ddc2bc709600082a5a";
+export const SCHEMA_DIGEST = "d780b9ddd039206f33f3ead6f08b29d176ecd3990edd0e0b61b9124ec37a45a0";

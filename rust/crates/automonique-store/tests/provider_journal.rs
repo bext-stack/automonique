@@ -87,6 +87,7 @@ fn open_turn(journal: &mut ProviderJournal, session_id: i64, ordinal: u64, key: 
             ordinal,
             turn_key: key,
             opened_ms: 30,
+            provenance: None,
         })
         .expect("open turn")
         .turn_id
@@ -350,6 +351,7 @@ fn second_open_turn_for_one_session_refuses() {
             ordinal: 2,
             turn_key: "turn:2",
             opened_ms: 31,
+            provenance: None,
         })
         .expect_err("second open turn refusal");
     assert_eq!(error.category(), "turn_open");
@@ -378,6 +380,7 @@ fn non_contiguous_turn_ordinal_refuses() {
             ordinal: 3,
             turn_key: "turn:3",
             opened_ms: 51,
+            provenance: None,
         })
         .expect_err("ordinal gap refusal");
     assert_eq!(error.category(), "turn_ordinal");
@@ -389,6 +392,7 @@ fn non_contiguous_turn_ordinal_refuses() {
             ordinal: 1,
             turn_key: "turn:repeat",
             opened_ms: 51,
+            provenance: None,
         })
         .expect_err("ordinal reuse refusal");
     assert_eq!(error.category(), "turn_ordinal");
@@ -647,6 +651,7 @@ fn exact_replay_writes_are_idempotent_without_duplication() {
             ordinal: 1,
             turn_key: "turn:1",
             opened_ms: 30,
+            provenance: None,
         })
         .expect("open turn");
     let replay = journal
@@ -655,6 +660,7 @@ fn exact_replay_writes_are_idempotent_without_duplication() {
             ordinal: 1,
             turn_key: "turn:1",
             opened_ms: 30,
+            provenance: None,
         })
         .expect("replayed turn");
     assert_eq!(replay.turn_id, turn.turn_id);
@@ -842,6 +848,13 @@ fn a_v1_journal_migrates_to_the_usage_schema() {
     let raw = Connection::open(private.path()).expect("raw v1 simulation");
     raw.execute("DROP TABLE provider_turn_usage", [])
         .expect("remove v2 table");
+    raw.execute_batch(
+        "DROP INDEX provider_turns_by_trace;
+         ALTER TABLE provider_turns DROP COLUMN trace_id;
+         ALTER TABLE provider_turns DROP COLUMN correlation_id;
+         ALTER TABLE provider_turns DROP COLUMN causation_id;",
+    )
+    .expect("remove v3 provenance");
     raw.pragma_update(None, "user_version", 1).expect("mark v1");
     drop(raw);
 
@@ -1334,6 +1347,7 @@ fn reopen_keeps_wal_foreign_keys_and_durable_rows() {
             ordinal: 1,
             turn_key: "turn:orphan",
             opened_ms: 30,
+            provenance: None,
         })
         .expect_err("orphan turn refusal");
     assert_eq!(error.category(), "not_found");

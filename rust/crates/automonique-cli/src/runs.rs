@@ -267,13 +267,19 @@ fn render(request: &RunsRequest, response: RunsResponse) -> Result<String, RunsE
             Ok(rendered)
         }
         (RunsRequest::RunDetail { .. }, RunsResponse::RunDetail { view, .. }) => Ok(format!(
-            "Automonique run: {} last_sequence={} coverage={} lifecycle_events={} resume_cursor={}\n",
+            "Automonique run: {} last_sequence={} coverage={} lifecycle_events={} resume_cursor={} trace_id={} correlation_id={} causation_id={}\n",
             render_summary(view.summary()),
             view.last_sequence(),
             view.coverage(),
             view.lifecycle().len(),
             view.resume_cursor()
                 .map_or_else(|| "-".to_owned(), |cursor| cursor.to_string()),
+            view.provenance()
+                .map_or("-", |value| value.trace_id().as_str()),
+            view.provenance()
+                .map_or("-", |value| value.correlation_id().as_str()),
+            view.provenance()
+                .map_or("-", |value| value.causation_id().as_str()),
         )),
         (
             RunsRequest::ListRuns { .. },
@@ -390,6 +396,7 @@ mod tests {
     use automonique_protocol::digest::{Sha256, Sha256Digest};
     use automonique_protocol::journal::CursorResume;
     use automonique_protocol::primitives::EpochMillis;
+    use automonique_protocol::provenance::{CausationId, CorrelationId, Provenance, TraceId};
     use automonique_protocol::runs_api::{
         Continuation, LifecycleCoverage, RunDetailView, RunListPage, RunsRefusal, SubmissionState,
     };
@@ -606,7 +613,12 @@ mod tests {
                 Vec::new(),
                 LifecycleCoverage::Complete,
             )
-            .expect("view"),
+            .expect("view")
+            .with_provenance(Provenance::new(
+                TraceId::new("trace-4").expect("trace"),
+                CorrelationId::new("run-4").expect("correlation"),
+                CausationId::new("submission-4").expect("causation"),
+            )),
         });
 
         let (exit, stdout, stderr) = invoke(
@@ -619,7 +631,7 @@ mod tests {
         assert_eq!(
             stdout,
             format!(
-                "Automonique run: run_id=run-1 submission_id=4 state=ready submission_state=accepted accepted_at_ms=1700000000000 spec_digest={} last_sequence=0 coverage=complete lifecycle_events=0 resume_cursor=-\n",
+                "Automonique run: run_id=run-1 submission_id=4 state=ready submission_state=accepted accepted_at_ms=1700000000000 spec_digest={} last_sequence=0 coverage=complete lifecycle_events=0 resume_cursor=- trace_id=trace-4 correlation_id=run-4 causation_id=submission-4\n",
                 digest(),
             ),
         );

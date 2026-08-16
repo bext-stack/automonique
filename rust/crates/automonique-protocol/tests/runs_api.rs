@@ -492,7 +492,15 @@ mod framing {
             .to_message()
             .expect("encodable")
             .to_canonical_bytes(),
-            &["coverage", "last_sequence", "lifecycle", "summary"],
+            &[
+                "causation_id",
+                "correlation_id",
+                "coverage",
+                "last_sequence",
+                "lifecycle",
+                "summary",
+                "trace_id",
+            ],
         );
         expect_fields(
             &RunsResponse::Resync {

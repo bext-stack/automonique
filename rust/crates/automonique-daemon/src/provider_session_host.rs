@@ -19,6 +19,7 @@ use automonique_agents::{
     ExecutionMode, NormalizedEvent, NormalizedTranscript, ProviderDisposition, ProviderEventStream,
     RecordedKind, ResumeBinding, RunCoordinates, SessionScope, StreamPolicy,
 };
+use automonique_protocol::provenance::{CausationId, CorrelationId, Provenance, TraceId};
 use automonique_runner::{LaunchPlan, RunContainment, SandboxedSession, spawn_sandboxed_session};
 use automonique_store::provider_journal::{
     CursorAdvance, FinishReason, ProcessExit, ProcessSpawn, ProcessState, ProcessTermination,
@@ -275,11 +276,23 @@ impl ProviderSessionHost {
         if self.is_idle_expired(now_ms) {
             return Err(SessionHostError::IdleExpired);
         }
+        let trace_id = TraceId::for_ingress("provider_session", &self.session_key);
+        let provenance = Provenance::new(
+            trace_id,
+            CorrelationId::new(format!(
+                "provider-turn:{}:{}",
+                self.session_id, self.next_ordinal
+            ))
+            .map_err(|_| SessionHostError::InvalidField("turn_key"))?,
+            CausationId::new(format!("provider-session:{}", self.session_id))
+                .map_err(|_| SessionHostError::InvalidField("session_key"))?,
+        );
         let opening = self.journal.open_turn(TurnOpening {
             session_id: self.session_id,
             ordinal: self.next_ordinal,
             turn_key,
             opened_ms: now_ms,
+            provenance: Some(&provenance),
         })?;
         let input = serde_json::to_vec(&UserTurn {
             r#type: "user",

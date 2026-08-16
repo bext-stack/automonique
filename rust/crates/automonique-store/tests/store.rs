@@ -227,6 +227,61 @@ fn open_requires_private_owned_paths_and_refuses_unknown_schema() {
 }
 
 #[test]
+fn terminal_effect_has_one_connected_causal_chain_back_to_ingress() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("store");
+    let epoch = lease(&mut store, "holder-a", 0);
+    let inbox_id = submit(&mut store, "causal-delivery", "causal-scope");
+    let run_id = claim(&mut store, inbox_id, epoch, "causal-claim", "causal-scope");
+    let terminal = store
+        .finish_run(TerminalRun {
+            run_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            expected_revision: 1,
+            now_ms: 3,
+            state: TerminalState::Succeeded,
+            event_kind: "run.succeeded",
+            event_payload: b"done",
+            outbox_intent_key: "causal-intent",
+            outbox_kind: "test.effect",
+            outbox_payload: b"effect",
+        })
+        .expect("terminal effect");
+
+    let chain = store
+        .causal_chain_for_outbox(terminal.outbox_id)
+        .expect("one-query causal chain");
+    assert_eq!(chain.inbox_id, inbox_id);
+    assert_eq!(chain.inbox_transport, "local-test");
+    assert_eq!(chain.inbox_transport_key, "causal-delivery");
+    assert_eq!(chain.run_id, run_id);
+    assert_eq!(chain.event_id, terminal.event_id);
+    assert_eq!(chain.event_kind, "run.succeeded");
+    assert_eq!(chain.outbox_id, terminal.outbox_id);
+    assert_eq!(chain.outbox_kind, "test.effect");
+    assert_eq!(chain.run_causation_id, format!("inbox:{inbox_id}"));
+    assert_eq!(chain.event_causation_id, format!("run:{run_id}"));
+    assert_eq!(
+        chain.outbox_causation_id,
+        format!("event:{}", terminal.event_id)
+    );
+
+    let duplicate = store
+        .submit_inbox(InboxSubmission {
+            transport: "local-test",
+            transport_key: "causal-delivery",
+            scope: "causal-scope",
+            payload: b"payload",
+            received_ms: 99,
+        })
+        .expect("duplicate ingress");
+    assert!(duplicate.duplicate);
+    assert_eq!(duplicate.inbox_id, inbox_id);
+}
+
+#[test]
 fn reopen_preserves_wal_foreign_keys_and_durable_rows() {
     let database = PrivateDatabase::new();
     let mut store = Store::open(database.path()).expect("open");

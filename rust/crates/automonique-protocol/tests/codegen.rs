@@ -2730,6 +2730,9 @@ mod command_surface {
                     lease_epoch: None,
                     lease_expires_ms: None,
                     delivery_receipt_key: None,
+                    trace_id: None,
+                    correlation_id: None,
+                    causation_id: None,
                 })
                 .expect("outbox evidence"),
             },
@@ -3740,6 +3743,8 @@ mod runs_surface {
         coverage: &str,
     ) -> JsonValue {
         JsonValue::Object(vec![
+            ("causation_id".to_owned(), JsonValue::Null),
+            ("correlation_id".to_owned(), JsonValue::Null),
             ("coverage".to_owned(), text(coverage)),
             (
                 "last_sequence".to_owned(),
@@ -3747,6 +3752,7 @@ mod runs_surface {
             ),
             ("lifecycle".to_owned(), JsonValue::Array(lifecycle)),
             ("summary".to_owned(), summary),
+            ("trace_id".to_owned(), JsonValue::Null),
         ])
     }
 

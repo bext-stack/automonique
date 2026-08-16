@@ -45,6 +45,7 @@ fn restart_recovery_marks_an_orphaned_process_session_and_turn_lost() {
             ordinal: 1,
             turn_key: "turn-1",
             opened_ms: 3,
+            provenance: None,
         })
         .unwrap();
     drop(journal);
@@ -131,6 +132,17 @@ fn turn_two_reuses_the_live_session_process_and_journals_both_turns() {
     let turns = journal.session_turns(session.session_id).unwrap();
     assert_eq!(turns.len(), 2);
     assert!(turns.iter().all(|turn| turn.state == TurnState::Completed));
+    let first_provenance = turns[0].provenance.as_ref().expect("turn provenance");
+    let second_provenance = turns[1].provenance.as_ref().expect("turn provenance");
+    assert_eq!(first_provenance.trace_id, second_provenance.trace_id);
+    assert_ne!(
+        first_provenance.correlation_id,
+        second_provenance.correlation_id
+    );
+    assert_eq!(
+        first_provenance.causation_id,
+        format!("provider-session:{}", session.session_id)
+    );
     let totals = journal.usage_totals().unwrap();
     assert_eq!(totals.requests, 2);
     assert_eq!(totals.input_tokens, 2);

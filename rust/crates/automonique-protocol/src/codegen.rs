@@ -307,6 +307,7 @@ use crate::digest::Sha256;
 use crate::event::{Authority, EventKind, MAX_RETRY_AFTER_MS, RetryCategory, StepStatus};
 use crate::primitives::ValueError;
 use crate::progress_api::{StreamMessageKind, StreamRefusal};
+use crate::provenance::MAX_PROVENANCE_ID_BYTES;
 use crate::runs_api::{
     LIFECYCLE_AUTHORITIES, LifecycleCoverage, RunState, RunsApiError, RunsRefusal, SpoolEventKind,
     SubmissionState,
@@ -2837,6 +2838,23 @@ fn runs_module() -> GeneratedModule {
                 value: ConstantValue::Text(crate::runs_api::RUNS_PROTOCOL.to_owned()),
             },
         ],
+        branded_ids: vec![
+            BrandedId {
+                name: "CausationId".to_owned(),
+                max_bytes: MAX_PROVENANCE_ID_BYTES,
+                pattern: Some("^[A-Za-z0-9._:-]+$".to_owned()),
+            },
+            BrandedId {
+                name: "CorrelationId".to_owned(),
+                max_bytes: MAX_PROVENANCE_ID_BYTES,
+                pattern: Some("^[A-Za-z0-9._:-]+$".to_owned()),
+            },
+            BrandedId {
+                name: "TraceId".to_owned(),
+                max_bytes: MAX_PROVENANCE_ID_BYTES,
+                pattern: Some("^[A-Za-z0-9._:-]+$".to_owned()),
+            },
+        ],
         bounded_integers: vec![
             BoundedInteger {
                 // The store's `accepted_at_ms >= 0` constraint and the spool's
@@ -3169,6 +3187,20 @@ fn runs_module() -> GeneratedModule {
                           omits is a partial stream presented as a whole one."
                         .to_owned(),
                     fields: vec![
+                        ResponseField {
+                            name: "causation_id".to_owned(),
+                            value: ResponseValue::NullableChecked {
+                                type_name: "CausationId".to_owned(),
+                                refusal_category: "RUNS_INVALID_BODY".to_owned(),
+                            },
+                        },
+                        ResponseField {
+                            name: "correlation_id".to_owned(),
+                            value: ResponseValue::NullableChecked {
+                                type_name: "CorrelationId".to_owned(),
+                                refusal_category: "RUNS_INVALID_BODY".to_owned(),
+                            },
+                        },
                         enum_field("coverage", "LifecycleCoverage"),
                         runs_integer_field(
                             "last_sequence",
@@ -3188,6 +3220,13 @@ fn runs_module() -> GeneratedModule {
                             name: "summary".to_owned(),
                             value: ResponseValue::Object {
                                 type_name: "RunSummary".to_owned(),
+                            },
+                        },
+                        ResponseField {
+                            name: "trace_id".to_owned(),
+                            value: ResponseValue::NullableChecked {
+                                type_name: "TraceId".to_owned(),
+                                refusal_category: "RUNS_INVALID_BODY".to_owned(),
                             },
                         },
                     ],

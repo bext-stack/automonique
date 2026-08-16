@@ -55,6 +55,7 @@ use crate::codec::{
 };
 use crate::digest::{Sha256, Sha256Digest};
 use crate::execute_api::{EXECUTE_PROTOCOL, ExecuteApiError, ExecuteRequest};
+use crate::provenance::{CausationId, CorrelationId, TraceId};
 use crate::runs_api::{RUNS_PROTOCOL, RunsApiError, RunsRequest};
 use crate::tools::RunId;
 use crate::wire::{JsonValue, Message};
@@ -186,7 +187,8 @@ const _: () = assert!(
 ///   the live progress stream, with [`ENDPOINT_MATURITY`] as their declared
 ///   maturity and [`DaemonStatus::capability`] reporting this number.
 /// - **2** — added the read-only `automonique.admin/metrics` endpoint.
-pub const ADMIN_CAPABILITY: u32 = 2;
+/// - **3** — added trace, correlation and causation ids to reconciliation evidence.
+pub const ADMIN_CAPABILITY: u32 = 3;
 
 /// How much of a promise an endpoint is.
 ///
@@ -2877,6 +2879,9 @@ pub struct AdminReconciliationEvidence {
     run_revision: u64,
     terminal_payload_present: bool,
     outbox_count: u64,
+    trace_id: Option<String>,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
 }
 
 /// Redacted stable refusal category for a correlated admin operation.
@@ -2935,7 +2940,32 @@ impl AdminReconciliationEvidence {
             run_revision,
             terminal_payload_present,
             outbox_count,
+            trace_id: None,
+            correlation_id: None,
+            causation_id: None,
         })
+    }
+
+    /// Attach the complete provenance triple carried by the durable run.
+    pub fn with_provenance(
+        mut self,
+        trace_id: impl Into<String>,
+        correlation_id: impl Into<String>,
+        causation_id: impl Into<String>,
+    ) -> Result<Self, AdminError> {
+        let trace_id = trace_id.into();
+        let correlation_id = correlation_id.into();
+        let causation_id = causation_id.into();
+        if TraceId::new(trace_id.clone()).is_err()
+            || CorrelationId::new(correlation_id.clone()).is_err()
+            || CausationId::new(causation_id.clone()).is_err()
+        {
+            return Err(AdminError::InvalidBody);
+        }
+        self.trace_id = Some(trace_id);
+        self.correlation_id = Some(correlation_id);
+        self.causation_id = Some(causation_id);
+        Ok(self)
     }
 
     #[must_use]
@@ -2966,9 +2996,29 @@ impl AdminReconciliationEvidence {
     pub const fn outbox_count(&self) -> u64 {
         self.outbox_count
     }
+    #[must_use]
+    pub fn trace_id(&self) -> Option<&str> {
+        self.trace_id.as_deref()
+    }
+    #[must_use]
+    pub fn correlation_id(&self) -> Option<&str> {
+        self.correlation_id.as_deref()
+    }
+    #[must_use]
+    pub fn causation_id(&self) -> Option<&str> {
+        self.causation_id.as_deref()
+    }
 
     fn to_body(&self) -> Result<JsonValue, AdminError> {
         Ok(JsonValue::Object(vec![
+            (
+                "causation_id".to_owned(),
+                optional_string(&self.causation_id),
+            ),
+            (
+                "correlation_id".to_owned(),
+                optional_string(&self.correlation_id),
+            ),
             (
                 "generation_id".to_owned(),
                 JsonValue::String(self.generation_id.clone()),
@@ -2991,6 +3041,7 @@ impl AdminReconciliationEvidence {
                 "terminal_payload_present".to_owned(),
                 JsonValue::Bool(self.terminal_payload_present),
             ),
+            ("trace_id".to_owned(), optional_string(&self.trace_id)),
         ]))
     }
 
@@ -2998,6 +3049,8 @@ impl AdminReconciliationEvidence {
         exact_fields(
             body,
             &[
+                "causation_id",
+                "correlation_id",
                 "generation_id",
                 "lease_epoch",
                 "outbox_count",
@@ -3005,13 +3058,14 @@ impl AdminReconciliationEvidence {
                 "run_revision",
                 "scope",
                 "terminal_payload_present",
+                "trace_id",
             ],
         )?;
         let terminal_payload_present = match body.get("terminal_payload_present") {
             Some(JsonValue::Bool(value)) => *value,
             _ => return Err(AdminError::InvalidBody),
         };
-        Self::new(
+        let evidence = Self::new(
             unsigned(body, "run_id")?,
             required_body_string(body, "scope")?,
             required_body_string(body, "generation_id")?,
@@ -3019,7 +3073,18 @@ impl AdminReconciliationEvidence {
             unsigned(body, "run_revision")?,
             terminal_payload_present,
             unsigned(body, "outbox_count")?,
-        )
+        )?;
+        match (
+            optional_body_string(body, "trace_id")?,
+            optional_body_string(body, "correlation_id")?,
+            optional_body_string(body, "causation_id")?,
+        ) {
+            (None, None, None) => Ok(evidence),
+            (Some(trace_id), Some(correlation_id), Some(causation_id)) => {
+                evidence.with_provenance(trace_id, correlation_id, causation_id)
+            }
+            _ => Err(AdminError::InvalidBody),
+        }
     }
 }
 
@@ -3039,6 +3104,9 @@ pub struct AdminOutboxEvidence {
     lease_epoch: Option<u64>,
     lease_expires_ms: Option<u64>,
     delivery_receipt_key: Option<String>,
+    trace_id: Option<String>,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
 }
 
 impl fmt::Debug for AdminOutboxEvidence {
@@ -3064,6 +3132,9 @@ impl fmt::Debug for AdminOutboxEvidence {
                 "delivery_receipt_key",
                 &self.delivery_receipt_key.as_ref().map(|_| "<redacted>"),
             )
+            .field("trace_id", &self.trace_id)
+            .field("correlation_id", &self.correlation_id)
+            .field("causation_id", &self.causation_id)
             .finish()
     }
 }
@@ -3083,6 +3154,9 @@ pub struct AdminOutboxEvidenceParts {
     pub lease_epoch: Option<u64>,
     pub lease_expires_ms: Option<u64>,
     pub delivery_receipt_key: Option<String>,
+    pub trace_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
 }
 
 impl AdminOutboxEvidence {
@@ -3099,6 +3173,13 @@ impl AdminOutboxEvidence {
             parts.lease_epoch.is_some(),
             parts.lease_expires_ms.is_some(),
         ];
+        let provenance_fields_present = [
+            parts.trace_id.is_some(),
+            parts.correlation_id.is_some(),
+            parts.causation_id.is_some(),
+        ];
+        let provenance_is_complete = provenance_fields_present.iter().all(|present| *present);
+        let provenance_is_absent = provenance_fields_present.iter().all(|present| !*present);
         let lease_is_complete = lease_fields_present.iter().all(|present| *present);
         let lease_is_absent = lease_fields_present.iter().all(|present| !*present);
         let state_is_coherent = match parts.state.as_str() {
@@ -3124,6 +3205,12 @@ impl AdminOutboxEvidence {
             || !valid_optional(&parts.lease_generation_id)
             || !valid_optional(&parts.lease_holder)
             || !valid_optional(&parts.delivery_receipt_key)
+            || !valid_provenance(
+                parts.trace_id.as_deref(),
+                parts.correlation_id.as_deref(),
+                parts.causation_id.as_deref(),
+            )
+            || !(provenance_is_complete || provenance_is_absent)
             || parts.lease_epoch == Some(0)
         {
             return Err(AdminError::InvalidBody);
@@ -3142,6 +3229,9 @@ impl AdminOutboxEvidence {
             lease_epoch: parts.lease_epoch,
             lease_expires_ms: parts.lease_expires_ms,
             delivery_receipt_key: parts.delivery_receipt_key,
+            trace_id: parts.trace_id,
+            correlation_id: parts.correlation_id,
+            causation_id: parts.causation_id,
         })
     }
 
@@ -3197,10 +3287,30 @@ impl AdminOutboxEvidence {
     pub fn delivery_receipt_key(&self) -> Option<&str> {
         self.delivery_receipt_key.as_deref()
     }
+    #[must_use]
+    pub fn trace_id(&self) -> Option<&str> {
+        self.trace_id.as_deref()
+    }
+    #[must_use]
+    pub fn correlation_id(&self) -> Option<&str> {
+        self.correlation_id.as_deref()
+    }
+    #[must_use]
+    pub fn causation_id(&self) -> Option<&str> {
+        self.causation_id.as_deref()
+    }
 
     fn to_body(&self) -> Result<JsonValue, AdminError> {
         Ok(JsonValue::Object(vec![
             ("attempt".to_owned(), integer("attempt", self.attempt)?),
+            (
+                "causation_id".to_owned(),
+                optional_string(&self.causation_id),
+            ),
+            (
+                "correlation_id".to_owned(),
+                optional_string(&self.correlation_id),
+            ),
             (
                 "delivery_receipt_key".to_owned(),
                 optional_string(&self.delivery_receipt_key),
@@ -3233,6 +3343,7 @@ impl AdminOutboxEvidence {
             ),
             ("revision".to_owned(), integer("revision", self.revision)?),
             ("state".to_owned(), JsonValue::String(self.state.clone())),
+            ("trace_id".to_owned(), optional_string(&self.trace_id)),
             (
                 "transport".to_owned(),
                 JsonValue::String(self.transport.clone()),
@@ -3245,6 +3356,8 @@ impl AdminOutboxEvidence {
             body,
             &[
                 "attempt",
+                "causation_id",
+                "correlation_id",
                 "delivery_receipt_key",
                 "intent_key",
                 "kind",
@@ -3256,6 +3369,7 @@ impl AdminOutboxEvidence {
                 "outbox_id",
                 "revision",
                 "state",
+                "trace_id",
                 "transport",
             ],
         )?;
@@ -3273,6 +3387,9 @@ impl AdminOutboxEvidence {
             lease_epoch: optional_unsigned(body, "lease_epoch")?,
             lease_expires_ms: optional_unsigned(body, "lease_expires_ms")?,
             delivery_receipt_key: optional_body_string(body, "delivery_receipt_key")?,
+            trace_id: optional_body_string(body, "trace_id")?,
+            correlation_id: optional_body_string(body, "correlation_id")?,
+            causation_id: optional_body_string(body, "causation_id")?,
         })
     }
 }
@@ -3827,6 +3944,22 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
 
 fn valid_coordinate(value: &str, max_bytes: usize) -> bool {
     !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+}
+
+fn valid_provenance(
+    trace_id: Option<&str>,
+    correlation_id: Option<&str>,
+    causation_id: Option<&str>,
+) -> bool {
+    match (trace_id, correlation_id, causation_id) {
+        (None, None, None) => true,
+        (Some(trace_id), Some(correlation_id), Some(causation_id)) => {
+            TraceId::new(trace_id).is_ok()
+                && CorrelationId::new(correlation_id).is_ok()
+                && CausationId::new(causation_id).is_ok()
+        }
+        _ => false,
+    }
 }
 
 fn valid_metrics_exposition(value: &str) -> bool {

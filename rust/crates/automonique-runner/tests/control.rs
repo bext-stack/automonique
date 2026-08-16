@@ -487,7 +487,8 @@ fn subscribe_from_zero_replays_every_event_byte_for_byte() {
     let mut harness = Harness::spawn(server);
 
     // Anti-vacuity: the entire page is compared to literal bytes.
-    let expected = "event 1 started authoritative -\n\
+    let expected = "provenance 854a69b1c40d31f741e320be2150acd6 attempt:attempt-1 run:run-alpha\n\
+                    event 1 started authoritative -\n\
                     event 2 adapter_event synthetic 68656c6c6f\n\
                     event 3 cancel_requested authoritative 00ff\n\
                     end 3 false\n";
@@ -499,12 +500,12 @@ fn subscribe_from_zero_replays_every_event_byte_for_byte() {
     // A mid-cursor resumes strictly after that sequence.
     assert_eq!(
         body(harness.path(), "subscribe attempt-1 2\n"),
-        "event 3 cancel_requested authoritative 00ff\nend 3 false\n"
+        "provenance 854a69b1c40d31f741e320be2150acd6 attempt:attempt-1 run:run-alpha\nevent 3 cancel_requested authoritative 00ff\nend 3 false\n"
     );
     // The last sequence is an empty, non-advancing page.
     assert_eq!(
         body(harness.path(), "subscribe attempt-1 3\n"),
-        "end 3 false\n"
+        "provenance 854a69b1c40d31f741e320be2150acd6 attempt:attempt-1 run:run-alpha\nend 3 false\n"
     );
     // Ahead of the spool is a typed refusal, never a silent empty page.
     assert_eq!(
@@ -547,8 +548,12 @@ fn subscribe_pages_are_bounded_and_report_continuation() {
 
     let first = body(harness.path(), "subscribe attempt-1 0\n");
     let lines: Vec<&str> = first.lines().collect();
-    assert_eq!(lines.len(), MAX_SUBSCRIBE_PAGE_EVENTS + 1);
-    assert_eq!(lines[0], "event 1 simulation_event synthetic 7374657030");
+    assert_eq!(lines.len(), MAX_SUBSCRIBE_PAGE_EVENTS + 2);
+    assert_eq!(
+        lines[0],
+        "provenance 42e287f8c6607add83687308ae257bd5 attempt:attempt-1 run:run-page"
+    );
+    assert_eq!(lines[1], "event 1 simulation_event synthetic 7374657030");
     assert_eq!(
         *lines.last().unwrap(),
         format!("end {MAX_SUBSCRIBE_PAGE_EVENTS} true")
@@ -562,7 +567,7 @@ fn subscribe_pages_are_bounded_and_report_continuation() {
     assert_eq!(
         second,
         format!(
-            "event {} simulation_event synthetic {}\nevent {} simulation_event synthetic {}\nend {total} false\n",
+            "provenance 42e287f8c6607add83687308ae257bd5 attempt:attempt-1 run:run-page\nevent {} simulation_event synthetic {}\nevent {} simulation_event synthetic {}\nend {total} false\n",
             total - 1,
             hex(format!("step{}", total - 2).as_bytes()),
             total,
@@ -1176,7 +1181,7 @@ fn heartbeat_reports_only_server_liveness_and_binding_count() {
     assert_eq!(body(harness.path(), "inspect attempt-1\n"), before);
     assert_eq!(
         body(harness.path(), "subscribe attempt-1 0\n"),
-        "event 1 started authoritative 7365637265742d7061796c6f6164\nend 1 false\n"
+        "provenance f678093519c5629e717ce5682b216e17 attempt:attempt-1 run:run-one\nevent 1 started authoritative 7365637265742d7061796c6f6164\nend 1 false\n"
     );
 
     harness.stop();

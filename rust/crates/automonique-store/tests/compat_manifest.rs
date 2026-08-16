@@ -26,7 +26,7 @@ fn the_schema_versions_this_crate_owns_match_the_compat_matrix_rows() {
     // drifted from the authoritative constant — update both together.
     assert_eq!(
         automonique_store::SCHEMA_VERSION,
-        7,
+        8,
         "store SCHEMA_VERSION moved: update the compat matrix's store_schema \
          row in automonique-protocol/src/compat.rs together with this pin"
     );
@@ -39,11 +39,11 @@ fn the_schema_versions_this_crate_owns_match_the_compat_matrix_rows() {
         "generation audit schema moved: update the compat matrix row and this pin"
     );
     assert_eq!(
-        SLACK_INGRESS_SCHEMA_VERSION, 1,
+        SLACK_INGRESS_SCHEMA_VERSION, 2,
         "slack ingress schema moved: update the compat matrix row and this pin"
     );
     assert_eq!(
-        PROVIDER_JOURNAL_SCHEMA_VERSION, 2,
+        PROVIDER_JOURNAL_SCHEMA_VERSION, 3,
         "provider journal schema moved: update the compat matrix row and this pin"
     );
     assert_eq!(

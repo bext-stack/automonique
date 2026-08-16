@@ -10,7 +10,7 @@
 // ergonomics; it may not redefine anything in this file.
 
 import {DurableRowId, RequestId, RunId, SpecDigest} from "./admin-command.ts";
-import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyUnsigned, bodyValue, decodeMessageAdmitted, encodeMessage, exactFields, mapNullable, orderedEnumSet, refuse, refuseField, type JsonValue} from "./runtime.ts";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, bodyValue, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, mapNullable, orderedEnumSet, refuse, refuseField, type JsonValue} from "./runtime.ts";
 
 /** Maximum lifecycle events one detail view may carry. */
 export const MAX_LIFECYCLE_EVENTS = 128;
@@ -26,6 +26,39 @@ export const RUNS_API_SCHEMA_V1 = "automonique.runs/v1";
 
 /** Stable protocol name for the native Runs API. */
 export const RUNS_PROTOCOL = "automonique.runs";
+
+/** Branded identifier, at most 256 UTF-8 bytes. */
+export type CausationId = string & {readonly __brand: "CausationId"};
+export const CausationId_MAX_BYTES = 256;
+export const CausationId_PATTERN = /^[A-Za-z0-9._:-]+$/u;
+export function CausationId(value: string): CausationId {
+  if (value.length === 0) throw new ValidationError("CausationId", "empty");
+  if (byteLength(value) > 256) throw new ValidationError("CausationId", "too_long");
+  if (!CausationId_PATTERN.test(value)) throw new ValidationError("CausationId", "invalid_character");
+  return value as CausationId;
+}
+
+/** Branded identifier, at most 256 UTF-8 bytes. */
+export type CorrelationId = string & {readonly __brand: "CorrelationId"};
+export const CorrelationId_MAX_BYTES = 256;
+export const CorrelationId_PATTERN = /^[A-Za-z0-9._:-]+$/u;
+export function CorrelationId(value: string): CorrelationId {
+  if (value.length === 0) throw new ValidationError("CorrelationId", "empty");
+  if (byteLength(value) > 256) throw new ValidationError("CorrelationId", "too_long");
+  if (!CorrelationId_PATTERN.test(value)) throw new ValidationError("CorrelationId", "invalid_character");
+  return value as CorrelationId;
+}
+
+/** Branded identifier, at most 256 UTF-8 bytes. */
+export type TraceId = string & {readonly __brand: "TraceId"};
+export const TraceId_MAX_BYTES = 256;
+export const TraceId_PATTERN = /^[A-Za-z0-9._:-]+$/u;
+export function TraceId(value: string): TraceId {
+  if (value.length === 0) throw new ValidationError("TraceId", "empty");
+  if (byteLength(value) > 256) throw new ValidationError("TraceId", "too_long");
+  if (!TraceId_PATTERN.test(value)) throw new ValidationError("TraceId", "invalid_character");
+  return value as TraceId;
+}
 
 /** Bounded integer in [0, 9223372036854775807]. */
 export type EpochMillis = bigint & {readonly __brand: "EpochMillis"};
@@ -390,24 +423,36 @@ export function decodeRunsResync(request_id: RequestId, body: JsonValue): RunsRe
 /** One run in full. `coverage` says whether the carried lifecycle is the whole log, because a bounded list with no statement about what it omits is a partial stream presented as a whole one. */
 export const RUNS_RUN_DETAIL_RESULT_RESPONSE_KIND = "run_detail_result";
 export interface RunDetailView {
+  readonly causation_id: CausationId | null;
+  readonly correlation_id: CorrelationId | null;
   readonly coverage: LifecycleCoverage;
   readonly last_sequence: LastSequence;
   readonly lifecycle: readonly RunLifecycleEvent[];
   readonly request_id: RequestId;
   readonly summary: RunSummary;
+  readonly trace_id: TraceId | null;
 }
 
 /** The exact key set this response's wire body carries; the correlation identifier is not among them, because it travels in the envelope. */
 export const RunDetailView_BODY_FIELDS: readonly string[] = [
+  "causation_id",
+  "correlation_id",
   "coverage",
   "last_sequence",
   "lifecycle",
   "summary",
+  "trace_id",
 ];
 
 export function decodeRunDetailView(request_id: RequestId, body: JsonValue): RunDetailView {
   const fields = exactFields(body, RunDetailView_BODY_FIELDS, RUNS_INVALID_BODY);
   return {
+    causation_id: mapNullable(bodyStringOrNull(fields, "causation_id", RUNS_INVALID_BODY), (value) =>
+      refuse(RUNS_INVALID_BODY, () => CausationId(value)),
+    ),
+    correlation_id: mapNullable(bodyStringOrNull(fields, "correlation_id", RUNS_INVALID_BODY), (value) =>
+      refuse(RUNS_INVALID_BODY, () => CorrelationId(value)),
+    ),
     coverage: refuse(RUNS_UNKNOWN_ENUM_VALUE, () => decodeLifecycleCoverage(bodyString(fields, "coverage", RUNS_INVALID_BODY))),
     last_sequence: refuse(RUNS_INVALID_BODY, () => LastSequence(bodyUnsigned(fields, "last_sequence", RUNS_INVALID_BODY))),
     lifecycle: bodyArray(fields, "lifecycle", RUNS_INVALID_BODY, MAX_LIFECYCLE_EVENTS, RUNS_LIFECYCLE_TOO_LONG).map(
@@ -415,6 +460,9 @@ export function decodeRunDetailView(request_id: RequestId, body: JsonValue): Run
     ),
     request_id: request_id,
     summary: decodeRunSummary(bodyValue(fields, "summary", RUNS_INVALID_BODY)),
+    trace_id: mapNullable(bodyStringOrNull(fields, "trace_id", RUNS_INVALID_BODY), (value) =>
+      refuse(RUNS_INVALID_BODY, () => TraceId(value)),
+    ),
   };
 }
 

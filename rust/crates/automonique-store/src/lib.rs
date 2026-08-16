@@ -35,13 +35,14 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use automonique_protocol::provenance::{CausationId, CorrelationId, Provenance, TraceId};
 use nix::unistd::geteuid;
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 
 /// The only database schema this build can read and write.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 /// SQLite lock contention is bounded rather than waiting indefinitely.
 pub const BUSY_TIMEOUT: Duration = Duration::from_millis(2_000);
 
@@ -454,6 +455,27 @@ CREATE TABLE transport_pauses (
 ) STRICT;
 "#;
 
+/// Expand-only provenance columns. Historical rows remain explicitly unknown.
+const MIGRATE_V7_TO_V8: &str = r#"
+ALTER TABLE inbox ADD COLUMN trace_id TEXT;
+ALTER TABLE inbox ADD COLUMN correlation_id TEXT;
+ALTER TABLE inbox ADD COLUMN causation_id TEXT;
+ALTER TABLE runs ADD COLUMN trace_id TEXT;
+ALTER TABLE runs ADD COLUMN correlation_id TEXT;
+ALTER TABLE runs ADD COLUMN causation_id TEXT;
+ALTER TABLE domain_events ADD COLUMN trace_id TEXT;
+ALTER TABLE domain_events ADD COLUMN correlation_id TEXT;
+ALTER TABLE domain_events ADD COLUMN causation_id TEXT;
+ALTER TABLE outbox ADD COLUMN trace_id TEXT;
+ALTER TABLE outbox ADD COLUMN correlation_id TEXT;
+ALTER TABLE outbox ADD COLUMN causation_id TEXT;
+ALTER TABLE telegram_ingress ADD COLUMN trace_id TEXT;
+ALTER TABLE telegram_ingress ADD COLUMN correlation_id TEXT;
+ALTER TABLE telegram_ingress ADD COLUMN causation_id TEXT;
+CREATE INDEX domain_events_by_trace ON domain_events(trace_id, event_id);
+CREATE INDEX outbox_by_trace ON outbox(trace_id, outbox_id);
+"#;
+
 /// A durable store error with stable refusal categories.
 #[derive(Debug)]
 pub enum StoreError {
@@ -729,6 +751,31 @@ pub struct InboxReceipt {
     pub duplicate: bool,
 }
 
+/// Provenance persisted on one durable record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredProvenance {
+    pub trace_id: String,
+    pub correlation_id: String,
+    pub causation_id: String,
+}
+
+/// One joined causal path from an external effect back to its input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CausalChain {
+    pub inbox_id: i64,
+    pub inbox_transport: String,
+    pub inbox_transport_key: String,
+    pub run_id: i64,
+    pub event_id: i64,
+    pub event_kind: String,
+    pub outbox_id: i64,
+    pub outbox_kind: String,
+    pub provenance: StoredProvenance,
+    pub run_causation_id: String,
+    pub event_causation_id: String,
+    pub outbox_causation_id: String,
+}
+
 /// Content-bearing or content-free durable Telegram disposition.
 ///
 /// Denied and unsupported inputs cannot carry content in this type, preventing
@@ -942,6 +989,7 @@ pub struct ReconciliationEvidence {
     pub terminal_payload_present: bool,
     pub outbox_intent_key: Option<String>,
     pub outbox_count: u64,
+    pub provenance: Option<StoredProvenance>,
 }
 
 /// Compare-and-set reconciliation request.
@@ -1162,6 +1210,7 @@ pub struct OutboxReconciliationEvidence {
     pub delivery_receipt_key: Option<String>,
     pub available_ms: i64,
     pub last_error: Option<String>,
+    pub provenance: Option<StoredProvenance>,
 }
 
 /// An ambiguous effect may only be closed, never automatically retried.
@@ -1912,18 +1961,33 @@ impl Store {
 
         transaction.execute(
             "INSERT INTO inbox
-             (transport, transport_key, scope, payload, received_ms, state, revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1)",
+             (transport, transport_key, scope, payload, received_ms, state, revision, trace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, ?6)",
             params![
                 submission.transport,
                 submission.transport_key,
                 submission.scope,
                 submission.payload,
-                submission.received_ms
+                submission.received_ms,
+                TraceId::for_ingress(submission.transport, submission.transport_key).as_str()
             ],
         )?;
         let inbox_id = transaction.last_insert_rowid();
-        append_event(
+        let provenance = ingress_record_provenance(
+            submission.transport,
+            submission.transport_key,
+            "inbox",
+            inbox_id,
+        )?;
+        transaction.execute(
+            "UPDATE inbox SET correlation_id = ?2, causation_id = ?3 WHERE inbox_id = ?1",
+            params![
+                inbox_id,
+                provenance.correlation_id().as_str(),
+                provenance.causation_id().as_str()
+            ],
+        )?;
+        append_event_with_provenance(
             &transaction,
             "inbox",
             &inbox_id.to_string(),
@@ -1931,6 +1995,7 @@ impl Store {
             submission.received_ms,
             "inbox.accepted",
             submission.transport_key.as_bytes(),
+            &provenance,
         )?;
         transaction.commit()?;
         Ok(InboxReceipt {
@@ -2278,10 +2343,12 @@ impl Store {
                 return Err(StoreError::IdempotencyConflict("telegram_source_key"));
             }
             let (disposition, content) = telegram_disposition_parts(update.disposition);
+            let provenance = telegram_ingress_provenance(update.source_key, update.update_id)?;
             transaction.execute(
                 "INSERT INTO telegram_ingress
-                 (bot_id, update_id, source_key, scope, disposition, content, received_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (bot_id, update_id, source_key, scope, disposition, content, received_ms,
+                  trace_id, correlation_id, causation_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     batch.bot_id,
                     &telegram_offset_bytes(update.update_id)[..],
@@ -2289,7 +2356,10 @@ impl Store {
                     update.scope,
                     disposition,
                     content,
-                    batch.received_ms
+                    batch.received_ms,
+                    provenance.trace_id().as_str(),
+                    provenance.correlation_id().as_str(),
+                    provenance.causation_id().as_str()
                 ],
             )?;
         }
@@ -2452,8 +2522,11 @@ impl Store {
 
         transaction.execute(
             "INSERT INTO runs
-             (claim_key, inbox_id, scope, generation_id, lease_epoch, state, revision, started_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'running', 1, ?6)",
+             (claim_key, inbox_id, scope, generation_id, lease_epoch, state, revision, started_ms,
+              trace_id, causation_id)
+             SELECT ?1, inbox_id, ?3, ?4, ?5, 'running', 1, ?6,
+                    trace_id, 'inbox:' || inbox_id
+             FROM inbox WHERE inbox_id = ?2",
             params![
                 claim.claim_key,
                 claim.inbox_id,
@@ -2464,7 +2537,14 @@ impl Store {
             ],
         )?;
         let run_id = transaction.last_insert_rowid();
-        mark_inbox_claimed(&transaction, claim.inbox_id, run_id, claim.now_ms)?;
+        let provenance = run_provenance(&transaction, claim.inbox_id, run_id)?;
+        mark_inbox_claimed(
+            &transaction,
+            claim.inbox_id,
+            run_id,
+            claim.now_ms,
+            provenance.as_ref(),
+        )?;
         transaction.execute(
             "INSERT INTO work_locks
              (scope, run_id, generation_id, lease_epoch, expires_ms)
@@ -2477,15 +2557,28 @@ impl Store {
                 lease_expiry
             ],
         )?;
-        append_event(
-            &transaction,
-            "run",
-            &run_id.to_string(),
-            1,
-            claim.now_ms,
-            "run.claimed",
-            claim.scope.as_bytes(),
-        )?;
+        if let Some(provenance) = &provenance {
+            append_event_with_provenance(
+                &transaction,
+                "run",
+                &run_id.to_string(),
+                1,
+                claim.now_ms,
+                "run.claimed",
+                claim.scope.as_bytes(),
+                provenance,
+            )?;
+        } else {
+            append_event(
+                &transaction,
+                "run",
+                &run_id.to_string(),
+                1,
+                claim.now_ms,
+                "run.claimed",
+                claim.scope.as_bytes(),
+            )?;
+        }
         transaction.commit()?;
         Ok(RunClaim {
             run_id,
@@ -2585,8 +2678,11 @@ impl Store {
 
         transaction.execute(
             "INSERT INTO runs
-             (claim_key, inbox_id, scope, generation_id, lease_epoch, state, revision, started_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'running', 1, ?6)",
+             (claim_key, inbox_id, scope, generation_id, lease_epoch, state, revision, started_ms,
+              trace_id, causation_id)
+             SELECT ?1, inbox_id, ?3, ?4, ?5, 'running', 1, ?6,
+                    trace_id, 'inbox:' || inbox_id
+             FROM inbox WHERE inbox_id = ?2",
             params![
                 claim_key,
                 inbox_id,
@@ -2597,7 +2693,14 @@ impl Store {
             ],
         )?;
         let run_id = transaction.last_insert_rowid();
-        mark_inbox_claimed(&transaction, inbox_id, run_id, claim.now_ms)?;
+        let provenance = run_provenance(&transaction, inbox_id, run_id)?;
+        mark_inbox_claimed(
+            &transaction,
+            inbox_id,
+            run_id,
+            claim.now_ms,
+            provenance.as_ref(),
+        )?;
         transaction.execute(
             "INSERT INTO work_locks
              (scope, run_id, generation_id, lease_epoch, expires_ms)
@@ -2610,15 +2713,28 @@ impl Store {
                 lease_expiry
             ],
         )?;
-        append_event(
-            &transaction,
-            "run",
-            &run_id.to_string(),
-            1,
-            claim.now_ms,
-            "run.claimed",
-            scope.as_bytes(),
-        )?;
+        if let Some(provenance) = &provenance {
+            append_event_with_provenance(
+                &transaction,
+                "run",
+                &run_id.to_string(),
+                1,
+                claim.now_ms,
+                "run.claimed",
+                scope.as_bytes(),
+                provenance,
+            )?;
+        } else {
+            append_event(
+                &transaction,
+                "run",
+                &run_id.to_string(),
+                1,
+                claim.now_ms,
+                "run.claimed",
+                scope.as_bytes(),
+            )?;
+        }
         transaction.commit()?;
         Ok(Some(ScheduledRun {
             run_id,
@@ -2698,7 +2814,8 @@ impl Store {
                         (SELECT count(*) FROM outbox o
                          JOIN domain_events e ON e.event_id = o.event_id
                          WHERE e.aggregate_kind = 'run'
-                           AND e.aggregate_id = CAST(r.run_id AS TEXT))
+                           AND e.aggregate_id = CAST(r.run_id AS TEXT)),
+                        r.trace_id, r.correlation_id, r.causation_id
                  FROM runs r JOIN inbox i ON i.inbox_id = r.inbox_id
                  LEFT JOIN work_locks w ON w.run_id = r.run_id
                  WHERE r.run_id = ?1",
@@ -2723,6 +2840,9 @@ impl Store {
                         row.get::<_, bool>(15)?,
                         row.get::<_, Option<String>>(16)?,
                         row.get::<_, i64>(17)?,
+                        row.get::<_, Option<String>>(18)?,
+                        row.get::<_, Option<String>>(19)?,
+                        row.get::<_, Option<String>>(20)?,
                     ))
                 },
             )
@@ -2763,6 +2883,7 @@ impl Store {
             terminal_payload_present: row.15,
             outbox_intent_key: row.16,
             outbox_count: from_db_u64(row.17, "outbox_count")?,
+            provenance: stored_provenance(row.18, row.19, row.20)?,
         };
         transaction.commit()?;
         Ok(evidence)
@@ -2822,6 +2943,7 @@ impl Store {
             )
             .optional()?
             .ok_or(StoreError::NotFound("run"))?;
+        let run_provenance = run_row_provenance(&transaction, request.run_id)?;
         let revision = from_db_u64(run.1, "run_revision")?;
         if run.0 != "running" {
             let receipt = reconciliation_retry_receipt(&transaction, &request, &run)?;
@@ -2906,31 +3028,92 @@ impl Store {
         if inbox_changed != 1 {
             return Err(StoreError::IdempotencyConflict("inbox_state"));
         }
-        let run_event_id = append_event(
-            &transaction,
-            "run",
-            &request.run_id.to_string(),
-            next_revision,
-            request.now_ms,
-            "run.reconciliation_failed",
-            payload,
-        )?;
-        let inbox_event_id = append_event(
-            &transaction,
-            "inbox",
-            &run.6.to_string(),
-            next_inbox_revision,
-            request.now_ms,
-            "inbox.reconciliation_failed",
-            payload,
-        )?;
+        let event_provenance = run_provenance
+            .as_ref()
+            .map(|provenance| {
+                child_provenance(
+                    provenance.trace_id().as_str(),
+                    provenance.correlation_id().as_str().to_owned(),
+                    format!("run:{}", request.run_id),
+                )
+            })
+            .transpose()?;
+        let (run_event_id, inbox_event_id) = if let Some(provenance) = &event_provenance {
+            (
+                append_event_with_provenance(
+                    &transaction,
+                    "run",
+                    &request.run_id.to_string(),
+                    next_revision,
+                    request.now_ms,
+                    "run.reconciliation_failed",
+                    payload,
+                    provenance,
+                )?,
+                append_event_with_provenance(
+                    &transaction,
+                    "inbox",
+                    &run.6.to_string(),
+                    next_inbox_revision,
+                    request.now_ms,
+                    "inbox.reconciliation_failed",
+                    payload,
+                    provenance,
+                )?,
+            )
+        } else {
+            (
+                append_event(
+                    &transaction,
+                    "run",
+                    &request.run_id.to_string(),
+                    next_revision,
+                    request.now_ms,
+                    "run.reconciliation_failed",
+                    payload,
+                )?,
+                append_event(
+                    &transaction,
+                    "inbox",
+                    &run.6.to_string(),
+                    next_inbox_revision,
+                    request.now_ms,
+                    "inbox.reconciliation_failed",
+                    payload,
+                )?,
+            )
+        };
+        let outbox_provenance = event_provenance
+            .as_ref()
+            .map(|provenance| {
+                child_provenance(
+                    provenance.trace_id().as_str(),
+                    provenance.correlation_id().as_str().to_owned(),
+                    format!("event:{run_event_id}"),
+                )
+            })
+            .transpose()?;
         let insert = transaction.execute(
             "INSERT INTO outbox
              (intent_key, event_id, transport, kind, payload, state, revision,
-              attempts, available_ms, created_ms)
+              attempts, available_ms, created_ms, trace_id, correlation_id, causation_id)
              VALUES (?1, ?2, 'fake', 'fake.reconciliation.receipt', ?3,
-                     'pending', 1, 0, ?4, ?4)",
-            params![request.decision_key, run_event_id, payload, request.now_ms],
+                     'pending', 1, 0, ?4, ?4, ?5, ?6, ?7)",
+            params![
+                request.decision_key,
+                run_event_id,
+                payload,
+                request.now_ms,
+                outbox_provenance
+                    .as_ref()
+                    .map(|value| value.trace_id().as_str()),
+                outbox_provenance
+                    .as_ref()
+                    .map(|value| value.correlation_id().as_str()),
+                outbox_provenance
+                    .as_ref()
+                    .map(|value| value.causation_id().as_str())
+            ],
         );
         if let Err(error) = insert {
             if error
@@ -3038,6 +3221,7 @@ impl Store {
             )
             .optional()?
             .ok_or(StoreError::NotFound("run"))?;
+        let provenance = run_row_provenance(&transaction, terminal.run_id)?;
         let revision = from_db_u64(run.1, "run_revision")?;
         if run.2 != terminal.generation_id
             || from_db_u64(run.3, "lease_epoch")? != terminal.lease_epoch
@@ -3110,40 +3294,93 @@ impl Store {
             [run.6],
             |row| row.get(0),
         )?;
-        append_event(
-            &transaction,
-            "inbox",
-            &run.6.to_string(),
-            from_db_u64(inbox_revision, "inbox_revision")?,
-            terminal.now_ms,
-            if terminal.state == TerminalState::Succeeded {
-                "inbox.completed"
-            } else {
-                "inbox.failed"
-            },
-            terminal.event_payload,
-        )?;
-        let event_id = append_event(
-            &transaction,
-            "run",
-            &terminal.run_id.to_string(),
-            next_revision,
-            terminal.now_ms,
-            terminal.event_kind,
-            terminal.event_payload,
-        )?;
+        let inbox_kind = if terminal.state == TerminalState::Succeeded {
+            "inbox.completed"
+        } else {
+            "inbox.failed"
+        };
+        let event_provenance = provenance
+            .as_ref()
+            .map(|provenance| {
+                child_provenance(
+                    provenance.trace_id().as_str(),
+                    provenance.correlation_id().as_str().to_owned(),
+                    format!("run:{}", terminal.run_id),
+                )
+            })
+            .transpose()?;
+        let event_id = if let Some(provenance) = &event_provenance {
+            append_event_with_provenance(
+                &transaction,
+                "inbox",
+                &run.6.to_string(),
+                from_db_u64(inbox_revision, "inbox_revision")?,
+                terminal.now_ms,
+                inbox_kind,
+                terminal.event_payload,
+                provenance,
+            )?;
+            append_event_with_provenance(
+                &transaction,
+                "run",
+                &terminal.run_id.to_string(),
+                next_revision,
+                terminal.now_ms,
+                terminal.event_kind,
+                terminal.event_payload,
+                provenance,
+            )?
+        } else {
+            append_event(
+                &transaction,
+                "inbox",
+                &run.6.to_string(),
+                from_db_u64(inbox_revision, "inbox_revision")?,
+                terminal.now_ms,
+                inbox_kind,
+                terminal.event_payload,
+            )?;
+            append_event(
+                &transaction,
+                "run",
+                &terminal.run_id.to_string(),
+                next_revision,
+                terminal.now_ms,
+                terminal.event_kind,
+                terminal.event_payload,
+            )?
+        };
+        let outbox_provenance = event_provenance
+            .as_ref()
+            .map(|provenance| {
+                child_provenance(
+                    provenance.trace_id().as_str(),
+                    provenance.correlation_id().as_str().to_owned(),
+                    format!("event:{event_id}"),
+                )
+            })
+            .transpose()?;
         let insert = transaction.execute(
             "INSERT INTO outbox
              (intent_key, event_id, transport, kind, payload, state, revision,
-              attempts, available_ms, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, 0, ?6, ?6)",
+              attempts, available_ms, created_ms, trace_id, correlation_id, causation_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, 0, ?6, ?6, ?7, ?8, ?9)",
             params![
                 terminal.outbox_intent_key,
                 event_id,
                 outbox_transport(terminal.outbox_kind),
                 terminal.outbox_kind,
                 terminal.outbox_payload,
-                terminal.now_ms
+                terminal.now_ms,
+                outbox_provenance
+                    .as_ref()
+                    .map(|value| value.trace_id().as_str()),
+                outbox_provenance
+                    .as_ref()
+                    .map(|value| value.correlation_id().as_str()),
+                outbox_provenance
+                    .as_ref()
+                    .map(|value| value.causation_id().as_str())
             ],
         );
         if let Err(error) = insert {
@@ -3248,7 +3485,13 @@ impl Store {
             }
             return Err(StoreError::OutboxConflict);
         }
-        let event_id = append_event(
+        let root_trace = TraceId::for_ingress("outbox", request.intent_key);
+        let event_provenance = child_provenance(
+            root_trace.as_str(),
+            root_trace.as_str().to_owned(),
+            provenance_coordinate("generation", request.generation_id, root_trace.as_str()),
+        )?;
+        let event_id = append_event_with_provenance(
             &transaction,
             "outbox_intent",
             request.intent_key,
@@ -3256,19 +3499,28 @@ impl Store {
             request.now_ms,
             "outbox.queued",
             request.payload,
+            &event_provenance,
+        )?;
+        let outbox_provenance = child_provenance(
+            root_trace.as_str(),
+            root_trace.as_str().to_owned(),
+            format!("event:{event_id}"),
         )?;
         let insert = transaction.execute(
             "INSERT INTO outbox
              (intent_key, event_id, transport, kind, payload, state, revision,
-              attempts, available_ms, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, 0, ?6, ?6)",
+              attempts, available_ms, created_ms, trace_id, correlation_id, causation_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, 0, ?6, ?6, ?7, ?8, ?9)",
             params![
                 request.intent_key,
                 event_id,
                 outbox_transport(request.kind),
                 request.kind,
                 request.payload,
-                request.now_ms
+                request.now_ms,
+                outbox_provenance.trace_id().as_str(),
+                outbox_provenance.correlation_id().as_str(),
+                outbox_provenance.causation_id().as_str()
             ],
         );
         if let Err(error) = insert {
@@ -3660,7 +3912,7 @@ impl Store {
                 "SELECT intent_key, transport, kind, state, revision, attempts,
                         lease_token, lease_generation_id, lease_holder, lease_epoch,
                         lease_expires_ms, delivery_receipt_key, available_ms,
-                        last_error
+                        last_error, trace_id, correlation_id, causation_id
                  FROM outbox WHERE outbox_id = ?1",
                 [outbox_id],
                 |row| {
@@ -3679,6 +3931,9 @@ impl Store {
                         row.get::<_, Option<String>>(11)?,
                         row.get::<_, i64>(12)?,
                         row.get::<_, Option<String>>(13)?,
+                        row.get::<_, Option<String>>(14)?,
+                        row.get::<_, Option<String>>(15)?,
+                        row.get::<_, Option<String>>(16)?,
                     ))
                 },
             )
@@ -3703,6 +3958,83 @@ impl Store {
             delivery_receipt_key: row.11,
             available_ms: row.12,
             last_error: row.13,
+            provenance: stored_provenance(row.14, row.15, row.16)?,
+        })
+    }
+
+    /// Reconstruct one terminal effect's exact durable ancestry in one query.
+    pub fn causal_chain_for_outbox(&self, outbox_id: i64) -> Result<CausalChain, StoreError> {
+        if outbox_id <= 0 {
+            return Err(StoreError::InvalidField("outbox_id"));
+        }
+        let row = self
+            .connection
+            .query_row(
+                "SELECT i.inbox_id, i.transport, i.transport_key,
+                        r.run_id, e.event_id, e.kind, o.outbox_id, o.kind,
+                        o.trace_id, o.correlation_id, o.causation_id,
+                        r.causation_id, e.causation_id
+                 FROM outbox o
+                 JOIN domain_events e ON e.event_id = o.event_id
+                 JOIN runs r ON e.aggregate_kind = 'run'
+                            AND e.aggregate_id = CAST(r.run_id AS TEXT)
+                 JOIN inbox i ON i.inbox_id = r.inbox_id
+                 WHERE o.outbox_id = ?1
+                   AND i.trace_id = r.trace_id
+                   AND r.trace_id = e.trace_id
+                   AND e.trace_id = o.trace_id",
+                [outbox_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound("causal_chain"))?;
+        let provenance = stored_provenance(row.8, row.9, row.10)?.ok_or(
+            StoreError::MigrationInvariant("causal_chain_without_provenance"),
+        )?;
+        let run_causation_id = row
+            .11
+            .ok_or(StoreError::MigrationInvariant("run_without_causation"))?;
+        let event_causation_id = row
+            .12
+            .ok_or(StoreError::MigrationInvariant("event_without_causation"))?;
+        let expected_run_cause = format!("inbox:{}", row.0);
+        let expected_event_cause = format!("run:{}", row.3);
+        let expected_outbox_cause = format!("event:{}", row.4);
+        if run_causation_id != expected_run_cause
+            || event_causation_id != expected_event_cause
+            || provenance.causation_id != expected_outbox_cause
+        {
+            return Err(StoreError::MigrationInvariant("broken_causal_chain"));
+        }
+        Ok(CausalChain {
+            inbox_id: row.0,
+            inbox_transport: row.1,
+            inbox_transport_key: row.2,
+            run_id: row.3,
+            event_id: row.4,
+            event_kind: row.5,
+            outbox_id: row.6,
+            outbox_kind: row.7,
+            provenance,
+            run_causation_id,
+            event_causation_id,
+            outbox_causation_id: expected_outbox_cause,
         })
     }
 
@@ -4072,32 +4404,41 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
         migrate_v3_to_v4(connection)?;
         migrate_v4_to_v5(connection)?;
         migrate_v5_to_v6(connection)?;
-        return migrate_v6_to_v7(connection);
+        migrate_v6_to_v7(connection)?;
+        return migrate_v7_to_v8(connection);
     }
     if version == 2 {
         migrate_v2_to_v3(connection)?;
         migrate_v3_to_v4(connection)?;
         migrate_v4_to_v5(connection)?;
         migrate_v5_to_v6(connection)?;
-        return migrate_v6_to_v7(connection);
+        migrate_v6_to_v7(connection)?;
+        return migrate_v7_to_v8(connection);
     }
     if version == 3 {
         migrate_v3_to_v4(connection)?;
         migrate_v4_to_v5(connection)?;
         migrate_v5_to_v6(connection)?;
-        return migrate_v6_to_v7(connection);
+        migrate_v6_to_v7(connection)?;
+        return migrate_v7_to_v8(connection);
     }
     if version == 4 {
         migrate_v4_to_v5(connection)?;
         migrate_v5_to_v6(connection)?;
-        return migrate_v6_to_v7(connection);
+        migrate_v6_to_v7(connection)?;
+        return migrate_v7_to_v8(connection);
     }
     if version == 5 {
         migrate_v5_to_v6(connection)?;
-        return migrate_v6_to_v7(connection);
+        migrate_v6_to_v7(connection)?;
+        return migrate_v7_to_v8(connection);
     }
     if version == 6 {
-        return migrate_v6_to_v7(connection);
+        migrate_v6_to_v7(connection)?;
+        return migrate_v7_to_v8(connection);
+    }
+    if version == 7 {
+        return migrate_v7_to_v8(connection);
     }
     if version != 0 {
         return Err(StoreError::SchemaVersion {
@@ -4123,6 +4464,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Result<(), Stor
     transaction.execute_batch(MIGRATE_V4_TO_V5)?;
     transaction.execute_batch(MIGRATE_V5_TO_V6)?;
     transaction.execute_batch(MIGRATE_V6_TO_V7)?;
+    transaction.execute_batch(MIGRATE_V7_TO_V8)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -4163,6 +4505,14 @@ fn migrate_v5_to_v6(connection: &mut Connection) -> Result<(), StoreError> {
 fn migrate_v6_to_v7(connection: &mut Connection) -> Result<(), StoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(MIGRATE_V6_TO_V7)?;
+    transaction.pragma_update(None, "user_version", 7)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v7_to_v8(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(MIGRATE_V7_TO_V8)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -4410,10 +4760,12 @@ fn commit_fenced_telegram_batch(
             return Err(StoreError::IdempotencyConflict("telegram_source_key"));
         }
         let (disposition, content) = telegram_disposition_parts(update.disposition);
+        let provenance = telegram_ingress_provenance(update.source_key, update.update_id)?;
         transaction.execute(
             "INSERT INTO telegram_ingress
-             (bot_id, update_id, source_key, scope, disposition, content, received_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (bot_id, update_id, source_key, scope, disposition, content, received_ms,
+              trace_id, correlation_id, causation_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 batch.bot_id,
                 &telegram_offset_bytes(update.update_id)[..],
@@ -4421,7 +4773,10 @@ fn commit_fenced_telegram_batch(
                 update.scope,
                 disposition,
                 content,
-                batch.received_ms
+                batch.received_ms,
+                provenance.trace_id().as_str(),
+                provenance.correlation_id().as_str(),
+                provenance.causation_id().as_str()
             ],
         )?;
     }
@@ -4865,6 +5220,35 @@ fn append_event(
     kind: &str,
     payload: &[u8],
 ) -> Result<i64, StoreError> {
+    let trace_id = TraceId::for_ingress(aggregate_kind, aggregate_id);
+    let correlation_id = CorrelationId::new(trace_id.as_str().to_owned())
+        .map_err(|_| StoreError::InvalidField("correlation_id"))?;
+    let causation_id = CausationId::new(format!("{aggregate_kind}:{aggregate_id}"))
+        .or_else(|_| CausationId::new(trace_id.as_str().to_owned()))
+        .map_err(|_| StoreError::InvalidField("causation_id"))?;
+    append_event_with_provenance(
+        transaction,
+        aggregate_kind,
+        aggregate_id,
+        revision,
+        occurred_ms,
+        kind,
+        payload,
+        &Provenance::new(trace_id, correlation_id, causation_id),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_event_with_provenance(
+    transaction: &Transaction<'_>,
+    aggregate_kind: &str,
+    aggregate_id: &str,
+    revision: u64,
+    occurred_ms: i64,
+    kind: &str,
+    payload: &[u8],
+    provenance: &Provenance,
+) -> Result<i64, StoreError> {
     validate_id(aggregate_kind, "aggregate_kind")?;
     validate_id(aggregate_id, "aggregate_id")?;
     if kind.is_empty() || kind.len() > MAX_KIND_BYTES || kind.chars().any(char::is_control) {
@@ -4873,18 +5257,112 @@ fn append_event(
     validate_payload(payload, "event_payload")?;
     transaction.execute(
         "INSERT INTO domain_events
-         (aggregate_kind, aggregate_id, revision, schema_version, occurred_ms, kind, payload)
-         VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6)",
+         (aggregate_kind, aggregate_id, revision, schema_version, occurred_ms, kind, payload,
+          trace_id, correlation_id, causation_id)
+         VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             aggregate_kind,
             aggregate_id,
             to_db_u64(revision, "event_revision")?,
             occurred_ms,
             kind,
-            payload
+            payload,
+            provenance.trace_id().as_str(),
+            provenance.correlation_id().as_str(),
+            provenance.causation_id().as_str()
         ],
     )?;
     Ok(transaction.last_insert_rowid())
+}
+
+fn ingress_record_provenance(
+    transport: &str,
+    transport_key: &str,
+    record_kind: &str,
+    record_id: i64,
+) -> Result<Provenance, StoreError> {
+    let trace_id = TraceId::for_ingress(transport, transport_key);
+    let correlation_id = CorrelationId::new(format!("{record_kind}:{record_id}"))
+        .map_err(|_| StoreError::InvalidField("correlation_id"))?;
+    let causation_id = CausationId::new(format!("ingress:{}", trace_id.as_str()))
+        .map_err(|_| StoreError::InvalidField("causation_id"))?;
+    Ok(Provenance::new(trace_id, correlation_id, causation_id))
+}
+
+fn telegram_ingress_provenance(source_key: &str, update_id: u64) -> Result<Provenance, StoreError> {
+    let trace_id = TraceId::for_ingress("telegram", source_key);
+    child_provenance(
+        trace_id.as_str(),
+        format!("telegram:{update_id}"),
+        format!("ingress:{}", trace_id.as_str()),
+    )
+}
+
+fn child_provenance(
+    trace_id: &str,
+    correlation_id: String,
+    causation_id: String,
+) -> Result<Provenance, StoreError> {
+    Ok(Provenance::new(
+        TraceId::new(trace_id.to_owned()).map_err(|_| StoreError::InvalidField("trace_id"))?,
+        CorrelationId::new(correlation_id)
+            .map_err(|_| StoreError::InvalidField("correlation_id"))?,
+        CausationId::new(causation_id).map_err(|_| StoreError::InvalidField("causation_id"))?,
+    ))
+}
+
+fn provenance_coordinate(prefix: &str, value: &str, fallback: &str) -> String {
+    let coordinate = format!("{prefix}:{value}");
+    if CausationId::new(coordinate.clone()).is_ok() {
+        coordinate
+    } else {
+        fallback.to_owned()
+    }
+}
+
+fn run_row_provenance(
+    transaction: &Transaction<'_>,
+    run_id: i64,
+) -> Result<Option<Provenance>, StoreError> {
+    let row = transaction.query_row(
+        "SELECT trace_id, correlation_id, causation_id FROM runs WHERE run_id = ?1",
+        [run_id],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )?;
+    match row {
+        (None, None, None) => Ok(None),
+        (Some(trace_id), Some(correlation_id), Some(causation_id)) => Ok(Some(child_provenance(
+            &trace_id,
+            correlation_id,
+            causation_id,
+        )?)),
+        _ => Err(StoreError::MigrationInvariant("partial_provenance")),
+    }
+}
+
+fn stored_provenance(
+    trace_id: Option<String>,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
+) -> Result<Option<StoredProvenance>, StoreError> {
+    match (trace_id, correlation_id, causation_id) {
+        (None, None, None) => Ok(None),
+        (Some(trace_id), Some(correlation_id), Some(causation_id)) => {
+            child_provenance(&trace_id, correlation_id.clone(), causation_id.clone())?;
+            Ok(Some(StoredProvenance {
+                trace_id,
+                correlation_id,
+                causation_id,
+            }))
+        }
+        _ => Err(StoreError::MigrationInvariant("partial_provenance")),
+    }
 }
 
 fn mark_inbox_claimed(
@@ -4892,6 +5370,7 @@ fn mark_inbox_claimed(
     inbox_id: i64,
     run_id: i64,
     occurred_ms: i64,
+    provenance: Option<&Provenance>,
 ) -> Result<(), StoreError> {
     let changed = transaction.execute(
         "UPDATE inbox SET state = 'claimed', claimed_run_id = ?2, revision = revision + 1
@@ -4906,16 +5385,58 @@ fn mark_inbox_claimed(
         [inbox_id],
         |row| row.get(0),
     )?;
-    append_event(
-        transaction,
-        "inbox",
-        &inbox_id.to_string(),
-        from_db_u64(revision, "inbox_revision")?,
-        occurred_ms,
-        "inbox.claimed",
-        &run_id.to_be_bytes(),
-    )?;
+    if let Some(provenance) = provenance {
+        append_event_with_provenance(
+            transaction,
+            "inbox",
+            &inbox_id.to_string(),
+            from_db_u64(revision, "inbox_revision")?,
+            occurred_ms,
+            "inbox.claimed",
+            &run_id.to_be_bytes(),
+            provenance,
+        )?;
+    } else {
+        append_event(
+            transaction,
+            "inbox",
+            &inbox_id.to_string(),
+            from_db_u64(revision, "inbox_revision")?,
+            occurred_ms,
+            "inbox.claimed",
+            &run_id.to_be_bytes(),
+        )?;
+    }
     Ok(())
+}
+
+fn run_provenance(
+    transaction: &Transaction<'_>,
+    inbox_id: i64,
+    run_id: i64,
+) -> Result<Option<Provenance>, StoreError> {
+    let trace_id = transaction.query_row(
+        "SELECT trace_id FROM inbox WHERE inbox_id = ?1",
+        [inbox_id],
+        |row| row.get::<_, Option<String>>(0),
+    )?;
+    let Some(trace_id) = trace_id else {
+        return Ok(None);
+    };
+    let provenance = child_provenance(
+        &trace_id,
+        format!("run:{run_id}"),
+        format!("inbox:{inbox_id}"),
+    )?;
+    transaction.execute(
+        "UPDATE runs SET correlation_id = ?2, causation_id = ?3 WHERE run_id = ?1",
+        params![
+            run_id,
+            provenance.correlation_id().as_str(),
+            provenance.causation_id().as_str()
+        ],
+    )?;
+    Ok(Some(provenance))
 }
 
 fn terminal_receipt(
@@ -5042,6 +5563,19 @@ fn query_count(transaction: &Transaction<'_>, sql: &str) -> Result<u64, StoreErr
 mod migration_tests {
     use super::*;
 
+    #[test]
+    fn a_causal_coordinate_does_not_narrow_an_existing_identifier_bound() {
+        let maximum = "g".repeat(MAX_ID_BYTES);
+        assert_eq!(
+            provenance_coordinate("generation", &maximum, "fallback"),
+            "fallback"
+        );
+        assert_eq!(
+            provenance_coordinate("generation", "foreground", "fallback"),
+            "generation:foreground"
+        );
+    }
+
     #[derive(Debug, Eq, PartialEq)]
     struct LegacyTelegramBatch {
         disposition_count: i64,
@@ -5092,7 +5626,7 @@ mod migration_tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let transport_pauses: i64 = connection
             .query_row("SELECT count(*) FROM transport_pauses", [], |row| {
                 row.get(0)
@@ -5427,7 +5961,7 @@ mod migration_tests {
             let version: u32 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap_or_else(|error| panic!("{label} version: {error}"));
-            assert_eq!(version, SCHEMA_VERSION, "{label} stopped short of v7");
+            assert_eq!(version, SCHEMA_VERSION, "{label} stopped short of v8");
             connection
                 .execute(
                     "INSERT INTO transport_pauses
@@ -5520,6 +6054,15 @@ mod migration_tests {
                 None
             )
         );
+        let provenance: (Option<String>, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT trace_id, correlation_id, causation_id FROM telegram_ingress
+                 WHERE bot_id = 7 AND update_id = ?1",
+                [&telegram_offset_bytes(update_id)[..]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("historical provenance");
+        assert_eq!(provenance, (None, None, None));
         let batch: LegacyTelegramBatch = connection
             .query_row(
                 "SELECT disposition_count, batch_digest, poller_generation_id,

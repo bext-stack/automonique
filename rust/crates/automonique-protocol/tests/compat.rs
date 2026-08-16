@@ -1029,12 +1029,12 @@ mod versions {
         fn the_asserted_foreign_versions_are_the_ones_this_wave_recorded() {
             let matrix = shipped_matrix();
             let recorded = [
-                (Component::StoreSchema, 1, 7),
+                (Component::StoreSchema, 1, 8),
                 (Component::CancelLedgerSchema, 1, 1),
                 (Component::GenerationAuditSchema, 1, 1),
-                (Component::ProviderJournalSchema, 1, 1),
+                (Component::ProviderJournalSchema, 1, 3),
                 (Component::RunSubmissionsSchema, 1, 1),
-                (Component::SlackIngressSchema, 1, 1),
+                (Component::SlackIngressSchema, 1, 2),
                 (Component::RunSpecDocument, 1, 1),
             ];
             assert_eq!(recorded.len(), KNOWN_FOREIGN.len());

@@ -34,6 +34,7 @@ pub mod parity;
 pub mod primitives;
 pub mod progress_api;
 pub mod protocols;
+pub mod provenance;
 pub mod provider;
 pub mod provider_catalog;
 pub mod release;

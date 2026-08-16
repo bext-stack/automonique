@@ -114,14 +114,15 @@ use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use automonique_protocol::provenance::{CausationId, CorrelationId, TraceId};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 
-use crate::{BUSY_TIMEOUT, StoreError, validate_database_path};
+use crate::{BUSY_TIMEOUT, StoreError, StoredProvenance, validate_database_path};
 
 /// The only Slack ingress schema this build can read and write.
-pub const SLACK_INGRESS_SCHEMA_VERSION: u32 = 1;
+pub const SLACK_INGRESS_SCHEMA_VERSION: u32 = 2;
 
 /// Largest number of live dispositions any log will hold.
 pub const MAX_SLACK_DISPOSITIONS: usize = 65_536;
@@ -176,6 +177,14 @@ CREATE TABLE slack_ingress_dispositions (
 
 CREATE INDEX slack_ingress_by_app
     ON slack_ingress_dispositions(app_id, recorded_at_ms, entry_id);
+"#;
+
+const MIGRATE_V1_TO_V2: &str = r#"
+ALTER TABLE slack_ingress_dispositions ADD COLUMN trace_id TEXT;
+ALTER TABLE slack_ingress_dispositions ADD COLUMN correlation_id TEXT;
+ALTER TABLE slack_ingress_dispositions ADD COLUMN causation_id TEXT;
+CREATE INDEX slack_ingress_by_trace
+    ON slack_ingress_dispositions(trace_id, entry_id);
 "#;
 
 /// A Slack ingress log error with stable refusal categories.
@@ -452,6 +461,8 @@ pub struct SlackDispositionEntry {
     pub retry_attempt: u32,
     /// When the *first* delivery of this event was recorded.
     pub recorded_at_ms: i64,
+    /// Absent only on a disposition written before schema v2.
+    pub provenance: Option<StoredProvenance>,
 }
 
 /// Bounded retention window for [`SlackIngressLog::prune`].
@@ -678,8 +689,8 @@ fn record_row(
     transaction.execute(
         "INSERT INTO slack_ingress_dispositions
          (source_key, app_id, disposition, content_digest,
-          envelope_id, retry_attempt, recorded_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+          envelope_id, retry_attempt, recorded_at_ms, trace_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             record.source_key,
             record.app_id,
@@ -687,14 +698,26 @@ fn record_row(
             record.disposition.content_digest(),
             record.envelope_id,
             i64::from(record.retry_attempt),
-            record.recorded_at_ms
+            record.recorded_at_ms,
+            TraceId::for_ingress("slack", record.source_key).as_str()
         ],
+    )?;
+    let entry_id = transaction.last_insert_rowid();
+    let trace_id = TraceId::for_ingress("slack", record.source_key);
+    let correlation_id = CorrelationId::new(format!("slack:{entry_id}"))
+        .map_err(|_| SlackIngressError::InvalidField("correlation_id"))?;
+    let causation_id = CausationId::new(format!("ingress:{}", trace_id.as_str()))
+        .map_err(|_| SlackIngressError::InvalidField("causation_id"))?;
+    transaction.execute(
+        "UPDATE slack_ingress_dispositions
+         SET correlation_id = ?2, causation_id = ?3 WHERE entry_id = ?1",
+        params![entry_id, correlation_id.as_str(), causation_id.as_str()],
     )?;
     *live = live
         .checked_add(1)
         .ok_or(SlackIngressError::InvalidField("source_key"))?;
     Ok(SlackIngressReceipt {
-        entry_id: transaction.last_insert_rowid(),
+        entry_id,
         outcome: SlackRecordOutcome::Recorded,
     })
 }
@@ -717,10 +740,14 @@ struct RawEntry {
     envelope_id: String,
     retry_attempt: i64,
     recorded_at_ms: i64,
+    trace_id: Option<String>,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
 }
 
 const ENTRY_COLUMNS: &str = "entry_id, source_key, app_id, disposition, \
-                             content_digest, envelope_id, retry_attempt, recorded_at_ms";
+                             content_digest, envelope_id, retry_attempt, recorded_at_ms, \
+                             trace_id, correlation_id, causation_id";
 
 fn raw_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEntry> {
     Ok(RawEntry {
@@ -732,6 +759,9 @@ fn raw_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEntry> {
         envelope_id: row.get(5)?,
         retry_attempt: row.get(6)?,
         recorded_at_ms: row.get(7)?,
+        trace_id: row.get(8)?,
+        correlation_id: row.get(9)?,
+        causation_id: row.get(10)?,
     })
 }
 
@@ -755,7 +785,30 @@ fn validated_entry(raw: RawEntry) -> Logged<SlackDispositionEntry> {
         retry_attempt: u32::try_from(raw.retry_attempt)
             .map_err(|_| corrupt_field("retry_attempt"))?,
         recorded_at_ms: checked_time(raw.recorded_at_ms)?,
+        provenance: checked_provenance(raw.trace_id, raw.correlation_id, raw.causation_id)?,
     })
+}
+
+fn checked_provenance(
+    trace_id: Option<String>,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
+) -> Logged<Option<StoredProvenance>> {
+    match (trace_id, correlation_id, causation_id) {
+        (None, None, None) => Ok(None),
+        (Some(trace_id), Some(correlation_id), Some(causation_id)) => {
+            TraceId::new(trace_id.clone()).map_err(|_| corrupt_field("trace_id"))?;
+            CorrelationId::new(correlation_id.clone())
+                .map_err(|_| corrupt_field("correlation_id"))?;
+            CausationId::new(causation_id.clone()).map_err(|_| corrupt_field("causation_id"))?;
+            Ok(Some(StoredProvenance {
+                trace_id,
+                correlation_id,
+                causation_id,
+            }))
+        }
+        _ => Err(corrupt_field("partial_provenance")),
+    }
 }
 
 fn read_entry_by_source_key(
@@ -816,6 +869,13 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Logged<()> {
     if version == SLACK_INGRESS_SCHEMA_VERSION {
         return Ok(());
     }
+    if version == 1 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATE_V1_TO_V2)?;
+        transaction.pragma_update(None, "user_version", SLACK_INGRESS_SCHEMA_VERSION)?;
+        transaction.commit()?;
+        return Ok(());
+    }
     if version != 0 {
         return Err(SlackIngressError::SchemaVersion {
             found: version,
@@ -835,6 +895,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Logged<()> {
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(SCHEMA_V1)?;
+    transaction.execute_batch(MIGRATE_V1_TO_V2)?;
     transaction.pragma_update(None, "user_version", SLACK_INGRESS_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())

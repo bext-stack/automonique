@@ -14,6 +14,8 @@ use std::fs;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use automonique_protocol::provenance::TraceId;
+use automonique_store::StoredProvenance;
 use automonique_store::slack_ingress::{
     CONTENT_DIGEST_CHARS, MAX_DISPOSITION_PAGE, MAX_SLACK_IDENTIFIER_BYTES, MAX_SOURCE_KEY_BYTES,
     SLACK_INGRESS_SCHEMA_VERSION, SlackDispositionEntry, SlackDispositionKind,
@@ -123,6 +125,11 @@ fn a_fresh_disposition_is_recorded_exactly_once_and_survives_a_reopen() {
             envelope_id: "envelope-1".to_owned(),
             retry_attempt: 0,
             recorded_at_ms: 1_000,
+            provenance: Some(StoredProvenance {
+                trace_id: TraceId::for_ingress("slack", KEY_A).to_string(),
+                correlation_id: format!("slack:{}", receipt.entry_id),
+                causation_id: format!("ingress:{}", TraceId::for_ingress("slack", KEY_A)),
+            }),
         }
     );
 
@@ -131,6 +138,31 @@ fn a_fresh_disposition_is_recorded_exactly_once_and_survives_a_reopen() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("user_version");
     assert_eq!(version, SLACK_INGRESS_SCHEMA_VERSION);
+}
+
+#[test]
+fn a_v1_disposition_migrates_without_inventing_provenance() {
+    let (private, mut log) = log();
+    log.record(admitted(KEY_A, &"a".repeat(CONTENT_DIGEST_CHARS)))
+        .expect("record");
+    drop(log);
+    let raw = Connection::open(private.path()).expect("raw v1 simulation");
+    raw.execute_batch(
+        "DROP INDEX slack_ingress_by_trace;
+         ALTER TABLE slack_ingress_dispositions DROP COLUMN trace_id;
+         ALTER TABLE slack_ingress_dispositions DROP COLUMN correlation_id;
+         ALTER TABLE slack_ingress_dispositions DROP COLUMN causation_id;",
+    )
+    .expect("remove v2 provenance");
+    raw.pragma_update(None, "user_version", 1).expect("mark v1");
+    drop(raw);
+
+    let reopened = SlackIngressLog::open(private.path()).expect("migrate v1");
+    let entry = reopened
+        .disposition(KEY_A)
+        .expect("read")
+        .expect("historical row");
+    assert_eq!(entry.provenance, None);
 }
 
 #[test]

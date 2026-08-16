@@ -132,6 +132,7 @@ use crate::digest::Sha256Digest;
 use crate::event::Authority;
 use crate::journal::{ActionOutcome, CursorResume, JournalCursor, RetainedRange};
 use crate::primitives::{EpochMillis, ValueError};
+use crate::provenance::{CausationId, CorrelationId, Provenance, TraceId};
 use crate::tools::{MAX_TOOL_FIELD_BYTES, RunId};
 use crate::wire::{JsonValue, Message};
 
@@ -1236,6 +1237,7 @@ pub struct RunDetailView {
     last_sequence: u64,
     lifecycle: Vec<RunLifecycleEvent>,
     coverage: LifecycleCoverage,
+    provenance: Option<Provenance>,
 }
 
 impl RunDetailView {
@@ -1318,7 +1320,15 @@ impl RunDetailView {
             last_sequence,
             lifecycle,
             coverage,
+            provenance: None,
         })
+    }
+
+    /// Attach the durable ancestry for this run and its attempt events.
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = Some(provenance);
+        self
     }
 
     /// The listing summary for this run.
@@ -1345,6 +1355,11 @@ impl RunDetailView {
         self.coverage
     }
 
+    #[must_use]
+    pub const fn provenance(&self) -> Option<&Provenance> {
+        self.provenance.as_ref()
+    }
+
     /// The cursor a subscriber resumes from to receive what this view omits.
     ///
     /// `None` when the view is complete: there is nothing to resume. Otherwise
@@ -1365,6 +1380,18 @@ impl RunDetailView {
         }
         Ok(JsonValue::Object(vec![
             (
+                "causation_id".to_owned(),
+                self.provenance.as_ref().map_or(JsonValue::Null, |value| {
+                    JsonValue::String(value.causation_id().as_str().to_owned())
+                }),
+            ),
+            (
+                "correlation_id".to_owned(),
+                self.provenance.as_ref().map_or(JsonValue::Null, |value| {
+                    JsonValue::String(value.correlation_id().as_str().to_owned())
+                }),
+            ),
+            (
                 "coverage".to_owned(),
                 JsonValue::String(self.coverage.as_str().to_owned()),
             ),
@@ -1374,11 +1401,28 @@ impl RunDetailView {
             ),
             ("lifecycle".to_owned(), JsonValue::Array(lifecycle)),
             ("summary".to_owned(), self.summary.to_body()?),
+            (
+                "trace_id".to_owned(),
+                self.provenance.as_ref().map_or(JsonValue::Null, |value| {
+                    JsonValue::String(value.trace_id().as_str().to_owned())
+                }),
+            ),
         ]))
     }
 
     fn from_body(body: &JsonValue) -> Result<Self, RunsApiError> {
-        exact_fields(body, &["coverage", "last_sequence", "lifecycle", "summary"])?;
+        exact_fields(
+            body,
+            &[
+                "causation_id",
+                "correlation_id",
+                "coverage",
+                "last_sequence",
+                "lifecycle",
+                "summary",
+                "trace_id",
+            ],
+        )?;
         let JsonValue::Array(items) = body.get("lifecycle").ok_or(RunsApiError::InvalidBody)?
         else {
             return Err(RunsApiError::InvalidBody);
@@ -1393,12 +1437,27 @@ impl RunDetailView {
         for item in items {
             lifecycle.push(RunLifecycleEvent::from_body(item)?);
         }
-        Self::new(
+        let view = Self::new(
             RunSummary::from_body(body.get("summary").ok_or(RunsApiError::InvalidBody)?)?,
             unsigned(body, "last_sequence")?,
             lifecycle,
             decode_security_enum::<LifecycleCoverage>(&required_string(body, "coverage")?)?,
-        )
+        )?;
+        match (
+            optional_provenance_string(body, "trace_id")?,
+            optional_provenance_string(body, "correlation_id")?,
+            optional_provenance_string(body, "causation_id")?,
+        ) {
+            (None, None, None) => Ok(view),
+            (Some(trace_id), Some(correlation_id), Some(causation_id)) => {
+                Ok(view.with_provenance(Provenance::new(
+                    TraceId::new(trace_id).map_err(|_| RunsApiError::InvalidBody)?,
+                    CorrelationId::new(correlation_id).map_err(|_| RunsApiError::InvalidBody)?,
+                    CausationId::new(causation_id).map_err(|_| RunsApiError::InvalidBody)?,
+                )))
+            }
+            _ => Err(RunsApiError::InvalidBody),
+        }
     }
 }
 
@@ -1928,6 +1987,17 @@ fn required_string(body: &JsonValue, field: &'static str) -> Result<String, Runs
         .and_then(JsonValue::as_str)
         .map(str::to_owned)
         .ok_or(RunsApiError::InvalidBody)
+}
+
+fn optional_provenance_string(
+    body: &JsonValue,
+    field: &'static str,
+) -> Result<Option<String>, RunsApiError> {
+    match body.get(field) {
+        Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(value)) => Ok(Some(value.clone())),
+        _ => Err(RunsApiError::InvalidBody),
+    }
 }
 
 fn exact_fields(body: &JsonValue, fields: &[&str]) -> Result<(), RunsApiError> {

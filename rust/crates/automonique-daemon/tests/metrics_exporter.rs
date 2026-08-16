@@ -92,6 +92,7 @@ fn authenticated_scrape_exports_live_and_durable_gen_ai_metrics() {
             ordinal: 1,
             turn_key: "metrics-turn",
             opened_ms: 3,
+            provenance: None,
         })
         .unwrap();
     journal
