@@ -71,9 +71,108 @@ impl ImprovementExecutionRequest {
     }
 }
 
+/// Where a verification recipe runs, relative to the candidate worktree. The
+/// Cargo gates run in `rust/`; the repository-wide checkers read paths from the
+/// worktree root and refuse to run anywhere else.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecipeDir {
+    RustWorkspace,
+    RepositoryRoot,
+}
+
+/// One verification gate, spelled exactly as the required CI job spells it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Recipe {
+    pub label: &'static str,
+    pub program: &'static str,
+    pub args: &'static [&'static str],
+    pub dir: RecipeDir,
+}
+
+/// The check-run names the required CI jobs publish. A gate that is renamed,
+/// deleted or never triggered has to be visible on both sides of the pipeline:
+/// here it scopes which workflow jobs the drift test reads, and the release
+/// gate treats a name missing from a commit's check runs as a refusal rather
+/// than as a pass.
+pub const REQUIRED_CI_CHECKS: &[&str] = &["workspace", "licence-boundary", "development-scrub"];
+
+/// The gates a candidate must pass locally, in the order and spelling the
+/// required CI jobs use. `tests::recipes_match_the_required_ci_jobs` fails when
+/// this table and those jobs disagree in either direction, so a gate added to
+/// CI cannot silently stop applying to candidates and vice versa.
+pub const CI_VERIFICATION_RECIPES: &[Recipe] = &[
+    Recipe {
+        label: "cargo fmt --all -- --check",
+        program: "cargo",
+        args: &["fmt", "--all", "--", "--check"],
+        dir: RecipeDir::RustWorkspace,
+    },
+    Recipe {
+        label: "cargo check --workspace --all-targets --offline --locked",
+        program: "cargo",
+        args: &[
+            "check",
+            "--workspace",
+            "--all-targets",
+            "--offline",
+            "--locked",
+        ],
+        dir: RecipeDir::RustWorkspace,
+    },
+    Recipe {
+        label: "cargo test --workspace --all-targets --offline --locked",
+        program: "cargo",
+        args: &[
+            "test",
+            "--workspace",
+            "--all-targets",
+            "--offline",
+            "--locked",
+        ],
+        dir: RecipeDir::RustWorkspace,
+    },
+    Recipe {
+        label: "cargo clippy --workspace --all-targets --offline --locked -- -D warnings",
+        program: "cargo",
+        args: &[
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--offline",
+            "--locked",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        dir: RecipeDir::RustWorkspace,
+    },
+    Recipe {
+        label: "python3 tools/check_licenses.py",
+        program: "python3",
+        args: &["tools/check_licenses.py"],
+        dir: RecipeDir::RepositoryRoot,
+    },
+    Recipe {
+        label: "python3 tools/scrub/scan.py",
+        program: "python3",
+        args: &["tools/scrub/scan.py"],
+        dir: RecipeDir::RepositoryRoot,
+    },
+    Recipe {
+        label: "python3 plan/check.py --identifiers",
+        program: "python3",
+        args: &["plan/check.py", "--identifiers"],
+        dir: RecipeDir::RepositoryRoot,
+    },
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VerificationProfile {
+    /// The full required-CI gate set, `CI_VERIFICATION_RECIPES`.
     RustWorkspace,
+    /// Exactly these recipes. Tests use it to observe what state a recipe is
+    /// handed; the daemon always selects `RustWorkspace`.
+    Recipes(&'static [Recipe]),
     None,
 }
 
@@ -223,8 +322,12 @@ impl<A: ImprovementAgent> ImprovementExecutor<A> {
         if changed_paths(&worktree)?.is_empty() {
             return Err(ImprovementExecutionError::NoChanges);
         }
-        let checks = run_checks(&worktree, self.verification)?;
-
+        // Stage before verifying. `tools/scrub/scan.py` reads content through
+        // the index, so a scan run against an unstaged worktree would inspect
+        // the approved base and pass without ever seeing the candidate's edits.
+        // Staging first is safe: `ensure_no_commit` above already refused a
+        // candidate that created a commit, and the `status_is_clean` assertion
+        // after the commit still catches anything a check left behind.
         run_checked(
             Command::new("git")
                 .arg("-C")
@@ -232,6 +335,7 @@ impl<A: ImprovementAgent> ImprovementExecutor<A> {
                 .args(["add", "--all"]),
             "git add",
         )?;
+        let checks = run_checks(&worktree, self.verification)?;
         run_checked(
             Command::new("git")
                 .arg("-C")
@@ -273,38 +377,41 @@ fn run_checks(
     worktree: &Path,
     profile: VerificationProfile,
 ) -> Result<Vec<CheckReceipt>, ImprovementExecutionError> {
-    if profile == VerificationProfile::None {
-        return Ok(Vec::new());
-    }
+    let recipes = match profile {
+        VerificationProfile::None => return Ok(Vec::new()),
+        VerificationProfile::RustWorkspace => CI_VERIFICATION_RECIPES,
+        VerificationProfile::Recipes(recipes) => recipes,
+    };
     let rust = worktree.join("rust");
-    if !rust.join("Cargo.toml").is_file() {
+    if recipes
+        .iter()
+        .any(|recipe| recipe.dir == RecipeDir::RustWorkspace)
+        && !rust.join("Cargo.toml").is_file()
+    {
         return Err(ImprovementExecutionError::CheckFailed(
             "rust workspace missing",
         ));
     }
-    let recipes: &[(&str, &[&str])] = &[
-        (
-            "cargo fmt --all -- --check",
-            &["fmt", "--all", "--", "--check"],
-        ),
-        ("cargo test --workspace", &["test", "--workspace"]),
-    ];
     let mut receipts = Vec::with_capacity(recipes.len());
-    for (label, arguments) in recipes {
+    for recipe in recipes {
+        let directory = match recipe.dir {
+            RecipeDir::RustWorkspace => rust.as_path(),
+            RecipeDir::RepositoryRoot => worktree,
+        };
         let succeeded = bounded_output(
-            Command::new("cargo")
-                .current_dir(&rust)
-                .args(*arguments)
+            Command::new(recipe.program)
+                .current_dir(directory)
+                .args(recipe.args)
                 .stdin(Stdio::null()),
         )?
         .status
         .success();
         receipts.push(CheckReceipt {
-            command: label,
+            command: recipe.label,
             succeeded,
         });
         if !succeeded {
-            return Err(ImprovementExecutionError::CheckFailed(label));
+            return Err(ImprovementExecutionError::CheckFailed(recipe.label));
         }
     }
     Ok(receipts)
@@ -571,7 +678,134 @@ impl From<CodexAppServerError> for ImprovementExecutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use tempfile::TempDir;
+
+    /// The workflow file each required check run is defined by. The job key is
+    /// also the check-run name GitHub publishes, which is why one constant can
+    /// serve both the drift test and the release gate's required-check set.
+    const REQUIRED_JOBS: &[(&str, &str)] = &[
+        ("rust.yml", "workspace"),
+        ("plan.yml", "licence-boundary"),
+        ("scrub.yml", "development-scrub"),
+    ];
+
+    /// Command lines inside the required jobs that are deliberately not
+    /// candidate gates. Every entry has to say why, and every entry has to
+    /// still appear in the workflow — an allowlist nobody can see rotting is
+    /// how the drift test would quietly stop meaning anything.
+    const CI_ONLY: &[(&str, &str)] = &[
+        (
+            "cargo fetch --locked",
+            "populates the offline cache the gates below then use; a prerequisite, not a gate",
+        ),
+        (
+            "cargo metadata --no-deps --offline --locked --format-version 1 >/dev/null",
+            "manifest parse only, wholly subsumed by the `cargo check` gate beside it",
+        ),
+        (
+            "cargo generate-lockfile --offline",
+            "the lockfile-reproducibility probe; it rewrites Cargo.lock, so it needs the scratch copy CI takes outside the tree and must not run against a candidate worktree",
+        ),
+        (
+            "python3 -m unittest -v tools.test_check_licenses",
+            "negative controls for the licence checker itself, not a property of the candidate's tree",
+        ),
+        (
+            "python3 -m unittest discover -s tools/scrub -p 'test_*.py'",
+            "negative controls for the scrub scanner itself, as above",
+        ),
+    ];
+
+    fn repository_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("repository root above rust/crates/<crate>")
+            .to_path_buf()
+    }
+
+    /// Every `cargo …` and `python3 …` line inside one workflow job. A job ends
+    /// at the next key indented by exactly two spaces, which is how these three
+    /// workflows separate jobs.
+    fn job_commands(workflow: &str, job: &str) -> Vec<String> {
+        let path = repository_root().join(".github/workflows").join(workflow);
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("required workflow {}: {error}", path.display()));
+        let mut lines = text.lines();
+        lines
+            .by_ref()
+            .find(|line| line.trim_end() == format!("  {job}:"))
+            .unwrap_or_else(|| panic!("workflow {workflow} no longer defines job {job}"));
+        let mut commands = Vec::new();
+        for line in lines {
+            let is_next_job = line.starts_with("  ")
+                && !line.starts_with("   ")
+                && line.trim_end().ends_with(':')
+                && !line.trim().starts_with('-');
+            if is_next_job {
+                break;
+            }
+            // A step spells its command either inline (`run: cargo …`) or as a
+            // block scalar whose body lines carry no key.
+            let trimmed = line.trim();
+            let command = trimmed.strip_prefix("run:").map_or(trimmed, str::trim);
+            if command.starts_with("cargo ") || command.starts_with("python3 ") {
+                commands.push(command.to_owned());
+            }
+        }
+        commands
+    }
+
+    #[test]
+    fn recipe_labels_spell_the_command_they_run() {
+        for recipe in CI_VERIFICATION_RECIPES {
+            let spelled = std::iter::once(recipe.program)
+                .chain(recipe.args.iter().copied())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(recipe.label, spelled, "recipe label is not what it runs");
+        }
+    }
+
+    #[test]
+    fn recipes_match_the_required_ci_jobs() {
+        let jobs = REQUIRED_JOBS
+            .iter()
+            .map(|(_, job)| *job)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            jobs,
+            REQUIRED_CI_CHECKS.iter().copied().collect::<BTreeSet<_>>(),
+            "the required-check set and the jobs this test reads disagree"
+        );
+
+        let mut workflow_gates = BTreeSet::new();
+        for (workflow, job) in REQUIRED_JOBS {
+            workflow_gates.extend(job_commands(workflow, job));
+        }
+        for (line, why) in CI_ONLY {
+            assert!(
+                workflow_gates.remove(*line),
+                "allowlisted line is no longer in any required job, so its reason has expired: {line} ({why})"
+            );
+        }
+
+        let recipes = CI_VERIFICATION_RECIPES
+            .iter()
+            .map(|recipe| recipe.label.to_owned())
+            .collect::<BTreeSet<_>>();
+        let missing_from_recipes = workflow_gates.difference(&recipes).collect::<Vec<_>>();
+        let missing_from_ci = recipes.difference(&workflow_gates).collect::<Vec<_>>();
+        assert!(
+            missing_from_recipes.is_empty(),
+            "CI gates the candidate never runs: {missing_from_recipes:?}"
+        );
+        assert!(
+            missing_from_ci.is_empty(),
+            "candidate gates no required CI job runs: {missing_from_ci:?}"
+        );
+    }
 
     #[derive(Debug)]
     struct FakeAgent {
@@ -615,6 +849,13 @@ mod tests {
     }
 
     fn fixture(agent: FakeAgent) -> (TempDir, ImprovementExecutor<FakeAgent>, String) {
+        fixture_with(agent, VerificationProfile::None)
+    }
+
+    fn fixture_with(
+        agent: FakeAgent,
+        verification: VerificationProfile,
+    ) -> (TempDir, ImprovementExecutor<FakeAgent>, String) {
         let root = tempfile::tempdir().expect("root");
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
         let repository = root.path().join("repository");
@@ -644,9 +885,8 @@ mod tests {
             .mode(0o700)
             .create(&worktrees)
             .expect("worktrees");
-        let executor =
-            ImprovementExecutor::open(&repository, &worktrees, VerificationProfile::None, agent)
-                .expect("executor");
+        let executor = ImprovementExecutor::open(&repository, &worktrees, verification, agent)
+            .expect("executor");
         (root, executor, base)
     }
 
@@ -695,6 +935,35 @@ mod tests {
         assert!(matches!(
             executor.execute(&request),
             Err(ImprovementExecutionError::PlanDigestMismatch)
+        ));
+    }
+
+    /// The gates must see the candidate's bytes, not the approved base. This
+    /// recipe exits non-zero exactly when the index differs from `HEAD`, so it
+    /// fails only if staging happened first — which is the ordering the scrub
+    /// gate depends on, since `tools/scrub/scan.py` reads through the index.
+    const STAGED_PROBE: &[Recipe] = &[Recipe {
+        label: "git diff --cached --quiet",
+        program: "git",
+        args: &["diff", "--cached", "--quiet"],
+        dir: RecipeDir::RepositoryRoot,
+    }];
+
+    #[test]
+    fn verification_recipes_run_against_the_staged_candidate() {
+        let (_root, mut executor, base) = fixture_with(
+            FakeAgent {
+                path: "README.md".to_owned(),
+                contents: "improved\n".to_owned(),
+                commit: false,
+            },
+            VerificationProfile::Recipes(STAGED_PROBE),
+        );
+        assert!(matches!(
+            executor.execute(&request(base)),
+            Err(ImprovementExecutionError::CheckFailed(
+                "git diff --cached --quiet"
+            ))
         ));
     }
 

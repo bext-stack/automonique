@@ -1062,7 +1062,15 @@ mod surface_coverage {
                 // filesystem coordinates rather than protocol identities.
                 "improvements.sqlite3",
                 "manifest.json",
+                // CI workflow filenames, named by the improvement executor's
+                // drift test so that a gate added to CI and not to the
+                // candidate's recipe table fails the build. They are paths
+                // under `.github/workflows/`, and the test has to spell them
+                // exactly to read the file it checks against.
+                "plan.yml",
+                "rust.yml",
                 "sandbox.actor",
+                "scrub.yml",
                 "supervisor.adapter",
                 "users.info",
                 "views.open",
