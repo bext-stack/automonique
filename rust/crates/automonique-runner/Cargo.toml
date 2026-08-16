@@ -14,5 +14,8 @@ seccompiler = { workspace = true }
 nix = { version = "=0.29.0", default-features = false, features = ["fs", "poll", "process", "signal", "socket", "user"] }
 sha2.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

@@ -23,6 +23,7 @@ use automonique_runner::{
     ContainmentDomain, ContainmentError, ContainmentLimits, HELPER_REFUSED_EXIT, LaunchPlan,
     LaunchPlanError, RunContainment, SocketGrant, spawn_sandboxed, spawn_sandboxed_session,
 };
+use sha2::{Digest as _, Sha256};
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _};
 use std::os::unix::fs::PermissionsExt;
@@ -35,6 +36,10 @@ const HELPER: &str = env!("CARGO_BIN_EXE_automonique-launch-enter");
 const BUSYBOX: &str = "/usr/bin/busybox";
 const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 const REQUIRE_ENFORCED_ENV: &str = "AUTOMONIQUE_REQUIRE_ENFORCED_CONTAINMENT";
+
+fn busybox_sha256() -> String {
+    format!("{:x}", Sha256::digest(fs::read(BUSYBOX).unwrap()))
+}
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
@@ -104,7 +109,7 @@ fn enforcement_domain(proof: &str) -> Option<ContainmentDomain> {
 /// Busybox is statically linked, so a single read-execute file grant makes it
 /// runnable without granting any loader or library directory.
 fn busybox_plan(script: &str, extra: impl FnOnce(LaunchPlan) -> LaunchPlan) -> LaunchPlan {
-    let plan = LaunchPlan::new(BUSYBOX)
+    let plan = LaunchPlan::new(BUSYBOX, busybox_sha256())
         .unwrap()
         .argument("sh")
         .unwrap()
@@ -124,7 +129,7 @@ fn busybox_plan(script: &str, extra: impl FnOnce(LaunchPlan) -> LaunchPlan) -> L
 /// the shell, not the launch. Exec'ing `busybox env` as the workload itself
 /// makes the observed set exactly the delivered set.
 fn busybox_applet_plan(applet: &str, extra: impl FnOnce(LaunchPlan) -> LaunchPlan) -> LaunchPlan {
-    let plan = LaunchPlan::new(BUSYBOX)
+    let plan = LaunchPlan::new(BUSYBOX, busybox_sha256())
         .unwrap()
         .argument(applet)
         .unwrap()
@@ -583,6 +588,29 @@ fn frames_round_trip_and_refuse_corruption() {
         .unwrap()
         .replace("program=", "programme=");
     assert!(LaunchPlan::decode(unknown.as_bytes()).is_err());
+
+    // Version 1 and a v2 frame without one canonical digest are both closed:
+    // neither can fall back to path execution.
+    let text = String::from_utf8(frame).unwrap();
+    let version_one = text
+        .replace(
+            "schema=automonique.launch/v2",
+            "schema=automonique.launch/v1",
+        )
+        .replace("end=automonique.launch/v2", "end=automonique.launch/v1");
+    assert!(LaunchPlan::decode(version_one.as_bytes()).is_err());
+    let missing_digest = text
+        .lines()
+        .filter(|line| !line.starts_with("program_sha256="))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert!(LaunchPlan::decode(missing_digest.as_bytes()).is_err());
+    let malformed_digest = text.replace(
+        plan.program_sha256(),
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    );
+    assert!(LaunchPlan::decode(malformed_digest.as_bytes()).is_err());
 }
 
 // The bounds below are the module's own constants, written out rather than
@@ -648,7 +676,7 @@ fn prompt_bytes_reach_the_workload_byte_exact() {
     prompt.extend_from_slice(b"first line\nsecond=line:with separators\n");
     prompt.push(0);
     prompt.push(0xff);
-    prompt.extend_from_slice(b"\nend=automonique.launch/v1\ntrailing without newline");
+    prompt.extend_from_slice(b"\nend=automonique.launch/v2\ntrailing without newline");
 
     // `busybox cat` copies stdin to stdout with no shell to reinterpret it.
     let plan = busybox_applet_plan("cat", |plan| plan.prompt(&prompt).unwrap());

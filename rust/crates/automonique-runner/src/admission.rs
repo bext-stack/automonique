@@ -1261,9 +1261,18 @@ fn build_plan(
     context: &AdmissionContext,
     prompt: &ResolvedPrompt,
 ) -> Result<LaunchPlan, AdmissionRefusal> {
-    let mut plan = LaunchPlan::new(spec.executable()).map_err(|error| AdmissionRefusal::Plan {
-        field: "executable",
-        error,
+    let program_sha256 = context
+        .observed_provider_binary()
+        .digest()
+        .strip_prefix("sha256:")
+        .ok_or(AdmissionRefusal::ContextRejected(
+            "observed_provider_binary",
+        ))?;
+    let mut plan = LaunchPlan::new(spec.executable(), program_sha256).map_err(|error| {
+        AdmissionRefusal::Plan {
+            field: "executable",
+            error,
+        }
     })?;
     for argument in spec.arguments() {
         plan = plan

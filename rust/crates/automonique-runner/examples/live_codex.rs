@@ -59,6 +59,7 @@
 //! Every path is read from the environment so nothing here is tied to one host:
 //!
 //! - `LIVE_CODEX_BIN` — absolute path to the codex executable.
+//! - `LIVE_CODEX_SHA256` — lowercase SHA-256 of that executable.
 //! - `LIVE_CODEX_HOME` — an **isolated** `CODEX_HOME` (a copy of `auth.json`
 //!   and a minimal `config.toml`), so the run never touches the operator's real
 //!   Codex state. Credentials travel as a read grant on this directory, never
@@ -140,6 +141,7 @@ fn real(path: &str) -> Result<PathBuf, Box<dyn Error>> {
 /// Build the launch plan for one contained Codex completion.
 fn build_plan(
     codex_bin: &str,
+    codex_sha256: &str,
     codex_home: &str,
     workspace: &str,
     prompt: &str,
@@ -148,7 +150,7 @@ fn build_plan(
     // real targets so a symlinked resolv.conf is granted as its stub file.
     let resolv = real("/etc/resolv.conf")?;
     let hosts = real("/etc/hosts")?;
-    let plan = LaunchPlan::new(codex_bin)?
+    let plan = LaunchPlan::new(codex_bin, codex_sha256)?
         // codex exec -, prompt on stdin, a pure read-only completion.
         .argument("exec")?
         .argument("-")?
@@ -255,6 +257,7 @@ struct Captured {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let codex_bin = required("LIVE_CODEX_BIN")?;
+    let codex_sha256 = required("LIVE_CODEX_SHA256")?;
     let codex_home = required("LIVE_CODEX_HOME")?;
     let workspace = required("LIVE_CODEX_WORKSPACE")?;
     let prompt = std::env::var("LIVE_CODEX_PROMPT").unwrap_or_else(|_| DEFAULT_PROMPT.to_owned());
@@ -274,7 +277,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let containment = RunContainment::create(&domain, &run_id, ContainmentLimits::none())?;
     eprintln!("[live_codex] containment: {}", containment.path().display());
 
-    let plan = build_plan(&codex_bin, &codex_home, &workspace, &prompt)?;
+    let plan = build_plan(&codex_bin, &codex_sha256, &codex_home, &workspace, &prompt)?;
     let captured = run(&plan, &containment)?;
     // Dispose of the cgroup tree regardless of how the workload exited.
     let _ = containment.dispose(Duration::from_secs(5));

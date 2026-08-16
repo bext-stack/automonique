@@ -330,7 +330,7 @@ fn a_fully_mappable_spec_admits_the_exact_plan_limits_and_outputs() {
     // program, argv, the executable's own execute grant, the workspace at the
     // intent its filesystem access permits, the spec's path grants, the
     // environment, and the prompt.
-    let expected = LaunchPlan::new(BUSYBOX)
+    let expected = LaunchPlan::new(BUSYBOX, "1".repeat(64))
         .unwrap()
         .argument("sh")
         .unwrap()
@@ -427,7 +427,7 @@ fn declared_path_grants_map_by_access_in_declared_order() {
     let spec = RunSpec::new(parts).unwrap();
     let admitted = admit(&spec, &mappable_context(workspace.path())).unwrap();
 
-    let expected = LaunchPlan::new(BUSYBOX)
+    let expected = LaunchPlan::new(BUSYBOX, "1".repeat(64))
         .unwrap()
         .argument("sh")
         .unwrap()

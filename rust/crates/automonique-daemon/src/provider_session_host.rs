@@ -183,7 +183,6 @@ impl ProviderSessionHost {
         scope: SessionScope,
         provider_kind: &str,
         request_model: Option<&str>,
-        executable_digest: &str,
         now_ms: i64,
         idle_ttl_ms: i64,
     ) -> Result<Self, SessionHostError> {
@@ -212,7 +211,7 @@ impl ProviderSessionHost {
             spawn_key: &spawn_key,
             attempt_id: session_key,
             provider_kind,
-            executable_digest,
+            executable_digest: plan.program_sha256(),
             spawned_ms: now_ms,
         }) {
             Ok(receipt) => receipt,

@@ -3688,7 +3688,7 @@ impl Daemon {
 
     /// Re-check that the launch context still matches the one approved.
     ///
-    /// # The window this closes, and the one it does not
+    /// # The window this closes
     ///
     /// An operator approves a *document*, and between that moment and the
     /// launch every one of the five things the document resolves to can change:
@@ -3698,15 +3698,11 @@ impl Daemon {
     /// bound at proposal time closes **approval → admission** drift: an
     /// approval granted for one launch cannot be spent on a different one.
     ///
-    /// It does not close **admission → exec** drift. The runner opens the
-    /// executable, hashes it, and then `execve`s *the path* rather than the
-    /// bytes it hashed, so the file behind a verified path can still change in
-    /// the window between the two. That residual is real and this check does
-    /// not narrow it; roadmap item 48 closes it with a sealed memfd, and this
-    /// module must not claim otherwise — an approval system that binds context
-    /// and then executes a path whose bytes can change is *better* than
-    /// approval theater, and the distance from there to "verified" is exactly
-    /// one item.
+    /// The runner separately closes **admission → exec** drift: the launch
+    /// frame carries the approved executable digest, and the entry helper
+    /// copies, hashes, seals, and `execveat`s one descriptor without resolving
+    /// the path again. A changed path is either a digest refusal or irrelevant
+    /// to the immutable bytes executed.
     ///
     /// # Why this is not the provider-pin check
     ///

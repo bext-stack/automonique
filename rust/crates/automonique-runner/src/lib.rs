@@ -42,8 +42,8 @@ pub use containment::{
 pub use launch::{
     FRAME_HEADER, FRAME_TERMINATOR, LaunchError, LaunchPlan, LaunchPlanError, MAX_FRAME_BYTES,
     MAX_LAUNCH_ARG_BYTES, MAX_LAUNCH_ARGS, MAX_LAUNCH_ENV_ENTRIES, MAX_LAUNCH_ENV_NAME_BYTES,
-    MAX_LAUNCH_ENV_VALUE_BYTES, MAX_LAUNCH_PROMPT_BYTES, SandboxedSession, SocketGrant,
-    StdoutCapture, launch_entry_helper_main, spawn_sandboxed, spawn_sandboxed_session,
+    MAX_LAUNCH_ENV_VALUE_BYTES, MAX_LAUNCH_PROMPT_BYTES, MAX_PROGRAM_BYTES, SandboxedSession,
+    SocketGrant, StdoutCapture, launch_entry_helper_main, spawn_sandboxed, spawn_sandboxed_session,
     spawn_sandboxed_with_stdout,
 };
 pub use runner::{CancellationToken, ContainmentEvidence, Runner, RunnerError};

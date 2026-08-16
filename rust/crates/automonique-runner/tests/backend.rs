@@ -29,6 +29,7 @@ use automonique_runner::{
     Authority, CancellationToken, ContainmentDomain, ContainmentError, ContainmentLimits, Event,
     EventKind, LaunchPlan, RunState, Spool, process_is_live,
 };
+use sha2::{Digest as _, Sha256};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -43,6 +44,10 @@ const MAX_SPOOL_BYTES: u64 = 1024 * 1024;
 /// inside it, so a workload that outlives its supervisor fails the test rather
 /// than hanging it.
 const BOUNDED_RUN: Duration = Duration::from_secs(30);
+
+fn busybox_sha256() -> String {
+    format!("{:x}", Sha256::digest(fs::read(BUSYBOX).unwrap()))
+}
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
@@ -124,7 +129,7 @@ fn fresh_spool(temporary: &TempDir, id: &str) -> Spool {
 /// Busybox is statically linked, so a single read-execute file grant makes it
 /// runnable without granting any loader or library directory.
 fn busybox_plan(script: &str, extra: impl FnOnce(LaunchPlan) -> LaunchPlan) -> LaunchPlan {
-    let plan = LaunchPlan::new(BUSYBOX)
+    let plan = LaunchPlan::new(BUSYBOX, busybox_sha256())
         .unwrap()
         .argument("sh")
         .unwrap()
@@ -407,7 +412,7 @@ fn a_sandbox_refusal_is_not_a_workload_failure() {
     // The plan grants write access to the witness directory but never grants
     // execute on the program itself, so the helper's own Landlock domain denies
     // the final execve: a refusal after enforcement, before any workload byte.
-    let plan = LaunchPlan::new(BUSYBOX)
+    let plan = LaunchPlan::new(BUSYBOX, busybox_sha256())
         .unwrap()
         .argument("sh")
         .unwrap()

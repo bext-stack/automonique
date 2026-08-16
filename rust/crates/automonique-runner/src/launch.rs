@@ -13,8 +13,10 @@
 //! 3. replaces stdin with the prompt descriptor the plan names — an anonymous,
 //!    sealed, memory-backed file — or with `/dev/null` when it names none, so
 //!    the workload cannot read the plan channel either way;
-//! 4. closes every descriptor except the standard streams and verifies the
-//!    closure ([`crate::descriptors`]);
+//! 4. opens the workload once, copies the verified bytes into an immutable
+//!    sealed descriptor, then closes every descriptor except that descriptor
+//!    and the standard streams and verifies the closure
+//!    ([`crate::descriptors`]);
 //! 5. installs the plan's Landlock filesystem allowlist
 //!    ([`crate::filesystem`]);
 //! 6. installs the plan's Landlock TCP policy ([`crate::network`]);
@@ -22,13 +24,14 @@
 //!    which denies creating every socket shape the plan does not grant —
 //!    including UDP, raw and packet sockets, and non-TCP stream protocols
 //!    that Landlock's TCP rules cannot see;
-//! 8. `execve`s the workload with exactly the environment the plan names.
+//! 8. `execveat`s the sealed descriptor with exactly the environment the plan
+//!    names. The path is not resolved again.
 //!
 //! Any failure at any step exits with [`crate::HELPER_REFUSED_EXIT`] before
 //! the workload runs. The workload's very first instruction therefore executes
 //! inside the cgroup, behind both Landlock domains and the socket filter, with
-//! exactly three open descriptors and exactly the environment the plan spells
-//! out — empty unless it spells one, and never anything inherited.
+//! exactly three inherited descriptors and exactly the environment the plan
+//! spells out — empty unless it spells one, and never anything inherited.
 //!
 //! # Why this order
 //!
@@ -38,7 +41,7 @@
 //! Landlock enforcement. Descriptor closure precedes Landlock because its
 //! verification re-reads `/proc/self/fd`, which the Landlock domain denies.
 //! The residue this ordering accepts is bounded and named: between closure
-//! verification and `execve`, the only descriptors this process creates are
+//! verification and `execveat`, the only descriptors this process creates are
 //! the Landlock crate's ruleset and grant-path descriptors, which are opened
 //! close-on-exec and dropped before `execve`; they cannot reach the workload.
 //!
@@ -83,6 +86,12 @@
 //!   loads. There is deliberately no denylist here: a denylist would be
 //!   hidden policy, the plan is the review point, and what such a variable can
 //!   actually reach is bounded by the filesystem allowlist, not by this API.
+//! - **The main executable is pinned, not its dynamic loader or libraries.**
+//!   The executable bytes are copied, hashed, sealed, and executed from one
+//!   descriptor. An ELF interpreter and shared libraries are still resolved by
+//!   path under the plan's Landlock read-execute grants. The executable's own
+//!   path grant therefore remains necessary even though `execveat` does not
+//!   resolve that path again.
 //! - **It is not attestation.** Nothing here proves to a third party what
 //!   was launched; the release-manifest trust chain is a separate concern.
 //! - **The supervisor cannot distinguish a helper refusal from a workload
@@ -122,14 +131,18 @@
 //! prompt can never crowd the rest of a plan out of the frame: at
 //! [`MAX_LAUNCH_PROMPT_BYTES`] = 16 KiB the line costs `11 + 2×16384 + 1 =
 //! 32780` bytes of the 65536-byte budget, which alongside the 29-byte header
-//! and 26-byte terminator leaves 32701 bytes for the program, argv, grants,
-//! ports and environment.
+//! and 26-byte terminator plus the required 80-byte program-digest line leaves
+//! 32621 bytes for the program, argv, grants, ports and environment.
 //!
 //! Per-item ceilings bound shape; the frame bound is separate and binding.
 //! Neither 64 maximal argv entries (`64 × 8197 = 524608`) nor four maximal
 //! environment entries beside a maximal prompt (`4 × 8454 = 33816`) fit in
 //! 65536 bytes, and [`LaunchPlan::encode`] refuses such a plan with
 //! [`LaunchPlanError::FrameTooLarge`] rather than truncating it.
+//!
+//! The frame version is deliberately not backward compatible. The supervisor
+//! and entry helper are release-pinned together, and accepting a v1 frame
+//! would reintroduce path execution without a digest.
 
 use crate::containment::join_and_confirm_membership;
 use crate::descriptors::{DescriptorAllowlist, close_all_except, verify_only_allowlist_open};
@@ -137,21 +150,23 @@ use crate::filesystem::{FilesystemPolicy, PathIntent};
 use crate::network::TcpBindConnectPolicy;
 use crate::seccomp::SocketFamilyPolicy;
 use crate::{HELPER_REFUSED_EXIT, RunContainment};
-use nix::fcntl::{FcntlArg, SealFlag};
+use nix::fcntl::{AtFlags, FcntlArg, OFlag, SealFlag};
 use nix::sys::memfd::MemFdCreateFlag;
+use sha2::{Digest as _, Sha256};
 use std::ffi::CString;
 use std::fmt;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 
 /// Exact first line of every launch plan frame.
-pub const FRAME_HEADER: &str = "schema=automonique.launch/v1";
+pub const FRAME_HEADER: &str = "schema=automonique.launch/v2";
 /// Exact final line of every complete launch plan frame.
-pub const FRAME_TERMINATOR: &str = "end=automonique.launch/v1";
+pub const FRAME_TERMINATOR: &str = "end=automonique.launch/v2";
 /// Upper bound on one encoded frame, matching the spool's event bound.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Upper bound on workload argv entries, beyond the program itself.
@@ -169,6 +184,10 @@ pub const MAX_LAUNCH_ENV_VALUE_BYTES: usize = 4096;
 /// See the module's frame-grammar section for the budget arithmetic that
 /// picks this number.
 pub const MAX_LAUNCH_PROMPT_BYTES: usize = 16 * 1024;
+/// Largest executable the helper will copy, verify, seal, and execute.
+pub const MAX_PROGRAM_BYTES: u64 = 128 * 1024 * 1024;
+
+const SHA256_HEX_BYTES: usize = 64;
 
 /// Private marker selecting the full-duplex session launch path in the entry
 /// helper. It is consumed before `execve`; the workload receives only the
@@ -182,6 +201,8 @@ const SESSION_STREAM_ENV: &str = "AUTOMONIQUE_SESSION_STREAM";
 pub enum LaunchPlanError {
     /// The workload program path is empty, relative, or oversized.
     ProgramRejected,
+    /// The required workload digest is not 64 lowercase hexadecimal bytes.
+    ProgramDigestRejected,
     /// An argv entry is oversized, or there are too many.
     ArgumentsRejected,
     /// A path, argument, or port failed policy validation.
@@ -204,6 +225,8 @@ impl fmt::Display for LaunchPlanError {
             Self::ProgramRejected => {
                 formatter.write_str("workload program must be a bounded absolute path")
             }
+            Self::ProgramDigestRejected => formatter
+                .write_str("workload program digest must be 64 lowercase hexadecimal bytes"),
             Self::ArgumentsRejected => {
                 formatter.write_str("workload arguments are oversized or too many")
             }
@@ -236,6 +259,7 @@ impl std::error::Error for LaunchPlanError {}
 #[derive(Clone, Eq, PartialEq)]
 pub struct LaunchPlan {
     program: PathBuf,
+    program_sha256: String,
     arguments: Vec<Vec<u8>>,
     filesystem: Vec<(PathIntent, PathBuf)>,
     connect_ports: Vec<u16>,
@@ -253,6 +277,7 @@ impl fmt::Debug for LaunchPlan {
         formatter
             .debug_struct("LaunchPlan")
             .field("program", &self.program)
+            .field("program_sha256", &self.program_sha256)
             .field("arguments", &self.arguments)
             .field("filesystem", &self.filesystem)
             .field("connect_ports", &self.connect_ports)
@@ -312,21 +337,30 @@ impl SocketGrant {
 }
 
 impl LaunchPlan {
-    /// Start a plan for `program`, which must be a bounded absolute path.
+    /// Start a plan for `program`, bound to its expected SHA-256 digest.
     ///
-    /// The program is executed by exact path; there is no `PATH` search, and a
-    /// fresh plan carries no environment at all. Variables exist only where
-    /// [`LaunchPlan::environment`] puts them, never by inheritance.
-    pub fn new(program: impl Into<PathBuf>) -> Result<Self, LaunchPlanError> {
+    /// The helper opens `program` without following its final symlink, copies
+    /// and hashes the bytes into an immutable descriptor, compares them with
+    /// `program_sha256`, and executes that descriptor. There is no `PATH`
+    /// search or second path lookup.
+    pub fn new(
+        program: impl Into<PathBuf>,
+        program_sha256: impl Into<String>,
+    ) -> Result<Self, LaunchPlanError> {
         let program = program.into();
+        let program_sha256 = program_sha256.into();
         if !program.is_absolute()
             || program.as_os_str().is_empty()
             || program.as_os_str().len() > MAX_LAUNCH_ARG_BYTES
         {
             return Err(LaunchPlanError::ProgramRejected);
         }
+        if !valid_sha256(&program_sha256) {
+            return Err(LaunchPlanError::ProgramDigestRejected);
+        }
         Ok(Self {
             program,
+            program_sha256,
             arguments: Vec::new(),
             filesystem: Vec::new(),
             connect_ports: Vec::new(),
@@ -483,6 +517,12 @@ impl LaunchPlan {
         &self.program
     }
 
+    /// SHA-256 of the exact bytes the helper must execute.
+    #[must_use]
+    pub fn program_sha256(&self) -> &str {
+        &self.program_sha256
+    }
+
     /// Names this plan delivers, in frame order.
     ///
     /// Values have no accessor on purpose: a plan is built, encoded, and
@@ -582,6 +622,7 @@ impl LaunchPlan {
             "program={}\n",
             hex(self.program.as_os_str().as_encoded_bytes())
         ));
+        frame.push_str(&format!("program_sha256={}\n", self.program_sha256));
         for argument in &self.arguments {
             frame.push_str(&format!("arg={}\n", hex(argument)));
         }
@@ -625,6 +666,7 @@ impl LaunchPlan {
         if lines.next() != Some(FRAME_HEADER) {
             return Err(LaunchPlanError::FrameRejected);
         }
+        let mut program: Option<PathBuf> = None;
         let mut plan: Option<Self> = None;
         let mut terminated = false;
         for line in lines {
@@ -638,12 +680,18 @@ impl LaunchPlan {
             }
             let (key, value) = line.split_once('=').ok_or(LaunchPlanError::FrameRejected)?;
             match (key, &mut plan) {
-                ("program", None) => {
+                ("program", None) if program.is_none() => {
                     let bytes = unhex(value).ok_or(LaunchPlanError::FrameRejected)?;
                     let path = os_string_from_bytes(bytes)?;
-                    plan = Some(Self::new(PathBuf::from(path))?);
+                    program = Some(PathBuf::from(path));
                 }
-                ("program", Some(_)) => return Err(LaunchPlanError::FrameRejected),
+                ("program_sha256", None) => {
+                    let path = program.take().ok_or(LaunchPlanError::FrameRejected)?;
+                    plan = Some(Self::new(path, value)?);
+                }
+                ("program", _) | ("program_sha256", _) => {
+                    return Err(LaunchPlanError::FrameRejected);
+                }
                 ("arg", Some(current)) => {
                     let bytes = unhex(value).ok_or(LaunchPlanError::FrameRejected)?;
                     *current = current.clone().argument(bytes)?;
@@ -962,8 +1010,12 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         drop(stdin_source);
     }
 
-    // 4. Close and verify descriptors while /proc is still reachable.
-    let allowlist = DescriptorAllowlist::standard_streams();
+    // 4. Open, copy, verify, and seal the program before filesystem policy is
+    //    installed. The immutable descriptor is the object execveat consumes;
+    //    the path is never resolved again.
+    let program_descriptor = sealed_verified_program_descriptor(&plan)?;
+    let allowlist = DescriptorAllowlist::new(&[0, 1, 2, program_descriptor.as_raw_fd()])
+        .map_err(|error| error.to_string())?;
     close_all_except(&allowlist).map_err(|error| error.to_string())?;
     verify_only_allowlist_open(&allowlist).map_err(|error| error.to_string())?;
 
@@ -1006,9 +1058,16 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         environment
             .push(CString::new(entry).map_err(|_| "environment entry contains NUL".to_owned())?);
     }
-    nix::unistd::execve(&program, &argv, &environment)
-        .map_err(|error| format!("execve failed: {error}"))?;
-    unreachable!("execve returned without an error")
+    let empty_path = CString::new(Vec::new()).expect("empty path contains no NUL");
+    nix::unistd::execveat(
+        Some(program_descriptor.as_raw_fd()),
+        &empty_path,
+        &argv,
+        &environment,
+        AtFlags::AT_EMPTY_PATH,
+    )
+    .map_err(|error| format!("execveat failed: {error}"))?;
+    unreachable!("execveat returned without an error")
 }
 
 /// Read exactly one launch frame without waiting for EOF or consuming bytes
@@ -1034,6 +1093,73 @@ fn read_session_launch_frame() -> Result<Vec<u8>, String> {
         }
     }
     Err("plan frame exceeds bound".to_owned())
+}
+
+/// Copy the program from one no-follow open into an immutable executable fd.
+///
+/// The source path is resolved exactly once. Every byte that contributes to
+/// the digest is written to the memfd, the memfd is sealed against mutation,
+/// and that same object is retained until `execveat`. If this host does not
+/// permit execution from a memfd, the later syscall refuses; there is no path
+/// fallback.
+fn sealed_verified_program_descriptor(plan: &LaunchPlan) -> Result<File, String> {
+    let mut source = OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+        .open(&plan.program)
+        .map_err(|_| "program unavailable".to_owned())?;
+    let metadata = source
+        .metadata()
+        .map_err(|_| "program metadata unavailable".to_owned())?;
+    if !metadata.is_file()
+        || metadata.mode() & 0o111 == 0
+        || metadata.mode() & 0o022 != 0
+        || metadata.len() == 0
+        || metadata.len() > MAX_PROGRAM_BYTES
+    {
+        return Err("program metadata rejected".to_owned());
+    }
+
+    let name = CString::new("automonique-program").expect("literal has no interior NUL");
+    let descriptor = nix::sys::memfd::memfd_create(
+        &name,
+        MemFdCreateFlag::MFD_CLOEXEC | MemFdCreateFlag::MFD_ALLOW_SEALING,
+    )
+    .map_err(|error| format!("program descriptor unavailable: {error}"))?;
+    let mut sealed = File::from(descriptor);
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|_| "program unreadable".to_owned())?;
+        if read == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(u64::try_from(read).map_err(|_| "program oversized".to_owned())?)
+            .ok_or_else(|| "program oversized".to_owned())?;
+        if copied > MAX_PROGRAM_BYTES {
+            return Err("program oversized".to_owned());
+        }
+        hasher.update(&buffer[..read]);
+        sealed
+            .write_all(&buffer[..read])
+            .map_err(|_| "program could not be staged".to_owned())?;
+    }
+    if copied != metadata.len() {
+        return Err("program changed while being staged".to_owned());
+    }
+    let observed = hex(&hasher.finalize());
+    if observed != plan.program_sha256 {
+        return Err("program digest mismatch".to_owned());
+    }
+    seal_descriptor(&sealed, "program")?;
+    sealed
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| "program rewind failed".to_owned())?;
+    Ok(sealed)
 }
 
 /// An anonymous, sealed, memory-backed descriptor holding `prompt`, rewound.
@@ -1063,6 +1189,13 @@ fn sealed_prompt_descriptor(prompt: &[u8]) -> Result<File, String> {
     // Seal before the workload can reach it: writing, growing and shrinking
     // are all closed, and F_SEAL_SEAL closes the sealing itself, so neither
     // the workload nor a descendant can restore any of them.
+    seal_descriptor(&file, "prompt")?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| "prompt rewind failed".to_owned())?;
+    Ok(file)
+}
+
+fn seal_descriptor(file: &File, label: &str) -> Result<(), String> {
     nix::fcntl::fcntl(
         file.as_raw_fd(),
         FcntlArg::F_ADD_SEALS(
@@ -1072,10 +1205,15 @@ fn sealed_prompt_descriptor(prompt: &[u8]) -> Result<File, String> {
                 | SealFlag::F_SEAL_SEAL,
         ),
     )
-    .map_err(|error| format!("prompt could not be sealed: {error}"))?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| "prompt rewind failed".to_owned())?;
-    Ok(file)
+    .map_err(|error| format!("{label} could not be sealed: {error}"))?;
+    Ok(())
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == SHA256_HEX_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 /// Shape check for one environment entry, shared by construction and decode.
@@ -1162,5 +1300,89 @@ fn nibble(byte: u8) -> Option<u8> {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::fcntl::FdFlag;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Command;
+
+    const BUSYBOX: &str = "/usr/bin/busybox";
+    const EXEC_FD_ENV: &str = "AUTOMONIQUE_TEST_EXEC_FD";
+
+    #[test]
+    fn swapping_the_path_after_verification_cannot_change_the_bytes_executed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let program = temporary.path().join("provider");
+        let replacement = temporary.path().join("replacement");
+        fs::copy(BUSYBOX, &program).unwrap();
+        fs::copy("/usr/bin/false", &replacement).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let original = fs::read(&program).unwrap();
+        let original_sha256 = hex(&Sha256::digest(&original));
+        let plan = LaunchPlan::new(&program, &original_sha256).unwrap();
+        let descriptor = sealed_verified_program_descriptor(&plan).unwrap();
+
+        // This is the old vulnerable window: the pathname now resolves to a
+        // different executable after verification and before exec.
+        fs::rename(&replacement, &program).unwrap();
+        assert_ne!(
+            hex(&Sha256::digest(fs::read(&program).unwrap())),
+            original_sha256
+        );
+
+        let mut staged = descriptor.try_clone().unwrap();
+        staged.seek(SeekFrom::Start(0)).unwrap();
+        let mut staged_bytes = Vec::new();
+        staged.read_to_end(&mut staged_bytes).unwrap();
+        assert_eq!(hex(&Sha256::digest(&staged_bytes)), plan.program_sha256());
+
+        // The child test process inherits only this explicitly de-CLOEXEC'd
+        // descriptor and replaces itself using the same execveat call as the
+        // production helper. The replacement path is /usr/bin/false bytes; an
+        // observed line proves the staged BusyBox bytes ran instead.
+        nix::fcntl::fcntl(descriptor.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("launch::tests::exec_sealed_descriptor_child")
+            .env(EXEC_FD_ENV, descriptor.as_raw_fd().to_string())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            output.stdout.ends_with(b"verified-bytes-ran\n"),
+            "{output:?}"
+        );
+    }
+
+    #[test]
+    fn exec_sealed_descriptor_child() {
+        let Some(raw_fd) = std::env::var_os(EXEC_FD_ENV) else {
+            return;
+        };
+        let raw_fd = raw_fd.to_string_lossy().parse::<i32>().unwrap();
+        let empty_path = CString::new(Vec::new()).unwrap();
+        let argv = [
+            CString::new("busybox").unwrap(),
+            CString::new("echo").unwrap(),
+            CString::new("verified-bytes-ran").unwrap(),
+        ];
+        let environment: [CString; 0] = [];
+        match nix::unistd::execveat(
+            Some(raw_fd),
+            &empty_path,
+            &argv,
+            &environment,
+            AtFlags::AT_EMPTY_PATH,
+        ) {
+            Ok(never) => match never {},
+            Err(error) => panic!("execveat failed: {error}"),
+        }
     }
 }

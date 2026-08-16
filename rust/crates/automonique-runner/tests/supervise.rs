@@ -45,6 +45,7 @@ use automonique_runner::{
     Authority, CancellationToken, ContainmentDomain, ContainmentError, ContainmentLimits, Event,
     EventKind, LaunchPlan, RunState, Spool, process_is_live,
 };
+use sha2::{Digest as _, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -69,6 +70,10 @@ const ATTEMPT_DEADLINE: Duration = Duration::from_secs(20);
 const PEER_DEADLINE: Duration = Duration::from_secs(25);
 /// Bound on the whole supervised call, well above `ATTEMPT_DEADLINE`.
 const BOUNDED_RUN: Duration = Duration::from_secs(60);
+
+fn busybox_sha256() -> String {
+    format!("{:x}", Sha256::digest(fs::read(BUSYBOX).unwrap()))
+}
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
@@ -172,7 +177,7 @@ fn supervisor(temporary: &TempDir, attempt_id: &str, run_id: &str) -> AttemptSup
 
 /// A plan running `script` under busybox sh with the standard test grants.
 fn busybox_plan(script: &str, extra: impl FnOnce(LaunchPlan) -> LaunchPlan) -> LaunchPlan {
-    let plan = LaunchPlan::new(BUSYBOX)
+    let plan = LaunchPlan::new(BUSYBOX, busybox_sha256())
         .unwrap()
         .argument("sh")
         .unwrap()

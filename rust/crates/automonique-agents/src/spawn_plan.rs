@@ -26,22 +26,15 @@
 //! yet, and until it does, the pin's whole value is that it is supplied by the
 //! caller and checked, rather than assumed.
 //!
-//! # The digest pin is TOCTOU-vulnerable, and that is not fixable here
+//! # The digest pin names the bytes the runner executes
 //!
 //! [`ProviderSpawnRequest::plan`] opens the executable, hashes it, and compares
-//! it to the pin. The runner then `execve`s **the path**, not the bytes that
-//! were hashed. Between those two moments anything with write access to the
-//! path — including the workload of an earlier run, a package upgrade, or a
-//! same-uid process — can replace the file, and the sandbox will faithfully
-//! execute the replacement. The check therefore detects a *stale or wrong*
-//! binary, which is a real and common failure, and does not detect a
-//! *deliberate swap*, which is the one an attacker would attempt.
-//!
-//! The real closure needs both halves and neither is in this crate: a reviewed
-//! release manifest that says which digest is legitimate, and descriptor-based
-//! execution — hash an open `O_PATH` descriptor and `execveat` *that same
-//! descriptor*, so no path resolution happens in between. Until then, a caller
-//! must not read a successful plan as "the provider binary is trustworthy".
+//! it to the pin. The launch frame carries that digest; the runner opens the
+//! path once, copies and verifies the bytes into an immutable sealed
+//! descriptor, then `execveat`s that descriptor without resolving the path
+//! again. A rename or rewrite after verification therefore cannot change the
+//! bytes that run. The remaining trust question is which digest is legitimate,
+//! answered by the reviewed release manifest rather than this crate.
 //!
 //! # A grant list, not a convenience layer
 //!
@@ -257,8 +250,8 @@ impl ProviderSpawnRequest {
     /// Every path is checked for existence here so that a plan cannot be
     /// reviewed, approved, and only then fail inside the entry helper where
     /// the failure is a bare refusal exit code. Those checks are subject to
-    /// the same TOCTOU caveat as the digest: they describe the filesystem at
-    /// plan time.
+    /// a path-resolution caveat: unlike the executable bytes, grant targets
+    /// are resolved later when Landlock installs the policy.
     pub fn plan(&self, request: &RunRequest) -> Result<ProviderLaunchPlan, SpawnPlanError> {
         // An environment that cannot be delivered is a refusal, never a
         // silently emptier provider run.
@@ -288,7 +281,7 @@ impl ProviderSpawnRequest {
             .arguments()
             .to_vec();
 
-        let mut launch = LaunchPlan::new(self.executable.path())?;
+        let mut launch = LaunchPlan::new(self.executable.path(), self.executable.pinned_sha256())?;
         for argument in &arguments {
             launch = launch.argument(argument)?;
         }
@@ -335,7 +328,7 @@ impl ProviderSpawnRequest {
     pub fn plan_session(&self, request: &RunRequest) -> Result<ProviderLaunchPlan, SpawnPlanError> {
         let one_shot = self.plan(request)?;
         let arguments = vec!["app-server".to_owned()];
-        let mut launch = LaunchPlan::new(self.executable.path())?;
+        let mut launch = LaunchPlan::new(self.executable.path(), self.executable.pinned_sha256())?;
         launch = launch.argument(&arguments[0])?;
         for (intent, path) in &one_shot.grants {
             launch = launch.filesystem_grant(*intent, path.clone())?;

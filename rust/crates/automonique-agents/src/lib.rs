@@ -23,12 +23,11 @@
 //! therefore still refuses every call — this crate's ability to *plan* a launch
 //! deliberately did not become an ability to *perform* one.
 //!
-//! The remaining half is trust, and it is unbuilt. [`spawn_plan`] verifies that
-//! an executable's bytes match a caller-supplied digest at plan time, which is
-//! TOCTOU-vulnerable by construction — the runner execs the path afterwards,
-//! not the bytes that were hashed — and it says nothing about whether that
-//! digest is the legitimate one. Closing both needs the reviewed release
-//! manifest and descriptor-based execution described in [`spawn_plan`].
+//! The remaining half is release trust, and it is unbuilt. [`spawn_plan`]
+//! verifies that an executable's bytes match a caller-supplied digest and the
+//! runner executes a sealed descriptor containing those verified bytes. This
+//! still says nothing about whether that digest is the legitimate one; closing
+//! that needs the reviewed release manifest described in [`spawn_plan`].
 
 mod codex;
 mod normalize;

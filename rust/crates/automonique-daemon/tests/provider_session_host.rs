@@ -13,8 +13,13 @@ use automonique_store::provider_journal::{
     ProcessSpawn, ProcessState, ProviderJournal, SessionOpening, SessionState, TurnOpening,
     TurnState,
 };
+use sha2::{Digest as _, Sha256};
 
 const BUSYBOX: &str = "/usr/bin/busybox";
+
+fn busybox_sha256() -> String {
+    format!("{:x}", Sha256::digest(fs::read(BUSYBOX).unwrap()))
+}
 
 #[test]
 fn restart_recovery_marks_an_orphaned_process_session_and_turn_lost() {
@@ -87,7 +92,7 @@ fn turn_two_reuses_the_live_session_process_and_journals_both_turns() {
         "'{\"type\":\"turn.completed\",\"usage\":{\"cached_input_tokens\":0,\"input_tokens\":1,\"output_tokens\":1}}'; ",
         "done"
     );
-    let plan = LaunchPlan::new(BUSYBOX)
+    let plan = LaunchPlan::new(BUSYBOX, busybox_sha256())
         .unwrap()
         .argument("sh")
         .unwrap()
@@ -107,7 +112,6 @@ fn turn_two_reuses_the_live_session_process_and_journals_both_turns() {
         scope,
         "fixture",
         Some("fixture-model"),
-        &"a".repeat(64),
         100,
         60_000,
     )
@@ -126,7 +130,9 @@ fn turn_two_reuses_the_live_session_process_and_journals_both_turns() {
 
     let mut journal = ProviderJournal::open(&journal_path).unwrap();
     let recovered = journal.recover_attempt("fixture-session").unwrap();
-    assert_eq!(recovered.process.unwrap().state, ProcessState::Exited);
+    let process = recovered.process.unwrap();
+    assert_eq!(process.state, ProcessState::Exited);
+    assert_eq!(process.executable_digest, plan.program_sha256());
     let session = recovered.session.unwrap();
     assert_eq!(session.state, SessionState::Closed);
     let turns = journal.session_turns(session.session_id).unwrap();

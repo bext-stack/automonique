@@ -22,7 +22,7 @@
 //! ## The launch policy this enables
 //!
 //! ```text
-//! LaunchPlan::new(provider_binary)?
+//! LaunchPlan::new(provider_binary, provider_sha256)?
 //!     .socket_grant(SocketGrant::Tcp)?              // create TCP sockets
 //!     .socket_grant(SocketGrant::Unix)?             // the async runtime's self-pipe
 //!     .allow_connect_port(broker.local_addr().port())?

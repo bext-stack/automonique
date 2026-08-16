@@ -180,6 +180,7 @@ dependencies = [
  "nix",
  "seccompiler",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]

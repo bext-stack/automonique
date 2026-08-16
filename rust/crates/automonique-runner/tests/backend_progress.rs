@@ -47,12 +47,17 @@ use automonique_runner::{
     Authority, CancellationToken, ContainmentDomain, ContainmentError, ContainmentLimits, Event,
     EventKind, LaunchPlan, RunState, Spool,
 };
+use sha2::{Digest as _, Sha256};
 
 const HELPER: &str = env!("CARGO_BIN_EXE_automonique-launch-enter");
 const BUSYBOX: &str = "/usr/bin/busybox";
 const REQUIRE_ENFORCED_ENV: &str = "AUTOMONIQUE_REQUIRE_ENFORCED_CONTAINMENT";
 const MAX_SPOOL_BYTES: u64 = 1024 * 1024;
 const BOUNDED_RUN: Duration = Duration::from_secs(30);
+
+fn busybox_sha256() -> String {
+    format!("{:x}", Sha256::digest(fs::read(BUSYBOX).unwrap()))
+}
 
 /// The transcript the fake provider writes, one object per line.
 ///
@@ -137,7 +142,7 @@ fn emitting_plan(lines: &[&str]) -> LaunchPlan {
         .map(|line| format!("{BUSYBOX} printf '%s\\n' '{line}'"))
         .collect::<Vec<_>>()
         .join("; ");
-    LaunchPlan::new(BUSYBOX)
+    LaunchPlan::new(BUSYBOX, busybox_sha256())
         .expect("an absolute program")
         .argument("sh")
         .expect("an argument")
