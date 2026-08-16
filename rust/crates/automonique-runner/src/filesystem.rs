@@ -603,20 +603,35 @@ fn validate_grant_path(path: &Path) -> Result<(), FilesystemPolicyError> {
 /// A Landlock domain covers the calling thread and its future children only.
 /// In the intended post-`fork`, pre-`execv` position there is exactly one
 /// thread, so confirming that is confirming the whole process is covered.
-fn require_single_threaded() -> Result<(), FilesystemPolicyError> {
-    let raw = std::fs::read("/proc/self/status")?;
+pub(crate) fn require_single_threaded() -> Result<(), SingleThreadError> {
+    let raw = std::fs::read("/proc/self/status").map_err(|_| SingleThreadError::Unknown)?;
     if raw.len() > MAX_STATUS_BYTES {
-        return Err(FilesystemPolicyError::ThreadCountUnknown);
+        return Err(SingleThreadError::Unknown);
     }
-    let text = String::from_utf8(raw).map_err(|_| FilesystemPolicyError::ThreadCountUnknown)?;
+    let text = String::from_utf8(raw).map_err(|_| SingleThreadError::Unknown)?;
     let threads = text
         .lines()
         .find_map(|line| line.strip_prefix("Threads:"))
         .map(str::trim)
         .and_then(|value| value.parse::<u32>().ok())
-        .ok_or(FilesystemPolicyError::ThreadCountUnknown)?;
+        .ok_or(SingleThreadError::Unknown)?;
     if threads != 1 {
-        return Err(FilesystemPolicyError::CallerNotSingleThreaded);
+        return Err(SingleThreadError::Multiple);
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SingleThreadError {
+    Multiple,
+    Unknown,
+}
+
+impl From<SingleThreadError> for FilesystemPolicyError {
+    fn from(error: SingleThreadError) -> Self {
+        match error {
+            SingleThreadError::Multiple => Self::CallerNotSingleThreaded,
+            SingleThreadError::Unknown => Self::ThreadCountUnknown,
+        }
+    }
 }

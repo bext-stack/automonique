@@ -101,6 +101,11 @@ pub const MAX_ALLOWED_PORTS: usize = 8;
 /// you asked for": a restriction this module cannot confirm is not installed.
 #[derive(Debug)]
 pub enum TcpPolicyError {
+    /// The caller has more than one thread. A Landlock domain applies to the
+    /// calling thread only, so enforcing here would leave its siblings free.
+    CallerNotSingleThreaded,
+    /// The caller's thread count could not be confirmed from `/proc`.
+    ThreadCountUnknown,
     /// The running kernel exposes no usable Landlock, either because it was not
     /// built with it or because it is disabled at boot.
     LandlockUnavailable,
@@ -139,6 +144,12 @@ pub enum TcpPolicyError {
 impl fmt::Display for TcpPolicyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CallerNotSingleThreaded => formatter.write_str(
+                "the caller has more than one thread; a Landlock policy would cover only one",
+            ),
+            Self::ThreadCountUnknown => {
+                formatter.write_str("the caller's thread count could not be confirmed")
+            }
             Self::LandlockUnavailable => {
                 formatter.write_str("the running kernel exposes no usable Landlock implementation")
             }
@@ -355,6 +366,12 @@ impl TcpBindConnectPolicy {
     /// perform. Filesystem restriction is a separate Landlock domain, stacked
     /// by a separate module.
     pub fn enforce_on_current_thread(&self) -> Result<EnforcedTcpRestriction, TcpPolicyError> {
+        crate::filesystem::require_single_threaded().map_err(|error| match error {
+            crate::filesystem::SingleThreadError::Multiple => {
+                TcpPolicyError::CallerNotSingleThreaded
+            }
+            crate::filesystem::SingleThreadError::Unknown => TcpPolicyError::ThreadCountUnknown,
+        })?;
         Self::check_kernel_support()?;
         // Queried before restricting so the reported value describes the kernel
         // rather than anything this call did.

@@ -1069,6 +1069,18 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
     close_all_except(&allowlist).map_err(|error| error.to_string())?;
     verify_only_allowlist_open(&allowlist).map_err(|error| error.to_string())?;
 
+    // A Landlock domain and the seccomp filter below apply to the calling
+    // thread and its future children. Refuse explicitly unless this entry
+    // helper still has exactly one thread, so no sibling can escape them.
+    crate::filesystem::require_single_threaded().map_err(|error| match error {
+        crate::filesystem::SingleThreadError::Multiple => {
+            "entry helper has more than one thread".to_owned()
+        }
+        crate::filesystem::SingleThreadError::Unknown => {
+            "entry helper thread count could not be confirmed".to_owned()
+        }
+    })?;
+
     // 5–6. Landlock domains. Anything the crate opens here is close-on-exec
     //      and dropped before execve, so it cannot reach the workload.
     plan.filesystem_policy()

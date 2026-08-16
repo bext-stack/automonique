@@ -18,8 +18,8 @@
 //! than what is taken away.
 
 use automonique_runner::seccomp::{
-    IO_URING_SYSCALLS, MAX_ALLOWED_SHAPES, REQUIRED_TARGET_ARCH, SOCKET_TYPE_MASK, SocketDomain,
-    SocketFamilyPolicy, SocketFilterError, SocketKind,
+    IO_URING_SYSCALLS, MAX_ALLOWED_SHAPES, PROCESS_INSPECTION_SYSCALLS, REQUIRED_TARGET_ARCH,
+    SOCKET_TYPE_MASK, SocketDomain, SocketFamilyPolicy, SocketFilterError, SocketKind,
 };
 use nix::libc;
 use std::path::Path;
@@ -244,6 +244,21 @@ fn without_the_filter_every_probe_creates_its_socket() {
         "unsupported_eprotonosupport",
     );
     assert_field(&report, "inet_socketpair", "unsupported_eopnotsupp");
+    assert_allowed(
+        &report,
+        &["ptrace", "process_vm_readv", "process_vm_writev"],
+    );
+}
+
+#[test]
+fn every_policy_denies_cross_process_inspection_in_the_child() {
+    for mode in ["deny-all", "unix", "tcp", "unix-and-tcp"] {
+        let report = probe(mode);
+        assert_denied(
+            &report,
+            &["ptrace", "process_vm_readv", "process_vm_writev"],
+        );
+    }
 }
 
 /// What this host cannot tell apart, recorded as fact rather than hidden.
@@ -432,6 +447,9 @@ fn the_filter_survives_execv() {
             "unix_stream",
             "netlink_raw",
             "inet_stream_proto_udp",
+            "ptrace",
+            "process_vm_readv",
+            "process_vm_writev",
         ],
     );
 }
@@ -521,7 +539,8 @@ fn compiling_a_policy_does_not_filter_the_caller() {
     std::os::unix::net::UnixDatagram::unbound().expect("unix socket after compiling");
 }
 
-/// Every policy denies `io_uring`, including ones that allow sockets.
+/// Every policy denies `io_uring` and cross-process inspection, including ones
+/// that allow sockets.
 ///
 /// `IORING_OP_SOCKET` creates a socket without ever issuing `socket(2)`, so a
 /// filter that left `io_uring_setup` reachable would be bypassable in one step.
@@ -532,13 +551,16 @@ fn compiling_a_policy_does_not_filter_the_caller() {
 /// chain for each of those syscall numbers — under both the native and the
 /// `x32` spelling — and not that this kernel returned `EPERM` for one.
 #[test]
-fn every_policy_filters_io_uring_and_both_syscall_abis() {
+fn every_policy_filters_unconditional_syscalls_and_both_syscall_abis() {
     let policies = [SocketFamilyPolicy::deny_all(), unix_policy(), tcp_policy()];
     for policy in policies {
         let compiled = policy.compile().expect("policy compiles");
         let filtered = compiled.filtered_syscalls();
 
-        for syscall in IO_URING_SYSCALLS {
+        for syscall in IO_URING_SYSCALLS
+            .into_iter()
+            .chain(PROCESS_INSPECTION_SYSCALLS)
+        {
             assert!(
                 filtered.contains(&syscall),
                 "io_uring syscall {syscall} is not filtered: {filtered:?}"
@@ -558,7 +580,10 @@ fn every_policy_filters_io_uring_and_both_syscall_abis() {
         // Nothing else is filtered: this is not a syscall allowlist, and a
         // filter that had quietly grown one would change what "unfiltered
         // syscall" means for every other module in this crate.
-        assert_eq!(filtered.len(), 2 * (IO_URING_SYSCALLS.len() + 2));
+        assert_eq!(
+            filtered.len(),
+            2 * (IO_URING_SYSCALLS.len() + PROCESS_INSPECTION_SYSCALLS.len() + 2)
+        );
     }
 }
 

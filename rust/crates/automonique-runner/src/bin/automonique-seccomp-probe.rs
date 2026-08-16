@@ -21,9 +21,12 @@
 
 use automonique_runner::seccomp::SocketFamilyPolicy;
 use nix::errno::Errno;
+use nix::sys::ptrace;
 use nix::sys::socket::{AddressFamily, SockFlag, SockProtocol, SockType, socket, socketpair};
+use nix::sys::uio::{RemoteIoVec, process_vm_readv, process_vm_writev};
+use nix::unistd::Pid;
 use std::ffi::CString;
-use std::io::{self, Write as _};
+use std::io::{self, IoSlice, IoSliceMut, Write as _};
 use std::os::unix::ffi::OsStringExt as _;
 
 /// Exit code for an argv this helper does not recognise exactly.
@@ -309,6 +312,48 @@ fn probe_all() {
         SockType::Stream,
         CLOEXEC,
     );
+
+    probe_process_inspection();
+}
+
+/// Exercise the cross-process interfaces against this process itself. The
+/// unfiltered control succeeds without privileges, while every installed
+/// policy must answer `EPERM` before the kernel examines the arguments.
+fn probe_process_inspection() {
+    let source = [b'x'];
+    let mut read_target = [0_u8];
+    let read_remote = [RemoteIoVec {
+        base: source.as_ptr() as usize,
+        len: source.len(),
+    }];
+    let mut read_local = [IoSliceMut::new(&mut read_target)];
+    report_result(
+        "process_vm_readv",
+        process_vm_readv(Pid::this(), &mut read_local, &read_remote),
+    );
+
+    let mut write_target = [0_u8];
+    let write_remote = [RemoteIoVec {
+        base: write_target.as_mut_ptr() as usize,
+        len: write_target.len(),
+    }];
+    let write_local = [IoSlice::new(&source)];
+    report_result(
+        "process_vm_writev",
+        process_vm_writev(Pid::this(), &write_local, &write_remote),
+    );
+
+    // Last: an allowed PTRACE_TRACEME changes how a later exec would behave.
+    // This fixture exits immediately after the probe, so that state is inert.
+    report_result("ptrace", ptrace::traceme());
+}
+
+fn report_result<T>(label: &str, result: nix::Result<T>) {
+    let outcome = match result {
+        Ok(_) => "allowed".to_owned(),
+        Err(errno) => name(errno),
+    };
+    println!("{label}={outcome}");
 }
 
 fn report(

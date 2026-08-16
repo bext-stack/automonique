@@ -74,6 +74,11 @@
 //!   no opt-out: a workload that needs `io_uring` cannot run under this filter.
 //!   `io_uring_enter` and `io_uring_register` are denied as well, so a ring
 //!   descriptor *inherited* across `execv` is also unusable.
+//! - **Cross-process inspection and descriptor theft are refused outright.**
+//!   [`PROCESS_INSPECTION_SYSCALLS`] denies `ptrace`, both `process_vm_*`
+//!   calls, and `pidfd_getfd` under every policy. Those interfaces can read or
+//!   alter a sibling process, or copy one of its already-open descriptors,
+//!   bypassing the workload's own filesystem and socket-creation boundaries.
 //!
 //! # Denial is `EPERM`, not death
 //!
@@ -211,6 +216,15 @@ pub const IO_URING_SYSCALLS: [i64; 3] = [
     nix::libc::SYS_io_uring_setup & !X32_SYSCALL_BIT,
     nix::libc::SYS_io_uring_enter & !X32_SYSCALL_BIT,
     nix::libc::SYS_io_uring_register & !X32_SYSCALL_BIT,
+];
+
+/// Cross-process inspection and descriptor-copying entry points every policy
+/// denies unconditionally.
+pub const PROCESS_INSPECTION_SYSCALLS: [i64; 4] = [
+    nix::libc::SYS_ptrace & !X32_SYSCALL_BIT,
+    nix::libc::SYS_process_vm_readv & !X32_SYSCALL_BIT,
+    nix::libc::SYS_process_vm_writev & !X32_SYSCALL_BIT,
+    nix::libc::SYS_pidfd_getfd & !X32_SYSCALL_BIT,
 ];
 
 /// Index of the `domain` argument of `socket(2)` and `socketpair(2)`.
@@ -753,7 +767,10 @@ impl SocketFamilyPolicy {
         for number in both_abis(SYS_SOCKETPAIR) {
             rules.insert(number, socketpair_rules.clone());
         }
-        for syscall in IO_URING_SYSCALLS {
+        for syscall in IO_URING_SYSCALLS
+            .into_iter()
+            .chain(PROCESS_INSPECTION_SYSCALLS)
+        {
             for number in both_abis(syscall) {
                 // An empty rule chain matches the syscall whatever its
                 // arguments are, which is how `seccompiler` spells an
@@ -1335,15 +1352,17 @@ mod tests {
     }
 
     /// The compiled program names both ABI spellings of every syscall it
-    /// filters, and denies `io_uring` whatever the policy allows.
+    /// filters, and denies every unconditional syscall whatever the policy
+    /// allows.
     #[test]
-    fn every_policy_filters_both_abis_and_denies_io_uring() {
+    fn every_policy_filters_both_abis_and_denies_unconditional_syscalls() {
         for (name, policy) in policies() {
             let compiled = policy.compile().expect("compiles on this build");
             let filtered = compiled.filtered_syscalls();
             for syscall in [SYS_SOCKET, SYS_SOCKETPAIR]
                 .into_iter()
                 .chain(IO_URING_SYSCALLS)
+                .chain(PROCESS_INSPECTION_SYSCALLS)
             {
                 for number in both_abis(syscall) {
                     assert!(

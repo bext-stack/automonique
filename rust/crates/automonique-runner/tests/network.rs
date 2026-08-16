@@ -296,6 +296,18 @@ fn refused_enforcement_is_a_typed_error_not_a_weaker_success() {
     );
 }
 
+#[test]
+fn a_multi_threaded_caller_is_refused_rather_than_half_restricted() {
+    let endpoints = Endpoints::new();
+    let report = endpoints.probe("multiple-threads");
+
+    assert_field(
+        &report,
+        "enforce_error",
+        "the caller has more than one thread; a Landlock policy would cover only one",
+    );
+}
+
 /// Policy construction refuses in-process, before any kernel call.
 ///
 /// Port 0 is the important one: the kernel reads a bind rule for port 0 as the

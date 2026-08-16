@@ -347,6 +347,31 @@ fn a_malformed_request_is_refused_without_a_dial() {
 }
 
 #[test]
+fn an_empty_allowlist_refuses_every_destination_without_dialling() {
+    let destination = FakeDestination::spawn(Behaviour::Echo);
+    let broker = EgressBroker::start(BrokerConfig::new(DestinationAllowlist::deny_all()))
+        .expect("broker start");
+
+    let mut stream = client(&broker);
+    write!(
+        stream,
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n",
+        destination.port()
+    )
+    .expect("send CONNECT");
+    assert_eq!(read_status(&mut stream), "HTTP/1.1 403 Forbidden");
+
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        destination.accepts(),
+        0,
+        "deny-all must refuse before any dial"
+    );
+    assert_eq!(broker.stats().denied_destination, 1);
+    assert_eq!(broker.stats().established, 0);
+}
+
+#[test]
 fn an_oversized_request_head_is_refused_rather_than_buffered() {
     let destination = FakeDestination::spawn(Behaviour::Echo);
     let broker = broker_allowing("127.0.0.1", destination.port(), AddressScope::Loopback);

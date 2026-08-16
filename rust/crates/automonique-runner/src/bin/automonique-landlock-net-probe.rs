@@ -21,6 +21,8 @@ use std::io::{self, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::net::UnixStream;
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::Duration;
 
 /// Exit code for an argv this helper does not recognise exactly.
@@ -57,6 +59,8 @@ enum Mode {
     Preexisting,
     /// Stack domains until the kernel refuses, to reach the failure path.
     LayerExhaustion,
+    /// Keep a sibling thread alive while enforcement is attempted.
+    MultipleThreads,
 }
 
 impl Mode {
@@ -70,6 +74,7 @@ impl Mode {
             "deny-all-then-exec" => Some(Self::DenyAllThenExec),
             "preexisting" => Some(Self::Preexisting),
             "layer-exhaustion" => Some(Self::LayerExhaustion),
+            "multiple-threads" => Some(Self::MultipleThreads),
             _ => None,
         }
     }
@@ -84,6 +89,7 @@ impl Mode {
             Self::DenyAllThenExec => "deny-all-then-exec",
             Self::Preexisting => "preexisting",
             Self::LayerExhaustion => "layer-exhaustion",
+            Self::MultipleThreads => "multiple-threads",
         }
     }
 }
@@ -143,6 +149,33 @@ fn run() -> i32 {
         Mode::DenyAllThenExec => deny_all_then_exec(&targets),
         Mode::Preexisting => preexisting(&targets),
         Mode::LayerExhaustion => layer_exhaustion(),
+        Mode::MultipleThreads => multiple_threads(),
+    }
+}
+
+/// Prove enforcement refuses before installing a domain when any sibling
+/// thread exists.
+fn multiple_threads() -> i32 {
+    let rendezvous = Arc::new(Barrier::new(2));
+    let sibling = {
+        let rendezvous = Arc::clone(&rendezvous);
+        thread::spawn(move || rendezvous.wait())
+    };
+
+    let result = TcpBindConnectPolicy::deny_all().enforce_on_current_thread();
+    rendezvous.wait();
+    if sibling.join().is_err() {
+        return ENFORCEMENT_FAILED;
+    }
+    match result {
+        Err(error) => {
+            println!("enforce_error={error}");
+            0
+        }
+        Ok(_) => {
+            println!("enforce_error=none");
+            ENFORCEMENT_FAILED
+        }
     }
 }
 
