@@ -499,7 +499,7 @@ TYPESCRIPT_SDK = f"{CORPUS}/requirements/typescript-sdk.md"
 CHANNEL_INTEGRATIONS = f"{CORPUS}/requirements/channel-integrations.md"
 PLAN_REVIEW = f"{CORPUS}/reference/plan-review.md"
 CLIENT_SURFACES = f"{CORPUS}/requirements/client-experience-and-surfaces.md"
-HARNESS = f"{CORPUS}/requirements/ai-implementation-harness.md"
+VERIFICATION_ROLLOUT = f"{CORPUS}/requirements/verification-and-rollout.md"
 AGENT_INTEGRATIONS = f"{CORPUS}/requirements/agent-integrations.md"
 LEGACY_SOURCE = SANCTIONED_LEGACY_INVENTORY
 
@@ -924,8 +924,8 @@ CITED: tuple[Cited, ...] = (
     Cited(
         "automonique.dev-metrics/v1",
         durable("protocol"),
-        HARNESS,
-        "versioned `automonique.dev-metrics/v1` manifest",
+        VERIFICATION_ROLLOUT,
+        "every `automonique.dev-metrics/v1` manifest",
     ),
     Cited(
         "automonique daemon",

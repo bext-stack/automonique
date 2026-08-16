@@ -122,7 +122,7 @@ class Scope:
 SLACK_TICKET_POSTER = Seam(
     "SlackTicketPoster",
     f"{CRATES}/automonique-daemon/src/slack.rs",
-    "impl SlackTicketPoster for SlackClient",
+    "impl SlackTicketPoster for Arc<SlackClient>",
     f"{CRATES}/automonique-daemon/src/slack.rs",
 )
 SLACK_API = Seam(

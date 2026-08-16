@@ -60,7 +60,7 @@ Gaps — what this section cannot record and why:
 | `local-operator-actor` | local-operator-identity | `local-operator` | operator-tui -> operator-role-projection; confers role: no | opaque-identifier | `docs/product-plan/requirements/operator-tui.md` |
 | | | | The server authenticates Unix peer credentials and projects an operator role and capability set; visibility never implies mutation authority. | | |
 | `repository-candidate-actor` | repository-candidate-identity | `repository-owner` | repository -> commit-attribution; confers role: no; example `candidate@automonique.invalid` (reserved) | — | `AGENTS.md` |
-| | | | Every candidate commit is authored and committed as one reserved non-routable identity, so attribution stays provenance rather than a person. | | |
+| | | | Codex commits use one reserved non-routable candidate identity; human commits retain their truthful configured identity. | | |
 | `sdk-actor` | sdk-client-identity | null (unassigned-in-corpus) | sdk -> durable-actor-and-tenant; confers role: no | opaque-identifier | `docs/product-plan/requirements/state-and-protocols.md` |
 | | | | An SDK client identity mapped explicitly onto a durable tenant-scoped actor before any authorization decision. | | |
 | `slack-actor` | chat-transport-identity | null (unassigned-in-corpus) | slack -> durable-actor-and-tenant; confers role: no | external-platform-identifier | `docs/product-plan/requirements/state-and-protocols.md` |
@@ -92,7 +92,7 @@ Gaps — what this section cannot record and why:
 | `operator-role-projection` | operator-role-projection | `local-operator` | authority operate-runtime; assignment unix-peer-credential-projection | — | `docs/product-plan/requirements/operator-tui.md` |
 | | | | A local operator capability set projected from authenticated Unix peer credentials. | | |
 | `repository-owner` | repository-owner | `repository-owner` | authority select-work; assignment owner-decision | — | `GOVERNANCE.md` |
-| | | | Selects work, chooses review depth from the change's risk, and alone configures integration policy; the bounded integrator, not the owner, performs the integration. | | |
+| | | | May direct human or agent repository work and explicitly authorizes production, repository-administration, destructive-Git, and licence-boundary operations. | | |
 | `service-owner` | service-owner | `service-owner` | authority hold-durable-authority; assignment owner-decision | — | `docs/product-plan/requirements/goals-and-invariants.md` |
 | | | | One service owner and one durable authority; the identity change is additive and rewrites no durable ID. | | |
 | `tenant-scoped-actor` | tenant-scoped-actor | null (unassigned-in-corpus) | authority none-recorded; assignment policy-revision-record | — | `docs/product-plan/requirements/state-and-protocols.md` |

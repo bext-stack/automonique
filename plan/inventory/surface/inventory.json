@@ -232,11 +232,11 @@
     },
     "agents-candidate-identity": {
       "path": "AGENTS.md",
-      "quote": "`Automonique Candidate <candidate@automonique.invalid>`; human-authored commits"
+      "quote": "Codex commits use `Automonique Candidate <candidate@automonique.invalid>`."
     },
     "gov-owner": {
       "path": "GOVERNANCE.md",
-      "quote": "The owner may ask Codex or a human"
+      "quote": "The owner may ask a human or"
     }
   },
   "owners": {
@@ -434,7 +434,7 @@
         {
           "id": "repository-candidate-actor",
           "class": "repository-candidate-identity",
-          "summary": "Every candidate commit is authored and committed as one reserved non-routable identity, so attribution stays provenance rather than a person.",
+          "summary": "Codex commits use one reserved non-routable candidate identity; human commits retain their truthful configured identity.",
           "owner": "repository-owner",
           "owner_gap": null,
           "citation": "agents-candidate-identity",
@@ -521,7 +521,7 @@
         {
           "id": "repository-owner",
           "class": "repository-owner",
-          "summary": "Selects work, chooses review depth from the change's risk, and alone configures integration policy; the bounded integrator, not the owner, performs the integration.",
+          "summary": "May direct human or agent repository work and explicitly authorizes production, repository-administration, destructive-Git, and licence-boundary operations.",
           "owner": "repository-owner",
           "owner_gap": null,
           "citation": "gov-owner",

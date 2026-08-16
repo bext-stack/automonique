@@ -200,9 +200,9 @@ class ForwardDrift(unittest.TestCase):
             self.assertIsNotNone(inventory.build(root))
             rewrite(
                 root,
-                f"{inventory.CORPUS}/requirements/ai-implementation-harness.md",
-                "versioned `automonique.dev-metrics/v1` manifest",
-                "versioned `automonique.dev-metrics/v1` document",
+                inventory.VERIFICATION_ROLLOUT,
+                "every `automonique.dev-metrics/v1` manifest",
+                "every `automonique.dev-metrics/v1` document",
             )
             with self.assertRaises(inventory.InventoryError) as raised:
                 inventory.build(root)

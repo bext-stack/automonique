@@ -4,7 +4,7 @@
   "consumer": "R0-10",
   "source": {
     "path": "plan/inventory/surface/inventory.json",
-    "sha256": "0f52283cf5ce9b40754bfb12c26a4460df6a1194a5a2e80f40dceeb5ded9a602"
+    "sha256": "2ca589f5059d023bc3ae3c1d9e2f561c650dff72550f706e4dbf3c95a56038fc"
   },
   "objectives": [
     {

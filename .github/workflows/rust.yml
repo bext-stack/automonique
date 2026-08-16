@@ -24,7 +24,7 @@ jobs:
       # is the same colour in a log as measuring them.
       AUTOMONIQUE_REQUIRE_JS_TOOLCHAIN: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # No version here on purpose. `rust/rust-toolchain.toml` is the pin, and
       # a bare `rustup toolchain install` under that directory reads the
@@ -122,7 +122,7 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install the pinned Rust toolchain
         working-directory: rust
