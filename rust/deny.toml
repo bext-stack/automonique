@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+# Supply-chain policy for the workspace.
+#
+# Every external dependency is `=`-pinned in `Cargo.toml`, which is the right
+# default and has one consequence worth naming: an advisory published against a
+# pinned version never arrives on its own. Nothing in this repository would ever
+# notice. The weekly cron in `.github/workflows/audit.yml` is therefore not a
+# belt-and-braces addition to a version-range policy — under exact pins it is
+# the only path by which an advisory reaches anybody.
+#
+# cargo-deny rather than cargo-audit because this repository has a licence
+# boundary worth machine-checking (`LICENSE-POLICY.md`, `tools/check_licenses.py`)
+# and deny covers advisories, licences, bans and sources from one file.
+
+[graph]
+# What CI and contributors actually build. Widening this widens the licence and
+# advisory surface, so it is a deliberate list rather than "all targets".
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# A yanked version is a supply-chain signal in its own right: the publisher
+# withdrew it, and under exact pins nothing else would tell us.
+yanked = "deny"
+# Every entry here must carry the advisory id and a reason. An empty list is
+# the honest state: nothing is being tolerated today.
+ignore = []
+
+[licenses]
+version = 2
+# The exact set the current graph resolves to, not a permissive family filter.
+# A dependency arriving under a licence nobody has read then fails here by name
+# rather than passing because it looked close enough to something allowed.
+#
+# Crates offering a choice (`MIT OR Apache-2.0`, `Unlicense OR MIT`,
+# `MIT OR Apache-2.0 OR LGPL-2.1-or-later`) resolve against this list, which is
+# why LGPL-2.1-or-later, Unlicense and Apache-2.0-WITH-LLVM-exception are absent
+# despite appearing in the graph's raw licence listing: the permissive arm is
+# what is being taken. Each of those was tried in this list and reported back as
+# an allowance matching nothing, which is how they came off it.
+allow = [
+    # The workspace's own crates.
+    "Elastic-2.0",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    # webpki-roots: the Mozilla CA bundle, published under a data licence
+    # rather than a code licence.
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    # unicode-ident's tables.
+    "Unicode-3.0",
+]
+# A crate whose licence cannot be determined is a stop, not a shrug.
+unused-allowed-license = "warn"
+confidence-threshold = 0.93
+
+[bans]
+# Warn rather than deny to start with: the workspace pins exactly, so a
+# duplicate version is information about a transitive dependency's own pins
+# rather than something this repository can fix by editing a manifest. Promote
+# to "deny" once the duplicates below are resolved or accepted.
+multiple-versions = "warn"
+# A wildcard on a registry dependency defeats the `=`-pinning the whole
+# workspace is built on, so it is a hard stop.
+wildcards = "deny"
+# The nineteen internal crates depend on each other by `path` with no version,
+# which cargo-deny reads as a wildcard. The workspace is `publish = false`, so
+# there is no registry resolution for those to go wrong: exempting path
+# dependencies keeps the rule pointed at the case it is actually for.
+allow-wildcard-paths = true
+deny = []
+
+[sources]
+# crates.io and nothing else. A git or alternative-registry dependency is a
+# source no lockfile audit covers, so it has to be a decision rather than an
+# accident.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

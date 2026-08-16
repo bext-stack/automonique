@@ -1,0 +1,8 @@
+# Raw LLVM profile data from `cargo llvm-cov`.
+#
+# Most of it lands under `target/llvm-cov-target/` and is already ignored by
+# the root rule. These escape it: several suites spawn a child process that
+# changes its working directory, and the instrumented child writes its profile
+# beside wherever it happens to be — which is a source directory. They are
+# machine-local measurement scratch, never review material.
+*.profraw

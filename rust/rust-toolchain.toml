@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+# The single source of the toolchain pin.
+#
+# It lived inline in `.github/workflows/rust.yml`'s install step, which meant
+# the version a contributor built with and the version CI gated on were two
+# separate facts that happened to agree. Here rustup applies it to every cargo
+# invocation under `rust/`, and the workflow defers to it rather than repeating
+# it.
+#
+# The practical consequence worth knowing before you hit it: a checkout with a
+# different default toolchain will auto-download 1.93.1 on the first cargo
+# command under this directory. That is the intent, not a surprise to work
+# around.
+#
+# `llvm-tools-preview` is here for `cargo llvm-cov`, which cannot instrument a
+# build without it.
+[toolchain]
+channel = "1.93.1"
+profile = "minimal"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]

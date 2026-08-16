@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+name: audit
+
+# Every external dependency is `=`-pinned in `rust/Cargo.toml`. That is the
+# right default, and it means an advisory published against a pinned version
+# never arrives on its own — no resolver ever picks up a patched release, and
+# no pull request ever touches the lockfile in response. Under exact pins the
+# cron below is the only path by which a new advisory reaches anybody, so it is
+# the load-bearing trigger here rather than a periodic re-run of what pull
+# requests already check.
+on:
+  schedule:
+    # Mondays, 06:17 UTC. Off the hour because the shared runner pool is
+    # busiest there, and a scheduled job that is skipped under load is a gate
+    # that silently stops running.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - rust/Cargo.lock
+      - rust/deny.toml
+      - .github/workflows/audit.yml
+  pull_request:
+    paths:
+      - rust/Cargo.lock
+      - rust/deny.toml
+      - .github/workflows/audit.yml
+
+permissions:
+  contents: read
+
+jobs:
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A prebuilt binary at an exact version, never `cargo install`: building
+      # the auditor from source pulls a dependency graph nothing audits, on
+      # every run, to check a graph that has not changed.
+      - uses: taiki-e/install-action@v2.86.1
+        with:
+          tool: cargo-deny@0.20.2
+
+      # Advisories, licences, bans and sources — the policy is `rust/deny.toml`
+      # and it is deliberately readable.
+      - name: Supply-chain policy
+        working-directory: rust
+        run: cargo deny check
