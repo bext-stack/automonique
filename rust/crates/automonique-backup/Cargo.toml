@@ -1,21 +1,20 @@
 # SPDX-License-Identifier: Elastic-2.0
 
 [package]
-name = "automonique"
+name = "automonique-backup"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
-automonique-backup = { path = "../automonique-backup" }
-automonique-cli = { path = "../automonique-cli" }
-automonique-daemon = { path = "../automonique-daemon" }
+hex.workspace = true
+rusqlite.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
-automonique-store = { path = "../automonique-store" }
-rusqlite.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

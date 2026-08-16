@@ -2,6 +2,15 @@
 
 # Baseline recovery drill (`R0-10`)
 
+> Superseded by `automonique-backup`, the product CLI, the systemd backup
+> timer, and `rust/crates/automonique/tests/recovery_cli.rs`. This directory is
+> retained as design history, not as the operator path.
+>
+> Disposition of the undocumented `anonymous_*` work: the deterministic
+> concurrent-commit online-backup mechanism was adopted in the Rust crate's
+> tests. The separate sealed-execution boundary/composition/worker design is
+> archived here; it grants no product behavior or development requirement.
+
 This spike takes a consistent online backup of a synthetic control state,
 destroys the source, restores the backup into a target directory that did not
 exist, and proves the restored state is one coherent point in time rather than

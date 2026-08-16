@@ -24,9 +24,11 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "automonique"
 version = "0.1.0"
 dependencies = [
+ "automonique-backup",
  "automonique-cli",
  "automonique-daemon",
  "automonique-store",
+ "rusqlite",
  "serde_json",
  "tempfile",
 ]
@@ -38,6 +40,18 @@ dependencies = [
  "automonique-connector-substrate",
  "automonique-runner",
  "nix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "automonique-backup"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

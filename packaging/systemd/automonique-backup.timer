@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+[Unit]
+Description=Create an Automonique recovery set every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+Unit=automonique-backup.service
+
+[Install]
+WantedBy=timers.target

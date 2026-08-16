@@ -1259,6 +1259,8 @@ pub struct Daemon {
     /// [`Daemon::serve`], which is the same split every other worker here has:
     /// a process that opened a daemon and never served has answered nobody.
     progress_endpoint: Option<progress_hub::ProgressEndpoint>,
+    /// Recovery mode never composes an external transport and refuses starts.
+    disconnected_recovery: bool,
 }
 
 struct SocketCleanup {
@@ -1289,6 +1291,13 @@ impl Daemon {
     ///
     /// Refuses unsafe paths, an active endpoint, or store initialization failure.
     pub fn open(config: &DaemonConfig) -> Result<Self, DaemonError> {
+        Self::open_with_mode(config, false)
+    }
+
+    fn open_with_mode(
+        config: &DaemonConfig,
+        disconnected_recovery: bool,
+    ) -> Result<Self, DaemonError> {
         validate_root(&config.runtime_root, "runtime root")?;
         ensure_private_dir(&config.state_root, "state root")?;
         let runtime_dir = config.runtime_dir();
@@ -1373,7 +1382,11 @@ impl Daemon {
         // The execution measurement is taken here rather than beside the lane
         // below, because the Telegram host reports it in a status reply and a
         // second probe would be a second answer to a question with one.
-        let execution_state = Self::measure_execution_state();
+        let execution_state = if disconnected_recovery {
+            automonique_protocol::admin::ExecutionState::SandboxUnavailableNoLane
+        } else {
+            Self::measure_execution_state()
+        };
 
         // The Telegram host loads its explicit configuration and, when one
         // exists, acquires the durable bot lease beneath the generation fence
@@ -1398,33 +1411,43 @@ impl Daemon {
             )
             .map_err(|_| DaemonError::SlackRefused("ticket_gate_store_unavailable"))?,
         ));
-        let mut slack_tickets = slack::SlackTicketHost::open(
-            &state_dir,
-            &config.admin_socket(),
-            &config.run_index_path(),
-            Arc::clone(&ticket_gates),
-        )
-        .map_err(|error| DaemonError::SlackRefused(error.category()))?;
-        let slack = slack::SlackHost::open(&state_dir)
-            .map_err(|error| DaemonError::SlackRefused(error.category()))?;
-        let mut telegram = telegram::TelegramHost::open_with_ticket_gates(
-            &telegram::TelegramHostParams {
-                state_dir: &state_dir,
-                database_path: &config.database_path(),
-                run_index_path: &config.run_index_path(),
-                support_tickets_path: &config.support_tickets_path(),
-                operator_members_path: &config.operator_members_path(),
-                admin_socket: &config.admin_socket(),
-                generation_id: GENERATION_ID,
-                holder_id: instance_id.as_str(),
-                authority_lease_epoch: lease.epoch,
-                ttl_ms: TELEGRAM_LEASE_TTL_MS,
-                execution_state,
-            },
-            slack,
-            ticket_gates,
-        )
-        .map_err(|error| DaemonError::TelegramRefused(error.category()))?;
+        let (mut slack_tickets, slack) = if disconnected_recovery {
+            (slack::SlackTicketHost::Disabled, slack::SlackHost::Disabled)
+        } else {
+            (
+                slack::SlackTicketHost::open(
+                    &state_dir,
+                    &config.admin_socket(),
+                    &config.run_index_path(),
+                    Arc::clone(&ticket_gates),
+                )
+                .map_err(|error| DaemonError::SlackRefused(error.category()))?,
+                slack::SlackHost::open(&state_dir)
+                    .map_err(|error| DaemonError::SlackRefused(error.category()))?,
+            )
+        };
+        let mut telegram = if disconnected_recovery {
+            telegram::TelegramHost::Disabled
+        } else {
+            telegram::TelegramHost::open_with_ticket_gates(
+                &telegram::TelegramHostParams {
+                    state_dir: &state_dir,
+                    database_path: &config.database_path(),
+                    run_index_path: &config.run_index_path(),
+                    support_tickets_path: &config.support_tickets_path(),
+                    operator_members_path: &config.operator_members_path(),
+                    admin_socket: &config.admin_socket(),
+                    generation_id: GENERATION_ID,
+                    holder_id: instance_id.as_str(),
+                    authority_lease_epoch: lease.epoch,
+                    ttl_ms: TELEGRAM_LEASE_TTL_MS,
+                    execution_state,
+                },
+                slack,
+                ticket_gates,
+            )
+            .map_err(|error| DaemonError::TelegramRefused(error.category()))?
+        };
 
         // Custody storage opens beneath the same fence and before the socket
         // guard is disarmed: a daemon that cannot hold documents must not
@@ -1537,12 +1560,15 @@ impl Daemon {
         // `TicketIntakeHost::start` is what puts it on a thread, and only
         // `serve` calls that — while a present-but-refused one fails startup for
         // the reason the Telegram gate does.
-        let ticket_intake =
+        let ticket_intake = if disconnected_recovery {
+            ticket_intake::TicketIntakeHost::Disabled
+        } else {
             ticket_intake::TicketIntakeHost::open(&ticket_intake::TicketIntakeParams {
                 state_dir: &state_dir,
                 ticket_store_path: &config.support_tickets_path(),
             })
-            .map_err(|error| DaemonError::TicketIntakeRefused(error.category()))?;
+            .map_err(|error| DaemonError::TicketIntakeRefused(error.category()))?
+        };
         // The standing approval requirement is the one configured input to the
         // gate every launch takes. It is read here, beside the other startup
         // gates, so a malformed file refuses a daemon rather than the first
@@ -1599,6 +1625,7 @@ impl Daemon {
             execution: Some(execution),
             ticket_intake,
             progress_endpoint: Some(progress_endpoint),
+            disconnected_recovery,
         })
     }
 
@@ -1737,7 +1764,8 @@ impl Daemon {
                         }
                         next_renewal = std::time::Instant::now() + LEASE_RENEW_INTERVAL;
                     }
-                    if self.reconciliation_run_id.is_none()
+                    if !self.disconnected_recovery
+                        && self.reconciliation_run_id.is_none()
                         && let Err(error) = self.tick_synthetic()
                     {
                         break 'serving Err(error);
@@ -1746,7 +1774,9 @@ impl Daemon {
                     // every accept poll: it reads two databases, and a deadline
                     // measured in minutes does not need to be checked at the rate a
                     // socket is polled.
-                    if std::time::Instant::now() >= next_approval_sweep {
+                    if !self.disconnected_recovery
+                        && std::time::Instant::now() >= next_approval_sweep
+                    {
                         match unix_millis().and_then(|now_ms| self.tick_approvals(now_ms)) {
                             Ok(()) => {}
                             Err(error) => break 'serving Err(error),
@@ -2162,7 +2192,8 @@ impl Daemon {
                 // generation are different reasons for the same closed intake,
                 // and the status reports both so an operator can tell which
                 // one they are looking at.
-                let paused = self.store.intake_paused(GENERATION_ID, now_ms)?.is_some();
+                let paused = self.disconnected_recovery
+                    || self.store.intake_paused(GENERATION_ID, now_ms)?.is_some();
                 // The live fan-out is in this process's memory rather than in
                 // the database, so it is measured here and attached rather than
                 // projected from the snapshot. A daemon with no execution lane
@@ -2181,7 +2212,9 @@ impl Daemon {
                     .with_runtime(RuntimeObservation {
                         daemon_ready: !degraded,
                         intake_enabled: !degraded && !paused,
-                        provider_available: Some(self.provider_available()),
+                        provider_available: Some(
+                            !self.disconnected_recovery && self.provider_available(),
+                        ),
                         sandbox_launch_refusals: None,
                     })
                     .map_err(|_| DaemonError::ProtocolRefused("operational_projection"))?;
@@ -2229,7 +2262,8 @@ impl Daemon {
                 }
                 let degraded = self.reconciliation_run_id.is_some()
                     || snapshot_requires_reconciliation(&snapshot);
-                let paused = self.store.intake_paused(GENERATION_ID, now_ms)?.is_some();
+                let paused = self.disconnected_recovery
+                    || self.store.intake_paused(GENERATION_ID, now_ms)?.is_some();
                 let projection = StoreProjection::from_status(&snapshot)
                     .map_err(|_| DaemonError::ProtocolRefused("operational_projection"))?;
                 let projection = match self.progress() {
@@ -2242,7 +2276,9 @@ impl Daemon {
                     .with_runtime(RuntimeObservation {
                         daemon_ready: !degraded,
                         intake_enabled: !degraded && !paused,
-                        provider_available: Some(self.provider_available()),
+                        provider_available: Some(
+                            !self.disconnected_recovery && self.provider_available(),
+                        ),
                         sandbox_launch_refusals: None,
                     })
                     .map_err(|_| DaemonError::ProtocolRefused("operational_projection"))?;
@@ -2258,6 +2294,13 @@ impl Daemon {
                 }
             }
             automonique_protocol::admin::AdminCommand::SubmitSynthetic => {
+                if self.disconnected_recovery {
+                    return self.write_refusal(
+                        stream,
+                        request.request_id(),
+                        "disconnected_recovery",
+                    );
+                }
                 let now_ms = unix_millis()?;
                 let snapshot = self.store.status_snapshot_at(GENERATION_ID, now_ms)?;
                 if self.reconciliation_run_id.is_some()
@@ -2297,6 +2340,13 @@ impl Daemon {
                 }
             }
             automonique_protocol::admin::AdminCommand::SubmitRun => {
+                if self.disconnected_recovery {
+                    return self.write_refusal(
+                        stream,
+                        request.request_id(),
+                        "disconnected_recovery",
+                    );
+                }
                 // THIS ARM STOPS AT CUSTODY.
                 //
                 // What follows verifies a document and writes it down. It does
@@ -3179,7 +3229,12 @@ impl Daemon {
 
         let response = match request {
             ExecuteRequest::ExecuteRun { request_id, run_id } => {
-                match self.start_run(run_id, degraded, paused, now_ms) {
+                let started = if self.disconnected_recovery {
+                    Err(ExecuteRefusal::ExecutionUnavailable)
+                } else {
+                    self.start_run(run_id, degraded, paused, now_ms)
+                };
+                match started {
                     Ok(submission_id) => {
                         ExecuteResponse::accepted(request_id.clone(), run_id.clone(), submission_id)
                             .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
@@ -5568,6 +5623,17 @@ fn remove_socket_if_identity(path: &Path, identity: (u64, u64)) {
 ///
 /// Returns setup, signal, store, or serving failures.
 pub fn run_foreground(config: &DaemonConfig) -> Result<(), DaemonError> {
+    run_with_mode(config, false)
+}
+
+/// Run the daemon with every external transport disabled and provider starts
+/// refused. This is the only supported startup mode for a restored host before
+/// reconciliation and credential revalidation.
+pub fn run_disconnected_recovery(config: &DaemonConfig) -> Result<(), DaemonError> {
+    run_with_mode(config, true)
+}
+
+fn run_with_mode(config: &DaemonConfig, disconnected_recovery: bool) -> Result<(), DaemonError> {
     let mut signals = SigSet::empty();
     signals.add(Signal::SIGINT);
     signals.add(Signal::SIGTERM);
@@ -5596,7 +5662,8 @@ pub fn run_foreground(config: &DaemonConfig) -> Result<(), DaemonError> {
             }
         }
     });
-    let result = Daemon::open(config).and_then(|daemon| daemon.serve(&stop));
+    let result = Daemon::open_with_mode(config, disconnected_recovery)
+        .and_then(|daemon| daemon.serve(&stop));
     if !stop.load(Ordering::Acquire) {
         stop.store(true, Ordering::Release);
     }

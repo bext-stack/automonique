@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+[Unit]
+Description=Create an Automonique online recovery set
+
+[Service]
+Type=oneshot
+ExecStart=%S/automonique/improvement-code/current/bin/automonique backup create %S/automonique/backups
+StateDirectory=automonique
+StateDirectoryMode=0700
+Environment=XDG_STATE_HOME=%S

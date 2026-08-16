@@ -11,5 +11,8 @@ release_bin="$verify_state/automonique/improvement-code/current/bin"
 mkdir -p "$release_bin"
 cp /bin/true "$release_bin/automonique"
 
-XDG_STATE_HOME="$verify_state" \
-    systemd-analyze --user verify "$repo_root/packaging/systemd/automonique.service"
+XDG_STATE_HOME="$verify_state" systemd-analyze --user verify \
+    "$repo_root/packaging/systemd/automonique.service" \
+    "$repo_root/packaging/systemd/automonique-recovery.service" \
+    "$repo_root/packaging/systemd/automonique-backup.service" \
+    "$repo_root/packaging/systemd/automonique-backup.timer"

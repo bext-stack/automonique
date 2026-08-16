@@ -15,6 +15,9 @@ jobs:
   workspace:
     runs-on: ubuntu-latest
     env:
+      # GitHub provisions this runner from a fresh image. The recovery test
+      # runs as a local fixture everywhere this attestation is absent.
+      AUTOMONIQUE_CLEAN_HOST: "1"
       # On a runner a missing JavaScript toolchain is a broken job definition,
       # not a fact about the environment. Without this the protocol suite's
       # cross-language and codegen checks print a `GAP:` note and pass, which
