@@ -3493,7 +3493,7 @@ fn natural_support_ticket_inventory_and_its_followup_use_the_local_store() {
         &fixture,
         FakeClient::new([
             updates(&[(1, OPERATOR, "what support tickets do we have?")]),
-            updates(&[(2, OPERATOR, "what are the latest ones?")]),
+            updates(&[(2, OPERATOR, "list them")]),
         ]),
         outbound.clone(),
         FakeSink::default(),

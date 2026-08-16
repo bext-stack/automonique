@@ -8407,34 +8407,46 @@ fn is_support_ticket_inventory_question(text: &str) -> bool {
 /// Resolve only short deictic inventory follow-ups grounded in this chat's
 /// recent text. Durable memory is intentionally excluded from routing.
 fn is_support_ticket_inventory_followup(text: &str, memory_context: &str) -> bool {
-    let normalized = text
-        .to_lowercase()
+    let normalized = text.to_lowercase();
+    let terms = normalized
         .split(|character: char| !character.is_alphanumeric())
         .filter(|term| !term.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let followup = matches!(
-        normalized.as_str(),
-        "latest ones"
-            | "the latest ones"
-            | "and the latest ones"
-            | "what are the latest ones"
-            | "which are the latest ones"
-            | "show me the latest ones"
-            | "newest ones"
-            | "the newest ones"
-            | "what are the newest ones"
-            | "which are the newest ones"
-            | "show me the newest ones"
-            | "les derniers"
-            | "et les derniers"
-            | "quels sont les derniers"
-            | "montre moi les derniers"
-            | "les dernières"
-            | "et les dernières"
-            | "quelles sont les dernières"
-            | "montre moi les dernières"
-    );
+        .collect::<Vec<_>>();
+    let deictic = terms.iter().any(|term| {
+        matches!(
+            *term,
+            "one" | "ones" | "them" | "these" | "those" | "les" | "ceux" | "celles"
+        )
+    });
+    let inventory_verb = terms
+        .iter()
+        .any(|term| matches!(*term, "list" | "show" | "liste" | "montre"));
+    let recency = terms.iter().any(|term| {
+        matches!(
+            *term,
+            "latest" | "newest" | "recent" | "derniers" | "dernières" | "récents" | "récentes"
+        )
+    });
+    let mutation = terms.iter().any(|term| {
+        matches!(
+            *term,
+            "fix"
+                | "work"
+                | "close"
+                | "approve"
+                | "deny"
+                | "reply"
+                | "update"
+                | "corrige"
+                | "travaille"
+                | "ferme"
+                | "approuve"
+                | "refuse"
+                | "réponds"
+                | "modifie"
+        )
+    });
+    let followup = terms.len() <= 8 && !mutation && (recency || (inventory_verb && deictic));
     if !followup {
         return false;
     }
@@ -10074,6 +10086,8 @@ mod clock_tests {
             "what are the latest ones?",
             context
         ));
+        assert!(is_support_ticket_inventory_followup("list them", context));
+        assert!(is_support_ticket_inventory_followup("liste-les", context));
         assert!(!is_support_ticket_inventory_followup(
             "what are the latest ones?",
             "[recent_conversation]\nuser | content_untrusted=what models do we have?\n[/recent_conversation]"
