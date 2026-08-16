@@ -1,0 +1,1 @@
+{"body":{"approvals":[{"approval_key":"approval/only","decided_at_ms":0,"decider":"ops/oncall","decision":"denied","entry_id":9,"revision":1,"subject":"command:automonique.run.submit"}],"more":false,"next_cursor":null},"kind":"approval_list_result","protocol":"automonique.approval","request_id":"approval-list-page-complete","version":1}

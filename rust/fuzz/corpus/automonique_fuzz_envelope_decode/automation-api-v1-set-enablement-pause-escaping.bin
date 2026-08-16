@@ -1,0 +1,1 @@
+{"body":{"actor":"ops/\"oncall\" \\ naïve 日本語 🚀","automation_id":"auto/\"nightly digest\" \\ naïve 日本語 🚀","cause":"held: \"maintenance\" \\ withdrawn by ops/oncall — naïve 日本語 🚀","expected_revision":9223372036854775807,"target":"paused"},"kind":"set_enablement","protocol":"automonique.automation","request_id":"req-set-1","version":1}

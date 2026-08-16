@@ -1,0 +1,1 @@
+{"body":{"batches":[{"batch_id":"batch/only","concurrency":{"kind":"bounded_parallel","max_in_flight":4},"created_at_ms":0,"entry_id":9,"label":"nightly","revision":3}],"more":false,"next_cursor":null},"kind":"batch_list_result","protocol":"automonique.batch.control","request_id":"req-list-2","version":1}

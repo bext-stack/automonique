@@ -1,0 +1,1 @@
+{"body":{"approval_key":"approval/\"deploy prod\" \\ naïve 日本語 🚀","decided_at_ms":1700000001000,"decider":"ops/\"oncall\" \\ naïve 日本語 🚀","decision":"granted","entry_id":4,"revision":1,"subject":"effect:\"publish artifact\" \\ sha256:naïve 日本語 🚀"},"kind":"approval_detail_result","protocol":"automonique.approval","request_id":"req-detail-1","version":1}

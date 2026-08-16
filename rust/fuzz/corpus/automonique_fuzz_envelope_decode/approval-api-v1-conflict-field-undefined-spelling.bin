@@ -1,0 +1,1 @@
+{"body":{"entry_id":12,"field":"decided_at","recorded_decider":"ops/oncall","recorded_decision":"denied","recorded_subject":"effect:publish-artifact"},"kind":"approval_conflict","protocol":"automonique.approval","request_id":"req-record-1","version":1}

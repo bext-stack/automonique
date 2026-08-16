@@ -1,0 +1,1 @@
+{"body":{"approvals":[{"approval_key":"approval/deploy-prod","decided_at_ms":1700000000000,"decider":"","decision":"granted","entry_id":1,"revision":1,"subject":"effect:publish-artifact"}],"more":false,"next_cursor":null},"kind":"approval_list_result","protocol":"automonique.approval","request_id":"req-list-1","version":1}

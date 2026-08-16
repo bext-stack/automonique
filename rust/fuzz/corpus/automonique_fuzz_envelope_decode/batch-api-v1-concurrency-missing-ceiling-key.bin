@@ -1,0 +1,1 @@
+{"body":{"batches":[{"batch_id":"batch/nightly-eval","concurrency":{"kind":"sequential"},"created_at_ms":1700000000000,"entry_id":1,"label":"nightly","revision":1}],"more":false,"next_cursor":null},"kind":"batch_list_result","protocol":"automonique.batch.control","request_id":"req-list-1","version":1}

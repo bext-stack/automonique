@@ -7,6 +7,18 @@ edition = "2024"
 license = "Elastic-2.0"
 publish = false
 
+# The shipped graph stays empty: `[dependencies]` is absent on purpose and the
+# entries below are build-time only, so nothing here reaches a released binary.
+#
+# `proptest` drives `tests/properties.rs`; `default-features = false` drops the
+# subprocess `fork`/`timeout` machinery this suite has no use for. `sha2` is the
+# reference implementation the differential test checks `digest.rs` against —
+# the point of that test is that the two are written by different people, so it
+# has to be a second implementation rather than a second call into the first.
+[dev-dependencies]
+proptest = { version = "=1.11.0", default-features = false, features = ["std", "bit-set"] }
+sha2.workspace = true
+
 [lints.rust]
 unsafe_code = "forbid"
 

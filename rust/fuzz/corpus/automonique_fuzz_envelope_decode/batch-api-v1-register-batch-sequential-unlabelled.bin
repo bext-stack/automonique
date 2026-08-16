@@ -1,0 +1,1 @@
+{"body":{"batch_id":"batch/\"nightly eval\" \\ naïve 日本語 🚀","concurrency":{"kind":"sequential","max_in_flight":null},"label":null,"members":["submit/\"run prod\" \\ naïve 日本語 🚀","submit/aardvark","submit/zebra"]},"kind":"register_batch","protocol":"automonique.batch.control","request_id":"req-register-1","version":1}

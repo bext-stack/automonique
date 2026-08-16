@@ -22,6 +22,12 @@ members = [
     "crates/automonique-transport-runtime",
     "crates/automonique-transports",
 ]
+# `fuzz/` is a crate, and a sibling of `crates/`, but not a member. It needs
+# nightly and a sanitizer build, and its entry-point macro emits the `extern
+# "C"` symbol `unsafe_code = "forbid"` below exists to reject. Excluding it
+# keeps this lockfile — and the reproducibility check over it — independent of
+# anything under `fuzz/`. See `fuzz/README.md`.
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]

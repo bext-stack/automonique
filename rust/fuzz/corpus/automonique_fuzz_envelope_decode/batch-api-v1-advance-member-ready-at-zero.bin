@@ -1,0 +1,1 @@
+{"body":{"batch_id":"batch/nightly-eval","expected_revision":1,"last_sequence":0,"member_key":"submit/only","state":"ready"},"kind":"advance_member","protocol":"automonique.batch.control","request_id":"req-advance-2","version":1}

@@ -1,0 +1,1 @@
+{"body":{"document_hex":"7b22736368656d61223a226175746f6d6f6e697175652e72756e2d737065632f7631227d","idempotency_key":"submit-run-key-1","spec_digest":"sha256:cd53edf80ac383c9cee3a7572eb40a0a4eb3c5ebde34a187f6f0b22c2259b340"},"kind":"submit_run","protocol":"automonique.admin","request_id":"req-submit-1","version":1}

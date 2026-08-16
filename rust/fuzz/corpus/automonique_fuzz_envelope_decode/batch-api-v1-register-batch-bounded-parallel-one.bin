@@ -1,0 +1,1 @@
+{"body":{"batch_id":"batch/nightly-eval","concurrency":{"kind":"bounded_parallel","max_in_flight":1},"label":"nightly \"eval\" \\ naïve 日本語 🚀","members":["submit/only"]},"kind":"register_batch","protocol":"automonique.batch.control","request_id":"req-register-2","version":1}

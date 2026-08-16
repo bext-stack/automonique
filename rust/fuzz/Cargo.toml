@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+# Its own workspace, deliberately.
+#
+# Two things keep this crate out of `rust/Cargo.toml`'s members. It needs a
+# nightly toolchain and a sanitizer-instrumented build, which the pinned stable
+# path must never depend on; and `libfuzzer-sys`'s entry-point macro emits an
+# `extern "C"` symbol, which the workspace's `unsafe_code = "forbid"` would
+# reject. Excluding it means the nineteen-member workspace, its lockfile and the
+# lockfile-reproducibility check are all untouched by anything below.
+[workspace]
+members = ["."]
+
+[package]
+name = "automonique-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Elastic-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+automonique-protocol = { path = "../crates/automonique-protocol" }
+automonique-slack-connector = { path = "../crates/automonique-slack-connector" }
+automonique-transports = { path = "../crates/automonique-transports" }
+
+[lints.clippy]
+dbg_macro = "forbid"
+todo = "forbid"
+unimplemented = "forbid"
+
+# Fuzzing an unoptimised decoder measures the profiler, not the decoder.
+[profile.release]
+debug = true
+
+[[bin]]
+name = "automonique_fuzz_decode_frame"
+path = "fuzz_targets/automonique_fuzz_decode_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "automonique_fuzz_parse_canonical"
+path = "fuzz_targets/automonique_fuzz_parse_canonical.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "automonique_fuzz_envelope_decode"
+path = "fuzz_targets/automonique_fuzz_envelope_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "automonique_fuzz_telegram_updates"
+path = "fuzz_targets/automonique_fuzz_telegram_updates.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "automonique_fuzz_slack_decode"
+path = "fuzz_targets/automonique_fuzz_slack_decode.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,1 @@
+{"body":{"durable_revision":7,"expected_revision":2},"kind":"revision_conflict","protocol":"automonique.batch.control","request_id":"req-advance-1","version":1}

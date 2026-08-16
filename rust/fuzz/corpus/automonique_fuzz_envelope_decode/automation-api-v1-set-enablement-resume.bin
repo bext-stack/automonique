@@ -1,0 +1,1 @@
+{"body":{"actor":"ops/oncall","automation_id":"auto-nightly","cause":null,"expected_revision":2,"target":"enabled"},"kind":"set_enablement","protocol":"automonique.automation","request_id":"req-set-2","version":1}

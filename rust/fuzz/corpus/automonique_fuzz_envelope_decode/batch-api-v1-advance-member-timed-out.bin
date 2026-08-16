@@ -1,0 +1,1 @@
+{"body":{"batch_id":"batch/nightly-eval","expected_revision":4,"last_sequence":99,"member_key":"submit/zebra","state":"timed_out"},"kind":"advance_member","protocol":"automonique.batch.control","request_id":"req-advance-3","version":1}
