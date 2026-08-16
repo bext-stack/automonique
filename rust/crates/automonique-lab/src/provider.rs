@@ -22,7 +22,7 @@ use crate::protocol::{
 };
 
 pub const R0_06_INVENTORY_SHA256: &str =
-    "3eebad2ee6a7c208861bb593b637d00b066b8084c420421fe71c79c0f187f521";
+    "be35c72dd84203b2f3b658b85b730a553584637067180aa802920ec8a21e09d1";
 const INVENTORY_SCHEMA: &str = "automonique.provider-inventory/v1";
 const SURFACE_SCHEMA: &str = "automonique.provider-surface/v1";
 const CAPABILITIES: [(&str, Capability); 9] = [

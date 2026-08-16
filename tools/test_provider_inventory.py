@@ -8,6 +8,8 @@ import unittest
 
 from tools import provider_inventory
 
+CAPTURE_DATE = "2026-08-16"
+
 
 class ProviderInventoryTests(unittest.TestCase):
     def test_probe_allowlist_is_model_free_and_non_mutating(self) -> None:
@@ -46,7 +48,7 @@ class ProviderInventoryTests(unittest.TestCase):
         self.assertEqual(b"probe\n<REDACTED_PATH>\n", clean)
 
     def test_manifest_digests_match_sanitized_artifacts(self) -> None:
-        document, files = provider_inventory.capture_document("2026-08-09")
+        document, files = provider_inventory.capture_document(CAPTURE_DATE)
         self.assertEqual(provider_inventory.SCHEMA, document["schema"])
         for entry in document["artifacts"]:
             self.assertEqual(0, entry["exit_code"])
@@ -55,7 +57,7 @@ class ProviderInventoryTests(unittest.TestCase):
         json.loads(files[provider_inventory.pathlib.Path("manifest.json")])
 
     def test_normalized_inventory_has_four_complete_provider_surfaces(self) -> None:
-        document = provider_inventory.normalized_inventory("2026-08-09")
+        document = provider_inventory.normalized_inventory(CAPTURE_DATE)
         self.assertEqual(provider_inventory.INVENTORY_SCHEMA, document["schema"])
         self.assertEqual(
             {"claude", "codex", "jcode", "opencode"},

@@ -1,20 +1,20 @@
 {
   "schema": "automonique.provider-surface/v1",
   "provider": "jcode",
-  "capture_date": "2026-08-09",
+  "capture_date": "2026-08-16",
   "expected_base": "972f94894dc84921454bfdde131c9fa8efa57ec2",
   "licence_class": "Elastic-2.0",
   "binary": {
     "command": "jcode",
     "version": {
-      "value": "0.68.0",
-      "display": "jcode v0.68.0 (fcf53909f)",
+      "value": "0.76.0",
+      "display": "jcode v0.76.0 (bbef1f6a8)",
       "evidence_level": "observed"
     },
     "build": {
-      "git_hash": "fcf53909f",
-      "git_tag": "v0.68.0",
-      "build_time": "2026-08-05 19:39:30 +0000",
+      "git_hash": "bbef1f6a8",
+      "git_tag": "v0.76.0",
+      "build_time": "2026-08-14 16:33:48 +0000",
       "release_build": true,
       "evidence_level": "observed"
     },

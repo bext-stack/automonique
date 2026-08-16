@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+[Unit]
+Description=Automonique local automation daemon
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=%S/automonique/improvement-code/current/bin/automonique daemon --foreground
+Restart=on-failure
+RestartSec=5s
+WatchdogSec=30s
+TimeoutStopSec=90s
+RuntimeDirectory=automonique
+RuntimeDirectoryMode=0700
+StateDirectory=automonique
+StateDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=%t
+Environment=XDG_STATE_HOME=%S
+Delegate=yes
+
+[Install]
+WantedBy=default.target

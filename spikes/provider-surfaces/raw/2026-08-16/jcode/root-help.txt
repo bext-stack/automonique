@@ -1,0 +1,156 @@
+J-Code: A coding agent using Claude Max or ChatGPT Pro subscriptions
+
+Usage: jcode-linux-x86_64.bin [OPTIONS] [COMMAND]
+
+Commands:
+  serve                   Start the agent server (background daemon)
+  acp                     Run as an Agent Client Protocol (ACP) adapter backed by the Jcode daemon
+  server                  Manage the background server daemon (e.g. `jcode server stop`)
+  connect                 Connect to a running server
+  run                     Run a single message and exit
+  login                   Login to a provider via OAuth, API key, or local credentials
+  account                 Log in to and manage your Jcode account
+  repl                    Run in simple REPL mode (no TUI)
+  update                  Update jcode to the latest version
+  version                 Show build/version information in human or JSON form
+  usage                   Show usage limits for connected providers
+  telemetry               Inspect or change anonymous telemetry settings
+  self-dev                Self-development mode: run as a canary session on the shared server
+  debug                   Debug socket CLI - interact with running jcode server
+  auth                    Authentication status and validation helpers
+  provider                Provider discovery and selection helpers
+  memory                  Memory management commands
+  session                 Session management commands
+  ambient                 Ambient mode management
+  cloud                   Optional Jcode Cloud/Jade integration commands
+  pair                    Generate a pairing code for iOS/web client
+  permissions             Review and respond to pending ambient permission requests
+  transcript              Inject externally transcribed text into the active Jcode TUI
+  dictate                 Run configured dictation: send to last-focused jcode client or type raw text
+  setup-hotkey            Set up the platform global hotkey to launch jcode
+  setup-launcher          Install a launcher so jcode appears in your app launcher
+  browser                 Browser automation setup and status
+  replay                  Replay a saved session in the TUI
+  model                   Model management commands
+  provider-test-coverage  Show live verification coverage. With no provider/model, prints the full coverage summary
+  provider-doctor         Diagnose why a provider/model or the model picker is broken by walking the strict end-to-end checkpoints (catalog, picker, model-switch, chat, streaming, tools)
+  auth-test               Test authentication end-to-end: login (optional), credential probe, refresh, and provider smoke
+  restart                 Save or restore the current set of open jcode windows across a system reboot
+  menubar                 Show a live macOS menu bar indicator with running/streaming session counts
+  api-bridge              Serve the stable harness API on a Unix socket, for SDK clients
+  help                    Print this message or the help of the given subcommand(s)
+
+Options:
+  -p, --provider <PROVIDER>
+          Initial provider to use (jcode, claude, openai, openai-api, openrouter, azure, opencode, opencode-go, zai, 302ai, baseten, cortecs, comtegra, deepseek, fpt, firmware, huggingface, moonshotai, nebius, scaleway, stackit, groq, mistral, perplexity, togetherai, deepinfra, xai, grok-build, nvidia-nim, lmstudio, ollama, chutes, cerebras, alibaba-coding-plan, openai-compatible, cursor, copilot, gemini, antigravity, google, or auto-detect). Interactive sessions can switch providers with /model
+
+          Possible values:
+          - jcode
+          - claude
+          - anthropic-api
+          - openai
+          - openai-api
+          - openrouter
+          - bedrock
+          - azure
+          - opencode
+          - opencode-go
+          - zai
+          - kimi
+          - ai302
+          - baseten
+          - cortecs
+          - comtegra
+          - deepseek
+          - fpt
+          - firmware
+          - hugging-face
+          - moonshot-ai
+          - nebius
+          - scaleway
+          - stackit
+          - groq
+          - mistral
+          - perplexity
+          - together-ai
+          - deepinfra
+          - fireworks
+          - minimax
+          - xai
+          - grok-build:          Grok Build subscription via the authenticated Grok CLI ACP transport
+          - nvidia-nim
+          - xiaomi-mimo
+          - meta-muse
+          - celeris
+          - lmstudio
+          - ollama
+          - chutes
+          - cerebras
+          - alibaba-coding-plan
+          - openai-compatible
+          - cursor
+          - copilot
+          - gemini
+          - gemini-api
+          - antigravity
+          - google
+          - auto
+
+          [default: auto]
+
+  -C, --cwd <CWD>
+          Working directory for the local client process
+
+      --remote-working-dir <REMOTE_WORKING_DIR>
+          Working directory to send to a remote server when using --socket
+
+      --no-update
+          Skip the automatic update check
+
+      --auto-update
+          Auto-update when new version is available (default: true for release builds)
+
+      --trace
+          Log tool inputs/outputs and token usage to stderr
+
+      --quiet
+          Suppress non-error CLI/status output for scripting and wrappers
+
+      --resume [<RESUME>]
+          Resume a session by ID, or list sessions if no ID provided
+
+      --no-selfdev
+          Disable auto-detection of jcode repository and self-dev mode
+
+      --onboarding-sim
+          Start the onboarding simulator on launch (same as `/onboarding-sim`). Steps through every first-run onboarding screen with synthetic data; never touches real auth state
+
+      --socket <SOCKET>
+          Custom socket path for server/client communication
+
+      --debug-socket
+          Enable debug socket (broadcasts all TUI state changes)
+
+  -m, --model <MODEL>
+          Model to use (e.g., claude-opus-4-6, gpt-5.5)
+
+      --provider-profile <PROVIDER_PROFILE>
+          Named provider profile from [providers.<name>] in config.toml. Implies --provider openai-compatible for OpenAI-compatible profiles
+
+      --tool-profile <TOOL_PROFILE>
+          Tool profile to expose to the model: full, minimal/lite, or none
+
+      --tools <TOOLS>
+          Comma-separated explicit allow-list of tools to expose, e.g. bash,read,write,apply_patch. Use '*' or 'all' for the unrestricted full toolset
+
+      --disabled-tools <DISABLED_TOOLS>
+          Comma-separated list of tools to hide after applying the selected profile
+
+      --disable-base-tools
+          Hide all built-in tools unless --tools or [tools].enabled opts tools back in
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version

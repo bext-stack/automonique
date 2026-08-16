@@ -1,14 +1,14 @@
 {
   "schema": "automonique.provider-surface/v1",
   "provider": "claude",
-  "capture_date": "2026-08-09",
+  "capture_date": "2026-08-16",
   "expected_base": "972f94894dc84921454bfdde131c9fa8efa57ec2",
   "licence_class": "Elastic-2.0",
   "binary": {
     "command": "claude",
     "version": {
-      "value": "2.1.226",
-      "display": "2.1.226 (Claude Code)",
+      "value": "2.1.233",
+      "display": "2.1.233 (Claude Code)",
       "evidence_level": "observed"
     },
     "build": {

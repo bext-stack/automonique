@@ -1,0 +1,119 @@
+Manage the background server daemon (e.g. `jcode server stop`)
+
+Usage: jcode-linux-x86_64.bin server [OPTIONS] <COMMAND>
+
+Commands:
+  start    Start the background server if it is not already running
+  promote  Pin the shared server channel to an installed version
+  reload   Gracefully reload the running background server onto the newest binary
+  stop     Stop the running background server and clear its socket
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -p, --provider <PROVIDER>
+          Initial provider to use (jcode, claude, openai, openai-api, openrouter, azure, opencode, opencode-go, zai, 302ai, baseten, cortecs, comtegra, deepseek, fpt, firmware, huggingface, moonshotai, nebius, scaleway, stackit, groq, mistral, perplexity, togetherai, deepinfra, xai, grok-build, nvidia-nim, lmstudio, ollama, chutes, cerebras, alibaba-coding-plan, openai-compatible, cursor, copilot, gemini, antigravity, google, or auto-detect). Interactive sessions can switch providers with /model
+
+          Possible values:
+          - jcode
+          - claude
+          - anthropic-api
+          - openai
+          - openai-api
+          - openrouter
+          - bedrock
+          - azure
+          - opencode
+          - opencode-go
+          - zai
+          - kimi
+          - ai302
+          - baseten
+          - cortecs
+          - comtegra
+          - deepseek
+          - fpt
+          - firmware
+          - hugging-face
+          - moonshot-ai
+          - nebius
+          - scaleway
+          - stackit
+          - groq
+          - mistral
+          - perplexity
+          - together-ai
+          - deepinfra
+          - fireworks
+          - minimax
+          - xai
+          - grok-build:          Grok Build subscription via the authenticated Grok CLI ACP transport
+          - nvidia-nim
+          - xiaomi-mimo
+          - meta-muse
+          - celeris
+          - lmstudio
+          - ollama
+          - chutes
+          - cerebras
+          - alibaba-coding-plan
+          - openai-compatible
+          - cursor
+          - copilot
+          - gemini
+          - gemini-api
+          - antigravity
+          - google
+          - auto
+
+          [default: auto]
+
+  -C, --cwd <CWD>
+          Working directory for the local client process
+
+      --remote-working-dir <REMOTE_WORKING_DIR>
+          Working directory to send to a remote server when using --socket
+
+      --no-update
+          Skip the automatic update check
+
+      --auto-update
+          Auto-update when new version is available (default: true for release builds)
+
+      --trace
+          Log tool inputs/outputs and token usage to stderr
+
+      --quiet
+          Suppress non-error CLI/status output for scripting and wrappers
+
+      --resume [<RESUME>]
+          Resume a session by ID, or list sessions if no ID provided
+
+      --no-selfdev
+          Disable auto-detection of jcode repository and self-dev mode
+
+      --socket <SOCKET>
+          Custom socket path for server/client communication
+
+      --debug-socket
+          Enable debug socket (broadcasts all TUI state changes)
+
+  -m, --model <MODEL>
+          Model to use (e.g., claude-opus-4-6, gpt-5.5)
+
+      --provider-profile <PROVIDER_PROFILE>
+          Named provider profile from [providers.<name>] in config.toml. Implies --provider openai-compatible for OpenAI-compatible profiles
+
+      --tool-profile <TOOL_PROFILE>
+          Tool profile to expose to the model: full, minimal/lite, or none
+
+      --tools <TOOLS>
+          Comma-separated explicit allow-list of tools to expose, e.g. bash,read,write,apply_patch. Use '*' or 'all' for the unrestricted full toolset
+
+      --disabled-tools <DISABLED_TOOLS>
+          Comma-separated list of tools to hide after applying the selected profile
+
+      --disable-base-tools
+          Hide all built-in tools unless --tools or [tools].enabled opts tools back in
+
+  -h, --help
+          Print help (see a summary with '-h')

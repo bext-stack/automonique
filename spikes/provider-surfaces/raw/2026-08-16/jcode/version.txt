@@ -1,0 +1,11 @@
+{
+  "version": "v0.76.0 (bbef1f6a8)",
+  "semver": "0.76.0",
+  "base_semver": "0.76.0",
+  "update_semver": "0.76.0",
+  "git_hash": "bbef1f6a8",
+  "git_tag": "v0.76.0",
+  "build_time": "2026-08-14 16:33:48 +0000",
+  "git_date": "2026-08-14 03:49:54 -0700",
+  "release_build": true
+}

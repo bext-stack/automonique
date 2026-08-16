@@ -1,7 +1,7 @@
 {
   "schema": "automonique.provider-surface/v1",
   "provider": "codex",
-  "capture_date": "2026-08-09",
+  "capture_date": "2026-08-16",
   "base": "972f94894dc84921454bfdde131c9fa8efa57ec2",
   "licence": "Elastic-2.0",
   "version": {

@@ -110,6 +110,9 @@ jobs:
       - name: Regeneration changed nothing
         run: git diff --exit-code -- sdk/typescript/packages/protocol/generated/
 
+      - name: Verify the systemd user service
+        run: tools/verify_systemd_unit.sh
+
   # Report-only, and deliberately not in the required-check set: the floor is a
   # decision to make once the number is known, and an instrumented rebuild of
   # the whole workspace does not belong on the pull-request critical path.

@@ -181,6 +181,7 @@ mod site_inventory;
 pub mod skill_runtime;
 pub mod slack;
 mod synthetic;
+mod systemd;
 mod telegram;
 pub mod telegram_bridge;
 pub mod ticket_intake;
@@ -971,6 +972,8 @@ pub enum DaemonError {
     /// status while nothing could watch a run would be reporting a capability
     /// it does not have.
     ProgressEndpointFailed(&'static str),
+    /// The service manager's readiness/watchdog notification channel failed.
+    ServiceManagerFailed(&'static str),
 }
 
 impl DaemonError {
@@ -1001,6 +1004,7 @@ impl DaemonError {
             Self::ApprovalRequestsFailed(category) => category,
             Self::ApprovalPolicyRefused(category) => category,
             Self::ProgressEndpointFailed(category) => category,
+            Self::ServiceManagerFailed(category) => category,
         }
     }
 }
@@ -1067,6 +1071,9 @@ impl fmt::Display for DaemonError {
             }
             Self::ProgressEndpointFailed(category) => {
                 write!(formatter, "progress endpoint failed: {category}")
+            }
+            Self::ServiceManagerFailed(category) => {
+                write!(formatter, "service manager notification failed: {category}")
             }
         }
     }
@@ -1650,6 +1657,8 @@ impl Daemon {
     /// Returns an I/O or durable-state failure. Individual hostile clients are
     /// closed and do not stop the daemon.
     pub fn serve(mut self, stop: &AtomicBool) -> Result<(), DaemonError> {
+        let mut service_manager = systemd::Notifier::from_environment()
+            .map_err(|error| DaemonError::ServiceManagerFailed(error.category()))?;
         let mut next_renewal = std::time::Instant::now() + LEASE_RENEW_INTERVAL;
         // The first sweep runs immediately: a daemon that just took over a
         // generation is exactly the one most likely to be holding proposals
@@ -1699,67 +1708,84 @@ impl Daemon {
             });
         let result = match started {
             Err(error) => Err(error),
-            Ok(()) => loop {
-                if stop.load(Ordering::Acquire) {
-                    break Ok(());
-                }
-                if std::time::Instant::now() >= next_renewal {
-                    if let Err(error) = self.renew_lease() {
-                        break Err(error);
-                    }
-                    // The bot lease renews on the same cadence and beneath the
-                    // just-renewed generation authority; losing it is fencing
-                    // evidence, not a condition to poll through. A live host
-                    // republishes the renewed lease to its poller here, which is
-                    // what keeps the next long poll inside its own expiry.
-                    if let Err(error) = self.telegram.renew() {
-                        break Err(DaemonError::TelegramRefused(error.category()));
-                    }
-                    next_renewal = std::time::Instant::now() + LEASE_RENEW_INTERVAL;
-                }
-                if self.reconciliation_run_id.is_none()
-                    && let Err(error) = self.tick_synthetic()
+            Ok(()) => 'serving: {
+                if let Some(notifier) = service_manager.as_mut()
+                    && let Err(error) = notifier.ready()
                 {
-                    break Err(error);
+                    break 'serving Err(DaemonError::ServiceManagerFailed(error.category()));
                 }
-                // The approval sweep runs on its own cadence rather than on
-                // every accept poll: it reads two databases, and a deadline
-                // measured in minutes does not need to be checked at the rate a
-                // socket is polled.
-                if std::time::Instant::now() >= next_approval_sweep {
-                    match unix_millis().and_then(|now_ms| self.tick_approvals(now_ms)) {
-                        Ok(()) => {}
-                        Err(error) => break Err(error),
+                loop {
+                    if let Some(notifier) = service_manager.as_mut()
+                        && let Err(error) = notifier.watchdog_if_due()
+                    {
+                        break 'serving Err(DaemonError::ServiceManagerFailed(error.category()));
                     }
-                    next_approval_sweep = std::time::Instant::now() + APPROVAL_SWEEP_INTERVAL;
-                }
-                match self.listener.accept() {
-                    Ok((mut stream, _)) => {
-                        // The timed renewal and each store mutation validate the
-                        // durable epoch. Read-only status additionally compares
-                        // a consistent lease snapshot, so client polling must not
-                        // turn into an fsync/lease-write storm.
-                        match self.handle_stream(&mut stream, stop) {
+                    if stop.load(Ordering::Acquire) {
+                        break 'serving Ok(());
+                    }
+                    if std::time::Instant::now() >= next_renewal {
+                        if let Err(error) = self.renew_lease() {
+                            break 'serving Err(error);
+                        }
+                        // The bot lease renews on the same cadence and beneath the
+                        // just-renewed generation authority; losing it is fencing
+                        // evidence, not a condition to poll through. A live host
+                        // republishes the renewed lease to its poller here, which is
+                        // what keeps the next long poll inside its own expiry.
+                        if let Err(error) = self.telegram.renew() {
+                            break 'serving Err(DaemonError::TelegramRefused(error.category()));
+                        }
+                        next_renewal = std::time::Instant::now() + LEASE_RENEW_INTERVAL;
+                    }
+                    if self.reconciliation_run_id.is_none()
+                        && let Err(error) = self.tick_synthetic()
+                    {
+                        break 'serving Err(error);
+                    }
+                    // The approval sweep runs on its own cadence rather than on
+                    // every accept poll: it reads two databases, and a deadline
+                    // measured in minutes does not need to be checked at the rate a
+                    // socket is polled.
+                    if std::time::Instant::now() >= next_approval_sweep {
+                        match unix_millis().and_then(|now_ms| self.tick_approvals(now_ms)) {
                             Ok(()) => {}
-                            Err(DaemonError::Store(store_error)) => {
-                                if fatal_store_error(&store_error) {
-                                    break Err(DaemonError::Store(store_error));
+                            Err(error) => break 'serving Err(error),
+                        }
+                        next_approval_sweep = std::time::Instant::now() + APPROVAL_SWEEP_INTERVAL;
+                    }
+                    match self.listener.accept() {
+                        Ok((mut stream, _)) => {
+                            // The timed renewal and each store mutation validate the
+                            // durable epoch. Read-only status additionally compares
+                            // a consistent lease snapshot, so client polling must not
+                            // turn into an fsync/lease-write storm.
+                            match self.handle_stream(&mut stream, stop) {
+                                Ok(()) => {}
+                                Err(DaemonError::Store(store_error)) => {
+                                    if fatal_store_error(&store_error) {
+                                        break Err(DaemonError::Store(store_error));
+                                    }
+                                }
+                                Err(_) => {
+                                    // A hostile or incomplete peer is isolated to
+                                    // this connection. Refusal details never contain
+                                    // bytes.
                                 }
                             }
-                            Err(_) => {
-                                // A hostile or incomplete peer is isolated to
-                                // this connection. Refusal details never contain
-                                // bytes.
-                            }
                         }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(ACCEPT_POLL);
+                        }
+                        Err(error) => break 'serving Err(DaemonError::Io(error)),
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(ACCEPT_POLL);
-                    }
-                    Err(error) => break Err(DaemonError::Io(error)),
                 }
-            },
+            }
         };
+        let service_stopping = service_manager.as_ref().map_or(Ok(()), |notifier| {
+            notifier
+                .stopping()
+                .map_err(|error| DaemonError::ServiceManagerFailed(error.category()))
+        });
         // LIVE ATTEMPTS END FIRST, AND THEY END BY FINISHING.
         //
         // Every worker holds a registration on the attempt host and writes to
@@ -1874,7 +1900,8 @@ impl Daemon {
             Ok(()) => attempt_host_disposal
                 .and(telegram_release)
                 .and(tenure_close)
-                .and(release),
+                .and(release)
+                .and(service_stopping),
         }
     }
 

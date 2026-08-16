@@ -12,8 +12,8 @@ becomes runtime proof.
 Capture and verify with fixed explicit argument vectors:
 
 ```sh
-python3 tools/provider_inventory.py capture --capture-date 2026-08-09
-python3 tools/provider_inventory.py verify --capture-date 2026-08-09
+python3 tools/provider_inventory.py capture --capture-date 2026-08-16
+python3 tools/provider_inventory.py verify --capture-date 2026-08-16
 python3 -m unittest tools/test_provider_inventory.py
 ```
 

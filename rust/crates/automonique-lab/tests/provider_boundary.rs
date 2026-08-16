@@ -21,7 +21,7 @@ const JCODE_SURFACE: &[u8] =
 const OPENCODE_SURFACE: &[u8] =
     include_bytes!("../../../../spikes/provider-surfaces/providers/opencode.json");
 const CODEX_SURFACE_SHA256: &str =
-    "abd7d9bcd2a12983ee76d97da9f28a229abea9f3e5d59702b776a7078448dfa8";
+    "c2b3fc4bed4a01cfb24906ce7c9bbe64bc851fa1e082862f551488d703db0590";
 const CODEX_BINARY_SHA256: &str =
     "cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40";
 
