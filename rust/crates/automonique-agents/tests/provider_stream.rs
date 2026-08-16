@@ -13,7 +13,8 @@
 
 use automonique_agents::{
     AdapterError, ExecutionMode, MAX_JSONL_LINE_BYTES, MAX_STREAM_EVENTS, NormalizedEvent,
-    ProviderDisposition, ProviderEventStream, RunCoordinates, SessionScope, normalize_jsonl,
+    ProviderDisposition, ProviderEventStream, RunCoordinates, SessionScope, StreamPolicy,
+    normalize_jsonl,
 };
 
 /// One complete successful turn, exactly as the normalizer accepts it.
@@ -370,4 +371,54 @@ fn framing_and_encoding_faults_fail_closed() {
             .category(),
         "event_order"
     );
+}
+
+#[test]
+fn session_policy_warns_on_garbage_and_continues_to_the_terminal_result() {
+    let mut bytes = String::from(OPEN_TURN);
+    bytes.push_str("this is not json\n");
+    bytes.push_str(
+        "{\"type\":\"item.started\",\"item\":{\"id\":\"m-1\",\"type\":\"agent_message\"}}\n\
+         {\"type\":\"item.completed\",\"item\":{\"id\":\"m-1\",\"type\":\"agent_message\",\"text\":\"done\"}}\n\
+         {\"type\":\"turn.completed\",\"usage\":{\"cached_input_tokens\":0,\"input_tokens\":1,\"output_tokens\":1}}\n",
+    );
+    let mut stream = ProviderEventStream::with_policy(
+        &coordinates(),
+        &ExecutionMode::NewSession,
+        StreamPolicy::Session,
+    );
+    stream
+        .push_bytes(bytes.as_bytes())
+        .expect("session continues");
+    assert_eq!(stream.warning_count(), 1);
+    let transcript = stream.finish_session(true).expect("terminal transcript");
+    assert_eq!(transcript.warning_count(), 1);
+    assert_eq!(transcript.disposition(), ProviderDisposition::Succeeded);
+}
+
+#[test]
+fn session_policy_turns_truncation_or_nonzero_exit_into_failed_completion() {
+    for (bytes, exit_success, warnings) in [
+        (format!("{OPEN_TURN}{{\"type\":\"item.started\""), true, 1),
+        (OPEN_TURN.to_owned(), false, 0),
+    ] {
+        let mut stream = ProviderEventStream::with_policy(
+            &coordinates(),
+            &ExecutionMode::NewSession,
+            StreamPolicy::Session,
+        );
+        stream
+            .push_bytes(bytes.as_bytes())
+            .expect("prefix accepted");
+        let transcript = stream
+            .finish_session(exit_success)
+            .expect("supervisor terminalizes failure");
+        assert_eq!(transcript.warning_count(), warnings);
+        assert_eq!(transcript.disposition(), ProviderDisposition::Failed);
+        assert!(transcript.events().iter().any(|event| matches!(
+            event,
+            NormalizedEvent::Recorded(recorded)
+                if recorded.kind() == automonique_agents::RecordedKind::TurnCompleted
+        )));
+    }
 }

@@ -220,6 +220,7 @@ pub fn normalize_jsonl(
         binding,
         events,
         disposition,
+        warning_count: 0,
     })
 }
 

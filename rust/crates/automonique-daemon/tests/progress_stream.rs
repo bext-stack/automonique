@@ -19,8 +19,8 @@ use automonique_agents::{
     ExecutionMode, ProviderItemKind, RecordedKind, RunCoordinates, SessionScope,
 };
 use automonique_daemon::progress::{
-    PREVIEW_FLUSH_BYTES, ProviderProgressMapper, STREAM_REFUSED_PREFIX, frame_kind,
-    item_frame_authority, item_frame_kind,
+    PREVIEW_FLUSH_BYTES, ProviderProgressMapper, STREAM_REFUSED_PREFIX, STREAM_WARNING_TEXT,
+    frame_kind, item_frame_authority, item_frame_kind,
 };
 use automonique_daemon::progress_hub::{
     HUB_ATTEMPT_FRAMES, HUB_ATTEMPTS, HUB_TERMINAL_RETENTION, ProgressHub,
@@ -258,6 +258,31 @@ mod normalization {
         frames = mapper.push(b"{\"type\":\"turn.started\"}\n");
         assert!(frames.is_empty());
         assert!(mapper.finish().is_empty());
+    }
+
+    #[test]
+    fn a_session_stream_warns_on_garbage_and_keeps_rendering() {
+        let mut mapper =
+            ProviderProgressMapper::for_session(&coordinates(), &ExecutionMode::NewSession);
+        let transcript = "{\"type\":\"thread.started\",\"thread_id\":\"fixture-session\"}\n\
+                          garbage\n\
+                          {\"type\":\"turn.started\"}\n";
+        let frames = mapper.push(transcript.as_bytes());
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.kind == EventKind::ProviderWarning)
+                .count(),
+            1
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame.kind == EventKind::TurnStarted)
+        );
+        assert!(frames.iter().any(|frame| {
+            frame.body.text().map(ProgressText::as_str) == Some(STREAM_WARNING_TEXT)
+        }));
     }
 
     /// A truncated final line is held, never salvaged into a frame.

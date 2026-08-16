@@ -216,6 +216,9 @@ pub enum PromptDelivery {
         /// themselves never enter a plan.
         prompt_bytes: usize,
     },
+    /// The process keeps stdin open and receives bounded NDJSON turns from the
+    /// session host after the launch frame has been consumed.
+    SessionNdjson,
 }
 
 /// Everything needed to plan one provider process.
@@ -320,6 +323,39 @@ impl ProviderSpawnRequest {
             prompt: PromptDelivery::UnresolvedProviderStdin {
                 prompt_bytes: request.prompt.len(),
             },
+        })
+    }
+
+    /// Plan the long-lived Codex app-server shape used by a session host.
+    ///
+    /// The executable pin and sandbox grants are identical to [`Self::plan`],
+    /// but argv is the second closed provider shape (`app-server`) and no turn
+    /// prompt is embedded in the launch plan. Turns travel over the retained
+    /// NDJSON stdin stream.
+    pub fn plan_session(&self, request: &RunRequest) -> Result<ProviderLaunchPlan, SpawnPlanError> {
+        let one_shot = self.plan(request)?;
+        let arguments = vec!["app-server".to_owned()];
+        let mut launch = LaunchPlan::new(self.executable.path())?;
+        launch = launch.argument(&arguments[0])?;
+        for (intent, path) in &one_shot.grants {
+            launch = launch.filesystem_grant(*intent, path.clone())?;
+        }
+        for grant in &one_shot.socket_grants {
+            launch = launch.socket_grant(*grant)?;
+        }
+        for port in &one_shot.connect_ports {
+            launch = launch.allow_connect_port(*port)?;
+        }
+        launch.encode()?;
+        Ok(ProviderLaunchPlan {
+            kind: self.kind,
+            launch,
+            grants: one_shot.grants,
+            socket_grants: one_shot.socket_grants,
+            connect_ports: one_shot.connect_ports,
+            arguments,
+            verified_sha256: one_shot.verified_sha256,
+            prompt: PromptDelivery::SessionNdjson,
         })
     }
 

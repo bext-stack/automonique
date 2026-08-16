@@ -69,6 +69,10 @@ impl Normalizer {
         &self.events
     }
 
+    pub fn is_terminal(&self) -> bool {
+        self.disposition.is_some()
+    }
+
     pub fn finish(&self) -> Result<NormalizedRun, AdapterError> {
         let session = self.session.clone().ok_or(AdapterError::EventOrder)?;
         let disposition = self.disposition.ok_or(AdapterError::EventOrder)?;
@@ -78,6 +82,17 @@ impl Normalizer {
             events: self.events.clone(),
             disposition,
         })
+    }
+
+    /// Complete an interrupted active turn as a provider failure.
+    pub fn finish_failed(mut self) -> Result<NormalizedRun, AdapterError> {
+        if self.disposition.is_none() {
+            self.active_item = None;
+            self.record(RecordedKind::ProviderFault, None)?;
+            self.record(RecordedKind::TurnCompleted, None)?;
+            self.disposition = Some(ProviderDisposition::Failed);
+        }
+        self.finish()
     }
 
     fn thread_started(&mut self, object: &Map<String, Value>) -> Result<(), AdapterError> {

@@ -83,6 +83,9 @@ use automonique_protocol::execute_api::{
 };
 use automonique_protocol::tools::RunId;
 use automonique_slack_connector::{ChannelId, MessageBlocks, MessageTs};
+use automonique_store::provider_deployments::{
+    DeploymentRegistration, ProviderDeployments, RouteClass,
+};
 use automonique_store::run_index::{RunIndex, RunSpoolState};
 
 use automonique_transport_runtime::{
@@ -107,6 +110,9 @@ use crate::telegram_bridge::{
 /// present file is also refused and falls back, matching the primary config's
 /// current fail-closed load behavior without taking `/status` down.
 pub const CONVERSATION_PROVIDER_CONFIG_NAME: &str = "conversation-provider";
+pub const PROVIDER_DEPLOYMENTS_NAME: &str = "provider-deployments.sqlite3";
+const PRIMARY_DEPLOYMENT: &str = "primary";
+const CONVERSATION_DEPLOYMENT: &str = "conversation";
 
 /// How long one `/run` waits for its run to reach a terminal state.
 ///
@@ -402,6 +408,9 @@ pub struct SocketRunLane {
     /// A present but malformed conversation configuration fails closed instead
     /// of silently spending the primary provider.
     conversation_provider_refused: bool,
+    /// Durable per-deployment failures, cooldowns and ordered fallback ranks.
+    provider_deployments: Option<ProviderDeployments>,
+    provider_deployments_refused: bool,
     /// Whether this deployment resolves any brokered destination. A composed
     /// document declares `brokered_named`, so without one it cannot be admitted.
     egress_configured: bool,
@@ -446,8 +455,46 @@ impl SocketRunLane {
             .unwrap_or_default();
         let conversation_provider =
             ProviderConfig::load(&state_dir.join(CONVERSATION_PROVIDER_CONFIG_NAME));
-        let conversation_provider_refused = conversation_provider.is_err();
+        let mut conversation_provider_refused = conversation_provider.is_err();
         let conversation_provider = conversation_provider.unwrap_or_default();
+        let (mut provider_deployments, mut provider_deployments_refused) =
+            if provider.is_some() || conversation_provider.is_some() {
+                match ProviderDeployments::open(state_dir.join(PROVIDER_DEPLOYMENTS_NAME)) {
+                    Ok(deployments) => (Some(deployments), false),
+                    Err(_) => (None, true),
+                }
+            } else {
+                (None, false)
+            };
+        if let Some(deployments) = provider_deployments.as_mut()
+            && provider.is_some()
+            && deployments
+                .register(DeploymentRegistration {
+                    deployment_id: PRIMARY_DEPLOYMENT,
+                    provider_kind: "codex",
+                    primary_rank: Some(1),
+                    context_window_rank: Some(0),
+                })
+                .is_err()
+        {
+            provider_deployments = None;
+            provider_deployments_refused = true;
+        }
+        if let Some(deployments) = provider_deployments.as_mut()
+            && conversation_provider.is_some()
+            && deployments
+                .register(DeploymentRegistration {
+                    deployment_id: CONVERSATION_DEPLOYMENT,
+                    provider_kind: "conversation",
+                    primary_rank: Some(0),
+                    context_window_rank: Some(1),
+                })
+                .is_err()
+        {
+            provider_deployments = None;
+            provider_deployments_refused = true;
+            conversation_provider_refused = true;
+        }
         let egress_configured =
             !crate::egress::load_destinations(&state_dir.join(crate::EGRESS_DESTINATIONS_NAME))
                 .unwrap_or_default()
@@ -459,6 +506,8 @@ impl SocketRunLane {
             provider,
             conversation_provider,
             conversation_provider_refused,
+            provider_deployments,
+            provider_deployments_refused,
             egress_configured,
             offered: crate::execute::offered_host_features(),
             sequence: 0,
@@ -951,24 +1000,110 @@ impl SocketRunLane {
         task: &str,
         profile: ProviderRunProfile,
     ) -> Result<String, RunFailure> {
+        if self.provider_deployments_refused {
+            return Err(RunFailure::Unavailable);
+        }
         if profile == ProviderRunProfile::FastConversation && self.conversation_provider_refused {
             return Err(RunFailure::NotConfigured);
         }
-        let selected = if profile == ProviderRunProfile::FastConversation {
-            self.conversation_provider
-                .as_ref()
-                .or(self.provider.as_ref())
+        let (selected, deployment_id) = if profile == ProviderRunProfile::FastConversation {
+            let routed = crate::unix_millis().ok().and_then(|now_ms| {
+                self.provider_deployments
+                    .as_ref()
+                    .and_then(|deployments| deployments.select(RouteClass::Primary, now_ms).ok())
+                    .flatten()
+                    .map(|deployment| deployment.deployment_id)
+            });
+            match routed.as_deref() {
+                Some(CONVERSATION_DEPLOYMENT) => (
+                    self.conversation_provider
+                        .as_ref()
+                        .or(self.provider.as_ref()),
+                    Some(CONVERSATION_DEPLOYMENT),
+                ),
+                Some(PRIMARY_DEPLOYMENT) => (self.provider.as_ref(), Some(PRIMARY_DEPLOYMENT)),
+                _ => (
+                    self.conversation_provider
+                        .as_ref()
+                        .or(self.provider.as_ref()),
+                    None,
+                ),
+            }
         } else {
-            self.provider.as_ref()
+            (self.provider.as_ref(), Some(PRIMARY_DEPLOYMENT))
         };
         let Some(provider) = selected.cloned() else {
             return Err(RunFailure::NotConfigured);
         };
+        let outcome = self.run_selected_provider(task, profile, &provider);
+        let Some(deployment_id) = deployment_id else {
+            return outcome;
+        };
+        let Ok(now_ms) = crate::unix_millis() else {
+            return outcome;
+        };
+        let Some(deployments) = self.provider_deployments.as_mut() else {
+            return outcome;
+        };
+        match &outcome {
+            Ok(_) => {
+                let _ = deployments.record_success(deployment_id);
+                outcome
+            }
+            Err(_) => {
+                let tripped = deployments
+                    .record_failure(deployment_id, now_ms)
+                    .ok()
+                    .is_some_and(|record| record.cooldown_until_ms > now_ms);
+                if !tripped || profile != ProviderRunProfile::FastConversation {
+                    return outcome;
+                }
+                let fallback_id = deployments
+                    .select(RouteClass::Primary, now_ms)
+                    .ok()
+                    .flatten()
+                    .map(|record| record.deployment_id);
+                let fallback = match fallback_id.as_deref() {
+                    Some(PRIMARY_DEPLOYMENT) if deployment_id != PRIMARY_DEPLOYMENT => {
+                        self.provider.clone()
+                    }
+                    Some(CONVERSATION_DEPLOYMENT) if deployment_id != CONVERSATION_DEPLOYMENT => {
+                        self.conversation_provider.clone()
+                    }
+                    _ => None,
+                };
+                let Some(fallback) = fallback else {
+                    return outcome;
+                };
+                let fallback_outcome = self.run_selected_provider(task, profile, &fallback);
+                if let Some(fallback_id) = fallback_id
+                    && let Some(deployments) = self.provider_deployments.as_mut()
+                {
+                    match &fallback_outcome {
+                        Ok(_) => {
+                            let _ = deployments.record_success(&fallback_id);
+                        }
+                        Err(_) => {
+                            let _ = deployments.record_failure(&fallback_id, now_ms);
+                        }
+                    }
+                }
+                fallback_outcome
+            }
+        }
+    }
+
+    fn run_selected_provider(
+        &mut self,
+        task: &str,
+        profile: ProviderRunProfile,
+        provider: &ProviderConfig,
+    ) -> Result<String, RunFailure> {
         let run_id = self.next_run_id()?;
         let inputs = CompositionInputs {
             state_dir: &self.state_dir,
             run_id: &run_id,
-            provider: &provider,
+            provider,
             offered_features: &self.offered,
             egress_configured: self.egress_configured,
         };

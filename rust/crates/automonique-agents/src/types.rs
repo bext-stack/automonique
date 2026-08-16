@@ -398,6 +398,7 @@ pub struct NormalizedTranscript {
     pub(crate) binding: ResumeBinding,
     pub(crate) events: Vec<NormalizedEvent>,
     pub(crate) disposition: ProviderDisposition,
+    pub(crate) warning_count: u64,
 }
 
 impl NormalizedTranscript {
@@ -414,6 +415,12 @@ impl NormalizedTranscript {
     #[must_use]
     pub const fn disposition(&self) -> ProviderDisposition {
         self.disposition
+    }
+
+    /// Invalid NDJSON lines skipped by an explicitly lenient session stream.
+    #[must_use]
+    pub const fn warning_count(&self) -> u64 {
+        self.warning_count
     }
 }
 

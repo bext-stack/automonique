@@ -41,7 +41,7 @@ pub use spawn_plan::{
     MAX_LOADER_GRANTS, PromptDelivery, ProviderExecutable, ProviderKind, ProviderLaunchPlan,
     ProviderNetwork, ProviderSpawnRequest, SHA256_HEX_BYTES, SpawnPlanError,
 };
-pub use stream::{MAX_STREAM_EVENTS, ProviderEventStream};
+pub use stream::{MAX_STREAM_EVENTS, ProviderEventStream, StreamPolicy};
 pub use types::{
     AdapterEnvironment, AdapterError, CancellationToken, CoordinateError, ExecutionMode,
     MAX_ENV_VALUE_BYTES, MAX_EVENT_KIND_BYTES, MAX_JSONL_LINE_BYTES, MAX_JSONL_TOTAL_BYTES,

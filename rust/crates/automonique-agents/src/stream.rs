@@ -80,6 +80,16 @@ use crate::types::{
 /// on.
 pub const MAX_STREAM_EVENTS: usize = 4096;
 
+/// How an incremental stream handles malformed NDJSON lines.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StreamPolicy {
+    /// Any malformed line permanently refuses the stream.
+    #[default]
+    Strict,
+    /// Invalid JSON or UTF-8 warns and continues at the next newline.
+    Session,
+}
+
 /// Incremental parser over one provider process's stdout bytes.
 ///
 /// Construction is free and starts no work. The parser *copies* the run
@@ -92,6 +102,8 @@ pub struct ProviderEventStream {
     pending: Vec<u8>,
     total_bytes: usize,
     refusal: Option<AdapterError>,
+    policy: StreamPolicy,
+    warning_count: u64,
 }
 
 impl ProviderEventStream {
@@ -103,7 +115,21 @@ impl ProviderEventStream {
             pending: Vec::new(),
             total_bytes: 0,
             refusal: None,
+            policy: StreamPolicy::Strict,
+            warning_count: 0,
         }
+    }
+
+    /// Start a stream under an explicitly selected malformed-line policy.
+    #[must_use]
+    pub fn with_policy(
+        coordinates: &RunCoordinates,
+        mode: &ExecutionMode,
+        policy: StreamPolicy,
+    ) -> Self {
+        let mut stream = Self::new(coordinates, mode);
+        stream.policy = policy;
+        stream
     }
 
     /// Feed the next chunk of provider stdout.
@@ -143,6 +169,12 @@ impl ProviderEventStream {
         self.total_bytes
     }
 
+    /// Invalid lines skipped by [`StreamPolicy::Session`].
+    #[must_use]
+    pub const fn warning_count(&self) -> u64 {
+        self.warning_count
+    }
+
     /// Complete the stream and produce the whole transcript.
     ///
     /// Refuses a stream that was already refused, one holding a partial final
@@ -163,6 +195,39 @@ impl ProviderEventStream {
             binding,
             events,
             disposition,
+            warning_count: self.warning_count,
+        })
+    }
+
+    /// Finish a session process after its trusted supervisor observed exit.
+    ///
+    /// A non-zero exit, truncated final line, or EOF without a provider
+    /// terminal becomes a failed disposition. Strict streams retain their
+    /// ordinary refusal behavior.
+    pub fn finish_session(
+        mut self,
+        exit_success: bool,
+    ) -> Result<NormalizedTranscript, AdapterError> {
+        if self.policy != StreamPolicy::Session {
+            return self.finish();
+        }
+        if let Some(refusal) = self.refusal {
+            return Err(refusal);
+        }
+        if !self.pending.is_empty() {
+            self.pending.clear();
+            self.warning_count = self.warning_count.saturating_add(1);
+        }
+        let normalized = if exit_success && self.normalizer.is_terminal() {
+            self.normalizer.finish()?
+        } else {
+            self.normalizer.finish_failed()?
+        };
+        Ok(NormalizedTranscript {
+            binding: normalized.binding,
+            events: normalized.events,
+            disposition: normalized.disposition,
+            warning_count: self.warning_count,
         })
     }
 
@@ -181,7 +246,15 @@ impl ProviderEventStream {
             // `tail` still begins with the newline itself.
             rest = &tail[1..];
             let line = std::mem::take(&mut self.pending);
-            self.accept_line(&line)?;
+            if let Err(error) = self.accept_line(&line) {
+                if self.policy == StreamPolicy::Session
+                    && matches!(error, AdapterError::InvalidJson | AdapterError::InvalidUtf8)
+                {
+                    self.warning_count = self.warning_count.saturating_add(1);
+                } else {
+                    return Err(error);
+                }
+            }
         }
         self.pending.extend_from_slice(rest);
         // The line bound applies to what is held, not only to what completed:

@@ -178,6 +178,21 @@ fn a_resume_plan_carries_the_provider_session_in_argv() {
 }
 
 #[test]
+fn a_session_plan_has_one_closed_long_lived_argv_shape_and_no_prompt() {
+    let fixture = fixture();
+    let request = request(ExecutionMode::NewSession, AdapterEnvironment::empty());
+    let planned = spawn_request(&fixture, ProviderNetwork::NoNetwork)
+        .plan_session(&request)
+        .expect("session plan");
+    assert_eq!(planned.arguments(), &["app-server"]);
+    assert_eq!(
+        planned.prompt_delivery(),
+        automonique_agents::PromptDelivery::SessionNdjson
+    );
+    assert_eq!(planned.launch_plan().prompt_len(), None);
+}
+
+#[test]
 fn a_tcp_plan_grants_exactly_tcp_and_exactly_the_named_ports() {
     let fixture = fixture();
     let plan = spawn_request(

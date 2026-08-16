@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use automonique_agents::{
     AdapterError, ExecutionMode, NormalizedEvent, ProviderEventStream, ProviderItemKind,
-    RecordedEvent, RecordedKind, RunCoordinates,
+    RecordedEvent, RecordedKind, RunCoordinates, StreamPolicy,
 };
 use automonique_protocol::event::{
     Authority, EventKind, MemberRule, RetryCategory, RetryContext, StepStatus,
@@ -68,6 +68,7 @@ pub const PREVIEW_FLUSH_INTERVAL: Duration = Duration::from_millis(PREVIEW_FLUSH
 
 /// The text of the one warning a refused provider stream emits.
 pub const STREAM_REFUSED_PREFIX: &str = "progress stream refused: ";
+pub const STREAM_WARNING_TEXT: &str = "progress stream warning: malformed provider line skipped";
 
 /// The shared kind one adapter record projects onto.
 ///
@@ -123,6 +124,8 @@ pub struct ProviderProgressMapper {
     last_preview: Instant,
     /// Set once the stream refused, after the one warning that says so.
     finished: bool,
+    /// Session-policy malformed lines already surfaced as warning frames.
+    projected_warnings: u64,
 }
 
 impl ProviderProgressMapper {
@@ -135,6 +138,20 @@ impl ProviderProgressMapper {
             pending_preview: None,
             last_preview: Instant::now(),
             finished: false,
+            projected_warnings: 0,
+        }
+    }
+
+    /// Start the explicitly lenient mapper used by a persistent session host.
+    #[must_use]
+    pub fn for_session(coordinates: &RunCoordinates, mode: &ExecutionMode) -> Self {
+        Self {
+            stream: ProviderEventStream::with_policy(coordinates, mode, StreamPolicy::Session),
+            projected: 0,
+            pending_preview: None,
+            last_preview: Instant::now(),
+            finished: false,
+            projected_warnings: 0,
         }
     }
 
@@ -235,6 +252,27 @@ impl ProviderProgressMapper {
             body,
         })
     }
+
+    fn project_warnings(&mut self, frames: &mut Vec<CapturedFrame>) {
+        while self.projected_warnings < self.stream.warning_count() {
+            self.projected_warnings = self.projected_warnings.saturating_add(1);
+            let Ok(body) = ProgressBody::new(
+                EventKind::ProviderWarning,
+                ProgressBodyParts {
+                    text: ProgressText::new(STREAM_WARNING_TEXT).ok(),
+                    step: None,
+                    retry: RetryContext::new(RetryCategory::Internal, true, None, 1).ok(),
+                },
+            ) else {
+                continue;
+            };
+            frames.push(CapturedFrame {
+                authority: Authority::Synthetic,
+                kind: EventKind::ProviderWarning,
+                body,
+            });
+        }
+    }
 }
 
 impl ProgressMapper for ProviderProgressMapper {
@@ -244,7 +282,10 @@ impl ProgressMapper for ProviderProgressMapper {
         }
         let mut frames = Vec::new();
         match self.stream.push_bytes(chunk) {
-            Ok(_) => self.project(&mut frames),
+            Ok(_) => {
+                self.project(&mut frames);
+                self.project_warnings(&mut frames);
+            }
             Err(error) => {
                 // Whatever the stream accepted before the bad line is still
                 // true, so it is projected before the warning that ends the

@@ -143,9 +143,10 @@ use std::ffi::CString;
 use std::fmt;
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-use std::os::fd::AsRawFd as _;
+use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 
 /// Exact first line of every launch plan frame.
 pub const FRAME_HEADER: &str = "schema=automonique.launch/v1";
@@ -168,6 +169,11 @@ pub const MAX_LAUNCH_ENV_VALUE_BYTES: usize = 4096;
 /// See the module's frame-grammar section for the budget arithmetic that
 /// picks this number.
 pub const MAX_LAUNCH_PROMPT_BYTES: usize = 16 * 1024;
+
+/// Private marker selecting the full-duplex session launch path in the entry
+/// helper. It is consumed before `execve`; the workload receives only the
+/// environment declared by [`LaunchPlan`].
+const SESSION_STREAM_ENV: &str = "AUTOMONIQUE_SESSION_STREAM";
 
 /// Why a launch plan is refused, before any child exists.
 ///
@@ -809,6 +815,87 @@ pub fn spawn_sandboxed_with_stdout(
     Ok(child)
 }
 
+/// A sandboxed workload whose stdin and stdout remain connected to its
+/// supervisor for multiple serialized turns.
+#[derive(Debug)]
+pub struct SandboxedSession {
+    child: Child,
+    stream: UnixStream,
+}
+
+impl SandboxedSession {
+    /// A clone suitable for a dedicated stdout reader thread.
+    pub fn try_clone_stream(&self) -> Result<UnixStream, std::io::Error> {
+        self.stream.try_clone()
+    }
+
+    /// Write already-framed provider input. Callers own the NDJSON grammar.
+    pub fn write_all(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
+        self.stream.write_all(bytes)
+    }
+
+    /// Observe termination without blocking.
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, std::io::Error> {
+        self.child.try_wait()
+    }
+
+    /// Wait for the provider process.
+    pub fn wait(&mut self) -> Result<ExitStatus, std::io::Error> {
+        self.child.wait()
+    }
+
+    /// Request process termination. The owning containment remains responsible
+    /// for descendant-complete cleanup.
+    pub fn kill(&mut self) -> Result<(), std::io::Error> {
+        self.child.kill()
+    }
+
+    /// Operating-system process identifier, for supervision evidence only.
+    #[must_use]
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+/// Spawn a session-scoped workload under the same entry helper and containment
+/// policy as a one-shot launch, while retaining a full-duplex stdin/stdout
+/// stream for serialized NDJSON turns.
+///
+/// A session plan may not contain a one-shot prompt. The helper consumes the
+/// launch frame through its exact terminator, leaves fd 0 connected, applies
+/// the ordinary descriptor/Landlock/seccomp policy, and then `execve`s.
+pub fn spawn_sandboxed_session(
+    helper: &Path,
+    plan: &LaunchPlan,
+    containment: &RunContainment,
+) -> Result<SandboxedSession, LaunchError> {
+    if plan.prompt_len().is_some() {
+        return Err(LaunchPlanError::PromptRejected.into());
+    }
+    let frame = plan.encode()?;
+    let (mut supervisor, workload) = UnixStream::pair()?;
+    let workload_stdin = workload.try_clone()?;
+    let workload_stdin: OwnedFd = workload_stdin.into();
+    let workload_stdout: OwnedFd = workload.into();
+    let mut child = Command::new(helper)
+        .env_clear()
+        .env(crate::CGROUP_DIR_ENV, containment.path())
+        .env(SESSION_STREAM_ENV, "1")
+        .stdin(Stdio::from(workload_stdin))
+        .stdout(Stdio::from(workload_stdout))
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    if let Err(error) = supervisor.write_all(&frame) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(LaunchError::Io(error));
+    }
+    Ok(SandboxedSession {
+        child,
+        stream: supervisor,
+    })
+}
+
 /// Entry-helper process body for a composed sandboxed launch.
 ///
 /// See the module documentation for the exact sequence. Every failure exits
@@ -831,13 +918,29 @@ enum Never {}
 
 fn enter_enforce_and_exec() -> Result<Never, String> {
     // 1. The plan arrives on stdin, bounded, and must be complete.
-    let mut frame = Vec::new();
-    std::io::stdin()
-        .lock()
-        .take(u64::try_from(MAX_FRAME_BYTES + 1).expect("constant fits"))
-        .read_to_end(&mut frame)
-        .map_err(|_| "plan frame unreadable".to_owned())?;
+    let session_stream = match std::env::var(SESSION_STREAM_ENV) {
+        Ok(value) if value == "1" => true,
+        Ok(_) => return Err("session stream marker malformed".to_owned()),
+        Err(std::env::VarError::NotPresent) => false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("session stream marker malformed".to_owned());
+        }
+    };
+    let frame = if session_stream {
+        read_session_launch_frame()?
+    } else {
+        let mut frame = Vec::new();
+        std::io::stdin()
+            .lock()
+            .take(u64::try_from(MAX_FRAME_BYTES + 1).expect("constant fits"))
+            .read_to_end(&mut frame)
+            .map_err(|_| "plan frame unreadable".to_owned())?;
+        frame
+    };
     let plan = LaunchPlan::decode(&frame).map_err(|error| error.to_string())?;
+    if session_stream && plan.prompt.is_some() {
+        return Err("session stream cannot carry a one-shot prompt".to_owned());
+    }
 
     // 2. Enter the cgroup before the workload exists; confirm from the kernel.
     let target = std::env::var_os(crate::CGROUP_DIR_ENV)
@@ -849,13 +952,15 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
     //    Either source is opened before descriptor closure, so the closure
     //    verification below still proves exactly the standard streams remain,
     //    and after the dup2 the original is closed immediately.
-    let stdin_source = match plan.prompt.as_deref() {
-        Some(prompt) => sealed_prompt_descriptor(prompt)?,
-        None => File::open("/dev/null").map_err(|_| "/dev/null unavailable".to_owned())?,
-    };
-    nix::unistd::dup2(stdin_source.as_raw_fd(), 0)
-        .map_err(|_| "stdin replacement failed".to_owned())?;
-    drop(stdin_source);
+    if !session_stream {
+        let stdin_source = match plan.prompt.as_deref() {
+            Some(prompt) => sealed_prompt_descriptor(prompt)?,
+            None => File::open("/dev/null").map_err(|_| "/dev/null unavailable".to_owned())?,
+        };
+        nix::unistd::dup2(stdin_source.as_raw_fd(), 0)
+            .map_err(|_| "stdin replacement failed".to_owned())?;
+        drop(stdin_source);
+    }
 
     // 4. Close and verify descriptors while /proc is still reachable.
     let allowlist = DescriptorAllowlist::standard_streams();
@@ -904,6 +1009,31 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
     nix::unistd::execve(&program, &argv, &environment)
         .map_err(|error| format!("execve failed: {error}"))?;
     unreachable!("execve returned without an error")
+}
+
+/// Read exactly one launch frame without waiting for EOF or consuming bytes
+/// from the first provider turn queued behind it.
+fn read_session_launch_frame() -> Result<Vec<u8>, String> {
+    let terminator = format!("{FRAME_TERMINATOR}\n");
+    let mut frame = Vec::new();
+    let mut line = Vec::new();
+    let stdin = std::io::stdin();
+    let mut locked = stdin.lock();
+    while frame.len() <= MAX_FRAME_BYTES {
+        let mut byte = [0_u8; 1];
+        locked
+            .read_exact(&mut byte)
+            .map_err(|_| "plan frame unreadable".to_owned())?;
+        frame.push(byte[0]);
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            if line == terminator.as_bytes() {
+                return Ok(frame);
+            }
+            line.clear();
+        }
+    }
+    Err("plan frame exceeds bound".to_owned())
 }
 
 /// An anonymous, sealed, memory-backed descriptor holding `prompt`, rewound.

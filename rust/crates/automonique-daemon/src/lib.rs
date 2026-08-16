@@ -165,6 +165,8 @@ mod model_inventory;
 pub mod parity_trace;
 pub mod progress;
 pub mod progress_hub;
+pub mod provider_health;
+pub mod provider_session_host;
 pub mod release_activation;
 pub mod release_builder;
 pub mod run_lane;

@@ -21,10 +21,10 @@
 use automonique_runner::filesystem::PathIntent;
 use automonique_runner::{
     ContainmentDomain, ContainmentError, ContainmentLimits, HELPER_REFUSED_EXIT, LaunchPlan,
-    LaunchPlanError, RunContainment, SocketGrant, spawn_sandboxed,
+    LaunchPlanError, RunContainment, SocketGrant, spawn_sandboxed, spawn_sandboxed_session,
 };
 use std::fs;
-use std::io::Read as _;
+use std::io::{BufRead as _, BufReader, Read as _};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -516,6 +516,44 @@ fn spawn_sandboxed_delivers_the_same_confinement() {
         }
     };
     assert_eq!(status.code(), Some(0));
+    containment.dispose(DRAIN_DEADLINE).unwrap();
+}
+
+#[test]
+fn session_launch_reuses_one_live_process_for_turn_two() {
+    let Some(domain) = enforcement_domain("session_launch_reuses_one_live_process_for_turn_two")
+    else {
+        return;
+    };
+    let containment =
+        RunContainment::create(&domain, &run_id("session"), ContainmentLimits::none()).unwrap();
+    let plan = busybox_plan(
+        "while IFS= read -r line; do printf '%s\\n' \"$line\"; [ \"$line\" = stop ] && exit 0; done",
+        |plan| plan,
+    );
+    let mut session =
+        spawn_sandboxed_session(Path::new(HELPER), &plan, &containment).expect("session spawn");
+    let process_id = session.id();
+    let mut output = BufReader::new(session.try_clone_stream().expect("reader"));
+
+    session.write_all(b"turn-1\n").expect("first turn");
+    let mut line = String::new();
+    output.read_line(&mut line).expect("first result");
+    assert_eq!(line, "turn-1\n");
+    assert_eq!(session.id(), process_id);
+    assert!(session.try_wait().expect("live check").is_none());
+
+    session.write_all(b"turn-2\n").expect("second turn");
+    line.clear();
+    output.read_line(&mut line).expect("second result");
+    assert_eq!(line, "turn-2\n");
+    assert_eq!(session.id(), process_id, "turn two must not spawn again");
+
+    session.write_all(b"stop\n").expect("close");
+    line.clear();
+    output.read_line(&mut line).expect("stop result");
+    assert_eq!(line, "stop\n");
+    assert!(session.wait().expect("reap").success());
     containment.dispose(DRAIN_DEADLINE).unwrap();
 }
 
