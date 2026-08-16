@@ -26,8 +26,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use automonique_daemon::cancel_custody::StoreCancelCustody;
 use automonique_runner::control::{
-    CONTROL_GREETING, CancelClaim, CancelCustody, CancelSink, CancelUnavailable, ControlServer,
-    CustodyFailure, CustodyVerdict,
+    CONTROL_GREETING, CancelClaim, CancelCustody, CancelDelivery, CancelSink, CancelSinkError,
+    ControlServer, CustodyFailure, CustodyVerdict,
 };
 use automonique_runner::{CancellationToken, Spool};
 use automonique_store::cancel_ledger::CancelLedger;
@@ -284,10 +284,14 @@ struct TokenSink {
 }
 
 impl CancelSink for TokenSink {
-    fn deliver(&self, _attempt_id: &str, _request_ref: &str) -> Result<(), CancelUnavailable> {
+    fn deliver(
+        &self,
+        _attempt_id: &str,
+        _request_ref: &str,
+    ) -> Result<CancelDelivery, CancelSinkError> {
         self.deliveries.fetch_add(1, Ordering::Release);
         self.token.cancel();
-        Ok(())
+        Ok(CancelDelivery::Accepted)
     }
 }
 
@@ -367,8 +371,7 @@ fn a_control_server_answers_already_delivered_after_a_full_restart() {
 
     let first_token = CancellationToken::new();
     let first_deliveries = Arc::new(AtomicUsize::new(0));
-    let mut server =
-        ControlServer::bind_with_custody(&socket_path, Box::new(root.custody())).expect("bind");
+    let mut server = ControlServer::bind(&socket_path, Box::new(root.custody())).expect("bind");
     server
         .register(
             "attempt-1",
@@ -403,8 +406,7 @@ fn a_control_server_answers_already_delivered_after_a_full_restart() {
     // `StoreCancelCustody` — over the same ledger file.
     let second_token = CancellationToken::new();
     let second_deliveries = Arc::new(AtomicUsize::new(0));
-    let mut server =
-        ControlServer::bind_with_custody(&socket_path, Box::new(root.custody())).expect("rebind");
+    let mut server = ControlServer::bind(&socket_path, Box::new(root.custody())).expect("rebind");
     server
         .register(
             "attempt-1",
@@ -475,8 +477,7 @@ fn a_broken_ledger_refuses_cancel_as_internal_without_taking_the_endpoint_down()
     drop(raw);
 
     let deliveries = Arc::new(AtomicUsize::new(0));
-    let mut server =
-        ControlServer::bind_with_custody(&socket_path, Box::new(root.custody())).expect("bind");
+    let mut server = ControlServer::bind(&socket_path, Box::new(root.custody())).expect("bind");
     server
         .register(
             "attempt-1",

@@ -152,7 +152,7 @@ use automonique_runner::backend::{
     DirectProcessBackend, ObservedSequence, PreparedRun, ProgressCapture,
 };
 use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
-use automonique_runner::control::{CancelSink, CancelUnavailable};
+use automonique_runner::control::{CancelDelivery, CancelSink, CancelSinkError};
 use automonique_runner::dispatch::RegistrationHandle;
 use automonique_runner::{
     CancellationToken, ContainmentDomain, Controller, PromptDeliveryPlan, RunSpec, Spool,
@@ -777,6 +777,7 @@ impl ExecutionLane {
 
         self.spawn(Attempt {
             run_id: run_id.to_owned(),
+            attempt_id,
             submission_id,
             revision,
             timeout: admitted.timeout(),
@@ -785,6 +786,7 @@ impl ExecutionLane {
             prepared,
             observed,
             progress: Arc::clone(&self.progress),
+            attempt_host: Arc::clone(&self.attempt_host),
             broker,
         })
     }
@@ -1042,6 +1044,7 @@ impl Drop for LiveClaim {
 /// refuse — it runs, and it records.
 struct Attempt {
     run_id: String,
+    attempt_id: String,
     submission_id: i64,
     revision: u64,
     timeout: Duration,
@@ -1056,6 +1059,8 @@ struct Attempt {
     /// Where live frames are retained while the spool is locked, and which is
     /// told to forget this attempt once it is not.
     progress: Arc<ProgressHub>,
+    /// Host whose durable cancellation rows are retired after terminality.
+    attempt_host: Arc<DaemonAttemptHost>,
     /// This run's own broker, when its document asked for egress. Owning it
     /// here is what bounds its lifetime to the run: every path out of this
     /// worker drops it, including a panic, and its drop stops the listener and
@@ -1073,6 +1078,7 @@ impl Attempt {
     fn run(self, index_path: &Path) {
         let Self {
             run_id,
+            attempt_id,
             submission_id,
             revision,
             timeout,
@@ -1081,6 +1087,7 @@ impl Attempt {
             prepared,
             observed,
             progress,
+            attempt_host,
             broker,
         } = self;
 
@@ -1125,6 +1132,10 @@ impl Attempt {
             Err(_) => (RunSpoolState::Failed, observed.get()),
         };
         advance(index_path, submission_id, revision, state, last_sequence);
+        // The process and spool are terminal and the registration is already
+        // gone, so no caller can reach this attempt again. Failure is safe: it
+        // retains replay evidence and only costs bounded-ledger capacity.
+        let _ = attempt_host.prune_terminal_attempt(&attempt_id);
     }
 }
 
@@ -1292,18 +1303,22 @@ struct TokenCancelSink {
 }
 
 impl CancelSink for TokenCancelSink {
-    fn deliver(&self, attempt_id: &str, _request_ref: &str) -> Result<(), CancelUnavailable> {
+    fn deliver(
+        &self,
+        attempt_id: &str,
+        _request_ref: &str,
+    ) -> Result<CancelDelivery, CancelSinkError> {
         // The dispatcher only calls the sink its own registration holds, so a
         // mismatch is unreachable; refusing rather than cancelling keeps it
         // that way if that ever stops being true.
         if attempt_id != self.attempt_id {
-            return Err(CancelUnavailable);
+            return Err(CancelSinkError::Unavailable);
         }
         // Set before counting: an observer that sees a nonzero count has, by
         // release/acquire ordering, also seen the token set.
         self.cancellation.cancel();
         self.deliveries.fetch_add(1, Ordering::Release);
-        Ok(())
+        Ok(CancelDelivery::Accepted)
     }
 }
 

@@ -103,7 +103,7 @@ use automonique_protocol::sandbox::{
 use automonique_protocol::tools::RunId;
 use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
 use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
-use automonique_runner::control::{CancelSink, CancelUnavailable};
+use automonique_runner::control::{CancelDelivery, CancelSink, CancelSinkError};
 use automonique_runner::dispatch::RegistrationHandle;
 use automonique_runner::{
     AdmissionFields, AdmissionFieldsParts, ArtifactGrantBindings, Authority, ContainmentDomain,
@@ -957,13 +957,17 @@ struct CountingSink {
 }
 
 impl CancelSink for CountingSink {
-    fn deliver(&self, attempt_id: &str, _request_ref: &str) -> Result<(), CancelUnavailable> {
+    fn deliver(
+        &self,
+        attempt_id: &str,
+        _request_ref: &str,
+    ) -> Result<CancelDelivery, CancelSinkError> {
         assert_eq!(
             attempt_id, self.attempt_id,
             "a dispatch must only ever reach its own registration's sink"
         );
         self.deliveries.fetch_add(1, Ordering::Release);
-        Ok(())
+        Ok(CancelDelivery::Accepted)
     }
 }
 

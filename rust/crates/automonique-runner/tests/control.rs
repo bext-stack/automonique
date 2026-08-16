@@ -30,13 +30,13 @@
 //! fails loudly at `bind` rather than silently admitting root peers.
 
 use automonique_runner::control::{
-    CONTROL_GREETING, CancelClaim, CancelCustody, CancelSink, CancelUnavailable, ControlError,
-    ControlServer, CustodyFailure, CustodyVerdict, InMemoryCancelCustody, MAX_BINDINGS,
-    MAX_CANCEL_LEDGER_ENTRIES, MAX_REQUEST_LINE_BYTES, MAX_SUBSCRIBE_PAGE_EVENTS, PeerIdentity,
-    PeerRefusal, Refusal, Served, admit_peer,
+    CONTROL_GREETING, CancelClaim, CancelCustody, CancelDelivery, CancelSink, CancelSinkError,
+    ControlError, ControlServer, CustodyFailure, CustodyVerdict, MAX_BINDINGS,
+    MAX_REQUEST_LINE_BYTES, MAX_SUBSCRIBE_PAGE_EVENTS, PeerIdentity, PeerRefusal, Refusal, Served,
+    admit_peer,
 };
 use automonique_runner::{Authority, CancellationToken, EventKind, Spool};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -49,6 +49,7 @@ use std::time::Duration;
 
 const SPOOL_MAX_BYTES: u64 = 1024 * 1024;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+const TEST_CUSTODY_CAPACITY: usize = 1024;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
@@ -89,14 +90,18 @@ struct TokenSink {
 }
 
 impl CancelSink for TokenSink {
-    fn deliver(&self, _attempt_id: &str, request_ref: &str) -> Result<(), CancelUnavailable> {
+    fn deliver(
+        &self,
+        _attempt_id: &str,
+        request_ref: &str,
+    ) -> Result<CancelDelivery, CancelSinkError> {
         if !self.available {
-            return Err(CancelUnavailable);
+            return Err(CancelSinkError::Unavailable);
         }
         self.deliveries.fetch_add(1, Ordering::Release);
         self.refs.lock().unwrap().push(request_ref.to_owned());
         self.token.cancel();
-        Ok(())
+        Ok(CancelDelivery::Accepted)
     }
 }
 
@@ -213,6 +218,58 @@ impl CancelCustody for ScriptedCustody {
             .pop_front()
             .unwrap_or(Err(CustodyFailure::Unavailable))
     }
+}
+
+struct MemoryCancelCustody {
+    entries: HashMap<String, (String, u64)>,
+    capacity: usize,
+}
+
+impl MemoryCancelCustody {
+    fn new() -> Self {
+        Self::with_capacity(TEST_CUSTODY_CAPACITY)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            capacity,
+        }
+    }
+
+    fn verdict(&self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
+        match self.entries.get(claim.request_ref) {
+            Some((attempt_id, sequence))
+                if attempt_id == claim.attempt_id && *sequence == claim.observed_sequence =>
+            {
+                Ok(CustodyVerdict::Replay)
+            }
+            Some(_) => Ok(CustodyVerdict::Conflict),
+            None if self.entries.len() >= self.capacity => Err(CustodyFailure::Full),
+            None => Ok(CustodyVerdict::Fresh),
+        }
+    }
+}
+
+impl CancelCustody for MemoryCancelCustody {
+    fn classify(&self, claim: CancelClaim<'_>) -> CustodyAnswer {
+        self.verdict(claim)
+    }
+
+    fn record(&mut self, claim: CancelClaim<'_>) -> CustodyAnswer {
+        let verdict = self.verdict(claim)?;
+        if verdict == CustodyVerdict::Fresh {
+            self.entries.insert(
+                claim.request_ref.to_owned(),
+                (claim.attempt_id.to_owned(), claim.observed_sequence),
+            );
+        }
+        Ok(verdict)
+    }
+}
+
+fn bind_test_server(path: impl Into<PathBuf>) -> Result<ControlServer, ControlError> {
+    ControlServer::bind(path, Box::new(MemoryCancelCustody::new()))
 }
 
 /// A server running on a thread this harness owns and joins.
@@ -336,7 +393,7 @@ fn admit_peer_refuses_a_foreign_uid() {
 #[test]
 fn same_uid_peer_is_admitted_and_greeted() {
     let dir = TempDir::new("greet");
-    let server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     assert_eq!(server.admitted_uid(), nix::unistd::geteuid().as_raw());
     let mut harness = Harness::spawn(server);
 
@@ -353,7 +410,7 @@ fn same_uid_peer_is_admitted_and_greeted() {
 fn inspect_reflects_real_appended_events_byte_for_byte() {
     let dir = TempDir::new("inspect");
     let spools = TempDir::new("inspect-spools");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     let (sink, _probe) = SinkProbe::new(true);
     let spool = spool_with(
         spools.path(),
@@ -378,7 +435,7 @@ fn inspect_reflects_real_appended_events_byte_for_byte() {
 fn inspect_reports_an_empty_spool_as_ready_and_a_terminal_spool_exactly() {
     let dir = TempDir::new("states");
     let spools = TempDir::new("states-spools");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     let (empty_sink, _empty_probe) = SinkProbe::new(true);
     let (done_sink, _done_probe) = SinkProbe::new(true);
     server
@@ -420,7 +477,7 @@ fn inspect_reports_an_empty_spool_as_ready_and_a_terminal_spool_exactly() {
 fn unknown_and_malformed_attempts_are_typed_refusals() {
     let dir = TempDir::new("unknown");
     let spools = TempDir::new("unknown-spools");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     let (sink, _probe) = SinkProbe::new(true);
     server
         .register("attempt-1", empty_spool(spools.path(), "run-alpha"), sink)
@@ -463,7 +520,7 @@ fn unknown_and_malformed_attempts_are_typed_refusals() {
 fn subscribe_from_zero_replays_every_event_byte_for_byte() {
     let dir = TempDir::new("sub0");
     let spools = TempDir::new("sub0-spools");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     let (sink, _probe) = SinkProbe::new(true);
     server
         .register(
@@ -529,7 +586,7 @@ fn subscribe_from_zero_replays_every_event_byte_for_byte() {
 fn subscribe_pages_are_bounded_and_report_continuation() {
     let dir = TempDir::new("page");
     let spools = TempDir::new("page-spools");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     let (sink, _probe) = SinkProbe::new(true);
     let total = MAX_SUBSCRIBE_PAGE_EVENTS + 2;
     let mut spool =
@@ -584,7 +641,7 @@ fn subscribe_pages_are_bounded_and_report_continuation() {
 fn cancel_delivers_once_and_replays_idempotently() {
     let dir = TempDir::new("cancel");
     let spools = TempDir::new("cancel-spools");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     let (sink, probe) = SinkProbe::new(true);
     server
         .register("attempt-1", empty_spool(spools.path(), "run-alpha"), sink)
@@ -630,7 +687,7 @@ fn cancel_delivers_once_and_replays_idempotently() {
 fn reusing_a_request_reference_across_attempts_conflicts() {
     let dir = TempDir::new("conflict");
     let spools = TempDir::new("conflict-spools");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     let (first_sink, first) = SinkProbe::new(true);
     let (second_sink, second) = SinkProbe::new(true);
     server
@@ -669,7 +726,7 @@ fn reusing_a_request_reference_across_attempts_conflicts() {
 fn cancel_refuses_unknown_targets_and_unavailable_sinks() {
     let dir = TempDir::new("cancel-neg");
     let spools = TempDir::new("cancel-neg-spools");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     let (sink, probe) = SinkProbe::new(false);
     server
         .register("attempt-1", empty_spool(spools.path(), "run-alpha"), sink)
@@ -710,27 +767,27 @@ fn cancel_refuses_unknown_targets_and_unavailable_sinks() {
 fn the_cancel_ledger_refuses_beyond_its_bound() {
     let dir = TempDir::new("ledger");
     let spools = TempDir::new("ledger-spools");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     let (sink, probe) = SinkProbe::new(true);
     server
         .register("attempt-1", empty_spool(spools.path(), "run-alpha"), sink)
         .unwrap();
     let mut harness = Harness::spawn(server);
 
-    for index in 0..MAX_CANCEL_LEDGER_ENTRIES {
+    for index in 0..TEST_CUSTODY_CAPACITY {
         assert_eq!(
             body(harness.path(), &format!("cancel attempt-1 ref-{index}\n")),
             "cancel_result delivered\n"
         );
     }
-    assert_eq!(probe.deliveries(), MAX_CANCEL_LEDGER_ENTRIES);
+    assert_eq!(probe.deliveries(), TEST_CUSTODY_CAPACITY);
     // Beyond the bound the server refuses instead of delivering something it
     // cannot deduplicate later.
     assert_eq!(
         body(harness.path(), "cancel attempt-1 ref-overflow\n"),
         "refused ledger_full\n"
     );
-    assert_eq!(probe.deliveries(), MAX_CANCEL_LEDGER_ENTRIES);
+    assert_eq!(probe.deliveries(), TEST_CUSTODY_CAPACITY);
     // Already-recorded references still replay.
     assert_eq!(
         body(harness.path(), "cancel attempt-1 ref-0\n"),
@@ -746,7 +803,7 @@ fn the_cancel_ledger_refuses_beyond_its_bound() {
 fn the_observed_sequence_is_optional_and_defaults_to_zero() {
     let dir = TempDir::new("seq-default");
     let spools = TempDir::new("seq-default-spools");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     let (sink, probe) = SinkProbe::new(true);
     server
         .register("attempt-1", empty_spool(spools.path(), "run-alpha"), sink)
@@ -784,7 +841,7 @@ fn the_observed_sequence_is_optional_and_defaults_to_zero() {
 fn the_observed_sequence_binds_the_reference_and_conflicts_when_it_differs() {
     let dir = TempDir::new("seq-bind");
     let spools = TempDir::new("seq-bind-spools");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     let (sink, probe) = SinkProbe::new(true);
     server
         .register("attempt-1", empty_spool(spools.path(), "run-alpha"), sink)
@@ -823,7 +880,7 @@ fn the_observed_sequence_binds_the_reference_and_conflicts_when_it_differs() {
 fn the_observed_sequence_obeys_the_canonical_unsigned_grammar() {
     let dir = TempDir::new("seq-grammar");
     let spools = TempDir::new("seq-grammar-spools");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     let (sink, probe) = SinkProbe::new(true);
     server
         .register("attempt-1", empty_spool(spools.path(), "run-alpha"), sink)
@@ -897,7 +954,7 @@ fn the_cancel_answer_follows_the_custody_verdict_and_nothing_else() {
     let dir = TempDir::new("custody");
     let spools = TempDir::new("custody-spools");
     let custody = ScriptedCustody::default();
-    let mut server = ControlServer::bind_with_custody(
+    let mut server = ControlServer::bind(
         dir.path().join("run/control.sock"),
         Box::new(custody.clone()),
     )
@@ -1034,9 +1091,9 @@ fn custody_supplied_at_bind_carries_its_own_bound() {
     let dir = TempDir::new("custody-bound");
     let spools = TempDir::new("custody-bound-spools");
     // Two references fit; the third has nowhere to be recorded.
-    let mut server = ControlServer::bind_with_custody(
+    let mut server = ControlServer::bind(
         dir.path().join("run/control.sock"),
-        Box::new(InMemoryCancelCustody::with_capacity(2)),
+        Box::new(MemoryCancelCustody::with_capacity(2)),
     )
     .unwrap();
     let (sink, probe) = SinkProbe::new(true);
@@ -1073,12 +1130,12 @@ fn custody_supplied_at_bind_carries_its_own_bound() {
 }
 
 #[test]
-fn the_default_custody_is_in_memory_and_dies_with_its_server() {
-    let dir = TempDir::new("custody-default");
-    let spools = TempDir::new("custody-default-spools");
+fn explicitly_scoped_test_custody_dies_with_its_server() {
+    let dir = TempDir::new("custody-explicit");
+    let spools = TempDir::new("custody-explicit-spools");
     let socket_path = dir.path().join("run/control.sock");
 
-    let mut server = ControlServer::bind(&socket_path).unwrap();
+    let mut server = bind_test_server(&socket_path).unwrap();
     let (sink, _probe) = SinkProbe::new(true);
     server
         .register("attempt-1", empty_spool(spools.path(), "run-alpha"), sink)
@@ -1094,10 +1151,10 @@ fn the_default_custody_is_in_memory_and_dies_with_its_server() {
     );
     harness.stop();
 
-    // The default custody is process-local and server-scoped. This is the
-    // limitation the durable seam exists to remove, asserted rather than
-    // described: a fresh server has forgotten the reference and delivers again.
-    let mut server = ControlServer::bind(&socket_path).unwrap();
+    // This fixture deliberately supplies a fresh process-local custody to the
+    // second server. The endpoint itself supplies no fallback: its owner chose
+    // this lifetime, so the new custody has forgotten the reference.
+    let mut server = bind_test_server(&socket_path).unwrap();
     let (sink, probe) = SinkProbe::new(true);
     server
         .register("attempt-1", empty_spool(spools.path(), "run-beta"), sink)
@@ -1117,7 +1174,7 @@ fn the_default_custody_is_in_memory_and_dies_with_its_server() {
 fn heartbeat_reports_only_server_liveness_and_binding_count() {
     let dir = TempDir::new("beat");
     let spools = TempDir::new("beat-spools");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     let (first_sink, _first) = SinkProbe::new(true);
     let (second_sink, _second) = SinkProbe::new(true);
     server
@@ -1192,7 +1249,7 @@ fn heartbeat_reports_only_server_liveness_and_binding_count() {
 #[test]
 fn an_oversized_request_line_is_refused() {
     let dir = TempDir::new("big");
-    let server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     let mut harness = Harness::spawn(server);
 
     let mut request = Vec::with_capacity(MAX_REQUEST_LINE_BYTES + 2);
@@ -1228,7 +1285,7 @@ fn a_request_that_never_terminates_is_bounded_before_the_terminator() {
     // without limit; the refusal has to arrive from the accumulated length
     // alone, never from finding a terminator.
     let dir = TempDir::new("noeol");
-    let server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     let mut harness = Harness::spawn(server);
 
     let flood = vec![b'a'; MAX_REQUEST_LINE_BYTES * 2];
@@ -1247,7 +1304,7 @@ fn a_request_that_never_terminates_is_bounded_before_the_terminator() {
 fn the_binding_registry_is_bounded_and_never_replaces_a_live_binding() {
     let dir = TempDir::new("bindings");
     let spools = TempDir::new("bindings-spools");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     for index in 0..MAX_BINDINGS {
         let (sink, _probe) = SinkProbe::new(true);
         let run_id = format!("run-{index}");
@@ -1287,7 +1344,7 @@ fn the_binding_registry_is_bounded_and_never_replaces_a_live_binding() {
 fn registration_refuses_identifiers_outside_the_wire_grammar() {
     let dir = TempDir::new("ids");
     let spools = TempDir::new("ids-spools");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
 
     let (sink, _probe) = SinkProbe::new(true);
     assert!(matches!(
@@ -1317,13 +1374,13 @@ fn socket_paths_and_directories_are_validated_before_bind() {
     // `sun_path` overflow refuses before any filesystem call.
     let long = dir.path().join("x".repeat(200));
     assert!(matches!(
-        ControlServer::bind(&long),
+        bind_test_server(&long),
         Err(ControlError::SocketPathTooLong)
     ));
     assert!(!long.exists());
 
     assert!(matches!(
-        ControlServer::bind(PathBuf::from("relative.sock")),
+        bind_test_server(PathBuf::from("relative.sock")),
         Err(ControlError::SocketPathNotAbsolute)
     ));
 
@@ -1332,7 +1389,7 @@ fn socket_paths_and_directories_are_validated_before_bind() {
     fs::create_dir(&loose).unwrap();
     fs::set_permissions(&loose, fs::Permissions::from_mode(0o770)).unwrap();
     assert!(matches!(
-        ControlServer::bind(loose.join("control.sock")),
+        bind_test_server(loose.join("control.sock")),
         Err(ControlError::UnsafeDirectory)
     ));
 
@@ -1343,7 +1400,7 @@ fn socket_paths_and_directories_are_validated_before_bind() {
     let squatter = occupied.join("control.sock");
     fs::write(&squatter, b"not a socket").unwrap();
     assert!(matches!(
-        ControlServer::bind(&squatter),
+        bind_test_server(&squatter),
         Err(ControlError::UnsafeSocket)
     ));
     assert_eq!(fs::read(&squatter).unwrap(), b"not a socket");
@@ -1353,13 +1410,13 @@ fn socket_paths_and_directories_are_validated_before_bind() {
 fn a_live_socket_refuses_a_second_bind_and_shutdown_removes_only_its_own_inode() {
     let dir = TempDir::new("life");
     let socket_path = dir.path().join("run/control.sock");
-    let server = ControlServer::bind(&socket_path).unwrap();
+    let server = bind_test_server(&socket_path).unwrap();
     assert!(socket_path.exists());
     let mut harness = Harness::spawn(server);
 
     // A live listener is not stale, so the path is never unlinked from under it.
     assert!(matches!(
-        ControlServer::bind(&socket_path),
+        bind_test_server(&socket_path),
         Err(ControlError::SocketInUse)
     ));
     // The original endpoint still answers.
@@ -1373,7 +1430,7 @@ fn a_live_socket_refuses_a_second_bind_and_shutdown_removes_only_its_own_inode()
 
     // Rebinding after a clean shutdown succeeds, with a fresh uptime and no
     // inherited bindings or ledger.
-    let restarted = ControlServer::bind(&socket_path).unwrap();
+    let restarted = bind_test_server(&socket_path).unwrap();
     let mut restarted = Harness::spawn(restarted);
     let beat = body(restarted.path(), "heartbeat\n");
     let fields: Vec<&str> = beat.trim_end().split(' ').collect();
@@ -1422,7 +1479,7 @@ fn the_refusal_category_set_is_closed_and_stable() {
 #[test]
 fn serve_once_reports_an_idle_wait_without_a_peer() {
     let dir = TempDir::new("idle");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     assert_eq!(
         server.serve_once(Duration::from_millis(5)).unwrap(),
         Served::Idle
@@ -1443,7 +1500,7 @@ fn serve_once_reports_an_idle_wait_without_a_peer() {
 fn refusals_never_echo_request_bytes() {
     let dir = TempDir::new("echo");
     let spools = TempDir::new("echo-spools");
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server = bind_test_server(dir.path().join("run/control.sock")).unwrap();
     let (sink, _probe) = SinkProbe::new(true);
     server
         .register(

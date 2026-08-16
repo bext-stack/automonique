@@ -4,11 +4,7 @@
 //!
 //! `automonique-runner`'s control socket answers `cancel` from a
 //! [`CancelCustody`] implementation and holds no idempotency state of its own.
-//! Its default custody is a process-local map: correct while the server lives,
-//! gone the moment it restarts, and never shared with a second server. That is
-//! stated as a divergence in the runner rather than pretended away.
-//!
-//! This module closes it. [`StoreCancelCustody`] is a newtype over
+//! [`StoreCancelCustody`] is a newtype over
 //! [`CancelLedger`], the durable host-wide ledger in `automonique-store`, and
 //! it is the reason the seam is a trait at all: the runner must not depend on
 //! the store — the dependency runs the other way, and a SQLite handle inside a

@@ -41,7 +41,9 @@ use automonique_daemon::{Daemon, DaemonConfig, DaemonError};
 use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_runner::Spool;
-use automonique_runner::control::{CONTROL_GREETING, CancelSink, CancelUnavailable, ControlServer};
+use automonique_runner::control::{
+    CONTROL_GREETING, CancelDelivery, CancelSink, CancelSinkError, ControlServer,
+};
 use automonique_runner::dispatch::DispatchOutcome;
 use automonique_store::cancel_ledger::CancelLedger;
 
@@ -107,7 +109,11 @@ struct CountingSink {
 }
 
 impl CancelSink for CountingSink {
-    fn deliver(&self, attempt_id: &str, request_ref: &str) -> Result<(), CancelUnavailable> {
+    fn deliver(
+        &self,
+        attempt_id: &str,
+        request_ref: &str,
+    ) -> Result<CancelDelivery, CancelSinkError> {
         assert_eq!(
             attempt_id, self.attempt_id,
             "a dispatch must only ever reach its own registration's sink"
@@ -123,7 +129,7 @@ impl CancelSink for CountingSink {
         std::thread::yield_now();
         self.refs.lock().expect("refs").push(request_ref.to_owned());
         self.deliveries.fetch_add(1, Ordering::Release);
-        Ok(())
+        Ok(CancelDelivery::Accepted)
     }
 }
 
@@ -256,9 +262,8 @@ fn seated_server(
 ) {
     let seat = host.seat();
     let handle = host.register(attempt_id, sink).expect("register");
-    let mut server =
-        ControlServer::bind_with_custody(root.path().join("run/control.sock"), seat.custody())
-            .expect("bind control socket");
+    let mut server = ControlServer::bind(root.path().join("run/control.sock"), seat.custody())
+        .expect("bind control socket");
     server
         .register(
             handle.attempt_id(),
@@ -435,6 +440,45 @@ fn a_delivered_reference_replays_across_a_host_teardown_and_reopen() {
     assert_eq!(
         recorded(&root.ledger_path(), "attempt-1"),
         vec![("ref-a".to_owned(), 7), ("ref-b".to_owned(), 8)]
+    );
+}
+
+#[test]
+fn terminal_attempt_pruning_releases_only_that_attempts_capacity() {
+    let root = PrivateRoot::new();
+    let host = root.host();
+
+    let (first_sink, first) = SinkProbe::boxed("attempt-1");
+    let first_handle = host
+        .register("attempt-1", first_sink)
+        .expect("register first");
+    let (second_sink, second) = SinkProbe::boxed("attempt-2");
+    let _second_handle = host
+        .register("attempt-2", second_sink)
+        .expect("register second");
+
+    assert_eq!(
+        host.cancel("attempt-1", "ref-terminal", 7),
+        DispatchOutcome::Delivered
+    );
+    assert_eq!(
+        host.cancel("attempt-2", "ref-live", 8),
+        DispatchOutcome::Delivered
+    );
+    assert_eq!(first.deliveries(), 1);
+    assert_eq!(second.deliveries(), 1);
+
+    // Terminality is asserted only after the registration is unreachable.
+    drop(first_handle);
+    let outcome = host
+        .prune_terminal_attempt("attempt-1")
+        .expect("prune terminal attempt");
+    assert_eq!(outcome.removed, 1);
+    assert_eq!(outcome.remaining, 1);
+    assert!(recorded(&root.ledger_path(), "attempt-1").is_empty());
+    assert_eq!(
+        recorded(&root.ledger_path(), "attempt-2"),
+        vec![("ref-live".to_owned(), 8)]
     );
 }
 

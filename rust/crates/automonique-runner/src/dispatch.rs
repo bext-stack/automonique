@@ -85,37 +85,14 @@
 //! - the sink adapter runs the entire serialized sequence — re-classify,
 //!   deliver, record — so a request that lost the race between the server's
 //!   classify and its deliver is not delivered a second time;
-//! - the server's own trailing `record` reaches the same custody the dispatcher
-//!   just wrote, sees the replay it wrote, and answers `delivered`.
+//! - the sink returns the dispatcher's completed outcome, so the server skips
+//!   its ordinary trailing `record` and answers with the winner's exact result.
 //!
 //! The seat exists because [`CancelSink::deliver`] carries no observed sequence
 //! and the claim needs one. The seat remembers the claim its custody adapter
 //! last classified, pinned to the classifying thread, and the sink adapter
 //! refuses to invent one: a delivery whose seat holds no matching claim from
 //! this thread fails closed rather than recording a sequence it guessed.
-//!
-//! ## What the composition still cannot do
-//!
-//! Two residues remain, and both need a `control.rs` change to close. Neither
-//! can deliver twice or record a delivery that did not happen.
-//!
-//! 1. **A racing caller is told `delivered`, not `already_delivered`.** The
-//!    server chose its answer at classify time, when the reference genuinely was
-//!    fresh; by delivery time another caller had won. `delivered` and
-//!    `already_delivered` both mean "this request reached the sink, do not
-//!    retry" — the distinction lost is *which* caller's delivery it was, not
-//!    whether one happened. Closing it needs the server to take its answer from
-//!    one call rather than from a classify that precedes delivery.
-//! 2. **A refusal discovered inside the section is categorised
-//!    `cancel_unavailable`.** [`CancelSink::deliver`] returns one bit of error,
-//!    so a conflict, a full custody or an unavailable custody found *after* the
-//!    server's classify all reach the wire as `cancel_unavailable`. Nothing is
-//!    delivered and nothing is recorded on any of those paths, so this is an
-//!    imprecise category on a refusal rather than a lost invariant. Closing it
-//!    needs a richer sink error type.
-//!
-//! A caller that wants the exact vocabulary calls [`CancelDispatcher::cancel`]
-//! directly; it has neither residue.
 //!
 //! The server's own invariant is preserved rather than weakened: an unavailable
 //! sink records nothing. The dispatcher records only after the registered sink
@@ -134,14 +111,13 @@
 //!   reaped and whether the run reached a terminal state remain separate
 //!   observations through the spool.
 //! - **It is not durability.** Idempotency survives exactly as long as the
-//!   custody it was constructed with: the in-memory default dies with the
-//!   process, a durable ledger does not.
+//!   explicit custody it was constructed with.
 //! - **It is not authorization.** Anyone holding the dispatcher can cancel any
 //!   attempt registered on it. Deciding who may ask is the caller's policy.
 
 use crate::control::{
-    CancelClaim, CancelCustody, CancelSink, CancelUnavailable, CustodyFailure, CustodyVerdict,
-    MAX_BINDINGS, MAX_IDENTIFIER_BYTES, Refusal,
+    CancelClaim, CancelCustody, CancelDelivery, CancelSink, CancelSinkError, CustodyFailure,
+    CustodyVerdict, MAX_BINDINGS, MAX_IDENTIFIER_BYTES, Refusal,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -620,7 +596,7 @@ struct SeatClaim {
 /// dispatcher.
 ///
 /// Not [`Clone`]: one seat per server. See the module documentation for what
-/// this composition establishes and the two residues it leaves.
+/// this composition establishes.
 ///
 /// # Lock ordering
 ///
@@ -633,7 +609,7 @@ pub struct ControlSeat {
 }
 
 impl ControlSeat {
-    /// Custody for [`ControlServer::bind_with_custody`](crate::control::ControlServer::bind_with_custody).
+    /// Custody for [`ControlServer::bind`](crate::control::ControlServer::bind).
     ///
     /// It classifies and records against the dispatcher's real custody, and it
     /// remembers the claim it classified so this seat's sinks can complete it.
@@ -650,9 +626,8 @@ impl ControlSeat {
     /// that routes the whole sequence through the dispatcher.
     ///
     /// Pinned to `handle`'s exact registration: once that handle is dropped or
-    /// the attempt is re-registered, this sink reaches nothing and answers
-    /// [`CancelUnavailable`], so a stale binding can never cross-route into a
-    /// newer registration.
+    /// the attempt is re-registered, this sink reaches nothing, so a stale
+    /// binding can never cross-route into a newer registration.
     #[must_use]
     pub fn sink(&self, handle: &RegistrationHandle) -> Box<dyn CancelSink> {
         Box::new(SeatSink {
@@ -752,26 +727,31 @@ impl SeatSink {
 }
 
 impl CancelSink for SeatSink {
-    fn deliver(&self, attempt_id: &str, request_ref: &str) -> Result<(), CancelUnavailable> {
+    fn deliver(
+        &self,
+        attempt_id: &str,
+        request_ref: &str,
+    ) -> Result<CancelDelivery, CancelSinkError> {
         // The server only calls the sink its own binding holds, so a mismatch is
         // unreachable; refusing rather than dispatching keeps it that way if
         // that ever stops being true.
         if attempt_id != self.attempt_id {
-            return Err(CancelUnavailable);
+            return Err(CancelSinkError::Unavailable);
         }
         let observed_sequence = self
             .take_observed_sequence(attempt_id, request_ref)
-            .ok_or(CancelUnavailable)?;
-        let core = self.core.upgrade().ok_or(CancelUnavailable)?;
+            .ok_or(CancelSinkError::Unavailable)?;
+        let core = self.core.upgrade().ok_or(CancelSinkError::Unavailable)?;
         let outcome = core.dispatch(attempt_id, request_ref, observed_sequence, Some(self.epoch));
-        // `AlreadyDelivered` is success here: the request reached the sink once,
-        // this call simply was not the one that took it there. Everything else
-        // collapses into the sink's single error, which is residue 2 in the
-        // module documentation — none of those paths delivered or recorded.
-        if outcome.is_delivery_evidence() {
-            Ok(())
-        } else {
-            Err(CancelUnavailable)
+        match outcome {
+            DispatchOutcome::Delivered => Ok(CancelDelivery::Delivered),
+            DispatchOutcome::AlreadyDelivered => Ok(CancelDelivery::AlreadyDelivered),
+            DispatchOutcome::Conflict => Err(CancelSinkError::Conflict),
+            DispatchOutcome::CustodyFull => Err(CancelSinkError::LedgerFull),
+            DispatchOutcome::CustodyUnavailable => Err(CancelSinkError::Internal),
+            DispatchOutcome::UnknownAttempt
+            | DispatchOutcome::SinkUnavailable
+            | DispatchOutcome::FieldInvalid => Err(CancelSinkError::Unavailable),
         }
     }
 }

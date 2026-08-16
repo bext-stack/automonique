@@ -30,14 +30,14 @@
 
 use automonique_runner::Spool;
 use automonique_runner::control::{
-    CONTROL_GREETING, CancelClaim, CancelCustody, CancelSink, CancelUnavailable, ControlError,
-    ControlServer, CustodyFailure, CustodyVerdict, InMemoryCancelCustody,
-    MAX_CANCEL_LEDGER_ENTRIES, MAX_IDENTIFIER_BYTES, Refusal,
+    CONTROL_GREETING, CancelClaim, CancelCustody, CancelDelivery, CancelSink, CancelSinkError,
+    ControlError, ControlServer, CustodyFailure, CustodyVerdict, MAX_IDENTIFIER_BYTES, Refusal,
 };
 use automonique_runner::dispatch::{
     CancelDispatcher, ControlSeat, DispatchError, DispatchOutcome, MAX_REGISTRATIONS,
     RegistrationHandle,
 };
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -53,6 +53,7 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Iterations for the two racing tests. High enough that an interleaving the
 /// scheduler only sometimes produces is seen many times over.
 const RACE_ITERATIONS: usize = 100;
+const TEST_CUSTODY_CAPACITY: usize = 1024;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
@@ -101,13 +102,17 @@ struct CountingSink {
 }
 
 impl CancelSink for CountingSink {
-    fn deliver(&self, attempt_id: &str, request_ref: &str) -> Result<(), CancelUnavailable> {
+    fn deliver(
+        &self,
+        attempt_id: &str,
+        request_ref: &str,
+    ) -> Result<CancelDelivery, CancelSinkError> {
         assert_eq!(
             attempt_id, self.attempt_id,
             "a dispatch must only ever reach its own registration's sink"
         );
         match self.mode.load(Ordering::Acquire) {
-            MODE_UNAVAILABLE => return Err(CancelUnavailable),
+            MODE_UNAVAILABLE => return Err(CancelSinkError::Unavailable),
             MODE_PANIC => panic!("cancel sink panicked inside the serialized section"),
             _ => {}
         }
@@ -118,7 +123,7 @@ impl CancelSink for CountingSink {
         std::thread::yield_now();
         self.refs.lock().unwrap().push(request_ref.to_owned());
         self.deliveries.fetch_add(1, Ordering::Release);
-        Ok(())
+        Ok(CancelDelivery::Accepted)
     }
 }
 
@@ -167,27 +172,27 @@ impl SinkProbe {
 // --- custody the test can inspect and break -------------------------------
 
 struct CustodyState {
-    inner: InMemoryCancelCustody,
+    entries: HashMap<String, (String, u64)>,
+    capacity: usize,
     classify_failure: Option<CustodyFailure>,
     record_failure: Option<CustodyFailure>,
     classify_calls: usize,
     record_calls: usize,
 }
 
-/// A real [`InMemoryCancelCustody`] behind a shared handle, so a test can read
-/// what custody holds while the dispatcher owns it — and can break it on
-/// demand without the dispatcher knowing the difference.
+/// Test custody behind a shared handle, inspectable and breakable on demand.
 #[derive(Clone)]
 struct CustodyProbe(Arc<Mutex<CustodyState>>);
 
 impl CustodyProbe {
     fn new() -> Self {
-        Self::with_capacity(MAX_CANCEL_LEDGER_ENTRIES)
+        Self::with_capacity(TEST_CUSTODY_CAPACITY)
     }
 
     fn with_capacity(capacity: usize) -> Self {
         Self(Arc::new(Mutex::new(CustodyState {
-            inner: InMemoryCancelCustody::with_capacity(capacity),
+            entries: HashMap::new(),
+            capacity,
             classify_failure: None,
             record_failure: None,
             classify_calls: 0,
@@ -201,7 +206,7 @@ impl CustodyProbe {
 
     /// References custody actually holds.
     fn entries(&self) -> usize {
-        self.0.lock().unwrap().inner.len()
+        self.0.lock().unwrap().entries.len()
     }
 
     fn classify_calls(&self) -> usize {
@@ -230,7 +235,7 @@ impl CancelCustody for ProbeCustody {
         if let Some(failure) = state.classify_failure {
             return Err(failure);
         }
-        state.inner.classify(claim)
+        custody_verdict(&state, claim)
     }
 
     fn record(&mut self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
@@ -239,7 +244,30 @@ impl CancelCustody for ProbeCustody {
         if let Some(failure) = state.record_failure {
             return Err(failure);
         }
-        state.inner.record(claim)
+        let verdict = custody_verdict(&state, claim)?;
+        if verdict == CustodyVerdict::Fresh {
+            state.entries.insert(
+                claim.request_ref.to_owned(),
+                (claim.attempt_id.to_owned(), claim.observed_sequence),
+            );
+        }
+        Ok(verdict)
+    }
+}
+
+fn custody_verdict(
+    state: &CustodyState,
+    claim: CancelClaim<'_>,
+) -> Result<CustodyVerdict, CustodyFailure> {
+    match state.entries.get(claim.request_ref) {
+        Some((attempt_id, sequence))
+            if attempt_id == claim.attempt_id && *sequence == claim.observed_sequence =>
+        {
+            Ok(CustodyVerdict::Replay)
+        }
+        Some(_) => Ok(CustodyVerdict::Conflict),
+        None if state.entries.len() >= state.capacity => Err(CustodyFailure::Full),
+        None => Ok(CustodyVerdict::Fresh),
     }
 }
 
@@ -369,8 +397,7 @@ fn seated_server(
     run_id: &str,
 ) -> ControlServer {
     let mut server =
-        ControlServer::bind_with_custody(dir.path().join("run/control.sock"), seat.custody())
-            .unwrap();
+        ControlServer::bind(dir.path().join("run/control.sock"), seat.custody()).unwrap();
     server
         .register(
             handle.attempt_id(),
@@ -745,7 +772,7 @@ fn a_stale_seat_sink_cannot_cross_route_into_a_later_registration() {
     let classify_calls = custody.classify_calls();
     assert_eq!(
         stale_sink.deliver("attempt-churn", "ref-a"),
-        Err(CancelUnavailable)
+        Err(CancelSinkError::Unavailable)
     );
     // Refused on the registration lookup, before custody is consulted again.
     assert_eq!(custody.classify_calls(), classify_calls);
@@ -756,7 +783,10 @@ fn a_stale_seat_sink_cannot_cross_route_into_a_later_registration() {
     // The live adapter, given the same treatment, reaches the live sink. The
     // stale delivery consumed the seat's claim, so it is classified again.
     assert_eq!(seat_custody.classify(claim), Ok(CustodyVerdict::Fresh));
-    assert_eq!(live_sink.deliver("attempt-churn", "ref-a"), Ok(()));
+    assert_eq!(
+        live_sink.deliver("attempt-churn", "ref-a"),
+        Ok(CancelDelivery::Delivered)
+    );
     assert_eq!(first_probe.deliveries(), 0);
     assert_eq!(second_probe.deliveries(), 1);
     drop(live);
@@ -969,7 +999,8 @@ fn the_dispatcher_grammar_is_the_control_servers_grammar() {
     let spools = TempDir::new("grammar-spools");
     let custody = CustodyProbe::new();
     let dispatcher = dispatcher_with(&custody);
-    let mut server = ControlServer::bind(dir.path().join("run/control.sock")).unwrap();
+    let mut server =
+        ControlServer::bind(dir.path().join("run/control.sock"), custody.custody()).unwrap();
 
     let long = "a".repeat(MAX_IDENTIFIER_BYTES + 1);
     let at_bound = "a".repeat(MAX_IDENTIFIER_BYTES);
@@ -1112,7 +1143,7 @@ fn dropping_the_dispatcher_fails_every_outstanding_adapter_closed() {
     assert_eq!(seat_custody.record(claim), Err(CustodyFailure::Unavailable));
     assert_eq!(
         seat_sink.deliver("attempt-gone", "ref-a"),
-        Err(CancelUnavailable)
+        Err(CancelSinkError::Unavailable)
     );
     assert_eq!(probe.deliveries(), 0);
     assert_eq!(custody.entries(), 0);
@@ -1135,7 +1166,7 @@ fn a_seat_sink_reached_without_its_own_classify_refuses() {
     // sequence the requester never sent.
     assert_eq!(
         seat_sink.deliver("attempt-seat", "ref-a"),
-        Err(CancelUnavailable)
+        Err(CancelSinkError::Unavailable)
     );
     assert_eq!(probe.deliveries(), 0);
     assert_eq!(custody.entries(), 0);
@@ -1149,11 +1180,14 @@ fn a_seat_sink_reached_without_its_own_classify_refuses() {
         observed_sequence: 4,
     };
     assert_eq!(seat_custody.classify(claim), Ok(CustodyVerdict::Fresh));
-    assert_eq!(seat_sink.deliver("attempt-seat", "ref-a"), Ok(()));
+    assert_eq!(
+        seat_sink.deliver("attempt-seat", "ref-a"),
+        Ok(CancelDelivery::Delivered)
+    );
     assert_eq!(probe.deliveries(), 1);
     assert_eq!(
         seat_sink.deliver("attempt-seat", "ref-a"),
-        Err(CancelUnavailable)
+        Err(CancelSinkError::Unavailable)
     );
     assert_eq!(probe.deliveries(), 1);
 
@@ -1170,7 +1204,7 @@ fn a_seat_sink_reached_without_its_own_classify_refuses() {
     // A sink reached for an attempt that is not its own refuses outright.
     assert_eq!(
         seat_sink.deliver("attempt-other", "ref-b"),
-        Err(CancelUnavailable)
+        Err(CancelSinkError::Unavailable)
     );
 }
 
@@ -1284,19 +1318,16 @@ fn concurrent_servers_over_one_dispatcher_deliver_a_reference_once() {
         // at once: one reference, one delivery.
         assert_eq!(probe.deliveries(), iteration + 1, "answers {answers:?}");
         assert_eq!(custody.entries(), iteration + 1);
-        for answer in &answers {
-            // Residue 1 of the composition, pinned rather than hidden: the
-            // caller that lost the race is told `delivered` rather than
-            // `already_delivered`, because the server chose its answer at
-            // classify time when the reference genuinely was fresh. Both
-            // answers mean the same actionable thing — the request reached the
-            // sink, do not retry — and neither is a second delivery.
-            assert!(
-                answer == "cancel_result delivered\n"
-                    || answer == "cancel_result already_delivered\n",
-                "unexpected answer {answer:?}"
-            );
-        }
+        let mut answers = answers;
+        answers.sort();
+        assert_eq!(
+            answers,
+            [
+                "cancel_result already_delivered\n".to_owned(),
+                "cancel_result delivered\n".to_owned(),
+            ],
+            "the racing loser must receive the dispatcher's exact replay answer"
+        );
     }
 
     harness_a.stop();

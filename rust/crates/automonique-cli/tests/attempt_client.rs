@@ -21,10 +21,12 @@
 
 use automonique_cli::run;
 use automonique_runner::control::{
-    CONTROL_GREETING, CancelSink, CancelUnavailable, ControlServer, MAX_IDENTIFIER_BYTES,
-    MAX_RESPONSE_BYTES, MAX_SUBSCRIBE_PAGE_EVENTS, Served,
+    CONTROL_GREETING, CancelClaim, CancelCustody, CancelDelivery, CancelSink, CancelSinkError,
+    ControlServer, CustodyFailure, CustodyVerdict, MAX_IDENTIFIER_BYTES, MAX_RESPONSE_BYTES,
+    MAX_SUBSCRIBE_PAGE_EVENTS, Served,
 };
 use automonique_runner::{Authority, EventKind, Spool};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
@@ -53,9 +55,47 @@ struct CountingSink {
 }
 
 impl CancelSink for CountingSink {
-    fn deliver(&self, _attempt_id: &str, _request_ref: &str) -> Result<(), CancelUnavailable> {
+    fn deliver(
+        &self,
+        _attempt_id: &str,
+        _request_ref: &str,
+    ) -> Result<CancelDelivery, CancelSinkError> {
         self.deliveries.fetch_add(1, Ordering::Release);
-        Ok(())
+        Ok(CancelDelivery::Accepted)
+    }
+}
+
+#[derive(Default)]
+struct TestCustody(HashMap<String, (String, u64)>);
+
+impl TestCustody {
+    fn verdict(&self, claim: CancelClaim<'_>) -> CustodyVerdict {
+        match self.0.get(claim.request_ref) {
+            Some((attempt, sequence))
+                if attempt == claim.attempt_id && *sequence == claim.observed_sequence =>
+            {
+                CustodyVerdict::Replay
+            }
+            Some(_) => CustodyVerdict::Conflict,
+            None => CustodyVerdict::Fresh,
+        }
+    }
+}
+
+impl CancelCustody for TestCustody {
+    fn classify(&self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
+        Ok(self.verdict(claim))
+    }
+
+    fn record(&mut self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
+        let verdict = self.verdict(claim);
+        if verdict == CustodyVerdict::Fresh {
+            self.0.insert(
+                claim.request_ref.to_owned(),
+                (claim.attempt_id.to_owned(), claim.observed_sequence),
+            );
+        }
+        Ok(verdict)
     }
 }
 
@@ -69,8 +109,11 @@ impl EndpointBuilder {
     fn new() -> Self {
         let directory = tempfile::tempdir().expect("endpoint directory");
         let spools = tempfile::tempdir().expect("spool directory");
-        let server =
-            ControlServer::bind(directory.path().join("run/control.sock")).expect("control server");
+        let server = ControlServer::bind(
+            directory.path().join("run/control.sock"),
+            Box::<TestCustody>::default(),
+        )
+        .expect("control server");
         Self {
             directory,
             spools,

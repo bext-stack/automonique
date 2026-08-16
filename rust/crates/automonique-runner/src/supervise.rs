@@ -66,11 +66,9 @@
 //! - **Live `subscribe` output is not the run's event log.** During the run it
 //!   is the synthetic view record described above; a client that needs the
 //!   authoritative chain reads the durable spool, or subscribes after the run.
-//! - **Cancel idempotency is in-memory and server-scoped.** It comes from
-//!   [`ControlServer`]'s own ledger, so it does not survive a server restart
-//!   and is not host-wide. A durable host-wide ledger is the intended
-//!   replacement; this module deliberately depends on nothing that does not
-//!   exist yet.
+//! - **Cancel idempotency belongs to the supplied custody.** This module does
+//!   not open or choose storage; production composes the daemon's durable
+//!   host-wide ledger into the [`ControlServer`].
 //! - **A broken control socket does not cancel a run.** If serving fails
 //!   mid-run the attempt keeps running to its own terminal state under its
 //!   deadline, and the listener failure is reported afterwards. Silently
@@ -78,7 +76,9 @@
 //!   module has no standing to choose.
 
 use crate::backend::{BackendError, DirectProcessBackend, ExecutionReport, TERMINAL_FAILED};
-use crate::control::{CancelSink, CancelUnavailable, ControlError, ControlServer, Served};
+use crate::control::{
+    CancelDelivery, CancelSink, CancelSinkError, ControlError, ControlServer, Served,
+};
 use crate::{
     Authority, CancellationToken, ContainmentDomain, ContainmentLimits, EventKind, LaunchPlan,
     Spool, SpoolError,
@@ -504,17 +504,21 @@ struct TokenCancelSink {
 }
 
 impl CancelSink for TokenCancelSink {
-    fn deliver(&self, attempt_id: &str, _request_ref: &str) -> Result<(), CancelUnavailable> {
+    fn deliver(
+        &self,
+        attempt_id: &str,
+        _request_ref: &str,
+    ) -> Result<CancelDelivery, CancelSinkError> {
         // The server only calls the sink its own binding holds, so a mismatch
         // is unreachable; refusing rather than cancelling keeps it that way if
         // that ever stops being true.
         if attempt_id != self.attempt_id {
-            return Err(CancelUnavailable);
+            return Err(CancelSinkError::Unavailable);
         }
         // Set before counting: an observer that sees a nonzero count has, by
         // release/acquire ordering, also seen the token set.
         self.cancellation.cancel();
         self.deliveries.fetch_add(1, Ordering::Release);
-        Ok(())
+        Ok(CancelDelivery::Accepted)
     }
 }

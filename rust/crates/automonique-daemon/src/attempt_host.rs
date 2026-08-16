@@ -22,8 +22,8 @@
 //!
 //! - **Idempotency is durable.** Custody is the store-backed ledger, so a
 //!   reference delivered before a restart is answered `already_delivered`
-//!   afterwards, by a new process over the same file. The in-memory default the
-//!   runner ships dies with its process; this does not.
+//!   afterwards, by a new process over the same file. The runner supplies no
+//!   fallback custody; opening this durable owner is required.
 //! - **Idempotency is host-wide within this process.** Every caller — a direct
 //!   [`DaemonAttemptHost::cancel`], and every
 //!   [`ControlServer`](automonique_runner::control::ControlServer) seated
@@ -106,7 +106,7 @@ use automonique_runner::dispatch::{
     CancelDispatcher, ControlSeat, DispatchError, DispatchOutcome, MAX_REGISTRATIONS,
     RegistrationHandle,
 };
-use automonique_store::cancel_ledger::{CancelLedger, CancelLedgerError};
+use automonique_store::cancel_ledger::{CancelLedger, CancelLedgerError, PruneOutcome, Retention};
 
 use crate::cancel_custody::StoreCancelCustody;
 
@@ -316,6 +316,34 @@ impl DaemonAttemptHost {
     ) -> DispatchOutcome {
         self.dispatcher
             .cancel(attempt_id, request_ref, observed_sequence)
+    }
+
+    /// Forget cancellation references for an attempt that is durably terminal.
+    ///
+    /// The caller's terminality assertion is the safety boundary: once the
+    /// registration has been released, this host cannot deliver another
+    /// request to the attempt, so retaining its references would consume the
+    /// bounded ledger forever without preserving any reachable replay. A
+    /// crash before this cleanup is safe and merely retains rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptHostError::LedgerUnavailable`] when the ledger cannot
+    /// be reopened or pruned. Existing rows remain the fail-safe outcome.
+    pub fn prune_terminal_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<PruneOutcome, AttemptHostError> {
+        let mut ledger = CancelLedger::open(&self.ledger_path)
+            .map_err(|error| AttemptHostError::LedgerUnavailable(ledger_category(&error)))?;
+        ledger
+            .prune(Retention {
+                // The terminal attempt can never accept another cancellation,
+                // so every timestamp it owns is outside its useful lifetime.
+                older_than_ms: i64::MAX,
+                terminal_attempts: &[attempt_id],
+            })
+            .map_err(|error| AttemptHostError::LedgerUnavailable(ledger_category(&error)))
     }
 
     /// End dispatch for this host and close its durable custody.

@@ -37,7 +37,8 @@ use automonique_runner::backend::{
     TERMINAL_CANCELLED, TERMINAL_COMPLETED, TERMINAL_FAILED,
 };
 use automonique_runner::control::{
-    CancelSink, CancelUnavailable, ControlError, ControlServer, Refusal,
+    CancelClaim, CancelCustody, CancelDelivery, CancelSink, CancelSinkError, ControlError,
+    ControlServer, CustodyFailure, CustodyVerdict, Refusal,
 };
 use automonique_runner::filesystem::PathIntent;
 use automonique_runner::supervise::{AttemptSupervisor, SuperviseError, VIEW_LIVE_PAYLOAD};
@@ -46,6 +47,7 @@ use automonique_runner::{
     EventKind, LaunchPlan, RunState, Spool, process_is_live,
 };
 use sha2::{Digest as _, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -221,11 +223,53 @@ struct CountingSink {
 }
 
 impl CancelSink for CountingSink {
-    fn deliver(&self, _attempt_id: &str, _request_ref: &str) -> Result<(), CancelUnavailable> {
+    fn deliver(
+        &self,
+        _attempt_id: &str,
+        _request_ref: &str,
+    ) -> Result<CancelDelivery, CancelSinkError> {
         self.deliveries.fetch_add(1, Ordering::Release);
         self.token.cancel();
-        Ok(())
+        Ok(CancelDelivery::Accepted)
     }
+}
+
+#[derive(Default)]
+struct TestCustody(HashMap<String, (String, u64)>);
+
+impl TestCustody {
+    fn verdict(&self, claim: CancelClaim<'_>) -> CustodyVerdict {
+        match self.0.get(claim.request_ref) {
+            Some((attempt, sequence))
+                if attempt == claim.attempt_id && *sequence == claim.observed_sequence =>
+            {
+                CustodyVerdict::Replay
+            }
+            Some(_) => CustodyVerdict::Conflict,
+            None => CustodyVerdict::Fresh,
+        }
+    }
+}
+
+impl CancelCustody for TestCustody {
+    fn classify(&self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
+        Ok(self.verdict(claim))
+    }
+
+    fn record(&mut self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
+        let verdict = self.verdict(claim);
+        if verdict == CustodyVerdict::Fresh {
+            self.0.insert(
+                claim.request_ref.to_owned(),
+                (claim.attempt_id.to_owned(), claim.observed_sequence),
+            );
+        }
+        Ok(verdict)
+    }
+}
+
+fn control_server(path: impl Into<PathBuf>) -> Result<ControlServer, ControlError> {
+    ControlServer::bind(path, Box::<TestCustody>::default())
 }
 
 fn counting_sink() -> (Box<dyn CancelSink>, Arc<AtomicUsize>) {
@@ -469,7 +513,7 @@ fn a_wire_cancel_kills_the_tree_and_records_cancelled() {
     let release_file = temporary.work().join("release");
     let cgroup = domain.root().join(format!("run-{run_id}"));
 
-    let mut server = ControlServer::bind(temporary.socket_path()).expect("the endpoint binds");
+    let mut server = control_server(temporary.socket_path()).expect("the endpoint binds");
     let peer = live_peer(
         temporary.socket_path(),
         attempt_id.clone(),
@@ -626,7 +670,7 @@ fn an_unrequested_run_reaches_its_natural_end_and_records_completed() {
     let release_file = temporary.work().join("release");
     let cgroup = domain.root().join(format!("run-{run_id}"));
 
-    let mut server = ControlServer::bind(temporary.socket_path()).expect("the endpoint binds");
+    let mut server = control_server(temporary.socket_path()).expect("the endpoint binds");
     let peer = live_peer(
         temporary.socket_path(),
         attempt_id.clone(),
@@ -732,7 +776,7 @@ fn a_second_supervisor_for_a_bound_attempt_is_refused_before_any_cgroup() {
     let held_run = identifier('r', "held");
     let cgroup = domain.root().join(format!("run-{run_id}"));
 
-    let mut server = ControlServer::bind(temporary.socket_path()).expect("the endpoint binds");
+    let mut server = control_server(temporary.socket_path()).expect("the endpoint binds");
     let (sink, deliveries) = counting_sink();
     server
         .register(
@@ -807,7 +851,7 @@ fn a_refused_preparation_releases_the_binding_and_leaves_no_residue() {
     let temporary = TempDir::new("reuse");
     let run_id = identifier('r', "reuse");
     let cgroup = domain.root().join(format!("run-{run_id}"));
-    let mut server = ControlServer::bind(temporary.socket_path()).expect("the endpoint binds");
+    let mut server = control_server(temporary.socket_path()).expect("the endpoint binds");
 
     let first = supervisor(&temporary, &identifier('a', "first"), &run_id)
         .run(
@@ -944,7 +988,7 @@ fn cancelling_an_unbound_attempt_is_refused() {
     // supervisor has bound cannot be cancelled, and the refusal names only its
     // category.
     let temporary = TempDir::new("unbound");
-    let server = ControlServer::bind(temporary.socket_path()).expect("the endpoint binds");
+    let server = control_server(temporary.socket_path()).expect("the endpoint binds");
     let mut harness = Harness::spawn(server);
     assert_eq!(
         body(harness.path(), "cancel a-unbound ref-unbound-1\n"),
