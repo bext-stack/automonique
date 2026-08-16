@@ -2132,6 +2132,82 @@ fn named_slack_and_github_facts_are_read_live_before_fast_operational_answer() {
 }
 
 #[test]
+fn natural_language_slack_post_composes_then_uses_the_typed_channel_effect() {
+    let fixture = Fixture::new(&[]);
+    let slack = FakeSlack::posting("Posted to #jean (ts 1786903071.699).")
+        .with_channels(&["deploiements", "jean"]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering(
+        r#"{"kind":"slack_post","channel":"jean","text":"Monique veille au fil des jours,\nEt sème en silence un peu de lumière."}"#,
+    );
+    let mut bridge = bridge_with_slack(
+        &fixture,
+        FakeClient::new([updates(&[(
+            1,
+            OPERATOR,
+            "can you send a poème about Monique in #jean channel?",
+        )])]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+        single_tier_roster(),
+        Some(slack.clone()),
+    );
+
+    let queued = poll(&mut bridge).expect("natural post queues composition");
+    assert_eq!(queued.questions_queued, 1);
+    assert_eq!(queued.slack_posted, 0);
+    let completed = await_question_completion(&mut bridge);
+    assert_eq!(completed.questions_answered, 1);
+    assert_eq!(completed.slack_posted, 1);
+    assert_eq!(completed.slack_failed, 0);
+    assert_eq!(
+        slack.posts(),
+        [(
+            String::from("jean"),
+            String::from("Monique veille au fil des jours,\nEt sème en silence un peu de lumière."),
+        )]
+    );
+    let prompts = lane.tasks();
+    assert_eq!(prompts.len(), 1, "composition and intent share one turn");
+    assert!(prompts[0].contains("AUTOMONIQUE_CONVERSATIONAL_TOOL_ROUTER_V1"));
+    assert!(prompts[0].contains(r#""kind":"slack_post""#));
+    assert!(prompts[0].contains("slack_channels=deploiements,jean"));
+    assert!(outbound.messages()[0].contains("Posted to #jean"));
+}
+
+#[test]
+fn model_cannot_post_to_a_channel_the_current_message_did_not_name() {
+    let fixture = Fixture::new(&[]);
+    let slack = FakeSlack::posting("must not post").with_channels(&["deploiements", "jean"]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering(
+        r#"{"kind":"slack_post","channel":"deploiements","text":"wrong destination"}"#,
+    );
+    let mut bridge = bridge_with_slack(
+        &fixture,
+        FakeClient::new([updates(&[(1, OPERATOR, "send a poem to #jean")])]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane,
+        single_tier_roster(),
+        Some(slack.clone()),
+    );
+
+    assert_eq!(
+        poll(&mut bridge)
+            .expect("composition queues")
+            .questions_queued,
+        1
+    );
+    let completed = await_question_completion(&mut bridge);
+    assert_eq!(completed.questions_failed, 1);
+    assert_eq!(completed.slack_posted, 0);
+    assert!(slack.posts().is_empty());
+    assert!(outbound.messages()[0].contains("nothing was posted"));
+}
+
+#[test]
 fn explicit_ticket_request_waits_for_an_admin_confirmation_before_work() {
     let fixture = Fixture::new(&[]);
     let actions = FakeTicketActions::succeeding();
