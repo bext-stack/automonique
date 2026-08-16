@@ -32,6 +32,7 @@ Admitted messages and successfully delivered assistant replies are captured auto
 Commands:
 
 - `/memory` — counts and recent active memories
+- `/memory inspect` or `/memory stats` — read-only attachment, identity-binding, store health, and lifecycle counts
 - `/memory search <query>` — FTS search with stable `M-…` citations
 - `/memory proposals` — pending automatic or Obsidian edits
 - `/memory show <M-ref>` and `/memory sources <M-ref>` — content and provenance

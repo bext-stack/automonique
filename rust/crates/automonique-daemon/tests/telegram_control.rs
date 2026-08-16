@@ -5628,6 +5628,46 @@ fn a_single_tier_host_keeps_every_authority_it_had() {
 }
 
 #[test]
+fn memory_summary_and_inspection_report_the_attached_readable_store() {
+    let fixture = Fixture::new(&[]);
+    let root = tempfile::tempdir().expect("memory root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private memory root");
+    let memory =
+        StoreMemorySurface::open(&root.path().join("agent-memory.sqlite3"), BOT_ID, "primary")
+            .expect("memory surface");
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge_with_memory(
+        &fixture,
+        FakeClient::new([updates(&[
+            (1, OPERATOR, "/memory"),
+            (2, OPERATOR, "/memory inspect"),
+            (3, OPERATOR, "/memory stats"),
+        ])]),
+        outbound.clone(),
+        FakeSink::default(),
+        single_tier_roster(),
+        memory,
+    );
+
+    let report = poll(&mut bridge).expect("memory commands commit");
+    assert_eq!(report.answered, 3);
+    let messages = outbound.messages();
+    assert_eq!(messages.len(), 3);
+    assert!(messages[0].contains("Monique memory"));
+    for message in &messages[1..] {
+        assert!(message.contains("Durable memory inspection"));
+        assert!(message.contains("status: available"));
+        assert!(message.contains("identity binding: available"));
+        assert!(message.contains("store: readable"));
+        assert!(message.contains("Memory stats"));
+        assert!(message.contains("superseded"));
+        assert!(message.contains("deleted"));
+        assert!(!message.contains("unavailable"));
+    }
+}
+
+#[test]
 fn durable_memory_survives_reopen_redacts_secrets_and_resets_only_conversation_history() {
     let root = tempfile::tempdir().expect("memory root");
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))

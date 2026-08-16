@@ -1506,10 +1506,13 @@ impl Daemon {
             )
             .map_err(|_| DaemonError::SlackRefused("ticket_gate_store_unavailable"))?,
         ));
-        let telegram_question_configuration = telegram::TelegramBotConfig::load(&state_dir)
-            .map_err(|error| {
+        let telegram_question_configuration = if disconnected_recovery {
+            None
+        } else {
+            telegram::TelegramBotConfig::load(&state_dir).map_err(|error| {
                 DaemonError::TelegramRefused(telegram::TelegramHostError::Config(error).category())
-            })?;
+            })?
+        };
         let telegram_bot_id = telegram_question_configuration
             .as_ref()
             .map_or(0, telegram::TelegramBotConfig::bot_id);

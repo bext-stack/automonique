@@ -1786,6 +1786,20 @@ impl MemorySurface for StoreMemorySurface {
                 }
                 Ok(text)
             }
+            MemoryDirective::Inspect => {
+                let counts = self
+                    .store
+                    .counts(&self.tenant, &actor)
+                    .map_err(|_| String::from("memory_read_unavailable"))?;
+                Ok(format!(
+                    "🧠 Durable memory inspection\nstatus: available\nidentity binding: available\nstore: readable\n\nMemory stats\n{} active · {} proposals · {} superseded · {} deleted\n{} conversation messages retained",
+                    counts.active,
+                    counts.candidates,
+                    counts.superseded,
+                    counts.deleted,
+                    counts.messages
+                ))
+            }
             MemoryDirective::Search { query } => {
                 let matches = self
                     .store
@@ -9154,6 +9168,15 @@ fn memory_answer(chat_id: i64, outcome: Result<String, String>) -> Answer {
                     "Durable memory is not configured on this daemon. Nothing was changed."
                 }
                 "memory_not_found" => "That memory does not exist in your authorized scope.",
+                "memory_maintenance_unavailable" => {
+                    "Durable memory is attached, but retention maintenance is unavailable right now. Nothing was changed."
+                }
+                "memory_identity_unavailable" => {
+                    "Durable memory is attached, but this Telegram identity could not be bound. Check the configured memory tenant and immutable identity binding. Nothing was changed."
+                }
+                "memory_read_unavailable" | "memory_search_unavailable" => {
+                    "Durable memory is attached, but its store cannot be read right now. Nothing was changed."
+                }
                 "memory_reference_invalid" => {
                     "Use a memory reference such as M-12. Nothing was changed."
                 }
@@ -9170,6 +9193,37 @@ fn memory_answer(chat_id: i64, outcome: Result<String, String>) -> Answer {
                 text: String::from(text),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod memory_answer_tests {
+    use super::{Answer, memory_answer};
+
+    fn unavailable_text(reason: &str) -> String {
+        match memory_answer(7, Err(String::from(reason))) {
+            Answer::Unavailable { chat_id: 7, text } => text,
+            _ => panic!("memory failure did not produce an unavailable answer"),
+        }
+    }
+
+    #[test]
+    fn read_failures_distinguish_the_attached_store_from_missing_configuration() {
+        assert!(
+            unavailable_text("memory_read_unavailable")
+                .contains("attached, but its store cannot be read")
+        );
+        assert!(
+            unavailable_text("memory_identity_unavailable")
+                .contains("Telegram identity could not be bound")
+        );
+        assert!(
+            unavailable_text("memory_maintenance_unavailable")
+                .contains("retention maintenance is unavailable")
+        );
+        assert!(
+            unavailable_text("memory_not_configured").contains("not configured on this daemon")
+        );
     }
 }
 

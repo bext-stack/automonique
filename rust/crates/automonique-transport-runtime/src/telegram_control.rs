@@ -553,7 +553,7 @@ pub fn help_text() -> String {
             ArgumentShape::Channel => String::from(" <channel>"),
             ArgumentShape::ChannelMessage => String::from(" <channel> <message>"),
             ArgumentShape::MemoryDirective => String::from(
-                " [search <query>|show <id>|proposals|approve <id>|deny <id>|sources <id>|link]",
+                " [inspect|stats|search <query>|show <id>|proposals|approve <id>|deny <id>|sources <id>|link]",
             ),
             ArgumentShape::MuteDirective => String::from(" [15m|1h|8h|24h|off]"),
             ArgumentShape::GitHubDirective => {
@@ -704,6 +704,7 @@ pub enum MuteDirective {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum MemoryDirective {
     Summary,
+    Inspect,
     Search { query: RunTask },
     Show { memory_ref: ControlRef },
     Proposals,
@@ -1587,7 +1588,7 @@ const fn command_usage(kind: CommandKind) -> &'static str {
         CommandKind::Ticket => "/ticket <reference>",
         CommandKind::Slack => "/slack <channel|list>",
         CommandKind::Memory => {
-            "/memory [search <query>|show <id>|proposals|approve <id>|deny <id>|sources <id>|link]"
+            "/memory [inspect|stats|search <query>|show <id>|proposals|approve <id>|deny <id>|sources <id>|link]"
         }
         CommandKind::Remember => "/remember <fact>",
         CommandKind::Forget => "/forget <id>",
@@ -2023,6 +2024,9 @@ fn one_memory_directive(rest: &str) -> Result<MemoryDirective, CommandRefusal> {
     {
         return Ok(MemoryDirective::Summary);
     }
+    if rest.eq_ignore_ascii_case("inspect") || rest.eq_ignore_ascii_case("stats") {
+        return Ok(MemoryDirective::Inspect);
+    }
     if rest.eq_ignore_ascii_case("proposals") {
         return Ok(MemoryDirective::Proposals);
     }
@@ -2341,6 +2345,18 @@ mod tests {
             parse_command("/memory"),
             Ok(ControlCommand::Memory {
                 directive: MemoryDirective::Summary
+            })
+        );
+        assert_eq!(
+            parse_command("/memory inspect"),
+            Ok(ControlCommand::Memory {
+                directive: MemoryDirective::Inspect
+            })
+        );
+        assert_eq!(
+            parse_command("/memory stats"),
+            Ok(ControlCommand::Memory {
+                directive: MemoryDirective::Inspect
             })
         );
         assert_eq!(
