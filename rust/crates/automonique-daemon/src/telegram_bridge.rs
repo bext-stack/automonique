@@ -5620,6 +5620,20 @@ where
         ))
     }
 
+    fn support_ticket_inventory_answer(&mut self, chat_id: i64) -> Answer {
+        match self.surface.tickets_text() {
+            Ok(text) => Answer::Answered {
+                chat_id,
+                text,
+                preformatted: false,
+            },
+            Err(_) => Answer::Unavailable {
+                chat_id,
+                text: String::from("The local support-ticket list is unavailable right now."),
+            },
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn answer_question(
         &mut self,
@@ -5682,6 +5696,9 @@ where
         }
         if let Some(answer) = self.ticket_action_answer(chat_id, message_id, source_key, question) {
             return answer;
+        }
+        if is_support_ticket_inventory_question(question) {
+            return self.support_ticket_inventory_answer(chat_id);
         }
         if is_github_repository_inventory_question(question) {
             return Answer::Answered {
@@ -5794,6 +5811,9 @@ where
                 .unwrap_or_default()
         };
         let host_load_followup = is_host_load_followup(question, &memory_context);
+        if is_support_ticket_inventory_followup(question, &memory_context) {
+            return self.support_ticket_inventory_answer(chat_id);
+        }
         if host_load_followup
             || (explicit_host_load && !deterministic_sources.needs_host_load_synthesis())
         {
@@ -8181,6 +8201,9 @@ struct SystemCapabilityQuery {
 /// closed typed registry. Content reads and action verbs without a capability
 /// question shape stay on their existing routes.
 fn system_capability_question(text: &str) -> Option<SystemCapabilityQuery> {
+    if is_support_ticket_inventory_question(text) {
+        return None;
+    }
     let normalized = text.to_lowercase();
     let terms: BTreeSet<&str> = normalized
         .split(|character: char| !character.is_alphanumeric())
@@ -8299,6 +8322,130 @@ fn system_capability_question(text: &str) -> Option<SystemCapabilityQuery> {
         targets.extend(ALL_CAPABILITY_TARGETS);
     }
     (!targets.is_empty()).then_some(SystemCapabilityQuery { targets })
+}
+
+/// Recognize a request for the bounded local support-ticket list without
+/// turning capability checks, one-ticket reads, or ticket mutations into an
+/// inventory read.
+fn is_support_ticket_inventory_question(text: &str) -> bool {
+    let normalized = text.to_lowercase();
+    let terms: BTreeSet<&str> = normalized
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .collect();
+    if terms.contains("github") || !terms.contains("tickets") {
+        return false;
+    }
+    let capability = terms.iter().any(|term| {
+        matches!(
+            *term,
+            "access"
+                | "acess"
+                | "configured"
+                | "configure"
+                | "enabled"
+                | "available"
+                | "capability"
+                | "capabilities"
+                | "accès"
+                | "configuré"
+                | "configurée"
+                | "disponible"
+        )
+    }) || (terms
+        .iter()
+        .any(|term| matches!(*term, "can" | "could" | "peux" | "pouvez"))
+        && terms
+            .iter()
+            .any(|term| matches!(*term, "read" | "use" | "lire" | "utiliser")));
+    let mutation = terms.iter().any(|term| {
+        matches!(
+            *term,
+            "create"
+                | "open"
+                | "close"
+                | "fix"
+                | "work"
+                | "approve"
+                | "deny"
+                | "reply"
+                | "update"
+                | "créer"
+                | "ouvre"
+                | "ferme"
+                | "corrige"
+                | "travaille"
+                | "approuve"
+                | "refuse"
+                | "réponds"
+                | "modifie"
+        )
+    });
+    let inventory = terms.iter().any(|term| {
+        matches!(
+            *term,
+            "what"
+                | "which"
+                | "list"
+                | "show"
+                | "latest"
+                | "newest"
+                | "recent"
+                | "quels"
+                | "quelles"
+                | "liste"
+                | "montre"
+                | "derniers"
+                | "dernières"
+                | "récents"
+                | "récentes"
+        )
+    });
+    inventory && !capability && !mutation
+}
+
+/// Resolve only short deictic inventory follow-ups grounded in this chat's
+/// recent text. Durable memory is intentionally excluded from routing.
+fn is_support_ticket_inventory_followup(text: &str, memory_context: &str) -> bool {
+    let normalized = text
+        .to_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let followup = matches!(
+        normalized.as_str(),
+        "latest ones"
+            | "the latest ones"
+            | "and the latest ones"
+            | "what are the latest ones"
+            | "which are the latest ones"
+            | "show me the latest ones"
+            | "newest ones"
+            | "the newest ones"
+            | "what are the newest ones"
+            | "which are the newest ones"
+            | "show me the newest ones"
+            | "les derniers"
+            | "et les derniers"
+            | "quels sont les derniers"
+            | "montre moi les derniers"
+            | "les dernières"
+            | "et les dernières"
+            | "quelles sont les dernières"
+            | "montre moi les dernières"
+    );
+    if !followup {
+        return false;
+    }
+    let recent = memory_context
+        .split_once("[recent_conversation]\n")
+        .and_then(|(_, remainder)| remainder.split_once("\n[/recent_conversation]"))
+        .map_or("", |(recent, _)| recent)
+        .to_lowercase();
+    recent
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|term| matches!(term, "ticket" | "tickets"))
 }
 
 /// Recognize a GitHub repository inventory without swallowing issue/project
@@ -9758,7 +9905,8 @@ mod clock_tests {
         github_issue_references, host_load_text, is_current_time_question,
         is_deepseek_balance_question, is_enabled_site_inventory_question,
         is_github_repository_inventory_question, is_host_load_followup, is_host_load_question,
-        is_named_entity_description_question, local_entity_terms, local_entity_value_matches,
+        is_named_entity_description_question, is_support_ticket_inventory_followup,
+        is_support_ticket_inventory_question, local_entity_terms, local_entity_value_matches,
         meminfo_kib, parse_decimal_milli, question_profile, question_prompt, question_sources,
         requires_scratchpad_review, system_capability_question, utc_rfc3339_from_unix_millis,
     };
@@ -9883,6 +10031,61 @@ mod clock_tests {
                 "ordinary/action intent for {question:?}"
             );
         }
+    }
+
+    #[test]
+    fn support_ticket_inventory_is_a_typed_read_not_a_capability_answer() {
+        for question in [
+            "what support tickets do we have?",
+            "what tickets do we have?",
+            "what are the latest support tickets?",
+            "list the latest tickets",
+            "quels sont les derniers tickets support ?",
+        ] {
+            assert!(
+                is_support_ticket_inventory_question(question),
+                "ticket inventory for {question:?}"
+            );
+            assert!(
+                system_capability_question(question).is_none(),
+                "not a capability answer for {question:?}"
+            );
+        }
+        for question in [
+            "do you have access to support tickets?",
+            "can you read support tickets?",
+            "are support tickets configured?",
+            "summarize ticket #12",
+            "work on the latest tickets",
+            "list the latest GitHub tickets",
+        ] {
+            assert!(
+                !is_support_ticket_inventory_question(question),
+                "not a ticket inventory for {question:?}"
+            );
+        }
+        assert!(system_capability_question("can you read support tickets?").is_some());
+    }
+
+    #[test]
+    fn support_ticket_inventory_followup_requires_recent_ticket_context() {
+        let context = "[recent_conversation]\nuser | content_untrusted=what support tickets do we have?\nassistant | content_untrusted=Support tickets are configured\n[/recent_conversation]";
+        assert!(is_support_ticket_inventory_followup(
+            "what are the latest ones?",
+            context
+        ));
+        assert!(!is_support_ticket_inventory_followup(
+            "what are the latest ones?",
+            "[recent_conversation]\nuser | content_untrusted=what models do we have?\n[/recent_conversation]"
+        ));
+        assert!(!is_support_ticket_inventory_followup(
+            "what are the latest ones?",
+            "[durable_memory]\ncontent_untrusted=support tickets\n[/durable_memory]"
+        ));
+        assert!(!is_support_ticket_inventory_followup(
+            "please fix the latest ones",
+            context
+        ));
     }
 
     #[test]

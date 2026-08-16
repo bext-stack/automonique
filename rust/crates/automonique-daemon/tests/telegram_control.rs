@@ -740,13 +740,34 @@ fn bridge_with_memory(
     roster: OperatorRoster,
     memory: StoreMemorySurface,
 ) -> Bridge {
+    bridge_with_memory_and_lane(
+        fixture,
+        client,
+        outbound,
+        sink,
+        roster,
+        memory,
+        FakeRunLane::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bridge_with_memory_and_lane(
+    fixture: &Fixture,
+    client: FakeClient,
+    outbound: FakeOutbound,
+    sink: FakeSink,
+    roster: OperatorRoster,
+    memory: StoreMemorySurface,
+    lane: FakeRunLane,
+) -> Bridge {
     TelegramControlBridge::new(BridgeParts {
         client,
         question_outbound: outbound.clone(),
         outbound,
         sink,
         surface: fixture.surface(),
-        lane: FakeRunLane::default(),
+        lane,
         slack: None,
         github: None,
         github_actions: None,
@@ -3451,6 +3472,53 @@ fn natural_system_access_questions_answer_from_typed_configuration_without_provi
     assert_eq!(report.questions_queued, 0);
     assert!(unavailable_lane.tasks().is_empty());
     assert!(unavailable_outbound.messages()[0].contains("Slack is not configured"));
+}
+
+#[test]
+fn natural_support_ticket_inventory_and_its_followup_use_the_local_store() {
+    let fixture = Fixture::new(&[]);
+    fixture.seed_tickets(&[
+        SeedTicket::new("SUP-NL-1001", "Printer offline in the back room"),
+        SeedTicket::new("SUP-NL-1002", "Mail relay rejects attachments"),
+    ]);
+    let root = tempfile::tempdir().expect("memory root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private memory root");
+    let memory =
+        StoreMemorySurface::open(&root.path().join("agent-memory.sqlite3"), BOT_ID, "primary")
+            .expect("memory surface");
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering("must not run");
+    let mut bridge = bridge_with_memory_and_lane(
+        &fixture,
+        FakeClient::new([
+            updates(&[(1, OPERATOR, "what support tickets do we have?")]),
+            updates(&[(2, OPERATOR, "what are the latest ones?")]),
+        ]),
+        outbound.clone(),
+        FakeSink::default(),
+        single_tier_roster(),
+        memory,
+        lane.clone(),
+    );
+
+    for expected_messages in 1..=2 {
+        let report = poll(&mut bridge).expect("ticket inventory answer commits");
+        assert_eq!(report.answered, 1);
+        assert_eq!(report.questions_queued, 0);
+        assert_eq!(outbound.messages().len(), expected_messages);
+    }
+    assert!(
+        lane.tasks().is_empty(),
+        "ticket reads must spend no provider run"
+    );
+    for message in outbound.messages() {
+        assert!(message.contains("🎫 Recent tickets · 2 of 2"));
+        assert!(message.contains("Mail relay rejects attachments"));
+        assert!(!message.contains("Support tickets: configured"));
+        assert!(!message.contains("Refused before provider execution"));
+        assert!(!message.contains("route="));
+    }
 }
 
 #[test]
