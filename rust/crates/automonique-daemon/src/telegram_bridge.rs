@@ -1478,7 +1478,15 @@ pub struct StoreMemorySurface {
     store: AgentMemoryStore,
     bot_id: i64,
     tenant: String,
+    tenant_source: MemoryTenantSource,
     last_prune_at_ms: i64,
+}
+
+/// Where the selected durable-memory tenant came from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryTenantSource {
+    Default,
+    Configured,
 }
 
 impl StoreMemorySurface {
@@ -1493,11 +1501,24 @@ impl StoreMemorySurface {
     ///
     /// Returns `memory_store_unavailable` when the database cannot be opened.
     pub fn open(path: &Path, bot_id: i64, tenant: &str) -> Result<Self, String> {
+        Self::open_with_tenant_source(path, bot_id, tenant, MemoryTenantSource::Configured)
+    }
+
+    /// Open memory while retaining whether the tenant was explicit or the
+    /// daemon's documented default, for the read-only Telegram configuration
+    /// view.
+    pub fn open_with_tenant_source(
+        path: &Path,
+        bot_id: i64,
+        tenant: &str,
+        tenant_source: MemoryTenantSource,
+    ) -> Result<Self, String> {
         AgentMemoryStore::open(path)
             .map(|store| Self {
                 store,
                 bot_id,
                 tenant: tenant.to_owned(),
+                tenant_source,
                 last_prune_at_ms: 0,
             })
             .map_err(|_| String::from("memory_store_unavailable"))
@@ -1760,8 +1781,53 @@ impl MemorySurface for StoreMemorySurface {
         directive: &MemoryDirective,
         at_ms: i64,
     ) -> Result<String, String> {
+        if matches!(directive, MemoryDirective::Config) {
+            let actor = Self::actor(actor_id);
+            let application = self.bot_id.to_string();
+            let external_user = actor_id.to_string();
+            let binding = self
+                .store
+                .resolve_identity("telegram", &application, "telegram", &external_user)
+                .map_err(|_| String::from("memory_read_unavailable"))?;
+            let binding = match binding {
+                Some((tenant, recorded_actor))
+                    if tenant == self.tenant && recorded_actor == actor =>
+                {
+                    "matched"
+                }
+                Some(_) => "conflicting",
+                None => "missing",
+            };
+            let counts = self
+                .store
+                .counts(&self.tenant, &actor)
+                .map_err(|_| String::from("memory_read_unavailable"))?;
+            let source = match self.tenant_source {
+                MemoryTenantSource::Default => "default (memory.conf absent)",
+                MemoryTenantSource::Configured => "explicit memory.conf",
+            };
+            let guidance = match binding {
+                "matched" => "Configuration and identity agree.",
+                "missing" => {
+                    "This identity has no durable binding yet; the next memory action can create it."
+                }
+                _ => {
+                    "This identity is bound outside the selected tenant or actor. Repair the private memory configuration before using memory."
+                }
+            };
+            return Ok(format!(
+                "🧠 Durable memory configuration\ntenant: `{}`\ntenant source: {source}\nstore: readable\ncurrent Telegram identity: {binding}\n\nMemory stats\n{} active · {} proposals · {} superseded · {} deleted\n{} conversation messages retained\n\n{guidance}",
+                self.tenant,
+                counts.active,
+                counts.candidates,
+                counts.superseded,
+                counts.deleted,
+                counts.messages
+            ));
+        }
         let actor = self.bind(actor_id, at_ms)?;
         match directive {
+            MemoryDirective::Config => unreachable!("handled before binding"),
             MemoryDirective::Summary => {
                 let counts = self
                     .store

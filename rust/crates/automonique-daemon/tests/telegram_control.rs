@@ -28,17 +28,19 @@ use automonique_daemon::slack::SLACK_NOT_CONFIGURED;
 use automonique_daemon::telegram_bridge::{
     ApprovalDecisionAnswer, ApprovalDecisionFailure, BridgeParts, ControlSurface, DispatchReport,
     EmailActionSurface, HostFacts, MAX_PENDING_QUESTIONS, MAX_QUESTION_CONTEXT_BYTES,
-    MAX_QUESTION_PROMPT_BYTES, MemberChange, MemorySurface, NO_TICKETS_RECORDED, OperatorRoster,
-    QUESTION_ADMIN_ONLY, QUESTION_FRENCH_GREETING, QUESTION_GREETING, QUESTION_IDENTITY,
-    QUESTION_SMALL_TALK, QUESTION_TICKETS_LISTED, RunFailure, RunLane, SlackSurface,
-    StoreControlSurface, StoreMemorySurface, TICKET_ACTION_UNAVAILABLE, TICKET_NOT_FOUND,
-    TICKETS_LISTED, TICKETS_NOT_ENABLED, TelegramControlBridge, TicketActionSurface,
+    MAX_QUESTION_PROMPT_BYTES, MemberChange, MemorySurface, MemoryTenantSource,
+    NO_TICKETS_RECORDED, OperatorRoster, QUESTION_ADMIN_ONLY, QUESTION_FRENCH_GREETING,
+    QUESTION_GREETING, QUESTION_IDENTITY, QUESTION_SMALL_TALK, QUESTION_TICKETS_LISTED, RunFailure,
+    RunLane, SlackSurface, StoreControlSurface, StoreMemorySurface, TICKET_ACTION_UNAVAILABLE,
+    TICKET_NOT_FOUND, TICKETS_LISTED, TICKETS_NOT_ENABLED, TelegramControlBridge,
+    TicketActionSurface,
 };
 use automonique_github_connector::IssueLocator;
 use automonique_protocol::admin::ExecutionState;
 use automonique_protocol::execute_api::CancelRunOutcome;
 use automonique_store::agent_memory::{
-    AgentMemoryStore, MemoryInput, MemoryKind, MemorySensitivity, MemoryStatus, MemoryVisibility,
+    AgentMemoryStore, ExternalIdentity, MemoryInput, MemoryKind, MemorySensitivity, MemoryStatus,
+    MemoryVisibility,
 };
 use automonique_store::operator_members::OperatorMemberStore;
 use automonique_store::run_index::{RunIndex, RunIndexEntry};
@@ -5643,6 +5645,7 @@ fn memory_summary_and_inspection_report_the_attached_readable_store() {
             (1, OPERATOR, "/memory"),
             (2, OPERATOR, "/memory inspect"),
             (3, OPERATOR, "/memory stats"),
+            (4, OPERATOR, "/memory config"),
         ])]),
         outbound.clone(),
         FakeSink::default(),
@@ -5651,11 +5654,11 @@ fn memory_summary_and_inspection_report_the_attached_readable_store() {
     );
 
     let report = poll(&mut bridge).expect("memory commands commit");
-    assert_eq!(report.answered, 3);
+    assert_eq!(report.answered, 4);
     let messages = outbound.messages();
-    assert_eq!(messages.len(), 3);
+    assert_eq!(messages.len(), 4);
     assert!(messages[0].contains("Monique memory"));
-    for message in &messages[1..] {
+    for message in &messages[1..3] {
         assert!(message.contains("Durable memory inspection"));
         assert!(message.contains("status: available"));
         assert!(message.contains("identity binding: available"));
@@ -5665,6 +5668,71 @@ fn memory_summary_and_inspection_report_the_attached_readable_store() {
         assert!(message.contains("deleted"));
         assert!(!message.contains("unavailable"));
     }
+    assert!(messages[3].contains("Durable memory configuration"));
+    assert!(messages[3].contains("tenant: `primary`"));
+    assert!(messages[3].contains("tenant source: explicit memory.conf"));
+    assert!(messages[3].contains("current Telegram identity: matched"));
+    assert!(messages[3].contains("store: readable"));
+    assert!(messages[3].contains("Memory stats"));
+    assert!(messages[3].contains("superseded"));
+    assert!(messages[3].contains("deleted"));
+}
+
+#[test]
+fn memory_config_reports_a_conflict_without_rebinding_the_identity() {
+    let root = tempfile::tempdir().expect("memory root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private memory root");
+    let path = root.path().join("agent-memory.sqlite3");
+    let application = BOT_ID.to_string();
+    let external_user = OPERATOR.to_string();
+    let actor = format!("telegram:{OPERATOR}");
+    let mut store = AgentMemoryStore::open(&path).expect("memory store");
+    store
+        .bind_identity(
+            "existing",
+            &actor,
+            ExternalIdentity {
+                platform: "telegram",
+                application: &application,
+                external_tenant: "telegram",
+                external_user: &external_user,
+            },
+            NOW_MS,
+        )
+        .expect("existing identity binding");
+    drop(store);
+
+    let mut memory = StoreMemorySurface::open_with_tenant_source(
+        &path,
+        BOT_ID,
+        "selected",
+        MemoryTenantSource::Default,
+    )
+    .expect("memory surface");
+    let answer = memory
+        .render(
+            OPERATOR,
+            OPERATOR,
+            "telegram:update:1",
+            &MemoryDirective::Config,
+            NOW_MS + 1,
+        )
+        .expect("memory configuration rendered");
+    assert!(answer.contains("tenant: `selected`"));
+    assert!(answer.contains("tenant source: default (memory.conf absent)"));
+    assert!(answer.contains("current Telegram identity: conflicting"));
+    assert!(answer.contains("Repair the private memory configuration"));
+    drop(memory);
+
+    let store = AgentMemoryStore::open(&path).expect("memory store reopened");
+    assert_eq!(
+        store
+            .resolve_identity("telegram", &application, "telegram", &external_user)
+            .expect("identity resolved"),
+        Some((String::from("existing"), actor)),
+        "the read-only configuration view must not rebind an identity"
+    );
 }
 
 #[test]

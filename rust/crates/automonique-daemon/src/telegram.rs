@@ -725,8 +725,22 @@ impl TelegramHost {
     ) -> Result<LiveBridge, TelegramHostError> {
         let manage =
             ManageConfig::load(params.state_dir).map_err(TelegramHostError::ManageConfig)?;
-        let memory_tenant = crate::memory_config::MemoryConfig::tenant_or_default(params.state_dir)
+        let memory_configuration = crate::memory_config::MemoryConfig::load(params.state_dir)
             .map_err(TelegramHostError::MemoryConfig)?;
+        let (memory_tenant, memory_tenant_source) = memory_configuration.map_or_else(
+            || {
+                (
+                    String::from(crate::memory_config::DEFAULT_MEMORY_TENANT),
+                    crate::telegram_bridge::MemoryTenantSource::Default,
+                )
+            },
+            |configuration| {
+                (
+                    configuration.tenant().to_owned(),
+                    crate::telegram_bridge::MemoryTenantSource::Configured,
+                )
+            },
+        );
         let surface = StoreControlSurface::open_with_lease_time_source(
             params.database_path,
             params.run_index_path,
@@ -830,10 +844,11 @@ impl TelegramHost {
                 ticket_actions,
                 email_actions,
                 memory: Some(Box::new(
-                    crate::telegram_bridge::StoreMemorySurface::open(
+                    crate::telegram_bridge::StoreMemorySurface::open_with_tenant_source(
                         &params.state_dir.join("agent-memory.sqlite3"),
                         bot_id,
                         &memory_tenant,
+                        memory_tenant_source,
                     )
                     .map_err(|_| TelegramHostError::SurfaceUnavailable)?,
                 )),
