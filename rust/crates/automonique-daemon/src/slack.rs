@@ -115,7 +115,8 @@ use crate::manage_config::ManageUrl;
 use crate::progress_hub::ProgressHub;
 use crate::run_lane::{SlackProgressSink, SlackProgressTarget, SocketRunLane};
 use crate::telegram_bridge::{
-    ApprovalDecisionAnswer, ApprovalDecisionFailure, RunLane as _, SlackSurface,
+    ApprovalDecisionAnswer, ApprovalDecisionFailure, HostFacts, RunLane as _, SlackSurface,
+    StoreControlSurface, answer_read_only_transport_question, deterministic_conversation_answer,
 };
 
 /// Configuration path beneath the daemon's private state directory.
@@ -317,6 +318,8 @@ pub enum SlackConfigError {
     TicketActionsUnavailable,
     /// GitHub actions were configured but their provider lane could not open.
     GitHubActionsUnavailable,
+    /// Read-only Slack conversation could not open its typed source or lane.
+    QuestionSurfaceUnavailable,
     /// A present Manage configuration was refused.
     ManageConfig(crate::manage_config::ManageConfigError),
     /// A present memory configuration was refused.
@@ -361,6 +364,8 @@ impl fmt::Display for SlackConfigError {
             Self::GitHubActionsUnavailable => {
                 formatter.write_str("slack GitHub actions require an available provider lane")
             }
+            Self::QuestionSurfaceUnavailable => formatter
+                .write_str("slack conversation requires an available read-only question surface"),
             Self::ManageConfig(error) => write!(formatter, "{error}"),
             Self::MemoryConfig(error) => write!(formatter, "{error}"),
             Self::ShadowConfig(error) => write!(formatter, "{error}"),
@@ -388,6 +393,7 @@ impl SlackConfigError {
             Self::ArtifactPolicyRequired => "slack_artifact_policy_required",
             Self::TicketActionsUnavailable => "slack_ticket_actions_unavailable",
             Self::GitHubActionsUnavailable => "slack_github_actions_unavailable",
+            Self::QuestionSurfaceUnavailable => "slack_question_surface_unavailable",
             Self::ManageConfig(error) => error.category(),
             Self::MemoryConfig(error) => error.category(),
             Self::ShadowConfig(error) => error.category(),
@@ -966,6 +972,26 @@ fn slack_ticket_event(text: &str) -> Option<SlackTicketEvent> {
         source_key,
         app_mention: event_type == "app_mention",
     })
+}
+
+/// Remove the one bot mention that made Slack classify this as `app_mention`.
+///
+/// Slack keeps the mention as `<@U…>` inside `text`, sometimes with sentence
+/// punctuation immediately after it. The conversational router should see the
+/// prose the person wrote, while any additional user mentions remain intact.
+fn slack_app_mention_text(text: &str) -> String {
+    let mut prose = text.to_owned();
+    if let Some(start) = prose.find("<@")
+        && let Some(relative_end) = prose[start + 2..].find('>')
+    {
+        let end = start + 2 + relative_end;
+        prose.replace_range(start..=end, "");
+    }
+    prose
+        .trim()
+        .trim_matches(|character: char| matches!(character, '?' | '!' | '.' | ','))
+        .trim()
+        .to_owned()
 }
 
 /// Parse one message the configured reference bot published.
@@ -1833,6 +1859,34 @@ struct SlackTicketRouter<P> {
     /// daemon's own run index would not open, which is the same condition
     /// every other socket lane refuses on.
     approval_lane: Option<SocketRunLane>,
+    /// The read-only conversational surface used only after action-shaped
+    /// Slack routes have been excluded.
+    question_answerer: Option<Box<dyn SlackQuestionAnswerer>>,
+}
+
+trait SlackQuestionAnswerer: Send {
+    fn answer(&mut self, question: &str, context: &str) -> String;
+}
+
+struct LiveSlackQuestionAnswerer {
+    surface: StoreControlSurface,
+    lane: SocketRunLane,
+    administrators: Vec<i64>,
+    configured: Vec<i64>,
+}
+
+impl SlackQuestionAnswerer for LiveSlackQuestionAnswerer {
+    fn answer(&mut self, question: &str, context: &str) -> String {
+        answer_read_only_transport_question(
+            &mut self.surface,
+            &mut self.lane,
+            question,
+            context,
+            &self.administrators,
+            &self.configured,
+            "slack_question_worker",
+        )
+    }
 }
 
 impl<P: SlackTicketPoster> SlackTicketRouter<P> {
@@ -2534,11 +2588,20 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
         {
             return;
         }
-        let trimmed = event.text.trim();
+        let mention_text = event
+            .app_mention
+            .then(|| slack_app_mention_text(&event.text));
+        let trimmed = mention_text.as_deref().unwrap_or_else(|| event.text.trim());
         let conversational = self.features.contains(&SlackFeature::Conversation)
             && self.members.contains(&event.user)
             && (event.app_mention || event.channel.as_str().starts_with('D'));
         if conversational {
+            if let Some(answer) = deterministic_conversation_answer(trimmed) {
+                let _ = self
+                    .poster
+                    .post_thread(&event.channel, &event.parent, answer);
+                return;
+            }
             if is_github_capability_question(trimmed) {
                 let text = if self.github_actions.is_some() {
                     "Yes. I can create GitHub issues, reply to them, and check or uncheck checklist items in configured repositories."
@@ -2607,7 +2670,22 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
         }
         let issue_url = match one_issue_url(trimmed) {
             Ok(Some(issue_url)) => issue_url,
-            Ok(None) => return,
+            Ok(None) => {
+                if conversational {
+                    let answer = self.question_answerer.as_mut().map_or_else(
+                        || {
+                            String::from(
+                                "Monique's read-only question surface is unavailable right now.",
+                            )
+                        },
+                        |answerer| answerer.answer(trimmed, context),
+                    );
+                    let _ = self
+                        .poster
+                        .post_thread(&event.channel, &event.parent, &answer);
+                }
+                return;
+            }
             Err(()) => {
                 let _ = self.poster.post_thread(
                     &event.channel,
@@ -2807,6 +2885,7 @@ pub(crate) fn replay_slack_trace(
         // The replay router reaches no daemon by construction: a parity replay
         // must not be able to decide anything.
         approval_lane: None,
+        question_answerer: None,
     };
     for event in trace.events() {
         let source_key = format!("slack:{}:event:{}", workspace.team, event.event_id);
@@ -2897,6 +2976,18 @@ const APPROVAL_REFERENCE_PREFIX: &str = "apr-";
 /// be an unbounded burst against somebody else's rate limit.
 const MAX_LISTED_APPROVALS: usize = 8;
 
+pub(crate) struct SlackTicketHostParams<'a> {
+    pub state_dir: &'a Path,
+    pub database_path: &'a Path,
+    pub admin_socket: &'a Path,
+    pub run_index_path: &'a Path,
+    pub support_tickets_path: &'a Path,
+    pub operator_members_path: &'a Path,
+    pub host_facts: HostFacts,
+    pub question_administrators: Vec<i64>,
+    pub question_configured: Vec<i64>,
+}
+
 /// Socket Mode ticket-intake lifecycle, separate from Telegram's Slack read and
 /// post surface so Slack works even when Telegram is disabled.
 pub(crate) enum SlackTicketHost {
@@ -2919,11 +3010,20 @@ pub(crate) enum SlackTicketHost {
 
 impl SlackTicketHost {
     pub fn open(
-        state_dir: &Path,
-        admin_socket: &Path,
-        run_index_path: &Path,
+        params: &SlackTicketHostParams<'_>,
         gates: Arc<std::sync::Mutex<crate::telegram_bridge::TicketGateRegistry>>,
     ) -> Result<Self, SlackConfigError> {
+        let SlackTicketHostParams {
+            state_dir,
+            database_path,
+            admin_socket,
+            run_index_path,
+            support_tickets_path,
+            operator_members_path,
+            host_facts,
+            question_administrators,
+            question_configured,
+        } = params;
         let Some(config) = SlackConfig::load(state_dir)? else {
             return Ok(Self::Disabled);
         };
@@ -2945,8 +3045,10 @@ impl SlackTicketHost {
             .map_err(|_| SlackConfigError::TicketActionsUnavailable)?
             .ok_or(SlackConfigError::TicketActionsUnavailable)?
             .into_action_client();
-        let manage_url = crate::manage_config::ManageConfig::load(state_dir)
-            .map_err(SlackConfigError::ManageConfig)?
+        let manage_config = crate::manage_config::ManageConfig::load(state_dir)
+            .map_err(SlackConfigError::ManageConfig)?;
+        let manage_url = manage_config
+            .as_ref()
             .and_then(|config| config.url().cloned());
         let memory_tenant = crate::memory_config::MemoryConfig::tenant_or_default(state_dir)
             .map_err(SlackConfigError::MemoryConfig)?;
@@ -2963,6 +3065,37 @@ impl SlackTicketHost {
                 ))
             }
             None => None,
+        };
+        let question_answerer = if features.contains(&SlackFeature::Conversation) {
+            let surface = StoreControlSurface::open_with_lease_time_source(
+                database_path,
+                run_index_path,
+                host_facts.clone(),
+                Arc::new(crate::lease_time::BootTimeSource),
+            )
+            .map_err(|_| SlackConfigError::QuestionSurfaceUnavailable)?
+            .with_support_tickets(support_tickets_path)
+            .with_operator_members(operator_members_path)
+            .with_prism_sites(Path::new(crate::site_inventory::NGINX_SITES_ENABLED))
+            .with_local_knowledge(&crate::local_knowledge::catalog_path(state_dir))
+            .with_provider_state(state_dir);
+            let surface = match manage_config
+                .as_ref()
+                .and_then(crate::manage_config::ManageConfig::profile_app)
+            {
+                Some(profile) => surface.with_manage_profiles(profile.clone()),
+                None => surface,
+            };
+            let lane = SocketRunLane::open(state_dir, admin_socket, run_index_path)
+                .map_err(|_| SlackConfigError::QuestionSurfaceUnavailable)?;
+            Some(Box::new(LiveSlackQuestionAnswerer {
+                surface,
+                lane,
+                administrators: question_administrators.clone(),
+                configured: question_configured.clone(),
+            }) as Box<dyn SlackQuestionAnswerer>)
+        } else {
+            None
         };
         let legacy = legacy_observation(state_dir)?;
         let client = Arc::new(SlackClient::new(SlackBase::production(), token));
@@ -2995,6 +3128,7 @@ impl SlackTicketHost {
                     .ok(),
                     approval_lane: SocketRunLane::open(state_dir, admin_socket, run_index_path)
                         .ok(),
+                    question_answerer,
                 },
             })),
             stop: Arc::new(AtomicBool::new(false)),
@@ -4875,6 +5009,20 @@ mod tests {
         confirmed: Arc<std::sync::Mutex<Vec<(String, String)>>>,
     }
 
+    struct FakeQuestionAnswerer {
+        seen: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl SlackQuestionAnswerer for FakeQuestionAnswerer {
+        fn answer(&mut self, question: &str, context: &str) -> String {
+            self.seen
+                .lock()
+                .expect("questions")
+                .push((question.to_owned(), context.to_owned()));
+            String::from("Monique intelligent answer")
+        }
+    }
+
     fn ticket_receipt(approved: bool) -> automonique_support_connector::TicketDispatchReceipt {
         automonique_support_connector::TicketDispatchReceipt {
             issue_id: String::from("issue-fixture"),
@@ -4967,6 +5115,7 @@ mod tests {
             github_actions: None,
             approvals: None,
             approval_lane: None,
+            question_answerer: None,
         }
     }
 
@@ -5028,6 +5177,7 @@ mod tests {
             github_actions: None,
             approvals: None,
             approval_lane: None,
+            question_answerer: None,
         };
 
         router.handle_with_context(
@@ -5107,6 +5257,7 @@ mod tests {
                 github_actions: None,
                 approvals: None,
                 approval_lane: None,
+                question_answerer: None,
             }
         }
 
@@ -5310,6 +5461,7 @@ mod tests {
             github_actions: None,
             approvals: None,
             approval_lane: None,
+            question_answerer: None,
         };
         let event = ticket_event(
             "U0ADMIN001",
@@ -5393,6 +5545,7 @@ mod tests {
             github_actions: None,
             approvals: None,
             approval_lane: None,
+            question_answerer: None,
         };
         let mut in_thread = |thread_ts: &str, event_id: &str| {
             let mut event = ticket_event("U0ADMIN001", "bonjour", event_id);
@@ -5476,6 +5629,7 @@ mod tests {
             github_actions: None,
             approvals: None,
             approval_lane: None,
+            question_answerer: None,
         };
         router.handle_with_context(
             ticket_event("U0ADMIN001", "confirm job-from-telegram", "Ev4"),
@@ -5525,6 +5679,91 @@ mod tests {
                 .expect("plain message")
                 .app_mention
         );
+    }
+
+    #[test]
+    fn admitted_app_mentions_reach_monique_question_routing() {
+        let poster = FakeTicketPoster::default();
+        let messages = Arc::clone(&poster.messages);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut router = SlackTicketRouter {
+            poster,
+            manage: Box::new(FakeManage::default()),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
+            channels: ChannelMap(vec![(
+                name("ops"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![SlackFeature::Approvals, SlackFeature::Conversation],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+            approvals: None,
+            approval_lane: None,
+            question_answerer: Some(Box::new(FakeQuestionAnswerer {
+                seen: Arc::clone(&seen),
+            })),
+        };
+        let mut event = ticket_event(
+            "U0ADMIN001",
+            "<@B0APP> what do you know about webdesign29 and activ?",
+            "EvQuestion",
+        );
+        event.app_mention = true;
+        router.handle_with_context(event, "remembered context");
+
+        assert_eq!(
+            seen.lock().expect("questions").as_slice(),
+            [(
+                String::from("what do you know about webdesign29 and activ"),
+                String::from("remembered context")
+            )]
+        );
+        assert_eq!(
+            messages.lock().expect("messages").as_slice(),
+            [String::from("Monique intelligent answer")]
+        );
+    }
+
+    #[test]
+    fn slack_greetings_answer_as_monique_without_spending_a_provider_run() {
+        let poster = FakeTicketPoster::default();
+        let messages = Arc::clone(&poster.messages);
+        let mut router = SlackTicketRouter {
+            poster,
+            manage: Box::new(FakeManage::default()),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
+            channels: ChannelMap(vec![(
+                name("ops"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![SlackFeature::Conversation],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+            approvals: None,
+            approval_lane: None,
+            question_answerer: None,
+        };
+        let mut event = ticket_event("U0ADMIN001", "hello <@B0APP>?", "EvHello");
+        event.app_mention = true;
+        router.handle_with_context(event, "");
+
+        assert_eq!(
+            messages.lock().expect("messages").as_slice(),
+            [String::from(crate::telegram_bridge::QUESTION_GREETING)]
+        );
+        assert!(crate::telegram_bridge::QUESTION_GREETING.contains("Monique"));
     }
 
     #[test]
@@ -5641,6 +5880,7 @@ mod tests {
             github_actions: None,
             approvals: None,
             approval_lane: None,
+            question_answerer: None,
         };
         router.handle_with_context(
             ticket_event(

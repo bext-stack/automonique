@@ -1506,14 +1506,41 @@ impl Daemon {
             )
             .map_err(|_| DaemonError::SlackRefused("ticket_gate_store_unavailable"))?,
         ));
+        let telegram_question_configuration = telegram::TelegramBotConfig::load(&state_dir)
+            .map_err(|error| {
+                DaemonError::TelegramRefused(telegram::TelegramHostError::Config(error).category())
+            })?;
+        let telegram_bot_id = telegram_question_configuration
+            .as_ref()
+            .map_or(0, telegram::TelegramBotConfig::bot_id);
+        let (question_administrators, question_configured) =
+            telegram_question_configuration.as_ref().map_or_else(
+                || (Vec::new(), Vec::new()),
+                telegram::TelegramBotConfig::question_operator_ids,
+            );
+        drop(telegram_question_configuration);
         let (mut slack_tickets, slack) = if disconnected_recovery {
             (slack::SlackTicketHost::Disabled, slack::SlackHost::Disabled)
         } else {
             (
                 slack::SlackTicketHost::open(
-                    &state_dir,
-                    &config.admin_socket(),
-                    &config.run_index_path(),
+                    &slack::SlackTicketHostParams {
+                        state_dir: &state_dir,
+                        database_path: &config.database_path(),
+                        admin_socket: &config.admin_socket(),
+                        run_index_path: &config.run_index_path(),
+                        support_tickets_path: &config.support_tickets_path(),
+                        operator_members_path: &config.operator_members_path(),
+                        host_facts: telegram_bridge::HostFacts {
+                            generation_id: GENERATION_ID.to_owned(),
+                            holder_id: instance_id.as_str().to_owned(),
+                            lease_epoch: lease.epoch,
+                            bot_id: telegram_bot_id,
+                            execution_state,
+                        },
+                        question_administrators,
+                        question_configured,
+                    },
                     Arc::clone(&ticket_gates),
                 )
                 .map_err(|error| DaemonError::SlackRefused(error.category()))?,

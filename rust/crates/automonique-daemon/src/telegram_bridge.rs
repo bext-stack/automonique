@@ -228,7 +228,7 @@ pub const QUESTION_ADMIN_ONLY: &str = "Natural-language questions are available 
 pub const QUESTION_REJECTED: &str = "That question is empty, too long, or contains unsupported control characters, so no provider run was started.";
 
 /// Deterministic answer for greeting-only administrator prose.
-pub const QUESTION_GREETING: &str = "Hello! How can I help?";
+pub const QUESTION_GREETING: &str = "Hello! I'm Monique. How can I help?";
 
 /// Deterministic identity answer that never needs an operational fact snapshot.
 pub const QUESTION_IDENTITY: &str = "I'm Monique, Automonique's operational assistant. I can answer questions about the daemon and the locally tracked support tickets.";
@@ -6520,21 +6520,7 @@ where
                 preformatted: false,
             };
         }
-        if is_greeting(question) {
-            return Answer::Answered {
-                chat_id,
-                text: String::from(QUESTION_GREETING),
-                preformatted: false,
-            };
-        }
-        if is_identity_question(question) {
-            return Answer::Answered {
-                chat_id,
-                text: String::from(QUESTION_IDENTITY),
-                preformatted: false,
-            };
-        }
-        if let Some(answer) = small_talk_answer(question) {
+        if let Some(answer) = deterministic_conversation_answer(question) {
             return Answer::Answered {
                 chat_id,
                 text: String::from(answer),
@@ -9698,6 +9684,212 @@ fn small_talk_answer(text: &str) -> Option<&'static str> {
     .then_some(QUESTION_SMALL_TALK)
 }
 
+/// Answer the transport-independent conversational fast paths.
+///
+/// Slack and Telegram both admit these exact, read-only utterances without a
+/// provider run. Keeping the decision here prevents one transport from
+/// silently dropping a greeting that the other transport answers.
+pub(crate) fn deterministic_conversation_answer(text: &str) -> Option<&'static str> {
+    if is_greeting(text) {
+        return Some(QUESTION_GREETING);
+    }
+    if is_identity_question(text) {
+        return Some(QUESTION_IDENTITY);
+    }
+    small_talk_answer(text)
+}
+
+/// Run the same closed, read-only conversational router for a non-Telegram
+/// transport.
+///
+/// The caller supplies only already-admitted prose, bounded conversation
+/// context and typed daemon seams. Model output may select a closed read plan,
+/// but it cannot select a mutation: Slack posts and MCP effects are refused on
+/// this surface. This keeps Slack mentions intelligent without creating a
+/// second authority model beside Telegram's question path.
+pub(crate) fn answer_read_only_transport_question(
+    surface: &mut dyn ControlSurface,
+    lane: &mut dyn RunLane,
+    question: &str,
+    memory_context: &str,
+    administrators: &[i64],
+    configured: &[i64],
+    caller: &'static str,
+) -> String {
+    let accepted_unix_ms = crate::unix_millis().ok();
+    let accepted_at = Instant::now();
+    if let Some(answer) = deterministic_conversation_answer(question) {
+        return String::from(answer);
+    }
+    let Some(question) = accepted_question(question) else {
+        return String::from(QUESTION_REJECTED);
+    };
+
+    if is_current_time_question(question) {
+        return accepted_unix_ms
+            .and_then(utc_rfc3339_from_unix_millis)
+            .map_or_else(
+                || String::from("The daemon clock is unavailable right now."),
+                |current_utc| format!("It’s {current_utc} (UTC)."),
+            );
+    }
+    if is_host_load_question(question) {
+        return surface.host_load().map_or_else(
+            |_| String::from("Live CPU load and RAM are unavailable right now."),
+            host_load_text,
+        );
+    }
+    if is_enabled_site_inventory_question(question) {
+        return surface.prism_inventory_markdown().map_or_else(
+            |_| String::from("The enabled-site inventory is unavailable right now."),
+            |answer| bounded_reply(&answer),
+        );
+    }
+    if is_deepseek_balance_question(question) {
+        return deepseek_balance_text(surface.deepseek_balance());
+    }
+    if is_codex_usage_question(question) {
+        return codex_usage_text(surface.codex_usage());
+    }
+
+    let lookup_started = Instant::now();
+    if is_named_entity_description_question(question) {
+        if let Ok(Some(answer)) = surface.local_entity_answer(question) {
+            return bounded_reply(&answer);
+        }
+        if let Ok(Some(context)) =
+            surface.local_entity_question_context(question, administrators, configured)
+        {
+            let context = bounded_question_context(&format!("{memory_context}\n\n{context}"));
+            let Some(prompt) =
+                question_prompt(question, &context, QuestionProfile::OperationalLookup)
+            else {
+                return String::from(
+                    "The local entity context did not fit safely, so no provider run was started.",
+                );
+            };
+            let lookup_ms = lookup_started.elapsed().as_millis();
+            let execution_started = Instant::now();
+            let runtime = lane.question_runtime(QuestionProfile::OperationalLookup);
+            let answer = match lane.run_question(&prompt, QuestionProfile::OperationalLookup) {
+                Ok(answer) => answer,
+                Err(failure) => return String::from(question_failure_reply(failure)),
+            };
+            let execution_ms = execution_started.elapsed().as_millis();
+            return timed_question_reply_for(
+                &answer,
+                runtime,
+                QuestionTimingBreakdown {
+                    accepted_unix_ms,
+                    lookup_ms,
+                    ack_ms: 0,
+                    queue_ms: 0,
+                    routing_ms: 0,
+                    execution_ms,
+                    total_ms: accepted_at.elapsed().as_millis(),
+                },
+                caller,
+            );
+        }
+    }
+
+    let profile = question_profile(question);
+    let Some(intent_prompt) =
+        question_intent_prompt(question, memory_context, &[], false, &[], profile)
+    else {
+        return String::from(
+            "The conversational intent request did not fit safely, so no provider run was started.",
+        );
+    };
+    let routing_started = Instant::now();
+    let routing_runtime = lane.question_runtime(profile);
+    let routed = match lane.run_question(&intent_prompt, profile) {
+        Ok(answer) => answer,
+        Err(failure) => return String::from(question_failure_reply(failure)),
+    };
+    let first_execution_ms = routing_started.elapsed().as_millis();
+    match model_question_intent(&routed, None, question, &[], &[]) {
+        Some(ModelQuestionIntent::Answer(answer)) => timed_question_reply_for(
+            &answer,
+            routing_runtime,
+            QuestionTimingBreakdown {
+                accepted_unix_ms,
+                lookup_ms: lookup_started.elapsed().as_millis(),
+                ack_ms: 0,
+                queue_ms: 0,
+                routing_ms: 0,
+                execution_ms: first_execution_ms,
+                total_ms: accepted_at.elapsed().as_millis(),
+            },
+            caller,
+        ),
+        Some(ModelQuestionIntent::Read(plan)) => {
+            let selected_started = Instant::now();
+            let durable = match surface.question_context_selected(
+                question,
+                administrators,
+                configured,
+                plan.sources,
+            ) {
+                Ok(context) => context,
+                Err(refusal) => return refusal.operator_reply().to_owned(),
+            };
+            let context = bounded_question_context(&format!("{memory_context}\n\n{durable}"));
+            let Some(prompt) = question_prompt(question, &context, plan.profile) else {
+                return String::from(
+                    "The model-selected read context did not fit safely, so no tool answer was generated.",
+                );
+            };
+            let lookup_ms = lookup_started
+                .elapsed()
+                .as_millis()
+                .saturating_sub(first_execution_ms)
+                .saturating_add(selected_started.elapsed().as_millis());
+            let execution_started = Instant::now();
+            let runtime = lane.question_runtime(plan.profile);
+            let answer = match lane.run_question(&prompt, plan.profile) {
+                Ok(answer) => answer,
+                Err(failure) => return String::from(question_failure_reply(failure)),
+            };
+            let execution_ms = execution_started.elapsed().as_millis();
+            timed_question_reply_for(
+                &answer,
+                runtime,
+                QuestionTimingBreakdown {
+                    accepted_unix_ms,
+                    lookup_ms,
+                    ack_ms: 0,
+                    queue_ms: 0,
+                    routing_ms: first_execution_ms,
+                    execution_ms,
+                    total_ms: accepted_at.elapsed().as_millis(),
+                },
+                caller,
+            )
+        }
+        Some(ModelQuestionIntent::Refused(answer)) => answer,
+        Some(ModelQuestionIntent::SlackPost(_)) | Some(ModelQuestionIntent::McpCall(_)) => {
+            String::from(
+                "That request requires an explicit approved action surface; this Slack mention performed no mutation.",
+            )
+        }
+        None => timed_question_reply_for(
+            &routed,
+            routing_runtime,
+            QuestionTimingBreakdown {
+                accepted_unix_ms,
+                lookup_ms: lookup_started.elapsed().as_millis(),
+                ack_ms: 0,
+                queue_ms: 0,
+                routing_ms: 0,
+                execution_ms: first_execution_ms,
+                total_ms: accepted_at.elapsed().as_millis(),
+            },
+            caller,
+        ),
+    }
+}
+
 /// Whether prose asks only for the trusted daemon clock fact.
 ///
 /// Named-location conversions stay on the conversation route because they
@@ -12090,6 +12282,15 @@ fn timed_question_reply(
     runtime: QuestionRuntime,
     timing: QuestionTimingBreakdown,
 ) -> String {
+    timed_question_reply_for(answer, runtime, timing, "telegram_question_worker")
+}
+
+fn timed_question_reply_for(
+    answer: &str,
+    runtime: QuestionRuntime,
+    timing: QuestionTimingBreakdown,
+    caller: &'static str,
+) -> String {
     let accepted = timing
         .accepted_unix_ms
         .map_or_else(|| String::from("unavailable"), |value| value.to_string());
@@ -12110,7 +12311,7 @@ fn timed_question_reply(
         ..
     } = timing;
     let footer = format!(
-        "⏱ route={} · caller=telegram_question_worker · harness={} · model={} · reasoning={} · accepted_unix_ms={accepted} · lookup_ms={lookup_ms} · ack_ms={ack_ms} · queue_ms={queue_ms} · routing_ms={routing_ms} · execution_ms={execution_ms} · overhead_ms={overhead_ms} · total_ms={total_ms}",
+        "⏱ route={} · caller={caller} · harness={} · model={} · reasoning={} · accepted_unix_ms={accepted} · lookup_ms={lookup_ms} · ack_ms={ack_ms} · queue_ms={queue_ms} · routing_ms={routing_ms} · execution_ms={execution_ms} · overhead_ms={overhead_ms} · total_ms={total_ms}",
         runtime.route, runtime.harness, runtime.model, runtime.reasoning,
     );
     let footer_units = footer.encode_utf16().count() + 2;

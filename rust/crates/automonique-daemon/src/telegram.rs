@@ -265,6 +265,19 @@ impl TelegramBotConfig {
         self.bot_id
     }
 
+    /// Operator ids used only as bounded facts in a read-only question
+    /// snapshot. Returning owned vectors ensures the configuration (and any
+    /// credential it retains) can be dropped before another transport starts.
+    pub(crate) fn question_operator_ids(&self) -> (Vec<i64>, Vec<i64>) {
+        match &self.enablement {
+            TelegramEnablement::LeaseOnly => (Vec::new(), Vec::new()),
+            TelegramEnablement::Live(control) => (
+                control.roster.admins().to_vec(),
+                control.roster.configured().to_vec(),
+            ),
+        }
+    }
+
     /// Configuration file location beneath `state_dir`.
     pub(crate) fn path(state_dir: &Path) -> PathBuf {
         state_dir.join(CONFIG_RELATIVE)
