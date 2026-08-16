@@ -47,6 +47,11 @@ const _: () = assert!((log::STATIC_MAX_LEVEL as usize) <= (log::LevelFilter::Deb
 /// Whole-request budget for an outbound call, which never long-polls.
 const OUTBOUND_REQUEST_TIMEOUT_SECONDS: u64 = 10;
 const _: () = assert!(OUTBOUND_REQUEST_TIMEOUT_SECONDS >= HTTP_TRANSPORT_ALLOWANCE_SECONDS);
+/// A reaction is decorative acknowledgement, not delivery of the answer.
+/// Bound it separately so a stalled Telegram edge cannot delay provider
+/// admission for the full durable-message budget.
+const REACTION_REQUEST_TIMEOUT_SECONDS: u64 = 1;
+const _: () = assert!(REACTION_REQUEST_TIMEOUT_SECONDS < OUTBOUND_REQUEST_TIMEOUT_SECONDS);
 
 /// Longest `sendMessage` text Telegram accepts, in UTF-16 code units.
 ///
@@ -200,9 +205,17 @@ impl TelegramOutboundClient for TelegramHttpsClient {
         let prepared = PreparedRequest::from_outbound(plan)?;
         self.post(
             &prepared,
-            Duration::from_secs(OUTBOUND_REQUEST_TIMEOUT_SECONDS),
+            outbound_request_timeout(plan.request()),
             cancellation,
         )
+    }
+}
+
+fn outbound_request_timeout(request: &TelegramOutbound) -> Duration {
+    if matches!(request, TelegramOutbound::SetMessageReaction(_)) {
+        Duration::from_secs(REACTION_REQUEST_TIMEOUT_SECONDS)
+    } else {
+        Duration::from_secs(OUTBOUND_REQUEST_TIMEOUT_SECONDS)
     }
 }
 
@@ -1658,8 +1671,8 @@ mod tests {
             ),
         ] {
             let method = request.method_name();
-            // Every outbound plan this module prepares is issued with the same
-            // whole-request budget; there is no per-method timeout to drift.
+            // Both streaming methods use the durable outbound budget. The
+            // only shorter per-method exception is the decorative reaction.
             PreparedRequest::from_outbound(&outbound_plan(&token, request))
                 .unwrap_or_else(|error| panic!("{method} prepares: {error:?}"));
             assert!(
@@ -2310,9 +2323,25 @@ mod tests {
     #[test]
     fn the_outbound_budget_is_bounded_and_needs_no_long_poll_allowance() {
         assert_eq!(OUTBOUND_REQUEST_TIMEOUT_SECONDS, 10);
+        assert_eq!(REACTION_REQUEST_TIMEOUT_SECONDS, 1);
         assert!(
             Duration::from_secs(OUTBOUND_REQUEST_TIMEOUT_SECONDS) < request_timeout(50),
             "an outbound call must never outlive an inbound long poll"
+        );
+    }
+
+    #[test]
+    fn decorative_reactions_cannot_spend_the_durable_message_budget() {
+        let reaction = TelegramOutbound::SetMessageReaction(
+            SetMessageReactionRequest::looking(-1_001, 31).expect("reaction"),
+        );
+        assert_eq!(
+            outbound_request_timeout(&reaction),
+            Duration::from_secs(REACTION_REQUEST_TIMEOUT_SECONDS)
+        );
+        assert_eq!(
+            outbound_request_timeout(&send_message("answer")),
+            Duration::from_secs(OUTBOUND_REQUEST_TIMEOUT_SECONDS)
         );
     }
 }

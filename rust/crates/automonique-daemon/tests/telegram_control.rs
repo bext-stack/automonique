@@ -2551,7 +2551,12 @@ fn named_site_entities_skip_the_router_and_receive_the_typed_inventory() {
     assert!(prompts[0].contains("zzzz-activ.example"));
     assert!(prompts[0].contains("hostnames_omitted="));
     assert!(!prompts[0].contains("AUTOMONIQUE_CONVERSATIONAL_TOOL_ROUTER_V1"));
-    assert!(outbound.messages()[0].contains("managed site inventory"));
+    let answer = &outbound.messages()[0];
+    assert!(answer.contains("managed site inventory"));
+    assert!(answer.contains("lookup_ms="));
+    assert!(answer.contains("ack_ms="));
+    assert!(answer.contains("routing_ms=0"));
+    assert!(answer.contains("overhead_ms="));
 }
 
 #[test]
@@ -2837,9 +2842,12 @@ fn an_administrator_may_ask_a_read_only_question_from_durable_facts() {
     assert!(messages[0].contains("model=configured_intelligent"));
     assert!(messages[0].contains("reasoning=configured"));
     assert!(messages[0].contains("accepted_unix_ms="));
-    assert!(messages[0].contains("context_ms="));
+    assert!(messages[0].contains("lookup_ms="));
+    assert!(messages[0].contains("ack_ms="));
     assert!(messages[0].contains("queue_ms="));
+    assert!(messages[0].contains("routing_ms="));
     assert!(messages[0].contains("execution_ms="));
+    assert!(messages[0].contains("overhead_ms="));
     assert!(messages[0].contains("total_ms="));
     assert!(
         !messages[0].contains(r#""entities""#),

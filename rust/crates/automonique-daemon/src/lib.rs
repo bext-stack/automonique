@@ -170,6 +170,7 @@ mod lease_identity;
 mod lease_time;
 mod local_knowledge;
 pub mod manage_config;
+pub mod mcp_client;
 pub mod memory_config;
 mod model_inventory;
 pub mod parity_trace;

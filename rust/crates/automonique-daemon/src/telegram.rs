@@ -796,7 +796,7 @@ impl TelegramHost {
         let improvement_worker =
             crate::improvement_worker::ImprovementWorker::load(params.state_dir)
                 .map_err(|_| TelegramHostError::SurfaceUnavailable)?;
-        TelegramControlBridge::new_with_ticket_gates(
+        let mut bridge = TelegramControlBridge::new_with_ticket_gates(
             BridgeParts {
                 client: TelegramHttpsClient::new(),
                 outbound: TelegramHttpsClient::new(),
@@ -836,7 +836,12 @@ impl TelegramHost {
             )
             .map_err(|_| TelegramHostError::SurfaceUnavailable)?,
         )
-        .map_err(TelegramHostError::Runtime)
+        .map_err(TelegramHostError::Runtime)?;
+        bridge.attach_mcp(
+            crate::mcp_client::McpRegistry::load(params.state_dir)
+                .map_err(|_| TelegramHostError::SurfaceUnavailable)?,
+        );
+        Ok(bridge)
     }
 
     /// Give the composed bridge the daemon's live progress stream.
