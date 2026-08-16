@@ -189,7 +189,11 @@ pub const MAX_LAUNCH_ENV_VALUE_BYTES: usize = 4096;
 /// picks this number.
 pub const MAX_LAUNCH_PROMPT_BYTES: usize = 16 * 1024;
 /// Largest executable the helper will copy, verify, seal, and execute.
-pub const MAX_PROGRAM_BYTES: u64 = 128 * 1024 * 1024;
+///
+/// Current self-contained provider clients can legitimately exceed 128 MiB.
+/// Keep a finite copy/seal budget, with enough headroom for those static
+/// bundles, instead of rejecting a verified deployment binary by size alone.
+pub const MAX_PROGRAM_BYTES: u64 = 384 * 1024 * 1024;
 /// Smallest descriptor ceiling that can retain stdin, stdout and stderr.
 pub const MIN_LAUNCH_NOFILE: u64 = 3;
 /// Largest descriptor ceiling admitted by the run-spec budget grammar.

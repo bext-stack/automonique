@@ -157,6 +157,8 @@ fn decode_manage_profiles(
         .filter(|term| term.len() >= 3)
         .map(ToOwned::to_owned)
         .collect();
+    let names_company_manager = (terms.contains("company") && terms.contains("manager"))
+        || terms.contains("companymanager");
     // Manage's profile prose is predominantly French while an operator may
     // ask in English. Expand only narrow domain synonyms locally so retrieval
     // does not require a model call and "agency" can find "agence web".
@@ -215,8 +217,12 @@ fn decode_manage_profiles(
             if terms.is_empty() {
                 return true;
             }
+            if names_company_manager && profile.kind == "cm" {
+                return true;
+            }
             let haystack = format!(
-                "{} {} {} {}",
+                "{} {} {} {} {}",
+                profile.kind,
                 profile.reference,
                 profile.label,
                 profile.host.as_deref().unwrap_or_default(),
@@ -575,6 +581,39 @@ mod tests {
                 .expect("profiles");
 
         assert_eq!(inventory.selected[0].reference, "example-agency-prism");
+    }
+
+    #[test]
+    fn company_manager_intent_prioritizes_company_manager_profiles() {
+        let rows = serde_json::json!([
+            {
+                "kind": "ecosystem",
+                "ref": "alpha-prism",
+                "label": "Alpha",
+                "context": "Generic application"
+            },
+            {
+                "kind": "cm",
+                "ref": "account-console",
+                "label": "Operations console",
+                "context": "Create and administer customer accounts",
+                "rules": ["Confirm the customer scope before creation"]
+            }
+        ]);
+        let bytes = serde_json::to_vec(&serde_json::json!({ "value": rows })).expect("fixture");
+
+        let inventory = decode_manage_profiles(
+            &bytes,
+            "do you know how to create accounts in company manager?",
+        )
+        .expect("profiles");
+
+        assert_eq!(inventory.selected[0].kind, "cm");
+        assert_eq!(inventory.selected[0].reference, "account-console");
+        assert_eq!(
+            inventory.selected[0].rules,
+            ["Confirm the customer scope before creation"]
+        );
     }
 
     #[test]

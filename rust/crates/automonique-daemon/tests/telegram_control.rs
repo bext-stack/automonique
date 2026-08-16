@@ -3160,8 +3160,35 @@ fn a_question_provider_failure_is_reported_without_command_dispatch() {
     assert_eq!(report.runs_failed, 0);
     assert_eq!(lane.tasks().len(), 1);
     let messages = outbound.messages();
-    assert!(messages[0].contains("deadline"));
+    assert!(messages[0].contains("took too long"));
+    assert!(!messages[0].contains("run failed"));
+    assert!(!messages[0].contains("/runs"));
     assert!(!messages[0].contains(r#""entities""#));
+}
+
+#[test]
+fn a_failed_natural_question_never_exposes_run_internals() {
+    let fixture = Fixture::new(&[]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::failing(RunFailure::Failed);
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        FakeClient::new([updates(&[(
+            1,
+            OPERATOR,
+            "do you know how to create accounts in company manager?",
+        )])]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane,
+    );
+
+    assert_eq!(poll(&mut bridge).expect("poll commits").questions_queued, 1);
+    assert_eq!(await_question_completion(&mut bridge).questions_failed, 1);
+    let messages = outbound.messages();
+    assert!(messages[0].contains("Please try again"));
+    assert!(!messages[0].contains("The run failed"));
+    assert!(!messages[0].contains("/runs"));
 }
 
 /// A ticket reference on either verb reaches the ticket lane, and says so when
