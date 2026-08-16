@@ -909,6 +909,8 @@ struct SlackTicketEvent {
     parent: MessageTs,
     source_key: String,
     app_mention: bool,
+    in_thread: bool,
+    continues_conversation: bool,
 }
 
 /// Extract the acknowledgement key independently from the event payload.
@@ -947,10 +949,8 @@ fn slack_ticket_event(text: &str) -> Option<SlackTicketEvent> {
         return None;
     }
     let ts = event.get("ts")?.as_str()?;
-    let parent = event
-        .get("thread_ts")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(ts);
+    let thread_ts = event.get("thread_ts").and_then(serde_json::Value::as_str);
+    let parent = thread_ts.unwrap_or(ts);
     let parent = MessageTs::new(parent).ok()?;
     if !team_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
         || !event_id
@@ -971,6 +971,8 @@ fn slack_ticket_event(text: &str) -> Option<SlackTicketEvent> {
         parent,
         source_key,
         app_mention: event_type == "app_mention",
+        in_thread: thread_ts.is_some(),
+        continues_conversation: false,
     })
 }
 
@@ -2475,10 +2477,10 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             ConversationScope::slack(event.channel.as_str(), Some(event.parent.as_str()))
                 .map_err(|_| ())?;
         let external_scope = external_scope.as_str();
-        let conversation_id = format!(
-            "slack:{}:{}:{}:{}",
-            event.team_id, event.channel, event.parent, event.user
-        );
+        let conversation_id = memory
+            .current_conversation(&tenant, &actor, "slack", external_scope)
+            .map_err(|_| ())?
+            .unwrap_or_else(|| slack_event_conversation_id(event, event.app_mention));
         let content = redact_content(&event.text);
         memory
             .record_message(&MessageInput {
@@ -2494,6 +2496,65 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             })
             .map(|_| ())
             .map_err(|_| ())
+    }
+
+    /// Decide whether an unmentioned thread reply belongs to a conversation
+    /// Monique already opened. New conversations carry an explicit durable
+    /// identifier. The content check recognizes conversations opened by the
+    /// immediately preceding release, which stored app mentions under the old
+    /// neutral identifier.
+    fn conversation_follow_up(
+        &self,
+        memory: &AgentMemoryStore,
+        event: &SlackTicketEvent,
+    ) -> Result<bool, ()> {
+        if !event.in_thread
+            || !self.members.contains(&event.user)
+            || !self
+                .channels
+                .0
+                .iter()
+                .any(|(_, channel)| channel == &event.channel)
+        {
+            return Ok(false);
+        }
+        let identity = memory
+            .resolve_identity(
+                "slack",
+                "automonique-slack",
+                &event.team_id,
+                event.user.as_str(),
+            )
+            .map_err(|_| ())?;
+        let (tenant, actor) = identity.unwrap_or_else(|| {
+            (
+                self.memory_tenant.clone(),
+                format!("slack:{}:{}", event.team_id, event.user),
+            )
+        });
+        let scope = ConversationScope::slack(event.channel.as_str(), Some(event.parent.as_str()))
+            .map_err(|_| ())?;
+        let Some(conversation_id) = memory
+            .current_conversation(&tenant, &actor, "slack", scope.as_str())
+            .map_err(|_| ())?
+        else {
+            return Ok(false);
+        };
+        if conversation_id.starts_with("slack-monique:") {
+            return Ok(true);
+        }
+        let prior_messages = memory
+            .recent_messages(
+                &tenant,
+                &actor,
+                &conversation_id,
+                crate::unix_millis().unwrap_or_default(),
+                20,
+            )
+            .map_err(|_| ())?;
+        Ok(prior_messages
+            .iter()
+            .any(|message| message.content.contains("<@")))
     }
 
     fn capture_command_memory(
@@ -2594,7 +2655,9 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
         let trimmed = mention_text.as_deref().unwrap_or_else(|| event.text.trim());
         let conversational = self.features.contains(&SlackFeature::Conversation)
             && self.members.contains(&event.user)
-            && (event.app_mention || event.channel.as_str().starts_with('D'));
+            && (event.app_mention
+                || event.continues_conversation
+                || event.channel.as_str().starts_with('D'));
         if conversational {
             if let Some(answer) = deterministic_conversation_answer(trimmed) {
                 let _ = self
@@ -2903,6 +2966,8 @@ pub(crate) fn replay_slack_trace(
                     .map_err(|_| TraceError::Field("event.thread_ts"))?,
                 source_key,
                 app_mention: event.app_mention,
+                in_thread: true,
+                continues_conversation: false,
             },
             "",
         );
@@ -3232,7 +3297,7 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
             let Some(envelope_id) = socket_envelope_id(envelope.as_str()) else {
                 break;
             };
-            let event = slack_ticket_event(envelope.as_str());
+            let mut event = slack_ticket_event(envelope.as_str());
             let app_home_user = match slack_app_home_user(envelope.as_str()) {
                 Ok(user) => user,
                 Err(()) => break,
@@ -3277,7 +3342,12 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
                     Ok(command) => command,
                     Err(()) => break,
                 };
-            if event.as_ref().is_some_and(|event| {
+            if event.as_mut().is_some_and(|event| {
+                let Ok(continues) = worker.router.conversation_follow_up(&worker.memory, event)
+                else {
+                    return true;
+                };
+                event.continues_conversation = continues;
                 worker
                     .router
                     .capture_memory(&mut worker.memory, event)
@@ -3360,11 +3430,25 @@ fn slack_event_context(
                 format!("slack:{}:{}", event.team_id, event.user),
             )
         });
-    let conversation_id = format!(
-        "slack:{}:{}:{}:{}",
-        event.team_id, event.channel, event.parent, event.user
-    );
+    let scope = ConversationScope::slack(event.channel.as_str(), Some(event.parent.as_str())).ok();
+    let conversation_id = scope
+        .as_ref()
+        .and_then(|scope| {
+            memory
+                .current_conversation(&tenant, &actor, "slack", scope.as_str())
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_else(|| slack_event_conversation_id(event, event.app_mention));
     recent_slack_context(memory, &tenant, &actor, &conversation_id)
+}
+
+fn slack_event_conversation_id(event: &SlackTicketEvent, monique: bool) -> String {
+    let prefix = if monique { "slack-monique" } else { "slack" };
+    format!(
+        "{prefix}:{}:{}:{}:{}",
+        event.team_id, event.channel, event.parent, event.user
+    )
 }
 
 fn slack_command_context(
@@ -5084,6 +5168,8 @@ mod tests {
             parent: MessageTs::new("1723542000.000100").expect("timestamp"),
             source_key: format!("slack:T0RESERVED:event:{event_id}"),
             app_mention: false,
+            in_thread: false,
+            continues_conversation: false,
         }
     }
 
@@ -5727,6 +5813,143 @@ mod tests {
         assert_eq!(
             messages.lock().expect("messages").as_slice(),
             [String::from("Monique intelligent answer")]
+        );
+    }
+
+    #[test]
+    fn unmentioned_thread_replies_continue_a_durable_monique_conversation() {
+        let root = tempfile::tempdir().expect("memory root");
+        std::fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private memory root");
+        let mut memory =
+            AgentMemoryStore::open(root.path().join("agent-memory.sqlite3")).expect("memory store");
+        let poster = FakeTicketPoster::default();
+        let messages = Arc::clone(&poster.messages);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut router = SlackTicketRouter {
+            poster,
+            manage: Box::new(FakeManage::default()),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
+            channels: ChannelMap(vec![(
+                name("ops"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![SlackFeature::Conversation],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+            approvals: None,
+            approval_lane: None,
+            question_answerer: Some(Box::new(FakeQuestionAnswerer {
+                seen: Arc::clone(&seen),
+            })),
+        };
+        let mut mention = ticket_event("U0ADMIN001", "<@B0APP> tell me about activ", "EvRoot");
+        mention.app_mention = true;
+        router
+            .capture_memory(&mut memory, &mention)
+            .expect("mention captured");
+
+        let actor = "slack:T0RESERVED:U0ADMIN001";
+        let head = memory
+            .current_conversation(
+                "primary",
+                actor,
+                "slack",
+                "channel:C0RESERVED01:thread:1723542000.000100",
+            )
+            .expect("head lookup")
+            .expect("conversation head");
+        assert!(head.starts_with("slack-monique:"));
+
+        let mut follow_up = ticket_event("U0ADMIN001", "and webdesign29?", "EvFollowUp");
+        follow_up.in_thread = true;
+        follow_up.continues_conversation = router
+            .conversation_follow_up(&memory, &follow_up)
+            .expect("follow-up classification");
+        assert!(follow_up.continues_conversation);
+        router
+            .capture_memory(&mut memory, &follow_up)
+            .expect("follow-up captured");
+        let context = slack_event_context(&memory, "primary", &follow_up);
+        router.handle_with_context(follow_up, &context);
+
+        let seen = seen.lock().expect("questions");
+        assert_eq!(seen[0].0, "and webdesign29?");
+        assert!(seen[0].1.contains("tell me about activ"));
+        assert!(seen[0].1.contains("and webdesign29?"));
+        assert_eq!(
+            messages.lock().expect("messages").as_slice(),
+            [String::from("Monique intelligent answer")]
+        );
+    }
+
+    #[test]
+    fn old_app_mention_threads_are_recognized_without_admitting_unrelated_threads() {
+        let root = tempfile::tempdir().expect("memory root");
+        std::fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private memory root");
+        let mut memory =
+            AgentMemoryStore::open(root.path().join("agent-memory.sqlite3")).expect("memory store");
+        let router = SlackTicketRouter {
+            poster: FakeTicketPoster::default(),
+            manage: Box::new(FakeManage::default()),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
+            channels: ChannelMap(vec![(
+                name("ops"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![SlackFeature::Conversation],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+            approvals: None,
+            approval_lane: None,
+            question_answerer: None,
+        };
+
+        // Reproduce the identifier written by the release that received the
+        // user's already-open thread, before app mentions were marked.
+        let old_mention = ticket_event("U0ADMIN001", "hello <@B0APP>?", "EvOldRoot");
+        router
+            .capture_memory(&mut memory, &old_mention)
+            .expect("old mention captured");
+        let mut old_follow_up = ticket_event("U0ADMIN001", "are you there?", "EvOldReply");
+        old_follow_up.in_thread = true;
+        assert!(
+            router
+                .conversation_follow_up(&memory, &old_follow_up)
+                .expect("old follow-up classification")
+        );
+
+        let mut unrelated_root = ticket_event("U0ADMIN001", "team status", "EvOtherRoot");
+        unrelated_root.parent = MessageTs::new("1723542999.000900").expect("timestamp");
+        router
+            .capture_memory(&mut memory, &unrelated_root)
+            .expect("unrelated root captured");
+        let mut unrelated_reply = ticket_event("U0ADMIN001", "looks good", "EvOtherReply");
+        unrelated_reply.parent = unrelated_root.parent;
+        unrelated_reply.in_thread = true;
+        assert!(
+            !router
+                .conversation_follow_up(&memory, &unrelated_reply)
+                .expect("unrelated classification")
         );
     }
 
