@@ -40,6 +40,7 @@ static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub(crate) enum Operation {
     Status,
+    Metrics,
     Submit(SyntheticSubmission),
     SubmitRun(SubmittedRunSpec),
     InspectReconciliation(u64),
@@ -76,6 +77,7 @@ pub(crate) fn request(
 ) -> Result<AdminResponse, ClientError> {
     let operation_name = match &operation {
         Operation::Status => "status",
+        Operation::Metrics => "metrics",
         Operation::Submit(_) => "submit",
         Operation::SubmitRun(_) => "run-submit",
         Operation::InspectReconciliation(_) => "reconcile-inspect",
@@ -103,6 +105,7 @@ pub(crate) fn request(
             AdminRequest::reconcile_outbox(request_id, reconciliation)
         }
         Operation::Status => AdminRequest::new(request_id, AdminCommand::Status),
+        Operation::Metrics => AdminRequest::new(request_id, AdminCommand::Metrics),
         Operation::Shutdown => AdminRequest::new(request_id, AdminCommand::Shutdown),
     };
     let request_id = request.request_id().as_str().to_owned();

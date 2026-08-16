@@ -54,10 +54,16 @@ pub enum MetricName {
     /// The live window's depth in time. It is not a claim about the durable
     /// record, which retains everything and has no age.
     ProgressOldestRetainedAgeMs,
+    /// Completed provider turns carrying token usage, cumulative.
+    GenAiClientRequests,
+    /// Provider-reported input tokens, cumulative.
+    GenAiInputTokens,
+    /// Provider-reported output tokens, cumulative.
+    GenAiOutputTokens,
 }
 
 impl MetricName {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 26] = [
         Self::DaemonReady,
         Self::IntakeEnabled,
         Self::InboxPending,
@@ -81,6 +87,9 @@ impl MetricName {
         Self::ProgressFramesDropped,
         Self::ProgressLagDisconnects,
         Self::ProgressOldestRetainedAgeMs,
+        Self::GenAiClientRequests,
+        Self::GenAiInputTokens,
+        Self::GenAiOutputTokens,
     ];
 
     #[must_use]
@@ -109,6 +118,56 @@ impl MetricName {
             Self::ProgressFramesDropped => "automonique_progress_frames_dropped_total",
             Self::ProgressLagDisconnects => "automonique_progress_lag_disconnects_total",
             Self::ProgressOldestRetainedAgeMs => "automonique_progress_oldest_retained_age_ms",
+            Self::GenAiClientRequests => "automonique_gen_ai_client_requests_total",
+            Self::GenAiInputTokens => "automonique_gen_ai_usage_input_tokens_total",
+            Self::GenAiOutputTokens => "automonique_gen_ai_usage_output_tokens_total",
+        }
+    }
+
+    #[must_use]
+    pub const fn metric_type(self) -> &'static str {
+        match self {
+            Self::SandboxLaunchRefusals
+            | Self::OutboxDelivered
+            | Self::OutboxDeadLettered
+            | Self::ProgressFramesDropped
+            | Self::ProgressLagDisconnects
+            | Self::GenAiClientRequests
+            | Self::GenAiInputTokens
+            | Self::GenAiOutputTokens => "counter",
+            _ => "gauge",
+        }
+    }
+
+    #[must_use]
+    pub const fn help(self) -> &'static str {
+        match self {
+            Self::DaemonReady => "Whether this daemon generation is ready.",
+            Self::IntakeEnabled => "Whether this daemon generation accepts intake.",
+            Self::InboxPending => "Durable inbox entries awaiting processing.",
+            Self::RunsRunning => "Durable runs currently marked running.",
+            Self::ReconciliationPending => "Durable ambiguous work awaiting reconciliation.",
+            Self::OutboxPending => "Durable outbox entries awaiting delivery.",
+            Self::OutboxOldestAgeMs => "Age in milliseconds of the oldest ready outbox entry.",
+            Self::TelegramPollerOwned => "Whether this generation owns a Telegram poller lease.",
+            Self::TelegramOffsetLag => "Telegram updates behind the durable offset.",
+            Self::ProviderAvailable => "Whether a configured provider deployment is available.",
+            Self::SandboxLaunchRefusals => "Sandbox launches refused since process start.",
+            Self::OutboxPendingReady => "Outbox entries ready for delivery.",
+            Self::OutboxPendingDelayed => "Outbox entries delayed until a future retry.",
+            Self::OutboxInFlightLive => "Outbox effects held by live leases.",
+            Self::OutboxInFlightAmbiguous => "Outbox effects whose lease expired mid-flight.",
+            Self::OutboxDelivered => "Outbox effects recorded delivered.",
+            Self::OutboxDeadLettered => "Outbox effects recorded dead-lettered.",
+            Self::TelegramPollersLive => "Telegram poller leases currently live.",
+            Self::TelegramPollersExpired => "Telegram poller leases currently expired.",
+            Self::ProgressQueueHighWaterBytes => "Largest observed live-progress subscriber queue.",
+            Self::ProgressFramesDropped => "Live-progress frames dropped from subscriber queues.",
+            Self::ProgressLagDisconnects => "Live-progress subscribers disconnected for lagging.",
+            Self::ProgressOldestRetainedAgeMs => "Age of the oldest retained live-progress frame.",
+            Self::GenAiClientRequests => "Completed GenAI provider turns with recorded usage.",
+            Self::GenAiInputTokens => "Provider-reported GenAI input tokens.",
+            Self::GenAiOutputTokens => "Provider-reported GenAI output tokens.",
         }
     }
 
@@ -207,6 +266,9 @@ impl StoreProjection {
             unavailable(MetricName::ProgressFramesDropped),
             unavailable(MetricName::ProgressLagDisconnects),
             unavailable(MetricName::ProgressOldestRetainedAgeMs),
+            unavailable(MetricName::GenAiClientRequests),
+            unavailable(MetricName::GenAiInputTokens),
+            unavailable(MetricName::GenAiOutputTokens),
         ];
         let metrics = MetricsSnapshot::new(observed_ms, generation.generation_id(), samples)?;
         let assessment = if reconciliation_pending > 0 {
@@ -260,6 +322,41 @@ impl StoreProjection {
         Ok(self)
     }
 
+    /// Attach live daemon facts that do not exist in the durable snapshot.
+    pub fn with_runtime(
+        mut self,
+        observation: RuntimeObservation,
+    ) -> Result<Self, ObservabilityError> {
+        let mut samples = vec![
+            (MetricName::DaemonReady, u64::from(observation.daemon_ready)),
+            (
+                MetricName::IntakeEnabled,
+                u64::from(observation.intake_enabled),
+            ),
+        ];
+        if let Some(value) = observation.provider_available {
+            samples.push((MetricName::ProviderAvailable, u64::from(value)));
+        }
+        if let Some(value) = observation.sandbox_launch_refusals {
+            samples.push((MetricName::SandboxLaunchRefusals, value));
+        }
+        self.metrics.measure(samples)?;
+        Ok(self)
+    }
+
+    /// Attach durable aggregate GenAI usage.
+    pub fn with_gen_ai_usage(
+        mut self,
+        observation: GenAiUsageObservation,
+    ) -> Result<Self, ObservabilityError> {
+        self.metrics.measure([
+            (MetricName::GenAiClientRequests, observation.requests),
+            (MetricName::GenAiInputTokens, observation.input_tokens),
+            (MetricName::GenAiOutputTokens, observation.output_tokens),
+        ])?;
+        Ok(self)
+    }
+
     #[must_use]
     pub const fn metrics(&self) -> &MetricsSnapshot {
         &self.metrics
@@ -269,6 +366,23 @@ impl StoreProjection {
     pub const fn assessment(&self) -> StoreAssessment {
         self.assessment
     }
+}
+
+/// Runtime facts supplied by the daemon beside a durable snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeObservation {
+    pub daemon_ready: bool,
+    pub intake_enabled: bool,
+    pub provider_available: Option<bool>,
+    pub sandbox_launch_refusals: Option<u64>,
+}
+
+/// Durable aggregate of completed provider-turn usage records.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GenAiUsageObservation {
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 /// What one live progress fan-out has observed since the process started.
@@ -296,6 +410,18 @@ pub enum UnavailableReason {
     CapabilityMissing,
     DependencyUnavailable,
     MeasurementFailed,
+}
+
+impl UnavailableReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotIntegrated => "not_integrated",
+            Self::CapabilityMissing => "capability_missing",
+            Self::DependencyUnavailable => "dependency_unavailable",
+            Self::MeasurementFailed => "measurement_failed",
+        }
+    }
 }
 
 /// A measurement is never represented by an invented default.
@@ -423,6 +549,60 @@ impl MetricsSnapshot {
         MetricName::ALL
             .into_iter()
             .map(|name| (name, self.values[&name]))
+    }
+}
+
+/// Render one snapshot in Prometheus text exposition format.
+///
+/// Missing readings remain visible as comments and are not emitted as zero.
+/// The output uses only the closed metric vocabulary; the sole label is the
+/// build version, escaped according to the exposition grammar.
+#[must_use]
+pub fn render_exposition(snapshot: &MetricsSnapshot, build_version: &str) -> String {
+    let mut output = String::new();
+    output.push_str("# HELP automonique_build_info Automonique build information.\n");
+    output.push_str("# TYPE automonique_build_info gauge\n");
+    output.push_str("automonique_build_info{version=\"");
+    push_label_value(&mut output, build_version);
+    output.push_str("\"} 1\n");
+    for (name, value) in snapshot.samples() {
+        output.push_str("# HELP ");
+        output.push_str(name.as_str());
+        output.push(' ');
+        output.push_str(name.help());
+        output.push('\n');
+        output.push_str("# TYPE ");
+        output.push_str(name.as_str());
+        output.push(' ');
+        output.push_str(name.metric_type());
+        output.push('\n');
+        match value {
+            MetricValue::Measured(value) => {
+                output.push_str(name.as_str());
+                output.push(' ');
+                output.push_str(&value.to_string());
+                output.push('\n');
+            }
+            MetricValue::Unavailable(reason) => {
+                output.push_str("# automonique unavailable ");
+                output.push_str(name.as_str());
+                output.push(' ');
+                output.push_str(reason.as_str());
+                output.push('\n');
+            }
+        }
+    }
+    output
+}
+
+fn push_label_value(output: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '\\' => output.push_str("\\\\"),
+            '"' => output.push_str("\\\""),
+            '\n' => output.push_str("\\n"),
+            other => output.push(other),
+        }
     }
 }
 

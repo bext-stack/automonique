@@ -2,8 +2,8 @@
 
 use crate::types::{
     AdapterError, ExecutionMode, MAX_EVENT_TEXT_BYTES, NormalizedEvent, ProviderDisposition,
-    ProviderItemKind, RecordedEvent, RecordedKind, ResumeBinding, RunCoordinates, UnknownEventKind,
-    validate_coordinate, validate_provider_session,
+    ProviderItemKind, ProviderUsage, RecordedEvent, RecordedKind, ResumeBinding, RunCoordinates,
+    UnknownEventKind, validate_coordinate, validate_provider_session,
 };
 use automonique_connector_substrate::json::strict_json;
 use serde_json::{Map, Value};
@@ -12,6 +12,7 @@ pub(crate) struct NormalizedRun {
     pub binding: ResumeBinding,
     pub events: Vec<NormalizedEvent>,
     pub disposition: ProviderDisposition,
+    pub usage: Option<ProviderUsage>,
 }
 
 /// The state machine, which owns the coordinates it normalizes against.
@@ -28,6 +29,7 @@ pub(crate) struct Normalizer {
     active_item: Option<String>,
     final_seen: bool,
     disposition: Option<ProviderDisposition>,
+    usage: Option<ProviderUsage>,
     events: Vec<NormalizedEvent>,
 }
 
@@ -41,6 +43,7 @@ impl Normalizer {
             active_item: None,
             final_seen: false,
             disposition: None,
+            usage: None,
             events: Vec::new(),
         }
     }
@@ -81,6 +84,7 @@ impl Normalizer {
             binding,
             events: self.events.clone(),
             disposition,
+            usage: self.usage,
         })
     }
 
@@ -197,11 +201,23 @@ impl Normalizer {
             usage,
             &["cached_input_tokens", "input_tokens", "output_tokens"],
         )?;
-        for field in ["cached_input_tokens", "input_tokens", "output_tokens"] {
-            if usage.get(field).and_then(Value::as_u64).is_none() {
-                return Err(AdapterError::UnknownSchema);
-            }
-        }
+        let cached_input_tokens = usage
+            .get("cached_input_tokens")
+            .and_then(Value::as_u64)
+            .ok_or(AdapterError::UnknownSchema)?;
+        let input_tokens = usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .ok_or(AdapterError::UnknownSchema)?;
+        let output_tokens = usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .ok_or(AdapterError::UnknownSchema)?;
+        self.usage = Some(ProviderUsage::new(
+            cached_input_tokens,
+            input_tokens,
+            output_tokens,
+        ));
         self.record(RecordedKind::UsageUpdated, None)?;
         self.record(RecordedKind::TurnCompleted, None)?;
         self.disposition = Some(ProviderDisposition::Succeeded);

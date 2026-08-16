@@ -275,6 +275,14 @@ Teams fixtures cover personal/group/channel activities, Adaptive Cards, proactiv
 
 ## Observability required before rollout
 
+The authenticated local exporter currently exposes the 26 closed
+`automonique_*` metrics defined by `automonique-observability`, including
+daemon/intake readiness, inbox/run/reconciliation/outbox state, Telegram and
+live-progress health, provider availability, sandbox refusals, and durable
+GenAI request/input/output token totals. The inventory below is the broader
+rollout target; an item is not live merely because it appears here. Additions
+must enter the closed metric vocabulary and the exporter together.
+
 Expose these metrics/events:
 
 - active and draining generation IDs, revisions and ages;

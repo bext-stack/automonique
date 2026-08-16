@@ -11,11 +11,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use automonique_store::provider_journal::{
-    ApprovalDecision, ApprovalRecord, BindingKind, BindingRecord, CursorAdvance,
+    ApprovalDecision, ApprovalRecord, BindingKind, BindingRecord, CursorAdvance, FinishReason,
     PROVIDER_JOURNAL_SCHEMA_VERSION, ProcessExit, ProcessSpawn, ProcessState, ProcessTermination,
     ProviderJournal, RequestDirection, RequestOutcomeCommit, RequestRecord, RequestSettlement,
     RequestState, SessionClosing, SessionClosure, SessionOpening, SessionState, SettledOutcome,
-    TurnCompletion, TurnOpening, TurnOutcome, TurnState,
+    TurnCompletion, TurnOpening, TurnOutcome, TurnState, TurnUsage,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -194,6 +194,7 @@ fn full_lifecycle_recovers_byte_exact_bindings() {
                 sequence: 17,
                 now_ms: 50,
             }),
+            usage: None,
         })
         .expect("complete first turn");
     assert_eq!(completed.ordinal, 1);
@@ -367,6 +368,7 @@ fn non_contiguous_turn_ordinal_refuses() {
             outcome: TurnOutcome::Completed,
             settlements: &[],
             cursor: None,
+            usage: None,
         })
         .expect("complete first turn");
 
@@ -725,6 +727,7 @@ fn exact_replay_writes_are_idempotent_without_duplication() {
                 sequence: 9,
                 now_ms: 50,
             }),
+            usage: None,
         })
         .expect("complete turn");
     let replay = journal
@@ -740,6 +743,7 @@ fn exact_replay_writes_are_idempotent_without_duplication() {
                 sequence: 9,
                 now_ms: 50,
             }),
+            usage: None,
         })
         .expect("replayed completion");
     assert!(replay.duplicate);
@@ -751,6 +755,7 @@ fn exact_replay_writes_are_idempotent_without_duplication() {
         ("provider_processes", 1_i64),
         ("provider_sessions", 1),
         ("provider_turns", 1),
+        ("provider_turn_usage", 0),
         ("provider_requests", 1),
         ("provider_cursors", 1),
         ("provider_bindings", 1),
@@ -763,6 +768,90 @@ fn exact_replay_writes_are_idempotent_without_duplication() {
             .expect("count rows");
         assert_eq!(count, expected, "{table} must hold exactly one row");
     }
+}
+
+#[test]
+fn completed_turn_usage_is_atomic_durable_and_aggregated() {
+    let (_private, mut journal) = journal();
+    let (_process_id, _session_id, turn_id) = live_turn(&mut journal);
+    let usage = TurnUsage {
+        gen_ai_system: "openai",
+        request_model: Some("gpt-5"),
+        response_model: Some("gpt-5.1"),
+        input_tokens: 13,
+        cached_input_tokens: 5,
+        output_tokens: 8,
+        finish_reason: FinishReason::Stop,
+    };
+    let completion = TurnCompletion {
+        turn_id,
+        expected_revision: 1,
+        now_ms: 50,
+        outcome: TurnOutcome::Completed,
+        settlements: &[],
+        cursor: None,
+        usage: Some(usage),
+    };
+    journal
+        .complete_turn(completion)
+        .expect("complete with usage");
+
+    let recorded = journal
+        .turn_usage(turn_id)
+        .expect("usage read")
+        .expect("usage row");
+    assert_eq!(recorded.gen_ai_system, "openai");
+    assert_eq!(recorded.request_model.as_deref(), Some("gpt-5"));
+    assert_eq!(recorded.response_model.as_deref(), Some("gpt-5.1"));
+    assert_eq!(recorded.input_tokens, 13);
+    assert_eq!(recorded.cached_input_tokens, 5);
+    assert_eq!(recorded.output_tokens, 8);
+    assert_eq!(recorded.finish_reason, FinishReason::Stop);
+    assert_eq!(
+        journal.usage_totals().expect("usage totals"),
+        automonique_store::provider_journal::UsageTotals {
+            requests: 1,
+            input_tokens: 13,
+            output_tokens: 8,
+        }
+    );
+
+    let replay = journal
+        .complete_turn(TurnCompletion {
+            expected_revision: 1,
+            ..completion
+        })
+        .expect("exact replay");
+    assert!(replay.duplicate);
+    let conflict = journal
+        .complete_turn(TurnCompletion {
+            usage: Some(TurnUsage {
+                output_tokens: 9,
+                ..usage
+            }),
+            ..completion
+        })
+        .expect_err("changed usage refusal");
+    assert_eq!(conflict.category(), "already_settled");
+}
+
+#[test]
+fn a_v1_journal_migrates_to_the_usage_schema() {
+    let (private, journal) = journal();
+    drop(journal);
+    let raw = Connection::open(private.path()).expect("raw v1 simulation");
+    raw.execute("DROP TABLE provider_turn_usage", [])
+        .expect("remove v2 table");
+    raw.pragma_update(None, "user_version", 1).expect("mark v1");
+    drop(raw);
+
+    let reopened = ProviderJournal::open(private.path()).expect("migrate v1");
+    assert_eq!(reopened.usage_totals().expect("empty totals").requests, 0);
+    let raw = Connection::open(private.path()).expect("inspect migrated version");
+    let version: u32 = raw
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+    assert_eq!(version, PROVIDER_JOURNAL_SCHEMA_VERSION);
 }
 
 #[test]
@@ -835,6 +924,7 @@ fn stale_turn_revision_refuses_completion() {
             outcome: TurnOutcome::Completed,
             settlements: &[],
             cursor: None,
+            usage: None,
         })
         .expect_err("stale turn revision refusal");
     assert_eq!(error.category(), "revision_mismatch");
@@ -878,6 +968,7 @@ fn a_refused_last_settlement_discards_the_whole_turn_commit() {
                 sequence: 99,
                 now_ms: 50,
             }),
+            usage: None,
         })
         .expect_err("unknown request refusal");
     assert_eq!(error.category(), "not_found");
@@ -931,6 +1022,7 @@ fn a_refused_cursor_step_discards_the_whole_turn_commit() {
                 sequence: 39,
                 now_ms: 50,
             }),
+            usage: None,
         })
         .expect_err("cursor regression refusal");
     assert_eq!(error.category(), "cursor_regression");
@@ -1138,6 +1230,7 @@ fn a_hand_written_turn_ordinal_gap_surfaces_as_corruption() {
             outcome: TurnOutcome::Completed,
             settlements: &[],
             cursor: None,
+            usage: None,
         })
         .expect("complete first turn");
     drop(journal);

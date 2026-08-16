@@ -101,11 +101,12 @@ fn spec_with(
 // ---------------------------------------------------------------------------
 
 /// How many commands the closed [`AdminCommand`] enum carries.
-const ADMIN_COMMAND_COUNT: usize = 10;
+const ADMIN_COMMAND_COUNT: usize = 11;
 
 /// Every admin command, in the order the enum declares them.
 const EVERY_ADMIN_COMMAND: [AdminCommand; ADMIN_COMMAND_COUNT] = [
     AdminCommand::Status,
+    AdminCommand::Metrics,
     AdminCommand::SubmitSynthetic,
     AdminCommand::SubmitRun,
     AdminCommand::InspectReconciliation,
@@ -127,15 +128,16 @@ const EVERY_ADMIN_COMMAND: [AdminCommand; ADMIN_COMMAND_COUNT] = [
 fn position(command: AdminCommand) -> usize {
     match command {
         AdminCommand::Status => 0,
-        AdminCommand::SubmitSynthetic => 1,
-        AdminCommand::SubmitRun => 2,
-        AdminCommand::InspectReconciliation => 3,
-        AdminCommand::FailReconciliation => 4,
-        AdminCommand::InspectOutbox => 5,
-        AdminCommand::ReconcileOutbox => 6,
-        AdminCommand::PauseIntake => 7,
-        AdminCommand::ResumeIntake => 8,
-        AdminCommand::Shutdown => 9,
+        AdminCommand::Metrics => 1,
+        AdminCommand::SubmitSynthetic => 2,
+        AdminCommand::SubmitRun => 3,
+        AdminCommand::InspectReconciliation => 4,
+        AdminCommand::FailReconciliation => 5,
+        AdminCommand::InspectOutbox => 6,
+        AdminCommand::ReconcileOutbox => 7,
+        AdminCommand::PauseIntake => 8,
+        AdminCommand::ResumeIntake => 9,
+        AdminCommand::Shutdown => 10,
     }
 }
 
@@ -148,6 +150,7 @@ fn position(command: AdminCommand) -> usize {
 fn representative_requests(command: AdminCommand) -> Vec<AdminRequest> {
     match command {
         AdminCommand::Status => vec![AdminRequest::new(request_id(), AdminCommand::Status)],
+        AdminCommand::Metrics => vec![AdminRequest::new(request_id(), AdminCommand::Metrics)],
         AdminCommand::Shutdown => vec![AdminRequest::new(request_id(), AdminCommand::Shutdown)],
         AdminCommand::SubmitSynthetic => vec![AdminRequest::submit(
             request_id(),
@@ -351,7 +354,7 @@ mod anti_drift {
         );
     }
 
-    /// The three disciplines partition the ten commands, and the partition is
+    /// The three disciplines partition the eleven commands, and the partition is
     /// stated rather than derived, so reclassifying a command — describing a
     /// write as a read, or dropping a retry key — fails here.
     #[test]
@@ -368,7 +371,12 @@ mod anti_drift {
 
         assert_eq!(
             named(|mutation| matches!(mutation, MutationDiscipline::ReadOnly)),
-            ["inspect_outbox", "inspect_reconciliation", "status"],
+            [
+                "inspect_outbox",
+                "inspect_reconciliation",
+                "metrics",
+                "status"
+            ],
             "the set of read-only admin commands changed"
         );
         assert_eq!(
@@ -392,7 +400,7 @@ mod anti_drift {
                 .iter()
                 .filter(|spec| spec.mutation().mutates())
                 .count(),
-            ADMIN_COMMAND_COUNT - 3,
+            ADMIN_COMMAND_COUNT - 4,
             "a command belongs to no discipline"
         );
     }
@@ -422,6 +430,7 @@ mod seeded_registry {
                 "fail_reconciliation",
                 "inspect_outbox",
                 "inspect_reconciliation",
+                "metrics",
                 "pause_intake",
                 "reconcile_outbox",
                 "resume_intake",

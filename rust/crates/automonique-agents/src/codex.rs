@@ -215,11 +215,13 @@ pub fn normalize_jsonl(
         binding,
         events,
         disposition,
+        usage,
     } = normalizer.finish()?;
     Ok(NormalizedTranscript {
         binding,
         events,
         disposition,
+        usage,
         warning_count: 0,
     })
 }

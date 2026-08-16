@@ -16,14 +16,15 @@ use std::path::Path;
 use std::time::Duration;
 
 use automonique_agents::{
-    ExecutionMode, NormalizedEvent, NormalizedTranscript, ProviderEventStream, RecordedKind,
-    ResumeBinding, RunCoordinates, SessionScope, StreamPolicy,
+    ExecutionMode, NormalizedEvent, NormalizedTranscript, ProviderDisposition, ProviderEventStream,
+    RecordedKind, ResumeBinding, RunCoordinates, SessionScope, StreamPolicy,
 };
 use automonique_runner::{LaunchPlan, RunContainment, SandboxedSession, spawn_sandboxed_session};
 use automonique_store::provider_journal::{
-    CursorAdvance, ProcessExit, ProcessSpawn, ProcessState, ProcessTermination, ProviderJournal,
-    ProviderJournalError, RequestDirection, RequestRecord, RequestSettlement, SessionClosing,
-    SessionClosure, SessionOpening, SettledOutcome, TurnCompletion, TurnOpening, TurnOutcome,
+    CursorAdvance, FinishReason, ProcessExit, ProcessSpawn, ProcessState, ProcessTermination,
+    ProviderJournal, ProviderJournalError, RequestDirection, RequestRecord, RequestSettlement,
+    SessionClosing, SessionClosure, SessionOpening, SettledOutcome, TurnCompletion, TurnOpening,
+    TurnOutcome, TurnUsage,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -90,6 +91,8 @@ struct UserTurn<'a> {
 /// One live, session-scoped provider process.
 pub struct ProviderSessionHost {
     session_key: String,
+    provider_kind: String,
+    request_model: Option<String>,
     scope: SessionScope,
     process: SandboxedSession,
     reader: BufReader<std::os::unix::net::UnixStream>,
@@ -178,12 +181,16 @@ impl ProviderSessionHost {
         session_key: &str,
         scope: SessionScope,
         provider_kind: &str,
+        request_model: Option<&str>,
         executable_digest: &str,
         now_ms: i64,
         idle_ttl_ms: i64,
     ) -> Result<Self, SessionHostError> {
         validate_key(session_key, "session_key")?;
         validate_key(provider_kind, "provider_kind")?;
+        if let Some(model) = request_model {
+            validate_key(model, "request_model")?;
+        }
         if now_ms < 0 || idle_ttl_ms <= 0 {
             return Err(SessionHostError::InvalidField("time"));
         }
@@ -220,6 +227,8 @@ impl ProviderSessionHost {
         })?;
         Ok(Self {
             session_key: session_key.to_owned(),
+            provider_kind: provider_kind.to_owned(),
+            request_model: request_model.map(str::to_owned),
             scope,
             process,
             reader,
@@ -390,6 +399,18 @@ impl ProviderSessionHost {
         }];
         let sequence = u64::try_from(transcript.events().len())
             .map_err(|_| SessionHostError::InvalidField("event_count"))?;
+        let usage = transcript.usage().map(|usage| TurnUsage {
+            gen_ai_system: &self.provider_kind,
+            request_model: self.request_model.as_deref(),
+            response_model: None,
+            input_tokens: usage.input_tokens(),
+            cached_input_tokens: usage.cached_input_tokens(),
+            output_tokens: usage.output_tokens(),
+            finish_reason: match transcript.disposition() {
+                ProviderDisposition::Succeeded => FinishReason::Stop,
+                ProviderDisposition::Failed => FinishReason::Error,
+            },
+        });
         let completed = self.journal.complete_turn(TurnCompletion {
             turn_id: opening.turn_id,
             expected_revision: opening.revision,
@@ -402,6 +423,7 @@ impl ProviderSessionHost {
                 sequence,
                 now_ms,
             }),
+            usage,
         })?;
         self.next_ordinal = completed.ordinal.saturating_add(1);
         self.last_active_ms = now_ms;
@@ -438,6 +460,7 @@ impl ProviderSessionHost {
             outcome: TurnOutcome::Aborted,
             settlements: &[],
             cursor: None,
+            usage: None,
         })?;
         Ok(())
     }
@@ -462,6 +485,7 @@ impl ProviderSessionHost {
             outcome: TurnOutcome::Aborted,
             settlements: &settlement,
             cursor: None,
+            usage: None,
         })?;
         Ok(())
     }

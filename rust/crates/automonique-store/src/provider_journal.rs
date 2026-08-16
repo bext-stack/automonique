@@ -47,7 +47,7 @@ use rusqlite::{
 use crate::{BUSY_TIMEOUT, StoreError, validate_database_path};
 
 /// The only provider journal schema this build can read and write.
-pub const PROVIDER_JOURNAL_SCHEMA_VERSION: u32 = 1;
+pub const PROVIDER_JOURNAL_SCHEMA_VERSION: u32 = 2;
 
 /// Exact character count of a lowercase hex SHA-256 digest.
 pub const DIGEST_CHARS: usize = 64;
@@ -179,6 +179,20 @@ CREATE TABLE provider_approvals (
     deciding_actor TEXT NOT NULL,
     decided_ms INTEGER NOT NULL CHECK (decided_ms >= 0),
     PRIMARY KEY (session_id, approval_key)
+) STRICT;
+"#;
+
+/// Schema v2 adds one bounded, one-to-one usage record per provider turn.
+const SCHEMA_V2: &str = r#"
+CREATE TABLE provider_turn_usage (
+    turn_id INTEGER PRIMARY KEY REFERENCES provider_turns(turn_id),
+    gen_ai_system TEXT NOT NULL,
+    request_model TEXT,
+    response_model TEXT,
+    input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+    cached_input_tokens INTEGER NOT NULL CHECK (cached_input_tokens >= 0),
+    output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+    finish_reason TEXT NOT NULL CHECK (finish_reason IN ('stop', 'error'))
 ) STRICT;
 "#;
 
@@ -378,6 +392,31 @@ pub enum TurnState {
 pub enum TurnOutcome {
     Completed,
     Aborted,
+}
+
+/// Closed `gen_ai.response.finish_reasons` vocabulary recorded for a turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinishReason {
+    Stop,
+    Error,
+}
+
+impl FinishReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Error => "error",
+        }
+    }
+
+    fn parse(value: &str) -> Journalled<Self> {
+        match value {
+            "stop" => Ok(Self::Stop),
+            "error" => Ok(Self::Error),
+            _ => Err(ProviderJournalError::Corrupt("finish_reason")),
+        }
+    }
 }
 
 /// Which side issued a correlated request.
@@ -637,6 +676,7 @@ pub struct TurnOpening<'a> {
 }
 
 /// Atomic close of one open turn with its settlements and cursor.
+#[derive(Clone, Copy)]
 pub struct TurnCompletion<'a> {
     pub turn_id: i64,
     pub expected_revision: u64,
@@ -646,6 +686,20 @@ pub struct TurnCompletion<'a> {
     pub settlements: &'a [RequestSettlement<'a>],
     /// Applied after the settlements and before the turn closes.
     pub cursor: Option<CursorAdvance<'a>>,
+    /// OTel GenAI usage committed in the same transaction as the terminal.
+    pub usage: Option<TurnUsage<'a>>,
+}
+
+/// Provider-reported OpenTelemetry GenAI attributes for one turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TurnUsage<'a> {
+    pub gen_ai_system: &'a str,
+    pub request_model: Option<&'a str>,
+    pub response_model: Option<&'a str>,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub finish_reason: FinishReason,
 }
 
 /// Durable identity of one journalled turn transition.
@@ -780,6 +834,27 @@ pub struct TurnRow {
     pub opened_ms: i64,
     pub closed_ms: Option<i64>,
     pub revision: u64,
+}
+
+/// Validated durable usage attached to one turn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnUsageRow {
+    pub turn_id: i64,
+    pub gen_ai_system: String,
+    pub request_model: Option<String>,
+    pub response_model: Option<String>,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub finish_reason: FinishReason,
+}
+
+/// Aggregate used by the local metrics exporter.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UsageTotals {
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 /// Validated `provider_requests` row.
@@ -1217,6 +1292,12 @@ impl ProviderJournal {
         if let Some(cursor) = completion.cursor.as_ref() {
             validate_cursor(cursor)?;
         }
+        if let Some(usage) = completion.usage.as_ref() {
+            if completion.outcome != TurnOutcome::Completed {
+                return Err(ProviderJournalError::InvalidField("turn_usage"));
+            }
+            validate_turn_usage(usage)?;
+        }
 
         let transaction = self
             .connection
@@ -1238,6 +1319,14 @@ impl ProviderJournal {
             advance_cursor_row(&transaction, cursor)?;
         }
         if replay {
+            match (
+                read_turn_usage(&transaction, turn.turn_id)?,
+                completion.usage.as_ref(),
+            ) {
+                (None, None) => {}
+                (Some(recorded), Some(supplied)) if usage_matches(&recorded, supplied) => {}
+                _ => return Err(ProviderJournalError::AlreadySettled),
+            }
             transaction.commit()?;
             return Ok(TurnReceipt {
                 turn_id: turn.turn_id,
@@ -1259,12 +1348,37 @@ impl ProviderJournal {
             ],
         )?;
         require_single_row(changed, "provider_turn")?;
+        if let Some(usage) = completion.usage.as_ref() {
+            insert_turn_usage(&transaction, turn.turn_id, usage)?;
+        }
         transaction.commit()?;
         Ok(TurnReceipt {
             turn_id: turn.turn_id,
             ordinal: turn.ordinal,
             revision: next_revision,
             duplicate: false,
+        })
+    }
+
+    /// Read the usage recorded for one turn.
+    pub fn turn_usage(&self, turn_id: i64) -> Journalled<Option<TurnUsageRow>> {
+        validate_row_id(turn_id, "turn_id")?;
+        read_turn_usage(&self.connection, turn_id)
+    }
+
+    /// Aggregate all durable completed-turn usage in this journal.
+    pub fn usage_totals(&self) -> Journalled<UsageTotals> {
+        let (requests, input_tokens, output_tokens): (i64, i64, i64) = self.connection.query_row(
+            "SELECT count(*), coalesce(sum(input_tokens), 0),
+                        coalesce(sum(output_tokens), 0)
+                 FROM provider_turn_usage",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(UsageTotals {
+            requests: from_db_u64(requests, "usage_requests")?,
+            input_tokens: from_db_u64(input_tokens, "usage_input_tokens")?,
+            output_tokens: from_db_u64(output_tokens, "usage_output_tokens")?,
         })
     }
 
@@ -2000,6 +2114,17 @@ struct RawTurn {
     revision: i64,
 }
 
+struct RawTurnUsage {
+    turn_id: i64,
+    gen_ai_system: String,
+    request_model: Option<String>,
+    response_model: Option<String>,
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    finish_reason: String,
+}
+
 const TURN_COLUMNS: &str = "turn_id, session_id, ordinal, turn_key, state,
      opened_ms, closed_ms, revision";
 
@@ -2049,6 +2174,82 @@ fn read_turn(connection: &Connection, turn_id: i64) -> Journalled<Option<TurnRow
         )
         .optional()?;
     raw.map(validated_turn).transpose()
+}
+
+fn read_turn_usage(connection: &Connection, turn_id: i64) -> Journalled<Option<TurnUsageRow>> {
+    let raw: Option<RawTurnUsage> = connection
+        .query_row(
+            "SELECT turn_id, gen_ai_system, request_model, response_model,
+                        input_tokens, cached_input_tokens, output_tokens, finish_reason
+                 FROM provider_turn_usage WHERE turn_id = ?1",
+            [turn_id],
+            |row| {
+                Ok(RawTurnUsage {
+                    turn_id: row.get(0)?,
+                    gen_ai_system: row.get(1)?,
+                    request_model: row.get(2)?,
+                    response_model: row.get(3)?,
+                    input_tokens: row.get(4)?,
+                    cached_input_tokens: row.get(5)?,
+                    output_tokens: row.get(6)?,
+                    finish_reason: row.get(7)?,
+                })
+            },
+        )
+        .optional()?;
+    raw.map(|raw| {
+        Ok(TurnUsageRow {
+            turn_id: checked_row_id(raw.turn_id, "turn_id")?,
+            gen_ai_system: checked_bounded(raw.gen_ai_system, MAX_KIND_BYTES, "gen_ai_system")?,
+            request_model: raw
+                .request_model
+                .map(|value| checked_bounded(value, MAX_VERSION_BYTES, "request_model"))
+                .transpose()?,
+            response_model: raw
+                .response_model
+                .map(|value| checked_bounded(value, MAX_VERSION_BYTES, "response_model"))
+                .transpose()?,
+            input_tokens: from_db_u64(raw.input_tokens, "input_tokens")?,
+            cached_input_tokens: from_db_u64(raw.cached_input_tokens, "cached_input_tokens")?,
+            output_tokens: from_db_u64(raw.output_tokens, "output_tokens")?,
+            finish_reason: FinishReason::parse(&raw.finish_reason)?,
+        })
+    })
+    .transpose()
+}
+
+fn insert_turn_usage(
+    connection: &Connection,
+    turn_id: i64,
+    usage: &TurnUsage<'_>,
+) -> Journalled<()> {
+    let changed = connection.execute(
+        "INSERT INTO provider_turn_usage
+         (turn_id, gen_ai_system, request_model, response_model, input_tokens,
+          cached_input_tokens, output_tokens, finish_reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            turn_id,
+            usage.gen_ai_system,
+            usage.request_model,
+            usage.response_model,
+            to_db_u64(usage.input_tokens, "input_tokens")?,
+            to_db_u64(usage.cached_input_tokens, "cached_input_tokens")?,
+            to_db_u64(usage.output_tokens, "output_tokens")?,
+            usage.finish_reason.as_str(),
+        ],
+    )?;
+    require_single_row(changed, "provider_turn_usage")
+}
+
+fn usage_matches(recorded: &TurnUsageRow, supplied: &TurnUsage<'_>) -> bool {
+    recorded.gen_ai_system == supplied.gen_ai_system
+        && recorded.request_model.as_deref() == supplied.request_model
+        && recorded.response_model.as_deref() == supplied.response_model
+        && recorded.input_tokens == supplied.input_tokens
+        && recorded.cached_input_tokens == supplied.cached_input_tokens
+        && recorded.output_tokens == supplied.output_tokens
+        && recorded.finish_reason == supplied.finish_reason
 }
 
 fn read_turn_by_key(
@@ -2407,6 +2608,13 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Journalled<()> 
     if version == PROVIDER_JOURNAL_SCHEMA_VERSION {
         return Ok(());
     }
+    if version == 1 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_V2)?;
+        transaction.pragma_update(None, "user_version", PROVIDER_JOURNAL_SCHEMA_VERSION)?;
+        transaction.commit()?;
+        return Ok(());
+    }
     if version != 0 {
         return Err(ProviderJournalError::SchemaVersion {
             found: version,
@@ -2426,6 +2634,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Journalled<()> 
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(SCHEMA_V1)?;
+    transaction.execute_batch(SCHEMA_V2)?;
     transaction.pragma_update(None, "user_version", PROVIDER_JOURNAL_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -2448,6 +2657,20 @@ fn validate_cursor(advance: &CursorAdvance<'_>) -> Journalled<()> {
     validate_time(advance.now_ms, "now_ms")?;
     validate_row_id(advance.session_id, "session_id")?;
     to_db_u64(advance.sequence, "sequence").map(|_| ())
+}
+
+fn validate_turn_usage(usage: &TurnUsage<'_>) -> Journalled<()> {
+    validate_bounded(usage.gen_ai_system, MAX_KIND_BYTES, "gen_ai_system")?;
+    if let Some(model) = usage.request_model {
+        validate_bounded(model, MAX_VERSION_BYTES, "request_model")?;
+    }
+    if let Some(model) = usage.response_model {
+        validate_bounded(model, MAX_VERSION_BYTES, "response_model")?;
+    }
+    to_db_u64(usage.input_tokens, "input_tokens")?;
+    to_db_u64(usage.cached_input_tokens, "cached_input_tokens")?;
+    to_db_u64(usage.output_tokens, "output_tokens")?;
+    Ok(())
 }
 
 fn validate_key(value: &str, field: &'static str) -> Journalled<()> {

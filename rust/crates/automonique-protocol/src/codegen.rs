@@ -2486,6 +2486,13 @@ fn admin_command_module() -> GeneratedModule {
                     coupling: None,
                 },
                 RequestCommand {
+                    kind: "metrics".to_owned(),
+                    name: "Metrics".to_owned(),
+                    doc: "Read a Prometheus metrics snapshot.".to_owned(),
+                    fields: Vec::new(),
+                    coupling: None,
+                },
+                RequestCommand {
                     kind: "submit_run".to_owned(),
                     name: "SubmitRun".to_owned(),
                     doc: "Take durable custody of one canonical RunSpec document. Acceptance is \
@@ -2616,6 +2623,7 @@ fn admin_command_module() -> GeneratedModule {
                 "outbox_reconciled".to_owned(),
                 "reconciliation_failed".to_owned(),
                 "reconciliation_inspected".to_owned(),
+                "metrics_result".to_owned(),
                 "status_result".to_owned(),
                 "synthetic_accepted".to_owned(),
             ],

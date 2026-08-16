@@ -2561,6 +2561,7 @@ mod command_surface {
         let id = request_id("req-coverage-1");
         let requests = vec![
             AdminRequest::new(id.clone(), AdminCommand::Status),
+            AdminRequest::new(id.clone(), AdminCommand::Metrics),
             AdminRequest::new(id.clone(), AdminCommand::Shutdown),
             AdminRequest::submit(
                 id.clone(),
@@ -2603,6 +2604,7 @@ mod command_surface {
         let mut declared: BTreeSet<String> = BTreeSet::new();
         for command in [
             AdminCommand::Status,
+            AdminCommand::Metrics,
             AdminCommand::SubmitSynthetic,
             AdminCommand::SubmitRun,
             AdminCommand::InspectReconciliation,
@@ -2615,6 +2617,7 @@ mod command_surface {
         ] {
             match command {
                 AdminCommand::Status
+                | AdminCommand::Metrics
                 | AdminCommand::SubmitSynthetic
                 | AdminCommand::SubmitRun
                 | AdminCommand::InspectReconciliation
@@ -2675,6 +2678,10 @@ mod command_surface {
         let responses = vec![
             AdminResponse::from_canonical_bytes(&encoded_status().to_canonical_bytes())
                 .expect("a status response"),
+            AdminResponse::Metrics {
+                request_id: id.clone(),
+                exposition: "automonique_ready 1\n".to_owned(),
+            },
             AdminResponse::SyntheticAccepted {
                 request_id: id.clone(),
                 inbox_id: 1,
@@ -2754,6 +2761,7 @@ mod command_surface {
         for response in &responses {
             match response {
                 AdminResponse::Status { .. }
+                | AdminResponse::Metrics { .. }
                 | AdminResponse::SyntheticAccepted { .. }
                 | AdminResponse::RunAccepted { .. }
                 | AdminResponse::ReconciliationInspected { .. }

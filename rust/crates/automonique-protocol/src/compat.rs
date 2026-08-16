@@ -1201,9 +1201,11 @@ impl Component {
             // chain yet, so its only supported version is the one it creates.
             Self::CancelLedgerSchema
             | Self::GenerationAuditSchema
-            | Self::ProviderJournalSchema
             | Self::RunSubmissionsSchema
             | Self::SlackIngressSchema => (1, 1),
+            // Provider journal v2 adds durable GenAI turn usage and migrates
+            // v1 files in place.
+            Self::ProviderJournalSchema => (1, 2),
             // `RunSpec` admission refuses any `protocol_version` but 1.
             Self::RunSpecDocument => (1, 1),
         }

@@ -105,6 +105,7 @@ fn turn_two_reuses_the_live_session_process_and_journals_both_turns() {
         "fixture-session",
         scope,
         "fixture",
+        Some("fixture-model"),
         &"a".repeat(64),
         100,
         60_000,
@@ -130,4 +131,14 @@ fn turn_two_reuses_the_live_session_process_and_journals_both_turns() {
     let turns = journal.session_turns(session.session_id).unwrap();
     assert_eq!(turns.len(), 2);
     assert!(turns.iter().all(|turn| turn.state == TurnState::Completed));
+    let totals = journal.usage_totals().unwrap();
+    assert_eq!(totals.requests, 2);
+    assert_eq!(totals.input_tokens, 2);
+    assert_eq!(totals.output_tokens, 2);
+    for turn in turns {
+        let usage = journal.turn_usage(turn.turn_id).unwrap().unwrap();
+        assert_eq!(usage.gen_ai_system, "fixture");
+        assert_eq!(usage.request_model.as_deref(), Some("fixture-model"));
+        assert_eq!(usage.finish_reason.as_str(), "stop");
+    }
 }

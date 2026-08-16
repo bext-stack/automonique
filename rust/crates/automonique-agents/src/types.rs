@@ -392,12 +392,47 @@ pub enum ProviderDisposition {
     Failed,
 }
 
+/// Provider-reported token usage for one completed turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderUsage {
+    cached_input_tokens: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+impl ProviderUsage {
+    #[must_use]
+    pub const fn new(cached_input_tokens: u64, input_tokens: u64, output_tokens: u64) -> Self {
+        Self {
+            cached_input_tokens,
+            input_tokens,
+            output_tokens,
+        }
+    }
+
+    #[must_use]
+    pub const fn cached_input_tokens(self) -> u64 {
+        self.cached_input_tokens
+    }
+
+    #[must_use]
+    pub const fn input_tokens(self) -> u64 {
+        self.input_tokens
+    }
+
+    #[must_use]
+    pub const fn output_tokens(self) -> u64 {
+        self.output_tokens
+    }
+}
+
 /// Complete, strictly normalized provider fixture transcript.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NormalizedTranscript {
     pub(crate) binding: ResumeBinding,
     pub(crate) events: Vec<NormalizedEvent>,
     pub(crate) disposition: ProviderDisposition,
+    pub(crate) usage: Option<ProviderUsage>,
     pub(crate) warning_count: u64,
 }
 
@@ -415,6 +450,12 @@ impl NormalizedTranscript {
     #[must_use]
     pub const fn disposition(&self) -> ProviderDisposition {
         self.disposition
+    }
+
+    /// Token usage carried by a successful provider terminal.
+    #[must_use]
+    pub const fn usage(&self) -> Option<ProviderUsage> {
+        self.usage
     }
 
     /// Invalid NDJSON lines skipped by an explicitly lenient session stream.

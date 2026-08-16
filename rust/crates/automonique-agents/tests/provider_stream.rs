@@ -105,6 +105,10 @@ fn fixture_lines_become_exactly_these_normalized_events() {
 
     let transcript = stream.finish().expect("complete transcript");
     assert_eq!(transcript.disposition(), ProviderDisposition::Succeeded);
+    let usage = transcript.usage().expect("provider usage");
+    assert_eq!(usage.cached_input_tokens(), 1);
+    assert_eq!(usage.input_tokens(), 2);
+    assert_eq!(usage.output_tokens(), 3);
     assert_eq!(
         transcript.binding().provider_session_id(),
         "fixture-session"

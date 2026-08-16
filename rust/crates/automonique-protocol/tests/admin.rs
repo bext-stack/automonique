@@ -212,7 +212,11 @@ fn durable_state() -> DurableStateCounts {
 
 #[test]
 fn requests_round_trip_through_canonical_framing() {
-    for command in [AdminCommand::Status, AdminCommand::Shutdown] {
+    for command in [
+        AdminCommand::Status,
+        AdminCommand::Metrics,
+        AdminCommand::Shutdown,
+    ] {
         let request = AdminRequest::new(request_id(), command);
         let payload = request
             .to_message()
@@ -232,6 +236,30 @@ fn requests_round_trip_through_canonical_framing() {
             request
         );
     }
+}
+
+#[test]
+fn metrics_exposition_is_bounded_exact_and_correlated() {
+    let response = AdminResponse::Metrics {
+        request_id: request_id(),
+        exposition:
+            "# HELP automonique_ready Ready.\n# TYPE automonique_ready gauge\nautomonique_ready 1\n"
+                .to_owned(),
+    };
+    let payload = response
+        .to_message()
+        .expect("bounded metrics")
+        .to_canonical_bytes();
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(&payload).expect("metrics response"),
+        response
+    );
+
+    let invalid = AdminResponse::Metrics {
+        request_id: request_id(),
+        exposition: "missing final newline".to_owned(),
+    };
+    assert_eq!(invalid.to_message(), Err(AdminError::InvalidBody));
 }
 
 #[test]
@@ -2172,10 +2200,13 @@ mod capability {
     /// the same commit as the change it describes. Editing an existing line
     /// fails this test, which is the point — the rule is enforced rather than
     /// requested in a review.
-    const CHANGELOG: &[(u32, &str)] = &[(
-        1,
-        "the six lanes of the local admin socket and the live progress stream",
-    )];
+    const CHANGELOG: &[(u32, &str)] = &[
+        (
+            1,
+            "the six lanes of the local admin socket and the live progress stream",
+        ),
+        (2, "the authenticated local metrics scrape"),
+    ];
 
     /// Every endpoint, at the maturity it had when it landed.
     ///
@@ -2214,6 +2245,7 @@ mod capability {
         "automonique.batch/list_batches",
         "automonique.batch/batch_detail",
         "automonique.progress.stream/subscribe",
+        "automonique.admin/metrics",
     ];
 
     #[test]
@@ -2268,7 +2300,7 @@ mod capability {
     /// closed set rather than by reading the table.
     #[test]
     fn every_admin_command_is_declared() {
-        assert_eq!(AdminCommand::ALL.len(), 10);
+        assert_eq!(AdminCommand::ALL.len(), 11);
         for command in AdminCommand::ALL {
             let endpoint = format!("automonique.admin/{}", command.kind());
             assert!(

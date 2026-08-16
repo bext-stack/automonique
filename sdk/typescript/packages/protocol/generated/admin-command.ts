@@ -158,6 +158,13 @@ export function encodeAdminRequest(
   return payload;
 }
 
+/** Read a Prometheus metrics snapshot. */
+export const ADMIN_METRICS_REQUEST_KIND = "metrics";
+
+export function encodeMetrics(request_id: RequestId): Uint8Array {
+  return encodeAdminRequest(request_id, ADMIN_METRICS_REQUEST_KIND, []);
+}
+
 /** Durably close intake for this generation, naming the deciding operator and the cause. */
 export const ADMIN_PAUSE_INTAKE_REQUEST_KIND = "pause_intake";
 export interface PauseIntakeBody {
@@ -360,7 +367,7 @@ export function decodeShutdownAccepted(request_id: RequestId, body: JsonValue): 
  * defined, and a client told otherwise might act on the lie. The body is not
  * handed back, because nothing here has validated it.
  */
-export const ADMIN_RESPONSE_KINDS_NOT_DECODED = ["outbox_inspected", "outbox_reconciled", "reconciliation_failed", "reconciliation_inspected", "status_result", "synthetic_accepted"] as const;
+export const ADMIN_RESPONSE_KINDS_NOT_DECODED = ["metrics_result", "outbox_inspected", "outbox_reconciled", "reconciliation_failed", "reconciliation_inspected", "status_result", "synthetic_accepted"] as const;
 export type UndecodedAdminResponseKind = (typeof ADMIN_RESPONSE_KINDS_NOT_DECODED)[number];
 export function isUndecodedAdminResponseKind(value: string): value is UndecodedAdminResponseKind {
   return (ADMIN_RESPONSE_KINDS_NOT_DECODED as readonly string[]).includes(value);

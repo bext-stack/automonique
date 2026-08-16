@@ -190,11 +190,13 @@ impl ProviderEventStream {
             binding,
             events,
             disposition,
+            usage,
         } = self.normalizer.finish()?;
         Ok(NormalizedTranscript {
             binding,
             events,
             disposition,
+            usage,
             warning_count: self.warning_count,
         })
     }
@@ -227,6 +229,7 @@ impl ProviderEventStream {
             binding: normalized.binding,
             events: normalized.events,
             disposition: normalized.disposition,
+            usage: normalized.usage,
             warning_count: self.warning_count,
         })
     }

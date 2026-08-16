@@ -47,7 +47,7 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
-const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique runs tail <spool-root> <run-id> [cursor]\n       automonique automation register <automation-id> <actor>\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique batch register <batch-id> [--label <label>] [--sequential | --parallel <ceiling>] <member-key>...\n       automonique batch advance <batch-id> <member-key> <revision> <state> <last-sequence>\n       automonique batch list [--cursor <entry-id>] [--page <size>]\n       automonique batch detail <batch-id>\n       automonique parity compare <database> <scope> [--registry <path>] [--category <category>]\n       automonique parity score <database> <scope>\n       automonique parity gate <database> <scope> <decision-key> <decider> [--registry <path>]\n       automonique audit verify <database>\n       automonique cancel <run-id> <request-ref> [observed-sequence]\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique progress subscribe <socket-path> <run-id> [cursor]\n       automonique shutdown\n";
+const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique metrics\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique runs tail <spool-root> <run-id> [cursor]\n       automonique automation register <automation-id> <actor>\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique batch register <batch-id> [--label <label>] [--sequential | --parallel <ceiling>] <member-key>...\n       automonique batch advance <batch-id> <member-key> <revision> <state> <last-sequence>\n       automonique batch list [--cursor <entry-id>] [--page <size>]\n       automonique batch detail <batch-id>\n       automonique parity compare <database> <scope> [--registry <path>] [--category <category>]\n       automonique parity score <database> <scope>\n       automonique parity gate <database> <scope> <decision-key> <decider> [--registry <path>]\n       automonique audit verify <database>\n       automonique cancel <run-id> <request-ref> [observed-sequence]\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique progress subscribe <socket-path> <run-id> [cursor]\n       automonique shutdown\n";
 
 #[derive(Clone)]
 enum Command {
@@ -57,6 +57,7 @@ enum Command {
     Status {
         json: bool,
     },
+    Metrics,
     Submit {
         scope: OsString,
         idempotency_key: OsString,
@@ -136,6 +137,7 @@ where
         (Some(command), Some(flag), None, None) if command == "status" && flag == "--json" => {
             Command::Status { json: true }
         }
+        (Some(command), None, None, None) if command == "metrics" => Command::Metrics,
         (Some(command), Some(scope), Some(idempotency_key), None) if command == "submit" => {
             Command::Submit {
                 scope,
@@ -499,6 +501,9 @@ where
     let json = match command {
         Command::Status { json } => {
             return admin_status(runtime.as_deref(), json, &mut stdout, &mut stderr);
+        }
+        Command::Metrics => {
+            return admin_metrics(runtime.as_deref(), &mut stdout, &mut stderr);
         }
         Command::Submit {
             scope,
@@ -1079,6 +1084,34 @@ fn admin_status<W: Write, E: Write>(
     0
 }
 
+fn admin_metrics<W: Write, E: Write>(
+    runtime: Option<&OsStr>,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> u8 {
+    match admin_client::request(runtime, admin_client::Operation::Metrics) {
+        Ok(automonique_protocol::admin::AdminResponse::Metrics { exposition, .. }) => {
+            if stdout.write_all(exposition.as_bytes()).is_ok() {
+                0
+            } else {
+                1
+            }
+        }
+        Ok(_) => {
+            let _ = stderr.write_all(b"automonique metrics unavailable: response_mismatch\n");
+            1
+        }
+        Err(error) => {
+            let _ = writeln!(
+                stderr,
+                "automonique metrics unavailable: {}",
+                error.category()
+            );
+            1
+        }
+    }
+}
+
 fn admin_shutdown<W: Write, E: Write>(
     runtime: Option<&OsStr>,
     stdout: &mut W,
@@ -1573,6 +1606,54 @@ mod tests {
             tenures_recorded: OperationalMetric::Measured(2),
         })
         .expect("coherent counts")
+    }
+
+    #[test]
+    fn metrics_writes_the_daemons_exposition_byte_for_byte() {
+        let runtime = tempfile::tempdir().expect("runtime");
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("runtime mode");
+        let product = runtime.path().join("automonique");
+        std::fs::create_dir(&product).expect("product runtime");
+        std::fs::set_permissions(&product, std::fs::Permissions::from_mode(0o700))
+            .expect("product mode");
+        let socket = product.join("admin.sock");
+        let listener = UnixListener::bind(&socket).expect("listener");
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .expect("socket mode");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut prefix = [0_u8; 4];
+            stream.read_exact(&mut prefix).expect("request prefix");
+            let mut body = vec![0_u8; u32::from_be_bytes(prefix) as usize];
+            stream.read_exact(&mut body).expect("request body");
+            let request = AdminRequest::from_canonical_bytes(&body).expect("typed request");
+            assert_eq!(
+                request.command(),
+                automonique_protocol::admin::AdminCommand::Metrics
+            );
+            let response = AdminResponse::Metrics {
+                request_id: request.request_id().clone(),
+                exposition: "# HELP automonique_ready Ready.\nautomonique_ready 1\n".to_owned(),
+            }
+            .to_message()
+            .expect("response")
+            .to_canonical_bytes();
+            let mut frame = Vec::new();
+            encode_frame(&response, &mut frame).expect("frame");
+            stream.write_all(&frame).expect("write");
+        });
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = super::admin_metrics(Some(runtime.path().as_os_str()), &mut stdout, &mut stderr);
+        server.join().expect("server");
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            stdout,
+            b"# HELP automonique_ready Ready.\nautomonique_ready 1\n"
+        );
     }
 
     #[test]

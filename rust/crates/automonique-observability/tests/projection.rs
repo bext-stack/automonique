@@ -3,7 +3,7 @@
 use automonique_observability::{
     EventCategory, MetricName, MetricSample, MetricValue, MetricsSnapshot, ObservabilityError,
     OperationalEvent, OperationalEventKind, Severity, StoreAssessment, StoreProjection,
-    UnavailableReason,
+    UnavailableReason, render_exposition,
 };
 use automonique_store::{
     InboxSubmission, LeaseRequest, OutboxClaimRequest, SchedulerClaim, Store,
@@ -382,4 +382,43 @@ fn every_metric_name_is_exported_once() {
             .all(|name| name.as_str().starts_with("automonique_")),
         "a metric escaped the product's own namespace"
     );
+}
+
+#[test]
+fn prometheus_exposition_is_complete_typed_and_never_invents_missing_values() {
+    let mut values = samples();
+    let provider = values
+        .iter_mut()
+        .find(|sample| sample.name() == MetricName::ProviderAvailable)
+        .expect("provider metric");
+    *provider = MetricSample::unavailable(
+        MetricName::ProviderAvailable,
+        UnavailableReason::DependencyUnavailable,
+    );
+    let snapshot = MetricsSnapshot::new(1, "generation-a", values).expect("snapshot");
+    let rendered = render_exposition(&snapshot, "1.2\"edge\\build");
+
+    assert!(rendered.starts_with("# HELP automonique_build_info"));
+    assert!(rendered.contains("automonique_build_info{version=\"1.2\\\"edge\\\\build\"} 1\n"));
+    for name in MetricName::ALL {
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| *line == format!("# HELP {} {}", name.as_str(), name.help()))
+                .count(),
+            1,
+            "{} must have one HELP line",
+            name.as_str()
+        );
+        assert!(rendered.contains(&format!(
+            "# TYPE {} {}\n",
+            name.as_str(),
+            name.metric_type()
+        )));
+    }
+    assert!(rendered.contains(
+        "# automonique unavailable automonique_provider_available dependency_unavailable\n"
+    ));
+    assert!(!rendered.contains("automonique_provider_available 0\n"));
+    assert!(rendered.ends_with('\n'));
 }

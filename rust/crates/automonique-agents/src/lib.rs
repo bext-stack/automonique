@@ -46,6 +46,6 @@ pub use types::{
     AdapterEnvironment, AdapterError, CancellationToken, CoordinateError, ExecutionMode,
     MAX_ENV_VALUE_BYTES, MAX_EVENT_KIND_BYTES, MAX_JSONL_LINE_BYTES, MAX_JSONL_TOTAL_BYTES,
     MAX_PROMPT_BYTES, NormalizedEvent, NormalizedTranscript, ProviderDisposition, ProviderItemKind,
-    RecordedEvent, RecordedKind, ResumeBinding, RunCoordinates, RunRequest, SessionScope,
-    StreamAuthority, UnknownEventKind,
+    ProviderUsage, RecordedEvent, RecordedKind, ResumeBinding, RunCoordinates, RunRequest,
+    SessionScope, StreamAuthority, UnknownEventKind,
 };

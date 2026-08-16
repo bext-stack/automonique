@@ -53,7 +53,7 @@
 //!
 //! # Where the seeded registry comes from
 //!
-//! [`admin_command_registry`] describes the ten commands
+//! [`admin_command_registry`] describes the eleven commands
 //! [`crate::admin::AdminCommand`] actually admits, with the field names those
 //! bodies actually encode and the byte bounds `crate::admin` actually enforces
 //! — imported from that module rather than restated here, so a widened bound
@@ -1341,6 +1341,7 @@ impl CommandRegistry {
 pub fn admin_command_registry() -> Result<CommandRegistry, CommandRegistryError> {
     CommandRegistry::new([
         status_spec()?,
+        metrics_spec()?,
         submit_synthetic_spec()?,
         submit_run_spec()?,
         inspect_reconciliation_spec()?,
@@ -1415,6 +1416,19 @@ fn status_spec() -> Result<CommandSpec, CommandRegistryError> {
         id: CommandId::new("status")?,
         aliases: Vec::new(),
         summary: help("Read a consistent daemon status snapshot.")?,
+        fields: Vec::new(),
+        authorization: AuthorizationRequirement::LocalPeer,
+        approval: ApprovalPolicy::None,
+        dry_run: DryRun::Unsupported,
+        mutation: MutationDiscipline::ReadOnly,
+    })
+}
+
+fn metrics_spec() -> Result<CommandSpec, CommandRegistryError> {
+    CommandSpec::new(CommandSpecParts {
+        id: CommandId::new("metrics")?,
+        aliases: Vec::new(),
+        summary: help("Read a Prometheus metrics snapshot.")?,
         fields: Vec::new(),
         authorization: AuthorizationRequirement::LocalPeer,
         approval: ApprovalPolicy::None,

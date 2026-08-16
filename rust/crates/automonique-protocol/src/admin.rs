@@ -86,6 +86,15 @@ pub const MAX_RECONCILIATION_FIELD_BYTES: usize = 256;
 /// Maximum stable refusal-category bytes returned to an authenticated client.
 pub const MAX_ADMIN_REFUSAL_CATEGORY_BYTES: usize = 64;
 
+/// Maximum Prometheus text bytes returned by one authenticated scrape.
+pub const MAX_METRICS_EXPOSITION_BYTES: usize = 24 * 1024;
+
+const METRICS_RESPONSE_OVERHEAD_BYTES: usize = 512;
+const _: () = assert!(
+    2 * MAX_METRICS_EXPOSITION_BYTES + METRICS_RESPONSE_OVERHEAD_BYTES <= MAX_ADMIN_CANONICAL_BYTES,
+    "a maximally escaped metrics response must fit one admin frame"
+);
+
 /// Maximum UTF-8 byte length of the actor named on an intake pause or resume.
 ///
 /// The transport authenticates the Unix peer; this string is the operator's own
@@ -176,7 +185,8 @@ const _: () = assert!(
 ///   socket (`admin`, `runs`, `automation`, `approval`, `batch`, `execute`) and
 ///   the live progress stream, with [`ENDPOINT_MATURITY`] as their declared
 ///   maturity and [`DaemonStatus::capability`] reporting this number.
-pub const ADMIN_CAPABILITY: u32 = 1;
+/// - **2** — added the read-only `automonique.admin/metrics` endpoint.
+pub const ADMIN_CAPABILITY: u32 = 2;
 
 /// How much of a promise an endpoint is.
 ///
@@ -308,6 +318,7 @@ pub const ENDPOINT_MATURITY: &[(&str, Maturity)] = &[
         "automonique.progress.stream/subscribe",
         Maturity::Experimental,
     ),
+    ("automonique.admin/metrics", Maturity::Experimental),
 ];
 
 /// A refusal while constructing or decoding an administration message.
@@ -552,6 +563,8 @@ impl ExecutionState {
 pub enum AdminCommand {
     /// Read a consistent daemon status snapshot.
     Status,
+    /// Read a Prometheus text snapshot over the authenticated local socket.
+    Metrics,
     /// Durably enqueue a no-effect synthetic work item.
     SubmitSynthetic,
     /// Take durable custody of one canonical RunSpec document.
@@ -584,8 +597,9 @@ impl AdminCommand {
     /// Published so [`ENDPOINT_MATURITY`] can be held exhaustive over this lane
     /// by a test rather than by inspection: a command added here without a row
     /// there is a surface the daemon serves and never declared.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Status,
+        Self::Metrics,
         Self::SubmitSynthetic,
         Self::SubmitRun,
         Self::InspectReconciliation,
@@ -602,6 +616,7 @@ impl AdminCommand {
     pub const fn kind(self) -> &'static str {
         match self {
             Self::Status => "status",
+            Self::Metrics => "metrics",
             Self::SubmitSynthetic => "submit_synthetic",
             Self::SubmitRun => "submit_run",
             Self::InspectReconciliation => "inspect_reconciliation",
@@ -1606,7 +1621,7 @@ impl AdminRequest {
                 Some(intake_resume),
             ) => intake_resume.to_body(),
             (
-                AdminCommand::Status | AdminCommand::Shutdown,
+                AdminCommand::Status | AdminCommand::Metrics | AdminCommand::Shutdown,
                 None,
                 None,
                 None,
@@ -1671,14 +1686,14 @@ impl AdminRequest {
                 message.envelope().request_id().clone(),
                 IntakeResume::from_body(message.body())?,
             )),
-            "status" | "shutdown" => {
+            "status" | "metrics" | "shutdown" => {
                 if !matches!(message.body(), JsonValue::Object(entries) if entries.is_empty()) {
                     return Err(AdminError::InvalidBody);
                 }
-                let command = if message.envelope().kind().as_str() == "status" {
-                    AdminCommand::Status
-                } else {
-                    AdminCommand::Shutdown
+                let command = match message.envelope().kind().as_str() {
+                    "status" => AdminCommand::Status,
+                    "metrics" => AdminCommand::Metrics,
+                    _ => AdminCommand::Shutdown,
                 };
                 Ok(Self::new(message.envelope().request_id().clone(), command))
             }
@@ -3272,6 +3287,13 @@ pub enum AdminResponse {
         /// Consistent status snapshot.
         status: DaemonStatus,
     },
+    /// Prometheus text exposition from the same point-in-time projection.
+    Metrics {
+        /// Correlation identifier from the request.
+        request_id: RequestId,
+        /// Bounded UTF-8 Prometheus text ending in a newline.
+        exposition: String,
+    },
     /// A synthetic work item is durable, or the exact retry was replayed.
     SyntheticAccepted {
         /// Correlation identifier from the request.
@@ -3360,6 +3382,7 @@ impl AdminResponse {
     pub const fn request_id(&self) -> &RequestId {
         match self {
             Self::Status { request_id, .. }
+            | Self::Metrics { request_id, .. }
             | Self::SyntheticAccepted { request_id, .. }
             | Self::RunAccepted { request_id, .. }
             | Self::ReconciliationInspected { request_id, .. }
@@ -3385,6 +3408,21 @@ impl AdminResponse {
                 envelope(request_id.clone(), "status_result")?,
                 status.to_body()?,
             )),
+            Self::Metrics {
+                request_id,
+                exposition,
+            } => {
+                if !valid_metrics_exposition(exposition) {
+                    return Err(AdminError::InvalidBody);
+                }
+                Ok(Message::new(
+                    envelope(request_id.clone(), "metrics_result")?,
+                    JsonValue::Object(vec![(
+                        "exposition".to_owned(),
+                        JsonValue::String(exposition.clone()),
+                    )]),
+                ))
+            }
             Self::SyntheticAccepted {
                 request_id,
                 inbox_id,
@@ -3544,6 +3582,17 @@ impl AdminResponse {
                 request_id,
                 status: DaemonStatus::from_body(message.body())?,
             }),
+            "metrics_result" => {
+                exact_fields(message.body(), &["exposition"])?;
+                let exposition = required_body_string(message.body(), "exposition")?;
+                if !valid_metrics_exposition(&exposition) {
+                    return Err(AdminError::InvalidBody);
+                }
+                Ok(Self::Metrics {
+                    request_id,
+                    exposition,
+                })
+            }
             "synthetic_accepted" => {
                 exact_fields(message.body(), &["duplicate", "inbox_id"])?;
                 let duplicate = match message.body().get("duplicate") {
@@ -3778,6 +3827,14 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
 
 fn valid_coordinate(value: &str, max_bytes: usize) -> bool {
     !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+}
+
+fn valid_metrics_exposition(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_METRICS_EXPOSITION_BYTES
+        && value.ends_with('\n')
+        && !value.contains('\0')
+        && !value.contains('\r')
 }
 
 fn exact_fields(body: &JsonValue, fields: &[&str]) -> Result<(), AdminError> {

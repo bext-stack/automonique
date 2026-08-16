@@ -174,7 +174,7 @@ fn expired_outbox_requires_exact_fenced_operator_reconciliation_and_replays_afte
     assert_eq!(operational.reconciliation_pending(), 1);
     assert_eq!(
         operational.provider_available(),
-        automonique_protocol::admin::OperationalMetric::Unavailable
+        automonique_protocol::admin::OperationalMetric::Measured(0)
     );
     let blocked_submission = SyntheticSubmission::new(
         "workspace:blocked",

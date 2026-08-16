@@ -56,7 +56,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use automonique_observability::{MetricName, MetricValue, StoreProjection};
+use automonique_observability::{
+    GenAiUsageObservation, MetricName, MetricValue, RuntimeObservation, StoreProjection,
+    render_exposition,
+};
 use automonique_policy::approval::{
     ApprovalEvidence, ApprovalGate, ApprovalPolicyRefusal, ApprovalRequirement, ApprovalSources,
     OperatorSurfaces,
@@ -128,6 +131,7 @@ use automonique_store::generation_audit::{
     GenerationAudit, GenerationAuditError, SelfEndKind, Succession, TenureEnding, TenureOpening,
     TenureRecord,
 };
+use automonique_store::provider_journal::ProviderJournal;
 use automonique_store::run_index::{
     RunIndex, RunIndexEntry, RunIndexError, RunIndexRecord, RunSpoolState,
 };
@@ -188,6 +192,9 @@ pub const ADMIN_SOCKET_NAME: &str = concat!("admin", ".sock");
 
 /// Database filename inside the private product state directory.
 pub const DATABASE_NAME: &str = concat!("automonique", ".sqlite3");
+
+/// Durable provider process/session/turn journal and GenAI usage source.
+pub const PROVIDER_JOURNAL_NAME: &str = concat!("provider-journal", ".sqlite3");
 
 /// Run submission custody database, a sibling of [`DATABASE_NAME`].
 ///
@@ -449,6 +456,12 @@ impl DaemonConfig {
     #[must_use]
     pub fn database_path(&self) -> PathBuf {
         self.state_dir().join(DATABASE_NAME)
+    }
+
+    /// Durable provider journal and GenAI usage path.
+    #[must_use]
+    pub fn provider_journal_path(&self) -> PathBuf {
+        self.state_dir().join(PROVIDER_JOURNAL_NAME)
     }
 
     /// Durable run submission custody path.
@@ -1943,6 +1956,30 @@ impl Daemon {
         }
     }
 
+    fn provider_available(&self) -> bool {
+        matches!(
+            self.execution_state,
+            automonique_protocol::admin::ExecutionState::SandboxEnforceableNoLane
+        ) && compose::ProviderConfig::load(&self.state_dir.join(compose::PROVIDER_CONFIG_NAME))
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    fn gen_ai_usage(&self) -> Option<GenAiUsageObservation> {
+        let path = self.state_dir.join(PROVIDER_JOURNAL_NAME);
+        if !path.exists() {
+            return None;
+        }
+        let journal = ProviderJournal::open(path).ok()?;
+        let totals = journal.usage_totals().ok()?;
+        Some(GenAiUsageObservation {
+            requests: totals.requests,
+            input_tokens: totals.input_tokens,
+            output_tokens: totals.output_tokens,
+        })
+    }
+
     fn renew_lease(&mut self) -> Result<(), DaemonError> {
         let now_ms = unix_millis()?;
         let lease = self.store.renew_generation_lease(LeaseRenewal {
@@ -2112,6 +2149,14 @@ impl Daemon {
                         .map_err(|_| DaemonError::ProtocolRefused("operational_projection"))?,
                     None => projection,
                 };
+                let projection = projection
+                    .with_runtime(RuntimeObservation {
+                        daemon_ready: !degraded,
+                        intake_enabled: !degraded && !paused,
+                        provider_available: Some(self.provider_available()),
+                        sandbox_launch_refusals: None,
+                    })
+                    .map_err(|_| DaemonError::ProtocolRefused("operational_projection"))?;
                 let operational = operational_status(&projection)?;
                 // Counted here, beside the projection, and not in it: these are
                 // reads of four other databases, and this daemon opens no
@@ -2141,6 +2186,47 @@ impl Daemon {
                 AdminResponse::Status {
                     request_id: request.request_id().clone(),
                     status,
+                }
+            }
+            automonique_protocol::admin::AdminCommand::Metrics => {
+                let now_ms = unix_millis()?;
+                let snapshot = self.store.status_snapshot_at(GENERATION_ID, now_ms)?;
+                let generation = snapshot.generation().ok_or(StoreError::StaleEpoch)?;
+                if generation.holder_id() != self.instance_id.as_str()
+                    || generation.lease_epoch() != self.lease_epoch
+                    || generation.lease_expires_ms() != self.lease_expires_ms
+                    || generation.lease_expires_ms() <= now_ms
+                {
+                    return Err(DaemonError::Store(StoreError::StaleEpoch));
+                }
+                let degraded = self.reconciliation_run_id.is_some()
+                    || snapshot_requires_reconciliation(&snapshot);
+                let paused = self.store.intake_paused(GENERATION_ID, now_ms)?.is_some();
+                let projection = StoreProjection::from_status(&snapshot)
+                    .map_err(|_| DaemonError::ProtocolRefused("operational_projection"))?;
+                let projection = match self.progress() {
+                    Some(hub) => projection
+                        .with_progress(hub.observation())
+                        .map_err(|_| DaemonError::ProtocolRefused("operational_projection"))?,
+                    None => projection,
+                };
+                let projection = projection
+                    .with_runtime(RuntimeObservation {
+                        daemon_ready: !degraded,
+                        intake_enabled: !degraded && !paused,
+                        provider_available: Some(self.provider_available()),
+                        sandbox_launch_refusals: None,
+                    })
+                    .map_err(|_| DaemonError::ProtocolRefused("operational_projection"))?;
+                let projection = match self.gen_ai_usage() {
+                    Some(observation) => projection
+                        .with_gen_ai_usage(observation)
+                        .map_err(|_| DaemonError::ProtocolRefused("operational_projection"))?,
+                    None => projection,
+                };
+                AdminResponse::Metrics {
+                    request_id: request.request_id().clone(),
+                    exposition: render_exposition(projection.metrics(), env!("CARGO_PKG_VERSION")),
                 }
             }
             automonique_protocol::admin::AdminCommand::SubmitSynthetic => {

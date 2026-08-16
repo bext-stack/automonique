@@ -43,7 +43,7 @@ fn the_schema_versions_this_crate_owns_match_the_compat_matrix_rows() {
         "slack ingress schema moved: update the compat matrix row and this pin"
     );
     assert_eq!(
-        PROVIDER_JOURNAL_SCHEMA_VERSION, 1,
+        PROVIDER_JOURNAL_SCHEMA_VERSION, 2,
         "provider journal schema moved: update the compat matrix row and this pin"
     );
     assert_eq!(
