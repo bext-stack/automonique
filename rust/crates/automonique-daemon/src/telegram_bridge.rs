@@ -111,6 +111,7 @@ use automonique_protocol::digest::Sha256;
 use automonique_protocol::event::EventKind;
 use automonique_protocol::execute_api::CancelRunOutcome;
 use automonique_protocol::progress_api::ProgressFrame;
+use automonique_slack_connector::MessageBlocks;
 use automonique_store::agent_memory::{
     AgentMemoryError, AgentMemoryStore, ConversationScope, ExternalIdentity, MemoryInput,
     MemoryKind, MemoryRecord, MemorySensitivity, MemoryStatus, MemorySupersession,
@@ -2067,6 +2068,27 @@ pub trait RunLane {
     /// watching a chat for it.
     fn set_draft_target(&mut self, chat_id: Option<i64>) {
         let _ = chat_id;
+    }
+
+    /// Name the Slack thread that should receive this lane's next run.
+    fn set_slack_progress_target(&mut self, target: Option<crate::run_lane::SlackProgressTarget>) {
+        let _ = target;
+    }
+
+    /// Stop the current Slack stream with the action's final presentation.
+    /// True means the receipt was delivered by the stream.
+    fn finish_slack_progress(&mut self, text: &str, blocks: Option<MessageBlocks>) -> bool {
+        let _ = (text, blocks);
+        false
+    }
+
+    /// Attach Slack's transport renderer to a lane before its worker starts.
+    fn attach_slack_progress(
+        &mut self,
+        hub: Arc<ProgressHub>,
+        sink: Box<dyn crate::run_lane::SlackProgressSink>,
+    ) {
+        let _ = (hub, sink);
     }
 }
 

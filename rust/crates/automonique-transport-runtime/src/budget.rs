@@ -565,6 +565,165 @@ impl TelegramCallBudget {
     }
 }
 
+// ------------------------------------------------------------- Slack budget
+
+/// Slack methods used by native streaming and its message-edit fallback.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SlackBudgetedMethod {
+    ChatStartStream,
+    ChatAppendStream,
+    ChatStopStream,
+    ChatPostMessage,
+    ChatUpdate,
+}
+
+pub const ALL_SLACK_BUDGETED_METHODS: [SlackBudgetedMethod; 5] = [
+    SlackBudgetedMethod::ChatStartStream,
+    SlackBudgetedMethod::ChatAppendStream,
+    SlackBudgetedMethod::ChatStopStream,
+    SlackBudgetedMethod::ChatPostMessage,
+    SlackBudgetedMethod::ChatUpdate,
+];
+
+impl SlackBudgetedMethod {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatStartStream => "chat.startStream",
+            Self::ChatAppendStream => "chat.appendStream",
+            Self::ChatStopStream => "chat.stopStream",
+            Self::ChatPostMessage => "chat.postMessage",
+            Self::ChatUpdate => "chat.update",
+        }
+    }
+
+    const fn spec(self) -> BucketSpec {
+        match self {
+            // Slack documents start/stop as Tier 2 (20+ per minute), append as
+            // Tier 4 (100+), and message writes as a special tier. The minimum
+            // published values are the conservative values used here.
+            Self::ChatStartStream | Self::ChatStopStream => BucketSpec::exact(20, 60_000),
+            Self::ChatAppendStream => BucketSpec::exact(100, 60_000),
+            Self::ChatPostMessage | Self::ChatUpdate => BucketSpec::exact(60, 60_000),
+        }
+    }
+
+    const fn headroom(self) -> u64 {
+        match self {
+            Self::ChatAppendStream => 20,
+            Self::ChatStartStream | Self::ChatStopStream => 4,
+            Self::ChatPostMessage | Self::ChatUpdate => 10,
+        }
+    }
+
+    const fn is_channel_message(self) -> bool {
+        matches!(self, Self::ChatPostMessage | Self::ChatUpdate)
+    }
+}
+
+const _: () = assert!(BucketSpec::is_exact(20, 60_000));
+const _: () = assert!(BucketSpec::is_exact(100, 60_000));
+const _: () = assert!(BucketSpec::is_exact(60, 60_000));
+
+/// Why an ephemeral Slack call was skipped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SlackBudgetRefusal {
+    Paused { resume_after_ms: i64 },
+    Method,
+    Channel,
+    Untracked,
+}
+
+/// One workspace's per-method Slack budget.
+///
+/// Slack scopes a `429` to the same method in the same workspace. Consequently
+/// pauses live beside method buckets instead of freezing the whole client.
+#[derive(Clone, Debug)]
+pub struct SlackCallBudget {
+    methods: BTreeMap<SlackBudgetedMethod, TokenBucket>,
+    paused_until_ms: BTreeMap<SlackBudgetedMethod, i64>,
+    channels: BTreeMap<String, TokenBucket>,
+}
+
+impl SlackCallBudget {
+    #[must_use]
+    pub fn new(now_ms: i64) -> Self {
+        let methods = ALL_SLACK_BUDGETED_METHODS
+            .into_iter()
+            .map(|method| (method, TokenBucket::full(method.spec(), now_ms)))
+            .collect();
+        Self {
+            methods,
+            paused_until_ms: BTreeMap::new(),
+            channels: BTreeMap::new(),
+        }
+    }
+
+    pub fn note_rate_limited(
+        &mut self,
+        method: SlackBudgetedMethod,
+        retry_after_ms: u64,
+        now_ms: i64,
+    ) -> i64 {
+        let delay = i64::try_from(retry_after_ms)
+            .unwrap_or(MAX_PAUSE_MS)
+            .clamp(1, MAX_PAUSE_MS);
+        let deadline = now_ms.saturating_add(delay);
+        self.paused_until_ms
+            .entry(method)
+            .and_modify(|existing| *existing = (*existing).max(deadline))
+            .or_insert(deadline);
+        self.paused_until_ms[&method]
+    }
+
+    #[must_use]
+    pub fn paused_until(&self, method: SlackBudgetedMethod, now_ms: i64) -> Option<i64> {
+        self.paused_until_ms
+            .get(&method)
+            .copied()
+            .filter(|deadline| *deadline > now_ms)
+    }
+
+    pub fn claim(
+        &mut self,
+        method: SlackBudgetedMethod,
+        channel: Option<&str>,
+        priority: CallPriority,
+        now_ms: i64,
+    ) -> Result<(), SlackBudgetRefusal> {
+        if let Some(resume_after_ms) = self.paused_until(method, now_ms) {
+            return Err(SlackBudgetRefusal::Paused { resume_after_ms });
+        }
+        let bucket = self.methods.get_mut(&method).expect("closed method set");
+        if priority == CallPriority::Ephemeral && !bucket.admits(method.headroom(), now_ms) {
+            return Err(SlackBudgetRefusal::Method);
+        }
+        if method.is_channel_message() {
+            let channel = channel.filter(|value| !value.is_empty());
+            if let Some(channel) = channel {
+                if !self.channels.contains_key(channel) && self.channels.len() >= MAX_TRACKED_CHATS
+                {
+                    self.channels.retain(|_, bucket| !bucket.is_full(now_ms));
+                    if self.channels.len() >= MAX_TRACKED_CHATS {
+                        return Err(SlackBudgetRefusal::Untracked);
+                    }
+                }
+                let channel_bucket = self.channels.entry(channel.to_owned()).or_insert_with(|| {
+                    TokenBucket::full(BucketSpec::exact(CHAT_BURST_CALLS, CHAT_WINDOW_MS), now_ms)
+                });
+                if priority == CallPriority::Ephemeral
+                    && !channel_bucket.admits(CHAT_EPHEMERAL_HEADROOM, now_ms)
+                {
+                    return Err(SlackBudgetRefusal::Channel);
+                }
+                channel_bucket.debit(now_ms);
+            }
+        }
+        bucket.debit(now_ms);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,6 +737,86 @@ mod tests {
 
     fn budget() -> TelegramCallBudget {
         TelegramCallBudget::new(T0)
+    }
+
+    #[test]
+    fn slack_streaming_preserves_method_headroom_for_final_calls() {
+        let mut budget = SlackCallBudget::new(T0);
+        for _ in 0..80 {
+            budget
+                .claim(
+                    SlackBudgetedMethod::ChatAppendStream,
+                    Some("C0RESERVED"),
+                    CallPriority::Ephemeral,
+                    T0,
+                )
+                .expect("tier-four capacity before headroom");
+        }
+        assert_eq!(
+            budget.claim(
+                SlackBudgetedMethod::ChatAppendStream,
+                Some("C0RESERVED"),
+                CallPriority::Ephemeral,
+                T0,
+            ),
+            Err(SlackBudgetRefusal::Method)
+        );
+        budget
+            .claim(
+                SlackBudgetedMethod::ChatStopStream,
+                Some("C0RESERVED"),
+                CallPriority::Durable,
+                T0,
+            )
+            .expect("the final stop is durable");
+    }
+
+    #[test]
+    fn a_slack_retry_after_pauses_only_the_same_method() {
+        let mut budget = SlackCallBudget::new(T0);
+        let deadline = budget.note_rate_limited(SlackBudgetedMethod::ChatAppendStream, 30_000, T0);
+        assert_eq!(deadline, T0 + 30_000);
+        assert_eq!(
+            budget.claim(
+                SlackBudgetedMethod::ChatAppendStream,
+                Some("C0RESERVED"),
+                CallPriority::Ephemeral,
+                T0 + 1,
+            ),
+            Err(SlackBudgetRefusal::Paused {
+                resume_after_ms: deadline
+            })
+        );
+        budget
+            .claim(
+                SlackBudgetedMethod::ChatStopStream,
+                Some("C0RESERVED"),
+                CallPriority::Durable,
+                T0 + 1,
+            )
+            .expect("a different method/workspace window remains available");
+    }
+
+    #[test]
+    fn slack_fallback_edits_share_one_per_channel_bucket() {
+        let mut budget = SlackCallBudget::new(T0);
+        budget
+            .claim(
+                SlackBudgetedMethod::ChatPostMessage,
+                Some("C0RESERVED"),
+                CallPriority::Ephemeral,
+                T0,
+            )
+            .expect("fallback post");
+        budget
+            .claim(
+                SlackBudgetedMethod::ChatUpdate,
+                Some("C0RESERVED"),
+                CallPriority::Ephemeral,
+                T0,
+            )
+            .expect("fallback edit within the bounded burst");
+        assert_eq!(budget.channels.len(), 1);
     }
 
     #[test]

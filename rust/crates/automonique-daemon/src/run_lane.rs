@@ -82,6 +82,7 @@ use automonique_protocol::execute_api::{
     CancelRequestRef, CancelRunOutcome, ExecuteRefusal, ExecuteRequest, ExecuteResponse,
 };
 use automonique_protocol::tools::RunId;
+use automonique_slack_connector::{ChannelId, MessageBlocks, MessageTs};
 use automonique_store::run_index::{RunIndex, RunSpoolState};
 
 use automonique_transport_runtime::{
@@ -171,6 +172,41 @@ pub trait DraftSink: Send {
     /// be drawn is a snapshot the next one replaces. What it does report is
     /// whether anything was sent, which is what a test asserts on.
     fn draft(&mut self, chat_id: i64, snapshot: &str, now_ms: i64) -> bool;
+}
+
+/// The Slack thread that requested one provider-backed action.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlackProgressTarget {
+    pub channel: ChannelId,
+    pub thread_ts: MessageTs,
+}
+
+/// Transport seam for one Slack progress stream.
+pub trait SlackProgressSink: Send {
+    fn begin(&mut self, target: &SlackProgressTarget, now_ms: i64) -> bool;
+    fn progress(
+        &mut self,
+        target: &SlackProgressTarget,
+        frames: &[automonique_protocol::progress_api::ProgressFrame],
+        now_ms: i64,
+    );
+    /// True when the stream delivered the final receipt and no duplicate post
+    /// is needed.
+    fn finish(
+        &mut self,
+        target: &SlackProgressTarget,
+        text: &str,
+        blocks: Option<MessageBlocks>,
+        now_ms: i64,
+    ) -> bool;
+}
+
+struct SlackProgressStream {
+    hub: Arc<ProgressHub>,
+    sink: Box<dyn SlackProgressSink>,
+    target: Option<SlackProgressTarget>,
+    cursor: u64,
+    active: bool,
 }
 
 /// The production draft transport: a budgeted Telegram client with a fallback.
@@ -382,6 +418,8 @@ pub struct SocketRunLane {
     drafts: Option<DraftStream>,
     /// The credential half of streaming, waiting for the budget half.
     pending_transport: Option<DraftTransport>,
+    /// Independently rendered Slack stream for this lane's current action.
+    slack_progress: Option<SlackProgressStream>,
 }
 
 impl SocketRunLane {
@@ -426,6 +464,7 @@ impl SocketRunLane {
             sequence: 0,
             drafts: None,
             pending_transport: None,
+            slack_progress: None,
         })
     }
 
@@ -448,6 +487,16 @@ impl SocketRunLane {
             hub,
             sink,
             target: None,
+        });
+    }
+
+    pub fn with_slack_progress(&mut self, hub: Arc<ProgressHub>, sink: Box<dyn SlackProgressSink>) {
+        self.slack_progress = Some(SlackProgressStream {
+            hub,
+            sink,
+            target: None,
+            cursor: 0,
+            active: false,
         });
     }
 
@@ -644,22 +693,50 @@ impl SocketRunLane {
 
     /// Fold one pass of the live stream and offer the snapshot to the sink.
     fn stream_progress(&mut self, view: &mut RunProgressView, run_id: &str) {
-        let Some(stream) = self.drafts.as_mut() else {
-            return;
-        };
-        let Some(chat_id) = stream.target else {
-            return;
-        };
-        let Some(snapshot) = view.poll(&stream.hub, run_id) else {
-            return;
-        };
         // A clock this process cannot read is a budget it cannot account
         // against, and drawing a draft anyway would be spending an untracked
         // call. Skipping one snapshot costs nothing.
         let Ok(now_ms) = crate::unix_millis() else {
             return;
         };
-        stream.sink.draft(chat_id, &snapshot, now_ms);
+        if let Some(stream) = self.drafts.as_mut()
+            && let Some(chat_id) = stream.target
+            && let Some(snapshot) = view.poll(&stream.hub, run_id)
+        {
+            stream.sink.draft(chat_id, &snapshot, now_ms);
+        }
+        self.stream_slack_progress(run_id, now_ms);
+    }
+
+    fn begin_slack_progress(&mut self) {
+        let Some(stream) = self.slack_progress.as_mut() else {
+            return;
+        };
+        let Some(target) = stream.target.as_ref() else {
+            return;
+        };
+        let Ok(now_ms) = crate::unix_millis() else {
+            return;
+        };
+        stream.cursor = 0;
+        stream.active = stream.sink.begin(target, now_ms);
+    }
+
+    fn stream_slack_progress(&mut self, run_id: &str, now_ms: i64) {
+        let Some(stream) = self.slack_progress.as_mut() else {
+            return;
+        };
+        if !stream.active {
+            return;
+        }
+        let Some(target) = stream.target.as_ref() else {
+            return;
+        };
+        let frames = stream.hub.frames_after(run_id, stream.cursor);
+        if let Some(last) = frames.last() {
+            stream.cursor = last.sequence();
+            stream.sink.progress(target, &frames, now_ms);
+        }
     }
 
     /// Ask the approval lane to record one operator decision.
@@ -822,6 +899,36 @@ impl RunLane for SocketRunLane {
         }
     }
 
+    fn set_slack_progress_target(&mut self, target: Option<SlackProgressTarget>) {
+        if let Some(stream) = self.slack_progress.as_mut() {
+            stream.target = target;
+            stream.cursor = 0;
+            stream.active = false;
+        }
+    }
+
+    fn finish_slack_progress(&mut self, text: &str, blocks: Option<MessageBlocks>) -> bool {
+        let Some(stream) = self.slack_progress.as_mut() else {
+            return false;
+        };
+        if !stream.active {
+            return false;
+        }
+        let Some(target) = stream.target.as_ref() else {
+            return false;
+        };
+        let Ok(now_ms) = crate::unix_millis() else {
+            return false;
+        };
+        let delivered = stream.sink.finish(target, text, blocks, now_ms);
+        stream.active = false;
+        delivered
+    }
+
+    fn attach_slack_progress(&mut self, hub: Arc<ProgressHub>, sink: Box<dyn SlackProgressSink>) {
+        self.with_slack_progress(hub, sink);
+    }
+
     fn question_runtime(&self, profile: QuestionProfile) -> QuestionRuntime {
         if matches!(
             profile,
@@ -906,6 +1013,7 @@ impl SocketRunLane {
     fn execute(&mut self, composition: &Composition) -> Result<String, RunFailure> {
         let submission_id = self.submit(composition)?;
         self.start(composition)?;
+        self.begin_slack_progress();
         // The run identity is the hub's key as well as the cgroup's and the
         // workspace's, which is what lets the wait below draw this run's own
         // frames and nobody else's.

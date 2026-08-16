@@ -13,12 +13,14 @@ use std::sync::{Arc, Mutex};
 use automonique_github_connector::{
     IssueLocator, MAX_ISSUE_BODY_BYTES, MAX_ISSUE_TITLE_BYTES, MAX_MANAGEMENT_OPERATIONS,
 };
+use automonique_slack_connector::MessageBlocks;
 use serde::Deserialize;
 
 use crate::github::{
     GitHubActionSurface, GitHubIssueContext, GitHubManagementInventory, GitHubManagementOperation,
     GitHubMutationReceipt,
 };
+use crate::run_lane::SlackProgressTarget;
 use crate::telegram_bridge::{QuestionProfile, RunLane};
 
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
@@ -89,6 +91,30 @@ where
 {
     pub fn new(lane: Arc<Mutex<L>>, surface: Box<dyn GitHubActionSurface + Send>) -> Self {
         Self { lane, surface }
+    }
+
+    /// Bind the next provider run to the Slack thread that requested it.
+    pub fn set_slack_progress_target(&self, target: Option<SlackProgressTarget>) {
+        if let Ok(mut lane) = self.lane.lock() {
+            lane.set_slack_progress_target(target);
+        }
+    }
+
+    /// Deliver the action receipt through an open Slack stream when one exists.
+    pub fn finish_slack_progress(&self, text: &str, blocks: Option<MessageBlocks>) -> bool {
+        self.lane
+            .lock()
+            .is_ok_and(|mut lane| lane.finish_slack_progress(text, blocks))
+    }
+
+    pub fn attach_slack_progress(
+        &self,
+        hub: Arc<crate::progress_hub::ProgressHub>,
+        sink: Box<dyn crate::run_lane::SlackProgressSink>,
+    ) {
+        if let Ok(mut lane) = self.lane.lock() {
+            lane.attach_slack_progress(hub, sink);
+        }
     }
 
     /// Recognize only an explicit GitHub mutation candidate.

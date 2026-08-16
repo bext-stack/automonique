@@ -2,7 +2,7 @@
 
 //! The synchronous Slack client.
 //!
-//! One origin, six methods, one verb. The client is the composition of
+//! One origin, twelve methods, one verb. The client is the composition of
 //! [`SlackOperation`]'s rendering and the `decode_*` functions around a single
 //! bounded HTTP call — it adds no field to a request and repairs no field in a
 //! response, so everything it can send or accept is already provable without a
@@ -36,14 +36,16 @@ use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::response::{
     decode_ack, decode_auth_test, decode_conversations_history, decode_conversations_info,
-    decode_conversations_list, decode_error_code, decode_post_message, decode_users_info,
+    decode_conversations_list, decode_error_code, decode_post_message, decode_stream_message,
+    decode_users_info,
 };
 use crate::{
-    AuthIdentity, ChannelPage, ConversationsHistoryRequest, ConversationsInfoRequest,
-    ConversationsListRequest, MAX_SLACK_RESPONSE_BYTES, MessagePage, OpenViewRequest,
-    PostMessageRequest, PostedMessage, PublishViewRequest, SLACK_REQUEST_TIMEOUT_SECONDS,
-    SlackBase, SlackChannel, SlackFailure, SlackMethod, SlackOperation, SlackOutcome,
-    SlackRejection, SlackToken, SlackUser, UpdateMessageRequest, UsersInfoRequest,
+    AppendStreamRequest, AuthIdentity, ChannelPage, ConversationsHistoryRequest,
+    ConversationsInfoRequest, ConversationsListRequest, MAX_SLACK_RESPONSE_BYTES, MessagePage,
+    OpenViewRequest, PostMessageRequest, PostedMessage, PublishViewRequest,
+    SLACK_REQUEST_TIMEOUT_SECONDS, SlackBase, SlackChannel, SlackFailure, SlackMethod,
+    SlackOperation, SlackOutcome, SlackRejection, SlackToken, SlackUser, StartStreamRequest,
+    StopStreamRequest, StreamMessage, UpdateMessageRequest, UsersInfoRequest,
 };
 
 /// The media type every request asks for.
@@ -257,6 +259,39 @@ impl SlackClient {
         request: &UpdateMessageRequest,
     ) -> Result<SlackOutcome<()>, SlackFailure> {
         self.call(&SlackOperation::ChatUpdate(request.clone()), decode_ack)
+    }
+
+    /// Start one native assistant stream in a thread.
+    pub fn start_stream(
+        &self,
+        request: &StartStreamRequest,
+    ) -> Result<SlackOutcome<StreamMessage>, SlackFailure> {
+        self.call(
+            &SlackOperation::ChatStartStream(request.clone()),
+            decode_stream_message,
+        )
+    }
+
+    /// Append bounded chunks to one native assistant stream.
+    pub fn append_stream(
+        &self,
+        request: &AppendStreamRequest,
+    ) -> Result<SlackOutcome<StreamMessage>, SlackFailure> {
+        self.call(
+            &SlackOperation::ChatAppendStream(request.clone()),
+            decode_stream_message,
+        )
+    }
+
+    /// Stop one native assistant stream and attach its final presentation.
+    pub fn stop_stream(
+        &self,
+        request: &StopStreamRequest,
+    ) -> Result<SlackOutcome<StreamMessage>, SlackFailure> {
+        self.call(
+            &SlackOperation::ChatStopStream(request.clone()),
+            decode_stream_message,
+        )
     }
 
     /// Open one validated modal for a Slack interaction trigger.

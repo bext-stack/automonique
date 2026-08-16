@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! The six methods, and the exact path and body each renders.
+//! The twelve methods, and the exact path and body each renders.
 //!
 //! [`SlackMethod`] is the second half of the target lock (the first is the
-//! origin in `target`). A path is never a caller string: it is one of six
+//! origin in `target`). A path is never a caller string: it is one of twelve
 //! private constants under a private `/api` prefix, and a layer talked into
 //! asking for `chat.delete` or `admin.conversations.archive` cannot spell one,
 //! because no variant exists.
@@ -54,6 +54,9 @@ const CONVERSATIONS_HISTORY: &str = "conversations.history";
 const USERS_INFO: &str = "users.info";
 const CHAT_POST_MESSAGE: &str = "chat.postMessage";
 const CHAT_UPDATE: &str = "chat.update";
+const CHAT_START_STREAM: &str = "chat.startStream";
+const CHAT_APPEND_STREAM: &str = "chat.appendStream";
+const CHAT_STOP_STREAM: &str = "chat.stopStream";
 const VIEWS_OPEN: &str = "views.open";
 const VIEWS_PUBLISH: &str = "views.publish";
 
@@ -79,10 +82,16 @@ pub enum SlackMethod {
     ConversationsHistory,
     /// `users.info` — resolve one user.
     UsersInfo,
-    /// `chat.postMessage` — post one message. The one external effect.
+    /// `chat.postMessage` — post one message.
     ChatPostMessage,
     /// `chat.update` — replace one existing bot message.
     ChatUpdate,
+    /// `chat.startStream` — start one native assistant stream in a thread.
+    ChatStartStream,
+    /// `chat.appendStream` — append bounded content to one native stream.
+    ChatAppendStream,
+    /// `chat.stopStream` — finish one native stream, optionally with blocks.
+    ChatStopStream,
     /// `views.open` — open one modal for an interaction trigger.
     ViewsOpen,
     /// `views.publish` — publish one App Home view.
@@ -101,6 +110,9 @@ impl SlackMethod {
             Self::UsersInfo => USERS_INFO,
             Self::ChatPostMessage => CHAT_POST_MESSAGE,
             Self::ChatUpdate => CHAT_UPDATE,
+            Self::ChatStartStream => CHAT_START_STREAM,
+            Self::ChatAppendStream => CHAT_APPEND_STREAM,
+            Self::ChatStopStream => CHAT_STOP_STREAM,
             Self::ViewsOpen => VIEWS_OPEN,
             Self::ViewsPublish => VIEWS_PUBLISH,
         }
@@ -334,6 +346,98 @@ impl MessageText {
     }
 
     /// The exact text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Markdown carried by one Slack streaming call.
+///
+/// Slack caps `markdown_text` at 12,000 characters. This byte bound is tighter
+/// for non-ASCII input and keeps request sizing deterministic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamText(String);
+
+/// Largest markdown payload accepted by one streaming call.
+pub const MAX_STREAM_TEXT_BYTES: usize = 12_000;
+
+impl StreamText {
+    pub fn new(value: &str) -> Result<Self, SlackRefusal> {
+        if is_body_text(value, MAX_STREAM_TEXT_BYTES) {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(SlackRefusal::Stream)
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A bounded JSON array of Slack streaming chunks.
+///
+/// Only the two chunk kinds this product emits are admitted: `markdown_text`
+/// and `task_update`. Keeping the JSON typed here prevents progress labels from
+/// becoming request structure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamChunks(String);
+
+impl StreamChunks {
+    pub fn new(json: &str) -> Result<Self, SlackRefusal> {
+        if json.is_empty() || json.len() > MAX_BLOCK_KIT_BYTES {
+            return Err(SlackRefusal::Stream);
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(json).map_err(|_| SlackRefusal::Stream)?;
+        let chunks = value.as_array().ok_or(SlackRefusal::Stream)?;
+        if chunks.is_empty() || chunks.len() > MAX_MESSAGE_BLOCKS {
+            return Err(SlackRefusal::Stream);
+        }
+        for chunk in chunks {
+            let row = chunk.as_object().ok_or(SlackRefusal::Stream)?;
+            let kind = row
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(SlackRefusal::Stream)?;
+            match kind {
+                "markdown_text" => {
+                    let text = row
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(SlackRefusal::Stream)?;
+                    StreamText::new(text)?;
+                }
+                "task_update" => {
+                    let id = row
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(SlackRefusal::Stream)?;
+                    let title = row
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(SlackRefusal::Stream)?;
+                    let status = row
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(SlackRefusal::Stream)?;
+                    if id.is_empty()
+                        || id.len() > 256
+                        || title.is_empty()
+                        || title.len() > 256
+                        || !matches!(status, "pending" | "in_progress" | "complete" | "error")
+                    {
+                        return Err(SlackRefusal::Stream);
+                    }
+                }
+                _ => return Err(SlackRefusal::Stream),
+            }
+        }
+        Ok(Self(json.to_owned()))
+    }
+
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -644,6 +748,128 @@ impl UpdateMessageRequest {
     }
 }
 
+/// Start one native stream as a reply to an existing message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartStreamRequest {
+    channel: ChannelId,
+    thread_ts: MessageTs,
+    markdown_text: Option<StreamText>,
+}
+
+impl StartStreamRequest {
+    #[must_use]
+    pub const fn new(channel: ChannelId, thread_ts: MessageTs) -> Self {
+        Self {
+            channel,
+            thread_ts,
+            markdown_text: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_markdown(mut self, text: StreamText) -> Self {
+        self.markdown_text = Some(text);
+        self
+    }
+
+    #[must_use]
+    pub const fn channel(&self) -> &ChannelId {
+        &self.channel
+    }
+    #[must_use]
+    pub const fn thread_ts(&self) -> &MessageTs {
+        &self.thread_ts
+    }
+    #[must_use]
+    pub const fn markdown_text(&self) -> Option<&StreamText> {
+        self.markdown_text.as_ref()
+    }
+}
+
+/// Append one bounded chunk array to a native stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppendStreamRequest {
+    channel: ChannelId,
+    ts: MessageTs,
+    markdown_text: StreamText,
+    chunks: Option<StreamChunks>,
+}
+
+impl AppendStreamRequest {
+    #[must_use]
+    pub const fn new(channel: ChannelId, ts: MessageTs, markdown_text: StreamText) -> Self {
+        Self {
+            channel,
+            ts,
+            markdown_text,
+            chunks: None,
+        }
+    }
+    #[must_use]
+    pub fn with_chunks(mut self, chunks: StreamChunks) -> Self {
+        self.chunks = Some(chunks);
+        self
+    }
+    #[must_use]
+    pub const fn channel(&self) -> &ChannelId {
+        &self.channel
+    }
+    #[must_use]
+    pub const fn ts(&self) -> &MessageTs {
+        &self.ts
+    }
+    #[must_use]
+    pub const fn markdown_text(&self) -> &StreamText {
+        &self.markdown_text
+    }
+    #[must_use]
+    pub const fn chunks(&self) -> Option<&StreamChunks> {
+        self.chunks.as_ref()
+    }
+}
+
+/// Stop one native stream and attach final accessible content.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StopStreamRequest {
+    channel: ChannelId,
+    ts: MessageTs,
+    markdown_text: StreamText,
+    blocks: Option<MessageBlocks>,
+}
+
+impl StopStreamRequest {
+    #[must_use]
+    pub const fn new(channel: ChannelId, ts: MessageTs, markdown_text: StreamText) -> Self {
+        Self {
+            channel,
+            ts,
+            markdown_text,
+            blocks: None,
+        }
+    }
+    #[must_use]
+    pub fn with_blocks(mut self, blocks: MessageBlocks) -> Self {
+        self.blocks = Some(blocks);
+        self
+    }
+    #[must_use]
+    pub const fn channel(&self) -> &ChannelId {
+        &self.channel
+    }
+    #[must_use]
+    pub const fn ts(&self) -> &MessageTs {
+        &self.ts
+    }
+    #[must_use]
+    pub const fn markdown_text(&self) -> &StreamText {
+        &self.markdown_text
+    }
+    #[must_use]
+    pub const fn blocks(&self) -> Option<&MessageBlocks> {
+        self.blocks.as_ref()
+    }
+}
+
 /// One validated call, ready to be rendered onto the wire.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SlackOperation {
@@ -661,6 +887,12 @@ pub enum SlackOperation {
     ChatPostMessage(PostMessageRequest),
     /// `chat.update`
     ChatUpdate(UpdateMessageRequest),
+    /// `chat.startStream`
+    ChatStartStream(StartStreamRequest),
+    /// `chat.appendStream`
+    ChatAppendStream(AppendStreamRequest),
+    /// `chat.stopStream`
+    ChatStopStream(StopStreamRequest),
     /// `views.open`
     ViewsOpen(OpenViewRequest),
     /// `views.publish`
@@ -679,6 +911,9 @@ impl SlackOperation {
             Self::UsersInfo(_) => SlackMethod::UsersInfo,
             Self::ChatPostMessage(_) => SlackMethod::ChatPostMessage,
             Self::ChatUpdate(_) => SlackMethod::ChatUpdate,
+            Self::ChatStartStream(_) => SlackMethod::ChatStartStream,
+            Self::ChatAppendStream(_) => SlackMethod::ChatAppendStream,
+            Self::ChatStopStream(_) => SlackMethod::ChatStopStream,
             Self::ViewsOpen(_) => SlackMethod::ViewsOpen,
             Self::ViewsPublish(_) => SlackMethod::ViewsPublish,
         }
@@ -695,6 +930,9 @@ impl SlackOperation {
             self,
             Self::ChatPostMessage(_)
                 | Self::ChatUpdate(_)
+                | Self::ChatStartStream(_)
+                | Self::ChatAppendStream(_)
+                | Self::ChatStopStream(_)
                 | Self::ViewsOpen(_)
                 | Self::ViewsPublish(_)
         )
@@ -751,6 +989,29 @@ impl SlackOperation {
                     push_form_field(&mut body, "blocks", blocks.as_str());
                 }
             }
+            Self::ChatStartStream(request) => {
+                push_form_field(&mut body, "channel", request.channel().as_str());
+                push_form_field(&mut body, "thread_ts", request.thread_ts().as_str());
+                if let Some(text) = request.markdown_text() {
+                    push_form_field(&mut body, "markdown_text", text.as_str());
+                }
+            }
+            Self::ChatAppendStream(request) => {
+                push_form_field(&mut body, "channel", request.channel().as_str());
+                push_form_field(&mut body, "ts", request.ts().as_str());
+                push_form_field(&mut body, "markdown_text", request.markdown_text().as_str());
+                if let Some(chunks) = request.chunks() {
+                    push_form_field(&mut body, "chunks", chunks.as_str());
+                }
+            }
+            Self::ChatStopStream(request) => {
+                push_form_field(&mut body, "channel", request.channel().as_str());
+                push_form_field(&mut body, "ts", request.ts().as_str());
+                push_form_field(&mut body, "markdown_text", request.markdown_text().as_str());
+                if let Some(blocks) = request.blocks() {
+                    push_form_field(&mut body, "blocks", blocks.as_str());
+                }
+            }
             Self::ViewsOpen(request) => {
                 push_form_field(&mut body, "trigger_id", request.trigger_id().as_str());
                 push_form_field(&mut body, "view", request.view().as_str());
@@ -792,6 +1053,9 @@ mod tests {
             (SlackMethod::UsersInfo, "/api/users.info"),
             (SlackMethod::ChatPostMessage, "/api/chat.postMessage"),
             (SlackMethod::ChatUpdate, "/api/chat.update"),
+            (SlackMethod::ChatStartStream, "/api/chat.startStream"),
+            (SlackMethod::ChatAppendStream, "/api/chat.appendStream"),
+            (SlackMethod::ChatStopStream, "/api/chat.stopStream"),
             (SlackMethod::ViewsOpen, "/api/views.open"),
             (SlackMethod::ViewsPublish, "/api/views.publish"),
         ] {
@@ -878,6 +1142,50 @@ mod tests {
             "channel=C0RESERVED&ts=1723542000.000100&text=Approval%20required&blocks="
         ));
 
+        let start = SlackOperation::ChatStartStream(
+            StartStreamRequest::new(channel(), MessageTs::new("1723542000.000100").expect("ts"))
+                .with_markdown(StreamText::new("Thinking…").expect("stream text")),
+        );
+        assert_eq!(
+            start.body(),
+            "channel=C0RESERVED&thread_ts=1723542000.000100&markdown_text=Thinking%E2%80%A6"
+        );
+
+        let chunks = StreamChunks::new(
+            r#"[{"type":"task_update","id":"task-1","title":"read_file","status":"in_progress"}]"#,
+        )
+        .expect("chunks");
+        let append = SlackOperation::ChatAppendStream(
+            AppendStreamRequest::new(
+                channel(),
+                MessageTs::new("1723542300.000400").expect("ts"),
+                StreamText::new("read_file in progress").expect("stream text"),
+            )
+            .with_chunks(chunks),
+        );
+        assert!(append.body().starts_with(
+            "channel=C0RESERVED&ts=1723542300.000400&markdown_text=read_file%20in%20progress&chunks=%5B"
+        ));
+
+        let stop = SlackOperation::ChatStopStream(
+            StopStreamRequest::new(
+                channel(),
+                MessageTs::new("1723542300.000400").expect("ts"),
+                StreamText::new("Done").expect("stream text"),
+            )
+            .with_blocks(
+                MessageBlocks::new(
+                    r#"[{"type":"section","text":{"type":"mrkdwn","text":"Done"}}]"#,
+                )
+                .expect("blocks"),
+            ),
+        );
+        assert!(
+            stop.body().starts_with(
+                "channel=C0RESERVED&ts=1723542300.000400&markdown_text=Done&blocks=%5B"
+            )
+        );
+
         let modal = ModalView::new(
             r#"{"type":"modal","title":{"type":"plain_text","text":"Reject"},"blocks":[]}"#,
         )
@@ -913,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn the_one_external_effect_is_marked_apart_from_the_five_reads() {
+    fn every_external_effect_is_marked_apart_from_the_five_reads() {
         let reads = [
             SlackOperation::AuthTest,
             SlackOperation::ConversationsList(
@@ -928,23 +1236,51 @@ mod tests {
         for read in &reads {
             assert!(!read.is_external_effect(), "{read:?} is a read");
         }
-        let write = SlackOperation::ChatPostMessage(PostMessageRequest::new(
-            channel(),
-            MessageText::new("bonjour").expect("text"),
-        ));
-        assert!(write.is_external_effect());
-        assert_eq!(write.method(), SlackMethod::ChatPostMessage);
+        let ts = || MessageTs::new("1723542300.000400").expect("ts");
+        let writes = vec![
+            SlackOperation::ChatPostMessage(PostMessageRequest::new(
+                channel(),
+                MessageText::new("bonjour").expect("text"),
+            )),
+            SlackOperation::ChatUpdate(UpdateMessageRequest::new(
+                channel(),
+                ts(),
+                MessageText::new("bonjour").expect("text"),
+            )),
+            SlackOperation::ChatStartStream(StartStreamRequest::new(channel(), ts())),
+            SlackOperation::ChatAppendStream(AppendStreamRequest::new(
+                channel(),
+                ts(),
+                StreamText::new("progress").expect("stream text"),
+            )),
+            SlackOperation::ChatStopStream(StopStreamRequest::new(
+                channel(),
+                ts(),
+                StreamText::new("done").expect("stream text"),
+            )),
+            SlackOperation::ViewsOpen(OpenViewRequest::new(
+                TriggerId::new("1337.abc").expect("trigger"),
+                ModalView::new(r#"{"type":"modal","blocks":[]}"#).expect("modal"),
+            )),
+            SlackOperation::ViewsPublish(PublishViewRequest::new(
+                UserId::new(USER).expect("user"),
+                HomeView::new(r#"{"type":"home","blocks":[]}"#).expect("home"),
+            )),
+        ];
+        for write in &writes {
+            assert!(write.is_external_effect(), "{write:?} is an effect");
+        }
 
         // Every operation names its own method, and no two share one.
         let mut methods: Vec<SlackMethod> = reads
             .iter()
             .map(SlackOperation::method)
-            .chain([write.method()])
+            .chain(writes.iter().map(SlackOperation::method))
             .collect();
         methods.sort_unstable();
         let total = methods.len();
         methods.dedup();
-        assert_eq!(methods.len(), total, "six operations, six methods");
+        assert_eq!(methods.len(), total, "twelve operations, twelve methods");
     }
 
     #[test]

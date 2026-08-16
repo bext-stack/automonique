@@ -27,10 +27,11 @@ mod store_sink;
 mod telegram_control;
 
 pub use budget::{
-    ALL_BUDGET_REFUSALS, ALL_BUDGETED_METHODS, ALL_CALL_PRIORITIES, BucketSpec, BudgetRefusal,
-    BudgetedMethod, CHAT_BURST_CALLS, CHAT_EPHEMERAL_HEADROOM, CallPriority, GLOBAL_CALLS,
-    GLOBAL_EPHEMERAL_HEADROOM, GROUP_CALLS, GROUP_EPHEMERAL_HEADROOM, MAX_PAUSE_MS,
-    MAX_TRACKED_CHATS, TOKEN_SCALE, TelegramCallBudget, TokenBucket,
+    ALL_BUDGET_REFUSALS, ALL_BUDGETED_METHODS, ALL_CALL_PRIORITIES, ALL_SLACK_BUDGETED_METHODS,
+    BucketSpec, BudgetRefusal, BudgetedMethod, CHAT_BURST_CALLS, CHAT_EPHEMERAL_HEADROOM,
+    CallPriority, GLOBAL_CALLS, GLOBAL_EPHEMERAL_HEADROOM, GROUP_CALLS, GROUP_EPHEMERAL_HEADROOM,
+    MAX_PAUSE_MS, MAX_TRACKED_CHATS, SlackBudgetRefusal, SlackBudgetedMethod, SlackCallBudget,
+    TOKEN_SCALE, TelegramCallBudget, TokenBucket,
 };
 pub use https_client::{
     AnswerCallbackQueryRequest, ApprovalKeyboard, EditMessageReplyMarkupRequest,

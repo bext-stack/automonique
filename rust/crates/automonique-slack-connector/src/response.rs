@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Bounded, refusing decoders for the six bot-token methods and Socket Mode
+//! Bounded, refusing decoders for the twelve bot-token methods and Socket Mode
 //! bootstrap.
 //!
 //! Each decoder takes the accepted response bytes and returns either the
@@ -226,6 +226,13 @@ pub struct PostedMessage {
     pub message: SlackMessage,
 }
 
+/// Coordinates Slack assigns to one native assistant stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamMessage {
+    pub channel: ChannelId,
+    pub ts: MessageTs,
+}
+
 /// Decode `auth.test`.
 ///
 /// # Errors
@@ -401,6 +408,19 @@ pub fn decode_post_message(bytes: &[u8]) -> Result<SlackOutcome<PostedMessage>, 
             .map_err(|_| SlackFailure::FieldOutOfBounds)?,
         ts: timestamp(&object, "ts")?,
         message: message(row)?,
+    }))
+}
+
+/// Decode the coordinates returned by each native streaming method.
+pub fn decode_stream_message(bytes: &[u8]) -> Result<SlackOutcome<StreamMessage>, SlackFailure> {
+    let object = match envelope(bytes)? {
+        Envelope::Accepted(object) => object,
+        Envelope::Rejected(rejection) => return Ok(SlackOutcome::Rejected(rejection)),
+    };
+    Ok(SlackOutcome::Accepted(StreamMessage {
+        channel: ChannelId::new(&nonempty(&object, "channel", MAX_NAME_BYTES)?)
+            .map_err(|_| SlackFailure::FieldOutOfBounds)?,
+        ts: timestamp(&object, "ts")?,
     }))
 }
 

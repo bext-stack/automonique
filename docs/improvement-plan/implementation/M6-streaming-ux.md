@@ -177,7 +177,8 @@ retry_after of added inbound latency.
 ### Issue #38 — Slack native streaming with thinking-steps task cards
 **Approach.** Connector: extend `SlackMethod` with `ChatStartStream`,
 `ChatAppendStream`, `ChatStopStream` plus validated request types (start:
-channel + thread coords; append: handle + bounded markdown; stop: handle +
+channel + thread timestamp; append: channel + stream timestamp + bounded
+markdown/chunks; stop: channel + stream timestamp +
 optional `MessageBlocks`, reusing the existing 32 KiB/50-block Block Kit
 validation so rich formatting exists only at stop) and response decoders for the
 stream handle. Budgeter: extract the generic token-bucket core from #37's
@@ -185,8 +186,8 @@ stream handle. Budgeter: extract the generic token-bucket core from #37's
 new crate) and instantiate a `SlackCallBudget` with tiered per-method limits and
 central `Retry-After` honoring (the connector already surfaces
 `retry_after_seconds`; today merely reported). Renderer: in `daemon/src/slack.rs`
-consume #36 frames — ToolCall*/Subagent* frames with StepStatus become appended
-thinking-steps task-card markdown (one line per transition, timeline order),
+consume #36 frames — ToolCall*/Subagent* frames with StepStatus become native
+`task_update` chunks (one transition at a time, timeline order),
 coalesced preview text becomes appendStream chunks, and the final answer lands as
 Block Kit in stopStream only. Fallback: when the triple is rejected
 (`unknown_method`/feature-gated), latch per-boot and fall back to

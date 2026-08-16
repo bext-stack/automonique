@@ -69,23 +69,26 @@
 //! them in return is honesty about the outcome — see [`SlackWorkspace::post`] on
 //! why a transport failure is reported as "unknown" and never as "not posted".
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use automonique_protocol::event::EventKind;
 use automonique_protocol::progress_api::ProgressFrame;
 use automonique_slack_connector::{
-    AppsConnectionsOpenClient, ChannelId, ConversationsHistoryRequest, HomeView, MAX_PAGE_LIMIT,
-    MessageBlocks, MessagePage, MessageText, MessageTs, ModalView, OpenViewRequest,
-    PostMessageRequest, PublishViewRequest, SlackAppToken, SlackBase, SlackClient, SlackErrorKind,
-    SlackFailure, SlackMessage, SlackOutcome, SlackRejection, SlackSocketModeConnector, SlackToken,
-    SlackUser, TriggerId, UserId, UsersInfoRequest,
+    AppendStreamRequest, AppsConnectionsOpenClient, ChannelId, ConversationsHistoryRequest,
+    HomeView, MAX_PAGE_LIMIT, MessageBlocks, MessagePage, MessageText, MessageTs, ModalView,
+    OpenViewRequest, PostMessageRequest, PublishViewRequest, SlackAppToken, SlackBase, SlackClient,
+    SlackErrorKind, SlackFailure, SlackMessage, SlackOutcome, SlackRejection,
+    SlackSocketModeConnector, SlackToken, SlackUser, StartStreamRequest, StopStreamRequest,
+    StreamChunks, StreamMessage, StreamText, TriggerId, UpdateMessageRequest, UserId,
+    UsersInfoRequest,
 };
 use automonique_store::agent_memory::{
     AgentMemoryStore, ConversationScope, ExternalIdentity, MessageInput, redact_content,
@@ -97,7 +100,8 @@ use automonique_store::slack_interactions::{
 };
 use automonique_support_connector::{TicketDecision, TicketDecisionOutcome};
 use automonique_transport_runtime::{
-    ChannelName, GitHubChecklistItem, GitHubIssueUrl, GitHubRepoAlias, GitHubRequest,
+    CallPriority, ChannelName, GitHubChecklistItem, GitHubIssueUrl, GitHubRepoAlias, GitHubRequest,
+    SlackBudgetedMethod, SlackCallBudget,
 };
 use automonique_transports::{
     SlackAccessPolicy, SlackAppId, SlackDisposition, SlackInputKind, SlackPrincipal,
@@ -109,7 +113,7 @@ use crate::github_actions::{
 };
 use crate::manage_config::ManageUrl;
 use crate::progress_hub::ProgressHub;
-use crate::run_lane::SocketRunLane;
+use crate::run_lane::{SlackProgressSink, SlackProgressTarget, SocketRunLane};
 use crate::telegram_bridge::{
     ApprovalDecisionAnswer, ApprovalDecisionFailure, RunLane as _, SlackSurface,
 };
@@ -1630,7 +1634,7 @@ pub(crate) trait SlackTicketPoster {
     }
 }
 
-impl SlackTicketPoster for SlackClient {
+impl SlackTicketPoster for Arc<SlackClient> {
     fn post_thread(
         &mut self,
         channel: &ChannelId,
@@ -1639,7 +1643,7 @@ impl SlackTicketPoster for SlackClient {
     ) -> Result<(), ()> {
         let text = MessageText::new(text).map_err(|_| ())?;
         let request = PostMessageRequest::new(channel.clone(), text).in_thread(parent.clone());
-        match SlackClient::post_message(self, &request).map_err(|_| ())? {
+        match SlackClient::post_message(self.as_ref(), &request).map_err(|_| ())? {
             SlackOutcome::Accepted(_) => Ok(()),
             SlackOutcome::Rejected(_) => Err(()),
         }
@@ -1648,7 +1652,7 @@ impl SlackTicketPoster for SlackClient {
     fn post_channel(&mut self, channel: &ChannelId, text: &str) -> Result<(), ()> {
         let text = MessageText::new(text).map_err(|_| ())?;
         let request = PostMessageRequest::new(channel.clone(), text);
-        match SlackClient::post_message(self, &request).map_err(|_| ())? {
+        match SlackClient::post_message(self.as_ref(), &request).map_err(|_| ())? {
             SlackOutcome::Accepted(_) => Ok(()),
             SlackOutcome::Rejected(_) => Err(()),
         }
@@ -1689,7 +1693,7 @@ impl SlackTicketPoster for SlackClient {
         )
         .in_thread(parent.clone())
         .with_blocks(blocks);
-        match SlackClient::post_message(self, &request).map_err(|_| ())? {
+        match SlackClient::post_message(self.as_ref(), &request).map_err(|_| ())? {
             SlackOutcome::Accepted(_) => Ok(()),
             SlackOutcome::Rejected(_) => Err(()),
         }
@@ -1720,7 +1724,7 @@ impl SlackTicketPoster for SlackClient {
             TriggerId::new(trigger_id).map_err(|_| ())?,
             ModalView::new(&view.to_string()).map_err(|_| ())?,
         );
-        match SlackClient::open_view(self, &request).map_err(|_| ())? {
+        match SlackClient::open_view(self.as_ref(), &request).map_err(|_| ())? {
             SlackOutcome::Accepted(()) => Ok(()),
             SlackOutcome::Rejected(_) => Err(()),
         }
@@ -1747,7 +1751,7 @@ impl SlackTicketPoster for SlackClient {
             MessageText::new(&fallback).map_err(|_| ())?,
         )
         .with_blocks(blocks);
-        match SlackClient::post_message(self, &request).map_err(|_| ())? {
+        match SlackClient::post_message(self.as_ref(), &request).map_err(|_| ())? {
             SlackOutcome::Accepted(_) => Ok(()),
             SlackOutcome::Rejected(_) => Err(()),
         }
@@ -1770,7 +1774,7 @@ impl SlackTicketPoster for SlackClient {
             MessageText::new(text).map_err(|_| ())?,
         )
         .with_blocks(blocks);
-        match SlackClient::update_message(self, &request).map_err(|_| ())? {
+        match SlackClient::update_message(self.as_ref(), &request).map_err(|_| ())? {
             SlackOutcome::Accepted(()) => Ok(()),
             SlackOutcome::Rejected(_) => Err(()),
         }
@@ -1794,7 +1798,7 @@ impl SlackTicketPoster for SlackClient {
         let view = HomeView::new(&serde_json::json!({"type":"home","blocks":blocks}).to_string())
             .map_err(|_| ())?;
         let request = PublishViewRequest::new(user.clone(), view);
-        match SlackClient::publish_view(self, &request).map_err(|_| ())? {
+        match SlackClient::publish_view(self.as_ref(), &request).map_err(|_| ())? {
             SlackOutcome::Accepted(()) => Ok(()),
             SlackOutcome::Rejected(_) => Err(()),
         }
@@ -2549,14 +2553,36 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             {
                 match actions.natural_request(trimmed) {
                     Ok(Some(request)) => {
+                        let target = crate::run_lane::SlackProgressTarget {
+                            channel: event.channel.clone(),
+                            thread_ts: event.parent.clone(),
+                        };
+                        self.github_actions
+                            .as_ref()
+                            .expect("GitHub action surface checked above")
+                            .set_slack_progress_target(Some(target));
                         let result = self
                             .github_actions
                             .as_mut()
                             .expect("GitHub action surface checked above")
                             .execute(&event.source_key, request, context);
-                        let _ =
-                            self.poster
-                                .post_thread(&event.channel, &event.parent, &result.text);
+                        let blocks = slack_result_blocks(&result.text);
+                        let streamed = self
+                            .github_actions
+                            .as_ref()
+                            .expect("GitHub action surface checked above")
+                            .finish_slack_progress(&result.text, blocks);
+                        self.github_actions
+                            .as_ref()
+                            .expect("GitHub action surface checked above")
+                            .set_slack_progress_target(None);
+                        if !streamed {
+                            let _ = self.poster.post_thread(
+                                &event.channel,
+                                &event.parent,
+                                &result.text,
+                            );
+                        }
                         return;
                     }
                     Ok(None) => {}
@@ -2712,6 +2738,14 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
     }
 }
 
+fn slack_result_blocks(text: &str) -> Option<MessageBlocks> {
+    let value = serde_json::json!([{
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": text}
+    }]);
+    MessageBlocks::new(&value.to_string()).ok()
+}
+
 /// Replay one Slack golden trace against the real router.
 ///
 /// Builds the production [`SlackTicketRouter`] — not a stand-in for it — with
@@ -2800,7 +2834,7 @@ pub(crate) fn replay_slack_trace(
 pub(crate) struct SlackTicketWorker {
     app: AppsConnectionsOpenClient,
     connector: SlackSocketModeConnector,
-    router: SlackTicketRouter<SlackClient>,
+    router: SlackTicketRouter<Arc<SlackClient>>,
     memory: AgentMemoryStore,
     interactions: SlackInteractionStore,
     /// The reference engine's half of the parity comparison.
@@ -2931,6 +2965,7 @@ impl SlackTicketHost {
             None => None,
         };
         let legacy = legacy_observation(state_dir)?;
+        let client = Arc::new(SlackClient::new(SlackBase::production(), token));
         Ok(Self::Configured {
             prepared: Some(Box::new(SlackTicketWorker {
                 legacy,
@@ -2943,7 +2978,7 @@ impl SlackTicketHost {
                 )
                 .map_err(|_| SlackConfigError::TicketActionsUnavailable)?,
                 router: SlackTicketRouter {
-                    poster: SlackClient::new(SlackBase::production(), token),
+                    poster: client,
                     manage: Box::new(manage),
                     manage_url,
                     memory_tenant,
@@ -2966,6 +3001,23 @@ impl SlackTicketHost {
             worker: None,
             approvals_enabled,
         })
+    }
+
+    /// Attach the execution lane's live progress before Socket Mode starts.
+    pub(crate) fn attach_progress(&mut self, hub: Arc<ProgressHub>) {
+        let Self::Configured { prepared, .. } = self else {
+            return;
+        };
+        let Some(worker) = prepared.as_mut() else {
+            return;
+        };
+        let Some(actions) = worker.router.github_actions.as_ref() else {
+            return;
+        };
+        let now_ms = crate::unix_millis().unwrap_or_default();
+        let budget = Arc::new(Mutex::new(SlackCallBudget::new(now_ms)));
+        let sink = SlackStreamSink::new(Arc::clone(&worker.router.poster), budget);
+        actions.attach_slack_progress(hub, Box::new(sink));
     }
 
     /// Whether a Slack operator could decide an approval right now.
@@ -3399,6 +3451,17 @@ fn repair(rejection: &SlackRejection, name: &ChannelName) -> String {
 /// rather than a wall.
 pub const MAX_TASK_CARD_LINES: usize = 16;
 
+/// One native Slack stream chunk rendered from normalized progress.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TaskCardChunk {
+    Markdown(String),
+    Task {
+        id: String,
+        title: String,
+        status: &'static str,
+    },
+}
+
 /// One Slack thread's view of a run in progress, folded from the same frames.
 ///
 /// # Why this is a different fold from Telegram's
@@ -3409,20 +3472,13 @@ pub const MAX_TASK_CARD_LINES: usize = 16;
 /// last drain and never repeats one. Sharing a fold between them would have
 /// forced one of the two to redraw what its reader had already seen.
 ///
-/// # What this is not
-///
-/// Not the transport. Nothing here opens a stream, appends to one, or builds
-/// Block Kit. The three native stream calls, the fallback for a workspace whose
-/// app class lacks them, and the rule that rich formatting exists only at the
-/// end are a separate change; this is the seam it will render through and an
-/// in-process consumer ([`Self::poll`]) that proves the fold runs against a live
-/// hub.
 #[derive(Clone, Debug, Default)]
 pub struct RunTaskCard {
     cursor: u64,
     /// The last assistant text emitted, so an unchanged snapshot is not
     /// appended a second time.
     last_text: Option<String>,
+    task_ids: BTreeMap<String, String>,
 }
 
 impl RunTaskCard {
@@ -3443,22 +3499,40 @@ impl RunTaskCard {
     /// Empty means there is nothing a reader has not already seen, which is a
     /// reason to append nothing rather than to append an empty chunk.
     pub fn absorb(&mut self, frames: &[ProgressFrame]) -> Vec<String> {
-        let mut lines = Vec::new();
+        self.absorb_chunks(frames)
+            .into_iter()
+            .map(|chunk| match chunk {
+                TaskCardChunk::Markdown(text) => text,
+                TaskCardChunk::Task { title, status, .. } => {
+                    let display = if status == "complete" {
+                        "completed"
+                    } else {
+                        status
+                    };
+                    format!("• {title} _{display}_")
+                }
+            })
+            .collect()
+    }
+
+    /// Fold frames into Slack's typed markdown and task-update chunks.
+    pub fn absorb_chunks(&mut self, frames: &[ProgressFrame]) -> Vec<TaskCardChunk> {
+        let mut chunks = Vec::new();
         for frame in frames {
             if frame.sequence() <= self.cursor {
                 continue;
             }
             self.cursor = frame.sequence();
-            if let Some(line) = self.line_for(frame) {
-                lines.push(line);
+            if let Some(chunk) = self.chunk_for(frame) {
+                chunks.push(chunk);
             }
         }
         // Oldest first, and the newest kept: a chunk that had to be cut is
         // better cut at the end a reader has already scrolled past.
-        while lines.len() > MAX_TASK_CARD_LINES {
-            lines.remove(0);
+        while chunks.len() > MAX_TASK_CARD_LINES {
+            chunks.remove(0);
         }
-        lines
+        chunks
     }
 
     /// Fold whatever a live hub has retained past this card's cursor.
@@ -3467,7 +3541,7 @@ impl RunTaskCard {
         self.absorb(&frames)
     }
 
-    fn line_for(&mut self, frame: &ProgressFrame) -> Option<String> {
+    fn chunk_for(&mut self, frame: &ProgressFrame) -> Option<TaskCardChunk> {
         let text = frame.body().text().map(|text| text.as_str().to_owned());
         match frame.kind() {
             EventKind::AssistantMessageDelta | EventKind::AssistantMessageCompleted => {
@@ -3479,21 +3553,429 @@ impl RunTaskCard {
                     return None;
                 }
                 self.last_text = Some(text.clone());
-                Some(text)
+                Some(TaskCardChunk::Markdown(text))
             }
-            EventKind::ProviderWarning | EventKind::ProviderFault => Some(format!(
-                ":warning: {}",
-                text.unwrap_or_else(|| frame.kind().as_str().to_owned())
-            )),
+            EventKind::ProviderWarning | EventKind::ProviderFault => {
+                Some(TaskCardChunk::Markdown(format!(
+                    ":warning: {}",
+                    text.unwrap_or_else(|| frame.kind().as_str().to_owned())
+                )))
+            }
             // The thinking step, drawn from the status the frame carries rather
             // than from which kind arrived.
             kind => {
                 let status = frame.body().step()?;
                 let label = text.unwrap_or_else(|| kind.as_str().to_owned());
-                Some(format!("• {label} _{}_", status.as_str()))
+                let label = if label.len() > 256 {
+                    bounded_field(&label, 253)
+                } else {
+                    label
+                };
+                let id = self
+                    .task_ids
+                    .entry(label.clone())
+                    .or_insert_with(|| format!("task-{}", frame.sequence()))
+                    .clone();
+                let status = match status.as_str() {
+                    "completed" => "complete",
+                    other => other,
+                };
+                Some(TaskCardChunk::Task {
+                    id,
+                    title: label,
+                    status,
+                })
             }
         }
     }
+}
+
+enum ActiveSlackProgress {
+    None,
+    Native { channel: ChannelId, ts: MessageTs },
+    Fallback { channel: ChannelId, ts: MessageTs },
+}
+
+trait SlackStreamApi: Send + Sync {
+    fn start(
+        &self,
+        request: &StartStreamRequest,
+    ) -> Result<SlackOutcome<StreamMessage>, SlackFailure>;
+    fn append(
+        &self,
+        request: &AppendStreamRequest,
+    ) -> Result<SlackOutcome<StreamMessage>, SlackFailure>;
+    fn stop(
+        &self,
+        request: &StopStreamRequest,
+    ) -> Result<SlackOutcome<StreamMessage>, SlackFailure>;
+    fn post(
+        &self,
+        request: &PostMessageRequest,
+    ) -> Result<SlackOutcome<StreamMessage>, SlackFailure>;
+    fn update(&self, request: &UpdateMessageRequest) -> Result<SlackOutcome<()>, SlackFailure>;
+}
+
+impl SlackStreamApi for SlackClient {
+    fn start(
+        &self,
+        request: &StartStreamRequest,
+    ) -> Result<SlackOutcome<StreamMessage>, SlackFailure> {
+        self.start_stream(request)
+    }
+
+    fn append(
+        &self,
+        request: &AppendStreamRequest,
+    ) -> Result<SlackOutcome<StreamMessage>, SlackFailure> {
+        self.append_stream(request)
+    }
+
+    fn stop(
+        &self,
+        request: &StopStreamRequest,
+    ) -> Result<SlackOutcome<StreamMessage>, SlackFailure> {
+        self.stop_stream(request)
+    }
+
+    fn post(
+        &self,
+        request: &PostMessageRequest,
+    ) -> Result<SlackOutcome<StreamMessage>, SlackFailure> {
+        Ok(match self.post_message(request)? {
+            SlackOutcome::Accepted(message) => SlackOutcome::Accepted(StreamMessage {
+                channel: message.channel,
+                ts: message.ts,
+            }),
+            SlackOutcome::Rejected(rejection) => SlackOutcome::Rejected(rejection),
+        })
+    }
+
+    fn update(&self, request: &UpdateMessageRequest) -> Result<SlackOutcome<()>, SlackFailure> {
+        self.update_message(request)
+    }
+}
+
+/// Native Slack streaming with one process-lifetime fallback latch.
+pub struct SlackStreamSink {
+    client: Arc<dyn SlackStreamApi>,
+    budget: Arc<Mutex<SlackCallBudget>>,
+    unsupported: bool,
+    active: ActiveSlackProgress,
+    card: RunTaskCard,
+    fallback_text: String,
+    last_fallback_edit_ms: Option<i64>,
+}
+
+impl SlackStreamSink {
+    #[must_use]
+    pub fn new(client: Arc<SlackClient>, budget: Arc<Mutex<SlackCallBudget>>) -> Self {
+        Self::with_api(client, budget)
+    }
+
+    fn with_api(client: Arc<dyn SlackStreamApi>, budget: Arc<Mutex<SlackCallBudget>>) -> Self {
+        Self {
+            client,
+            budget,
+            unsupported: false,
+            active: ActiveSlackProgress::None,
+            card: RunTaskCard::new(),
+            fallback_text: String::new(),
+            last_fallback_edit_ms: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn streaming_unsupported(&self) -> bool {
+        self.unsupported
+    }
+
+    fn claim(
+        &self,
+        method: SlackBudgetedMethod,
+        channel: &ChannelId,
+        priority: CallPriority,
+        now_ms: i64,
+    ) -> bool {
+        self.budget.lock().ok().is_some_and(|mut budget| {
+            budget
+                .claim(method, Some(channel.as_str()), priority, now_ms)
+                .is_ok()
+        })
+    }
+
+    fn note_rejection(&self, method: SlackBudgetedMethod, rejection: &SlackRejection, now_ms: i64) {
+        if rejection.kind() != SlackErrorKind::RateLimited {
+            return;
+        }
+        let retry_ms = u64::from(rejection.retry_after_seconds().unwrap_or(1)) * 1_000;
+        if let Ok(mut budget) = self.budget.lock() {
+            budget.note_rate_limited(method, retry_ms, now_ms);
+        }
+    }
+
+    fn fallback_begin(&mut self, target: &SlackProgressTarget, now_ms: i64) -> bool {
+        if !self.claim(
+            SlackBudgetedMethod::ChatPostMessage,
+            &target.channel,
+            CallPriority::Ephemeral,
+            now_ms,
+        ) {
+            return false;
+        }
+        let Ok(text) = MessageText::new("Thinking…") else {
+            return false;
+        };
+        let request = PostMessageRequest::new(target.channel.clone(), text)
+            .in_thread(target.thread_ts.clone());
+        match self.client.post(&request) {
+            Ok(SlackOutcome::Accepted(message)) => {
+                self.active = ActiveSlackProgress::Fallback {
+                    channel: message.channel,
+                    ts: message.ts,
+                };
+                self.fallback_text = String::from("Thinking…");
+                self.last_fallback_edit_ms = Some(now_ms);
+                true
+            }
+            Ok(SlackOutcome::Rejected(rejection)) => {
+                self.note_rejection(SlackBudgetedMethod::ChatPostMessage, &rejection, now_ms);
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn append_native(&mut self, chunks: Vec<TaskCardChunk>, now_ms: i64) {
+        let ActiveSlackProgress::Native { channel, ts } = &self.active else {
+            return;
+        };
+        let mut retained = chunks;
+        let (markdown, chunks) = loop {
+            let markdown = retained
+                .iter()
+                .map(|chunk| match chunk {
+                    TaskCardChunk::Markdown(text) => text.clone(),
+                    TaskCardChunk::Task { title, status, .. } => {
+                        format!("• {title} _{status}_")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let values: Vec<serde_json::Value> = retained
+                .iter()
+                .map(|chunk| match chunk {
+                    TaskCardChunk::Markdown(text) => {
+                        serde_json::json!({"type":"markdown_text","text":text})
+                    }
+                    TaskCardChunk::Task { id, title, status } => serde_json::json!({
+                        "type":"task_update", "id":id, "title":title, "status":status
+                    }),
+                })
+                .collect();
+            if let (Ok(markdown), Ok(chunks)) = (
+                StreamText::new(&markdown),
+                StreamChunks::new(&serde_json::Value::Array(values).to_string()),
+            ) {
+                break (markdown, chunks);
+            }
+            if retained.len() <= 1 {
+                return;
+            }
+            retained.remove(0);
+        };
+        let channel = channel.clone();
+        let ts = ts.clone();
+        if !self.claim(
+            SlackBudgetedMethod::ChatAppendStream,
+            &channel,
+            CallPriority::Ephemeral,
+            now_ms,
+        ) {
+            return;
+        }
+        let request = AppendStreamRequest::new(channel, ts, markdown).with_chunks(chunks);
+        if let Ok(SlackOutcome::Rejected(rejection)) = self.client.append(&request) {
+            self.note_rejection(SlackBudgetedMethod::ChatAppendStream, &rejection, now_ms);
+        }
+    }
+
+    fn append_fallback(&mut self, chunks: Vec<TaskCardChunk>, now_ms: i64) {
+        let ActiveSlackProgress::Fallback { channel, ts } = &self.active else {
+            return;
+        };
+        for chunk in chunks {
+            let line = match chunk {
+                TaskCardChunk::Markdown(text) => text,
+                TaskCardChunk::Task { title, status, .. } => format!("• {title} _{status}_"),
+            };
+            if self.fallback_text.len() + line.len()
+                < automonique_slack_connector::MAX_MESSAGE_TEXT_BYTES
+            {
+                self.fallback_text.push('\n');
+                self.fallback_text.push_str(&line);
+            }
+        }
+        if self.last_fallback_edit_ms.is_some_and(|last| {
+            now_ms.saturating_sub(last) < crate::run_lane::FALLBACK_EDIT_INTERVAL_MS
+        }) {
+            return;
+        }
+        let channel = channel.clone();
+        let ts = ts.clone();
+        if !self.claim(
+            SlackBudgetedMethod::ChatUpdate,
+            &channel,
+            CallPriority::Ephemeral,
+            now_ms,
+        ) {
+            return;
+        }
+        let Ok(text) = MessageText::new(&self.fallback_text) else {
+            return;
+        };
+        let request = UpdateMessageRequest::new(channel, ts, text);
+        match self.client.update(&request) {
+            Ok(SlackOutcome::Accepted(())) => self.last_fallback_edit_ms = Some(now_ms),
+            Ok(SlackOutcome::Rejected(rejection)) => {
+                self.note_rejection(SlackBudgetedMethod::ChatUpdate, &rejection, now_ms);
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+impl SlackProgressSink for SlackStreamSink {
+    fn begin(&mut self, target: &SlackProgressTarget, now_ms: i64) -> bool {
+        self.active = ActiveSlackProgress::None;
+        self.card = RunTaskCard::new();
+        self.fallback_text.clear();
+        self.last_fallback_edit_ms = None;
+        if self.unsupported {
+            return self.fallback_begin(target, now_ms);
+        }
+        if !self.claim(
+            SlackBudgetedMethod::ChatStartStream,
+            &target.channel,
+            CallPriority::Ephemeral,
+            now_ms,
+        ) {
+            return false;
+        }
+        let request = StartStreamRequest::new(target.channel.clone(), target.thread_ts.clone())
+            .with_markdown(StreamText::new("Thinking…").expect("fixed stream text"));
+        match self.client.start(&request) {
+            Ok(SlackOutcome::Accepted(message)) => {
+                self.active = ActiveSlackProgress::Native {
+                    channel: message.channel,
+                    ts: message.ts,
+                };
+                true
+            }
+            Ok(SlackOutcome::Rejected(rejection)) => {
+                self.note_rejection(SlackBudgetedMethod::ChatStartStream, &rejection, now_ms);
+                if streaming_is_unsupported(&rejection) {
+                    self.unsupported = true;
+                    self.fallback_begin(target, now_ms)
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn progress(&mut self, _target: &SlackProgressTarget, frames: &[ProgressFrame], now_ms: i64) {
+        let chunks = self.card.absorb_chunks(frames);
+        if chunks.is_empty() {
+            return;
+        }
+        match self.active {
+            ActiveSlackProgress::Native { .. } => self.append_native(chunks, now_ms),
+            ActiveSlackProgress::Fallback { .. } => self.append_fallback(chunks, now_ms),
+            ActiveSlackProgress::None => {}
+        }
+    }
+
+    fn finish(
+        &mut self,
+        _target: &SlackProgressTarget,
+        text: &str,
+        blocks: Option<MessageBlocks>,
+        now_ms: i64,
+    ) -> bool {
+        match &self.active {
+            ActiveSlackProgress::Native { channel, ts } => {
+                let (channel, ts) = (channel.clone(), ts.clone());
+                if !self.claim(
+                    SlackBudgetedMethod::ChatStopStream,
+                    &channel,
+                    CallPriority::Durable,
+                    now_ms,
+                ) {
+                    return false;
+                }
+                let Ok(markdown) = StreamText::new(text) else {
+                    return false;
+                };
+                let mut request = StopStreamRequest::new(channel, ts, markdown);
+                if let Some(blocks) = blocks {
+                    request = request.with_blocks(blocks);
+                }
+                match self.client.stop(&request) {
+                    Ok(SlackOutcome::Accepted(_)) => true,
+                    Ok(SlackOutcome::Rejected(rejection)) => {
+                        self.note_rejection(
+                            SlackBudgetedMethod::ChatStopStream,
+                            &rejection,
+                            now_ms,
+                        );
+                        false
+                    }
+                    Err(_) => false,
+                }
+            }
+            ActiveSlackProgress::Fallback { channel, ts } => {
+                let (channel, ts) = (channel.clone(), ts.clone());
+                if !self.claim(
+                    SlackBudgetedMethod::ChatUpdate,
+                    &channel,
+                    CallPriority::Durable,
+                    now_ms,
+                ) {
+                    return false;
+                }
+                let Ok(message) = MessageText::new(text) else {
+                    return false;
+                };
+                let mut request = UpdateMessageRequest::new(channel, ts, message);
+                if let Some(blocks) = blocks {
+                    request = request.with_blocks(blocks);
+                }
+                match self.client.update(&request) {
+                    Ok(SlackOutcome::Accepted(())) => true,
+                    Ok(SlackOutcome::Rejected(rejection)) => {
+                        self.note_rejection(SlackBudgetedMethod::ChatUpdate, &rejection, now_ms);
+                        false
+                    }
+                    Err(_) => false,
+                }
+            }
+            ActiveSlackProgress::None => false,
+        }
+    }
+}
+
+fn streaming_is_unsupported(rejection: &SlackRejection) -> bool {
+    matches!(
+        rejection.code().as_str(),
+        "unknown_method"
+            | "method_not_supported"
+            | "feature_not_enabled"
+            | "deprecated_endpoint"
+            | "method_deprecated"
+            | "not_allowed_token_type"
+    )
 }
 
 #[cfg(test)]
@@ -3502,6 +3984,176 @@ mod tests {
     use automonique_slack_connector::{MessageTs, SlackErrorCode};
 
     const SECRET: &str = "xoxb-0000000000-fixture-secret-never-print";
+
+    struct FakeStreamApi {
+        calls: Mutex<Vec<&'static str>>,
+        reject_start: bool,
+    }
+
+    impl FakeStreamApi {
+        fn position() -> StreamMessage {
+            StreamMessage {
+                channel: ChannelId::new("C0RESERVED01").expect("channel"),
+                ts: MessageTs::new("1723542300.000400").expect("ts"),
+            }
+        }
+    }
+
+    impl SlackStreamApi for FakeStreamApi {
+        fn start(
+            &self,
+            _request: &StartStreamRequest,
+        ) -> Result<SlackOutcome<StreamMessage>, SlackFailure> {
+            self.calls.lock().expect("calls").push("start");
+            if self.reject_start {
+                Ok(SlackOutcome::Rejected(SlackRejection::new(
+                    SlackErrorCode::sanitized("unknown_method"),
+                    None,
+                )))
+            } else {
+                Ok(SlackOutcome::Accepted(Self::position()))
+            }
+        }
+
+        fn append(
+            &self,
+            request: &AppendStreamRequest,
+        ) -> Result<SlackOutcome<StreamMessage>, SlackFailure> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(if request.chunks().is_some() {
+                    "append_chunks"
+                } else {
+                    "append"
+                });
+            Ok(SlackOutcome::Accepted(Self::position()))
+        }
+
+        fn stop(
+            &self,
+            request: &StopStreamRequest,
+        ) -> Result<SlackOutcome<StreamMessage>, SlackFailure> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(if request.blocks().is_some() {
+                    "stop_blocks"
+                } else {
+                    "stop"
+                });
+            Ok(SlackOutcome::Accepted(Self::position()))
+        }
+
+        fn post(
+            &self,
+            _request: &PostMessageRequest,
+        ) -> Result<SlackOutcome<StreamMessage>, SlackFailure> {
+            self.calls.lock().expect("calls").push("post");
+            Ok(SlackOutcome::Accepted(Self::position()))
+        }
+
+        fn update(
+            &self,
+            _request: &UpdateMessageRequest,
+        ) -> Result<SlackOutcome<()>, SlackFailure> {
+            self.calls.lock().expect("calls").push("update");
+            Ok(SlackOutcome::Accepted(()))
+        }
+    }
+
+    #[test]
+    fn rejected_native_stream_latches_the_message_edit_fallback() {
+        let api = Arc::new(FakeStreamApi {
+            calls: Mutex::new(Vec::new()),
+            reject_start: true,
+        });
+        let mut sink = SlackStreamSink::with_api(
+            api.clone(),
+            Arc::new(Mutex::new(SlackCallBudget::new(1_700_000_000_000))),
+        );
+        let target = SlackProgressTarget {
+            channel: ChannelId::new("C0RESERVED01").expect("channel"),
+            thread_ts: MessageTs::new("1723542000.000100").expect("thread"),
+        };
+        assert!(sink.begin(&target, 1_700_000_000_000));
+        assert!(sink.streaming_unsupported());
+        // A second run goes straight to postMessage; startStream is not probed
+        // again after the process-lifetime latch has been set.
+        assert!(sink.begin(&target, 1_700_000_000_001));
+        assert!(sink.finish(
+            &target,
+            "Done",
+            slack_result_blocks("Done"),
+            1_700_000_000_002
+        ));
+        assert_eq!(
+            *api.calls.lock().expect("calls"),
+            vec!["start", "post", "post", "update"]
+        );
+    }
+
+    #[test]
+    fn native_stream_orders_task_chunks_before_final_blocks() {
+        let api = Arc::new(FakeStreamApi {
+            calls: Mutex::new(Vec::new()),
+            reject_start: false,
+        });
+        let mut sink = SlackStreamSink::with_api(
+            api.clone(),
+            Arc::new(Mutex::new(SlackCallBudget::new(1_700_000_000_000))),
+        );
+        let target = SlackProgressTarget {
+            channel: ChannelId::new("C0RESERVED01").expect("channel"),
+            thread_ts: MessageTs::new("1723542000.000100").expect("thread"),
+        };
+        assert!(sink.begin(&target, 1_700_000_000_000));
+        sink.append_native(
+            vec![TaskCardChunk::Task {
+                id: String::from("task-1"),
+                title: String::from("read_file"),
+                status: "in_progress",
+            }],
+            1_700_000_000_001,
+        );
+        assert!(sink.finish(
+            &target,
+            "Done",
+            slack_result_blocks("Done"),
+            1_700_000_000_002,
+        ));
+        assert_eq!(
+            *api.calls.lock().expect("calls"),
+            vec!["start", "append_chunks", "stop_blocks"]
+        );
+    }
+
+    #[test]
+    fn fallback_updates_wait_at_least_three_seconds() {
+        const NOW: i64 = 1_700_000_000_000;
+        let api = Arc::new(FakeStreamApi {
+            calls: Mutex::new(Vec::new()),
+            reject_start: true,
+        });
+        let mut sink =
+            SlackStreamSink::with_api(api.clone(), Arc::new(Mutex::new(SlackCallBudget::new(NOW))));
+        let target = SlackProgressTarget {
+            channel: ChannelId::new("C0RESERVED01").expect("channel"),
+            thread_ts: MessageTs::new("1723542000.000100").expect("thread"),
+        };
+        assert!(sink.begin(&target, NOW));
+        let chunk = || vec![TaskCardChunk::Markdown(String::from("progress"))];
+        sink.append_fallback(
+            chunk(),
+            NOW + crate::run_lane::FALLBACK_EDIT_INTERVAL_MS - 1,
+        );
+        assert_eq!(*api.calls.lock().expect("calls"), vec!["start", "post"]);
+        sink.append_fallback(chunk(), NOW + crate::run_lane::FALLBACK_EDIT_INTERVAL_MS);
+        assert_eq!(
+            *api.calls.lock().expect("calls"),
+            vec!["start", "post", "update"]
+        );
+    }
 
     fn config(lines: &[&str]) -> String {
         let mut text = vec![String::from(CONFIG_HEADER)];

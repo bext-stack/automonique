@@ -1375,7 +1375,7 @@ impl Daemon {
             )
             .map_err(|_| DaemonError::SlackRefused("ticket_gate_store_unavailable"))?,
         ));
-        let slack_tickets = slack::SlackTicketHost::open(
+        let mut slack_tickets = slack::SlackTicketHost::open(
             &state_dir,
             &config.admin_socket(),
             &config.run_index_path(),
@@ -1504,6 +1504,7 @@ impl Daemon {
         // long before `serve` starts the poller thread, so no iteration can
         // observe a half-attached lane. A host with no bridge ignores it.
         telegram.attach_progress(execution.progress());
+        slack_tickets.attach_progress(execution.progress());
 
         // THE SUPPORT INTAKE GATE. An absent `support/fleet.conf` is the
         // disabled state: no credential is read, no fleet client is

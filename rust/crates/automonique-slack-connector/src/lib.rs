@@ -2,7 +2,7 @@
 
 //! Typed client for the Slack Web API surface Automonique reads and speaks on.
 //!
-//! Nine bot-token Web API methods are spelled, one per [`SlackMethod`]
+//! Twelve bot-token Web API methods are spelled, one per [`SlackMethod`]
 //! variant, and nothing else can be.
 //!
 //! Five are reads: identify the credential ([`SlackClient::auth_test`]), list
@@ -12,11 +12,12 @@
 //! messages ([`SlackClient::conversations_history`]), and resolve one user
 //! ([`SlackClient::users_info`]).
 //!
-//! Four are externally visible effects: post one message
+//! Seven are externally visible effects: post one message
 //! ([`SlackClient::post_message`]), replace one existing bot message
 //! ([`SlackClient::update_message`]), open one modal for an interaction
 //! trigger ([`SlackClient::open_view`]), and publish one App Home view
-//! ([`SlackClient::publish_view`]). Each is marked as an effect by
+//! ([`SlackClient::publish_view`]), and start, append, or stop one native
+//! assistant stream. Each is marked as an effect by
 //! [`SlackOperation::is_external_effect`], so an approval layer never has to
 //! re-derive the distinction from a verb — and the four are exactly the
 //! variants that predicate answers `true` for.
@@ -111,16 +112,18 @@ pub use connections::{
     ConnectionsOpenHttpResponse, ConnectionsOpenTransport, SlackConnectionsOpenTransport,
 };
 pub use request::{
-    ConversationTypes, ConversationsHistoryRequest, ConversationsInfoRequest,
-    ConversationsListRequest, HomeView, MAX_BLOCK_KIT_BYTES, MAX_MESSAGE_BLOCKS, MessageBlocks,
-    MessageText, ModalView, OpenViewRequest, PostMessageRequest, PublishViewRequest, SlackMethod,
-    SlackOperation, TriggerId, UpdateMessageRequest, UsersInfoRequest,
+    AppendStreamRequest, ConversationTypes, ConversationsHistoryRequest, ConversationsInfoRequest,
+    ConversationsListRequest, HomeView, MAX_BLOCK_KIT_BYTES, MAX_MESSAGE_BLOCKS,
+    MAX_STREAM_TEXT_BYTES, MessageBlocks, MessageText, ModalView, OpenViewRequest,
+    PostMessageRequest, PublishViewRequest, SlackMethod, SlackOperation, StartStreamRequest,
+    StopStreamRequest, StreamChunks, StreamText, TriggerId, UpdateMessageRequest, UsersInfoRequest,
 };
 pub use response::{
     AuthIdentity, ChannelPage, MAX_REPLY_COUNT, MessagePage, PostedMessage, SlackChannel,
-    SlackMessage, SlackUser, decode_ack, decode_apps_connections_open, decode_auth_test,
-    decode_conversations_history, decode_conversations_info, decode_conversations_list,
-    decode_error_code, decode_post_message, decode_users_info,
+    SlackMessage, SlackUser, StreamMessage, decode_ack, decode_apps_connections_open,
+    decode_auth_test, decode_conversations_history, decode_conversations_info,
+    decode_conversations_list, decode_error_code, decode_post_message, decode_stream_message,
+    decode_users_info,
 };
 pub use socket_mode::{
     MAX_SOCKET_MODE_ENVELOPE_BYTES, MAX_SOCKET_MODE_URL_BYTES, ProductionSocketModeSocket,
@@ -156,7 +159,7 @@ pub const MAX_PAGE_LIMIT: u16 = 200;
 
 /// Whole-request budget for one Slack call.
 ///
-/// None of the six methods long-polls, so a single bounded budget covers
+/// None of the twelve methods long-polls, so a single bounded budget covers
 /// connect, TLS, request and response. It is this crate's own choice rather
 /// than a value read off the legacy client, which delegates its timeout to an
 /// SDK default.
@@ -222,6 +225,8 @@ pub enum SlackRefusal {
     TriggerId,
     /// A modal view was malformed or outside its bound.
     View,
+    /// Native-stream markdown or chunk JSON was malformed or outside its bound.
+    Stream,
 }
 
 impl SlackRefusal {
@@ -242,6 +247,7 @@ impl SlackRefusal {
             Self::Blocks => "blocks",
             Self::TriggerId => "trigger_id",
             Self::View => "view",
+            Self::Stream => "stream",
         }
     }
 }

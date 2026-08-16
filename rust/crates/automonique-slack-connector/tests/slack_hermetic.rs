@@ -27,10 +27,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use automonique_slack_connector::{
-    ChannelId, ConversationTypes, ConversationsHistoryRequest, ConversationsInfoRequest,
-    ConversationsListRequest, Cursor, MAX_SLACK_RESPONSE_BYTES, MessageText, MessageTs,
-    PostMessageRequest, SLACK_ACCEPT, SLACK_CONTENT_TYPE, SLACK_USER_AGENT, SlackBase, SlackClient,
-    SlackErrorKind, SlackFailure, SlackToken, UserId, UsersInfoRequest,
+    AppendStreamRequest, ChannelId, ConversationTypes, ConversationsHistoryRequest,
+    ConversationsInfoRequest, ConversationsListRequest, Cursor, MAX_SLACK_RESPONSE_BYTES,
+    MessageText, MessageTs, PostMessageRequest, SLACK_ACCEPT, SLACK_CONTENT_TYPE, SLACK_USER_AGENT,
+    SlackBase, SlackClient, SlackErrorKind, SlackFailure, SlackToken, StartStreamRequest,
+    StopStreamRequest, StreamChunks, StreamText, UserId, UsersInfoRequest,
 };
 
 /// Bound on every server-side wait. A test that would otherwise hang fails here.
@@ -567,6 +568,66 @@ fn the_post_message_method_sends_its_exact_request_and_parses_the_receipt_back()
     assert_eq!(posted.ts.as_str(), "1723542300.000400");
     assert_eq!(posted.message.text, "Bonjour,\nc'est regle.");
     assert_eq!(posted.message.ts, posted.ts);
+}
+
+#[test]
+fn the_native_stream_methods_send_exact_paths_and_bodies() {
+    let response =
+        format!("{{\"ok\":true,\"channel\":\"{CHANNEL}\",\"ts\":\"1723542300.000400\"}}");
+    let fake = FakeSlack::spawn(vec![
+        Canned::json(&response),
+        Canned::json(&response),
+        Canned::json(&response),
+    ]);
+    let client = slack_client(&fake);
+    let parent = MessageTs::new("1723542000.000100").expect("parent");
+    let stream = client
+        .start_stream(
+            &StartStreamRequest::new(channel(), parent)
+                .with_markdown(StreamText::new("Thinking…").expect("text")),
+        )
+        .expect("start")
+        .accepted()
+        .expect("accepted")
+        .clone();
+    let chunks = StreamChunks::new(
+        r#"[{"type":"task_update","id":"task-1","title":"read_file","status":"in_progress"}]"#,
+    )
+    .expect("chunks");
+    client
+        .append_stream(
+            &AppendStreamRequest::new(
+                stream.channel.clone(),
+                stream.ts.clone(),
+                StreamText::new("read_file in progress").expect("text"),
+            )
+            .with_chunks(chunks),
+        )
+        .expect("append");
+    client
+        .stop_stream(&StopStreamRequest::new(
+            stream.channel,
+            stream.ts,
+            StreamText::new("Done").expect("text"),
+        ))
+        .expect("stop");
+
+    let captured = fake.captured();
+    assert_eq!(captured.len(), 3);
+    assert_wire_shape(&captured[0], "/api/chat.startStream");
+    assert_eq!(
+        captured[0].body,
+        "channel=C0RESERVED&thread_ts=1723542000.000100&markdown_text=Thinking%E2%80%A6"
+    );
+    assert_wire_shape(&captured[1], "/api/chat.appendStream");
+    assert!(captured[1].body.starts_with(
+        "channel=C0RESERVED&ts=1723542300.000400&markdown_text=read_file%20in%20progress&chunks=%5B"
+    ));
+    assert_wire_shape(&captured[2], "/api/chat.stopStream");
+    assert_eq!(
+        captured[2].body,
+        "channel=C0RESERVED&ts=1723542300.000400&markdown_text=Done"
+    );
 }
 
 #[test]
