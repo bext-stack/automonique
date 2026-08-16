@@ -47,7 +47,7 @@ jobs:
           - automonique_fuzz_telegram_updates
           - automonique_fuzz_slack_decode
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # `rust/fuzz` is its own workspace and needs nightly plus a sanitizer-
       # instrumented build. `rust/rust-toolchain.toml` pins the stable path and
@@ -98,7 +98,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install nightly
         run: rustup toolchain install nightly --profile minimal

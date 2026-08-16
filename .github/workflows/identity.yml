@@ -29,7 +29,7 @@ jobs:
     steps:
       # `read_commits` walks all of `git log HEAD`. A shallow clone would make
       # the check measure a handful of commits and pass for the wrong reason.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
