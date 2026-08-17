@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+[Unit]
+Description=Cloudflare Tunnel for the Automonique web entry point
+After=network-online.target automonique-web-entry.service
+Wants=network-online.target
+Requires=automonique-web-entry.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared tunnel --config %h/.cloudflared/config-monique-web.yml --no-autoupdate run
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=read-only
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=default.target

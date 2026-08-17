@@ -248,6 +248,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "automonique-web-entry"
+version = "0.1.0"
+dependencies = [
+ "httparse",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

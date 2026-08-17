@@ -23,6 +23,7 @@ members = [
     "crates/automonique-support-connector",
     "crates/automonique-transport-runtime",
     "crates/automonique-transports",
+    "crates/automonique-web-entry",
 ]
 # `fuzz/` is a crate, and a sibling of `crates/`, but not a member. It needs
 # nightly and a sanitizer build, and its entry-point macro emits the `extern
@@ -39,6 +40,7 @@ publish = false
 
 [workspace.dependencies]
 hex = "=0.4.3"
+httparse = "=1.10.1"
 landlock = "=0.4.7"
 seccompiler = "=0.5.0"
 log = { version = "=0.4.33", features = ["max_level_debug", "release_max_level_debug"] }
