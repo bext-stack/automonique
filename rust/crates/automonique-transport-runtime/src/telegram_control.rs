@@ -67,7 +67,7 @@ pub const MAX_COMMAND_NAME_BYTES: usize = 32;
 pub const MAX_BOT_SUFFIX_BYTES: usize = 32;
 /// Longest task text a `/run` may carry.
 pub const MAX_RUN_TASK_BYTES: usize = 1024;
-/// Longest reference a `/cancel`, `/approve`, `/deny`, `/ticket` or `/work` may
+/// Longest reference a `/cancel`, `/approve`, `/deny`, `/ticket`, `/job` or `/work` may
 /// name.
 pub const MAX_CONTROL_REF_BYTES: usize = 128;
 /// Longest configured channel name a `/slack` or `/say` may address.
@@ -103,7 +103,7 @@ pub const MAX_ALLOWED_USERS: usize = 256;
 /// being read rather than after an allocation.
 pub const MAX_USER_ID_BYTES: usize = 20;
 /// Number of commands in the closed registry.
-pub const COMMAND_COUNT: usize = 21;
+pub const COMMAND_COUNT: usize = 23;
 
 const _: () = assert!(COMMAND_COUNT == CommandKind::ALL.len());
 const _: () = assert!(MAX_COMMAND_NAME_BYTES <= MAX_COMMAND_TEXT_BYTES);
@@ -215,6 +215,10 @@ pub enum CommandKind {
     Status,
     /// List recent runs.
     Runs,
+    /// Summarize Automonique-owned provider instances and usage.
+    Agents,
+    /// Read one dispatched Manage job's current status.
+    Job,
     /// List recently tracked support tickets.
     Tickets,
     /// One tracked support ticket.
@@ -260,6 +264,8 @@ impl CommandKind {
         Self::Help,
         Self::Status,
         Self::Runs,
+        Self::Agents,
+        Self::Job,
         Self::Tickets,
         Self::Ticket,
         Self::Slack,
@@ -342,6 +348,18 @@ impl CommandKind {
                 name: "runs",
                 description: "List the most recent runs",
                 argument: ArgumentShape::None,
+                tier: CommandTier::Allowed,
+            },
+            Self::Agents => CommandSpec {
+                name: "agents",
+                description: "Show Automonique-owned provider instance statistics",
+                argument: ArgumentShape::None,
+                tier: CommandTier::Allowed,
+            },
+            Self::Job => CommandSpec {
+                name: "job",
+                description: "Show a dispatched issue-work job's status",
+                argument: ArgumentShape::Reference,
                 tier: CommandTier::Allowed,
             },
             Self::Tickets => CommandSpec {
@@ -1239,6 +1257,13 @@ pub enum ControlCommand {
     Status,
     /// List the most recent runs.
     Runs,
+    /// Report Automonique-owned provider process/session statistics.
+    Agents,
+    /// Report one dispatched issue-work job.
+    Job {
+        /// A full job id, an unambiguous tracked prefix, or an issue URL.
+        job_ref: ControlRef,
+    },
     /// List the most recently tracked support tickets.
     Tickets,
     /// Report the tracked support ticket this reference names.
@@ -1374,6 +1399,8 @@ impl ControlCommand {
             Self::Help => CommandKind::Help,
             Self::Status => CommandKind::Status,
             Self::Runs => CommandKind::Runs,
+            Self::Agents => CommandKind::Agents,
+            Self::Job { .. } => CommandKind::Job,
             Self::Tickets => CommandKind::Tickets,
             Self::Ticket { .. } => CommandKind::Ticket,
             Self::Slack { .. } | Self::SlackList => CommandKind::Slack,
@@ -1585,6 +1612,8 @@ const fn command_usage(kind: CommandKind) -> &'static str {
         CommandKind::Help => "/help",
         CommandKind::Status => "/status",
         CommandKind::Runs => "/runs",
+        CommandKind::Agents => "/agents",
+        CommandKind::Job => "/job <reference>",
         CommandKind::Tickets => "/tickets",
         CommandKind::Ticket => "/ticket <reference>",
         CommandKind::Slack => "/slack <channel|list>",
@@ -1939,6 +1968,8 @@ fn parse_arguments(kind: CommandKind, rest: &str) -> Result<ControlCommand, Comm
         CommandKind::Help => no_argument(rest).map(|()| ControlCommand::Help),
         CommandKind::Status => no_argument(rest).map(|()| ControlCommand::Status),
         CommandKind::Runs => no_argument(rest).map(|()| ControlCommand::Runs),
+        CommandKind::Agents => no_argument(rest).map(|()| ControlCommand::Agents),
+        CommandKind::Job => one_reference(rest).map(|job_ref| ControlCommand::Job { job_ref }),
         CommandKind::Tickets => no_argument(rest).map(|()| ControlCommand::Tickets),
         CommandKind::Ticket => {
             one_reference(rest).map(|ticket_ref| ControlCommand::Ticket { ticket_ref })
@@ -2285,6 +2316,8 @@ mod tests {
         assert!(text.contains("/say <channel> <message>"));
         assert!(text.contains("/cancel <reference>"));
         assert!(text.contains("/ticket <reference>"));
+        assert!(text.contains("/agents — "));
+        assert!(text.contains("/job <reference>"));
         assert!(text.contains("/gh create <repository> <request>"));
         assert!(text.contains("/gh reply <issue-url> <reply>"));
         assert!(text.contains("/gh check <issue-url> <item>"));
@@ -2295,6 +2328,22 @@ mod tests {
         assert!(text.contains("/tickets — "));
         assert!(text.contains("ask read-only questions in ordinary language"));
         assert!(text.contains("actions still require an explicit command"));
+    }
+
+    #[test]
+    fn provider_and_dispatched_job_reads_have_typed_commands() {
+        assert_eq!(parse_command("/agents"), Ok(ControlCommand::Agents));
+        assert_eq!(
+            parse_command("/job job-fixture-123456"),
+            Ok(ControlCommand::Job {
+                job_ref: ControlRef::new("job-fixture-123456").expect("job ref")
+            })
+        );
+        assert_eq!(parse_command("/job"), Err(CommandRefusal::MissingArgument));
+        assert_eq!(
+            parse_command("/agents now"),
+            Err(CommandRefusal::UnexpectedArgument)
+        );
     }
 
     #[test]
@@ -3032,6 +3081,8 @@ mod tests {
             (CommandKind::Help, CommandTier::Allowed),
             (CommandKind::Status, CommandTier::Allowed),
             (CommandKind::Runs, CommandTier::Allowed),
+            (CommandKind::Agents, CommandTier::Allowed),
+            (CommandKind::Job, CommandTier::Allowed),
             (CommandKind::Tickets, CommandTier::Allowed),
             (CommandKind::Ticket, CommandTier::Allowed),
             (CommandKind::Slack, CommandTier::Allowed),

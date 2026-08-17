@@ -69,7 +69,7 @@
 //! them in return is honesty about the outcome — see [`SlackWorkspace::post`] on
 //! why a transport failure is reported as "unknown" and never as "not posted".
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::MetadataExt as _;
@@ -111,14 +111,16 @@ use automonique_transports::{
 
 use crate::github::{GitHubSurface, IssueFactDetail};
 use crate::github_actions::{
-    GitHubActionEngine, GitHubActionRequest, GitHubManagementDomain, is_github_capability_question,
+    GitHubActionEngine, GitHubActionRequest, GitHubIssueRequestIntent, GitHubManagementDomain,
+    is_github_capability_question, natural_issue_request,
 };
 use crate::manage_config::ManageUrl;
 use crate::progress_hub::ProgressHub;
 use crate::run_lane::{SlackProgressSink, SlackProgressTarget, SocketRunLane};
 use crate::telegram_bridge::{
-    ApprovalDecisionAnswer, ApprovalDecisionFailure, HostFacts, RunLane as _, SlackSurface,
-    StoreControlSurface, answer_read_only_transport_question, deterministic_conversation_answer,
+    ApprovalDecisionAnswer, ApprovalDecisionFailure, ControlSurface as _, HostFacts, RunLane as _,
+    SlackSurface, StoreControlSurface, answer_read_only_transport_question,
+    answer_typed_github_issue_question, deterministic_conversation_answer,
 };
 
 /// Configuration path beneath the daemon's private state directory.
@@ -1594,11 +1596,22 @@ struct PreparedSlackTicketInteraction {
 pub(crate) trait SlackTicketPoster {
     /// Note which inbound event the decisions that follow belong to.
     ///
-    /// A no-op for every production implementation: a poster that actually posts
-    /// has no use for the correlation. The recording decorator needs it, because
-    /// an intended-action envelope is keyed by the source event it was decided
-    /// for, and the posting methods below carry no such key.
+    /// A no-op unless the implementation needs delivery correlation. The live
+    /// poster uses it to remember only Slack-accepted replies; the recording
+    /// decorator uses it because an intended-action envelope is keyed by the
+    /// source event it was decided for, and the posting methods below carry no
+    /// such key.
     fn begin_source(&mut self, _source_key: &str) {}
+
+    /// Return a thread reply only after Slack accepted it.
+    ///
+    /// Recording posters leave this empty.  The live poster uses it to make
+    /// Monique's own visible replies part of the durable conversation without
+    /// ever remembering a delivery that Slack rejected or whose outcome is
+    /// unknown.
+    fn take_confirmed_thread_reply(&mut self) -> Option<ConfirmedSlackThreadReply> {
+        None
+    }
 
     fn post_thread(
         &mut self,
@@ -1671,6 +1684,160 @@ pub(crate) trait SlackTicketPoster {
         _pending_count: usize,
     ) -> Result<(), ()> {
         Err(())
+    }
+}
+
+pub(crate) struct ConfirmedSlackThreadReply {
+    source_key: String,
+    channel: ChannelId,
+    parent: MessageTs,
+    text: String,
+}
+
+struct LiveSlackTicketPoster {
+    client: Arc<SlackClient>,
+    source_key: Option<String>,
+    confirmed_thread_replies: VecDeque<ConfirmedSlackThreadReply>,
+}
+
+impl LiveSlackTicketPoster {
+    fn new(client: Arc<SlackClient>) -> Self {
+        Self {
+            client,
+            source_key: None,
+            confirmed_thread_replies: VecDeque::new(),
+        }
+    }
+
+    fn client(&self) -> Arc<SlackClient> {
+        Arc::clone(&self.client)
+    }
+
+    fn remember_thread_reply(&mut self, channel: &ChannelId, parent: &MessageTs, text: &str) {
+        let Some(source_key) = self.source_key.clone() else {
+            return;
+        };
+        self.confirmed_thread_replies
+            .push_back(ConfirmedSlackThreadReply {
+                source_key,
+                channel: channel.clone(),
+                parent: parent.clone(),
+                text: text.to_owned(),
+            });
+    }
+}
+
+impl SlackTicketPoster for LiveSlackTicketPoster {
+    fn begin_source(&mut self, source_key: &str) {
+        self.source_key = Some(source_key.to_owned());
+    }
+
+    fn take_confirmed_thread_reply(&mut self) -> Option<ConfirmedSlackThreadReply> {
+        self.confirmed_thread_replies.pop_front()
+    }
+
+    fn post_thread(
+        &mut self,
+        channel: &ChannelId,
+        parent: &MessageTs,
+        text: &str,
+    ) -> Result<(), ()> {
+        <Arc<SlackClient> as SlackTicketPoster>::post_thread(
+            &mut self.client,
+            channel,
+            parent,
+            text,
+        )?;
+        self.remember_thread_reply(channel, parent, text);
+        Ok(())
+    }
+
+    fn post_channel(&mut self, channel: &ChannelId, text: &str) -> Result<(), ()> {
+        <Arc<SlackClient> as SlackTicketPoster>::post_channel(&mut self.client, channel, text)
+    }
+
+    fn post_approval_card(
+        &mut self,
+        channel: &ChannelId,
+        parent: &MessageTs,
+        receipt: &automonique_support_connector::TicketDispatchReceipt,
+        manage_url: Option<&ManageUrl>,
+    ) -> Result<(), ()> {
+        <Arc<SlackClient> as SlackTicketPoster>::post_approval_card(
+            &mut self.client,
+            channel,
+            parent,
+            receipt,
+            manage_url,
+        )?;
+        let short = receipt.job_id.get(..12).unwrap_or(&receipt.job_id);
+        self.remember_thread_reply(
+            channel,
+            parent,
+            &format!(
+                "Confirmation required for {} ({}) — Monique job {short}",
+                receipt.issue_title, receipt.issue_url
+            ),
+        );
+        Ok(())
+    }
+
+    fn open_reject_modal(
+        &mut self,
+        trigger_id: &str,
+        job_id: &str,
+        channel: &ChannelId,
+        message_ts: &MessageTs,
+    ) -> Result<(), ()> {
+        <Arc<SlackClient> as SlackTicketPoster>::open_reject_modal(
+            &mut self.client,
+            trigger_id,
+            job_id,
+            channel,
+            message_ts,
+        )
+    }
+
+    fn post_approval_request(
+        &mut self,
+        channel: &ChannelId,
+        request_key: &str,
+        expires_at_ms: i64,
+    ) -> Result<(), ()> {
+        <Arc<SlackClient> as SlackTicketPoster>::post_approval_request(
+            &mut self.client,
+            channel,
+            request_key,
+            expires_at_ms,
+        )
+    }
+
+    fn update_decision(
+        &mut self,
+        channel: &ChannelId,
+        message_ts: &MessageTs,
+        text: &str,
+    ) -> Result<(), ()> {
+        <Arc<SlackClient> as SlackTicketPoster>::update_decision(
+            &mut self.client,
+            channel,
+            message_ts,
+            text,
+        )
+    }
+
+    fn publish_home(
+        &mut self,
+        user: &UserId,
+        is_admin: bool,
+        pending_count: usize,
+    ) -> Result<(), ()> {
+        <Arc<SlackClient> as SlackTicketPoster>::publish_home(
+            &mut self.client,
+            user,
+            is_admin,
+            pending_count,
+        )
     }
 }
 
@@ -1881,7 +2048,21 @@ struct SlackTicketRouter<P> {
 trait SlackQuestionAnswerer: Send {
     fn answer(&mut self, question: &str, context: &str) -> String;
 
+    fn provider_stats(&mut self) -> String {
+        String::from("Monique's provider instance statistics are unavailable right now.")
+    }
+
     fn issue_status(&mut self, _issue_url: &str) -> String {
+        String::from("Monique's GitHub issue reader is unavailable right now.")
+    }
+
+    fn issue_review(
+        &mut self,
+        _issue_url: &str,
+        _question: &str,
+        _context: &str,
+        _deep: bool,
+    ) -> String {
         String::from("Monique's GitHub issue reader is unavailable right now.")
     }
 }
@@ -1896,6 +2077,9 @@ struct LiveSlackQuestionAnswerer {
 
 impl SlackQuestionAnswerer for LiveSlackQuestionAnswerer {
     fn answer(&mut self, question: &str, context: &str) -> String {
+        if let Some(answer) = slack_reply_location_answer(question, context) {
+            return answer;
+        }
         answer_read_only_transport_question(
             &mut self.surface,
             &mut self.lane,
@@ -1905,6 +2089,12 @@ impl SlackQuestionAnswerer for LiveSlackQuestionAnswerer {
             &self.configured,
             "slack_question_worker",
         )
+    }
+
+    fn provider_stats(&mut self) -> String {
+        self.surface.agents_text().unwrap_or_else(|_| {
+            String::from("Monique could not read provider instance statistics right now.")
+        })
     }
 
     fn issue_status(&mut self, issue_url: &str) -> String {
@@ -1922,6 +2112,88 @@ impl SlackQuestionAnswerer for LiveSlackQuestionAnswerer {
             Err(_) => String::from("Monique could not read that GitHub issue right now."),
         }
     }
+
+    fn issue_review(
+        &mut self,
+        issue_url: &str,
+        question: &str,
+        context: &str,
+        deep: bool,
+    ) -> String {
+        let Some(locator) = IssueLocator::parse(issue_url) else {
+            return String::from("That is not a canonical GitHub issue URL.");
+        };
+        let Some(github) = self.github.as_deref_mut() else {
+            return String::from("Monique's GitHub issue reader is not configured.");
+        };
+        let facts = match github.issue_facts(&locator, IssueFactDetail::Full) {
+            Ok(facts) => facts,
+            Err(error) if error.contains("repository_not_configured") => {
+                return String::from(
+                    "That GitHub repository is not in Monique's configured read allowlist.",
+                );
+            }
+            Err(_) => return String::from("Monique could not read that GitHub issue right now."),
+        };
+        let context =
+            format!("{context}\n\n[live_github_issues]\nissue=\n{facts}\n[/live_github_issues]");
+        answer_typed_github_issue_question(
+            &mut self.lane,
+            question,
+            &context,
+            deep,
+            "slack_question_worker",
+        )
+    }
+}
+
+fn slack_reply_location_answer(question: &str, context: &str) -> Option<String> {
+    let normalized = question
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let asks_where = [
+        "tu as répondu ou",
+        "tu as repondu ou",
+        "où as-tu répondu",
+        "ou as-tu repondu",
+        "où est-ce que tu as répondu",
+        "ou est ce que tu as repondu",
+        "where did you reply",
+        "where did you answer",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase));
+    if !asks_where || !context.lines().any(|line| line.starts_with("assistant: ")) {
+        return None;
+    }
+    Some(String::from(
+        "Ma réponse précédente a été publiée dans ce thread Slack. Je n’ai envoyé ni message privé ni second message ailleurs.",
+    ))
+}
+
+fn is_provider_stats_question(text: &str) -> bool {
+    let normalized = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    normalized == "agents"
+        || [
+            "agent stats",
+            "agents stats",
+            "provider stats",
+            "provider instances",
+            "running codex",
+            "running claude",
+            "instances codex",
+            "instances claude",
+            "statut des agents",
+            "stats des agents",
+        ]
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
 }
 
 fn github_issue_status_answer(locator: &IssueLocator, facts: &str) -> String {
@@ -1969,6 +2241,15 @@ fn is_github_issue_status_question(text: &str) -> bool {
         "est ce fini",
         "est-ce fait",
         "est ce fait",
+        "il est fait",
+        "il est terminé",
+        "il est termine",
+        "est-il fait",
+        "est il fait",
+        "c'est fait",
+        "c’est fait",
+        "ça a été fait",
+        "ca a ete fait",
     ]
     .iter()
     .any(|phrase| normalized.contains(phrase))
@@ -1981,6 +2262,21 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             return;
         }
         let text = command.text.trim();
+        match natural_issue_request(text) {
+            Ok(Some(GitHubIssueRequestIntent::Read { issue_url, deep })) => {
+                let answer = self.question_answerer.as_mut().map_or_else(
+                    || String::from("Monique's GitHub issue reader is unavailable right now."),
+                    |answerer| answerer.issue_review(&issue_url, text, context, deep),
+                );
+                let _ = self.poster.post_channel(&command.channel, &answer);
+                return;
+            }
+            Ok(Some(GitHubIssueRequestIntent::Work { .. }) | None) => {}
+            Err(answer) => {
+                let _ = self.poster.post_channel(&command.channel, &answer);
+                return;
+            }
+        }
         let ticket_text = text.strip_prefix("ticket ").unwrap_or(text);
         if let Ok(Some(issue_url)) = one_issue_url(ticket_text) {
             match self.manage.dispatch_ticket(&issue_url, &command.source_key) {
@@ -2035,8 +2331,20 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
         if text.is_empty() || text == "help" {
             let _ = self.poster.post_channel(
                 &command.channel,
-                "Monique commands: `ticket <GitHub issue URL>`, `help`. Admins can also use `approvals` to list what is waiting, `approve <reference>`, `reject <job> <reason>`, `status <job>`, and natural-language GitHub actions. Legacy `/github_*` commands remain available during migration.",
+                "Monique commands: `ticket <GitHub issue URL>`, `agents`, `help`. Admins can also use `approvals` to list what is waiting, `approve <reference>`, `reject <job> <reason>`, `status <job>`, and natural-language GitHub actions. Legacy `/github_*` commands remain available during migration.",
             );
+            return;
+        }
+        if text == "agents" {
+            let answer = self.question_answerer.as_mut().map_or_else(
+                || {
+                    String::from(
+                        "Monique's provider instance statistics are unavailable right now.",
+                    )
+                },
+                |answerer| answerer.provider_stats(),
+            );
+            let _ = self.poster.post_channel(&command.channel, &answer);
             return;
         }
         let is_admin = self.admins.contains(&command.user);
@@ -2581,6 +2889,69 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             .map_err(|_| ())
     }
 
+    fn capture_confirmed_reply(
+        &self,
+        memory: &mut AgentMemoryStore,
+        event: &SlackTicketEvent,
+        reply: &ConfirmedSlackThreadReply,
+    ) -> Result<(), ()> {
+        if reply.source_key != event.source_key
+            || reply.channel != event.channel
+            || reply.parent != event.parent
+            || !self.members.contains(&event.user)
+        {
+            return Ok(());
+        }
+        let identity = memory
+            .resolve_identity(
+                "slack",
+                "automonique-slack",
+                &event.team_id,
+                event.user.as_str(),
+            )
+            .map_err(|_| ())?;
+        let (tenant, actor) = identity.unwrap_or_else(|| {
+            (
+                self.memory_tenant.clone(),
+                format!("slack:{}:{}", event.team_id, event.user),
+            )
+        });
+        memory
+            .bind_identity(
+                &tenant,
+                &actor,
+                ExternalIdentity {
+                    platform: "slack",
+                    application: "automonique-slack",
+                    external_tenant: &event.team_id,
+                    external_user: event.user.as_str(),
+                },
+                crate::unix_millis().unwrap_or_default(),
+            )
+            .map_err(|_| ())?;
+        let scope = ConversationScope::slack(reply.channel.as_str(), Some(reply.parent.as_str()))
+            .map_err(|_| ())?;
+        let conversation_id = memory
+            .current_conversation(&tenant, &actor, "slack", scope.as_str())
+            .map_err(|_| ())?
+            .unwrap_or_else(|| slack_event_conversation_id(event, event.app_mention));
+        let content = redact_content(&reply.text);
+        memory
+            .record_message(&MessageInput {
+                tenant: &tenant,
+                actor: &actor,
+                conversation_id: &conversation_id,
+                transport: "slack-assistant",
+                external_scope: scope.as_str(),
+                transport_key: &reply.source_key,
+                role: "assistant",
+                content: &content,
+                created_at_ms: crate::unix_millis().unwrap_or_default(),
+            })
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
     /// Decide whether an unmentioned thread reply belongs to a conversation
     /// Monique already opened. New conversations carry an explicit durable
     /// identifier. The content check recognizes conversations opened by the
@@ -2743,6 +3114,43 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             .app_mention
             .then(|| slack_app_mention_text(&event.text));
         let trimmed = mention_text.as_deref().unwrap_or_else(|| event.text.trim());
+        // A read-only issue review is safe in every admitted configured-channel
+        // message shape, not only app mentions and existing conversations. In
+        // particular, it must be intercepted before the plain ticket-intake
+        // lane could mistake "review <issue>" for authorization to work it.
+        if self.members.contains(&event.user) {
+            if is_github_issue_status_question(trimmed)
+                && let Ok(Some(issue_url)) = one_issue_url(trimmed)
+            {
+                let answer = self.question_answerer.as_mut().map_or_else(
+                    || String::from("Monique's GitHub issue reader is unavailable right now."),
+                    |answerer| answerer.issue_status(&issue_url),
+                );
+                let _ = self
+                    .poster
+                    .post_thread(&event.channel, &event.parent, &answer);
+                return;
+            }
+            match natural_issue_request(trimmed) {
+                Ok(Some(GitHubIssueRequestIntent::Read { issue_url, deep })) => {
+                    let answer = self.question_answerer.as_mut().map_or_else(
+                        || String::from("Monique's GitHub issue reader is unavailable right now."),
+                        |answerer| answerer.issue_review(&issue_url, trimmed, context, deep),
+                    );
+                    let _ = self
+                        .poster
+                        .post_thread(&event.channel, &event.parent, &answer);
+                    return;
+                }
+                Ok(Some(GitHubIssueRequestIntent::Work { .. }) | None) => {}
+                Err(text) => {
+                    let _ = self
+                        .poster
+                        .post_thread(&event.channel, &event.parent, &text);
+                    return;
+                }
+            }
+        }
         let conversational = self.features.contains(&SlackFeature::Conversation)
             && self.members.contains(&event.user)
             && (event.app_mention
@@ -2764,6 +3172,20 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                 let _ = self.poster.post_thread(&event.channel, &event.parent, text);
                 return;
             }
+            if is_provider_stats_question(trimmed) {
+                let answer = self.question_answerer.as_mut().map_or_else(
+                    || {
+                        String::from(
+                            "Monique's provider instance statistics are unavailable right now.",
+                        )
+                    },
+                    |answerer| answerer.provider_stats(),
+                );
+                let _ = self
+                    .poster
+                    .post_thread(&event.channel, &event.parent, &answer);
+                return;
+            }
             if is_github_issue_status_question(trimmed)
                 && let Ok(Some(issue_url)) = one_issue_url(trimmed)
             {
@@ -2776,7 +3198,29 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                     .post_thread(&event.channel, &event.parent, &answer);
                 return;
             }
-            if self.admins.contains(&event.user)
+            let issue_request = match natural_issue_request(trimmed) {
+                Ok(intent) => intent,
+                Err(text) => {
+                    let _ = self
+                        .poster
+                        .post_thread(&event.channel, &event.parent, &text);
+                    return;
+                }
+            };
+            if let Some(GitHubIssueRequestIntent::Read { issue_url, deep }) = &issue_request {
+                let answer = self.question_answerer.as_mut().map_or_else(
+                    || String::from("Monique's GitHub issue reader is unavailable right now."),
+                    |answerer| answerer.issue_review(issue_url, trimmed, context, *deep),
+                );
+                let _ = self
+                    .poster
+                    .post_thread(&event.channel, &event.parent, &answer);
+                return;
+            }
+            let ticket_work_requested =
+                matches!(issue_request, Some(GitHubIssueRequestIntent::Work { .. }));
+            if !ticket_work_requested
+                && self.admins.contains(&event.user)
                 && let Some(actions) = self.github_actions.as_ref()
             {
                 match actions.natural_request(trimmed) {
@@ -3080,7 +3524,7 @@ pub(crate) fn replay_slack_trace(
 pub(crate) struct SlackTicketWorker {
     app: AppsConnectionsOpenClient,
     connector: SlackSocketModeConnector,
-    router: SlackTicketRouter<Arc<SlackClient>>,
+    router: SlackTicketRouter<LiveSlackTicketPoster>,
     memory: AgentMemoryStore,
     interactions: SlackInteractionStore,
     /// The reference engine's half of the parity comparison.
@@ -3282,7 +3726,7 @@ impl SlackTicketHost {
                 )
                 .map_err(|_| SlackConfigError::TicketActionsUnavailable)?,
                 router: SlackTicketRouter {
-                    poster: client,
+                    poster: LiveSlackTicketPoster::new(client),
                     manage: Box::new(manage),
                     manage_url,
                     memory_tenant,
@@ -3321,7 +3765,7 @@ impl SlackTicketHost {
         };
         let now_ms = crate::unix_millis().unwrap_or_default();
         let budget = Arc::new(Mutex::new(SlackCallBudget::new(now_ms)));
-        let sink = SlackStreamSink::new(Arc::clone(&worker.router.poster), budget);
+        let sink = SlackStreamSink::new(worker.router.poster.client(), budget);
         actions.attach_slack_progress(hub, Box::new(sink));
     }
 
@@ -3493,7 +3937,16 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
             if let Some(event) = event {
                 let context =
                     slack_event_context(&worker.memory, &worker.router.memory_tenant, &event);
-                worker.router.handle_with_context(event, &context);
+                worker.router.handle_with_context(event.clone(), &context);
+                while let Some(reply) = worker.router.poster.take_confirmed_thread_reply() {
+                    if worker
+                        .router
+                        .capture_confirmed_reply(&mut worker.memory, &event, &reply)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
             if let Some(command) = command {
                 let context =
@@ -5219,6 +5672,18 @@ mod tests {
         seen: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
+    struct FakeProviderStatsAnswerer;
+
+    impl SlackQuestionAnswerer for FakeProviderStatsAnswerer {
+        fn answer(&mut self, _question: &str, _context: &str) -> String {
+            panic!("provider statistics must use the typed provider journal read")
+        }
+
+        fn provider_stats(&mut self) -> String {
+            String::from("Automonique provider instances\ncodex: live 2 | recorded 5")
+        }
+    }
+
     impl SlackQuestionAnswerer for FakeIssueStatusAnswerer {
         fn answer(&mut self, _question: &str, _context: &str) -> String {
             panic!("status questions must use the typed GitHub issue reader")
@@ -5230,6 +5695,31 @@ mod tests {
                 .expect("issue reads")
                 .push(issue_url.to_owned());
             String::from("No — GitHub still marks this issue as open.")
+        }
+    }
+
+    struct FakeIssueReviewAnswerer {
+        seen: Arc<std::sync::Mutex<Vec<(String, String, bool)>>>,
+    }
+
+    impl SlackQuestionAnswerer for FakeIssueReviewAnswerer {
+        fn answer(&mut self, _question: &str, _context: &str) -> String {
+            panic!("issue reviews must use the typed GitHub issue reader")
+        }
+
+        fn issue_review(
+            &mut self,
+            issue_url: &str,
+            question: &str,
+            _context: &str,
+            deep: bool,
+        ) -> String {
+            self.seen.lock().expect("issue reviews").push((
+                issue_url.to_owned(),
+                question.to_owned(),
+                deep,
+            ));
+            String::from("Typed GitHub issue review")
         }
     }
 
@@ -5645,7 +6135,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_admin_slack_memory_is_durable_deduplicated_and_secret_redacted() {
+    fn configured_admin_slack_memory_keeps_user_and_confirmed_assistant_turns() {
         let root = tempfile::tempdir().expect("memory root");
         std::fs::set_permissions(
             root.path(),
@@ -5686,6 +6176,18 @@ mod tests {
         router
             .capture_memory(&mut memory, &event)
             .expect("replay capture");
+        let reply = ConfirmedSlackThreadReply {
+            source_key: event.source_key.clone(),
+            channel: event.channel.clone(),
+            parent: event.parent.clone(),
+            text: String::from("Je réponds dans ce thread; token sk-123456789012345678901234"),
+        };
+        router
+            .capture_confirmed_reply(&mut memory, &event, &reply)
+            .expect("confirmed reply capture");
+        router
+            .capture_confirmed_reply(&mut memory, &event, &reply)
+            .expect("confirmed reply replay capture");
         let actor = "slack:T0RESERVED:U0ADMIN001";
         assert_eq!(
             memory
@@ -5695,8 +6197,8 @@ mod tests {
         );
         assert_eq!(
             memory.counts("primary", actor).expect("counts").messages,
-            1,
-            "Slack event replay is one durable message"
+            2,
+            "Slack event and accepted reply each become one durable message"
         );
         let messages = memory
             .recent_messages(
@@ -5707,9 +6209,16 @@ mod tests {
                 5,
             )
             .expect("history");
-        assert_eq!(messages.len(), 1);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
         assert!(messages[0].content.contains("[REDACTED]"));
         assert!(!messages[0].content.contains("sk-123456789012345678901234"));
+        assert!(messages[1].content.contains("[REDACTED]"));
+        assert!(!messages[1].content.contains("sk-123456789012345678901234"));
+        let context = slack_event_context(&memory, "primary", &event);
+        assert!(context.contains("user: remember token [REDACTED]"));
+        assert!(context.contains("assistant: Je réponds dans ce thread; token [REDACTED]"));
 
         router
             .capture_memory(
@@ -5722,6 +6231,28 @@ mod tests {
                 .resolve_identity("slack", "automonique-slack", "T0RESERVED", "U0REQUEST01")
                 .expect("no binding"),
             None
+        );
+    }
+
+    #[test]
+    fn slack_reply_location_is_grounded_in_confirmed_conversation_history() {
+        assert_eq!(
+            slack_reply_location_answer(
+                "tu as répondu ou à Bruno ?",
+                "user: explique à Bruno\nassistant: Bruno, Ben teste le truc.\nuser: tu as répondu ou à Bruno ?",
+            )
+            .as_deref(),
+            Some(
+                "Ma réponse précédente a été publiée dans ce thread Slack. Je n’ai envoyé ni message privé ni second message ailleurs."
+            )
+        );
+        assert!(
+            slack_reply_location_answer(
+                "tu as répondu ou à Bruno ?",
+                "user: tu as répondu ou à Bruno ?",
+            )
+            .is_none(),
+            "without a confirmed assistant turn the helper must not invent delivery"
         );
     }
 
@@ -5957,6 +6488,62 @@ mod tests {
     }
 
     #[test]
+    fn slack_can_read_provider_instance_stats_by_question_or_command() {
+        let poster = FakeTicketPoster::default();
+        let messages = Arc::clone(&poster.messages);
+        let mut router = SlackTicketRouter {
+            poster,
+            manage: Box::new(FakeManage::default()),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
+            channels: ChannelMap(vec![(
+                name("ops"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![
+                SlackFeature::Approvals,
+                SlackFeature::Conversation,
+                SlackFeature::Commands,
+            ],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+            approvals: None,
+            approval_lane: None,
+            question_answerer: Some(Box::new(FakeProviderStatsAnswerer)),
+        };
+        let mut mention = ticket_event(
+            "U0ADMIN001",
+            "<@B0APP> montre les running Codex instances",
+            "EvAgents",
+        );
+        mention.app_mention = true;
+        router.handle_with_context(mention, "");
+        router.handle_monique_command(
+            SlackMoniqueCommand {
+                team_id: String::from("T0RESERVED"),
+                channel: ChannelId::new("C0RESERVED01").expect("channel"),
+                user: UserId::new("U0ADMIN001").expect("admin"),
+                source_key: String::from("slack:command:agents"),
+                text: String::from("agents"),
+            },
+            "",
+        );
+        assert_eq!(messages.lock().expect("messages").len(), 2);
+        assert!(
+            messages
+                .lock()
+                .expect("messages")
+                .iter()
+                .all(|message| message.contains("codex: live 2 | recorded 5"))
+        );
+    }
+
+    #[test]
     fn github_status_mentions_read_once_and_never_enter_ticket_intake() {
         let poster = FakeTicketPoster::default();
         let messages = Arc::clone(&poster.messages);
@@ -5986,7 +6573,7 @@ mod tests {
                 seen: Arc::clone(&issue_reads),
             })),
         };
-        let text = "<@B0APP> https://github.com/example/project/issues/42 is this done?";
+        let text = "<@B0APP> https://github.com/example/project/issues/42 il est fait celui là ?";
 
         // Slack's broad message subscription copy carries the same mention but
         // is not the event that owns conversational routing.
@@ -6020,6 +6607,70 @@ mod tests {
         assert!(answer.starts_with("Yes — GitHub marks this issue as closed."));
         assert!(answer.contains("example/project#42"));
         assert!(!answer.contains("Delivered change"));
+    }
+
+    #[test]
+    fn issue_review_is_read_only_while_run_opens_a_confirmation_gate() {
+        let poster = FakeTicketPoster::default();
+        let messages = Arc::clone(&poster.messages);
+        let manage = FakeManage::default();
+        let opened = Arc::clone(&manage.opened);
+        let reviews = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut router = SlackTicketRouter {
+            poster,
+            manage: Box::new(manage),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
+            channels: ChannelMap(vec![(
+                name("ops"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![SlackFeature::Approvals, SlackFeature::Conversation],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+            approvals: None,
+            approval_lane: None,
+            question_answerer: Some(Box::new(FakeIssueReviewAnswerer {
+                seen: Arc::clone(&reviews),
+            })),
+        };
+        const ISSUE: &str = "https://github.com/example/company-manager/issues/1212";
+
+        router.handle_with_context(
+            ticket_event("U0ADMIN001", &format!("review {ISSUE}"), "EvReview"),
+            "thread context",
+        );
+        router.handle_with_context(
+            ticket_event("U0ADMIN001", &format!("check {ISSUE}"), "EvCheck"),
+            "thread context",
+        );
+        assert!(opened.lock().expect("opened").is_empty());
+        assert_eq!(reviews.lock().expect("reviews").len(), 2);
+        assert!(
+            messages
+                .lock()
+                .expect("messages")
+                .iter()
+                .all(|message| message == "Typed GitHub issue review")
+        );
+
+        router.handle_with_context(
+            ticket_event("U0ADMIN001", &format!("run {ISSUE}"), "EvRun"),
+            "thread context",
+        );
+        assert_eq!(opened.lock().expect("opened").len(), 1);
+        assert!(
+            messages
+                .lock()
+                .expect("messages")
+                .iter()
+                .any(|message| message.contains("Confirmation required"))
+        );
     }
 
     #[test]

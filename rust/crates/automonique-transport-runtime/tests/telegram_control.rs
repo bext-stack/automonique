@@ -381,9 +381,9 @@ fn the_manifest_is_exhaustive_over_the_registry_and_round_trips() {
     assert_eq!(
         manifest.map(|entry| entry.name),
         [
-            "help", "status", "runs", "tickets", "ticket", "slack", "memory", "remember", "forget",
-            "new", "mute", "archive", "research", "gh", "work", "run", "say", "cancel", "approve",
-            "deny", "admin"
+            "help", "status", "runs", "agents", "job", "tickets", "ticket", "slack", "memory",
+            "remember", "forget", "new", "mute", "archive", "research", "gh", "work", "run", "say",
+            "cancel", "approve", "deny", "admin"
         ]
     );
     for entry in manifest {

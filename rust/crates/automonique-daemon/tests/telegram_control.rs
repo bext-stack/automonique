@@ -43,6 +43,7 @@ use automonique_store::agent_memory::{
     MemoryVisibility,
 };
 use automonique_store::operator_members::OperatorMemberStore;
+use automonique_store::provider_journal::{ProcessSpawn, ProviderJournal};
 use automonique_store::run_index::{RunIndex, RunIndexEntry};
 use automonique_store::support_tickets::{
     FleetTicket, SupportTicketStore, TicketLifecycle, TicketTransition,
@@ -478,6 +479,24 @@ impl Fixture {
         .with_prism_sites(&self.prism_sites_path)
         .with_local_knowledge(&self.local_knowledge_path)
         .with_provider_state(&self.provider_state_path)
+    }
+
+    fn seed_provider_runtime(&self) {
+        let mut journal = ProviderJournal::open(
+            self.provider_state_path
+                .join(automonique_daemon::PROVIDER_JOURNAL_NAME),
+        )
+        .expect("provider journal");
+        journal
+            .record_process(ProcessSpawn {
+                spawn_key: "fixture-spawn",
+                attempt_id: "fixture-attempt",
+                provider_kind: "codex",
+                executable_digest:
+                    "abababababababababababababababababababababababababababababababab",
+                spawned_ms: NOW_MS,
+            })
+            .expect("provider process");
     }
 
     fn seed_local_knowledge(&self) {
@@ -1182,9 +1201,25 @@ impl GitHubSurface for FakeGitHub {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct FakeGitHubActions {
     created: Arc<Mutex<Vec<RecordedGitHubCreate>>>,
+    aliases: Vec<String>,
+}
+
+impl Default for FakeGitHubActions {
+    fn default() -> Self {
+        Self::for_alias("automonique")
+    }
+}
+
+impl FakeGitHubActions {
+    fn for_alias(alias: &str) -> Self {
+        Self {
+            created: Arc::new(Mutex::new(Vec::new())),
+            aliases: vec![alias.to_owned()],
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1197,11 +1232,13 @@ struct RecordedGitHubCreate {
 
 impl GitHubActionSurface for FakeGitHubActions {
     fn repository_aliases(&self) -> Vec<String> {
-        vec![String::from("automonique")]
+        self.aliases.clone()
     }
 
     fn repository_labels(&mut self, alias: &str) -> Result<Vec<String>, String> {
-        (alias == "automonique")
+        self.aliases
+            .iter()
+            .any(|configured| configured == alias)
             .then(|| vec![String::from("bug")])
             .ok_or_else(|| String::from("not_found"))
     }
@@ -1670,6 +1707,37 @@ fn telegram_github_create_reaches_the_action_surface_not_ticket_intake() {
     assert!(rows[0].action_id.contains(":update:1"));
     assert!(outbound.messages()[0].contains("GitHub action completed"));
     assert!(outbound.messages()[0].contains("/issues/42"));
+}
+
+#[test]
+fn telegram_website_ticket_request_reaches_the_configured_github_action() {
+    let fixture = Fixture::new(&[]);
+    let outbound = FakeOutbound::default();
+    let actions = FakeGitHubActions::for_alias("gtonline");
+    let created = Arc::clone(&actions.created);
+    let lane = FakeRunLane::answering(
+        r#"{"proceed":true,"title":"Show the updated date","body":"Add it to Contact.","labels":[]}"#,
+    );
+    let mut bridge = bridge_with_github_actions(
+        &fixture,
+        FakeClient::new([updates(&[(
+            2,
+            OPERATOR,
+            "create ticket to add date updated to https://www.gtonline.fr/contact",
+        )])]),
+        outbound.clone(),
+        lane,
+        actions,
+    );
+
+    let report = poll(&mut bridge).expect("website ticket request dispatches");
+
+    assert_eq!(report.questions_queued, 0);
+    let rows = created.lock().expect("created issues");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].alias, "gtonline");
+    assert_eq!(rows[0].title, "Show the updated date");
+    assert!(outbound.messages()[0].contains("GitHub action completed"));
 }
 
 #[test]
@@ -2171,6 +2239,42 @@ fn named_slack_and_github_facts_are_read_live_before_fast_operational_answer() {
 }
 
 #[test]
+fn direct_issue_review_loads_full_github_context_without_a_router_turn() {
+    let fixture = Fixture::new(&[]);
+    let github = FakeGitHub::default();
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering("The issue is ready for a focused implementation review.");
+    let mut bridge = bridge_with_sources(
+        &fixture,
+        FakeClient::new([updates(&[(
+            12,
+            OPERATOR,
+            "review https://github.com/example/company-manager/issues/1212",
+        )])]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+        single_tier_roster(),
+        (None, Some(github.clone())),
+    );
+
+    assert_eq!(
+        poll(&mut bridge)
+            .expect("issue review queues")
+            .questions_queued,
+        1
+    );
+    assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
+    assert_eq!(github.seen(), ["example/company-manager#1212"]);
+    let prompts = lane.tasks();
+    assert_eq!(prompts.len(), 1, "the typed read skips intent routing");
+    assert!(prompts[0].contains("AUTOMONIQUE_READ_ONLY_QA_V1"));
+    assert!(prompts[0].contains("[live_github_issues]"));
+    assert!(prompts[0].contains("reference=example/company-manager#1212"));
+    assert!(outbound.messages()[0].contains("focused implementation review"));
+}
+
+#[test]
 fn natural_language_slack_post_composes_then_uses_the_typed_channel_effect() {
     let fixture = Fixture::new(&[]);
     let slack = FakeSlack::posting("Posted to #poetry (ts 1786903071.699).")
@@ -2397,6 +2501,11 @@ fn explicit_ticket_request_waits_for_an_admin_confirmation_before_work() {
     assert!(
         messages
             .iter()
+            .any(|message| message.contains("Status: /job fixture-job-123456"))
+    );
+    assert!(
+        messages
+            .iter()
             .any(|message| message.contains("Ticket confirmed")),
         "messages: {messages:?}"
     );
@@ -2410,6 +2519,113 @@ fn explicit_ticket_request_waits_for_an_admin_confirmation_before_work() {
             .iter()
             .all(|message| !message.contains("must not run"))
     );
+}
+
+#[test]
+fn run_issue_request_opens_a_confirmation_gate_instead_of_running_or_reviewing() {
+    let fixture = Fixture::new(&[]);
+    let actions = FakeTicketActions::succeeding();
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering("must not run");
+    let mut bridge = bridge_with_ticket_actions(
+        &fixture,
+        FakeClient::new([updates(&[(
+            13,
+            OPERATOR,
+            "run https://github.com/example/company-manager/issues/1212",
+        )])]),
+        outbound,
+        FakeSink::default(),
+        lane.clone(),
+        actions.clone(),
+    );
+
+    let report = poll(&mut bridge).expect("work request queues");
+    assert_eq!(report.ticket_actions_queued, 1);
+    assert_eq!(report.questions_queued, 0);
+    assert!(lane.tasks().is_empty());
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while actions.dispatches().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        actions.dispatches()[0].0,
+        "https://github.com/example/company-manager/issues/1212"
+    );
+    assert!(actions.confirmations().is_empty());
+}
+
+#[test]
+fn dispatched_issue_work_and_progress_reads_can_be_queued_together() {
+    let fixture = Fixture::new(&[]);
+    let actions = FakeTicketActions::succeeding();
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering("must not run");
+    let issue = "https://github.com/example/repo/issues/1007";
+    let mut bridge = bridge_with_ticket_actions(
+        &fixture,
+        FakeClient::new([
+            updates(&[
+                (20, OPERATOR, &format!("run {issue}")),
+                (
+                    21,
+                    OPERATOR,
+                    &format!("how is the work progressing on {issue}"),
+                ),
+            ]),
+            updates(&[]),
+        ]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+        actions.clone(),
+    );
+
+    let report = poll(&mut bridge).expect("both ticket operations queue");
+    assert_eq!(report.ticket_actions_queued, 2);
+    assert_eq!(report.questions_queued, 0);
+    assert!(lane.tasks().is_empty());
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while actions.dispatches().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    let _ = poll(&mut bridge).expect("ticket receipts settle");
+    let messages = outbound.messages();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("Ticket confirmation requested"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("Ticket work is now pending_approval")),
+        "messages: {messages:?}"
+    );
+}
+
+#[test]
+fn agents_command_reports_only_journalled_automonique_instances() {
+    let fixture = Fixture::new(&[]);
+    fixture.seed_provider_runtime();
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering("must not run");
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        FakeClient::new([updates(&[(30, OPERATOR, "/agents")])]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+
+    let report = poll(&mut bridge).expect("agents read");
+    assert_eq!(report.answered, 1);
+    assert!(lane.tasks().is_empty());
+    let message = &outbound.messages()[0];
+    assert!(message.contains("codex: live 1 | recorded 1"));
+    assert!(message.contains("parallel_capacity") || message.contains("up to 4 jobs"));
+    assert!(message.contains("Automonique-owned processes only"));
 }
 
 #[test]

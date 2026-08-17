@@ -60,6 +60,16 @@ pub enum GitHubManagementDomain {
     Project,
 }
 
+/// One natural-language request tied to exactly one canonical GitHub issue.
+///
+/// Read requests never cross an effect boundary. Work requests enter Manage's
+/// existing pending-confirmation gate; recognizing one does not release work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GitHubIssueRequestIntent {
+    Read { issue_url: String, deep: bool },
+    Work { issue_url: String },
+}
+
 impl GitHubManagementDomain {
     fn as_str(self) -> &'static str {
         match self {
@@ -132,6 +142,8 @@ where
         if capability_question(&normalized) {
             return Ok(None);
         }
+        let repository_aliases = self.surface.repository_aliases();
+        let website_aliases = repository_aliases_in_website_urls(text, &repository_aliases);
         let urls = issue_urls(text);
         let uncheck = contains_any(&normalized, &["uncheck", "décoche", "decoche"]);
         let check = !uncheck && contains_any(&normalized, &["check", "coche"]);
@@ -140,7 +152,7 @@ where
             &["reply", "respond", "comment", "répond", "repond"],
         );
         let create = contains_any(&normalized, &["create", "open", "crée", "cree", "ouvre"])
-            && normalized.contains("github")
+            && (normalized.contains("github") || website_aliases.len() == 1)
             && contains_any(&normalized, &["issue", "ticket"])
             && natural_management_domain(&normalized).is_none();
         let management_domain = natural_management_domain(&normalized);
@@ -218,11 +230,9 @@ where
                 .filter(|token| !token.is_empty())
                 .map(str::to_owned)
                 .collect();
-            let aliases: Vec<String> = self
-                .surface
-                .repository_aliases()
+            let aliases: Vec<String> = repository_aliases
                 .into_iter()
-                .filter(|alias| tokens.contains(alias))
+                .filter(|alias| tokens.contains(alias) || website_aliases.contains(alias))
                 .collect();
             let [alias] = aliases.as_slice() else {
                 return Err(String::from(
@@ -902,6 +912,211 @@ fn issue_urls(text: &str) -> Vec<String> {
     urls.into_iter().collect()
 }
 
+/// Separate issue review from ticket work before either transport considers a
+/// checklist mutation or generic conversational routing.
+pub fn natural_issue_request(text: &str) -> Result<Option<GitHubIssueRequestIntent>, String> {
+    // Verbs such as "check", "status", "do" and "work" are ordinary chat
+    // vocabulary. This router only owns a message once the sender supplied a
+    // canonical GitHub issue URL; without one, the rest of conversational
+    // routing must remain reachable.
+    let urls = issue_urls(text);
+    if urls.is_empty() {
+        return Ok(None);
+    }
+    let normalized = normalized(text);
+    let terms: BTreeSet<&str> = normalized
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .collect();
+    let status_read = contains_any(
+        &normalized,
+        &[
+            "is this done",
+            "is it done",
+            "is this complete",
+            "is this completed",
+            "is this closed",
+            "is this resolved",
+            "has this been done",
+            "has this been completed",
+            "what is the status",
+            "what's the status",
+            "status of this",
+            "does this work",
+            "did this run",
+            "has this run",
+            "was this run",
+            "est-ce terminé",
+            "est ce termine",
+            "est-ce fini",
+            "est ce fini",
+            "est-ce fait",
+            "est ce fait",
+            "il est fait",
+            "il est terminé",
+            "il est termine",
+            "est-il fait",
+            "est il fait",
+            "c'est fait",
+            "c’est fait",
+            "ça a été fait",
+            "ca a ete fait",
+        ],
+    );
+    let checklist_mutation = contains_any(
+        &normalized,
+        &[
+            "checklist",
+            "check list",
+            "check off",
+            "check the item",
+            "check item",
+            "checkbox",
+            "check box",
+            "mark as checked",
+            "coche ",
+            "décoche ",
+            "decoche ",
+        ],
+    );
+    let review = status_read
+        || terms.iter().any(|term| {
+            matches!(
+                *term,
+                "review"
+                    | "inspect"
+                    | "read"
+                    | "audit"
+                    | "analyze"
+                    | "analyse"
+                    | "summarize"
+                    | "summarise"
+                    | "résume"
+                    | "resume"
+                    | "vérifie"
+                    | "verifie"
+                    | "regarde"
+                    | "lis"
+                    | "statut"
+                    | "status"
+            )
+        })
+        || (terms.contains("check") && !checklist_mutation)
+        || contains_any(&normalized, &["look at", "take a look", "fais une revue"]);
+    let do_work = normalized.starts_with("do ")
+        || normalized.ends_with(" do")
+        || contains_any(
+            &normalized,
+            &[" do this", " do the issue", " do the ticket"],
+        );
+    let work = !status_read
+        && (do_work
+            || terms.iter().any(|term| {
+                matches!(
+                    *term,
+                    "run"
+                        | "handle"
+                        | "implement"
+                        | "fix"
+                        | "execute"
+                        | "build"
+                        | "deliver"
+                        | "ship"
+                        | "address"
+                        | "complete"
+                        | "work"
+                        | "faire"
+                        | "fais"
+                        | "traite"
+                        | "traiter"
+                        | "gère"
+                        | "gere"
+                        | "occupe"
+                        | "travaille"
+                        | "implémente"
+                        | "implemente"
+                        | "corrige"
+                        | "exécute"
+                        | "réalise"
+                        | "realise"
+                        | "livre"
+                )
+            }));
+    if !review && !work {
+        return Ok(None);
+    }
+    if review && work {
+        return Err(String::from(
+            "Choose either a read-only GitHub issue review or a work request that requires confirmation.",
+        ));
+    }
+    let [issue_url] = urls.as_slice() else {
+        return Err(String::from(
+            "Name exactly one full GitHub issue URL for that request.",
+        ));
+    };
+    if review {
+        let deep = !status_read;
+        return Ok(Some(GitHubIssueRequestIntent::Read {
+            issue_url: issue_url.clone(),
+            deep,
+        }));
+    }
+    Ok(Some(GitHubIssueRequestIntent::Work {
+        issue_url: issue_url.clone(),
+    }))
+}
+
+/// Resolve repository aliases only from the hostname of an explicit HTTPS URL.
+///
+/// This lets an administrator say `create ticket for https://www.example.test`
+/// when `example` is already an allowlisted repository alias. A URL path cannot
+/// select an alias, and no unconfigured hostname can widen the GitHub target.
+fn repository_aliases_in_website_urls(
+    text: &str,
+    configured_aliases: &[String],
+) -> BTreeSet<String> {
+    let mut matched = BTreeSet::new();
+    for token in text.split_whitespace() {
+        let token = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '"' | '\'' | '!' | '.'
+            )
+        });
+        let Some(remainder) = token.strip_prefix("https://") else {
+            continue;
+        };
+        let authority = remainder
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default()
+            .to_lowercase();
+        if authority.is_empty()
+            || authority.contains(['@', ':'])
+            || !authority.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+            })
+        {
+            continue;
+        }
+        let hostname = authority.strip_prefix("www.").unwrap_or(&authority);
+        let Some((site_name, suffix)) = hostname.split_once('.') else {
+            continue;
+        };
+        if site_name.is_empty() || suffix.is_empty() {
+            continue;
+        }
+        matched.extend(
+            configured_aliases
+                .iter()
+                .filter(|alias| alias.as_str() == site_name)
+                .cloned(),
+        );
+    }
+    matched
+}
+
 fn normalized(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
@@ -1144,6 +1359,77 @@ mod tests {
         assert!(!capability_question(
             "crée une issue github automonique pour le bug"
         ));
+    }
+
+    #[test]
+    fn a_configured_website_url_can_select_one_create_target_without_saying_github() {
+        let (engine, _, _) = engine("this answer must not be read");
+        assert_eq!(
+            engine
+                .natural_request(
+                    "create ticket to add date updated to https://www.automonique.fr/contact",
+                )
+                .expect("natural request"),
+            Some(GitHubActionRequest::Create {
+                alias: String::from("automonique"),
+                instruction: String::from(
+                    "create ticket to add date updated to https://www.automonique.fr/contact",
+                ),
+            })
+        );
+        assert_eq!(
+            engine
+                .natural_request(
+                    "create ticket to add date updated to https://www.unconfigured.invalid/contact",
+                )
+                .expect("unconfigured website"),
+            None
+        );
+        assert_eq!(
+            engine
+                .natural_request(
+                    "create ticket to add date updated to http://automonique.fr/contact",
+                )
+                .expect("insecure website URL"),
+            None
+        );
+    }
+
+    #[test]
+    fn issue_reads_and_confirmed_work_are_distinct_from_checklist_mutations() {
+        const ISSUE: &str = "https://github.com/example/company-manager/issues/1212";
+        for request in [
+            format!("check {ISSUE}"),
+            format!("review {ISSUE}"),
+            format!("inspect {ISSUE}"),
+            format!("what is the status of this {ISSUE}"),
+            format!("{ISSUE} il est fait celui là ?"),
+        ] {
+            assert!(matches!(
+                natural_issue_request(&request).expect("read intent"),
+                Some(GitHubIssueRequestIntent::Read { .. })
+            ));
+        }
+        for request in [
+            format!("run {ISSUE}"),
+            format!("do {ISSUE}"),
+            format!("handle {ISSUE}"),
+            format!("fix {ISSUE}"),
+            format!("implement {ISSUE}"),
+        ] {
+            assert_eq!(
+                natural_issue_request(&request).expect("work intent"),
+                Some(GitHubIssueRequestIntent::Work {
+                    issue_url: String::from(ISSUE),
+                })
+            );
+        }
+        assert_eq!(
+            natural_issue_request(&format!("check checklist item release on {ISSUE}"))
+                .expect("checklist action remains separate"),
+            None
+        );
+        assert!(natural_issue_request(&format!("review and fix {ISSUE}")).is_err());
     }
 
     #[test]

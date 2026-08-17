@@ -842,6 +842,47 @@ fn completed_turn_usage_is_atomic_durable_and_aggregated() {
 }
 
 #[test]
+fn runtime_stats_group_live_provider_processes_without_exposing_identifiers() {
+    let (_private, mut journal) = journal();
+    let _ = live_turn(&mut journal);
+    let claude = journal
+        .record_process(ProcessSpawn {
+            spawn_key: "spawn-claude",
+            attempt_id: "attempt-claude",
+            provider_kind: "claude",
+            executable_digest: EXECUTABLE_DIGEST,
+            spawned_ms: 60,
+        })
+        .expect("record claude process");
+    journal
+        .finish_process(ProcessExit {
+            process_id: claude.process_id,
+            expected_revision: claude.revision,
+            now_ms: 70,
+            termination: ProcessTermination::Exited,
+        })
+        .expect("settle claude process");
+
+    let stats = journal.runtime_stats().expect("runtime stats");
+    assert_eq!(stats.sessions_recorded, 1);
+    assert_eq!(stats.sessions_open, 1);
+    assert_eq!(stats.turns_recorded, 1);
+    assert_eq!(stats.turns_open, 1);
+    assert_eq!(stats.usage.requests, 0);
+    assert_eq!(stats.providers.len(), 2);
+    assert_eq!(stats.providers[0].provider_kind, "claude");
+    assert_eq!(
+        (stats.providers[0].live, stats.providers[0].recorded),
+        (0, 1)
+    );
+    assert_eq!(stats.providers[1].provider_kind, "codex");
+    assert_eq!(
+        (stats.providers[1].live, stats.providers[1].recorded),
+        (1, 1)
+    );
+}
+
+#[test]
 fn a_v1_journal_migrates_to_the_usage_schema() {
     let (private, journal) = journal();
     drop(journal);

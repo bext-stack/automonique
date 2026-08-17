@@ -870,6 +870,25 @@ pub struct UsageTotals {
     pub output_tokens: u64,
 }
 
+/// One provider kind's durable process counts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderProcessStats {
+    pub provider_kind: String,
+    pub recorded: u64,
+    pub live: u64,
+}
+
+/// Aggregate process/session/turn state owned by this journal.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProviderRuntimeStats {
+    pub providers: Vec<ProviderProcessStats>,
+    pub sessions_recorded: u64,
+    pub sessions_open: u64,
+    pub turns_recorded: u64,
+    pub turns_open: u64,
+    pub usage: UsageTotals,
+}
+
 /// Validated `provider_requests` row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestRow {
@@ -1401,6 +1420,56 @@ impl ProviderJournal {
             requests: from_db_u64(requests, "usage_requests")?,
             input_tokens: from_db_u64(input_tokens, "usage_input_tokens")?,
             output_tokens: from_db_u64(output_tokens, "usage_output_tokens")?,
+        })
+    }
+
+    /// Summarize Automonique-owned provider runtime state without reading any
+    /// prompt, response, session key, executable path or process identifier.
+    pub fn runtime_stats(&self) -> Journalled<ProviderRuntimeStats> {
+        let mut statement = self.connection.prepare(
+            "SELECT provider_kind, count(*),
+                    coalesce(sum(CASE WHEN state = 'live' THEN 1 ELSE 0 END), 0)
+             FROM provider_processes
+             GROUP BY provider_kind
+             ORDER BY provider_kind",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut providers = Vec::new();
+        for row in rows {
+            let (provider_kind, recorded, live) = row?;
+            providers.push(ProviderProcessStats {
+                provider_kind: checked_bounded(provider_kind, MAX_KIND_BYTES, "provider_kind")?,
+                recorded: from_db_u64(recorded, "provider_processes_recorded")?,
+                live: from_db_u64(live, "provider_processes_live")?,
+            });
+        }
+        let (sessions_recorded, sessions_open): (i64, i64) = self.connection.query_row(
+            "SELECT count(*),
+                    coalesce(sum(CASE WHEN state = 'open' THEN 1 ELSE 0 END), 0)
+             FROM provider_sessions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (turns_recorded, turns_open): (i64, i64) = self.connection.query_row(
+            "SELECT count(*),
+                    coalesce(sum(CASE WHEN state = 'open' THEN 1 ELSE 0 END), 0)
+             FROM provider_turns",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(ProviderRuntimeStats {
+            providers,
+            sessions_recorded: from_db_u64(sessions_recorded, "provider_sessions_recorded")?,
+            sessions_open: from_db_u64(sessions_open, "provider_sessions_open")?,
+            turns_recorded: from_db_u64(turns_recorded, "provider_turns_recorded")?,
+            turns_open: from_db_u64(turns_open, "provider_turns_open")?,
+            usage: self.usage_totals()?,
         })
     }
 
