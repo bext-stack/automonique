@@ -9,12 +9,20 @@ const yesNo = (value) => value === true ? "YES" : value === false ? "NO" : "—"
 let memorySnapshot = null;
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
+  const request = () => fetch(path, {
     cache: "no-store",
     credentials: "same-origin",
     ...options,
     headers: { Accept: "application/json", ...(options.headers || {}) },
   });
+  let response = await request();
+  // The authenticated document response mints the HttpOnly API session. Some
+  // browsers can start a deferred script's first fetch before that cookie has
+  // finished committing, so retry that one bootstrap race exactly once.
+  if (response.status === 401) {
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+    response = await request();
+  }
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
   return payload;
