@@ -1286,6 +1286,63 @@ pub trait TicketActionSurface {
     fn ticket_status(&mut self, job_id: &str) -> Result<TicketStatus, String>;
 }
 
+/// Resolve a persisted gate through Manage before applying a decision.
+///
+/// Older releases retained the newest chat message key when Manage
+/// deduplicated to an older job. A read-only dispatch returns that job's exact
+/// source coordinate; the job id check prevents a different job from being
+/// substituted before approval or rejection.
+pub(crate) fn canonical_ticket_source(
+    surface: &mut dyn TicketActionSurface,
+    job_id: &str,
+    issue_url: &str,
+    source_key: &str,
+) -> Result<String, String> {
+    let receipt = surface.dispatch_ticket(issue_url, source_key)?;
+    if receipt.job_id != job_id {
+        return Err(String::from("source_mismatch"));
+    }
+    Ok(receipt.source_key)
+}
+
+pub(crate) fn confirm_bound_ticket(
+    surface: &mut dyn TicketActionSurface,
+    job_id: &str,
+    issue_url: &str,
+    source_key: &str,
+) -> Result<TicketDispatchReceipt, String> {
+    let receipt = surface.confirm_ticket(issue_url, source_key)?;
+    if receipt.job_id == job_id && !receipt.approved && receipt.source_key != source_key {
+        return surface.confirm_ticket(issue_url, &receipt.source_key);
+    }
+    Ok(receipt)
+}
+
+pub(crate) fn decide_bound_ticket(
+    surface: &mut dyn TicketActionSurface,
+    job_id: &str,
+    issue_url: &str,
+    source_key: &str,
+    decision_key: &str,
+    actor_key: &str,
+    decision: TicketDecision,
+) -> Result<TicketDecisionReceipt, String> {
+    match surface.decide_ticket(
+        job_id,
+        source_key,
+        decision_key,
+        actor_key,
+        decision.clone(),
+    ) {
+        Err(reason) if reason == "source_mismatch" => {
+            canonical_ticket_source(surface, job_id, issue_url, source_key).and_then(|canonical| {
+                surface.decide_ticket(job_id, &canonical, decision_key, actor_key, decision)
+            })
+        }
+        result => result,
+    }
+}
+
 impl TicketActionSurface for FleetClient {
     fn dispatch_ticket(
         &mut self,
@@ -3434,10 +3491,13 @@ impl TicketActionWorker {
                                     false,
                                 ),
                                 [gate] => {
-                                    match surface.confirm_ticket(
+                                    let result = confirm_bound_ticket(
+                                        surface.as_mut(),
+                                        &gate.job_id,
                                         &gate.issue_url,
                                         &gate.source_key,
-                                    ) {
+                                    );
+                                    match result {
                                         Ok(receipt) if receipt.approved => {
                                             let _ = worker_gates
                                                 .lock()
@@ -3498,8 +3558,10 @@ impl TicketActionWorker {
                                         String::from("That rejection could not be composed, so nothing was decided."),
                                         false,
                                     ),
-                                    Ok(decision) => match surface.decide_ticket(
+                                    Ok(decision) => match decide_bound_ticket(
+                                        surface.as_mut(),
                                         &gate.job_id,
+                                        &gate.issue_url,
                                         &gate.source_key,
                                         &job.decision_key,
                                         &job.actor_key,
@@ -14912,15 +14974,28 @@ mod cross_transport_gate_tests {
     #[derive(Default)]
     struct FakeManage {
         confirmations: Arc<Mutex<Vec<(String, String)>>>,
+        canonical_source: Option<String>,
     }
 
     impl TicketActionSurface for FakeManage {
         fn dispatch_ticket(
             &mut self,
-            _issue_url: &str,
-            _source_key: &str,
+            issue_url: &str,
+            source_key: &str,
         ) -> Result<TicketDispatchReceipt, String> {
-            Err(String::from("not used"))
+            Ok(TicketDispatchReceipt {
+                issue_id: String::from("fixture-issue"),
+                issue_url: issue_url.to_owned(),
+                issue_title: String::from("Fixture"),
+                project_label: String::from("Fixture"),
+                site_label: None,
+                workspace: TicketWorkspace::InstanceDefault,
+                job_id: String::from("slack-job-123456"),
+                source_key: source_key.to_owned(),
+                job_status: TicketJobStatus::PendingApproval,
+                duplicate: true,
+                approved: false,
+            })
         }
 
         fn confirm_ticket(
@@ -14932,6 +15007,10 @@ mod cross_transport_gate_tests {
                 .lock()
                 .expect("confirmations")
                 .push((issue_url.to_owned(), source_key.to_owned()));
+            let canonical = self
+                .canonical_source
+                .clone()
+                .unwrap_or_else(|| source_key.to_owned());
             Ok(TicketDispatchReceipt {
                 issue_id: String::from("fixture-issue"),
                 issue_url: issue_url.to_owned(),
@@ -14940,16 +15019,50 @@ mod cross_transport_gate_tests {
                 site_label: None,
                 workspace: TicketWorkspace::InstanceDefault,
                 job_id: String::from("slack-job-123456"),
-                source_key: source_key.to_owned(),
-                job_status: TicketJobStatus::Pending,
-                duplicate: false,
-                approved: true,
+                source_key: canonical.clone(),
+                job_status: if canonical == source_key {
+                    TicketJobStatus::Pending
+                } else {
+                    TicketJobStatus::PendingApproval
+                },
+                duplicate: canonical != source_key,
+                approved: canonical == source_key,
             })
         }
 
         fn ticket_status(&mut self, _job_id: &str) -> Result<TicketStatus, String> {
             Err(String::from("not used"))
         }
+    }
+
+    #[test]
+    fn confirmation_recovers_the_canonical_source_of_a_persisted_old_gate() {
+        let confirmations = Arc::new(Mutex::new(Vec::new()));
+        let mut manage = FakeManage {
+            confirmations: Arc::clone(&confirmations),
+            canonical_source: Some(String::from("slack:T0RESERVED:event:original")),
+        };
+        let receipt = confirm_bound_ticket(
+            &mut manage,
+            "slack-job-123456",
+            "https://github.com/example/project/issues/42",
+            "slack:T0RESERVED:event:new",
+        )
+        .expect("canonical confirmation");
+        assert!(receipt.approved);
+        assert_eq!(
+            confirmations.lock().expect("confirmations").as_slice(),
+            [
+                (
+                    String::from("https://github.com/example/project/issues/42"),
+                    String::from("slack:T0RESERVED:event:new"),
+                ),
+                (
+                    String::from("https://github.com/example/project/issues/42"),
+                    String::from("slack:T0RESERVED:event:original"),
+                ),
+            ]
+        );
     }
 
     #[test]

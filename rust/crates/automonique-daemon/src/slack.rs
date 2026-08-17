@@ -3100,10 +3100,13 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                 );
                 return;
             };
-            let reply = match self
-                .manage
-                .confirm_ticket(&pending.issue_url, &pending.source_key)
-            {
+            let result = crate::telegram_bridge::confirm_bound_ticket(
+                self.manage.as_mut(),
+                &pending.job_id,
+                &pending.issue_url,
+                &pending.source_key,
+            );
+            let reply = match result {
                 Ok(receipt) if receipt.approved => {
                     let _ = self
                         .gates
@@ -3157,13 +3160,16 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                 return;
             };
             let actor_key = format!("slack:{}:{}", command.team_id, command.user);
-            let reply = match self.manage.decide_ticket(
+            let result = crate::telegram_bridge::decide_bound_ticket(
+                self.manage.as_mut(),
                 &pending.job_id,
+                &pending.issue_url,
                 &pending.source_key,
                 &command.source_key,
                 &actor_key,
                 decision,
-            ) {
+            );
+            let reply = match result {
                 Ok(receipt) if receipt.decision == TicketDecisionOutcome::Rejected => {
                     let _ = self
                         .gates
@@ -3495,8 +3501,10 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             TicketDecision::Reject { .. } => TicketDecisionOutcome::Rejected,
         };
         let actor_key = format!("slack:{}:{}", interaction.team_id, interaction.user);
-        let decision_result = self.manage.decide_ticket(
+        let decision_result = crate::telegram_bridge::decide_bound_ticket(
+            self.manage.as_mut(),
             &gate.job_id,
+            &gate.issue_url,
             &gate.source_key,
             &interaction.interaction_key,
             &actor_key,
@@ -4141,10 +4149,13 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                 .post_thread(&event.channel, &event.parent, reply);
             return;
         };
-        match self
-            .manage
-            .confirm_ticket(&pending.issue_url, &pending.source_key)
-        {
+        let result = crate::telegram_bridge::confirm_bound_ticket(
+            self.manage.as_mut(),
+            &pending.job_id,
+            &pending.issue_url,
+            &pending.source_key,
+        );
+        match result {
             Ok(receipt) if receipt.approved => {
                 let _ = self
                     .gates
@@ -6441,6 +6452,7 @@ mod tests {
     struct FakeManage {
         opened: Arc<std::sync::Mutex<Vec<(String, String)>>>,
         confirmed: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        canonical_source: Option<String>,
     }
 
     struct FakeQuestionAnswerer {
@@ -6600,7 +6612,12 @@ mod tests {
                 .lock()
                 .expect("opened")
                 .push((issue_url.to_owned(), source_key.to_owned()));
-            Ok(ticket_receipt(false))
+            let mut receipt = ticket_receipt(false);
+            receipt.source_key = self
+                .canonical_source
+                .clone()
+                .unwrap_or_else(|| source_key.to_owned());
+            Ok(receipt)
         }
 
         fn confirm_ticket(
@@ -6612,7 +6629,9 @@ mod tests {
                 .lock()
                 .expect("confirmed")
                 .push((issue_url.to_owned(), source_key.to_owned()));
-            Ok(ticket_receipt(true))
+            let mut receipt = ticket_receipt(true);
+            receipt.source_key = source_key.to_owned();
+            Ok(receipt)
         }
 
         fn ticket_status(
@@ -7263,7 +7282,7 @@ mod tests {
             .lock()
             .expect("gates")
             .register(crate::telegram_bridge::PendingTicketGate {
-                job_id: String::from("job-from-telegram-123"),
+                job_id: String::from("job-fixture-123456"),
                 issue_url: String::from("https://github.com/example/project/issues/42"),
                 source_key: String::from("telegram:123:update:9"),
             })
@@ -7287,10 +7306,7 @@ mod tests {
             approval_lane: None,
             question_answerer: None,
         };
-        router.handle_with_context(
-            ticket_event("U0ADMIN001", "confirm job-from-telegram", "Ev4"),
-            "",
-        );
+        router.handle_with_context(ticket_event("U0ADMIN001", "confirm job-fixture", "Ev4"), "");
         assert_eq!(
             confirmed.lock().expect("confirmed").as_slice(),
             [(
@@ -8036,7 +8052,10 @@ mod tests {
     fn a_plain_admin_issue_url_is_summarized_and_opens_a_confirmation_gate() {
         let poster = FakeTicketPoster::default();
         let messages = Arc::clone(&poster.messages);
-        let manage = FakeManage::default();
+        let manage = FakeManage {
+            canonical_source: Some(String::from("slack:T0RESERVED:event:EvFixture")),
+            ..FakeManage::default()
+        };
         let opened = Arc::clone(&manage.opened);
         let reviews = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut router = SlackTicketRouter {
