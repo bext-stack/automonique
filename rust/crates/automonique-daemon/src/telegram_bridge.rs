@@ -10045,14 +10045,6 @@ pub(crate) fn deterministic_conversation_answer(text: &str) -> Option<&'static s
     small_talk_answer(text)
 }
 
-/// Run the same closed, read-only conversational router for a non-Telegram
-/// transport.
-///
-/// The caller supplies only already-admitted prose, bounded conversation
-/// context and typed daemon seams. Model output may select a closed read plan,
-/// but it cannot select a mutation: Slack posts and MCP effects are refused on
-/// this surface. This keeps Slack mentions intelligent without creating a
-/// second authority model beside Telegram's question path.
 /// The transport facts handed to the conversational router for one Slack
 /// thread reply.
 ///
@@ -10067,6 +10059,14 @@ pub(crate) const SLACK_THREAD_TRANSPORT_CONTEXT: &str = "surface=slack_thread\n\
      mentions=copy an exact <@USERID> token verbatim from the admin message or the conversation into the answer to make a real Slack tag that notifies that person; a bare display name may be addressed by name but is not a verified tag\n\
      truth=never claim Slack is unavailable and never claim a separate post, DM, tag, or delivery occurred";
 
+/// Run the same closed, read-only conversational router for a non-Telegram
+/// transport.
+///
+/// The caller supplies only already-admitted prose, bounded conversation
+/// context and typed daemon seams. Model output may select a closed read plan,
+/// but it cannot select a mutation: Slack posts and MCP effects are refused on
+/// this surface. This keeps Slack mentions intelligent without creating a
+/// second authority model beside Telegram's question path.
 pub(crate) fn answer_read_only_transport_question(
     surface: &mut dyn ControlSurface,
     lane: &mut dyn RunLane,
