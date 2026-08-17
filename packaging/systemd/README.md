@@ -24,12 +24,17 @@ claims confirmed jobs with bounded parallelism, and streams their progress back
 to AI Operations. It runs from the same immutable release as the daemon.
 
 The optional hosted dashboard is deliberately separate from the daemon.
-`automonique-web-entry.service` binds a small Rust read-only dashboard server
-to loopback; `automonique-web-tunnel.service` publishes it through an
-operator-provisioned Cloudflare tunnel. The dashboard reads a sanitized status
-projection through the same peer-authenticated local protocol as the CLI and
-keeps mutations on the authenticated Manage console. The retired hostname
-redirects to the canonical dashboard hostname.
+`automonique-web-entry.service` binds a small Rust operations console to
+loopback; `automonique-web-tunnel.service` publishes it through an
+operator-provisioned Cloudflare tunnel. The console reads a sanitized status
+projection through the same peer-authenticated local protocol as the CLI. Its
+Slack tool is strictly read-only. When both `manage/manage.conf` and a unique
+same-origin server in `mcp/servers.json` are present, chat can also discover
+Manage AI Operations tools. Tools explicitly annotated as read-only can ground
+an answer immediately. Every other tool becomes an in-chat action card showing
+its proposed arguments and runs once only after the operator explicitly
+approves it. Denial and expiry change nothing. The retired hostname redirects
+to the canonical dashboard hostname.
 Every dashboard resource and API response on the canonical hostname requires
 HTTP Basic authentication over the Cloudflare TLS boundary. The strict private
 credential file is `%S/automonique/dashboard-auth.conf`; it stores a username
@@ -44,6 +49,12 @@ hostnames. The hostnames are deployment configuration rather than repository
 identifiers; the tenant and actor remain absent from every web configuration
 response. Chat turns use the daemon's contained run lane and
 the canonical memory database, rather than a dashboard-specific provider path.
+The dashboard reuses the deployment's private Manage URL and MCP credentials;
+it never embeds a production address, token, app identity or header in source.
+The configuration API exposes capability booleans and the validated console
+link, but keeps all authentication material concealed. If Manage or its exact
+same-origin MCP server is absent, Manage actions are simply unavailable rather
+than guessed.
 Create both private files with the binding helper, supplying deployment-owned
 hostnames explicitly:
 

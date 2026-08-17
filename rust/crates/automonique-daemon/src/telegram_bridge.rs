@@ -12896,6 +12896,8 @@ mod clock_tests {
             server: String::from("support"),
             name: String::from("support_list_tickets"),
             description: String::from("List support tickets"),
+            input_schema: serde_json::json!({ "type": "object" }),
+            read_only: true,
         }];
         let intent = model_question_intent(
             r#"{"kind":"mcp_call","server":"support","tool":"support_list_tickets","arguments":{"limit":10}}"#,

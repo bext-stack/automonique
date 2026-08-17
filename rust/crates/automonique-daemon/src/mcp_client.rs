@@ -25,6 +25,8 @@ pub struct McpToolDescriptor {
     pub server: String,
     pub name: String,
     pub description: String,
+    pub input_schema: Value,
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -96,6 +98,22 @@ impl McpRegistry {
     #[must_use]
     pub fn has_server(&self, name: &str) -> bool {
         self.servers.iter().any(|server| server.name == name)
+    }
+
+    /// Return the one configured server on the same HTTPS origin as `url`.
+    ///
+    /// Ambiguous or malformed matches stay disabled. This lets an optional
+    /// product integration bind to its private MCP endpoint without naming a
+    /// deployment-specific server in source.
+    #[must_use]
+    pub fn unique_server_for_https_origin(&self, url: &str) -> Option<String> {
+        let origin = https_origin(url)?;
+        let mut matching = self
+            .servers
+            .iter()
+            .filter(|server| https_origin(&server.url).as_deref() == Some(origin.as_str()));
+        let server = matching.next()?;
+        matching.next().is_none().then(|| server.name.clone())
     }
 
     #[must_use]
@@ -190,11 +208,65 @@ impl McpRegistry {
                         .chars()
                         .take(500)
                         .collect(),
+                    input_schema: bounded_input_schema(tool)?,
+                    read_only: tool
+                        .pointer("/annotations/readOnlyHint")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                 });
             }
             discovered.insert(server.name.clone(), names);
         }
         self.discovered = discovered;
+        Ok(output)
+    }
+
+    /// Discover only one operator-configured server and retain its exact tool
+    /// allowlist for subsequent calls.
+    pub fn discover_server(
+        &mut self,
+        server_name: &str,
+    ) -> Result<Vec<McpToolDescriptor>, McpFailure> {
+        let server = self
+            .servers
+            .iter()
+            .find(|server| server.name == server_name)
+            .cloned()
+            .ok_or(McpFailure::NotAllowed)?;
+        let value = self.request(&server, "tools/list", None, json!({}))?;
+        let tools = value
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .ok_or(McpFailure::Protocol)?;
+        let mut names = BTreeSet::new();
+        let mut output = Vec::new();
+        for tool in tools.iter().take(256) {
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| valid_label(name))
+                .ok_or(McpFailure::Protocol)?;
+            if !names.insert(name.to_owned()) {
+                return Err(McpFailure::Protocol);
+            }
+            output.push(McpToolDescriptor {
+                server: server.name.clone(),
+                name: name.to_owned(),
+                description: tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .chars()
+                    .take(500)
+                    .collect(),
+                input_schema: bounded_input_schema(tool)?,
+                read_only: tool
+                    .pointer("/annotations/readOnlyHint")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            });
+        }
+        self.discovered.insert(server.name, names);
         Ok(output)
     }
 
@@ -323,6 +395,38 @@ fn valid_endpoint(value: &str) -> bool {
         || value.starts_with("http://127.0.0.1:")
         || value.starts_with("http://[::1]:")
 }
+
+fn https_origin(value: &str) -> Option<String> {
+    let remainder = value.strip_prefix("https://")?;
+    let authority = remainder.split(['/', '?', '#']).next()?;
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority.starts_with('.')
+        || authority.ends_with('.')
+        || authority
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some(format!("https://{}", authority.to_ascii_lowercase()))
+}
+
+fn bounded_input_schema(tool: &Value) -> Result<Value, McpFailure> {
+    let schema = tool
+        .get("inputSchema")
+        .cloned()
+        .unwrap_or_else(|| json!({ "type": "object" }));
+    if !schema.is_object()
+        || serde_json::to_vec(&schema)
+            .map_err(|_| McpFailure::Protocol)?
+            .len()
+            > 16 * 1024
+    {
+        return Err(McpFailure::Protocol);
+    }
+    Ok(schema)
+}
 fn valid_header(name: &str, value: &str) -> bool {
     !name.eq_ignore_ascii_case("authorization")
         && name.to_ascii_lowercase().starts_with("mcp-")
@@ -387,13 +491,47 @@ mod tests {
     }
 
     #[test]
+    fn an_https_origin_selects_exactly_one_configured_server() {
+        let server = |name: &str, url: &str| ServerConfig {
+            name: name.to_owned(),
+            url: url.to_owned(),
+            token: String::from("0123456789abcdef"),
+            headers: BTreeMap::new(),
+        };
+        let mut registry = McpRegistry {
+            agent: agent(),
+            servers: vec![server(
+                "business",
+                "https://manage.example.test/api/v1/agent/mcp",
+            )],
+            discovered: BTreeMap::new(),
+        };
+        assert_eq!(
+            registry.unique_server_for_https_origin("https://MANAGE.example.test/manage"),
+            Some(String::from("business"))
+        );
+        assert_eq!(
+            registry.unique_server_for_https_origin("https://support.example.test/"),
+            None
+        );
+        registry.servers.push(server(
+            "duplicate",
+            "https://manage.example.test/another-mcp",
+        ));
+        assert_eq!(
+            registry.unique_server_for_https_origin("https://manage.example.test/manage"),
+            None
+        );
+    }
+
+    #[test]
     fn discovery_binds_calls_and_decodes_input_required() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let discovery = serve_once(
                 &listener,
-                r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"support_reply_to_ticket","description":"Reply"}]}}"#,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"support_reply_to_ticket","description":"Reply","annotations":{"readOnlyHint":false}}]}}"#,
             );
             let call = serve_once(
                 &listener,
@@ -408,8 +546,9 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
         let mut registry = McpRegistry::load(root.path()).unwrap();
-        let tools = registry.discover().unwrap();
+        let tools = registry.discover_server("support").unwrap();
         assert_eq!(tools[0].name, "support_reply_to_ticket");
+        assert!(!tools[0].read_only);
         let result = registry
             .call(
                 "support",

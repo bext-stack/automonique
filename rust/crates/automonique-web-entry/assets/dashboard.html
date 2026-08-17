@@ -6,24 +6,24 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <meta name="theme-color" content="#0b0d10">
-    <title>Monique Ops</title>
-    <link rel="icon" href="/favicon.svg?v=2" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=2">
-    <script src="/assets/dashboard.js?v=2" defer></script>
+    <title>Monique</title>
+    <link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml">
+    <link rel="stylesheet" href="/assets/dashboard.css?v=3">
+    <script src="/assets/dashboard.js?v=3" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
     <div class="app-shell">
       <aside class="sidebar">
-        <a class="identity" href="#overview" aria-label="Monique operations home">
+        <a class="identity" href="#chat" aria-label="Open Monique chat">
           <span class="identity-mark">M</span>
-          <span><strong>MONIQUE</strong><small>OPERATIONS</small></span>
+          <span><strong>MONIQUE</strong><small>AI OPERATIONS</small></span>
         </a>
         <nav class="primary-nav" aria-label="Operations sections">
-          <button class="nav-item is-active" data-view="overview"><span>01</span>Overview</button>
-          <button class="nav-item" data-view="chat"><span>02</span>Chat</button>
-          <button class="nav-item" data-view="memory"><span>03</span>Memory</button>
-          <button class="nav-item" data-view="configuration"><span>04</span>Configuration</button>
+          <button class="nav-item is-active" data-view="overview"><span aria-hidden="true">⌂</span>Overview</button>
+          <button class="nav-item" data-view="chat"><span aria-hidden="true">✦</span>Chat</button>
+          <button class="nav-item" data-view="memory"><span aria-hidden="true">◇</span>Memory</button>
+          <button class="nav-item" data-view="configuration"><span aria-hidden="true">⚙</span>Configuration</button>
         </nav>
         <div class="sidebar-foot">
           <span class="lock-mark" aria-hidden="true">◆</span>
@@ -38,14 +38,15 @@
             <span class="status-dot" aria-hidden="true"></span>
             <strong id="global-health">Connecting</strong>
             <span id="global-observed">No snapshot</span>
+            <button class="refresh-button" id="status-refresh" type="button" aria-label="Refresh operational status" title="Refresh status">↻</button>
           </div>
         </header>
 
         <main id="workspace">
           <section class="view is-visible" data-panel="overview" aria-labelledby="overview-title">
             <div class="page-heading">
-              <div><p class="kicker">CONTROL PLANE / LIVE</p><h1 id="overview-title">Operations overview</h1></div>
-              <a class="button secondary" href="https://manage.inklura.fr/manage">Open Manage ↗</a>
+              <div><p class="kicker">CONTROL PLANE / LIVE</p><h1 id="overview-title">Operations overview</h1><p class="page-lede">A live, secret-safe view of Monique’s execution path and delivery certainty.</p></div>
+              <div class="heading-actions"><button class="button primary" type="button" data-open-chat="Explain Monique’s current operational health and name anything that needs attention.">Ask Monique</button><a class="button secondary" id="manage-link" rel="noreferrer" target="_blank" hidden>Open Manage ↗</a></div>
             </div>
 
             <div class="attention-bar" id="attention-bar">
@@ -61,6 +62,13 @@
               <article><span>RECONCILE</span><strong id="metric-reconciliation">—</strong><small>manual outcomes</small></article>
               <article><span>AMBIGUOUS</span><strong id="metric-ambiguous">—</strong><small>uncertain effects</small></article>
               <article><span>ATTENTION</span><strong id="metric-attention">—</strong><small>failed invariants</small></article>
+            </div>
+
+            <div class="brief-strip" aria-label="Suggested operational questions">
+              <span>QUICK BRIEFS</span>
+              <button type="button" data-open-chat="Explain Monique’s current operational health and name anything that needs attention.">Explain health</button>
+              <button type="button" data-open-chat="Summarize the latest relevant Slack messages. Ask me which configured channel if the target is ambiguous.">Read Slack activity</button>
+              <button type="button" data-open-chat="What durable memory is most relevant to the current operational state? Cite its memory references.">Review memory</button>
             </div>
 
             <div class="ops-grid">
@@ -85,21 +93,52 @@
                   <div><dt>Snapshot</dt><dd id="runtime-snapshot">—</dd></div>
                 </dl>
               </article>
+
+              <article class="panel span-12 pulse-panel">
+                <div class="panel-head"><div><p class="kicker">CLIENT OBSERVATION WINDOW</p><h2>System pulse</h2></div><span class="tag" id="pulse-tag">COLLECTING</span></div>
+                <div class="pulse-body">
+                  <div class="pulse-chart-wrap">
+                    <svg id="status-pulse" class="pulse-chart" viewBox="0 0 720 160" role="img" aria-labelledby="pulse-title pulse-description" preserveAspectRatio="none">
+                      <title id="pulse-title">Recent operational queue levels</title>
+                      <desc id="pulse-description">Client-observed history for running work, inbox, and outbox counts.</desc>
+                      <g class="pulse-grid" aria-hidden="true"><path d="M0 20H720M0 60H720M0 100H720M0 140H720"></path></g>
+                      <polyline id="pulse-inbox" class="pulse-line inbox" points=""></polyline>
+                      <polyline id="pulse-outbox" class="pulse-line outbox" points=""></polyline>
+                      <polyline id="pulse-running" class="pulse-line running" points=""></polyline>
+                    </svg>
+                    <div class="pulse-legend" aria-hidden="true"><span class="running">Running</span><span class="inbox">Inbox</span><span class="outbox">Outbox</span></div>
+                  </div>
+                  <dl class="pulse-facts">
+                    <div><dt>Samples</dt><dd id="pulse-samples">0</dd></div>
+                    <div><dt>Window</dt><dd id="pulse-window">Just started</dd></div>
+                    <div><dt>Last change</dt><dd id="pulse-change">Waiting</dd></div>
+                  </dl>
+                </div>
+              </article>
             </div>
           </section>
 
           <section class="view" data-panel="chat" aria-labelledby="chat-title">
-            <div class="page-heading compact">
-              <div><p class="kicker">CONTAINED PROVIDER / DURABLE HISTORY</p><h1 id="chat-title">Talk to Monique</h1></div>
-              <button class="button secondary" id="new-chat" type="button">New conversation</button>
-            </div>
+            <h1 class="sr-only" id="chat-title">Chat with Monique</h1>
             <div class="chat-layout">
               <article class="chat-surface">
+                <div class="chat-model-bar">
+                  <div class="model-identity"><span>M</span><div><strong>Monique</strong><small>Contained assistant</small></div></div>
+                  <div class="chat-model-actions">
+                    <div class="chat-context-summary" aria-label="Conversation context">
+                      <span><b id="chat-memory-count">—</b> memory</span>
+                      <span><b id="chat-source-count">0</b> live</span>
+                      <span><b id="chat-latency">—</b> last turn</span>
+                      <span id="chat-manage-state" hidden>Actions ready</span>
+                    </div>
+                    <button class="new-chat-button" id="new-chat" type="button">＋ New chat</button>
+                  </div>
+                </div>
                 <div class="chat-thread" id="chat-thread" aria-live="polite">
-                  <div class="empty-state" id="chat-empty"><span>M</span><h2>How can I help?</h2><p>Ask about operations, current work, or anything retained in Monique’s reviewed memory.</p></div>
+                  <div class="empty-state" id="chat-empty"><span>M</span><h2>What can I help with?</h2><p>Ask naturally. I can reason with reviewed memory, use configured live sources, and prepare actions for your approval.</p><div class="starter-grid"><button type="button" data-chat-prompt="Explain the current operational health and any risks."><strong>Explain system health</strong><small>Review live status and surface risks</small></button><button type="button" data-chat-prompt="Summarize the latest relevant Slack messages."><strong>Catch me up</strong><small>Read recent configured Slack context</small></button><button type="button" data-chat-prompt="What do you remember that is most relevant right now? Cite memory references."><strong>Explore memory</strong><small>Use reviewed durable evidence</small></button><button type="button" data-chat-prompt="Show me the useful actions available in Manage AI Operations and help me choose the right one."><strong>Work in Manage</strong><small>Prepare a reviewable AI Operations action</small></button></div></div>
                 </div>
                 <form class="composer" id="chat-form">
-                  <textarea id="chat-input" maxlength="8192" rows="3" placeholder="Message Monique…" required></textarea>
+                  <textarea id="chat-input" maxlength="8192" rows="2" placeholder="Message Monique…" aria-label="Message Monique" required></textarea>
                   <div class="composer-row">
                     <label>Route
                       <select id="chat-profile">
@@ -107,28 +146,20 @@
                         <option value="operational">Operational reasoning</option>
                       </select>
                     </label>
-                    <span id="chat-state">Ready</span>
+                    <span class="composer-hint"><b id="chat-count">0</b>/8192 · <kbd>Enter</kbd> send</span>
+                    <span id="chat-state" role="status">Ready</span>
                     <button class="send-button" id="chat-send" type="submit" aria-label="Send message">↑</button>
                   </div>
                 </form>
+                <p class="chat-disclaimer">Monique can make mistakes. Durable memory and live sources are labeled when they support an answer.</p>
               </article>
-              <aside class="context-rail">
-                <div><p class="kicker">CONTEXT CONTRACT</p><h2>Grounded interaction</h2></div>
-                <ul>
-                  <li><strong>Canonical history</strong><span>Turns persist in the SQLite memory store.</span></li>
-                  <li><strong>Evidence retrieval</strong><span>FTS5 selects typed memory with stable M-references.</span></li>
-                  <li><strong>Contained execution</strong><span>The daemon’s supervised run lane executes every turn.</span></li>
-                  <li><strong>Explicit route</strong><span>The selector, never prompt text, chooses the profile.</span></li>
-                </ul>
-                <div class="context-meter"><span>MEMORY EVIDENCE</span><strong id="chat-memory-count">—</strong></div>
-              </aside>
             </div>
           </section>
 
           <section class="view" data-panel="memory" aria-labelledby="memory-title">
             <div class="page-heading compact">
-              <div><p class="kicker">TYPED / REVISIONED / PROVENANCE-BOUND</p><h1 id="memory-title">Memory system</h1></div>
-              <form class="search" id="memory-search"><input id="memory-query" maxlength="512" placeholder="Search memory evidence"><button type="submit">Search</button></form>
+              <div><p class="kicker">TYPED / REVISIONED / PROVENANCE-BOUND</p><h1 id="memory-title">Memory system</h1><p class="page-lede">Inspect the evidence Monique can retrieve without exposing raw private state.</p></div>
+              <form class="search" id="memory-search"><input id="memory-query" maxlength="512" aria-label="Search memory evidence" placeholder="Search memory evidence"><button class="search-clear" id="memory-clear" type="button" aria-label="Clear memory search" hidden>×</button><button type="submit">Search</button></form>
             </div>
             <div class="memory-metrics">
               <article><span>ACTIVE</span><strong id="memory-active">—</strong></article>
@@ -138,7 +169,8 @@
             </div>
             <div class="memory-toolbar">
               <div><button class="segmented is-active" type="button" data-memory-mode="graph">Evidence graph</button><button class="segmented" type="button" data-memory-mode="list">Records</button></div>
-              <span id="memory-result-label">Loading canonical store…</span>
+              <label class="memory-filter">Kind <select id="memory-kind"><option value="all">All evidence</option></select></label>
+              <span id="memory-result-label" role="status">Loading canonical store…</span>
             </div>
             <article class="memory-graph panel" id="memory-graph" aria-label="Typed memory evidence graph"></article>
             <div class="memory-list" id="memory-list" hidden></div>
@@ -146,16 +178,17 @@
 
           <section class="view" data-panel="configuration" aria-labelledby="configuration-title">
             <div class="page-heading compact">
-              <div><p class="kicker">EFFECTIVE / SECRET-SAFE PROJECTION</p><h1 id="configuration-title">Configuration</h1></div>
-              <span class="tag success">SECRETS CONCEALED</span>
+              <div><p class="kicker">EFFECTIVE / SECRET-SAFE PROJECTION</p><h1 id="configuration-title">Configuration</h1><p class="page-lede">Effective capabilities, boundaries, and limits—not credentials or private coordinates.</p></div>
+              <div class="heading-actions"><button class="button secondary" id="configuration-refresh" type="button">Refresh</button><span class="tag success">SECRETS CONCEALED</span></div>
             </div>
             <div class="config-notice"><strong>Values are allowlisted.</strong><span>Credentials, account identifiers, filesystem locations and provider payloads are structurally absent from this API.</span></div>
             <div class="config-grid" id="configuration-grid"><article class="panel loading-panel">Loading effective configuration…</article></div>
           </section>
         </main>
 
-        <footer><span>MONIQUE / AUTOMONIQUE</span><span id="footer-state">NO VERIFIED SNAPSHOT</span></footer>
+        <footer><span>MONIQUE / AUTOMONIQUE</span><span><kbd>/</kbd> CHAT · <kbd>R</kbd> REFRESH</span><span id="footer-state">NO VERIFIED SNAPSHOT</span></footer>
       </div>
     </div>
+    <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
   </body>
 </html>
