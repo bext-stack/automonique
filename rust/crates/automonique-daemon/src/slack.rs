@@ -287,6 +287,43 @@ impl SlackApi for SlackClient {
     }
 }
 
+/// Largest number of `users.info` calls one roster resolution may make.
+///
+/// The member allowlist is already bounded by configuration, but that bound
+/// belongs to another concern; this one keeps a single resolution from being
+/// an unbounded burst against Slack's rate limit however that list grows.
+const MAX_ROSTER_LOOKUPS: usize = 24;
+
+/// Resolve the configured member allowlist into a verified tag roster.
+///
+/// Each entry pairs a member's exact `<@USERID>` token with their display
+/// label, so the conversational router can turn "notify bruno" into a real
+/// Slack tag instead of an unverified plain-text `@bruno`. Bots, deactivated
+/// accounts and failed lookups are skipped rather than failing the roster:
+/// a partial roster still tags the people it names, and an absent member
+/// degrades to today's addressed-by-name reply.
+fn slack_member_roster(api: &dyn SlackApi, members: &[UserId]) -> Option<String> {
+    let mut entries = Vec::new();
+    for member in members.iter().take(MAX_ROSTER_LOOKUPS) {
+        let Ok(SlackOutcome::Accepted(user)) = api.users_info(member) else {
+            continue;
+        };
+        if user.is_bot == Some(true) || user.deleted == Some(true) {
+            continue;
+        }
+        let label = user
+            .display_label()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if label.is_empty() {
+            continue;
+        }
+        entries.push(format!("<@{}> is {label}", member.as_str()));
+    }
+    (!entries.is_empty()).then(|| entries.join("; "))
+}
+
 /// Why a present Slack configuration was refused.
 ///
 /// Every variant is a startup refusal. An absent file is not an error and is
@@ -915,6 +952,11 @@ struct SlackTicketEvent {
     app_mention: bool,
     in_thread: bool,
     continues_conversation: bool,
+    /// This bot's own user id, from the envelope's `authorizations`.
+    ///
+    /// `None` when Slack omitted the field: mention stripping then falls back
+    /// to removing the first mention token, the pre-authorization behavior.
+    bot_user: Option<UserId>,
 }
 
 /// Extract the acknowledgement key independently from the event payload.
@@ -977,6 +1019,13 @@ fn slack_ticket_event(text: &str) -> Option<SlackTicketEvent> {
     if source_key.len() > automonique_support_connector::MAX_TICKET_SOURCE_KEY_BYTES {
         return None;
     }
+    let bot_user = payload
+        .get("authorizations")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|authorizations| authorizations.first())
+        .and_then(|authorization| authorization.get("user_id"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|user_id| UserId::new(user_id).ok());
     Some(SlackTicketEvent {
         team_id: team_id.to_owned(),
         channel,
@@ -987,27 +1036,54 @@ fn slack_ticket_event(text: &str) -> Option<SlackTicketEvent> {
         app_mention: event_type == "app_mention",
         in_thread: thread_ts.is_some(),
         continues_conversation: false,
+        bot_user,
     })
 }
 
-/// Remove the one bot mention that made Slack classify this as `app_mention`.
+/// Remove the bot mention that made Slack classify this as `app_mention`.
 ///
 /// Slack keeps the mention as `<@U…>` inside `text`, sometimes with sentence
 /// punctuation immediately after it. The conversational router should see the
-/// prose the person wrote, while any additional user mentions remain intact.
-fn slack_app_mention_text(text: &str) -> String {
+/// prose the person wrote, while any other user mentions remain intact — they
+/// are how a reply can tag the person the message is about. When the bot's own
+/// id is known from the envelope, exactly its tokens are removed, wherever
+/// they sit; without it the first token is removed, which mistakes "@Bruno
+/// @Monique look" for a message about Monique, so the id-directed path is the
+/// one every authorized envelope takes.
+fn slack_app_mention_text(text: &str, bot_user: Option<&str>) -> String {
     let mut prose = text.to_owned();
-    if let Some(start) = prose.find("<@")
-        && let Some(relative_end) = prose[start + 2..].find('>')
-    {
-        let end = start + 2 + relative_end;
-        prose.replace_range(start..=end, "");
+    let mut removed_bot_mention = false;
+    if let Some(bot_user) = bot_user {
+        while let Some(range) = mention_token_range(&prose, Some(bot_user)) {
+            prose.replace_range(range, "");
+            removed_bot_mention = true;
+        }
+    }
+    if !removed_bot_mention && let Some(range) = mention_token_range(&prose, None) {
+        prose.replace_range(range, "");
     }
     prose
         .trim()
         .trim_matches(|character: char| matches!(character, '?' | '!' | '.' | ','))
         .trim()
         .to_owned()
+}
+
+/// Byte range of the first `<@…>` mention token, or with `user`, of the first
+/// token whose id — before any legacy `|label` suffix — is exactly that user.
+fn mention_token_range(text: &str, user: Option<&str>) -> Option<std::ops::RangeInclusive<usize>> {
+    let mut search_start = 0;
+    loop {
+        let start = search_start + text.get(search_start..)?.find("<@")?;
+        let relative_end = text[start + 2..].find('>')?;
+        let end = start + 2 + relative_end;
+        let inner = &text[start + 2..end];
+        let id = inner.split('|').next().unwrap_or(inner);
+        match user {
+            Some(user) if id != user => search_start = end + 1,
+            _ => return Some(start..=end),
+        }
+    }
 }
 
 /// Parse one message the configured reference bot published.
@@ -2073,6 +2149,17 @@ struct LiveSlackQuestionAnswerer {
     github: Option<Box<dyn GitHubSurface + Send>>,
     administrators: Vec<i64>,
     configured: Vec<i64>,
+    api: Arc<SlackClient>,
+    members: Vec<UserId>,
+    /// The member roster, resolved on the first conversational question and
+    /// kept for the worker's lifetime.
+    ///
+    /// Once, not per question: the allowlist is startup configuration, and a
+    /// per-question resolution would spend a `users.info` burst on every
+    /// mention. The cost of the cache is that a member renamed mid-run keeps
+    /// the old label until the daemon restarts, which a display label can
+    /// tolerate.
+    roster: Option<Option<String>>,
 }
 
 impl SlackQuestionAnswerer for LiveSlackQuestionAnswerer {
@@ -2080,6 +2167,10 @@ impl SlackQuestionAnswerer for LiveSlackQuestionAnswerer {
         if let Some(answer) = slack_reply_location_answer(question, context) {
             return answer;
         }
+        if self.roster.is_none() {
+            self.roster = Some(slack_member_roster(self.api.as_ref(), &self.members));
+        }
+        let roster = self.roster.clone().flatten();
         answer_read_only_transport_question(
             &mut self.surface,
             &mut self.lane,
@@ -2087,6 +2178,7 @@ impl SlackQuestionAnswerer for LiveSlackQuestionAnswerer {
             context,
             &self.administrators,
             &self.configured,
+            roster.as_deref(),
             "slack_question_worker",
         )
     }
@@ -3110,9 +3202,9 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
         if !event.app_mention && event.text.contains("<@") {
             return;
         }
-        let mention_text = event
-            .app_mention
-            .then(|| slack_app_mention_text(&event.text));
+        let mention_text = event.app_mention.then(|| {
+            slack_app_mention_text(&event.text, event.bot_user.as_ref().map(UserId::as_str))
+        });
         let trimmed = mention_text.as_deref().unwrap_or_else(|| event.text.trim());
         // A read-only issue review is safe in every admitted configured-channel
         // message shape, not only app mentions and existing conversations. In
@@ -3514,6 +3606,9 @@ pub(crate) fn replay_slack_trace(
                 app_mention: event.app_mention,
                 in_thread: true,
                 continues_conversation: false,
+                // Recorded traces carry no authorization envelope, so replay
+                // takes the first-token fallback the recording behavior had.
+                bot_user: None,
             },
             "",
         );
@@ -3680,6 +3775,7 @@ impl SlackTicketHost {
             }
             None => None,
         };
+        let client = Arc::new(SlackClient::new(SlackBase::production(), token));
         let question_answerer = if features.contains(&SlackFeature::Conversation) {
             let surface = StoreControlSurface::open_with_lease_time_source(
                 database_path,
@@ -3708,12 +3804,14 @@ impl SlackTicketHost {
                 github: github_reader,
                 administrators: question_administrators.clone(),
                 configured: question_configured.clone(),
+                api: Arc::clone(&client),
+                members: members.clone(),
+                roster: None,
             }) as Box<dyn SlackQuestionAnswerer>)
         } else {
             None
         };
         let legacy = legacy_observation(state_dir)?;
-        let client = Arc::new(SlackClient::new(SlackBase::production(), token));
         Ok(Self::Configured {
             prepared: Some(Box::new(SlackTicketWorker {
                 legacy,
@@ -5786,6 +5884,7 @@ mod tests {
             app_mention: false,
             in_thread: false,
             continues_conversation: false,
+            bot_user: Some(UserId::new("U0MONIQUE9").expect("bot user")),
         }
     }
 
@@ -6435,6 +6534,123 @@ mod tests {
             !slack_ticket_event(&plain)
                 .expect("plain message")
                 .app_mention
+        );
+    }
+
+    #[test]
+    fn envelope_authorizations_identify_the_bot_being_mentioned() {
+        let without = r#"{"envelope_id":"E3","type":"events_api","payload":{"event_id":"Ev3","team_id":"T0RESERVED","event":{"type":"app_mention","channel":"C0RESERVED01","user":"U0ADMIN001","text":"<@U0MONIQUE9> hello","ts":"1723542000.000300"}}}"#;
+        assert_eq!(
+            slack_ticket_event(without).expect("event").bot_user,
+            None,
+            "an envelope without authorizations still parses"
+        );
+
+        let with = r#"{"envelope_id":"E4","type":"events_api","payload":{"event_id":"Ev4","team_id":"T0RESERVED","authorizations":[{"team_id":"T0RESERVED","user_id":"U0MONIQUE9","is_bot":true}],"event":{"type":"app_mention","channel":"C0RESERVED01","user":"U0ADMIN001","text":"<@U0MONIQUE9> hello","ts":"1723542000.000400"}}}"#;
+        assert_eq!(
+            slack_ticket_event(with).expect("event").bot_user,
+            Some(UserId::new("U0MONIQUE9").expect("bot user")),
+        );
+    }
+
+    #[test]
+    fn mention_stripping_removes_exactly_the_bot_and_keeps_other_tags() {
+        // The bot first, another person mentioned after: only the bot goes.
+        assert_eq!(
+            slack_app_mention_text("<@U0MONIQUE9> notify <@U0BRUNO001> plz", Some("U0MONIQUE9")),
+            "notify <@U0BRUNO001> plz"
+        );
+        // The bot mentioned second: the other person's tag must survive, which
+        // the first-token fallback would have destroyed.
+        assert_eq!(
+            slack_app_mention_text(
+                "hey <@U0BRUNO001> regarde <@U0MONIQUE9>",
+                Some("U0MONIQUE9")
+            ),
+            "hey <@U0BRUNO001> regarde"
+        );
+        // Legacy tokens carry a `|label` suffix after the id.
+        assert_eq!(
+            slack_app_mention_text("<@U0MONIQUE9|monique> bonjour", Some("U0MONIQUE9")),
+            "bonjour"
+        );
+        // A person who mentions the bot twice still asked one thing.
+        assert_eq!(
+            slack_app_mention_text("<@U0MONIQUE9> ping <@U0MONIQUE9>", Some("U0MONIQUE9")),
+            "ping"
+        );
+        // Without an authorized id, the pre-authorization behavior holds: the
+        // first token is the one Slack classified on.
+        assert_eq!(
+            slack_app_mention_text("<@U0BRUNO001> et <@U0MONIQUE9>", None),
+            "et <@U0MONIQUE9>"
+        );
+        // An authorized id that matches no token also falls back, so a
+        // mismatched envelope never yields prose with the trigger left in.
+        assert_eq!(
+            slack_app_mention_text("<@U0OTHERBOT> status", Some("U0MONIQUE9")),
+            "status"
+        );
+    }
+
+    #[test]
+    fn member_roster_pairs_exact_tokens_with_display_labels() {
+        struct RosterFake;
+        impl SlackApi for RosterFake {
+            fn conversations_history(
+                &self,
+                _channel: &ChannelId,
+                _limit: u16,
+            ) -> Result<SlackOutcome<MessagePage>, SlackFailure> {
+                Err(SlackFailure::Unavailable)
+            }
+
+            fn users_info(&self, user: &UserId) -> Result<SlackOutcome<SlackUser>, SlackFailure> {
+                let profile = |name: &str, is_bot, deleted| {
+                    Ok(SlackOutcome::Accepted(SlackUser {
+                        id: user.clone(),
+                        name: name.to_owned(),
+                        real_name: None,
+                        display_name: Some(name.to_owned()),
+                        is_bot: Some(is_bot),
+                        deleted: Some(deleted),
+                    }))
+                };
+                match user.as_str() {
+                    "U0BEN000001" => profile("ben", false, false),
+                    "U0BRUNO001" => profile("bruno", false, false),
+                    "U0MONIQUE9" => profile("monique", true, false),
+                    "U0GONE0001" => profile("gone", false, true),
+                    _ => Err(SlackFailure::Unavailable),
+                }
+            }
+
+            fn post_message(
+                &self,
+                _channel: &ChannelId,
+                _text: &MessageText,
+            ) -> Result<SlackOutcome<PostedTs>, SlackFailure> {
+                Err(SlackFailure::Unavailable)
+            }
+        }
+
+        let members = [
+            "U0BEN000001",
+            "U0MONIQUE9",
+            "U0GONE0001",
+            "U0MISSING01",
+            "U0BRUNO001",
+        ]
+        .map(|id| UserId::new(id).expect("member"));
+        assert_eq!(
+            slack_member_roster(&RosterFake, &members).as_deref(),
+            Some("<@U0BEN000001> is ben; <@U0BRUNO001> is bruno"),
+            "bots, deactivated accounts and failed lookups are skipped"
+        );
+        assert_eq!(
+            slack_member_roster(&RosterFake, &[]),
+            None,
+            "an empty allowlist resolves to no roster rather than an empty one"
         );
     }
 

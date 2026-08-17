@@ -10056,8 +10056,24 @@ pub(crate) const SLACK_THREAD_TRANSPORT_CONTEXT: &str = "surface=slack_thread\n\
      delivery=the answer field you return is posted once as Monique's reply in the current Slack thread\n\
      separate_delivery=none; this read-only route cannot send a DM or a second message elsewhere\n\
      addressing=a request to notify, tell, ping, remind, or relay something to a person in this conversation is fulfilled by this reply itself: write the message to that person in the answer field; never refuse for lack of a messaging tool and never say you already told or sent it\n\
-     mentions=copy an exact <@USERID> token verbatim from the admin message or the conversation into the answer to make a real Slack tag that notifies that person; a bare display name may be addressed by name but is not a verified tag\n\
+     mentions=copy an exact <@USERID> token verbatim from the roster, the admin message, or the conversation into the answer to make a real Slack tag that notifies that person; a bare display name with no matching token may be addressed by name but is not a verified tag\n\
      truth=never claim Slack is unavailable and never claim a separate post, DM, tag, or delivery occurred";
+
+/// Assemble the Slack transport context, appending the verified member roster
+/// when the caller resolved one.
+///
+/// The roster rides inside the trusted transport block rather than the memory
+/// context because it answers a capability question — which exact tokens are
+/// real tags — and capability facts must not be forgeable from conversation.
+fn slack_thread_transport_context(roster: Option<&str>) -> String {
+    match roster {
+        Some(roster) => format!(
+            "{SLACK_THREAD_TRANSPORT_CONTEXT}\n\
+             roster=verified workspace members; to tag one, copy their exact token: {roster}"
+        ),
+        None => String::from(SLACK_THREAD_TRANSPORT_CONTEXT),
+    }
+}
 
 /// Run the same closed, read-only conversational router for a non-Telegram
 /// transport.
@@ -10067,6 +10083,7 @@ pub(crate) const SLACK_THREAD_TRANSPORT_CONTEXT: &str = "surface=slack_thread\n\
 /// but it cannot select a mutation: Slack posts and MCP effects are refused on
 /// this surface. This keeps Slack mentions intelligent without creating a
 /// second authority model beside Telegram's question path.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn answer_read_only_transport_question(
     surface: &mut dyn ControlSurface,
     lane: &mut dyn RunLane,
@@ -10074,6 +10091,7 @@ pub(crate) fn answer_read_only_transport_question(
     memory_context: &str,
     administrators: &[i64],
     configured: &[i64],
+    roster: Option<&str>,
     caller: &'static str,
 ) -> String {
     let accepted_unix_ms = crate::unix_millis().ok();
@@ -10154,10 +10172,11 @@ pub(crate) fn answer_read_only_transport_question(
     }
 
     let profile = question_profile(question);
+    let transport_context = slack_thread_transport_context(roster);
     let Some(intent_prompt) = question_intent_prompt(
         question,
         memory_context,
-        Some(SLACK_THREAD_TRANSPORT_CONTEXT),
+        Some(&transport_context),
         &[],
         false,
         &[],
@@ -12054,6 +12073,19 @@ mod clock_tests {
         .expect("bounded prompt");
         assert!(telegram.contains("surface=unspecified"));
         assert!(!telegram.contains("surface=slack_thread"));
+    }
+
+    #[test]
+    fn roster_rides_in_the_trusted_transport_block_when_resolved() {
+        let context = super::slack_thread_transport_context(Some("<@U0BRUNO001> is bruno"));
+        assert!(context.starts_with(super::SLACK_THREAD_TRANSPORT_CONTEXT));
+        assert!(context.contains("roster=verified workspace members"));
+        assert!(context.contains("<@U0BRUNO001> is bruno"));
+        assert_eq!(
+            super::slack_thread_transport_context(None),
+            super::SLACK_THREAD_TRANSPORT_CONTEXT,
+            "no roster line is offered when none was resolved"
+        );
     }
 
     #[test]
