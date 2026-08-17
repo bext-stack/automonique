@@ -2347,6 +2347,61 @@ fn is_github_issue_status_question(text: &str) -> bool {
     .any(|phrase| normalized.contains(phrase))
 }
 
+/// Resolve a read-only issue follow-up against the current Slack thread.
+///
+/// The first turn commonly carries the canonical URL while a human follow-up
+/// says only "fais un récap de la demande".  The durable conversation context
+/// is already scoped to that exact thread, so reusing its sole issue URL is a
+/// safe typed read.  Ambiguous contexts deliberately fall through to ordinary
+/// conversation rather than choosing a target for the user.
+fn contextual_github_issue_review(text: &str, context: &str) -> Option<String> {
+    if one_issue_url(text).ok().flatten().is_some() {
+        return None;
+    }
+    let normalized = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let terms: std::collections::BTreeSet<&str> = normalized
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .collect();
+    let asks_for_issue_detail = [
+        "récap",
+        "recap",
+        "résumé",
+        "resume",
+        "summary",
+        "summarize",
+        "summarise",
+        "détail",
+        "detail",
+        "contenu",
+        "content",
+        "demande",
+        "requirement",
+        "requirements",
+        "checklist",
+    ]
+    .iter()
+    .any(|term| terms.contains(term))
+        || [
+            "what does it ask",
+            "what was requested",
+            "what is requested",
+            "de quoi s'agit-il",
+            "de quoi il s'agit",
+            "qu'est-ce qui est demandé",
+            "qu est ce qui est demandé",
+        ]
+        .iter()
+        .any(|phrase| normalized.contains(phrase));
+    asks_for_issue_detail
+        .then(|| one_issue_url(context).ok().flatten())
+        .flatten()
+}
+
 fn ticket_approval_failure(reason: &str) -> &'static str {
     if reason == "executor_unavailable" {
         "Manage has no live code-execution worker for this ticket. The gate remains pending and no work was released."
@@ -3281,6 +3336,16 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                         )
                     },
                     |answerer| answerer.provider_stats(),
+                );
+                let _ = self
+                    .poster
+                    .post_thread(&event.channel, &event.parent, &answer);
+                return;
+            }
+            if let Some(issue_url) = contextual_github_issue_review(trimmed, context) {
+                let answer = self.question_answerer.as_mut().map_or_else(
+                    || String::from("Monique's GitHub issue reader is unavailable right now."),
+                    |answerer| answerer.issue_review(&issue_url, trimmed, context, true),
                 );
                 let _ = self
                     .poster
@@ -6895,6 +6960,72 @@ mod tests {
                 .expect("messages")
                 .iter()
                 .any(|message| message.contains("Confirmation required"))
+        );
+    }
+
+    #[test]
+    fn issue_recap_follow_up_reuses_the_threads_single_github_url() {
+        let poster = FakeTicketPoster::default();
+        let messages = Arc::clone(&poster.messages);
+        let manage = FakeManage::default();
+        let opened = Arc::clone(&manage.opened);
+        let reviews = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut router = SlackTicketRouter {
+            poster,
+            manage: Box::new(manage),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
+            channels: ChannelMap(vec![(
+                name("ops"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![SlackFeature::Conversation],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+            approvals: None,
+            approval_lane: None,
+            question_answerer: Some(Box::new(FakeIssueReviewAnswerer {
+                seen: Arc::clone(&reviews),
+            })),
+        };
+        let mut follow_up = ticket_event(
+            "U0ADMIN001",
+            "<@B0APP> peux tu faire un récap de la demande ?",
+            "EvRecap",
+        );
+        follow_up.app_mention = true;
+
+        router.handle_with_context(
+            follow_up,
+            "user: <@B0APP> https://github.com/webdesign29/activ-erepas/issues/3027 il est fait celui là ?\nassistant: GitHub marks it closed.",
+        );
+
+        assert!(opened.lock().expect("opened").is_empty());
+        assert_eq!(
+            reviews.lock().expect("reviews").as_slice(),
+            [(
+                String::from("https://github.com/webdesign29/activ-erepas/issues/3027"),
+                String::from("peux tu faire un récap de la demande"),
+                true,
+            )]
+        );
+        assert_eq!(
+            messages.lock().expect("messages").as_slice(),
+            [String::from("Typed GitHub issue review")]
+        );
+    }
+
+    #[test]
+    fn issue_recap_follow_up_does_not_guess_between_thread_urls() {
+        let context = "user: compare https://github.com/example/one/issues/1 and https://github.com/example/two/issues/2";
+        assert_eq!(
+            contextual_github_issue_review("fais un récap de la demande", context),
+            None
         );
     }
 
