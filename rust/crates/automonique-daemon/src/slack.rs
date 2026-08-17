@@ -2261,6 +2261,7 @@ struct SlackTicketRouter<P> {
 enum SlackQuestionReply {
     Text(String),
     Approval { key: String, preview: String },
+    GitHubAction(GitHubActionRequest),
 }
 
 enum PendingSlackTool {
@@ -2319,6 +2320,7 @@ struct LiveSlackQuestionAnswerer {
     channels: ChannelMap,
     members: Vec<UserId>,
     mcp: McpRegistry,
+    github_action_aliases: Vec<String>,
     pending_tools: BTreeMap<String, PendingSlackToolEntry>,
     /// The member roster, resolved on the first conversational question and
     /// kept for the worker's lifetime.
@@ -2400,6 +2402,15 @@ impl LiveSlackQuestionAnswerer {
                     PendingSlackTool::SlackPost(plan),
                     preview,
                 )
+            }
+            TransportToolPlan::GitHubAction(request) => {
+                if approvals_enabled {
+                    SlackQuestionReply::GitHubAction(request)
+                } else {
+                    SlackQuestionReply::Text(String::from(
+                        "GitHub writes require an administrator in an approval-enabled Slack conversation. Nothing was changed.",
+                    ))
+                }
             }
         }
     }
@@ -2573,6 +2584,7 @@ impl SlackQuestionAnswerer for LiveSlackQuestionAnswerer {
             &slack_channels,
             self.github.is_some(),
             &mcp_tools,
+            &self.github_action_aliases,
             &mut selected_tool,
             "slack_question_worker",
         );
@@ -3669,6 +3681,46 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
         let _ = self.poster.post_channel(&command.channel, &result.text);
     }
 
+    fn execute_github_thread_action(
+        &mut self,
+        event: &SlackTicketEvent,
+        request: GitHubActionRequest,
+        context: &str,
+    ) {
+        let Some(actions) = self.github_actions.as_ref() else {
+            let _ = self.poster.post_thread(
+                &event.channel,
+                &event.parent,
+                "GitHub actions are not configured on this daemon, so nothing changed.",
+            );
+            return;
+        };
+        actions.set_slack_progress_target(Some(crate::run_lane::SlackProgressTarget {
+            channel: event.channel.clone(),
+            thread_ts: event.parent.clone(),
+        }));
+        let result = self
+            .github_actions
+            .as_mut()
+            .expect("GitHub action surface checked above")
+            .execute(&event.source_key, request, context);
+        let blocks = slack_result_blocks(&result.text);
+        let streamed = self
+            .github_actions
+            .as_ref()
+            .expect("GitHub action surface checked above")
+            .finish_slack_progress(&result.text, blocks);
+        self.github_actions
+            .as_ref()
+            .expect("GitHub action surface checked above")
+            .set_slack_progress_target(None);
+        if !streamed {
+            let _ = self
+                .poster
+                .post_thread(&event.channel, &event.parent, &result.text);
+        }
+    }
+
     fn handle_with_context(&mut self, event: SlackTicketEvent, context: &str) {
         // Every decision below belongs to this event. Establishing the
         // correlation here rather than in the socket loop means a recording
@@ -3815,36 +3867,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             {
                 match actions.natural_request(trimmed) {
                     Ok(Some(request)) => {
-                        let target = crate::run_lane::SlackProgressTarget {
-                            channel: event.channel.clone(),
-                            thread_ts: event.parent.clone(),
-                        };
-                        self.github_actions
-                            .as_ref()
-                            .expect("GitHub action surface checked above")
-                            .set_slack_progress_target(Some(target));
-                        let result = self
-                            .github_actions
-                            .as_mut()
-                            .expect("GitHub action surface checked above")
-                            .execute(&event.source_key, request, context);
-                        let blocks = slack_result_blocks(&result.text);
-                        let streamed = self
-                            .github_actions
-                            .as_ref()
-                            .expect("GitHub action surface checked above")
-                            .finish_slack_progress(&result.text, blocks);
-                        self.github_actions
-                            .as_ref()
-                            .expect("GitHub action surface checked above")
-                            .set_slack_progress_target(None);
-                        if !streamed {
-                            let _ = self.poster.post_thread(
-                                &event.channel,
-                                &event.parent,
-                                &result.text,
-                            );
-                        }
+                        self.execute_github_thread_action(&event, request, context);
                         return;
                     }
                     Ok(None) => {}
@@ -3912,6 +3935,9 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                                     "Slack refused the tool approval controls, so nothing was executed.",
                                 );
                             }
+                        }
+                        SlackQuestionReply::GitHubAction(request) => {
+                            self.execute_github_thread_action(&event, request, context);
                         }
                     }
                 }
@@ -4305,6 +4331,10 @@ impl SlackTicketHost {
             }
             None => None,
         };
+        let github_action_aliases = github_actions
+            .as_ref()
+            .map(GitHubActionEngine::repository_aliases)
+            .unwrap_or_default();
         let client = Arc::new(SlackClient::new(SlackBase::production(), token));
         let question_answerer = if features.contains(&SlackFeature::Conversation) {
             let surface = StoreControlSurface::open_with_lease_time_source(
@@ -4339,6 +4369,7 @@ impl SlackTicketHost {
                 members: members.clone(),
                 mcp: McpRegistry::load(state_dir)
                     .map_err(|_| SlackConfigError::QuestionSurfaceUnavailable)?,
+                github_action_aliases,
                 pending_tools: BTreeMap::new(),
                 roster: None,
             }) as Box<dyn SlackQuestionAnswerer>)

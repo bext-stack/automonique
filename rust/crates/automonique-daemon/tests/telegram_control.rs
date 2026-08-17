@@ -1741,6 +1741,42 @@ fn telegram_website_ticket_request_reaches_the_configured_github_action() {
 }
 
 #[test]
+fn conversational_router_can_select_the_configured_github_create_tool() {
+    let fixture = Fixture::new(&[]);
+    let outbound = FakeOutbound::default();
+    let actions = FakeGitHubActions::for_alias("gtonline");
+    let created = Arc::clone(&actions.created);
+    let lane = FakeRunLane::answering_sequence(&[
+        r#"{"kind":"github_action","action":"create","alias":"gtonline"}"#,
+        r#"{"proceed":true,"title":"Show the modification date","body":"Add it to Contact.","labels":[]}"#,
+    ]);
+    let mut bridge = bridge_with_github_actions(
+        &fixture,
+        FakeClient::new([updates(&[(
+            3,
+            OPERATOR,
+            "please file a ticket about the date on https://www.gtonline.fr/contact",
+        )])]),
+        outbound.clone(),
+        lane,
+        actions,
+    );
+
+    assert_eq!(
+        poll(&mut bridge).expect("question queues").questions_queued,
+        1
+    );
+    let report = await_question_completion(&mut bridge);
+
+    assert_eq!(report.questions_answered, 1);
+    let rows = created.lock().expect("created issues");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].alias, "gtonline");
+    assert_eq!(rows[0].title, "Show the modification date");
+    assert!(outbound.messages()[0].contains("GitHub action completed"));
+}
+
+#[test]
 fn explicit_email_composes_one_body_and_sends_to_the_server_bound_recipient() {
     let fixture = Fixture::new(&[]);
     let lane = FakeRunLane::answering("Bonjour Ben,\n\nVoici le récapitulatif vérifié.");
