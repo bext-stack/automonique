@@ -629,7 +629,12 @@ impl<S: EnvelopeSink> ShadowTicketSurface<S> {
         format!("{SYNTHETIC_PREFIX}{}", &hex[..24])
     }
 
-    fn synthetic_receipt(issue_url: &str, job_id: String, approved: bool) -> TicketDispatchReceipt {
+    fn synthetic_receipt(
+        issue_url: &str,
+        source_key: &str,
+        job_id: String,
+        approved: bool,
+    ) -> TicketDispatchReceipt {
         TicketDispatchReceipt {
             issue_id: format!("{SYNTHETIC_PREFIX}issue"),
             issue_url: issue_url.to_owned(),
@@ -638,6 +643,7 @@ impl<S: EnvelopeSink> ShadowTicketSurface<S> {
             site_label: None,
             workspace: TicketWorkspace::InstanceDefault,
             job_id,
+            source_key: source_key.to_owned(),
             job_status: if approved {
                 TicketJobStatus::Pending
             } else {
@@ -661,6 +667,7 @@ impl<S: EnvelopeSink> TicketActionSurface for ShadowTicketSurface<S> {
         ));
         Ok(Self::synthetic_receipt(
             issue_url,
+            source_key,
             Self::synthetic_job_id(issue_url, source_key),
             false,
         ))
@@ -680,6 +687,7 @@ impl<S: EnvelopeSink> TicketActionSurface for ShadowTicketSurface<S> {
         // the harness itself caused. Nothing was confirmed anywhere.
         Ok(Self::synthetic_receipt(
             issue_url,
+            source_key,
             Self::synthetic_job_id(issue_url, source_key),
             true,
         ))

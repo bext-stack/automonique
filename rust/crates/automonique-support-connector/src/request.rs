@@ -634,7 +634,7 @@ impl FleetRequest {
     }
 }
 
-fn is_ticket_key(value: &str, max_bytes: usize) -> bool {
+pub(crate) fn is_ticket_key(value: &str, max_bytes: usize) -> bool {
     !value.is_empty()
         && value.len() <= max_bytes
         && value

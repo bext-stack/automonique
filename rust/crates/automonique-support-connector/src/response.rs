@@ -24,9 +24,10 @@
 use automonique_connector_substrate::json::strict_json;
 use serde_json::{Map, Value};
 
-use crate::request::is_github_issue_url;
+use crate::request::{is_github_issue_url, is_ticket_key};
 use crate::{
-    FleetFailure, FleetOutcome, MAX_FLEET_RESPONSE_BYTES, MAX_SUPPORT_ISSUES, ServerMessage,
+    FleetFailure, FleetOutcome, MAX_FLEET_RESPONSE_BYTES, MAX_SUPPORT_ISSUES,
+    MAX_TICKET_SOURCE_KEY_BYTES, ServerMessage,
 };
 
 /// Longest support issue id retained.
@@ -210,6 +211,8 @@ pub struct TicketDispatchReceipt {
     pub site_label: Option<String>,
     pub workspace: TicketWorkspace,
     pub job_id: String,
+    /// Exact transport coordinate that owns the returned Manage job.
+    pub source_key: String,
     pub job_status: TicketJobStatus,
     pub duplicate: bool,
     pub approved: bool,
@@ -399,6 +402,10 @@ pub fn decode_ticket_dispatch(
         "instance_default" => TicketWorkspace::InstanceDefault,
         _ => return Err(FleetFailure::FieldOutOfBounds),
     };
+    let source_key = nonempty(row, "source_key", MAX_TICKET_SOURCE_KEY_BYTES)?;
+    if !is_ticket_key(&source_key, MAX_TICKET_SOURCE_KEY_BYTES) {
+        return Err(FleetFailure::FieldOutOfBounds);
+    }
     Ok(FleetOutcome::Accepted(TicketDispatchReceipt {
         issue_id: nonempty(row, "issue_id", MAX_ISSUE_ID_BYTES)?,
         issue_url,
@@ -407,6 +414,7 @@ pub fn decode_ticket_dispatch(
         site_label,
         workspace,
         job_id: nonempty(row, "job_id", crate::MAX_FLEET_IDENTIFIER_BYTES)?,
+        source_key,
         job_status: ticket_status(row, "job_status")?,
         duplicate: boolean(row, "duplicate")?,
         approved: boolean(row, "approved")?,
@@ -1011,7 +1019,7 @@ mod tests {
 
     #[test]
     fn ticket_dispatch_receipt_is_strict_and_typed() {
-        let bytes = br#"{"ok":true,"receipt":{"issue_id":"issue-1","issue_url":"https://github.com/example/repo/issues/1007","issue_title":"List prism sites","project_id":"ignored","project_label":"Bext platform","site_label":"bext","workspace":"site_profile","job_id":"job-1","job_status":"pending","duplicate":false,"approved":true}}"#;
+        let bytes = br#"{"ok":true,"receipt":{"issue_id":"issue-1","issue_url":"https://github.com/example/repo/issues/1007","issue_title":"List prism sites","project_id":"ignored","project_label":"Bext platform","site_label":"bext","workspace":"site_profile","job_id":"job-1","source_key":"slack:workspace:event:original","job_status":"pending","duplicate":false,"approved":true}}"#;
         assert_eq!(
             decode_ticket_dispatch(bytes).expect("decode"),
             FleetOutcome::Accepted(TicketDispatchReceipt {
@@ -1022,6 +1030,7 @@ mod tests {
                 site_label: Some(String::from("bext")),
                 workspace: TicketWorkspace::SiteProfile,
                 job_id: String::from("job-1"),
+                source_key: String::from("slack:workspace:event:original"),
                 job_status: TicketJobStatus::Pending,
                 duplicate: false,
                 approved: true,

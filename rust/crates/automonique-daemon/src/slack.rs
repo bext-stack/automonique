@@ -2906,7 +2906,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                         .register(crate::telegram_bridge::PendingTicketGate {
                             job_id: receipt.job_id.clone(),
                             issue_url,
-                            source_key: event.source_key.clone(),
+                            source_key: receipt.source_key.clone(),
                         })
                         .is_ok()
                 });
@@ -2984,7 +2984,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                             .register(crate::telegram_bridge::PendingTicketGate {
                                 job_id: receipt.job_id.clone(),
                                 issue_url: issue_url.clone(),
-                                source_key: command.source_key.clone(),
+                                source_key: receipt.source_key.clone(),
                             })
                             .is_ok()
                     });
@@ -6579,6 +6579,7 @@ mod tests {
             site_label: None,
             workspace: automonique_support_connector::TicketWorkspace::InstanceDefault,
             job_id: String::from("job-fixture-123456"),
+            source_key: String::from("slack:T0RESERVED:event:EvFixture"),
             job_status: if approved {
                 automonique_support_connector::TicketJobStatus::Pending
             } else {
@@ -8070,6 +8071,11 @@ mod tests {
             "",
         );
         assert_eq!(opened.lock().expect("opened").len(), 1);
+        let gates = router.gates.lock().expect("gates");
+        let pending = gates.matching("job-fixture");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].source_key, "slack:T0RESERVED:event:EvFixture");
+        drop(gates);
         let reviews = reviews.lock().expect("reviews");
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].0, "https://github.com/example/project/issues/42");

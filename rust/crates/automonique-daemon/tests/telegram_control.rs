@@ -1321,6 +1321,7 @@ impl FakeTicketActions {
                     site_label: Some(String::from("Bext platform")),
                     workspace: TicketWorkspace::SiteProfile,
                     job_id: String::from("fixture-job-123456"),
+                    source_key: String::from("telegram:123456:update:original"),
                     job_status: TicketJobStatus::PendingApproval,
                     duplicate: false,
                     approved: false,
@@ -2523,7 +2524,7 @@ fn explicit_ticket_request_waits_for_an_admin_confirmation_before_work() {
         actions.confirmations(),
         [(
             String::from("https://github.com/example/repo/issues/1007"),
-            String::from("telegram:123456:update:1")
+            String::from("telegram:123456:update:original")
         )]
     );
     std::thread::sleep(Duration::from_millis(100));
