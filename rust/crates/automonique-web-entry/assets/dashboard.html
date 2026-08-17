@@ -1,15 +1,15 @@
 <!-- SPDX-License-Identifier: Elastic-2.0 -->
 <!doctype html>
-<html lang="en" data-health="loading">
+<html lang="en" data-health="loading" data-theme="system" data-text-scale="comfortable">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark">
-    <meta name="theme-color" content="#0b0d10">
+    <meta name="color-scheme" content="dark light">
+    <meta name="theme-color" id="theme-color" content="#0b0d10">
     <title>Monique</title>
     <link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=3">
-    <script src="/assets/dashboard.js?v=3" defer></script>
+    <link rel="stylesheet" href="/assets/dashboard.css?v=4">
+    <script src="/assets/dashboard.js?v=4" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -17,14 +17,21 @@
       <aside class="sidebar">
         <a class="identity" href="#chat" aria-label="Open Monique chat">
           <span class="identity-mark">M</span>
-          <span><strong>MONIQUE</strong><small>AI OPERATIONS</small></span>
+          <span><strong>Monique</strong><small>AI Operations</small></span>
         </a>
+        <button class="sidebar-new-chat" id="sidebar-new-chat" type="button"><span class="sidebar-new-icon" aria-hidden="true">＋</span><span id="sidebar-new-chat-label">New conversation</span></button>
+        <p class="nav-section-label">Workspace</p>
         <nav class="primary-nav" aria-label="Operations sections">
-          <button class="nav-item is-active" data-view="overview"><span aria-hidden="true">⌂</span>Overview</button>
-          <button class="nav-item" data-view="chat"><span aria-hidden="true">✦</span>Chat</button>
-          <button class="nav-item" data-view="memory"><span aria-hidden="true">◇</span>Memory</button>
-          <button class="nav-item" data-view="configuration"><span aria-hidden="true">⚙</span>Configuration</button>
+          <button class="nav-item is-active" data-view="overview"><span class="nav-icon" aria-hidden="true">⌂</span><span class="nav-label">Overview</span></button>
+          <button class="nav-item" data-view="chat"><span class="nav-icon" aria-hidden="true">✦</span><span class="nav-label">Chat</span></button>
+          <button class="nav-item" data-view="memory"><span class="nav-icon" aria-hidden="true">◇</span><span class="nav-label">Memory</span></button>
+          <button class="nav-item" data-view="configuration"><span class="nav-icon" aria-hidden="true">⚙</span><span class="nav-label">Configuration</span></button>
         </nav>
+        <section class="sidebar-preferences" aria-labelledby="appearance-title">
+          <p class="nav-section-label" id="appearance-title">Appearance</p>
+          <label class="preference-row" for="theme-select"><span>Theme</span><select id="theme-select"><option value="system">System</option><option value="dark">Dark</option><option value="light">Light</option></select></label>
+          <div class="preference-row"><span>Text size</span><div class="text-scale-control" role="group" aria-label="Text size"><button type="button" data-text-scale="standard" aria-label="Standard text size">A</button><button type="button" data-text-scale="comfortable" aria-label="Comfortable text size">A+</button><button type="button" data-text-scale="large" aria-label="Large text size">A++</button></div></div>
+        </section>
         <div class="sidebar-foot">
           <span class="lock-mark" aria-hidden="true">◆</span>
           <div><strong>PROTECTED</strong><small>Basic auth · TLS only</small></div>
@@ -38,6 +45,8 @@
             <span class="status-dot" aria-hidden="true"></span>
             <strong id="global-health">Connecting</strong>
             <span id="global-observed">No snapshot</span>
+            <button class="appearance-button" id="text-scale-cycle" type="button" aria-label="Increase text size" title="Change text size">Aa</button>
+            <button class="appearance-button" id="theme-cycle" type="button" aria-label="Change color theme" title="Change color theme">◐</button>
             <button class="refresh-button" id="status-refresh" type="button" aria-label="Refresh operational status" title="Refresh status">↻</button>
           </div>
         </header>

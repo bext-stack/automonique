@@ -17,6 +17,72 @@ let lastPulseChangeAt = null;
 let chatBusy = false;
 let newChatArmed = false;
 let newChatTimer = null;
+const themes = ["system", "dark", "light"];
+const textScales = ["standard", "comfortable", "large"];
+
+function storedPreference(key, allowed, fallback) {
+  try {
+    const value = window.localStorage.getItem(key);
+    return allowed.includes(value) ? value : fallback;
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+function savePreference(key, value) {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch (_error) {
+    // Private browsing and hardened storage policies may refuse persistence.
+  }
+}
+
+function resolvedTheme(theme) {
+  return theme === "system"
+    ? (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark")
+    : theme;
+}
+
+function applyTheme(theme, persist = true) {
+  if (!themes.includes(theme)) theme = "system";
+  document.documentElement.dataset.theme = theme;
+  byId("theme-select").value = theme;
+  const resolved = resolvedTheme(theme);
+  byId("theme-cycle").dataset.theme = resolved;
+  byId("theme-cycle").setAttribute("aria-label", `Color theme: ${theme}. Change theme`);
+  byId("theme-color").content = resolved === "light" ? "#f7f7f5" : "#0b0d10";
+  if (persist) savePreference("monique-theme", theme);
+}
+
+function applyTextScale(scale, persist = true) {
+  if (!textScales.includes(scale)) scale = "comfortable";
+  document.documentElement.dataset.textScale = scale;
+  document.querySelectorAll("[data-text-scale]").forEach((button) => {
+    const active = button.dataset.textScale === scale;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  byId("text-scale-cycle").dataset.scale = scale;
+  byId("text-scale-cycle").setAttribute("aria-label", `Text size: ${scale}. Increase text size`);
+  if (persist) savePreference("monique-text-scale", scale);
+}
+
+applyTheme(storedPreference("monique-theme", themes, "system"), false);
+applyTextScale(storedPreference("monique-text-scale", textScales, "comfortable"), false);
+
+byId("theme-select").addEventListener("change", (event) => applyTheme(event.target.value));
+document.querySelectorAll("[data-text-scale]").forEach((button) => button.addEventListener("click", () => applyTextScale(button.dataset.textScale)));
+byId("theme-cycle").addEventListener("click", () => {
+  const current = document.documentElement.dataset.theme || "system";
+  applyTheme(themes[(themes.indexOf(current) + 1) % themes.length]);
+});
+byId("text-scale-cycle").addEventListener("click", () => {
+  const current = document.documentElement.dataset.textScale || "comfortable";
+  applyTextScale(textScales[(textScales.indexOf(current) + 1) % textScales.length]);
+});
+window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+  if (document.documentElement.dataset.theme === "system") applyTheme("system", false);
+});
 
 async function api(path, options = {}) {
   const request = () => fetch(path, {
@@ -676,6 +742,8 @@ function resetNewChatButton() {
   newChatArmed = false;
   byId("new-chat").textContent = "New conversation";
   byId("new-chat").removeAttribute("data-armed");
+  byId("sidebar-new-chat-label").textContent = "New conversation";
+  byId("sidebar-new-chat").removeAttribute("data-armed");
 }
 
 byId("new-chat").addEventListener("click", async () => {
@@ -687,6 +755,8 @@ byId("new-chat").addEventListener("click", async () => {
     newChatArmed = true;
     byId("new-chat").textContent = "Confirm new conversation";
     byId("new-chat").dataset.armed = "true";
+    byId("sidebar-new-chat-label").textContent = "Confirm new conversation";
+    byId("sidebar-new-chat").dataset.armed = "true";
     newChatTimer = window.setTimeout(resetNewChatButton, 5000);
     return;
   }
@@ -706,6 +776,11 @@ byId("new-chat").addEventListener("click", async () => {
     byId("new-chat").disabled = false;
     resetNewChatButton();
   }
+});
+
+byId("sidebar-new-chat").addEventListener("click", () => {
+  showView("chat");
+  byId("new-chat").click();
 });
 
 function seedChatPrompt(prompt) {

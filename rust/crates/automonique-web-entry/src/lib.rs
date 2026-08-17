@@ -2549,12 +2549,17 @@ mod tests {
             "data-chat-prompt",
             "memory-kind",
             "configuration-refresh",
+            "theme-select",
+            "text-scale-cycle",
+            "sidebar-new-chat",
         ] {
             assert!(
                 DASHBOARD_HTML.contains(interaction),
                 "missing {interaction}"
             );
         }
+        assert!(DASHBOARD_JS.contains("monique-theme"));
+        assert!(DASHBOARD_JS.contains("monique-text-scale"));
     }
 
     #[test]
