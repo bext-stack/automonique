@@ -258,7 +258,7 @@ impl BasicAuth {
         let expiry = (now_ms() / 1_000).saturating_add(28_800).to_string();
         let signature = self.session_signature(&expiry);
         format!(
-            "monique_session={expiry}.{signature}; Path=/; Max-Age=28800; Secure; HttpOnly; SameSite=Lax"
+            "monique_session={expiry}.{signature}; Path=/; Max-Age=28800; Secure; HttpOnly; SameSite=None"
         )
     }
 
@@ -1696,7 +1696,7 @@ mod tests {
     fn basic_auth_mints_a_bounded_secure_session_cookie() {
         let auth = fixture_auth();
         let header = auth.session_cookie();
-        assert!(header.contains("; Secure; HttpOnly; SameSite=Lax"));
+        assert!(header.contains("; Secure; HttpOnly; SameSite=None"));
         let cookie = header.split(';').next().unwrap();
         assert!(auth.authorize_session(Some(cookie)));
         let mut tampered = cookie.to_owned();
