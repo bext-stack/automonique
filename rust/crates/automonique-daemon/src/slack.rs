@@ -2844,10 +2844,14 @@ fn contextual_github_issue_review(text: &str, context: &str) -> Option<String> {
 }
 
 fn ticket_approval_failure(reason: &str) -> &'static str {
-    if reason == "executor_unavailable" {
-        "Manage has no live code-execution worker for this ticket. The gate remains pending and no work was released."
-    } else {
-        "Manage did not accept that approval, so no work was released."
+    match reason {
+        "executor_unavailable" => {
+            "Manage has no live code-execution worker for this ticket. The gate remains pending and no work was released."
+        }
+        "source_mismatch" => {
+            "Manage linked this confirmation to a different pending request. The gate remains pending and no work was released."
+        }
+        _ => "Manage did not accept that approval, so no work was released.",
     }
 }
 
@@ -3393,17 +3397,20 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             TicketDecision::Reject { .. } => TicketDecisionOutcome::Rejected,
         };
         let actor_key = format!("slack:{}:{}", interaction.team_id, interaction.user);
-        let accepted = self
-            .manage
-            .decide_ticket(
-                &gate.job_id,
-                &gate.source_key,
-                &interaction.interaction_key,
-                &actor_key,
-                decision,
-            )
-            .ok()
-            .filter(|receipt| receipt.job_id == gate.job_id && receipt.decision == expected);
+        let decision_result = self.manage.decide_ticket(
+            &gate.job_id,
+            &gate.source_key,
+            &interaction.interaction_key,
+            &actor_key,
+            decision,
+        );
+        let (accepted, failure_reason) = match decision_result {
+            Ok(receipt) if receipt.job_id == gate.job_id && receipt.decision == expected => {
+                (Some(receipt), None)
+            }
+            Ok(_) => (None, Some(String::from("decision_receipt_mismatch"))),
+            Err(reason) => (None, Some(reason)),
+        };
         let state = if let Some(receipt) = accepted {
             let _ = self
                 .gates
@@ -3427,6 +3434,15 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                     .update_decision(&interaction.channel, &interaction.message_ts, &text);
             SlackInteractionState::Applied
         } else {
+            let short = gate.job_id.get(..12).unwrap_or(&gate.job_id);
+            let reason = failure_reason.as_deref().unwrap_or("decision_not_applied");
+            let text = format!(
+                "⚠️ Approval failed. {}\nMonique job `{short}` remains pending. Retry with `/monique approve {short}` after the reported blocker is fixed.",
+                ticket_approval_failure(reason)
+            );
+            let _ =
+                self.poster
+                    .update_decision(&interaction.channel, &interaction.message_ts, &text);
             SlackInteractionState::Failed
         };
         let _ = store.resolve(&record.interaction_key, record.revision, state, now);
@@ -6353,6 +6369,19 @@ mod tests {
                 .push(text.to_owned());
             Ok(())
         }
+
+        fn update_decision(
+            &mut self,
+            _channel: &ChannelId,
+            _message_ts: &MessageTs,
+            text: &str,
+        ) -> Result<(), ()> {
+            self.messages
+                .lock()
+                .expect("messages")
+                .push(text.to_owned());
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -8006,8 +8035,60 @@ mod tests {
             "Manage has no live code-execution worker for this ticket. The gate remains pending and no work was released."
         );
         assert_eq!(
+            ticket_approval_failure("source_mismatch"),
+            "Manage linked this confirmation to a different pending request. The gate remains pending and no work was released."
+        );
+        assert_eq!(
             ticket_approval_failure("manage_unavailable"),
             "Manage did not accept that approval, so no work was released."
         );
+    }
+
+    #[test]
+    fn a_failed_button_decision_replaces_the_card_with_an_actionable_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("secure temporary directory");
+        let mut store = SlackInteractionStore::open(directory.path().join("interactions.sqlite3"))
+            .expect("interaction store");
+        let mut router =
+            decide_gate_router(true, vec![SlackFeature::Approvals], vec!["U0ADMIN001"]);
+        router
+            .gates
+            .lock()
+            .expect("gates")
+            .register(crate::telegram_bridge::PendingTicketGate {
+                job_id: String::from("job-fixture-123456"),
+                issue_url: String::from("https://github.com/example/project/issues/42"),
+                source_key: String::from("slack:T0RESERVED:event:EvFixture"),
+            })
+            .expect("registered gate");
+        let prepared = router
+            .prepare_interaction(
+                SlackTicketInteraction {
+                    interaction_key: String::from(
+                        "slack-action:T0RESERVED:C0RESERVED01:1723542000.000100:U0ADMIN001:approve",
+                    ),
+                    team_id: String::from("T0RESERVED"),
+                    channel: ChannelId::new("C0RESERVED01").expect("channel"),
+                    message_ts: MessageTs::new("1723542000.000100").expect("timestamp"),
+                    user: UserId::new("U0ADMIN001").expect("user"),
+                    job_id: String::from("job-fixture-123456"),
+                    kind: SlackTicketInteractionKind::Approve,
+                },
+                &mut store,
+            )
+            .expect("prepared interaction")
+            .expect("accepted interaction");
+
+        router.handle_interaction(prepared, &mut store);
+
+        let messages = router.poster.messages.lock().expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("Approval failed"));
+        assert!(messages[0].contains("remains pending"));
+        assert!(messages[0].contains("/monique approve job-fixture"));
     }
 }
