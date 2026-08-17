@@ -254,6 +254,7 @@ dependencies = [
  "automonique-cli",
  "automonique-daemon",
  "automonique-store",
+ "automonique-transport-runtime",
  "base64 0.22.1",
  "hex",
  "httparse",

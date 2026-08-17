@@ -11,6 +11,7 @@ publish.workspace = true
 automonique-cli = { path = "../automonique-cli" }
 automonique-daemon = { path = "../automonique-daemon" }
 automonique-store = { path = "../automonique-store" }
+automonique-transport-runtime = { path = "../automonique-transport-runtime" }
 base64.workspace = true
 hex.workspace = true
 httparse.workspace = true

@@ -310,7 +310,10 @@ byId("chat-form").addEventListener("submit", async (event) => {
     });
     appendMessage("assistant", answer.answer);
     byId("chat-memory-count").textContent = count(answer.memory_evidence);
-    byId("chat-state").textContent = `${words(answer.profile)} · retained`;
+    const grounding = Array.isArray(answer.live_sources) && answer.live_sources.length > 0
+      ? ` · live ${answer.live_sources.join(", ")}`
+      : "";
+    byId("chat-state").textContent = `${words(answer.profile)}${grounding} · retained`;
   } catch (error) {
     appendMessage("assistant", `The contained conversation lane refused this turn (${error.message}).`);
     byId("chat-state").textContent = "Turn refused";
