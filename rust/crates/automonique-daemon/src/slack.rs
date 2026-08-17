@@ -2347,6 +2347,14 @@ fn is_github_issue_status_question(text: &str) -> bool {
     .any(|phrase| normalized.contains(phrase))
 }
 
+fn ticket_approval_failure(reason: &str) -> &'static str {
+    if reason == "executor_unavailable" {
+        "Manage has no live code-execution worker for this ticket. The gate remains pending and no work was released."
+    } else {
+        "Manage did not accept that approval, so no work was released."
+    }
+}
+
 impl<P: SlackTicketPoster> SlackTicketRouter<P> {
     fn handle_monique_command(&mut self, command: SlackMoniqueCommand, context: &str) {
         self.poster.begin_source(&command.source_key);
@@ -2510,7 +2518,8 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                         receipt.job_status.as_str()
                     )
                 }
-                _ => String::from("Manage did not accept that approval, so no work was released."),
+                Err(reason) => String::from(ticket_approval_failure(&reason)),
+                Ok(_) => String::from("Manage kept that ticket pending, so no work was released."),
             };
             let _ = self.poster.post_channel(&command.channel, &reply);
             return;
@@ -3506,11 +3515,11 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                     "Manage kept the ticket pending, so no work was released.",
                 );
             }
-            Err(_) => {
+            Err(reason) => {
                 let _ = self.poster.post_thread(
                     &event.channel,
                     &event.parent,
-                    "Manage did not accept that confirmation, so no work was released.",
+                    ticket_approval_failure(&reason),
                 );
             }
         }
@@ -7187,5 +7196,17 @@ mod tests {
             "",
         );
         assert_eq!(opened.lock().expect("opened").len(), 1);
+    }
+
+    #[test]
+    fn an_unavailable_executor_is_reported_without_claiming_release() {
+        assert_eq!(
+            ticket_approval_failure("executor_unavailable"),
+            "Manage has no live code-execution worker for this ticket. The gate remains pending and no work was released."
+        );
+        assert_eq!(
+            ticket_approval_failure("manage_unavailable"),
+            "Manage did not accept that approval, so no work was released."
+        );
     }
 }
