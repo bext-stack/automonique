@@ -1118,10 +1118,28 @@ fn repository_aliases_in_website_urls(
 }
 
 fn normalized(text: &str) -> String {
-    text.split_whitespace()
+    let compact = text
+        .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_lowercase()
+        .to_lowercase();
+    let mut normalized = String::with_capacity(compact.len());
+    for character in compact.chars() {
+        match character {
+            'à' | 'á' | 'â' | 'ä' | 'ã' | 'å' => normalized.push('a'),
+            'ç' => normalized.push('c'),
+            'é' | 'è' | 'ê' | 'ë' => normalized.push('e'),
+            'í' | 'ì' | 'î' | 'ï' => normalized.push('i'),
+            'ñ' => normalized.push('n'),
+            'ó' | 'ò' | 'ô' | 'ö' | 'õ' => normalized.push('o'),
+            'ú' | 'ù' | 'û' | 'ü' => normalized.push('u'),
+            'ý' | 'ÿ' => normalized.push('y'),
+            'æ' => normalized.push_str("ae"),
+            'œ' => normalized.push_str("oe"),
+            _ => normalized.push(character),
+        }
+    }
+    normalized
 }
 
 fn capability_question(text: &str) -> bool {
@@ -1374,6 +1392,19 @@ mod tests {
                 alias: String::from("automonique"),
                 instruction: String::from(
                     "create ticket to add date updated to https://www.automonique.fr/contact",
+                ),
+            })
+        );
+        assert_eq!(
+            engine
+                .natural_request(
+                    "créate a github ticket to add date of modification on https://www.automonique.fr/contact",
+                )
+                .expect("accented create request"),
+            Some(GitHubActionRequest::Create {
+                alias: String::from("automonique"),
+                instruction: String::from(
+                    "créate a github ticket to add date of modification on https://www.automonique.fr/contact",
                 ),
             })
         );

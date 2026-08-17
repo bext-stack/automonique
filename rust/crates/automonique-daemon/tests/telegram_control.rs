@@ -1723,7 +1723,7 @@ fn telegram_website_ticket_request_reaches_the_configured_github_action() {
         FakeClient::new([updates(&[(
             2,
             OPERATOR,
-            "create ticket to add date updated to https://www.gtonline.fr/contact",
+            "créate a github ticket to add date of modification on https://www.gtonline.fr/contact",
         )])]),
         outbound.clone(),
         lane,
