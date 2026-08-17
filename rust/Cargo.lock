@@ -251,7 +251,10 @@ dependencies = [
 name = "automonique-web-entry"
 version = "0.1.0"
 dependencies = [
+ "automonique-cli",
  "httparse",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,0 +1,6 @@
+<!-- SPDX-License-Identifier: Elastic-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Monique">
+  <rect width="64" height="64" rx="32" fill="#10100f"/>
+  <circle cx="32" cy="32" r="24" fill="none" stroke="#d8ff57" stroke-width="2"/>
+  <path d="M17 43V21h5l10 13 10-13h5v22h-6V31l-9 11-9-11v12z" fill="#f3f0e5"/>
+</svg>

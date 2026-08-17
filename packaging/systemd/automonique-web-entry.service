@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Elastic-2.0
 
 [Unit]
-Description=Automonique hosted web entry point
+Description=Automonique hosted dashboard
 After=network.target
 
 [Service]
@@ -11,6 +11,7 @@ Restart=on-failure
 RestartSec=5s
 StateDirectory=automonique
 StateDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=%t
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=read-only

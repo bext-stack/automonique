@@ -1,0 +1,166 @@
+<!-- SPDX-License-Identifier: Elastic-2.0 -->
+<!doctype html>
+<html lang="en" data-health="loading">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#10100f">
+    <title>Monique — Live operations</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/assets/dashboard.css">
+    <script src="/assets/dashboard.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to dashboard</a>
+    <div class="ambient ambient-one" aria-hidden="true"></div>
+    <div class="ambient ambient-two" aria-hidden="true"></div>
+
+    <div class="shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Monique dashboard home">
+          <span class="brand-mark" aria-hidden="true">M</span>
+          <span>
+            <strong>MONIQUE</strong>
+            <small>CONTROL PLANE</small>
+          </span>
+        </a>
+        <div class="topbar-actions">
+          <span class="read-only">Read-only live view</span>
+          <a class="button button-quiet" href="https://manage.inklura.fr/manage">Open Manage <span aria-hidden="true">↗</span></a>
+        </div>
+      </header>
+
+      <main id="main">
+        <section class="hero" aria-labelledby="hero-title">
+          <div class="hero-copy">
+            <p class="eyebrow">LIVE OPERATIONS / <span id="generation-kicker">GEN —</span></p>
+            <h1 id="hero-title">The whole system,<br><em>in one quiet view.</em></h1>
+            <p class="hero-summary">A focused read on Monique’s runtime, queues and delivery path. No hidden mutations. No synthetic activity.</p>
+          </div>
+          <div class="system-orbit" aria-label="Current system status">
+            <div class="orbit-ring" aria-hidden="true"></div>
+            <div class="status-core">
+              <span class="status-pulse" aria-hidden="true"></span>
+              <strong id="status-label">Connecting</strong>
+              <span id="status-detail">Waiting for a verified snapshot</span>
+            </div>
+          </div>
+          <div class="hero-meta">
+            <span><i class="live-dot" aria-hidden="true"></i> <span id="refresh-label">Establishing live feed</span></span>
+            <time id="last-updated">Not yet observed</time>
+          </div>
+        </section>
+
+        <section class="metric-grid" aria-label="Queue summary">
+          <article class="metric-card metric-primary">
+            <p>Active runs</p>
+            <strong id="metric-running">—</strong>
+            <span>work executing now</span>
+          </article>
+          <article class="metric-card">
+            <p>Inbox</p>
+            <strong id="metric-inbox">—</strong>
+            <span>requests awaiting intake</span>
+          </article>
+          <article class="metric-card">
+            <p>Outbox</p>
+            <strong id="metric-outbox">—</strong>
+            <span>effects awaiting delivery</span>
+          </article>
+          <article class="metric-card">
+            <p>Reconciliation</p>
+            <strong id="metric-reconciliation">—</strong>
+            <span>outcomes needing review</span>
+          </article>
+        </section>
+
+        <section class="dashboard-grid">
+          <article class="panel runtime-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="section-label">RUNTIME</p>
+                <h2>System posture</h2>
+              </div>
+              <span class="panel-badge" id="runtime-badge">Observing</span>
+            </div>
+            <dl class="runtime-list">
+              <div>
+                <dt>Daemon</dt>
+                <dd><span class="mini-light" aria-hidden="true"></span><span id="runtime-daemon">—</span></dd>
+              </div>
+              <div>
+                <dt>Provider lane</dt>
+                <dd id="runtime-provider">—</dd>
+              </div>
+              <div>
+                <dt>Accepting intake</dt>
+                <dd id="runtime-intake">—</dd>
+              </div>
+              <div>
+                <dt>Execution profile</dt>
+                <dd id="runtime-execution">—</dd>
+              </div>
+              <div>
+                <dt>Telegram</dt>
+                <dd id="runtime-telegram">—</dd>
+              </div>
+              <div>
+                <dt>Generation</dt>
+                <dd id="runtime-generation">—</dd>
+              </div>
+            </dl>
+          </article>
+
+          <article class="panel flow-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="section-label">DELIVERY PATH</p>
+                <h2>From request to effect</h2>
+              </div>
+              <span class="panel-badge panel-badge-soft">Live topology</span>
+            </div>
+            <ol class="flow-list">
+              <li>
+                <span class="flow-index">01</span>
+                <div><strong>Intake</strong><small>Bounded, durable admission</small></div>
+                <span class="flow-value" id="flow-intake">— pending</span>
+              </li>
+              <li>
+                <span class="flow-index">02</span>
+                <div><strong>Execution</strong><small>Fenced provider runs</small></div>
+                <span class="flow-value" id="flow-running">— active</span>
+              </li>
+              <li>
+                <span class="flow-index">03</span>
+                <div><strong>Delivery</strong><small>Idempotent outbound effects</small></div>
+                <span class="flow-value" id="flow-outbox">— pending</span>
+              </li>
+              <li>
+                <span class="flow-index">04</span>
+                <div><strong>Reconcile</strong><small>Explicit outcome certainty</small></div>
+                <span class="flow-value" id="flow-reconciliation">— pending</span>
+              </li>
+            </ol>
+          </article>
+
+          <article class="panel action-panel">
+            <p class="section-label">OPERATOR SURFACE</p>
+            <h2>Need to act?</h2>
+            <p>This dashboard intentionally cannot approve, cancel, retry or alter state. Continue in Manage for authenticated operations and their audit trail.</p>
+            <a class="button button-primary" href="https://manage.inklura.fr/manage">Continue to Manage <span aria-hidden="true">↗</span></a>
+            <div class="integrity-note">
+              <span aria-hidden="true">⌁</span>
+              <p><strong>Live facts, narrow scope.</strong><br>Only the daemon’s sanitized status projection reaches this page.</p>
+            </div>
+          </article>
+        </section>
+      </main>
+
+      <footer>
+        <span>MONIQUE / AUTOMONIQUE</span>
+        <span id="footer-state">Awaiting status</span>
+      </footer>
+    </div>
+  </body>
+</html>

@@ -23,12 +23,13 @@ external transports and refuses provider starts.
 claims confirmed jobs with bounded parallelism, and streams their progress back
 to AI Operations. It runs from the same immutable release as the daemon.
 
-The optional hosted web entry point is deliberately separate from the daemon.
-`automonique-web-entry.service` binds a small Rust redirect-only HTTP server to
-loopback; `automonique-web-tunnel.service` publishes it through an
-operator-provisioned Cloudflare tunnel. The canonical hostname enters the
-existing authenticated Manage console, while the retired hostname redirects
-to the canonical one.
+The optional hosted dashboard is deliberately separate from the daemon.
+`automonique-web-entry.service` binds a small Rust read-only dashboard server
+to loopback; `automonique-web-tunnel.service` publishes it through an
+operator-provisioned Cloudflare tunnel. The dashboard reads a sanitized status
+projection through the same peer-authenticated local protocol as the CLI and
+keeps mutations on the authenticated Manage console. The retired hostname
+redirects to the canonical dashboard hostname.
 Tunnel credentials and `config-monique-web.yml` are deployment state under
 `~/.cloudflared/` and must never be committed. Install and start both units only
 with owner authority for the public hostname and production change.
