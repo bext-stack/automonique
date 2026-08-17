@@ -1386,6 +1386,26 @@ fn one_issue_url(text: &str) -> Result<Option<String>, ()> {
     Ok(issue)
 }
 
+/// Return the canonical coordinate only when the message carries no request
+/// beyond one Slack-rendered GitHub issue link.
+///
+/// A bare link is context, not permission to release work. Slack rewrites it
+/// as `<url|label>`, so compare the URL half after removing presentation
+/// punctuation. Explicit verbs such as `run`, `review`, or `status` continue
+/// through their typed routes.
+fn bare_issue_url(text: &str) -> Option<String> {
+    let issue_url = one_issue_url(text).ok().flatten()?;
+    let token = text.trim().trim_matches(|character: char| {
+        matches!(
+            character,
+            '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '"' | '\'' | '!'
+        )
+    });
+    let token = token.split_once('|').map_or(token, |(url, _)| url);
+    let token = token.strip_suffix('.').unwrap_or(token);
+    (token == issue_url).then_some(issue_url)
+}
+
 #[derive(Clone, Debug)]
 enum SlackTicketInteractionKind {
     Approve,
@@ -3751,6 +3771,23 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
         // particular, it must be intercepted before the plain ticket-intake
         // lane could mistake "review <issue>" for authorization to work it.
         if self.members.contains(&event.user) {
+            if let Some(issue_url) = bare_issue_url(trimmed) {
+                let answer = self.question_answerer.as_mut().map_or_else(
+                    || String::from("Monique's GitHub issue reader is unavailable right now."),
+                    |answerer| {
+                        answerer.issue_review(
+                            &issue_url,
+                            "Summarize this GitHub issue briefly in the language of its content, report its current state, and ask what the user wants Monique to do next. Do not start work from a bare link.",
+                            context,
+                            true,
+                        )
+                    },
+                );
+                let _ = self
+                    .poster
+                    .post_thread(&event.channel, &event.parent, &answer);
+                return;
+            }
             if is_github_issue_status_question(trimmed)
                 && let Ok(Some(issue_url)) = one_issue_url(trimmed)
             {
@@ -7913,10 +7950,12 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_admin_issue_url_still_enters_manage_not_github_actions() {
+    fn a_plain_admin_issue_url_is_read_before_the_user_selects_an_action() {
         let poster = FakeTicketPoster::default();
+        let messages = Arc::clone(&poster.messages);
         let manage = FakeManage::default();
         let opened = Arc::clone(&manage.opened);
+        let reviews = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut router = SlackTicketRouter {
             poster,
             manage: Box::new(manage),
@@ -7936,7 +7975,9 @@ mod tests {
             github_actions: None,
             approvals: None,
             approval_lane: None,
-            question_answerer: None,
+            question_answerer: Some(Box::new(FakeIssueReviewAnswerer {
+                seen: Arc::clone(&reviews),
+            })),
         };
         router.handle_with_context(
             ticket_event(
@@ -7946,7 +7987,16 @@ mod tests {
             ),
             "",
         );
-        assert_eq!(opened.lock().expect("opened").len(), 1);
+        assert!(opened.lock().expect("opened").is_empty());
+        let reviews = reviews.lock().expect("reviews");
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].0, "https://github.com/example/project/issues/42");
+        assert!(reviews[0].1.contains("Do not start work from a bare link"));
+        assert!(reviews[0].2);
+        assert_eq!(
+            messages.lock().expect("messages").as_slice(),
+            [String::from("Typed GitHub issue review")]
+        );
     }
 
     #[test]
