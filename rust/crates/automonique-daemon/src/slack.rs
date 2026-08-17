@@ -150,6 +150,12 @@ pub const MAX_CONFIGURED_ADMINS: usize = 32;
 pub const MAX_CONFIGURED_MEMBERS: usize = 256;
 /// Most conversational tool approvals retained by one Slack worker.
 const MAX_PENDING_SLACK_TOOL_APPROVALS: usize = 64;
+/// Maximum channel-history pages one in-thread ticket audit may inspect.
+///
+/// This keeps a natural-language read bounded even when a configured channel
+/// has years of history. Slack currently caps a page at `MAX_PAGE_LIMIT`, so
+/// the total is at most 4,000 messages.
+const MAX_CHANNEL_TICKET_AUDIT_PAGES: usize = 20;
 
 /// Independently staged Slack product capabilities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2315,6 +2321,10 @@ trait SlackQuestionAnswerer: Send {
         String::from("Monique's provider instance statistics are unavailable right now.")
     }
 
+    fn channel_ticket_audit(&mut self, _channel: &ChannelId) -> String {
+        String::from("Monique's Slack ticket auditor is unavailable right now.")
+    }
+
     fn issue_status(&mut self, _issue_url: &str) -> String {
         String::from("Monique's GitHub issue reader is unavailable right now.")
     }
@@ -2630,6 +2640,49 @@ impl SlackQuestionAnswerer for LiveSlackQuestionAnswerer {
         })
     }
 
+    fn channel_ticket_audit(&mut self, channel: &ChannelId) -> String {
+        let identity = match self.api.auth_test() {
+            Ok(SlackOutcome::Accepted(identity)) => identity,
+            Ok(SlackOutcome::Rejected(_)) | Err(_) => {
+                return String::from(
+                    "Monique could not identify its Slack account, so the ticket audit was not run.",
+                );
+            }
+        };
+        let mut messages = Vec::new();
+        let mut cursor = None;
+        let mut complete = false;
+        for _ in 0..MAX_CHANNEL_TICKET_AUDIT_PAGES {
+            let mut request =
+                match ConversationsHistoryRequest::new(channel.clone(), MAX_PAGE_LIMIT) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        return String::from(
+                            "Monique could not construct the bounded Slack history audit.",
+                        );
+                    }
+                };
+            if let Some(next) = cursor.take() {
+                request = request.from_cursor(next);
+            }
+            let page = match self.api.conversations_history(&request) {
+                Ok(SlackOutcome::Accepted(page)) => page,
+                Ok(SlackOutcome::Rejected(_)) | Err(_) => {
+                    return String::from(
+                        "Slack did not provide a complete channel-history page, so Monique did not claim an audit result.",
+                    );
+                }
+            };
+            messages.extend(page.messages);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                complete = true;
+                break;
+            }
+        }
+        channel_ticket_audit_text(&messages, &identity.user_id, complete)
+    }
+
     fn issue_status(&mut self, issue_url: &str) -> String {
         let Some(locator) = IssueLocator::parse(issue_url) else {
             return String::from("That is not a canonical GitHub issue URL.");
@@ -2812,6 +2865,129 @@ fn is_ticket_job_progress_question(text: &str) -> bool {
         || normalized.contains("ou en est le travail")
         || normalized.contains("où en est le job")
         || normalized.contains("ou en est le job")
+}
+
+/// Recognize a read-only request to audit ticket posts and their follow-ups in
+/// the current Slack channel. In particular, `check` and `comments` here are
+/// audit nouns: they must not be reinterpreted as checklist and reply writes.
+fn is_channel_ticket_audit_question(text: &str) -> bool {
+    let normalized = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let names_tickets = ["ticket", "tickets", "issue", "issues"]
+        .iter()
+        .any(|term| normalized.contains(term));
+    let names_channel = normalized.contains("channel") || normalized.contains("slack");
+    let asks_audit = [
+        "check", "audit", "review", "inspect", "verify", "vérifie", "verifie",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term));
+    let names_gap = [
+        "missed",
+        "unhandled",
+        "not handled",
+        "follow up",
+        "follow-up",
+        "comment",
+        "oublié",
+        "oublie",
+        "non traité",
+        "non traite",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term));
+    names_tickets && names_channel && asks_audit && names_gap
+}
+
+fn channel_ticket_audit_text(
+    messages: &[SlackMessage],
+    bot_user: &UserId,
+    complete_history: bool,
+) -> String {
+    let mut ticket_posts = 0usize;
+    let mut unique_issues = BTreeMap::<String, usize>::new();
+    let mut missing = BTreeMap::<String, usize>::new();
+    let mut bot_only_threads = 0usize;
+    let mut mixed_threads = 0usize;
+    let mut uncertain_threads = 0usize;
+
+    for message in messages {
+        if !message.is_from_member() || !message.is_top_level() {
+            continue;
+        }
+        let Ok(Some(issue_url)) = one_issue_url(&message.text) else {
+            continue;
+        };
+        ticket_posts += 1;
+        *unique_issues.entry(issue_url.clone()).or_default() += 1;
+        if message.reply_count.unwrap_or_default() == 0 {
+            *missing.entry(issue_url).or_default() += 1;
+            continue;
+        }
+        let Some(reply_users) = message.reply_users.as_ref() else {
+            uncertain_threads += 1;
+            continue;
+        };
+        let summary_complete = message
+            .reply_users_count
+            .is_some_and(|count| usize::try_from(count).ok() == Some(reply_users.len()));
+        if !summary_complete {
+            uncertain_threads += 1;
+            continue;
+        }
+        if !reply_users.contains(bot_user) {
+            *missing.entry(issue_url).or_default() += 1;
+        } else if reply_users.iter().any(|user| user != bot_user) {
+            mixed_threads += 1;
+        } else {
+            bot_only_threads += 1;
+        }
+    }
+
+    let history_scope = if complete_history {
+        "all history Slack made available"
+    } else {
+        "the first 4,000 available channel messages"
+    };
+    let mut answer = format!(
+        "Channel ticket audit: scanned {} messages and {ticket_posts} GitHub ticket posts ({} unique issues) across {history_scope}.",
+        messages.len(),
+        unique_issues.len()
+    );
+    if missing.is_empty() {
+        answer.push_str("\n\nNo ticket post is confirmed as missing a Monique reply.");
+    } else {
+        let missed_posts: usize = missing.values().sum();
+        answer.push_str(&format!(
+            "\n\n{missed_posts} ticket post(s) have no confirmed Monique reply:"
+        ));
+        for (index, (issue_url, count)) in missing.iter().enumerate() {
+            if index == 20 {
+                answer.push_str(&format!(
+                    "\n- … and {} more issue(s)",
+                    missing.len().saturating_sub(index)
+                ));
+                break;
+            }
+            answer.push_str("\n- ");
+            answer.push_str(issue_url);
+            if *count > 1 {
+                answer.push_str(&format!(" ({count} separate posts)"));
+            }
+        }
+    }
+    answer.push_str(&format!(
+        "\n\nFollow-ups: {bot_only_threads} replied threads have only Monique in Slack's complete participant summary. {mixed_threads} thread(s) contain both Monique and human replies; channel history does not expose their reply order, so they still require exact per-thread checking."
+    ));
+    if uncertain_threads > 0 {
+        answer.push_str(&format!(
+            " Slack supplied an incomplete participant summary for {uncertain_threads} additional thread(s), so Monique does not claim those are clear."
+        ));
+    }
+    answer
 }
 
 fn slack_ticket_status_text(status: &automonique_support_connector::TicketStatus) -> String {
@@ -4035,6 +4211,16 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                         )
                     },
                     |answerer| answerer.provider_stats(),
+                );
+                let _ = self
+                    .poster
+                    .post_thread(&event.channel, &event.parent, &answer);
+                return;
+            }
+            if is_channel_ticket_audit_question(trimmed) {
+                let answer = self.question_answerer.as_mut().map_or_else(
+                    || String::from("Monique's Slack ticket auditor is unavailable right now."),
+                    |answerer| answerer.channel_ticket_audit(&event.channel),
                 );
                 let _ = self
                     .poster
@@ -6214,6 +6400,9 @@ mod tests {
             ts: MessageTs::new(ts).expect("ts"),
             thread_ts: None,
             reply_count: None,
+            reply_users: None,
+            reply_users_count: None,
+            latest_reply: None,
         }
     }
 
@@ -7513,6 +7702,48 @@ mod tests {
                 "{failure:?}"
             );
         }
+    }
+
+    #[test]
+    fn channel_ticket_audit_is_read_only_and_reports_its_follow_up_boundary() {
+        let request = "check if we missed handling any of the tickets or follow up comments of tickets posted in the channel";
+        assert!(is_channel_ticket_audit_question(request));
+        assert!(!is_channel_ticket_audit_question(
+            "check the deployment item on https://github.com/example/project/issues/42"
+        ));
+
+        let bot = UserId::new("U0MONIQUE9").expect("bot user");
+        let human = UserId::new("U0RESERVED").expect("human user");
+        let mut missed = message(
+            Some("U0RESERVED"),
+            "1723542000.000100",
+            "https://github.com/example/project/issues/42",
+        );
+        missed.reply_count = Some(0);
+        let mut handled = message(
+            Some("U0RESERVED"),
+            "1723542100.000200",
+            "https://github.com/example/project/issues/43",
+        );
+        handled.reply_count = Some(1);
+        handled.reply_users = Some(vec![bot.clone()]);
+        handled.reply_users_count = Some(1);
+        let mut follow_up = message(
+            Some("U0RESERVED"),
+            "1723542200.000300",
+            "https://github.com/example/project/issues/44",
+        );
+        follow_up.reply_count = Some(3);
+        follow_up.reply_users = Some(vec![bot.clone(), human]);
+        follow_up.reply_users_count = Some(2);
+
+        let answer = channel_ticket_audit_text(&[missed, handled, follow_up], &bot, true);
+        assert!(answer.contains("3 GitHub ticket posts (3 unique issues)"));
+        assert!(answer.contains("1 ticket post(s) have no confirmed Monique reply"));
+        assert!(answer.contains("https://github.com/example/project/issues/42"));
+        assert!(answer.contains("1 replied threads have only Monique"));
+        assert!(answer.contains("1 thread(s) contain both Monique and human replies"));
+        assert!(!answer.contains("issues/43\n-"));
     }
 
     #[test]

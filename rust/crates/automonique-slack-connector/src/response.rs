@@ -142,6 +142,18 @@ pub struct SlackMessage {
     pub thread_ts: Option<MessageTs>,
     /// How many replies the thread has — the count, not the replies.
     pub reply_count: Option<u32>,
+    /// Distinct reply authors Slack included in the channel-history summary.
+    ///
+    /// This field is a summary, not reply order. `None` means Slack omitted the
+    /// summary; an empty vector means it explicitly supplied no authors.
+    pub reply_users: Option<Vec<UserId>>,
+    /// Number of distinct reply authors Slack says the thread contains.
+    ///
+    /// Comparing this with `reply_users.len()` tells a caller whether Slack's
+    /// author summary was complete before it draws a negative conclusion.
+    pub reply_users_count: Option<u32>,
+    /// Timestamp of the newest thread reply, when Slack supplied one.
+    pub latest_reply: Option<MessageTs>,
 }
 
 impl SlackMessage {
@@ -546,6 +558,34 @@ fn message(row: &Map<String, Value>) -> Result<SlackMessage, SlackFailure> {
             Some(u32::try_from(count).map_err(|_| SlackFailure::FieldOutOfBounds)?)
         }
     };
+    let reply_users = match row.get("reply_users") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(values)) => {
+            if values.len() > MAX_REPLY_COUNT as usize {
+                return Err(SlackFailure::FieldOutOfBounds);
+            }
+            Some(
+                values
+                    .iter()
+                    .map(|value| {
+                        let user = value.as_str().ok_or(SlackFailure::FieldOutOfBounds)?;
+                        UserId::new(user).map_err(|_| SlackFailure::FieldOutOfBounds)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        }
+        Some(_) => return Err(SlackFailure::FieldOutOfBounds),
+    };
+    let reply_users_count = match row.get("reply_users_count") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let count = value.as_u64().ok_or(SlackFailure::FieldOutOfBounds)?;
+            if count > MAX_REPLY_COUNT {
+                return Err(SlackFailure::FieldOutOfBounds);
+            }
+            Some(u32::try_from(count).map_err(|_| SlackFailure::FieldOutOfBounds)?)
+        }
+    };
     Ok(SlackMessage {
         kind: nonempty(row, "type", MAX_OPAQUE_BYTES)?,
         user: optional_user_id(row, "user")?,
@@ -556,6 +596,9 @@ fn message(row: &Map<String, Value>) -> Result<SlackMessage, SlackFailure> {
         ts: timestamp(row, "ts")?,
         thread_ts: optional_timestamp(row, "thread_ts")?,
         reply_count,
+        reply_users,
+        reply_users_count,
+        latest_reply: optional_timestamp(row, "latest_reply")?,
     })
 }
 
@@ -718,7 +761,9 @@ mod tests {
     fn message_json() -> String {
         format!(
             r#"{{"type":"message","user":"{USER}","text":"le paiement echoue",
-               "ts":"1723542000.000100","thread_ts":"1723542000.000100","reply_count":2}}"#
+               "ts":"1723542000.000100","thread_ts":"1723542000.000100","reply_count":2,
+               "reply_users":["U0MONIQUE9","{USER}"],"reply_users_count":2,
+               "latest_reply":"1723542200.000300"}}"#
         )
     }
 
@@ -833,6 +878,21 @@ mod tests {
         assert_eq!(human.text, "le paiement echoue");
         assert_eq!(human.ts.as_str(), "1723542000.000100");
         assert_eq!(human.reply_count, Some(2));
+        assert_eq!(
+            human
+                .reply_users
+                .as_ref()
+                .expect("reply users")
+                .iter()
+                .map(UserId::as_str)
+                .collect::<Vec<_>>(),
+            ["U0MONIQUE9", USER]
+        );
+        assert_eq!(human.reply_users_count, Some(2));
+        assert_eq!(
+            human.latest_reply.as_ref().map(MessageTs::as_str),
+            Some("1723542200.000300")
+        );
         assert!(human.is_from_member());
         assert!(
             human.is_top_level(),
