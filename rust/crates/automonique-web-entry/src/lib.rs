@@ -84,6 +84,7 @@ pub struct Request<'a> {
     pub path: &'a str,
     pub host: &'a str,
     authorization: Option<&'a str>,
+    cookie: Option<&'a str>,
     forwarded_proto: Option<&'a str>,
     content_type: Option<&'a str>,
     content_length: usize,
@@ -98,6 +99,7 @@ impl fmt::Debug for Request<'_> {
             .field("path", &self.path)
             .field("host", &self.host)
             .field("authorization", &self.authorization.map(|_| "<redacted>"))
+            .field("cookie", &self.cookie.map(|_| "<redacted>"))
             .field("forwarded_proto", &self.forwarded_proto)
             .field("content_type", &self.content_type)
             .field("content_length", &self.content_length)
@@ -227,6 +229,46 @@ impl BasicAuth {
         .unwrap_or(false);
         decoded.zeroize();
         authorized
+    }
+
+    fn authorize_session(&self, cookie: Option<&str>) -> bool {
+        let Some(cookie) = cookie.filter(|value| value.len() <= 4096) else {
+            return false;
+        };
+        let token = cookie.split(';').find_map(|part| {
+            part.trim()
+                .strip_prefix("monique_session=")
+                .filter(|value| !value.is_empty())
+        });
+        let Some((expiry, signature)) = token.and_then(|token| token.split_once('.')) else {
+            return false;
+        };
+        let Ok(expiry_seconds) = expiry.parse::<u64>() else {
+            return false;
+        };
+        let now_seconds = now_ms() / 1_000;
+        if expiry_seconds < now_seconds || expiry_seconds > now_seconds.saturating_add(28_800) {
+            return false;
+        }
+        let expected = self.session_signature(expiry);
+        expected.as_bytes().ct_eq(signature.as_bytes()).into()
+    }
+
+    fn session_cookie(&self) -> String {
+        let expiry = (now_ms() / 1_000).saturating_add(28_800).to_string();
+        let signature = self.session_signature(&expiry);
+        format!(
+            "monique_session={expiry}.{signature}; Path=/; Max-Age=28800; Secure; HttpOnly; SameSite=Strict"
+        )
+    }
+
+    fn session_signature(&self, expiry: &str) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"automonique.dashboard-session/v1\0");
+        digest.update(self.credential_sha256);
+        digest.update(b"\0");
+        digest.update(expiry.as_bytes());
+        hex::encode(digest.finalize())
     }
 }
 
@@ -836,6 +878,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request<'_>, Route> {
 
     let mut host = None;
     let mut authorization = None;
+    let mut cookie = None;
     let mut forwarded_proto = None;
     let mut content_type = None;
     let mut content_length = None;
@@ -850,6 +893,15 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request<'_>, Route> {
                 return Err(Route::BadRequest);
             }
             authorization = Some(std::str::from_utf8(header.value).map_err(|_| Route::BadRequest)?);
+        } else if header.name.eq_ignore_ascii_case("cookie") {
+            if cookie.is_some() {
+                return Err(Route::BadRequest);
+            }
+            let value = std::str::from_utf8(header.value).map_err(|_| Route::BadRequest)?;
+            if value.len() > 4096 {
+                return Err(Route::BadRequest);
+            }
+            cookie = Some(value);
         } else if header.name.eq_ignore_ascii_case("x-forwarded-proto") {
             if forwarded_proto.is_some() {
                 return Err(Route::BadRequest);
@@ -892,6 +944,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request<'_>, Route> {
         path,
         host,
         authorization,
+        cookie,
         forwarded_proto,
         content_type,
         content_length: content_length.unwrap_or(0),
@@ -1216,7 +1269,7 @@ fn empty_response(status: &'static str) -> Response {
     }
 }
 
-fn response_bytes(response: Response, head_only: bool) -> Vec<u8> {
+fn response_bytes(response: Response, head_only: bool, session_cookie: Option<&str>) -> Vec<u8> {
     let content_security_policy = if response.content_type == Some("text/html; charset=utf-8") {
         "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
     } else {
@@ -1253,6 +1306,11 @@ fn response_bytes(response: Response, head_only: bool) -> Vec<u8> {
         headers.push_str(
             "WWW-Authenticate: Basic realm=\"Monique Operations\", charset=\"UTF-8\"\r\n",
         );
+    }
+    if let Some(session_cookie) = session_cookie {
+        headers.push_str("Set-Cookie: ");
+        headers.push_str(session_cookie);
+        headers.push_str("\r\n");
     }
     headers.push_str(&format!("Content-Length: {}\r\n\r\n", response.body.len()));
     let mut bytes = headers.into_bytes();
@@ -1317,9 +1375,11 @@ fn handle(
                             | Route::UnknownHost
                             | Route::BadRequest
                     );
+                let basic_authorized = auth.authorize(request.authorization);
+                let session_authorized = auth.authorize_session(request.cookie);
                 let route = if !state.admit() {
                     Route::RateLimited
-                } else if needs_auth && !auth.authorize(request.authorization) {
+                } else if needs_auth && !(basic_authorized || session_authorized) {
                     Route::Unauthorized
                 } else if request.method == Method::Post
                     && (request.content_length == 0
@@ -1336,7 +1396,8 @@ fn handle(
                 } else {
                     Vec::new()
                 };
-                break Ok((route, request.method == Method::Head, body));
+                let issue_session = needs_auth && basic_authorized && !session_authorized;
+                break Ok((route, request.method == Method::Head, body, issue_session));
             }
             Err(Route::BadRequest) if !bytes.windows(4).any(|part| part == b"\r\n\r\n") => {
                 continue;
@@ -1344,9 +1405,9 @@ fn handle(
             Err(error) => break Err(error),
         }
     };
-    let (route, head_only, body) = match parsed {
+    let (route, head_only, body, issue_session) = match parsed {
         Ok(value) => value,
-        Err(route) => (route, false, Vec::new()),
+        Err(route) => (route, false, Vec::new(), false),
     };
     let response = if matches!(
         route,
@@ -1364,7 +1425,12 @@ fn handle(
     } else {
         response_for(route, state)
     };
-    stream.write_all(&response_bytes(response, head_only))?;
+    let session_cookie = issue_session.then(|| auth.session_cookie());
+    stream.write_all(&response_bytes(
+        response,
+        head_only,
+        session_cookie.as_deref(),
+    ))?;
     stream.flush()
 }
 
@@ -1527,6 +1593,7 @@ mod tests {
         let response = String::from_utf8(response_bytes(
             response_for(Route::Dashboard, &state),
             false,
+            None,
         ))
         .unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -1543,7 +1610,7 @@ mod tests {
         assert_eq!(Method::Head, parsed.method);
         assert_eq!(Route::Legacy, route(&parsed));
         let state = AppState::new(fixture_status());
-        let response = response_bytes(response_for(Route::Legacy, &state), true);
+        let response = response_bytes(response_for(Route::Legacy, &state), true, None);
         assert!(
             response
                 .windows(CANONICAL_HOST.len())
@@ -1567,7 +1634,7 @@ mod tests {
         let parsed = parse_request(&bytes).unwrap();
         assert_eq!(Route::MethodNotAllowed, route(&parsed));
         let state = AppState::new(fixture_status());
-        let response = response_bytes(response_for(Route::MethodNotAllowed, &state), false);
+        let response = response_bytes(response_for(Route::MethodNotAllowed, &state), false, None);
         assert!(!response.windows(9).any(|part| part == b"Location:"));
     }
 
@@ -1623,6 +1690,18 @@ mod tests {
         let accepted = format!("Basic {}", BASE64_STANDARD.encode("ops:fixture-password"));
         assert!(auth.authorize(Some(&accepted)));
         assert!(BasicAuth::from_config(format!("{config}extra=1\n").as_bytes()).is_err());
+    }
+
+    #[test]
+    fn basic_auth_mints_a_bounded_secure_session_cookie() {
+        let auth = fixture_auth();
+        let header = auth.session_cookie();
+        assert!(header.contains("; Secure; HttpOnly; SameSite=Strict"));
+        let cookie = header.split(';').next().unwrap();
+        assert!(auth.authorize_session(Some(cookie)));
+        let mut tampered = cookie.to_owned();
+        tampered.push('0');
+        assert!(!auth.authorize_session(Some(&tampered)));
     }
 
     #[test]
