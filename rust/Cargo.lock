@@ -252,9 +252,18 @@ name = "automonique-web-entry"
 version = "0.1.0"
 dependencies = [
  "automonique-cli",
+ "automonique-daemon",
+ "automonique-store",
+ "base64 0.22.1",
+ "hex",
  "httparse",
+ "nix",
+ "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]

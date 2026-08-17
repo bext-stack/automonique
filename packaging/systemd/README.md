@@ -30,6 +30,21 @@ operator-provisioned Cloudflare tunnel. The dashboard reads a sanitized status
 projection through the same peer-authenticated local protocol as the CLI and
 keeps mutations on the authenticated Manage console. The retired hostname
 redirects to the canonical dashboard hostname.
+Every dashboard resource and API response on the canonical hostname requires
+HTTP Basic authentication over the Cloudflare TLS boundary. The strict private
+credential file is `%S/automonique/dashboard-auth.conf`; it stores a username
+and the SHA-256 digest of an operator-generated high-entropy secret, never the
+secret itself. The loopback-only health check is the sole unauthenticated route.
+`automonique-dashboard-auth` creates that verifier and a separate owner-only
+recovery file without printing the credential. The recovery file is not read by
+the service and should be moved into the operator's password manager, then
+removed. `%S/automonique/dashboard-integration.conf` binds the dashboard to one
+existing memory tenant and actor; those identifiers remain absent from every
+web configuration response. Chat turns use the daemon's contained run lane and
+the canonical memory database, rather than a dashboard-specific provider path.
+The private `%S/automonique/dashboard-runtime.conf` supplies the absolute live
+daemon state directory as `AUTOMONIQUE_DAEMON_STATE`; no deployment path is
+embedded in the committed unit.
 Tunnel credentials and `config-monique-web.yml` are deployment state under
 `~/.cloudflared/` and must never be committed. Install and start both units only
 with owner authority for the public hostname and production change.

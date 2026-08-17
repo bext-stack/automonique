@@ -9,9 +9,18 @@ publish.workspace = true
 
 [dependencies]
 automonique-cli = { path = "../automonique-cli" }
+automonique-daemon = { path = "../automonique-daemon" }
+automonique-store = { path = "../automonique-store" }
+base64.workspace = true
+hex.workspace = true
 httparse.workspace = true
+nix.workspace = true
+rusqlite.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true
