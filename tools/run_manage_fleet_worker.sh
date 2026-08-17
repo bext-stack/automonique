@@ -49,9 +49,10 @@ fleet_instance=$(private_value instance "$fleet_config")
 fleet_token=$(private_value token "$fleet_config")
 provider_binary=$(private_value binary "$provider_config")
 provider_home=$(private_value home "$provider_config")
+worker_home=${AUTOMONIQUE_FLEET_CODEX_HOME:-$provider_home}
 fleet_url=${fleet_base%/}/api/manage/shelldeck/fleet
 
-if [[ ! -x "$provider_binary" || ! -d "$provider_home" ]]; then
+if [[ ! -x "$provider_binary" || ! -d "$worker_home" ]]; then
     printf '%s\n' 'configured Codex provider is unavailable' >&2
     exit 2
 fi
@@ -188,20 +189,26 @@ run_job() {
         return
     }
     output=$runtime_dir/$job_id.jsonl
+    error_output=$runtime_dir/$job_id.stderr
     : >"$output"
+    : >"$error_output"
     chmod 600 -- "$output"
+    chmod 600 -- "$error_output"
 
     report_job "$job_id" running 'Codex started by Monique.' || return
     post_job_log "$job_id" lifecycle 'Codex started by Monique.'
 
     set +e
     printf '%s\n' "$prompt" \
-        | CODEX_HOME="$provider_home" "$provider_binary" exec \
+        | CODEX_HOME="$worker_home" "$provider_binary" exec \
             --json \
             --dangerously-bypass-approvals-and-sandbox \
             --skip-git-repo-check \
             -C "$cwd" \
-            - 2>&1 \
+            - 2> >(while IFS= read -r line; do
+                printf '%s\n' "$line" >>"$error_output"
+                post_job_log "$job_id" provider_stderr "$line"
+            done) \
         | tee "$output" \
         | while IFS= read -r line; do
             log_codex_line "$job_id" "$line"

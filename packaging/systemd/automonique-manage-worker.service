@@ -15,6 +15,9 @@ StateDirectory=automonique
 StateDirectoryMode=0700
 Environment=AUTOMONIQUE_STATE_DIR=%S/automonique
 Environment=AUTOMONIQUE_FLEET_CONCURRENCY=3
+# Optional: set this to an owner-managed Codex home with the full operational
+# tool host. The daemon's isolated conversation home may deliberately disable it.
+# Environment=AUTOMONIQUE_FLEET_CODEX_HOME=%h/.codex
 
 [Install]
 WantedBy=default.target
