@@ -3169,6 +3169,21 @@ pub(crate) struct PendingTicketGate {
     pub(crate) source_key: String,
 }
 
+/// One durable binding from a Slack thread to a Manage ticket job.
+///
+/// A confirmation gate is deliberately removed after approval, but the job it
+/// released remains queryable. Keeping that second lifetime separate lets a
+/// follow-up in the originating thread ask for execution progress without
+/// treating the GitHub issue's open/closed state as the run state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SlackTicketJobBinding {
+    team_id: String,
+    channel: String,
+    thread_ts: String,
+    pub(crate) job_id: String,
+    pub(crate) issue_url: String,
+}
+
 /// In-process projection of Manage's durable pending gates. Slack and Telegram
 /// share this registry so a gate created in either transport can be confirmed
 /// from the other without copying authority into user text.
@@ -3176,6 +3191,8 @@ pub(crate) struct PendingTicketGate {
 pub(crate) struct TicketGateRegistry {
     gates: Vec<PendingTicketGate>,
     path: Option<PathBuf>,
+    slack_jobs: Vec<SlackTicketJobBinding>,
+    slack_jobs_path: Option<PathBuf>,
 }
 
 impl TicketGateRegistry {
@@ -3201,9 +3218,24 @@ impl TicketGateRegistry {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(_) => return Err(()),
         };
+        let slack_jobs_path = path.with_file_name("slack-ticket-jobs.v1.json");
+        if let Ok(metadata) = std::fs::symlink_metadata(&slack_jobs_path)
+            && (!metadata.is_file()
+                || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+                || metadata.mode() & 0o077 != 0)
+        {
+            return Err(());
+        }
+        let slack_jobs = match std::fs::read(&slack_jobs_path) {
+            Ok(bytes) => decode_slack_ticket_jobs(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(_) => return Err(()),
+        };
         Ok(Self {
             gates,
             path: Some(path),
+            slack_jobs,
+            slack_jobs_path: Some(slack_jobs_path),
         })
     }
 
@@ -3233,6 +3265,60 @@ impl TicketGateRegistry {
 
     pub(crate) fn len(&self) -> usize {
         self.gates.len()
+    }
+
+    pub(crate) fn register_slack_job(
+        &mut self,
+        team_id: &str,
+        channel: &str,
+        thread_ts: &str,
+        job_id: &str,
+        issue_url: &str,
+    ) -> Result<(), ()> {
+        let binding = SlackTicketJobBinding {
+            team_id: team_id.to_owned(),
+            channel: channel.to_owned(),
+            thread_ts: thread_ts.to_owned(),
+            job_id: job_id.to_owned(),
+            issue_url: issue_url.to_owned(),
+        };
+        validate_slack_ticket_job(&binding)?;
+        let mut jobs = self.slack_jobs.clone();
+        if let Some(existing) = jobs.iter_mut().find(|existing| {
+            existing.team_id == binding.team_id
+                && existing.channel == binding.channel
+                && existing.thread_ts == binding.thread_ts
+                && existing.job_id == binding.job_id
+        }) {
+            *existing = binding;
+        } else {
+            if jobs.len() >= 256 {
+                jobs.remove(0);
+            }
+            jobs.push(binding);
+        }
+        self.persist_slack_jobs(&jobs)?;
+        self.slack_jobs = jobs;
+        Ok(())
+    }
+
+    pub(crate) fn matching_slack_jobs(
+        &self,
+        team_id: &str,
+        channel: &str,
+        thread_ts: &str,
+        issue_url: Option<&str>,
+    ) -> Vec<SlackTicketJobBinding> {
+        self.slack_jobs
+            .iter()
+            .filter(|binding| {
+                binding.team_id == team_id
+                    && binding.channel == channel
+                    && binding.thread_ts == thread_ts
+                    && issue_url.is_none_or(|issue_url| binding.issue_url == issue_url)
+            })
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn resolve(&mut self, job_id: &str) -> Result<(), ()> {
@@ -3281,6 +3367,113 @@ impl TicketGateRegistry {
             .and_then(|directory| directory.sync_all())
             .map_err(|_| ())
     }
+
+    fn persist_slack_jobs(&self, jobs: &[SlackTicketJobBinding]) -> Result<(), ()> {
+        let Some(path) = self.slack_jobs_path.as_ref() else {
+            return Ok(());
+        };
+        let rows: Vec<serde_json::Value> = jobs
+            .iter()
+            .map(|binding| {
+                serde_json::json!({
+                    "team_id": binding.team_id,
+                    "channel": binding.channel,
+                    "thread_ts": binding.thread_ts,
+                    "job_id": binding.job_id,
+                    "issue_url": binding.issue_url,
+                })
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&rows).map_err(|_| ())?;
+        let temporary = path.with_extension("v1.tmp");
+        use std::io::Write as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        if let Ok(metadata) = std::fs::symlink_metadata(&temporary) {
+            if !metadata.is_file()
+                || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+                || metadata.mode() & 0o077 != 0
+            {
+                return Err(());
+            }
+            std::fs::remove_file(&temporary).map_err(|_| ())?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|_| ())?;
+        file.write_all(&bytes).map_err(|_| ())?;
+        file.sync_all().map_err(|_| ())?;
+        std::fs::rename(&temporary, path).map_err(|_| ())?;
+        std::fs::File::open(path.parent().ok_or(())?)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| ())
+    }
+}
+
+fn decode_slack_ticket_jobs(bytes: &[u8]) -> Result<Vec<SlackTicketJobBinding>, ()> {
+    if bytes.len() > 256 * 1024 {
+        return Err(());
+    }
+    let rows = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|_| ())?;
+    let rows = rows.as_array().ok_or(())?;
+    if rows.len() > 256 {
+        return Err(());
+    }
+    rows.iter()
+        .map(|row| {
+            let row = row.as_object().ok_or(())?;
+            if row.len() != 5 {
+                return Err(());
+            }
+            let binding = SlackTicketJobBinding {
+                team_id: row
+                    .get("team_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?
+                    .to_owned(),
+                channel: row
+                    .get("channel")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?
+                    .to_owned(),
+                thread_ts: row
+                    .get("thread_ts")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?
+                    .to_owned(),
+                job_id: row
+                    .get("job_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?
+                    .to_owned(),
+                issue_url: row
+                    .get("issue_url")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?
+                    .to_owned(),
+            };
+            validate_slack_ticket_job(&binding)?;
+            Ok(binding)
+        })
+        .collect()
+}
+
+fn validate_slack_ticket_job(binding: &SlackTicketJobBinding) -> Result<(), ()> {
+    if binding.team_id.is_empty()
+        || !binding
+            .team_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric())
+        || automonique_slack_connector::ChannelId::new(&binding.channel).is_err()
+        || automonique_slack_connector::MessageTs::new(&binding.thread_ts).is_err()
+        || automonique_support_connector::TicketStatusRequest::new(&binding.job_id).is_err()
+        || automonique_github_connector::IssueLocator::parse(&binding.issue_url).is_none()
+    {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn decode_ticket_gates(bytes: &[u8]) -> Result<Vec<PendingTicketGate>, ()> {
@@ -15153,5 +15346,42 @@ mod cross_transport_gate_tests {
 
         let reopened = TicketGateRegistry::open(path).expect("registry reopens");
         assert!(reopened.matching("job-resolved").is_empty());
+    }
+
+    #[test]
+    fn slack_thread_job_binding_survives_gate_resolution_and_registry_reopen() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private directory");
+        let path = directory.path().join("ticket-confirmations.v1.json");
+        let mut registry = TicketGateRegistry::open(path.clone()).expect("registry opens");
+        registry
+            .register(PendingTicketGate {
+                job_id: String::from("job-running-123"),
+                issue_url: String::from("https://github.com/example/project/issues/42"),
+                source_key: String::from("slack:T0RESERVED:event:Ev11"),
+            })
+            .expect("gate persists");
+        registry
+            .register_slack_job(
+                "T0RESERVED",
+                "C0RESERVED01",
+                "1723542000.000100",
+                "job-running-123",
+                "https://github.com/example/project/issues/42",
+            )
+            .expect("thread binding persists");
+        registry.resolve("job-running-123").expect("gate resolves");
+
+        let reopened = TicketGateRegistry::open(path).expect("registry reopens");
+        assert!(reopened.matching("job-running").is_empty());
+        let bindings =
+            reopened.matching_slack_jobs("T0RESERVED", "C0RESERVED01", "1723542000.000100", None);
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].job_id, "job-running-123");
+        assert_eq!(
+            bindings[0].issue_url,
+            "https://github.com/example/project/issues/42"
+        );
     }
 }

@@ -87,9 +87,9 @@ use automonique_slack_connector::{
     HomeView, MAX_PAGE_LIMIT, MessageBlocks, MessagePage, MessageText, MessageTs, ModalView,
     OpenViewRequest, PostMessageRequest, PublishViewRequest, SlackAppToken, SlackBase, SlackClient,
     SlackErrorKind, SlackFailure, SlackMessage, SlackOutcome, SlackRejection,
-    SlackSocketModeConnector, SlackToken, SlackUser, StartStreamRequest, StopStreamRequest,
-    StreamChunks, StreamMessage, StreamText, TriggerId, UpdateMessageRequest, UserId,
-    UsersInfoRequest,
+    SlackSocketModeConnector, SlackToken, SlackUser, SocketModeFailure, StartStreamRequest,
+    StopStreamRequest, StreamChunks, StreamMessage, StreamText, TriggerId, UpdateMessageRequest,
+    UserId, UsersInfoRequest,
 };
 use automonique_store::agent_memory::{
     AgentMemoryStore, ConversationScope, ExternalIdentity, MessageInput, redact_content,
@@ -2788,6 +2788,46 @@ fn is_github_issue_status_question(text: &str) -> bool {
     .any(|phrase| normalized.contains(phrase))
 }
 
+/// Recognize a question about the dispatched Manage job, not the GitHub
+/// issue's open/closed state. These phrases are intentionally work-shaped so
+/// an ordinary "how's it going?" still reaches conversation.
+fn is_ticket_job_progress_question(text: &str) -> bool {
+    let normalized = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    normalized.contains("progressing")
+        || normalized.contains("job progress")
+        || normalized.contains("job status")
+        || normalized.contains("run status")
+        || normalized.contains("work progress")
+        || normalized.contains("work status")
+        || normalized.contains("how is the work")
+        || normalized.contains("how's the work")
+        || normalized.contains("avancement du travail")
+        || normalized.contains("avancement du job")
+        || normalized.contains("statut du job")
+        || normalized.contains("où en est le travail")
+        || normalized.contains("ou en est le travail")
+        || normalized.contains("où en est le job")
+        || normalized.contains("ou en est le job")
+}
+
+fn slack_ticket_status_text(status: &automonique_support_connector::TicketStatus) -> String {
+    let short = status.job_id.get(..12).unwrap_or(&status.job_id);
+    let mut text = format!(
+        "Monique job `{short}` is {}.\nLast updated: {}",
+        status.job_status.as_str(),
+        status.updated_at
+    );
+    if !status.result.trim().is_empty() {
+        text.push('\n');
+        text.push_str(status.result.trim());
+    }
+    text
+}
+
 /// Resolve a read-only issue follow-up against the current Slack thread.
 ///
 /// The first turn commonly carries the canonical URL while a human follow-up
@@ -2901,15 +2941,26 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
         }
         match self.manage.dispatch_ticket(&issue_url, &event.source_key) {
             Ok(receipt) if !receipt.approved => {
-                let registered = self.gates.lock().ok().is_some_and(|mut gates| {
-                    gates
-                        .register(crate::telegram_bridge::PendingTicketGate {
-                            job_id: receipt.job_id.clone(),
-                            issue_url,
-                            source_key: receipt.source_key.clone(),
-                        })
-                        .is_ok()
-                });
+                let (registered, tracked) =
+                    self.gates.lock().ok().map_or((false, false), |mut gates| {
+                        let registered = gates
+                            .register(crate::telegram_bridge::PendingTicketGate {
+                                job_id: receipt.job_id.clone(),
+                                issue_url: issue_url.clone(),
+                                source_key: receipt.source_key.clone(),
+                            })
+                            .is_ok();
+                        let tracked = gates
+                            .register_slack_job(
+                                &event.team_id,
+                                event.channel.as_str(),
+                                event.parent.as_str(),
+                                &receipt.job_id,
+                                &issue_url,
+                            )
+                            .is_ok();
+                        (registered, tracked)
+                    });
                 if !registered {
                     let _ = self.poster.post_thread(
                         &event.channel,
@@ -2917,6 +2968,13 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                         "The ticket is pending in Manage, but Monique could not retain its cross-channel confirmation coordinates. Confirm it in Manage; no work has been released.",
                     );
                     return;
+                }
+                if !tracked {
+                    let _ = self.poster.post_thread(
+                        &event.channel,
+                        &event.parent,
+                        "The ticket is pending in Manage, but Monique could not retain this thread's progress binding. Use `/monique status <job-id>` for status after confirmation.",
+                    );
                 }
                 if self.interactive_decisions {
                     let _ = self.poster.post_approval_card(
@@ -3983,6 +4041,40 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                     .post_thread(&event.channel, &event.parent, &answer);
                 return;
             }
+            if is_ticket_job_progress_question(trimmed) {
+                let issue_url = one_issue_url(trimmed).ok().flatten();
+                let matches = self.gates.lock().map_or_else(
+                    |_| Vec::new(),
+                    |gates| {
+                        gates.matching_slack_jobs(
+                            &event.team_id,
+                            event.channel.as_str(),
+                            event.parent.as_str(),
+                            issue_url.as_deref(),
+                        )
+                    },
+                );
+                let answer = match matches.as_slice() {
+                    [binding] => self.manage.ticket_status(&binding.job_id).map_or_else(
+                        |_| {
+                            String::from(
+                                "Manage could not read that Monique job's status right now.",
+                            )
+                        },
+                        |status| slack_ticket_status_text(&status),
+                    ),
+                    [] => String::from(
+                        "No Monique job is bound to this Slack thread. Use `/monique status <job-id>` if the job was created before thread tracking was enabled.",
+                    ),
+                    _ => String::from(
+                        "More than one Monique job is bound to this thread. Include the exact GitHub issue URL or use `/monique status <job-id>`.",
+                    ),
+                };
+                let _ = self
+                    .poster
+                    .post_thread(&event.channel, &event.parent, &answer);
+                return;
+            }
             if let Some(issue_url) = contextual_github_issue_review(trimmed, context) {
                 let answer = self.question_answerer.as_mut().map_or_else(
                     || String::from("Monique's GitHub issue reader is unavailable right now."),
@@ -4621,8 +4713,14 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
             continue;
         };
         while !stop.load(Ordering::Acquire) {
-            let Ok(envelope) = connection.receive_envelope() else {
-                break;
+            let envelope = match slack_receive_disposition(connection.receive_envelope()) {
+                SlackReceiveDisposition::Envelope(envelope) => envelope,
+                // The connector's bounded read timeout is also the worker's
+                // shutdown cadence. Silence is not a failed Socket Mode
+                // connection: keep the established websocket and check the
+                // stop flag again instead of churning apps.connections.open.
+                SlackReceiveDisposition::Idle => continue,
+                SlackReceiveDisposition::Reconnect => break,
             };
             let envelope_id = match socket_envelope_id(envelope.as_str()) {
                 Some(envelope_id) => envelope_id,
@@ -4755,6 +4853,23 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
                 worker.router.handle_monique_command(command, "");
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlackReceiveDisposition<T> {
+    Envelope(T),
+    Idle,
+    Reconnect,
+}
+
+fn slack_receive_disposition<T>(
+    result: Result<T, SocketModeFailure>,
+) -> SlackReceiveDisposition<T> {
+    match result {
+        Ok(envelope) => SlackReceiveDisposition::Envelope(envelope),
+        Err(SocketModeFailure::TimedOut) => SlackReceiveDisposition::Idle,
+        Err(_) => SlackReceiveDisposition::Reconnect,
     }
 }
 
@@ -6452,6 +6567,8 @@ mod tests {
     struct FakeManage {
         opened: Arc<std::sync::Mutex<Vec<(String, String)>>>,
         confirmed: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        status_reads: Arc<std::sync::Mutex<Vec<String>>>,
+        status: Option<automonique_support_connector::TicketStatus>,
         canonical_source: Option<String>,
     }
 
@@ -6602,6 +6719,19 @@ mod tests {
         }
     }
 
+    fn running_ticket_status() -> automonique_support_connector::TicketStatus {
+        automonique_support_connector::TicketStatus {
+            issue_id: String::from("issue-fixture"),
+            issue_url: String::from("https://github.com/example/project/issues/42"),
+            issue_title: String::from("Repair the form"),
+            job_id: String::from("job-fixture-123456"),
+            job_status: automonique_support_connector::TicketJobStatus::Running,
+            result: String::from("Implementing the requested change."),
+            created_at: String::from("2026-08-17T20:42:00Z"),
+            updated_at: String::from("2026-08-17T20:54:00Z"),
+        }
+    }
+
     impl crate::telegram_bridge::TicketActionSurface for FakeManage {
         fn dispatch_ticket(
             &mut self,
@@ -6636,9 +6766,13 @@ mod tests {
 
         fn ticket_status(
             &mut self,
-            _job_id: &str,
+            job_id: &str,
         ) -> Result<automonique_support_connector::TicketStatus, String> {
-            Err(String::from("not used"))
+            self.status_reads
+                .lock()
+                .expect("status reads")
+                .push(job_id.to_owned());
+            self.status.clone().ok_or_else(|| String::from("not used"))
         }
     }
 
@@ -7353,6 +7487,35 @@ mod tests {
     }
 
     #[test]
+    fn idle_socket_timeout_keeps_the_connection_and_other_failures_reconnect() {
+        assert_eq!(
+            slack_receive_disposition::<()>(Err(SocketModeFailure::TimedOut)),
+            SlackReceiveDisposition::Idle
+        );
+        assert_eq!(
+            slack_receive_disposition(Ok("event")),
+            SlackReceiveDisposition::Envelope("event")
+        );
+        for failure in [
+            SocketModeFailure::UrlRejected,
+            SocketModeFailure::Redirected,
+            SocketModeFailure::Unavailable,
+            SocketModeFailure::BinaryFrame,
+            SocketModeFailure::EnvelopeTooLarge,
+            SocketModeFailure::InvalidText,
+            SocketModeFailure::MalformedControl,
+            SocketModeFailure::Closed,
+            SocketModeFailure::InvalidAcknowledgement,
+        ] {
+            assert_eq!(
+                slack_receive_disposition::<()>(Err(failure)),
+                SlackReceiveDisposition::Reconnect,
+                "{failure:?}"
+            );
+        }
+    }
+
+    #[test]
     fn app_mentions_are_distinct_from_plain_ticket_messages() {
         let mention = r#"{"envelope_id":"E2","type":"events_api","payload":{"event_id":"Ev2","team_id":"T0RESERVED","event":{"type":"app_mention","channel":"C0RESERVED01","user":"U0ADMIN001","text":"<@B0APP> reply https://github.com/example/project/issues/42 with the verification","ts":"1723542000.000200"}}}"#;
         let parsed = slack_ticket_event(mention).expect("app mention");
@@ -7640,6 +7803,71 @@ mod tests {
             [String::from("No — GitHub still marks this issue as open.")]
         );
         assert!(opened.lock().expect("opened").is_empty());
+    }
+
+    #[test]
+    fn progress_follow_up_reads_the_manage_job_bound_to_the_slack_thread() {
+        let poster = FakeTicketPoster::default();
+        let messages = Arc::clone(&poster.messages);
+        let manage = FakeManage {
+            status: Some(running_ticket_status()),
+            ..FakeManage::default()
+        };
+        let status_reads = Arc::clone(&manage.status_reads);
+        let mut router = SlackTicketRouter {
+            poster,
+            manage: Box::new(manage),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
+            channels: ChannelMap(vec![(
+                name("ops"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![SlackFeature::Approvals, SlackFeature::Conversation],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+            approvals: None,
+            approval_lane: None,
+            question_answerer: Some(Box::new(FakeIssueReviewAnswerer {
+                seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+            })),
+        };
+
+        router.handle_with_context(
+            ticket_event(
+                "U0ADMIN001",
+                "https://github.com/example/project/issues/42",
+                "EvOpen",
+            ),
+            "",
+        );
+        router.handle_with_context(
+            ticket_event("U0ADMIN001", "confirm job-fixture", "EvConfirm"),
+            "",
+        );
+        let mut follow_up = ticket_event(
+            "U0ADMIN001",
+            "<@U0MONIQUE9> how's it progressing ?",
+            "EvProgress",
+        );
+        follow_up.app_mention = true;
+        router.handle_with_context(follow_up, "thread context");
+
+        assert_eq!(
+            status_reads.lock().expect("status reads").as_slice(),
+            [String::from("job-fixture-123456")]
+        );
+        let messages = messages.lock().expect("messages");
+        let progress = messages.last().expect("progress reply");
+        assert!(progress.contains("Monique job `job-fixture-` is running."));
+        assert!(progress.contains("Last updated: 2026-08-17T20:54:00Z"));
+        assert!(progress.contains("Implementing the requested change."));
+        assert!(!progress.contains("GitHub still marks this issue as open"));
     }
 
     #[test]
