@@ -1120,7 +1120,7 @@ impl Response {
         Self {
             status: "200 OK",
             content_type: Some(content_type),
-            cache_control: "private, max-age=3600",
+            cache_control: "no-store",
             location: None,
             retry_after: None,
             body: body.as_bytes().to_vec(),
