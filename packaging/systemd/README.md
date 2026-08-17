@@ -23,3 +23,24 @@ Before replacing an installed unit, verify the checked-in file with
 `tools/verify_systemd_unit.sh`. To roll back,
 restore the previous `current` link through the release activation procedure
 and restart the unit.
+
+For an owner-authorized local release, use the checked-in operator tool rather
+than creating an ad-hoc helper:
+
+```sh
+cargo run --release -p automonique --bin automonique-release -- deploy \
+  --state-dir /private/state/automonique \
+  --worktree /path/to/clean/automonique \
+  --unit automonique.service \
+  --plan-digest sha256:<approved-plan-digest> \
+  --changed-path rust/crates/example/src/lib.rs
+```
+
+Repeat `--changed-path` for every path in the release. `deploy` refuses a dirty
+worktree, derives the source commit and tree itself, builds the immutable
+release, then rechecks that the live daemon
+is ready with no running work, pending inbox/outbox effects, ambiguous outbound
+effect or reconciliation before activation. Activation uses the same atomic
+link switch, supervised restart and automatic rollback as the approved
+self-improvement path. `build` and `activate` subcommands are also available
+when an operator deliberately needs the two phases separated.
