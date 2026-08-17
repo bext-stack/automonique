@@ -109,6 +109,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+pub use automonique_core::conversation::utc_rfc3339_from_unix_millis;
+use automonique_core::conversation::{
+    is_current_time_question, is_enabled_site_inventory_question, is_site_inventory_question,
+};
 use automonique_github_connector::IssueLocator;
 use automonique_protocol::admin::ExecutionState;
 use automonique_protocol::digest::Sha256;
@@ -10679,31 +10683,6 @@ pub(crate) fn answer_typed_github_issue_question(
     )
 }
 
-/// Whether prose asks only for the trusted daemon clock fact.
-///
-/// Named-location conversions stay on the conversation route because they
-/// require timezone knowledge. This closed vocabulary covers the common
-/// English and French forms without swallowing questions about schedules,
-/// elapsed time, ticket timestamps, or another location.
-fn is_current_time_question(text: &str) -> bool {
-    matches!(
-        text.trim()
-            .trim_end_matches(['?', '!', '.'])
-            .trim_end()
-            .to_lowercase()
-            .as_str(),
-        "what time is it"
-            | "what's the time"
-            | "whats the time"
-            | "what is the current time"
-            | "current time"
-            | "quelle heure est-il"
-            | "quelle heure est il"
-            | "il est quelle heure"
-            | "quelle est l'heure actuelle"
-    )
-}
-
 /// Whether this turn explicitly asks for the local host's CPU/RAM load.
 fn is_host_load_question(text: &str) -> bool {
     let normalized = text.to_lowercase();
@@ -10798,7 +10777,7 @@ fn question_profile(question: &str) -> QuestionProfile {
         .collect();
     let asks_about_account_usage = is_codex_usage_terms(&terms);
     if asks_about_account_usage
-        || is_site_inventory_terms(&terms)
+        || is_site_inventory_question(question)
         || is_operator_inventory_terms(&terms)
         || terms.contains("claude")
         || terms.contains("activity")
@@ -10889,79 +10868,6 @@ fn question_profile(question: &str) -> QuestionProfile {
     } else {
         QuestionProfile::Conversation
     }
-}
-
-/// Whether the question names a bounded inventory rather than site analysis.
-///
-/// A plural inventory noun plus a hosting/management cue is intentionally
-/// narrower than the word `site` alone. "Why is the client site down?" still
-/// receives operational reasoning, while common inventory phrasings use the
-/// lower-latency read-only lookup route.
-fn is_site_inventory_terms(terms: &BTreeSet<&str>) -> bool {
-    let names_inventory = terms.iter().any(|term| {
-        matches!(
-            *term,
-            "sites" | "domains" | "domaines" | "hostnames" | "apps" | "applications"
-        )
-    });
-    let inventory_cue = terms.iter().any(|term| {
-        matches!(
-            *term,
-            "manage"
-                | "managed"
-                | "gère"
-                | "gérer"
-                | "gérés"
-                | "host"
-                | "hosted"
-                | "hosting"
-                | "héberge"
-                | "hébergés"
-                | "serve"
-                | "served"
-                | "server"
-                | "serveur"
-                | "webserver"
-                | "webservers"
-                | "inventory"
-                | "inventaire"
-                | "list"
-                | "liste"
-                | "prism"
-        )
-    });
-    names_inventory && inventory_cue
-}
-
-/// Whether the bounded enabled-vhost inventory fully answers the question.
-///
-/// Generic business-management questions still receive the richer Manage and
-/// ticket snapshot. A local-hosting cue binds this fast path to deployment
-/// inventory that the daemon can render without a provider.
-fn is_enabled_site_inventory_question(question: &str) -> bool {
-    let normalized = question.to_lowercase();
-    let terms: BTreeSet<&str> = normalized
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|term| !term.is_empty())
-        .collect();
-    is_site_inventory_terms(&terms)
-        && terms.iter().any(|term| {
-            matches!(
-                *term,
-                "host"
-                    | "hosted"
-                    | "hosting"
-                    | "héberge"
-                    | "hébergés"
-                    | "server"
-                    | "serveur"
-                    | "webserver"
-                    | "webservers"
-                    | "inventory"
-                    | "inventaire"
-                    | "prism"
-            )
-        })
 }
 
 /// Whether the question asks for the configured human access inventory.
@@ -12578,40 +12484,6 @@ const fn cancel_failure_reply(failure: RunFailure) -> &'static str {
         }
         _ => "Could not reach the execution lane, so nothing was cancelled. Try again.",
     }
-}
-
-pub(crate) fn utc_rfc3339_from_unix_millis(unix_ms: i64) -> Option<String> {
-    let unix_ms = u64::try_from(unix_ms).ok()?;
-    let unix_seconds = unix_ms / 1_000;
-    let milliseconds = unix_ms % 1_000;
-    let days = i64::try_from(unix_seconds / 86_400).ok()?;
-    let seconds_in_day = unix_seconds % 86_400;
-    let hour = seconds_in_day / 3_600;
-    let minute = seconds_in_day % 3_600 / 60;
-    let second = seconds_in_day % 60;
-
-    // Howard Hinnant's civil-from-days transformation, with day zero at the
-    // Unix epoch. All current dates are comfortably inside these checked i64
-    // operations; overflow means the clock is not renderable.
-    let shifted = days.checked_add(719_468)?;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted.checked_sub(era.checked_mul(146_097)?)?;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era.checked_add(era.checked_mul(400)?)?;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    if month <= 2 {
-        year = year.checked_add(1)?;
-    }
-    if !(0..=9_999).contains(&year) {
-        return None;
-    }
-    Some(format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{milliseconds:03}Z"
-    ))
 }
 
 #[cfg(test)]

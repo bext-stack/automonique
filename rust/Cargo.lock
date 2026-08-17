@@ -252,6 +252,7 @@ name = "automonique-web-entry"
 version = "0.1.0"
 dependencies = [
  "automonique-cli",
+ "automonique-core",
  "automonique-daemon",
  "automonique-store",
  "automonique-transport-runtime",
