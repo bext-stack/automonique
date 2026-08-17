@@ -286,7 +286,7 @@ impl Fixture {
                 holder_id: String::from("telegram-pause-fixture"),
                 lease_epoch: lease.epoch,
                 bot_id: BOT_ID,
-                execution_state: ExecutionState::SandboxUnavailableNoLane,
+                execution_state: ExecutionState::SandboxUnavailableLaneWired,
             },
             database_path,
             run_index_path,

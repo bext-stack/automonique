@@ -314,7 +314,7 @@ pub enum ExecuteRefusal {
     /// This daemon already holds as many live attempts as it admits.
     LaneSaturated,
     /// The host cannot enforce the composed sandbox, so no attempt may run.
-    /// Mirrors the `sandbox_unavailable_no_lane` execution state.
+    /// Mirrors the `sandbox_unavailable_lane_wired` execution state.
     SandboxUnenforceable,
     /// The host exposes no delegated cgroup v2 domain, so no descendant-complete
     /// containment can be created and nothing runs.

@@ -1231,7 +1231,7 @@ mod tests {
                 holder_id: "telegram-host-fixture",
                 authority_lease_epoch: self.lease_epoch,
                 ttl_ms: crate::TELEGRAM_LEASE_TTL_MS,
-                execution_state: ExecutionState::SandboxUnavailableNoLane,
+                execution_state: ExecutionState::SandboxUnavailableLaneWired,
             }
         }
     }

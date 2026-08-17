@@ -3,9 +3,10 @@
 //! The daemon's execution-state report is a measurement, not a hope.
 //!
 //! The status command's `execution_state` must agree with an independent
-//! capability probe taken in the same environment, and neither value may ever
-//! claim an execution lane exists — both spellings end in `no_lane` because
-//! this release wires none.
+//! capability probe taken in the same environment, and both values must report
+//! the execution lane that this release wires. Host enforcement and lane
+//! presence are separate facts: an unavailable sandbox makes the lane refuse;
+//! it does not make the lane disappear.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -98,8 +99,8 @@ fn reported_execution_state_matches_an_independent_measurement() {
         BoundaryProperty::SyscallRestriction,
     ]);
     let expected = match independent {
-        Ok(_) => ExecutionState::SandboxEnforceableNoLane,
-        Err(_) => ExecutionState::SandboxUnavailableNoLane,
+        Ok(_) => ExecutionState::SandboxEnforceableLaneWired,
+        Err(_) => ExecutionState::SandboxUnavailableLaneWired,
     };
 
     let reported = status(&config).execution_state();
@@ -107,11 +108,11 @@ fn reported_execution_state_matches_an_independent_measurement() {
         reported, expected,
         "the daemon's execution state must be the measured one, not a default"
     );
-    // Whatever the measurement said, no lane exists in this release, and the
+    // Whatever the measurement said, the lane exists in this release, and the
     // wire spelling itself must keep saying so.
     assert!(
-        reported.as_str().ends_with("_no_lane"),
-        "execution state spelling must not imply an execution lane: {}",
+        reported.as_str().ends_with("_lane_wired"),
+        "execution state spelling must report the wired execution lane: {}",
         reported.as_str()
     );
 

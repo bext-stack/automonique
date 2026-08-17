@@ -2385,7 +2385,7 @@ impl LiveSlackQuestionAnswerer {
                                 "The MCP result did not fit safely, so it was not sent to the answer model.",
                             ));
                         };
-                        return SlackQuestionReply::Text(
+                        SlackQuestionReply::Text(
                             self.lane
                                 .run_question(&prompt, QuestionProfile::OperationalLookup)
                                 .unwrap_or_else(|_| {
@@ -2393,7 +2393,7 @@ impl LiveSlackQuestionAnswerer {
                                         "The MCP read completed, but the answer model is unavailable right now.",
                                     )
                                 }),
-                        );
+                        )
                     }
                     Ok(McpCallResult::InputRequired { requests }) => {
                         if !approvals_enabled {
@@ -2402,18 +2402,16 @@ impl LiveSlackQuestionAnswerer {
                             ));
                         }
                         let preview = mcp_approval_preview(&plan, &requests);
-                        return self.stage_tool(
+                        self.stage_tool(
                             source_key,
                             channel,
                             PendingSlackTool::McpCall { plan, requests },
                             preview,
-                        );
+                        )
                     }
-                    Err(_) => {
-                        return SlackQuestionReply::Text(String::from(
-                            "The selected MCP capability is unavailable right now; nothing was changed.",
-                        ));
-                    }
+                    Err(_) => SlackQuestionReply::Text(String::from(
+                        "The selected MCP capability is unavailable right now; nothing was changed.",
+                    )),
                 }
             }
             TransportToolPlan::SlackPost(plan) => {

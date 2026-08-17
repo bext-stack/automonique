@@ -4,7 +4,7 @@ use automonique_protocol::admin::{
     ADMIN_PROTOCOL, AdminCommand, AdminError, AdminInstanceId, AdminOutboxEvidence,
     AdminOutboxEvidenceParts, AdminReconciliationEvidence, AdminRefusalCategory, AdminRequest,
     AdminResponse, DaemonState, DaemonStatus, DurableStateCounts, DurableStateCountsParts,
-    IntakePause, IntakeResume, MAX_ADMIN_CANONICAL_BYTES, MAX_INSTANCE_ID_BYTES,
+    ExecutionState, IntakePause, IntakeResume, MAX_ADMIN_CANONICAL_BYTES, MAX_INSTANCE_ID_BYTES,
     MAX_INTAKE_ACTOR_BYTES, MAX_INTAKE_REASON_BYTES, MAX_RUN_SUBMISSION_KEY_BYTES,
     MAX_SUBMITTED_RUN_SPEC_BYTES, MAX_SYNTHETIC_KEY_BYTES, MAX_SYNTHETIC_SCOPE_BYTES,
     MAX_SYNTHETIC_TASK_BYTES, OperationalMetric, OperationalStatus, OperationalStatusParts,
@@ -838,6 +838,50 @@ fn unknown_state_is_a_security_sensitive_refusal() {
         AdminResponse::from_canonical_bytes(payload.as_bytes()).expect_err("unknown state"),
         AdminError::UnknownState
     );
+}
+
+#[test]
+fn legacy_execution_state_spellings_decode_but_never_encode() {
+    for (current, legacy, expected) in [
+        (
+            "sandbox_unavailable_lane_wired",
+            "sandbox_unavailable_no_lane",
+            ExecutionState::SandboxUnavailableLaneWired,
+        ),
+        (
+            "sandbox_enforceable_lane_wired",
+            "sandbox_enforceable_no_lane",
+            ExecutionState::SandboxEnforceableLaneWired,
+        ),
+    ] {
+        let payload = String::from_utf8(
+            AdminResponse::Status {
+                request_id: request_id(),
+                status: status().with_execution(expected),
+            }
+            .to_message()
+            .expect("status message")
+            .to_canonical_bytes(),
+        )
+        .expect("UTF-8")
+        .replace(current, legacy);
+        let AdminResponse::Status { status, .. } =
+            AdminResponse::from_canonical_bytes(payload.as_bytes()).expect("legacy alias decodes")
+        else {
+            panic!("wrong response variant")
+        };
+        assert_eq!(status.execution_state(), expected);
+        let encoded = AdminResponse::Status {
+            request_id: request_id(),
+            status,
+        }
+        .to_message()
+        .expect("status re-encodes")
+        .to_canonical_bytes();
+        let encoded = String::from_utf8(encoded).expect("UTF-8");
+        assert!(encoded.contains(current));
+        assert!(!encoded.contains(legacy));
+    }
 }
 
 #[test]
@@ -2218,6 +2262,7 @@ mod capability {
         ),
         (2, "the authenticated local metrics scrape"),
         (3, "provenance on reconciliation evidence"),
+        (4, "execution status reports the wired lane"),
     ];
 
     /// Every endpoint, at the maturity it had when it landed.

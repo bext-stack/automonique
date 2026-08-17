@@ -148,7 +148,7 @@ impl Fixture {
                 holder_id: String::from(HOLDER),
                 lease_epoch: 1,
                 bot_id: 123_456,
-                execution_state: ExecutionState::SandboxUnavailableNoLane,
+                execution_state: ExecutionState::SandboxUnavailableLaneWired,
             },
             config: DaemonConfig {
                 runtime_root: runtime,

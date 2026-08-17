@@ -245,10 +245,10 @@ exact sandboxed launch plans for a digest-pinned provider executable and parses
 provider event streams incrementally, and the daemon's execution lane drives
 those plans through the launch helper with one worker thread per attempt. The
 daemon's status reports a measured `execution_state`
-(`sandbox_unavailable_no_lane` / `sandbox_enforceable_no_lane`): what the host
-could enforce for a launcher. Both spellings still say `no_lane`, which the
-lane's own wiring has outgrown — the measurement is honest about the host and
-stale about the lane, and correcting the vocabulary is a protocol change. The
+(`sandbox_unavailable_lane_wired` / `sandbox_enforceable_lane_wired`): the lane
+is present in both cases, while the first makes every start fail closed and the
+second says the host can enforce the required sandbox. Legacy `*_no_lane`
+spellings remain decode-only aliases. The
 admin status read surface and the doctor report schema are now generated
 into the Apache-2.0 TypeScript SDK by a maintained generator with a drift
 gate that fails when the checked-in files no longer match, a typecheck

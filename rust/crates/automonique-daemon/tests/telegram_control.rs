@@ -455,7 +455,7 @@ impl Fixture {
                 holder_id: String::from("telegram-fixture-holder"),
                 lease_epoch: lease.epoch,
                 bot_id: BOT_ID,
-                execution_state: ExecutionState::SandboxUnavailableNoLane,
+                execution_state: ExecutionState::SandboxUnavailableLaneWired,
             },
             database_path,
             run_index_path,
@@ -2943,7 +2943,7 @@ fn help_status_and_runs_are_answered_from_the_live_read_surfaces() {
     assert!(messages[1].contains("Automonique status"));
     assert!(messages[1].contains("generation foreground epoch"));
     assert!(messages[1].contains("intake paused: no"));
-    assert!(messages[1].contains("sandbox_unavailable_no_lane"));
+    assert!(messages[1].contains("sandbox_unavailable_lane_wired"));
     assert!(messages[1].contains("bridge polls=1 poll_failures=0 rate_limited=0"));
     assert!(messages[1].contains("questions queued=0 answered=0 failed=0 busy=0 pending=0"));
     assert!(!messages[0].contains(r#""entities""#), "help stays plain");

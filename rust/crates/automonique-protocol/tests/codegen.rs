@@ -1194,7 +1194,12 @@ mod maintained_surface {
             (
                 ADMIN_STATUS_MODULE,
                 "ExecutionState",
-                &["sandbox_enforceable_no_lane", "sandbox_unavailable_no_lane"],
+                &[
+                    "sandbox_enforceable_lane_wired",
+                    "sandbox_enforceable_no_lane",
+                    "sandbox_unavailable_lane_wired",
+                    "sandbox_unavailable_no_lane",
+                ],
             ),
             (
                 ADMIN_STATUS_MODULE,

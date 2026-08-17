@@ -1475,19 +1475,29 @@ fn daemon_state_values() -> Vec<String> {
     .collect()
 }
 
-/// The declared [`ExecutionState`] spellings, pinned to the Rust wire strings.
+/// The canonical [`ExecutionState`] spellings and their decode-only aliases.
+///
+/// Status is a read surface, so the generated TypeScript enum describes every
+/// value its decoder accepts. The first two values come from the Rust enum;
+/// the final two are the rolling-upgrade aliases admitted by
+/// `ExecutionState::parse` and never emitted by `ExecutionState::as_str`.
 fn execution_state_values() -> Vec<String> {
-    [
-        ExecutionState::SandboxUnavailableNoLane,
-        ExecutionState::SandboxEnforceableNoLane,
+    let mut values: Vec<String> = [
+        ExecutionState::SandboxUnavailableLaneWired,
+        ExecutionState::SandboxEnforceableLaneWired,
     ]
     .into_iter()
     .map(|state| match state {
-        ExecutionState::SandboxUnavailableNoLane | ExecutionState::SandboxEnforceableNoLane => {
-            state.as_str().to_owned()
-        }
+        ExecutionState::SandboxUnavailableLaneWired
+        | ExecutionState::SandboxEnforceableLaneWired => state.as_str().to_owned(),
     })
-    .collect()
+    .collect();
+    values.extend(
+        ["sandbox_unavailable_no_lane", "sandbox_enforceable_no_lane"]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    values
 }
 
 /// The declared [`Maturity`] spellings, pinned to the Rust wire strings.

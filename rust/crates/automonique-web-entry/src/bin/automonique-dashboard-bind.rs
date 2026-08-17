@@ -23,12 +23,22 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), &'static str> {
     let mut arguments = std::env::args_os().skip(1);
-    let (Some(state_dir), Some(output), Some(runtime_output), None) = (
+    let (
+        Some(state_dir),
+        Some(output),
+        Some(runtime_output),
+        Some(canonical_host),
+        Some(legacy_host),
+        None,
+    ) = (
         arguments.next(),
         arguments.next(),
         arguments.next(),
         arguments.next(),
-    ) else {
+        arguments.next(),
+        arguments.next(),
+    )
+    else {
         return Err("usage");
     };
     let state_dir = PathBuf::from(state_dir);
@@ -55,8 +65,14 @@ fn run() -> Result<(), &'static str> {
         .ok_or("path")?;
     let tenant = read_tenant(&state_dir.join("memory/memory.conf"))?;
     let actor = unique_actor(&state_dir.join("agent-memory.sqlite3"), &tenant)?;
+    let canonical_host = canonical_host.to_str().ok_or("host")?;
+    let legacy_host = legacy_host.to_str().ok_or("host")?;
+    let hosts = automonique_web_entry::DashboardHosts::new(canonical_host, legacy_host)
+        .map_err(|_| "host")?;
+    let canonical_host = hosts.canonical();
+    let legacy_host = hosts.legacy();
     let config = format!(
-        "schema=automonique.dashboard-integration/v1\nmemory_tenant={tenant}\nmemory_actor={actor}\nend=automonique.dashboard-integration/v1\n"
+        "schema=automonique.dashboard-integration/v2\nmemory_tenant={tenant}\nmemory_actor={actor}\ncanonical_host={canonical_host}\nlegacy_host={legacy_host}\nend=automonique.dashboard-integration/v2\n"
     );
     write_private(&output, config.as_bytes())?;
     let runtime = format!("AUTOMONIQUE_DAEMON_STATE={state_value}\n");

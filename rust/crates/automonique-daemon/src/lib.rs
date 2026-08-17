@@ -1480,7 +1480,7 @@ impl Daemon {
         // below, because the Telegram host reports it in a status reply and a
         // second probe would be a second answer to a question with one.
         let execution_state = if disconnected_recovery {
-            automonique_protocol::admin::ExecutionState::SandboxUnavailableNoLane
+            automonique_protocol::admin::ExecutionState::SandboxUnavailableLaneWired
         } else {
             Self::measure_execution_state()
         };
@@ -1669,7 +1669,7 @@ impl Daemon {
             config.run_index_path(),
             matches!(
                 execution_state,
-                automonique_protocol::admin::ExecutionState::SandboxEnforceableNoLane
+                automonique_protocol::admin::ExecutionState::SandboxEnforceableLaneWired
             ),
         );
 
@@ -2134,7 +2134,7 @@ impl Daemon {
             self.configured_approval_requirement,
             ApprovalRequirement::for_measured_host(matches!(
                 self.execution_state,
-                automonique_protocol::admin::ExecutionState::SandboxEnforceableNoLane
+                automonique_protocol::admin::ExecutionState::SandboxEnforceableLaneWired
             )),
             per_call,
         )
@@ -2163,15 +2163,15 @@ impl Daemon {
         // properties this build enforces.
         let selection = HostCapabilities::probe().select_mode(&execute::ENFORCED_PROPERTIES);
         match selection {
-            Ok(_) => ExecutionState::SandboxEnforceableNoLane,
-            Err(_) => ExecutionState::SandboxUnavailableNoLane,
+            Ok(_) => ExecutionState::SandboxEnforceableLaneWired,
+            Err(_) => ExecutionState::SandboxUnavailableLaneWired,
         }
     }
 
     fn provider_available(&self) -> bool {
         matches!(
             self.execution_state,
-            automonique_protocol::admin::ExecutionState::SandboxEnforceableNoLane
+            automonique_protocol::admin::ExecutionState::SandboxEnforceableLaneWired
         ) && compose::ProviderConfig::load(&self.state_dir.join(compose::PROVIDER_CONFIG_NAME))
             .ok()
             .flatten()

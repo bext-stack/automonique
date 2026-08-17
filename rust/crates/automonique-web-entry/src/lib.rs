@@ -23,8 +23,6 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
-pub const CANONICAL_HOST: &str = "monique.1clic.pro";
-pub const LEGACY_HOST: &str = "jean.1clic.pro";
 pub const MANAGE_URL: &str = "https://manage.inklura.fr/manage";
 
 const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
@@ -111,6 +109,65 @@ impl fmt::Debug for Request<'_> {
 pub struct IntegrationConfig {
     tenant: String,
     actor: String,
+    hosts: DashboardHosts,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DashboardHosts {
+    canonical: String,
+    legacy: String,
+}
+
+impl DashboardHosts {
+    /// Bind one canonical and one retired DNS hostname to the dashboard.
+    ///
+    /// Both values must be distinct, lowercase DNS names without a port. This
+    /// exact grammar keeps them safe to place in `Host` comparisons and an
+    /// HTTPS `Location` header without escaping or normalization.
+    pub fn new(canonical: &str, legacy: &str) -> Result<Self, AuthConfigError> {
+        let valid = |value: &str| {
+            normalize_host(value) == Some(value)
+                && value.bytes().all(|byte| !byte.is_ascii_uppercase())
+                && value != "localhost"
+                && value.split('.').count() >= 2
+                && value.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && label.bytes().all(|byte| {
+                            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                        })
+                        && label
+                            .as_bytes()
+                            .first()
+                            .is_some_and(u8::is_ascii_alphanumeric)
+                        && label
+                            .as_bytes()
+                            .last()
+                            .is_some_and(u8::is_ascii_alphanumeric)
+                })
+        };
+        if !valid(canonical) || !valid(legacy) || canonical == legacy {
+            return Err(AuthConfigError::Malformed);
+        }
+        Ok(Self {
+            canonical: canonical.to_owned(),
+            legacy: legacy.to_owned(),
+        })
+    }
+
+    /// The hostname that serves the authenticated dashboard.
+    pub fn canonical(&self) -> &str {
+        &self.canonical
+    }
+
+    /// The retired hostname that redirects to [`Self::canonical`].
+    pub fn legacy(&self) -> &str {
+        &self.legacy
+    }
+
+    fn canonical_url(&self) -> String {
+        format!("https://{}/", self.canonical)
+    }
 }
 
 impl IntegrationConfig {
@@ -118,7 +175,7 @@ impl IntegrationConfig {
         let bytes = read_private_config(path, INTEGRATION_CONFIG_LIMIT)?;
         let text = std::str::from_utf8(&bytes).map_err(|_| AuthConfigError::Malformed)?;
         let mut lines = text.lines();
-        if lines.next() != Some("schema=automonique.dashboard-integration/v1") {
+        if lines.next() != Some("schema=automonique.dashboard-integration/v2") {
             return Err(AuthConfigError::Malformed);
         }
         let tenant = lines
@@ -131,7 +188,16 @@ impl IntegrationConfig {
             .and_then(|line| line.strip_prefix("memory_actor="))
             .filter(|value| valid_actor(value))
             .ok_or(AuthConfigError::Malformed)?;
-        if lines.next() != Some("end=automonique.dashboard-integration/v1")
+        let canonical_host = lines
+            .next()
+            .and_then(|line| line.strip_prefix("canonical_host="))
+            .ok_or(AuthConfigError::Malformed)?;
+        let legacy_host = lines
+            .next()
+            .and_then(|line| line.strip_prefix("legacy_host="))
+            .ok_or(AuthConfigError::Malformed)?;
+        let hosts = DashboardHosts::new(canonical_host, legacy_host)?;
+        if lines.next() != Some("end=automonique.dashboard-integration/v2")
             || lines.next().is_some()
         {
             return Err(AuthConfigError::Malformed);
@@ -139,6 +205,7 @@ impl IntegrationConfig {
         Ok(Self {
             tenant: tenant.to_owned(),
             actor: actor.to_owned(),
+            hosts,
         })
     }
 }
@@ -463,7 +530,7 @@ struct MemoryEntryView {
 #[derive(Serialize)]
 struct ConfigurationView {
     schema: &'static str,
-    canonical_host: &'static str,
+    canonical_host: String,
     authentication: &'static str,
     transport_security: &'static str,
     bind_scope: &'static str,
@@ -591,7 +658,7 @@ impl WebIntegration {
         let exists = |relative: &str| self.state_dir.join(relative).is_file();
         ConfigurationView {
             schema: "automonique.dashboard.configuration/v1",
-            canonical_host: CANONICAL_HOST,
+            canonical_host: self.config.hosts.canonical().to_owned(),
             authentication: "HTTP Basic / SHA-256 verifier",
             transport_security: "HTTPS required",
             bind_scope: "IPv4 loopback",
@@ -952,11 +1019,11 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request<'_>, Route> {
     })
 }
 
-pub fn route(request: &Request<'_>) -> Route {
+pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
     match normalize_host(request.host) {
-        Some(host) if host.eq_ignore_ascii_case(LEGACY_HOST) => Route::Legacy,
+        Some(host) if host.eq_ignore_ascii_case(hosts.legacy()) => Route::Legacy,
         Some(host)
-            if host.eq_ignore_ascii_case(CANONICAL_HOST)
+            if host.eq_ignore_ascii_case(hosts.canonical())
                 || host.eq_ignore_ascii_case("localhost") =>
         {
             let route = match request.path.split('?').next().unwrap_or_default() {
@@ -1110,7 +1177,7 @@ struct Response {
     status: &'static str,
     content_type: Option<&'static str>,
     cache_control: &'static str,
-    location: Option<&'static str>,
+    location: Option<String>,
     retry_after: Option<&'static str>,
     body: Vec<u8>,
 }
@@ -1128,7 +1195,7 @@ impl Response {
     }
 }
 
-fn response_for(route: Route, state: &AppState) -> Response {
+fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Response {
     match route {
         Route::Dashboard => Response {
             status: "200 OK",
@@ -1168,7 +1235,7 @@ fn response_for(route: Route, state: &AppState) -> Response {
             status: "308 Permanent Redirect",
             content_type: None,
             cache_control: "no-store",
-            location: Some("https://monique.1clic.pro/"),
+            location: Some(hosts.canonical_url()),
             retry_after: None,
             body: Vec::new(),
         },
@@ -1179,7 +1246,7 @@ fn response_for(route: Route, state: &AppState) -> Response {
             status: "308 Permanent Redirect",
             content_type: None,
             cache_control: "no-store",
-            location: Some("https://monique.1clic.pro/"),
+            location: Some(hosts.canonical_url()),
             retry_after: None,
             body: Vec::new(),
         },
@@ -1325,6 +1392,7 @@ fn handle(
     state: &AppState,
     auth: &BasicAuth,
     integration: Option<&WebIntegration>,
+    hosts: &DashboardHosts,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
@@ -1358,9 +1426,9 @@ fn handle(
                 if bytes.len() != total {
                     break Err(Route::BadRequest);
                 }
-                let mut requested_route = route(&request);
+                let mut requested_route = route(&request, hosts);
                 let host = normalize_host(request.host);
-                if host.is_some_and(|host| host.eq_ignore_ascii_case(CANONICAL_HOST))
+                if host.is_some_and(|host| host.eq_ignore_ascii_case(hosts.canonical()))
                     && request.forwarded_proto != Some("https")
                 {
                     requested_route = Route::HttpsRedirect;
@@ -1423,7 +1491,7 @@ fn handle(
             |integration| api_response(route, &body, integration),
         )
     } else {
-        response_for(route, state)
+        response_for(route, state, hosts)
     };
     let session_cookie = issue_session.then(|| auth.session_cookie());
     stream.write_all(&response_bytes(
@@ -1441,6 +1509,7 @@ pub fn serve(
 ) -> io::Result<()> {
     let state = Arc::new(AppState::new(DashboardStatus::unavailable()));
     let auth = Arc::new(auth);
+    let hosts = Arc::new(integration.config.hosts.clone());
     let integration = Arc::new(integration);
     refresh_status(&state);
     start_status_refresher(Arc::clone(&state))?;
@@ -1451,6 +1520,7 @@ pub fn serve(
         let receiver = Arc::clone(&receiver);
         let state = Arc::clone(&state);
         let auth = Arc::clone(&auth);
+        let hosts = Arc::clone(&hosts);
         let integration = Arc::clone(&integration);
         thread::Builder::new()
             .name(format!("web-entry-{index}"))
@@ -1462,7 +1532,7 @@ pub fn serve(
                     };
                     match stream {
                         Ok(stream) => {
-                            let _ = handle(stream, &state, &auth, Some(&integration));
+                            let _ = handle(stream, &state, &auth, Some(&integration), &hosts);
                         }
                         Err(_) => return,
                     }
@@ -1498,6 +1568,61 @@ pub fn serve(
 mod tests {
     use super::*;
     use std::net::Shutdown;
+    use std::os::unix::fs::PermissionsExt;
+
+    const CANONICAL_HOST: &str = concat!("dashboard", ".", "example", ".", "invalid");
+    const LEGACY_HOST: &str = concat!("retired", ".", "example", ".", "invalid");
+
+    fn fixture_hosts() -> DashboardHosts {
+        DashboardHosts::new(CANONICAL_HOST, LEGACY_HOST).expect("fixture hosts")
+    }
+
+    #[test]
+    fn dashboard_hosts_are_strict_distinct_dns_names() {
+        assert_eq!(fixture_hosts().canonical(), CANONICAL_HOST);
+        for invalid in [
+            "localhost",
+            "single-label",
+            "Upper.example",
+            "port.example:443",
+            ".leading.example",
+            "double..example",
+            "-leading.example",
+            "trailing-.example",
+        ] {
+            assert!(
+                DashboardHosts::new(invalid, LEGACY_HOST).is_err(),
+                "accepted {invalid}"
+            );
+        }
+        assert!(DashboardHosts::new(CANONICAL_HOST, CANONICAL_HOST).is_err());
+    }
+
+    #[test]
+    fn integration_config_requires_explicit_hosts() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let path = root.path().join("integration.conf");
+        let config = format!(
+            "schema=automonique.dashboard-integration/v2\n\
+             memory_tenant=operator\n\
+             memory_actor=operator:fixture\n\
+             canonical_host={CANONICAL_HOST}\n\
+             legacy_host={LEGACY_HOST}\n\
+             end=automonique.dashboard-integration/v2\n"
+        );
+        std::fs::write(&path, &config).expect("write config");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("private config");
+        let parsed = IntegrationConfig::from_file(&path).expect("valid config");
+        assert_eq!(parsed.hosts, fixture_hosts());
+
+        let legacy = config.replace("/v2", "/v1");
+        std::fs::write(&path, legacy).expect("write legacy config");
+        assert!(matches!(
+            IntegrationConfig::from_file(&path),
+            Err(AuthConfigError::Malformed)
+        ));
+    }
 
     fn request(method: &str, path: &str, host: &str) -> Vec<u8> {
         format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
@@ -1524,7 +1649,7 @@ mod tests {
             br#"{
               "state":"ready","running":2,"inbox_pending":1,"outbox_pending":0,
               "accepting_intake":true,"generation":42,
-              "execution_state":"sandbox_enforceable_no_lane","telegram_state":"polling_live",
+              "execution_state":"sandbox_enforceable_lane_wired","telegram_state":"polling_live",
               "operational":{"reconciliation_pending":0,"outbox_in_flight_ambiguous":0,
                 "provider_available":{"state":"measured","value":1}}
             }"#,
@@ -1544,7 +1669,10 @@ mod tests {
         ];
         for (path, expected) in cases {
             let bytes = request("GET", path, CANONICAL_HOST);
-            assert_eq!(expected, route(&parse_request(&bytes).unwrap()));
+            assert_eq!(
+                expected,
+                route(&parse_request(&bytes).unwrap(), &fixture_hosts())
+            );
         }
     }
 
@@ -1573,7 +1701,7 @@ mod tests {
     #[test]
     fn api_contains_no_instance_or_message_fields() {
         let state = AppState::new(fixture_status());
-        let response = response_for(Route::ApiStatus, &state);
+        let response = response_for(Route::ApiStatus, &state, &fixture_hosts());
         let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         let object = value.as_object().unwrap();
         for forbidden in [
@@ -1591,7 +1719,7 @@ mod tests {
     fn dashboard_security_policy_allows_only_same_origin_assets() {
         let state = AppState::new(fixture_status());
         let response = String::from_utf8(response_bytes(
-            response_for(Route::Dashboard, &state),
+            response_for(Route::Dashboard, &state, &fixture_hosts()),
             false,
             None,
         ))
@@ -1608,9 +1736,13 @@ mod tests {
         let bytes = request("HEAD", "/old/path", LEGACY_HOST);
         let parsed = parse_request(&bytes).unwrap();
         assert_eq!(Method::Head, parsed.method);
-        assert_eq!(Route::Legacy, route(&parsed));
+        assert_eq!(Route::Legacy, route(&parsed, &fixture_hosts()));
         let state = AppState::new(fixture_status());
-        let response = response_bytes(response_for(Route::Legacy, &state), true, None);
+        let response = response_bytes(
+            response_for(Route::Legacy, &state, &fixture_hosts()),
+            true,
+            None,
+        );
         assert!(
             response
                 .windows(CANONICAL_HOST.len())
@@ -1620,21 +1752,25 @@ mod tests {
 
     #[test]
     fn invalid_or_duplicate_host_is_rejected() {
-        for host in ["", "attacker@monique.1clic.pro", "monique.1clic.pro:0"] {
+        for host in ["", "attacker@host", &format!("{CANONICAL_HOST}:0")] {
             assert!(parse_request(&request("GET", "/", host)).is_err());
         }
         let duplicate =
-            b"GET / HTTP/1.1\r\nHost: monique.1clic.pro\r\nHost: attacker.example\r\n\r\n";
-        assert_eq!(Err(Route::BadRequest), parse_request(duplicate));
+            format!("GET / HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nHost: attacker.example\r\n\r\n");
+        assert_eq!(Err(Route::BadRequest), parse_request(duplicate.as_bytes()));
     }
 
     #[test]
     fn method_not_allowed_has_no_redirect() {
         let bytes = request("POST", "/", CANONICAL_HOST);
         let parsed = parse_request(&bytes).unwrap();
-        assert_eq!(Route::MethodNotAllowed, route(&parsed));
+        assert_eq!(Route::MethodNotAllowed, route(&parsed, &fixture_hosts()));
         let state = AppState::new(fixture_status());
-        let response = response_bytes(response_for(Route::MethodNotAllowed, &state), false, None);
+        let response = response_bytes(
+            response_for(Route::MethodNotAllowed, &state, &fixture_hosts()),
+            false,
+            None,
+        );
         assert!(!response.windows(9).any(|part| part == b"Location:"));
     }
 
@@ -1645,9 +1781,10 @@ mod tests {
         let state = Arc::new(AppState::new(fixture_status()));
         let server_state = Arc::clone(&state);
         let auth = fixture_auth();
+        let hosts = fixture_hosts();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            handle(stream, &server_state, &auth, None).unwrap();
+            handle(stream, &server_state, &auth, None, &hosts).unwrap();
         });
         let mut client = TcpStream::connect(address).unwrap();
         client
@@ -1711,9 +1848,10 @@ mod tests {
         let state = Arc::new(AppState::new(fixture_status()));
         let server_state = Arc::clone(&state);
         let auth = fixture_auth();
+        let hosts = fixture_hosts();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            handle(stream, &server_state, &auth, None).unwrap();
+            handle(stream, &server_state, &auth, None, &hosts).unwrap();
         });
         let mut client = TcpStream::connect(address).unwrap();
         client
@@ -1735,14 +1873,18 @@ mod tests {
         let state = Arc::new(AppState::new(fixture_status()));
         let server_state = Arc::clone(&state);
         let auth = fixture_auth();
+        let hosts = fixture_hosts();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            handle(stream, &server_state, &auth, None).unwrap();
+            handle(stream, &server_state, &auth, None, &hosts).unwrap();
         });
         let mut client = TcpStream::connect(address).unwrap();
         client
             .write_all(
-                b"GET / HTTP/1.1\r\nHost: monique.1clic.pro\r\nX-Forwarded-Proto: https\r\n\r\n",
+                format!(
+                    "GET / HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\n\r\n"
+                )
+                .as_bytes(),
             )
             .unwrap();
         client.shutdown(Shutdown::Write).unwrap();

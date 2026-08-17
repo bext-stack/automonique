@@ -39,9 +39,22 @@ secret itself. The loopback-only health check is the sole unauthenticated route.
 recovery file without printing the credential. The recovery file is not read by
 the service and should be moved into the operator's password manager, then
 removed. `%S/automonique/dashboard-integration.conf` binds the dashboard to one
-existing memory tenant and actor; those identifiers remain absent from every
-web configuration response. Chat turns use the daemon's contained run lane and
+existing memory tenant and actor and names its canonical and retired public
+hostnames. The hostnames are deployment configuration rather than repository
+identifiers; the tenant and actor remain absent from every web configuration
+response. Chat turns use the daemon's contained run lane and
 the canonical memory database, rather than a dashboard-specific provider path.
+Create both private files with the binding helper, supplying deployment-owned
+hostnames explicitly:
+
+```sh
+automonique-dashboard-bind \
+  /private/state/automonique \
+  /private/state/automonique/dashboard-integration.conf \
+  /private/state/automonique/dashboard-runtime.conf \
+  dashboard.example.invalid retired.example.invalid
+```
+
 The private `%S/automonique/dashboard-runtime.conf` supplies the absolute live
 daemon state directory as `AUTOMONIQUE_DAEMON_STATE`; no deployment path is
 embedded in the committed unit.

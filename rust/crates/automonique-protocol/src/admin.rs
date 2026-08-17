@@ -188,7 +188,9 @@ const _: () = assert!(
 ///   maturity and [`DaemonStatus::capability`] reporting this number.
 /// - **2** — added the read-only `automonique.admin/metrics` endpoint.
 /// - **3** — added trace, correlation and causation ids to reconciliation evidence.
-pub const ADMIN_CAPABILITY: u32 = 3;
+/// - **4** — corrected `execution_state` to report that the execution lane is
+///   wired; the former `*_no_lane` values remain decode-only aliases.
+pub const ADMIN_CAPABILITY: u32 = 4;
 
 /// How much of a promise an endpoint is.
 ///
@@ -525,36 +527,39 @@ impl TelegramState {
 
 /// Sandboxed-execution capability state, reported independently from intake.
 ///
-/// Both states end in `NoLane` because this release has no execution lane:
-/// neither value says any work can be executed. The distinction is what the
-/// host could enforce for a future launcher — measured, like every capability
-/// claim in this product, rather than assumed.
+/// Both states say the execution lane is wired. The distinction is whether the
+/// host can enforce the sandbox that lane requires: an unavailable host keeps
+/// the lane present but makes every start fail closed.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ExecutionState {
     /// The daemon's process has no delegated cgroup v2 domain or lacks another
     /// required enforcement mechanism, so the composed sandbox is
-    /// unenforceable here and an execution lane would refuse fail-closed.
-    SandboxUnavailableNoLane,
+    /// unenforceable here and the wired execution lane refuses fail-closed.
+    SandboxUnavailableLaneWired,
     /// The host can enforce the full composed sandbox for a launcher —
     /// delegated cgroup v2 containment, Landlock filesystem and TCP domains,
-    /// and the seccomp socket filter. The execution lane itself remains
-    /// deliberately unwired.
-    SandboxEnforceableNoLane,
+    /// and the seccomp socket filter. The wired execution lane may accept work
+    /// that passes its remaining configuration and admission gates.
+    SandboxEnforceableLaneWired,
 }
 
 impl ExecutionState {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::SandboxUnavailableNoLane => "sandbox_unavailable_no_lane",
-            Self::SandboxEnforceableNoLane => "sandbox_enforceable_no_lane",
+            Self::SandboxUnavailableLaneWired => "sandbox_unavailable_lane_wired",
+            Self::SandboxEnforceableLaneWired => "sandbox_enforceable_lane_wired",
         }
     }
 
     fn parse(value: &str) -> Result<Self, AdminError> {
         match value {
-            "sandbox_unavailable_no_lane" => Ok(Self::SandboxUnavailableNoLane),
-            "sandbox_enforceable_no_lane" => Ok(Self::SandboxEnforceableNoLane),
+            "sandbox_unavailable_lane_wired" | "sandbox_unavailable_no_lane" => {
+                Ok(Self::SandboxUnavailableLaneWired)
+            }
+            "sandbox_enforceable_lane_wired" | "sandbox_enforceable_no_lane" => {
+                Ok(Self::SandboxEnforceableLaneWired)
+            }
             _ => Err(AdminError::InvalidBody),
         }
     }
@@ -2487,7 +2492,7 @@ impl DaemonStatus {
             intake_paused: false,
             telegram_state: TelegramState::DisabledNoClient,
             telegram_poller_epoch: None,
-            execution_state: ExecutionState::SandboxUnavailableNoLane,
+            execution_state: ExecutionState::SandboxUnavailableLaneWired,
             operational: None,
             durable_state: None,
         })

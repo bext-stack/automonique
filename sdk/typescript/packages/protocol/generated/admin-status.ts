@@ -12,7 +12,7 @@
 import {ValidationError, byteLength} from "./runtime.ts";
 
 /** What this build's local endpoints can do, as one monotonic integer. A client compares it against the number it was written for; it never assumes the two must be equal. */
-export const ADMIN_CAPABILITY = 3;
+export const ADMIN_CAPABILITY = 4;
 
 /** Stable protocol name for local daemon administration. */
 export const ADMIN_PROTOCOL = "automonique.admin";
@@ -59,8 +59,8 @@ export function decodeDaemonState(value: string): DaemonState {
   return value as DaemonState;
 }
 
-export type ExecutionState = "sandbox_enforceable_no_lane" | "sandbox_unavailable_no_lane";
-export const ExecutionState_VALUES: readonly ExecutionState[] = ["sandbox_enforceable_no_lane", "sandbox_unavailable_no_lane"];
+export type ExecutionState = "sandbox_enforceable_lane_wired" | "sandbox_enforceable_no_lane" | "sandbox_unavailable_lane_wired" | "sandbox_unavailable_no_lane";
+export const ExecutionState_VALUES: readonly ExecutionState[] = ["sandbox_enforceable_lane_wired", "sandbox_enforceable_no_lane", "sandbox_unavailable_lane_wired", "sandbox_unavailable_no_lane"];
 /** Security-sensitive: an undefined value is refused. */
 export function decodeExecutionState(value: string): ExecutionState {
   if (!(ExecutionState_VALUES as readonly string[]).includes(value)) {
