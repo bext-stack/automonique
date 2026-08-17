@@ -4573,6 +4573,7 @@ pub(crate) struct SlackTicketWorker {
     router: SlackTicketRouter<LiveSlackTicketPoster>,
     memory: AgentMemoryStore,
     interactions: SlackInteractionStore,
+    generation_canary: Option<SlackGenerationCanary>,
     /// The reference engine's half of the parity comparison.
     ///
     /// `None` unless an installation configures an identity to observe. It
@@ -4589,6 +4590,16 @@ struct LegacyObservation {
 
 /// The parity scope this worker's decisions and observations are filed under.
 const SLACK_PARITY_SCOPE: &str = "slack-ticket-routing";
+
+/// Configured label for generation-health announcements.
+const GENERATION_CANARY_CHANNEL: &str = "deploiements";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SlackGenerationCanary {
+    channel: ChannelId,
+    generation: u64,
+    queues_clean: bool,
+}
 
 /// Build the reference-engine observer, when an installation configures one.
 ///
@@ -4643,6 +4654,7 @@ pub(crate) struct SlackTicketHostParams<'a> {
     pub host_facts: HostFacts,
     pub question_administrators: Vec<i64>,
     pub question_configured: Vec<i64>,
+    pub generation_queues_clean: bool,
 }
 
 /// Socket Mode ticket-intake lifecycle, separate from Telegram's Slack read and
@@ -4680,6 +4692,7 @@ impl SlackTicketHost {
             host_facts,
             question_administrators,
             question_configured,
+            generation_queues_clean,
         } = params;
         let Some(config) = SlackConfig::load(state_dir)? else {
             return Ok(Self::Disabled);
@@ -4698,6 +4711,14 @@ impl SlackTicketHost {
         };
         let approvals_enabled =
             interactive_decisions && features.contains(&SlackFeature::Approvals);
+        let generation_canary = ChannelName::new(GENERATION_CANARY_CHANNEL)
+            .ok()
+            .and_then(|name| channels.resolve(&name).cloned())
+            .map(|channel| SlackGenerationCanary {
+                channel,
+                generation: host_facts.lease_epoch,
+                queues_clean: *generation_queues_clean,
+            });
         let manage = crate::ticket_intake::FleetConfig::load(state_dir)
             .map_err(|_| SlackConfigError::TicketActionsUnavailable)?
             .ok_or(SlackConfigError::TicketActionsUnavailable)?
@@ -4783,6 +4804,7 @@ impl SlackTicketHost {
                     state_dir.join("slack-ticket-interactions.sqlite3"),
                 )
                 .map_err(|_| SlackConfigError::TicketActionsUnavailable)?,
+                generation_canary,
                 router: SlackTicketRouter {
                     poster: LiveSlackTicketPoster::new(client),
                     manage: Box::new(manage),
@@ -4910,7 +4932,10 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
             };
             let envelope_id = match socket_envelope_id(envelope.as_str()) {
                 Some(envelope_id) => envelope_id,
-                None if socket_hello(envelope.as_str()) => continue,
+                None if socket_hello(envelope.as_str()) => {
+                    post_generation_canary(worker);
+                    continue;
+                }
                 None => break,
             };
             let mut event = slack_ticket_event(envelope.as_str());
@@ -5040,6 +5065,34 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
             }
         }
     }
+}
+
+fn generation_canary_message(
+    canary: &mut Option<SlackGenerationCanary>,
+) -> Option<(ChannelId, String)> {
+    let canary = canary.take()?;
+    let (marker, queue_state) = if canary.queues_clean {
+        (":white_check_mark:", "queues clean")
+    } else {
+        (":warning:", "queues not clean")
+    };
+    Some((
+        canary.channel,
+        format!(
+            "{marker} Monique generation {} canary: Slack connected; {queue_state}.",
+            canary.generation
+        ),
+    ))
+}
+
+fn post_generation_canary(worker: &mut SlackTicketWorker) {
+    let Some((channel, text)) = generation_canary_message(&mut worker.generation_canary) else {
+        return;
+    };
+    // Consume the canary before the network call. A lost response is
+    // ambiguous, so retrying on this process's next Socket Mode hello could
+    // duplicate an announcement that Slack already accepted.
+    let _ = worker.router.poster.post_channel(&channel, &text);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7673,6 +7726,35 @@ mod tests {
             r#"{"type":"hello","envelope_id":"unexpected"}"#
         ));
         assert!(!socket_hello("not json"));
+    }
+
+    #[test]
+    fn generation_canary_is_exact_and_consumed_once() {
+        let mut canary = Some(SlackGenerationCanary {
+            channel: ChannelId::new("C0DEPLOY001").expect("channel"),
+            generation: 108,
+            queues_clean: true,
+        });
+        let (_, message) = generation_canary_message(&mut canary).expect("first hello");
+        assert_eq!(
+            message,
+            ":white_check_mark: Monique generation 108 canary: Slack connected; queues clean."
+        );
+        assert!(generation_canary_message(&mut canary).is_none());
+    }
+
+    #[test]
+    fn generation_canary_does_not_claim_dirty_queues_are_clean() {
+        let mut canary = Some(SlackGenerationCanary {
+            channel: ChannelId::new("C0DEPLOY001").expect("channel"),
+            generation: 109,
+            queues_clean: false,
+        });
+        let (_, message) = generation_canary_message(&mut canary).expect("hello");
+        assert_eq!(
+            message,
+            ":warning: Monique generation 109 canary: Slack connected; queues not clean."
+        );
     }
 
     #[test]

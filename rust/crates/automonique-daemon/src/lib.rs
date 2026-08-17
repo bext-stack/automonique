@@ -1473,6 +1473,8 @@ impl Daemon {
             lease.epoch,
             now_ms,
         )?;
+        let generation_queues_clean =
+            startup_queues_clean(&store.status_snapshot_at(GENERATION_ID, now_ms)?);
 
         // The execution measurement is taken here rather than beside the lane
         // below, because the Telegram host reports it in a status reply and a
@@ -1543,6 +1545,7 @@ impl Daemon {
                         },
                         question_administrators,
                         question_configured,
+                        generation_queues_clean,
                     },
                     Arc::clone(&ticket_gates),
                 )
@@ -5698,6 +5701,20 @@ fn record_tenure(
 
 fn snapshot_requires_reconciliation(snapshot: &StatusSnapshot) -> bool {
     snapshot.runs_reconciliation_pending() > 0 || snapshot.outbox_in_flight_ambiguous() > 0
+}
+
+/// Whether a newly acquired generation found every active-work queue empty.
+///
+/// This fact is captured before the transport workers start, so the Slack
+/// connection can report the generation's admission state without racing a
+/// later status query against newly accepted work.
+fn startup_queues_clean(snapshot: &StatusSnapshot) -> bool {
+    snapshot.runs_running() == 0
+        && snapshot.inbox_pending() == 0
+        && snapshot.outbox_pending() == 0
+        && snapshot.runs_reconciliation_pending() == 0
+        && snapshot.outbox_in_flight_live() == 0
+        && snapshot.outbox_in_flight_ambiguous() == 0
 }
 
 /// One durable count, or the honest absence of one.
