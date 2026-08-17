@@ -23,28 +23,54 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), &'static str> {
     let mut arguments = std::env::args_os().skip(1);
-    let (Some(state_dir), Some(output), None) =
-        (arguments.next(), arguments.next(), arguments.next())
-    else {
+    let (Some(state_dir), Some(output), Some(runtime_output), None) = (
+        arguments.next(),
+        arguments.next(),
+        arguments.next(),
+        arguments.next(),
+    ) else {
         return Err("usage");
     };
     let state_dir = PathBuf::from(state_dir);
     let output = PathBuf::from(output);
-    if !state_dir.is_absolute() || !output.is_absolute() || output.exists() {
+    let runtime_output = PathBuf::from(runtime_output);
+    if !state_dir.is_absolute()
+        || !output.is_absolute()
+        || !runtime_output.is_absolute()
+        || output == runtime_output
+        || output.exists()
+        || runtime_output.exists()
+    {
         return Err("path");
     }
+    let state_value = state_dir
+        .to_str()
+        .filter(|value| {
+            !value.is_empty()
+                && value.is_ascii()
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
+                })
+        })
+        .ok_or("path")?;
     let tenant = read_tenant(&state_dir.join("memory/memory.conf"))?;
     let actor = unique_actor(&state_dir.join("agent-memory.sqlite3"), &tenant)?;
     let config = format!(
         "schema=automonique.dashboard-integration/v1\nmemory_tenant={tenant}\nmemory_actor={actor}\nend=automonique.dashboard-integration/v1\n"
     );
+    write_private(&output, config.as_bytes())?;
+    let runtime = format!("AUTOMONIQUE_DAEMON_STATE={state_value}\n");
+    write_private(&runtime_output, runtime.as_bytes())
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> Result<(), &'static str> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(output)
+        .open(path)
         .map_err(|_| "output")?;
-    file.write_all(config.as_bytes()).map_err(|_| "output")?;
+    file.write_all(bytes).map_err(|_| "output")?;
     file.sync_all().map_err(|_| "output")
 }
 
