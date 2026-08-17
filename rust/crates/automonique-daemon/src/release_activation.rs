@@ -76,6 +76,10 @@ struct Manifest {
     launch_helper_binary_path: Option<String>,
     #[serde(default)]
     launch_helper_binary_sha256: Option<String>,
+    #[serde(default)]
+    manage_worker_path: Option<String>,
+    #[serde(default)]
+    manage_worker_sha256: Option<String>,
     changed_paths: Vec<String>,
     #[serde(default)]
     skill_manifest_digest: Option<String>,
@@ -373,6 +377,23 @@ impl<S: ReleaseSupervisor> CodeReleaseActivator<S> {
                 ));
             }
         }
+        match (
+            manifest.manage_worker_path.as_deref(),
+            manifest.manage_worker_sha256.as_deref(),
+        ) {
+            (Some(path), Some(digest)) => {
+                validate_manage_worker_path(path)?;
+                validate_sha256(digest, "manage_worker_sha256")?;
+                let bytes = read_bounded(&release.join(path), MAX_BINARY_BYTES)?;
+                if encode_hex(&Sha256::digest(&bytes)) != digest {
+                    return Err(ReleaseActivationError::DigestMismatch("manage_worker"));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(ReleaseActivationError::InvalidManifest("manage_worker"));
+            }
+        }
         let kind = ReleaseKind::classify(&manifest.changed_paths)?;
         match (kind, manifest.skill_manifest_digest.as_deref()) {
             (ReleaseKind::Mixed, Some(digest)) => {
@@ -533,6 +554,15 @@ fn validate_launch_helper_binary_path(path: &str) -> Result<(), ReleaseActivatio
     {
         return Err(ReleaseActivationError::InvalidManifest(
             "launch_helper_binary_path",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_manage_worker_path(path: &str) -> Result<(), ReleaseActivationError> {
+    if path != "bin/automonique-manage-worker" {
+        return Err(ReleaseActivationError::InvalidManifest(
+            "manage_worker_path",
         ));
     }
     Ok(())

@@ -7,6 +7,7 @@ Install the units in this directory under `~/.config/systemd/user/`, then run:
 ```sh
 systemctl --user daemon-reload
 systemctl --user enable --now automonique.service
+systemctl --user enable --now automonique-manage-worker.service
 systemctl --user enable --now automonique-backup.timer
 systemctl --user status automonique.service
 ```
@@ -18,6 +19,9 @@ and waits for the daemon's real readiness notification. Upgrade switches the
 The timer writes an online recovery set every five minutes.
 `automonique-recovery.service` is started manually after a restore; it disables
 external transports and refuses provider starts.
+`automonique-manage-worker.service` heartbeats the configured Manage instance,
+claims confirmed jobs with bounded parallelism, and streams their progress back
+to AI Operations. It runs from the same immutable release as the daemon.
 
 Before replacing an installed unit, verify the checked-in file with
 `tools/verify_systemd_unit.sh`. To roll back,

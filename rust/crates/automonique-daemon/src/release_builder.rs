@@ -201,6 +201,12 @@ fn build_code_release(
         return Err(ReleaseBuildError::InvalidField("launch_helper_binary"));
     }
     let launch_helper_digest = encode_hex(&Sha256::digest(&launch_helper_bytes));
+    let manage_worker = worktree.join("tools/run_manage_fleet_worker.sh");
+    let manage_worker_bytes = fs::read(&manage_worker).map_err(ReleaseBuildError::Io)?;
+    if manage_worker_bytes.is_empty() || manage_worker_bytes.len() > 1024 * 1024 {
+        return Err(ReleaseBuildError::InvalidField("manage_worker"));
+    }
+    let manage_worker_digest = encode_hex(&Sha256::digest(&manage_worker_bytes));
     let manifest = serde_json::to_vec(&json!({
         "schema": "automonique.code-release/v1",
         "source_sha": candidate_sha,
@@ -211,6 +217,8 @@ fn build_code_release(
         "chat_provider_binary_sha256": chat_provider_digest,
         "launch_helper_binary_path": "bin/automonique-launch-enter",
         "launch_helper_binary_sha256": launch_helper_digest,
+        "manage_worker_path": "bin/automonique-manage-worker",
+        "manage_worker_sha256": manage_worker_digest,
         "changed_paths": changed_paths,
         "skill_manifest_digest": skill_manifest_digest,
     }))
@@ -227,6 +235,10 @@ fn build_code_release(
         write_executable(
             &staging.join("bin/automonique-launch-enter"),
             &launch_helper_bytes,
+        )?;
+        write_executable(
+            &staging.join("bin/automonique-manage-worker"),
+            &manage_worker_bytes,
         )?;
         write_immutable(&staging.join("manifest.json"), &manifest)
     })?;

@@ -624,6 +624,31 @@ fn a_fleet_refusal_is_a_parsed_outcome_and_carries_a_bounded_reason() {
 }
 
 #[test]
+fn a_manage_domain_refusal_keeps_its_reason_across_http_400() {
+    let fake = FakeFleet::spawn(vec![Canned::Exact {
+        status: 400,
+        content_type: "application/json",
+        body: br#"{"ok":false,"error":"executor_unavailable"}"#.to_vec(),
+    }]);
+    let client = fleet_client(&fake);
+    let request = TicketDecisionRequest::new(
+        "job-1",
+        "slack:A1:T1:C1:123.4",
+        "slack-action:T1:C1:124.5:U1:approve",
+        "slack:T1:U1",
+        TicketDecision::Approve,
+    )
+    .expect("request");
+    let outcome = client
+        .decide_ticket(&request)
+        .expect("a domain refusal is not a transport failure");
+    assert_eq!(
+        outcome.rejected().map(ServerMessage::as_str),
+        Some("executor_unavailable")
+    );
+}
+
+#[test]
 fn a_revoked_credential_is_named_apart_from_every_other_status() {
     for (status, expected) in [
         (401_u16, FleetFailure::Unauthorized),

@@ -274,7 +274,11 @@ impl FleetClient {
             // is the failure mode that otherwise looks like a quiet outage.
             return Err(FleetFailure::Unauthorized);
         }
-        if status != 200 {
+        // Manage returns domain refusals (for example executor_unavailable or
+        // job_missing) as bounded JSON with HTTP 400/404. They are typed fleet
+        // outcomes, not transport failures, and callers need the exact reason
+        // to tell an operator what must be repaired.
+        if !matches!(status, 200 | 400 | 404) {
             return Err(FleetFailure::UnexpectedStatus);
         }
         let content_type = response
