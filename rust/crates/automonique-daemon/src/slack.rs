@@ -108,6 +108,7 @@ use automonique_transports::{
     SlackAccessPolicy, SlackAppId, SlackDisposition, SlackInputKind, SlackPrincipal,
     parse_slack_envelope,
 };
+use sha2::{Digest as _, Sha256};
 
 use crate::github::{GitHubSurface, IssueFactDetail};
 use crate::github_actions::{
@@ -115,12 +116,15 @@ use crate::github_actions::{
     is_github_capability_question, natural_issue_request,
 };
 use crate::manage_config::ManageUrl;
+use crate::mcp_client::{McpCallResult, McpRegistry};
 use crate::progress_hub::ProgressHub;
 use crate::run_lane::{SlackProgressSink, SlackProgressTarget, SocketRunLane};
 use crate::telegram_bridge::{
-    ApprovalDecisionAnswer, ApprovalDecisionFailure, ControlSurface as _, HostFacts, RunLane as _,
-    SlackSurface, StoreControlSurface, answer_read_only_transport_question,
-    answer_typed_github_issue_question, deterministic_conversation_answer,
+    ApprovalDecisionAnswer, ApprovalDecisionFailure, ControlSurface as _, HostFacts,
+    QuestionProfile, RunLane as _, SlackSurface, StoreControlSurface, TransportToolPlan,
+    accepted_mcp_input_responses, answer_read_only_transport_question,
+    answer_typed_github_issue_question, deterministic_conversation_answer, mcp_approval_preview,
+    mcp_result_prompt,
 };
 
 /// Configuration path beneath the daemon's private state directory.
@@ -144,6 +148,8 @@ pub const MAX_CONFIGURED_CHANNELS: usize = 32;
 pub const MAX_CONFIGURED_ADMINS: usize = 32;
 /// Most Slack identities admitted to read-only Monique conversations.
 pub const MAX_CONFIGURED_MEMBERS: usize = 256;
+/// Most conversational tool approvals retained by one Slack worker.
+const MAX_PENDING_SLACK_TOOL_APPROVALS: usize = 64;
 
 /// Independently staged Slack product capabilities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -666,6 +672,11 @@ impl SlackConfig {
         if features.contains(&SlackFeature::Files) {
             return Err(SlackConfigError::ArtifactPolicyRequired);
         }
+        // V1 already requires a Socket Mode app token and an explicit
+        // administrator list. Those are the same authority gates the V2
+        // interactive flag represents, so legacy live configurations can
+        // render contextual approval buttons instead of dead-end text.
+        let interactive_decisions = v2 || app_token.is_some();
         Ok(Some(Self {
             token: token.ok_or(SlackConfigError::TokenInvalid)?,
             app_token,
@@ -673,7 +684,7 @@ impl SlackConfig {
             admins,
             members,
             features,
-            interactive_decisions: v2,
+            interactive_decisions,
         }))
     }
 
@@ -1414,6 +1425,78 @@ struct SlackApprovalInteraction {
 const SLACK_APPROVAL_GRANT_ACTION: &str = "automonique_approval_grant";
 /// The `action_id` a deny button carries.
 const SLACK_APPROVAL_DENY_ACTION: &str = "automonique_approval_deny";
+const SLACK_TOOL_GRANT_ACTION: &str = "automonique_tool_grant";
+const SLACK_TOOL_DENY_ACTION: &str = "automonique_tool_deny";
+
+struct SlackToolInteraction {
+    channel: ChannelId,
+    message_ts: MessageTs,
+    user: UserId,
+    key: String,
+    granted: bool,
+}
+
+fn slack_tool_interaction(text: &str) -> Result<Option<SlackToolInteraction>, ()> {
+    let frame: serde_json::Value = serde_json::from_str(text).map_err(|_| ())?;
+    if frame.get("type").and_then(serde_json::Value::as_str) != Some("interactive") {
+        return Ok(None);
+    }
+    let payload = frame
+        .get("payload")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(())?;
+    if payload.get("type").and_then(serde_json::Value::as_str) != Some("block_actions") {
+        return Ok(None);
+    }
+    let actions = payload
+        .get("actions")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(())?;
+    let [action] = actions.as_slice() else {
+        return Err(());
+    };
+    let granted = match action
+        .get("action_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?
+    {
+        SLACK_TOOL_GRANT_ACTION => true,
+        SLACK_TOOL_DENY_ACTION => false,
+        _ => return Ok(None),
+    };
+    let key = action
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    if key.len() != 37
+        || !key.starts_with("tool-")
+        || !key[5..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(());
+    }
+    let user = payload
+        .get("user")
+        .and_then(|value| value.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    let channel = payload
+        .get("channel")
+        .and_then(|value| value.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    let message_ts = payload
+        .get("container")
+        .and_then(|value| value.get("message_ts"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?;
+    Ok(Some(SlackToolInteraction {
+        channel: ChannelId::new(channel).map_err(|_| ())?,
+        message_ts: MessageTs::new(message_ts).map_err(|_| ())?,
+        user: UserId::new(user).map_err(|_| ())?,
+        key: key.to_owned(),
+        granted,
+    }))
+}
 
 /// Read one pressed approval button, or nothing.
 ///
@@ -1744,6 +1827,16 @@ pub(crate) trait SlackTicketPoster {
         Err(())
     }
 
+    fn post_tool_approval_card(
+        &mut self,
+        channel: &ChannelId,
+        parent: &MessageTs,
+        _key: &str,
+        preview: &str,
+    ) -> Result<(), ()> {
+        self.post_thread(channel, parent, preview)
+    }
+
     fn update_decision(
         &mut self,
         _channel: &ChannelId,
@@ -1886,6 +1979,24 @@ impl SlackTicketPoster for LiveSlackTicketPoster {
             request_key,
             expires_at_ms,
         )
+    }
+
+    fn post_tool_approval_card(
+        &mut self,
+        channel: &ChannelId,
+        parent: &MessageTs,
+        key: &str,
+        preview: &str,
+    ) -> Result<(), ()> {
+        <Arc<SlackClient> as SlackTicketPoster>::post_tool_approval_card(
+            &mut self.client,
+            channel,
+            parent,
+            key,
+            preview,
+        )?;
+        self.remember_thread_reply(channel, parent, preview);
+        Ok(())
     }
 
     fn update_decision(
@@ -2040,6 +2151,32 @@ impl SlackTicketPoster for Arc<SlackClient> {
         }
     }
 
+    fn post_tool_approval_card(
+        &mut self,
+        channel: &ChannelId,
+        parent: &MessageTs,
+        key: &str,
+        preview: &str,
+    ) -> Result<(), ()> {
+        let blocks = serde_json::json!([
+            {"type":"header","text":{"type":"plain_text","text":"Tool approval required"}},
+            {"type":"section","text":{"type":"mrkdwn","text":preview}},
+            {"type":"actions","elements":[
+                {"type":"button","action_id":SLACK_TOOL_GRANT_ACTION,"text":{"type":"plain_text","text":"Approve"},"style":"primary","value":key,"confirm":{"title":{"type":"plain_text","text":"Run this tool?"},"text":{"type":"mrkdwn","text":"This performs the exact operation previewed above once."},"confirm":{"type":"plain_text","text":"Approve"},"deny":{"type":"plain_text","text":"Cancel"}}},
+                {"type":"button","action_id":SLACK_TOOL_DENY_ACTION,"text":{"type":"plain_text","text":"Deny"},"style":"danger","value":key}
+            ]}
+        ]);
+        let blocks = MessageBlocks::new(&blocks.to_string()).map_err(|_| ())?;
+        let request =
+            PostMessageRequest::new(channel.clone(), MessageText::new(preview).map_err(|_| ())?)
+                .in_thread(parent.clone())
+                .with_blocks(blocks);
+        match SlackClient::post_message(self.as_ref(), &request).map_err(|_| ())? {
+            SlackOutcome::Accepted(_) => Ok(()),
+            SlackOutcome::Rejected(_) => Err(()),
+        }
+    }
+
     fn update_decision(
         &mut self,
         channel: &ChannelId,
@@ -2121,8 +2258,37 @@ struct SlackTicketRouter<P> {
     question_answerer: Option<Box<dyn SlackQuestionAnswerer>>,
 }
 
+enum SlackQuestionReply {
+    Text(String),
+    Approval { key: String, preview: String },
+}
+
+enum PendingSlackTool {
+    SlackPost(crate::telegram_bridge::QuestionSlackPostPlan),
+    McpCall {
+        plan: crate::telegram_bridge::QuestionMcpCallPlan,
+        requests: serde_json::Value,
+    },
+}
+
+struct PendingSlackToolEntry {
+    channel: ChannelId,
+    tool: PendingSlackTool,
+}
+
 trait SlackQuestionAnswerer: Send {
-    fn answer(&mut self, question: &str, context: &str) -> String;
+    fn answer(
+        &mut self,
+        question: &str,
+        context: &str,
+        source_key: &str,
+        channel: &ChannelId,
+        approvals_enabled: bool,
+    ) -> SlackQuestionReply;
+
+    fn decide_tool(&mut self, _key: &str, _granted: bool, _channel: &ChannelId) -> String {
+        String::from("That tool approval is no longer pending. Nothing was changed.")
+    }
 
     fn provider_stats(&mut self) -> String {
         String::from("Monique's provider instance statistics are unavailable right now.")
@@ -2150,7 +2316,10 @@ struct LiveSlackQuestionAnswerer {
     administrators: Vec<i64>,
     configured: Vec<i64>,
     api: Arc<SlackClient>,
+    channels: ChannelMap,
     members: Vec<UserId>,
+    mcp: McpRegistry,
+    pending_tools: BTreeMap<String, PendingSlackToolEntry>,
     /// The member roster, resolved on the first conversational question and
     /// kept for the worker's lifetime.
     ///
@@ -2162,16 +2331,238 @@ struct LiveSlackQuestionAnswerer {
     roster: Option<Option<String>>,
 }
 
+impl LiveSlackQuestionAnswerer {
+    fn prepare_tool_approval(
+        &mut self,
+        selected: TransportToolPlan,
+        question: &str,
+        source_key: &str,
+        channel: &ChannelId,
+        approvals_enabled: bool,
+    ) -> SlackQuestionReply {
+        match selected {
+            TransportToolPlan::McpCall(plan) => {
+                match self
+                    .mcp
+                    .call(&plan.server, &plan.tool, plan.arguments.clone(), None)
+                {
+                    Ok(McpCallResult::Complete { value, is_error }) => {
+                        let Some(prompt) = mcp_result_prompt(question, &plan, &value, is_error)
+                        else {
+                            return SlackQuestionReply::Text(String::from(
+                                "The MCP result did not fit safely, so it was not sent to the answer model.",
+                            ));
+                        };
+                        return SlackQuestionReply::Text(
+                            self.lane
+                                .run_question(&prompt, QuestionProfile::OperationalLookup)
+                                .unwrap_or_else(|_| {
+                                    String::from(
+                                        "The MCP read completed, but the answer model is unavailable right now.",
+                                    )
+                                }),
+                        );
+                    }
+                    Ok(McpCallResult::InputRequired { requests }) => {
+                        if !approvals_enabled {
+                            return SlackQuestionReply::Text(String::from(
+                                "This MCP operation requires approval, but interactive approvals are not enabled in this Slack workspace. Nothing was changed.",
+                            ));
+                        }
+                        let preview = mcp_approval_preview(&plan, &requests);
+                        return self.stage_tool(
+                            source_key,
+                            channel,
+                            PendingSlackTool::McpCall { plan, requests },
+                            preview,
+                        );
+                    }
+                    Err(_) => {
+                        return SlackQuestionReply::Text(String::from(
+                            "The selected MCP capability is unavailable right now; nothing was changed.",
+                        ));
+                    }
+                }
+            }
+            TransportToolPlan::SlackPost(plan) => {
+                if !approvals_enabled {
+                    return SlackQuestionReply::Text(String::from(
+                        "Posting to another Slack channel requires approval, but interactive approvals are not enabled in this workspace. Nothing was posted.",
+                    ));
+                }
+                let preview = format!(
+                    "Slack post awaiting approval\nChannel: #{}\n\n{}\n\nApprove posts it once. Deny posts nothing.",
+                    plan.channel, plan.text
+                );
+                self.stage_tool(
+                    source_key,
+                    channel,
+                    PendingSlackTool::SlackPost(plan),
+                    preview,
+                )
+            }
+        }
+    }
+
+    fn stage_tool(
+        &mut self,
+        source_key: &str,
+        channel: &ChannelId,
+        tool: PendingSlackTool,
+        preview: String,
+    ) -> SlackQuestionReply {
+        if self.pending_tools.len() >= MAX_PENDING_SLACK_TOOL_APPROVALS {
+            return SlackQuestionReply::Text(String::from(
+                "Too many Slack tool approvals are pending; nothing was staged.",
+            ));
+        }
+        let binding = format!("slack-tool-approval-v1\0{source_key}\0{}", channel.as_str());
+        let digest = Sha256::digest(binding.as_bytes());
+        let suffix = digest[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let key = format!("tool-{suffix}");
+        self.pending_tools.insert(
+            key.clone(),
+            PendingSlackToolEntry {
+                channel: channel.clone(),
+                tool,
+            },
+        );
+        SlackQuestionReply::Approval { key, preview }
+    }
+
+    fn decide_pending_tool(&mut self, key: &str, granted: bool, channel: &ChannelId) -> String {
+        if self
+            .pending_tools
+            .get(key)
+            .is_some_and(|pending| &pending.channel != channel)
+        {
+            return String::from(
+                "That tool approval belongs to another Slack conversation. Nothing was changed.",
+            );
+        }
+        let Some(pending) = self.pending_tools.remove(key) else {
+            return String::from("That tool approval is no longer pending. Nothing was changed.");
+        };
+        if !granted {
+            return String::from("Denied. The proposed tool was not run.");
+        }
+        match pending.tool {
+            PendingSlackTool::SlackPost(plan) => {
+                let label = self
+                    .channels
+                    .labels()
+                    .into_iter()
+                    .find(|label| label.eq_ignore_ascii_case(&plan.channel));
+                let Some(label) = label else {
+                    return String::from(
+                        "That Slack channel is no longer configured, so nothing was posted.",
+                    );
+                };
+                let Ok(name) = ChannelName::new(label) else {
+                    return String::from(
+                        "That configured Slack channel is invalid, so nothing was posted.",
+                    );
+                };
+                let Some(target) = self.channels.resolve(&name).cloned() else {
+                    return String::from(
+                        "That Slack channel is no longer configured, so nothing was posted.",
+                    );
+                };
+                let Ok(text) = MessageText::new(&plan.text) else {
+                    return String::from(
+                        "The approved Slack message is invalid; nothing was posted.",
+                    );
+                };
+                match SlackClient::post_message(
+                    self.api.as_ref(),
+                    &PostMessageRequest::new(target, text),
+                ) {
+                    Ok(SlackOutcome::Accepted(_)) => {
+                        format!("✅ Approved and posted once to #{}.", plan.channel)
+                    }
+                    Ok(SlackOutcome::Rejected(_)) => {
+                        String::from("Slack rejected the approved post, so nothing was posted.")
+                    }
+                    Err(_) => String::from(
+                        "Slack did not confirm the approved post. Its outcome is unknown and Monique did not retry it.",
+                    ),
+                }
+            }
+            PendingSlackTool::McpCall { plan, requests } => {
+                let Some(responses) = accepted_mcp_input_responses(&requests) else {
+                    return String::from(
+                        "The MCP approval request was malformed, so nothing was changed.",
+                    );
+                };
+                match self
+                    .mcp
+                    .call(&plan.server, &plan.tool, plan.arguments, Some(responses))
+                {
+                    Ok(McpCallResult::Complete {
+                        value,
+                        is_error: false,
+                    }) => bounded_slack_tool_reply(&format!(
+                        "✅ Approved and completed {}.\n\n{}",
+                        plan.tool, value
+                    )),
+                    Ok(McpCallResult::Complete {
+                        value,
+                        is_error: true,
+                    }) => bounded_slack_tool_reply(&format!(
+                        "The approved MCP operation returned an error.\n\n{value}"
+                    )),
+                    Ok(McpCallResult::InputRequired { .. }) => String::from(
+                        "The MCP server requested another approval step; nothing further was executed.",
+                    ),
+                    Err(_) => String::from(
+                        "The approved MCP operation could not be completed. Retry from the original request.",
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn bounded_slack_tool_reply(value: &str) -> String {
+    const MAX_BYTES: usize = 12 * 1024;
+    if value.len() <= MAX_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_BYTES;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[…truncated]", &value[..end])
+}
+
 impl SlackQuestionAnswerer for LiveSlackQuestionAnswerer {
-    fn answer(&mut self, question: &str, context: &str) -> String {
+    fn answer(
+        &mut self,
+        question: &str,
+        context: &str,
+        source_key: &str,
+        channel: &ChannelId,
+        approvals_enabled: bool,
+    ) -> SlackQuestionReply {
         if let Some(answer) = slack_reply_location_answer(question, context) {
-            return answer;
+            return SlackQuestionReply::Text(answer);
         }
         if self.roster.is_none() {
             self.roster = Some(slack_member_roster(self.api.as_ref(), &self.members));
         }
         let roster = self.roster.clone().flatten();
-        answer_read_only_transport_question(
+        let slack_channels = self
+            .channels
+            .labels()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mcp_tools = self.mcp.discover().unwrap_or_default();
+        let mut selected_tool = None;
+        let answer = answer_read_only_transport_question(
             &mut self.surface,
             &mut self.lane,
             question,
@@ -2179,8 +2570,26 @@ impl SlackQuestionAnswerer for LiveSlackQuestionAnswerer {
             &self.administrators,
             &self.configured,
             roster.as_deref(),
+            &slack_channels,
+            self.github.is_some(),
+            &mcp_tools,
+            &mut selected_tool,
             "slack_question_worker",
+        );
+        let Some(selected_tool) = selected_tool else {
+            return SlackQuestionReply::Text(answer);
+        };
+        self.prepare_tool_approval(
+            selected_tool,
+            question,
+            source_key,
+            channel,
+            approvals_enabled,
         )
+    }
+
+    fn decide_tool(&mut self, key: &str, granted: bool, channel: &ChannelId) -> String {
+        self.decide_pending_tool(key, granted, channel)
     }
 
     fn provider_stats(&mut self) -> String {
@@ -2740,6 +3149,21 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
         };
         // A failed rewrite does not roll anything back: the decision is durable
         // and the card is a view of it.
+        let _ = self
+            .poster
+            .update_decision(&interaction.channel, &interaction.message_ts, &text);
+    }
+
+    fn handle_tool_interaction(&mut self, interaction: SlackToolInteraction) {
+        if !self.may_decide(&interaction.user, &interaction.channel) {
+            return;
+        }
+        let text = self.question_answerer.as_mut().map_or_else(
+            || String::from("Monique's conversational tool surface is unavailable right now."),
+            |answerer| {
+                answerer.decide_tool(&interaction.key, interaction.granted, &interaction.channel)
+            },
+        );
         let _ = self
             .poster
             .update_decision(&interaction.channel, &interaction.message_ts, &text);
@@ -3449,15 +3873,47 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                 if conversational {
                     let answer = self.question_answerer.as_mut().map_or_else(
                         || {
-                            String::from(
-                                "Monique's read-only question surface is unavailable right now.",
+                            SlackQuestionReply::Text(String::from(
+                                "Monique's conversational tool surface is unavailable right now.",
+                            ))
+                        },
+                        |answerer| {
+                            answerer.answer(
+                                trimmed,
+                                context,
+                                &event.source_key,
+                                &event.channel,
+                                self.interactive_decisions
+                                    && self.features.contains(&SlackFeature::Approvals)
+                                    && self.admins.contains(&event.user),
                             )
                         },
-                        |answerer| answerer.answer(trimmed, context),
                     );
-                    let _ = self
-                        .poster
-                        .post_thread(&event.channel, &event.parent, &answer);
+                    match answer {
+                        SlackQuestionReply::Text(answer) => {
+                            let _ = self
+                                .poster
+                                .post_thread(&event.channel, &event.parent, &answer);
+                        }
+                        SlackQuestionReply::Approval { key, preview } => {
+                            if self
+                                .poster
+                                .post_tool_approval_card(
+                                    &event.channel,
+                                    &event.parent,
+                                    &key,
+                                    &preview,
+                                )
+                                .is_err()
+                            {
+                                let _ = self.poster.post_thread(
+                                    &event.channel,
+                                    &event.parent,
+                                    "Slack refused the tool approval controls, so nothing was executed.",
+                                );
+                            }
+                        }
+                    }
                 }
                 return;
             }
@@ -3879,7 +4335,11 @@ impl SlackTicketHost {
                 administrators: question_administrators.clone(),
                 configured: question_configured.clone(),
                 api: Arc::clone(&client),
+                channels: channels.clone(),
                 members: members.clone(),
+                mcp: McpRegistry::load(state_dir)
+                    .map_err(|_| SlackConfigError::QuestionSurfaceUnavailable)?,
+                pending_tools: BTreeMap::new(),
                 roster: None,
             }) as Box<dyn SlackQuestionAnswerer>)
         } else {
@@ -4048,6 +4508,10 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
                 Ok(approval) => approval,
                 Err(()) => break,
             };
+            let tool_interaction = match slack_tool_interaction(envelope.as_str()) {
+                Ok(interaction) => interaction,
+                Err(()) => break,
+            };
             let command = match slack_github_command(
                 envelope.as_str(),
                 &worker.router.channels,
@@ -4132,6 +4596,9 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
             }
             if let Some(approval) = approval {
                 worker.router.handle_approval_interaction(approval);
+            }
+            if let Some(interaction) = tool_interaction {
+                worker.router.handle_tool_interaction(interaction);
             }
             if let Some(user) = app_home_user {
                 worker.router.handle_app_home(&user);
@@ -5831,12 +6298,19 @@ mod tests {
     }
 
     impl SlackQuestionAnswerer for FakeQuestionAnswerer {
-        fn answer(&mut self, question: &str, context: &str) -> String {
+        fn answer(
+            &mut self,
+            question: &str,
+            context: &str,
+            _source_key: &str,
+            _channel: &ChannelId,
+            _approvals_enabled: bool,
+        ) -> SlackQuestionReply {
             self.seen
                 .lock()
                 .expect("questions")
                 .push((question.to_owned(), context.to_owned()));
-            String::from("Monique intelligent answer")
+            SlackQuestionReply::Text(String::from("Monique intelligent answer"))
         }
     }
 
@@ -5847,7 +6321,14 @@ mod tests {
     struct FakeProviderStatsAnswerer;
 
     impl SlackQuestionAnswerer for FakeProviderStatsAnswerer {
-        fn answer(&mut self, _question: &str, _context: &str) -> String {
+        fn answer(
+            &mut self,
+            _question: &str,
+            _context: &str,
+            _source_key: &str,
+            _channel: &ChannelId,
+            _approvals_enabled: bool,
+        ) -> SlackQuestionReply {
             panic!("provider statistics must use the typed provider journal read")
         }
 
@@ -5857,7 +6338,14 @@ mod tests {
     }
 
     impl SlackQuestionAnswerer for FakeIssueStatusAnswerer {
-        fn answer(&mut self, _question: &str, _context: &str) -> String {
+        fn answer(
+            &mut self,
+            _question: &str,
+            _context: &str,
+            _source_key: &str,
+            _channel: &ChannelId,
+            _approvals_enabled: bool,
+        ) -> SlackQuestionReply {
             panic!("status questions must use the typed GitHub issue reader")
         }
 
@@ -5875,7 +6363,14 @@ mod tests {
     }
 
     impl SlackQuestionAnswerer for FakeIssueReviewAnswerer {
-        fn answer(&mut self, _question: &str, _context: &str) -> String {
+        fn answer(
+            &mut self,
+            _question: &str,
+            _context: &str,
+            _source_key: &str,
+            _channel: &ChannelId,
+            _approvals_enabled: bool,
+        ) -> SlackQuestionReply {
             panic!("issue reviews must use the typed GitHub issue reader")
         }
 
@@ -5892,6 +6387,36 @@ mod tests {
                 deep,
             ));
             String::from("Typed GitHub issue review")
+        }
+    }
+
+    struct FakeToolAnswerer {
+        decisions: Arc<std::sync::Mutex<Vec<(String, bool, String)>>>,
+    }
+
+    impl SlackQuestionAnswerer for FakeToolAnswerer {
+        fn answer(
+            &mut self,
+            _question: &str,
+            _context: &str,
+            _source_key: &str,
+            _channel: &ChannelId,
+            approvals_enabled: bool,
+        ) -> SlackQuestionReply {
+            assert!(approvals_enabled);
+            SlackQuestionReply::Approval {
+                key: String::from("tool-0123456789abcdef0123456789abcdef"),
+                preview: String::from("MCP action awaiting approval"),
+            }
+        }
+
+        fn decide_tool(&mut self, key: &str, granted: bool, channel: &ChannelId) -> String {
+            self.decisions.lock().expect("decisions").push((
+                key.to_owned(),
+                granted,
+                channel.as_str().to_owned(),
+            ));
+            String::from("Approved and completed the tool.")
         }
     }
 
@@ -6009,7 +6534,7 @@ mod tests {
         let permitted = decide_gate_router(true, approvals.clone(), vec!["U0ADMIN001"]);
         assert!(permitted.may_decide(&admin, &channel));
 
-        // Interactive decisions disabled: a v1 workspace decides nothing.
+        // Interactive decisions explicitly disabled decides nothing.
         assert!(
             !decide_gate_router(false, approvals.clone(), vec!["U0ADMIN001"])
                 .may_decide(&admin, &channel)
@@ -6024,6 +6549,70 @@ mod tests {
         assert!(!permitted.may_decide(&UserId::new("U0MEMBER01").expect("member"), &channel));
         // A channel this deployment did not configure.
         assert!(!permitted.may_decide(&admin, &ChannelId::new("C0ELSEWHERE").expect("channel")));
+    }
+
+    #[test]
+    fn conversational_tool_plans_use_slack_buttons_and_the_same_admin_gate() {
+        let poster = FakeTicketPoster::default();
+        let messages = Arc::clone(&poster.messages);
+        let decisions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut router = SlackTicketRouter {
+            poster,
+            manage: Box::new(FakeManage::default()),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
+            channels: ChannelMap(vec![(
+                name("ops"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![SlackFeature::Approvals, SlackFeature::Conversation],
+            interactive_decisions: true,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+            approvals: None,
+            approval_lane: None,
+            question_answerer: Some(Box::new(FakeToolAnswerer {
+                decisions: Arc::clone(&decisions),
+            })),
+        };
+        let mut event = ticket_event("U0ADMIN001", "<@B0APP> utilise l'outil", "EvTool");
+        event.app_mention = true;
+        router.handle_with_context(event, "");
+        assert_eq!(
+            messages.lock().expect("messages").as_slice(),
+            [String::from("MCP action awaiting approval")]
+        );
+
+        router.handle_tool_interaction(SlackToolInteraction {
+            channel: ChannelId::new("C0RESERVED01").expect("channel"),
+            message_ts: MessageTs::new("1723542001.000200").expect("message"),
+            user: UserId::new("U0ADMIN001").expect("admin"),
+            key: String::from("tool-0123456789abcdef0123456789abcdef"),
+            granted: true,
+        });
+        assert_eq!(
+            decisions.lock().expect("decisions").as_slice(),
+            [(
+                String::from("tool-0123456789abcdef0123456789abcdef"),
+                true,
+                String::from("C0RESERVED01"),
+            )]
+        );
+    }
+
+    #[test]
+    fn slack_tool_button_payload_carries_only_an_opaque_plan_key() {
+        let frame = r#"{"type":"interactive","payload":{"type":"block_actions","user":{"id":"U0ADMIN001"},"channel":{"id":"C0RESERVED01"},"container":{"message_ts":"1723542001.000200"},"actions":[{"action_id":"automonique_tool_grant","value":"tool-0123456789abcdef0123456789abcdef"}]}}"#;
+        let interaction = slack_tool_interaction(frame)
+            .expect("payload")
+            .expect("tool interaction");
+        assert!(interaction.granted);
+        assert_eq!(interaction.key, "tool-0123456789abcdef0123456789abcdef");
+        assert_eq!(interaction.channel.as_str(), "C0RESERVED01");
     }
 
     #[test]
