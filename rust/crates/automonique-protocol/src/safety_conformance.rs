@@ -25,13 +25,11 @@
 //!
 //! # What a suite is for
 //!
-//! A suite is not a test of the reference model. It is the gate a real
-//! implementation will be held to, written before that implementation exists so
-//! it cannot be written to match it. Each suite therefore returns a
+//! A suite is not a test of the reference model. It is a reusable check for a
+//! real implementation. Each suite therefore returns a
 //! [`SafetyViolation`] rather than panicking: a caller can run it against a
-//! candidate, get a machine-readable case name back, and record the verdict.
-//! The reference model exists to prove the suite is satisfiable at all — a gate
-//! nothing can pass is indistinguishable from a gate nothing has tried.
+//! candidate and get a machine-readable case name back. The reference model
+//! proves that the suite is satisfiable.
 //!
 //! Every suite's negative cases matter more than its positive one. The positive
 //! case says the happy path works, which an implementation will get right by
@@ -44,7 +42,7 @@
 //!
 //! No suite in this module is bound to a daemon. Nothing here opens a socket,
 //! holds a credential, or observes a real deployment, and passing a suite is not
-//! evidence that the product has the property — it is evidence that a specific
+//! proof that the product has the property — it only shows that a specific
 //! implementation of a specific trait has it. [`PENDING_BINDINGS`] names the
 //! surface each property is still waiting for and where that work is tracked, so
 //! the gap is data in the build rather than a sentence in a document.
@@ -147,9 +145,8 @@ pub struct PendingBinding {
 /// The three chat-surface properties are built by the launch roadmap's
 /// Increment 4 (`docs/product-plan/launch-roadmap.md` § Increment 4), which is
 /// the first increment that sends anything outbound; the scheduler is
-/// `docs/improvement-plan/implementation/M8-scheduler-reload-isolation.md`
-/// issue #45, whose spec is `requirements/scheduler-core.md` — the same document
-/// this module's fourth suite judges.
+/// tracked by `requirements/scheduler-core.md` — the same document this
+/// module's fourth suite judges.
 pub const PENDING_BINDINGS: [PendingBinding; 4] = [
     PendingBinding {
         property: SafetyProperty::DeployRoute,
@@ -169,7 +166,7 @@ pub const PENDING_BINDINGS: [PendingBinding; 4] = [
     PendingBinding {
         property: SafetyProperty::SchedulerCore,
         surface: "the durable scheduler in automonique-core",
-        tracked_at: "docs/improvement-plan/implementation/M8-scheduler-reload-isolation.md #45",
+        tracked_at: "docs/product-plan/requirements/scheduler-core.md",
     },
 ];
 

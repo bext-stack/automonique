@@ -11,9 +11,8 @@ support connectors can also perform live effects when an operator explicitly
 configures them. The repository status table in `README.md` is the concise
 inventory of those surfaces.
 
-These capabilities were implemented before the old three-gate brief was
-resolved in writing. That historical process defect does not turn `plan/` into
-an active approval system and does not authorize production use.
+These capabilities are available for ordinary repository development. Their
+production use remains separately authorized.
 
 ## What remains incomplete
 

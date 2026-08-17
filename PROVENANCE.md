@@ -46,45 +46,12 @@ source. A parity oracle may execute privately against synthetic inputs, but it
 must expose only bounded behavior results and must not emit source, private
 data, credentials, proprietary identifiers, or implementation text. The
 enforcement mechanism for that boundary is built and measured in
-`tools/oracle/`. The historical `GATE-ORACLE` label remains open because the old
-plan never recorded external acceptance; it is not a development gate.
+`tools/oracle/`.
 
 ## Repository identity
 
-The identity register below records the repository's candidate automation
-identity and its historical exceptions. From the direct-development decision
-of 2026-08-12 onward it is an optional audit rather than a work-admission or CI
-gate. Codex-authored commits continue to use `Automonique Candidate`; human
-commits may use the human's truthful configured identity.
-
-**Declared state.** Identity separation: not claimed. Commit signing: not
-enabled. Identities of record: `.github/identity/register.toml`.
-
-The archived `.github/identity/check_identity.py` derives that line from the
-register and refuses this document when the two disagree. It can still audit
-the candidate-identity era; it no longer determines whether ordinary work may
-start or land.
-
-**Recorded candidate-bot state.** One identity, `Automonique Candidate`,
-performed all roles in the former harness, so no role was separated and
-no commit was signed. Three commits predate that rule and are recorded as pinned
-exceptions in the register rather than rewritten: the root commit and the
-commit after it carry an owner bootstrap identity, and one later commit
-inherited an ambient personal Git configuration.
-`plan/owner-decisions/2026-08-10-candidate-identity-rewrite.md` records the
-rewrite that brought the rest of that history to the candidate identity.
-
-**Direct-development state.** Codex uses the candidate identity; humans may use
-their truthful configured identity. Ordinary non-force pushes are permitted.
+Codex uses the `Automonique Candidate` identity; humans use their truthful
+configured identity. Commit signing and role-separated identities are optional
+operator choices, not repository gates. Ordinary non-force pushes are permitted.
 Repository administration, release, publication, credential, and production
 operations remain separately authorized.
-
-**Optional hardened state.** Dedicated workload identities may separate
-candidate, review/build and integration activity when the operational value
-justifies their cost. Repository administration and legal approval remain
-external actions. The root commit ID, tree digest, signer identity when used,
-policy digest and legal approval receipt belong in an external immutable
-receipt.
-
-`GATE-IDENTITY` is the archived label for optional identity hardening. It does
-not block repository work.

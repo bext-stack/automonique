@@ -66,11 +66,10 @@
 //! obeys the same canonical-decimal rule as `<cursor>`; a non-canonical
 //! spelling is `field_invalid` and never reaches custody.
 //!
-//! # Divergence from the R2-04 contract
+//! # Current scope
 //!
-//! `plan/contracts/R2-04.md` was a design input. It names several types and
-//! services that do not exist in this repository, so this module implements the
-//! sound core and states the gaps rather than faking them:
+//! The product requirements name several types and services that do not exist
+//! yet, so this module implements the sound core and states the gaps:
 //!
 //! - **Framing.** The contract specifies length-prefixed canonical JSON
 //!   `Message` envelopes with a 64 KiB request / 2 MiB response ceiling and a

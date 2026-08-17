@@ -25,8 +25,7 @@ examples, generated client source, and package documentation:
 
 This is the only Apache-2.0 root. It previously also listed `integrations/` and
 `connectors/`; neither directory was ever created, and the provider connectors
-shipped instead as Elastic-2.0 crates under `rust/crates/` — see
-[the 2026-08-15 decision](plan/owner-decisions/2026-08-15-connector-licence-boundary.md).
+shipped instead as Elastic-2.0 crates under `rust/crates/`.
 They stay Elastic-2.0: each is locked to a single backend's wire protocol and is
 consumed only by the daemon, which is not what an Apache root exists to enable.
 

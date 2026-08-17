@@ -168,7 +168,7 @@ class ScrubScannerTests(ScannerFixture):
                 "id": "new-exemption",
                 "retained": "too broad",
                 "reason": "synthetic pressure test",
-                "decision": "plan/gates.md#gate-scrub",
+                "decision": "AGENTS.md#guardrails",
             }
         )
         path = self.repository / "allowlist.json"

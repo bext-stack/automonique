@@ -28,7 +28,7 @@ refuses to start rather than degrading quietly.
 | Support intake | `support/fleet.conf` | Polls the ticket board into a durable store and drafts replies. Intake itself sends nothing; an email or a dispatched job happens only on an explicit operator intent. |
 | Provider execution | `provider` | Composes a bounded launch document and runs a real provider process through the full sandbox boundary, returning its answer. |
 | Brokered egress | `egress-destinations` | Starts one loopback CONNECT broker per run on a kernel-assigned ephemeral port, allowing exactly the host/port pairs the file names and denying everything else. Absent, every brokered document is refused. |
-| Self-improvement | `improvement-lab.json` | Runs a pinned agent in a worktree, pushes a tested candidate, opens and merges pull requests, repoints a release symlink, and restarts a systemd user unit. Gated behind two separate administrator approvals bound by an HMAC challenge. |
+| Self-improvement | `improvement-lab.json` | Turns an administrator request into a concise internal brief, runs a pinned agent and standard checks in a worktree, and opens a source pull request. One HMAC-bound administrator approval authorizes merge and activation. |
 | Durable memory | `memory/memory.conf` | The one gate whose absent state is a default rather than an off switch: memory runs under a neutral default tenant. It never migrates rows written under another tenant. |
 
 What the daemon still does not do, and says so at the sites that would have to
@@ -53,9 +53,6 @@ change:
   effect; callback queries cannot be acknowledged; support intake pages nothing
   and holds no cursor or lease.
 
-Large historical planning and development-harness surfaces remain in the tree,
-but they are no longer prerequisites for product development.
-
 Status reconciled against `d10cfa5`, 2026-08-15. A pull request that adds or
 enables an external surface updates this section in the same pull request; see
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
@@ -64,7 +61,6 @@ enables an external surface updates this section in the same pull request; see
 docs/product-plan/       product goals, requirements, architecture, migration
 rust/crates/             Rust product crates and tests
 sdk/                     Apache-2.0 client SDKs
-plan/                    archived executable-plan experiment
 tools/                   development and diagnostic tools
 
 AGENTS.md                direct development and safety policy
@@ -77,20 +73,19 @@ PROVENANCE.md            clean-room provenance
 
 Read [`AGENTS.md`](AGENTS.md), inspect the relevant requirement, code, and
 tests, then make the requested change directly. Run checks that fit the change;
-commit normally and non-force-push when requested. The old material under
-`plan/` is historical and is not part of this workflow.
+commit normally and non-force-push when requested.
 
 Useful checks include:
 
 ```sh
 python3 tools/check_licenses.py
-python3 tools/scrub/scan.py
+python3 tools/scrub/scan.py --scope tree
 cargo fmt --manifest-path rust/Cargo.toml --all -- --check
 cargo test --manifest-path rust/Cargo.toml --workspace --all-targets --locked
 cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --locked -- -D warnings
 ```
 
-The runner's containment proofs need a delegated cgroup v2 subtree, which an
+The runner's containment tests need a delegated cgroup v2 subtree, which an
 interactive login session does not have. Outside one they assert the fail-closed
 refusal instead. To actually exercise the boundary, run them in a delegated
 scope and require enforcement, so a host that cannot prove it fails loudly
@@ -102,9 +97,8 @@ systemd-run --user --scope -p Delegate=yes \
   cargo test --manifest-path rust/Cargo.toml -p automonique-runner --test containment
 ```
 
-Choose checks relevant to the changed area. Product CI remains authoritative
-for actual failures; the archived plan's self-consistency is not a product
-gate.
+Choose checks relevant to the changed area. Optional diagnostics and metrics
+are inputs to judgment, not additional gates.
 
 ## Run the local daemon
 

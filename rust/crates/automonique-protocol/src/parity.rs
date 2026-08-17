@@ -3,12 +3,9 @@
 //! Intended-action envelopes: what an engine *decided to do*, held apart from
 //! doing it.
 //!
-//! `docs/improvement-plan/implementation/M2-parity-harness.md` states the
-//! central design question — "where does 'decide to post' become 'actually
-//! post'?" — and answers it: every externally visible effect in this product
-//! already passes through a narrow injected trait, so suppressing effects needs
-//! a recording decorator per trait rather than a new architecture. This module
-//! is the value those decorators record.
+//! Every externally visible effect passes through a narrow injected trait, so
+//! dry-run comparison can record intended effects without performing them. This
+//! module defines the values those decorators record.
 //!
 //! An [`IntendedActionEnvelope`] says *one engine, at one point in one source
 //! event's handling, decided to perform this exact action*. It is not a receipt
@@ -405,9 +402,7 @@ impl SecuritySensitiveEnum for Relation {
 
 /// The kind of action an envelope carries.
 ///
-/// One member per row of the effect-suppression seam table in
-/// `docs/improvement-plan/implementation/M2-parity-harness.md`, plus the
-/// deliberate silence.
+/// One member per supported effect seam, plus deliberate silence.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ActionKind {
     /// A reply posted into an existing Slack thread.

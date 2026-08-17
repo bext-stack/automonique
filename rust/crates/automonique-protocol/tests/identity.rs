@@ -3,7 +3,7 @@
 //! R1-13 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-13.md`.
+//! `docs/product-plan/requirements/operations-and-governance.md`.
 
 use automonique_protocol::identity::{
     Actor, BreakGlassGrant, CredentialHealth, CredentialRecord, DecisionOutcome, DenyReason,

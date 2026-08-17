@@ -3,7 +3,7 @@
 //! R1-09 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-09.md`.
+//! `docs/product-plan/requirements/state-and-protocols.md`.
 
 use automonique_protocol::event::{
     ApprovalClass, ApprovalDecision, ApprovalLedger, Authority, ConsumerCursor, EventCoordinates,

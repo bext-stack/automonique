@@ -3,7 +3,7 @@
 //! R1-18 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-18.md`.
+//! `docs/product-plan/requirements/sandbox-management.md`.
 
 use automonique_protocol::identity::Actor;
 use automonique_protocol::models::ProviderAccountId;
@@ -311,8 +311,7 @@ mod profile_ordering {
 mod spec_completeness {
     use super::*;
 
-    /// The field list of `plan/contracts/R1-18.md` § Sandbox contract, which
-    /// restates `docs/product-plan/requirements/sandbox-management.md`
+    /// The field list from `docs/product-plan/requirements/sandbox-management.md`
     /// § Policy compilation, with the accessor that observes each clause on a
     /// compiled spec.
     ///

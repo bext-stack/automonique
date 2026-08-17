@@ -3,7 +3,7 @@
 //! R1-22 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-22.md`. The rows that require something to be
+//! `docs/product-plan/requirements/automation-goals-and-triggers.md`. The rows that require something to be
 //! *unrepresentable* are proven by paired doc tests in the library, where a
 //! `compile_fail` case executes; the modules here assert the runtime half and
 //! name the doc test that carries the compile-time half.
@@ -1404,10 +1404,9 @@ mod fenced_claims {
 }
 
 // ---------------------------------------------------------------------------
-// Extension: the automation surface the R1-22 evidence recorded as not done.
+// Extension: automation capabilities added after the initial model.
 //
-// `plan/evidence/R1-22.json` states under "WHAT IS NOT DONE" that an
-// `AutomationRevision` carries no enabled state and no concurrency or overlap
+// The initial `AutomationRevision` carried no enabled state or concurrency and overlap
 // policy, both of which `docs/product-plan/requirements/
 // automation-goals-and-triggers.md` § Durable automations requires (lines 7 and
 // 11). The same requirement's line 43 lists a filter vocabulary — equals,

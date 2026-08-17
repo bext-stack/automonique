@@ -5,15 +5,14 @@ agent to inspect, edit, test, commit, and non-force-push a change without a
 separate planning or approval workflow. Review is useful where risk warrants
 it, but is not universally required.
 
-`AGENTS.md` is the repository's development policy. The old work graph,
-contracts, roles, gates, evidence, and harness records under `plan/` and
-`.automonique/dev/` are historical and grant or withhold no authority.
+`AGENTS.md` is the repository's complete development policy. Product documents
+describe desired behavior; they do not add development stages or authority
+requirements.
 
 ## Roles
 
-The identity audit still uses five historical labels: implementer, reviewer,
-fixer, builder, and merger. They are responsibilities, not required people,
-agents, approvals, or workflow stages, and one identity may hold all of them.
+Implementing, reviewing, fixing, building, and merging are activities, not
+required roles or workflow stages. One person or agent may do all of them.
 
 Production changes, live effects, releases, credentials, repository
 administration, destructive Git operations, and licence-boundary moves before

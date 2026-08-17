@@ -3,7 +3,7 @@
 //! R1-04 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-04.md`.
+//! `docs/product-plan/requirements/operations-and-governance.md`.
 
 use automonique_policy::peer::{
     Admission, EntryMetadata, MODE_IMMUTABLE_SPEC, MODE_PRIVATE_DIRECTORY, MODE_PRIVATE_FILE,

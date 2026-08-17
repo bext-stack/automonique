@@ -10,8 +10,8 @@ Digest domain prefix hex: 6175746f6d6f6e697175652e72756e2d737065632f763100
 Domain-separated SHA-256: 12a7a94d02665732ee3a205d443056359ca992bfa2ae923e6b6123e82e0ccc04
 Recorded at: 2026-08-12T20:53:02Z
 
-The fixture was written directly from the normative grammar in
-plan/contracts/R2-01.md. No Automonique encoder, decoder, canonical JSON
+The fixture was written directly from the documented RunSpec grammar. No
+Automonique encoder, decoder, canonical JSON
 builder, RunSpec constructor, digest helper, or generated fixture produced the
 expected bytes or either expected digest.
 

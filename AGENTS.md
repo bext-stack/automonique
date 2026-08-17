@@ -5,9 +5,12 @@ product requirements. Inspect before editing, preserve unrelated changes, and
 run checks appropriate to the change. Ordinary commits and non-force pushes
 are allowed when requested.
 
-The material under `plan/` and `.automonique/dev/` is historical. It is not a
-workflow: no claim, packet, lease, ready ID, contract, evidence record, gate,
-review stage, or plan update is required to start or finish repository work.
+Keep progress updates and handoffs concise: state the outcome, material risks,
+and checks that actually ran. Do not generate evidence packets, approval
+records, role reports, or workflow narration for ordinary development.
+
+No claim, packet, lease, ready ID, contract, evidence record, gate, review
+stage, or plan update is required to start or finish repository work.
 
 ## Guardrails
 

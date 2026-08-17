@@ -38,9 +38,8 @@
 //!
 //! Nothing here schedules anything. [`ReferenceScheduler`] holds rows in
 //! vectors, has no lease timer, no store, and no executor, and it exists to
-//! prove [`verify_scheduler_core`] is satisfiable. The durable scheduler that
-//! must pass this suite is
-//! `docs/improvement-plan/implementation/M8-scheduler-reload-isolation.md` #45.
+//! prove [`verify_scheduler_core`] is satisfiable. A durable scheduler can use
+//! this suite as a focused compatibility check.
 
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};

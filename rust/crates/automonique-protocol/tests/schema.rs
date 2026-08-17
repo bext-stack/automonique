@@ -3,7 +3,7 @@
 //! R1-10 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-10.md`.
+//! `docs/product-plan/requirements/state-and-protocols.md`.
 
 use automonique_protocol::codec::{MajorVersion, VersionRange};
 use automonique_protocol::digest::DigestError;

@@ -7,7 +7,7 @@
 //! Runs API makes this surface the complete one — "The TypeScript SDK's native
 //! API remains the complete surface for cursor-based events, exact revisions,
 //! attachments, artifacts, work graphs, sandboxes and reload" — and
-//! `docs/product-plan/reference/work-breakdown.md` R11-01 names the resources:
+//! The native API requirements name the resources:
 //! "native HTTP runs/events/stop/approval/session/job resources over canonical
 //! receipts and cursors".
 //!
@@ -106,10 +106,8 @@
 //!   models no actor, so it cannot filter by one; [`RunsRefusal`] has no
 //!   `not_authorized` variant because a refusal this slice cannot decide is a
 //!   refusal it must not claim.
-//! - **Lease.** `plan/work-graph.toml` gives R11-01 the paths
-//!   `rust/crates/automonique-compat-api/`, which does not exist. These values
-//!   sit in `automonique-protocol` beside [`crate::admin`], whose custody
-//!   vocabulary they read against.
+//! - The compatibility API is modeled in `automonique-protocol` beside
+//!   [`crate::admin`], whose custody vocabulary it reads against.
 //!
 //! # The seam this leaves open
 //!
@@ -710,8 +708,7 @@ impl RunCursor {
     ///
     /// Delegates to [`JournalCursor::resume_within`]. The resumable set is
     /// `first ..= caught_up`, which is one larger than the retained window, and
-    /// re-deriving that off-by-one here — recorded as amendment A2 of
-    /// `plan/contracts/R1-12.md` — is exactly the drift the house forbids. A
+    /// re-deriving that off-by-one here would create wire drift. A
     /// cursor outside the set answers [`CursorResume::ResyncRequired`], never a
     /// position that would skip rows.
     ///

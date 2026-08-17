@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! R1-17 verification contract, and the version-compatibility matrix.
+//! Version-compatibility checks.
 //!
-//! Each module up to `identifier_classes` corresponds to one row of the check
-//! table in `plan/contracts/R1-17.md`. The modules after it cover the
-//! compatibility ranges: the range invariants, the verdict bands, the
+//! Each module up to `identifier_classes` covers one compatibility concern.
+//! The modules after it cover the compatibility ranges, verdict bands,
 //! cross-checks against the constants this crate can see, and the manifest a
 //! crate this one cannot depend on would pin.
 
@@ -21,7 +20,8 @@ fn generated_path() -> PathBuf {
 }
 
 fn contract() -> MigrationContract {
-    MigrationContract::new("plan/contracts/R1-17.md").expect("valid contract")
+    MigrationContract::new("docs/product-plan/requirements/state-and-protocols.md")
+        .expect("valid contract")
 }
 
 fn alias(spelling: &str) -> LegacyAlias {
@@ -443,7 +443,10 @@ mod authorized_aliases {
     fn every_alias_declares_a_contract_and_a_window() {
         let declared = entry();
         let alias = &declared.aliases()[0];
-        assert_eq!(alias.authorized_by().as_str(), "plan/contracts/R1-17.md");
+        assert_eq!(
+            alias.authorized_by().as_str(),
+            "docs/product-plan/requirements/state-and-protocols.md"
+        );
         assert_eq!(alias.retire_after(), "0.9.0");
     }
 

@@ -100,9 +100,9 @@ class Relation(enum.Enum):
 class Magnitude(enum.Enum):
     """A coarse class, deliberately not a measurement.
 
-    `plan/contracts/BOOT-004.md` names "a timing or size measurement precise
-    enough to reconstruct behavior" as a failure mode, so no number crosses the
-    boundary at all: the wire has no integer slot and a JSON number anywhere in
+    A timing or size measurement precise enough to reconstruct behavior is a
+    failure mode, so no number crosses the
+    boundary: the wire has no integer slot and a JSON number anywhere in
     a record is refused.
     """
 

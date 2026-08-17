@@ -16,7 +16,6 @@ When documents disagree, use this order:
 | 4 | historical context | `reference/` |
 
 No product requirement can grant authority withheld by the active policy.
-`plan/` is historical and has no place in this precedence order.
 
 `reference/` material describes the prior product and migration. It is context,
 never a source of new product requirements, and cannot override any higher
@@ -54,8 +53,7 @@ What deliberately remains, and why:
 - `legacy*` compatibility identifiers — dormant by design, not leaks.
 
 Historical GPL reference documents are marked superseded.
-`reference/corpus-index.md` is the former planning-tree index and carries the
-canonical-surface and licence notes.
+The remaining `reference/` documents are sanitized technical context.
 
 Any new private identifier entering this tree is a defect. The public scanner
 helps detect regressions but cannot stand in for private-data review.
@@ -95,11 +93,11 @@ reconcilable.
 - treating a green self-test as independent verification;
 - adding product breadth before the durable autonomy and recovery spine works.
 
-## Working with the plan
+## Working with product documents
 
-Start with the requested outcome, then read the relevant requirement and the
-code that implements it. The roadmap and reference material can supply context;
-the historical graph, contracts, and gates under `plan/` are not prerequisites.
+Start with the requested outcome, then read only the requirements relevant to
+the code being changed. Roadmaps and reference material are optional context,
+not a development checklist.
 
 ## Safety property specifications
 

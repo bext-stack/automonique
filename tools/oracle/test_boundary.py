@@ -3,8 +3,8 @@
 
 """Adversarial suite for the parity-oracle boundary.
 
-The objective in `plan/contracts/BOOT-004.md` is a negative property, so this
-file is written as an attacker, not as a demonstration. Every test states the
+The boundary is a negative property, so this file is written as an attacker,
+not as a demonstration. Every test states the
 attack it runs. Attacks that succeed are kept and named, because a residual
 channel that is measured is worth more than one that is assumed away —
 `TimingChannelTests` and `FilesystemChannelTests` both record successful

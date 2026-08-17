@@ -6,16 +6,9 @@ judgement call: **parity** (the two engines agreed), **known deviation** (they
 differed, and the difference is registered below with a reason and an owner), or
 **regression** (they differed and nothing here explains it).
 
-An unregistered difference is always a regression. That direction is deliberate:
-a harness that could resolve an unexplained difference in the candidate's favour
-would be scoring its own opinion, and the whole point of the gate is that it
-scores evidence.
-
-This document is the human record. `tools/parity/deviations.py` derives
-`plan/ledgers/deviations.json` from it and refuses on drift, and the Rust
-comparator loads that ledger, digests it, and pins the digest into every gate
-decision it records — so a later edit here cannot retroactively rewrite what was
-known when a scope was promoted.
+An unregistered difference is reported as a regression by default. Callers may
+provide an explicit deviation registry when a comparison needs one; no checked-in
+registry or regeneration step is required.
 
 ## How to read a row
 
@@ -32,10 +25,7 @@ name and the date next to that decision.
 
 ## Closed vocabularies
 
-Nothing outside these sets may appear in a row. They are the same spellings
-`automonique_protocol::parity` defines, and `tools/parity/deviations.py` refuses
-a row that steps outside them rather than passing an unknown value through to a
-comparator that would then not match it.
+The comparison API accepts the spellings below.
 
 | Column | Admitted values |
 |---|---|
@@ -54,32 +44,5 @@ them before comparing. A difference on one of those fields is therefore not
 something a row here can be needed for — and a row that registers one is
 reported as a finding rather than silently kept.
 
-## Registered deviations
-
-| Id | Scope | Action kind | Field | Relation | Reason | Owner | Date | Rationale |
-|---|---|---|---|---|---|---|---|---|
-
-**This table is empty, and that is a measurement rather than an omission.** No
-difference between the two engines has been investigated and accepted yet,
-because no production-representative comparison has been run — the harness
-landed in this milestone and the traffic capture it needs is the next one. An
-empty registry means every mismatch the corpus finds today classifies as a
-regression, which is the correct posture for a scope nobody has examined.
-
-## Adding a row
-
-1. Investigate the mismatch. The comparison names the scope, the action kind,
-   the field and the relation; it never carries the values, so the investigation
-   happens against the shadow database on the host that recorded it.
-2. Mint the fixture first. `python3 tools/parity/traces.py export` writes an
-   anonymized golden trace, and the replay corpus picks it up on the next run.
-   A registered deviation with no fixture is a claim nothing re-checks.
-3. Add one row here, with an owner who is a person and a date that is the day
-   the decision was taken.
-4. Regenerate: `python3 tools/parity/deviations.py --write`, and commit
-   `plan/ledgers/deviations.json` in the same change. CI refuses the two files
-   out of step.
-
-Removing a row is the same ritual in reverse, and it is not retroactive: gate
-decisions already recorded pinned the registry digest they were taken against,
-so they keep meaning what they meant.
+No deviations are registered in the repository. A local diagnostic run may
+supply a registry file directly to the parity CLI.

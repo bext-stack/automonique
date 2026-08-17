@@ -3,7 +3,7 @@
 //! R1-08 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-08.md`.
+//! `docs/product-plan/requirements/agent-integrations.md`.
 
 use automonique_protocol::provider::{
     BinaryProvenance, Capability, CapabilityGroup, CapabilityState, MAX_CAPABILITIES,

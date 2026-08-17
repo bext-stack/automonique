@@ -30,11 +30,8 @@ SKIP_PARTS = {
     "__pycache__", "node_modules", "target", "third_party",
 }
 SPDX = re.compile(r"SPDX-License-Identifier:\s*([^\s*<>]+)")
-# `sdk/` is the only Apache-2.0 root, decided 2026-08-15 — see
-# plan/owner-decisions/2026-08-15-connector-licence-boundary.md. This also
-# declared `integrations/` and `connectors/`, neither of which ever existed on
-# disk, so those two gated nothing; the connectors shipped as Elastic-2.0
-# daemon-internal crates under rust/crates/ and stay there.
+# `sdk/` is the only Apache-2.0 root. Provider connectors are Elastic-2.0
+# daemon-internal crates under `rust/crates/`.
 APACHE_ROOTS = {"sdk"}
 
 

@@ -147,22 +147,6 @@ fn the_corpus_carries_more_than_one_category() {
 }
 
 #[test]
-fn every_fixture_cites_a_parity_row_from_the_derived_ledger() {
-    let ledger = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../plan/ledgers/parity.json"),
-    )
-    .expect("the derived parity ledger is readable");
-    for path in fixtures() {
-        let row = load(&path).header().parity_row.clone();
-        assert!(
-            ledger.contains(&format!("\"key\": \"{row}\"")),
-            "{} cites {row}, which is not a row in plan/ledgers/parity.json",
-            name(&path)
-        );
-    }
-}
-
-#[test]
 fn the_corpus_scores_against_the_weighted_bands() {
     let registry = DeviationRegistry::empty();
     let mut corpus = Vec::new();

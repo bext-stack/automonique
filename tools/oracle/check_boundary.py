@@ -18,10 +18,8 @@ Run it standalone:
     python3 tools/oracle/check_boundary.py            # verify, write nothing
     python3 tools/oracle/check_boundary.py --write    # regenerate the document
 
-Exit code is non-zero on drift, so it can be wired into `plan/check.py`. That
-wiring is the integrator's follow-up: several items share that file this run
-and this module is deliberately importable and self-contained so it can be
-called from there without moving any logic.
+Exit code is non-zero on drift. This is an optional diagnostic and document
+generator; it is not part of the repository development workflow.
 """
 
 from __future__ import annotations

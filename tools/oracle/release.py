@@ -20,8 +20,7 @@ set and carries no detail about what was rejected — not the offending bytes, n
 their length, not an exception message.
 
 `parse` never raises on hostile input and never logs. There is no verbosity
-switch and no debug mode: a bypass that exists only for local development is a
-bypass, and `plan/contracts/BOOT-004.md` forbids it by name.
+switch or debug bypass.
 """
 
 from __future__ import annotations

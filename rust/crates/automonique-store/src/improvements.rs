@@ -2,13 +2,13 @@
 
 //! Durable state for owner-directed Automonique self-improvements.
 //!
-//! An improvement is deliberately a two-gate workflow. A plan can be revised
-//! until an owner approves its exact digest; implementation then produces an
-//! exact release manifest which requires a second approval before activation.
+//! New improvements move directly from an internal work brief to implementation.
+//! The release manifest is the only artifact that requires owner approval before
+//! merge and activation. The older plan-review states remain readable and
+//! resumable so upgrades do not strand work created by the two-gate workflow.
 //! Approval challenges are single-use, expire, and are bound to the requesting
 //! actor, Telegram chat, durable revision, and artifact digest. This store does
-//! not authenticate an actor or talk to GitHub/Telegram: it persists the facts
-//! an authenticated coordinator has already established.
+//! not authenticate an actor or talk to GitHub/Telegram.
 
 use std::error::Error;
 use std::fmt;
@@ -118,15 +118,13 @@ CREATE INDEX improvement_challenges_by_improvement
     ON improvement_approval_challenges(improvement_id, approval_kind, bound_revision);
 "#;
 
-/// The remote-CI evidence a release must carry before it may activate: the
-/// exact commit CI ran on, and one entry per required check naming its run.
+/// Optional remote-check details retained for records created by older builds
+/// and for operators that choose to collect them as diagnostics.
 ///
 /// The column is nullable because a V1 database may already hold rows in
 /// `activating` or `completed` that predate the gate, and a migration that
 /// refused to open such a database would lose the journal it is meant to
-/// preserve. Presence is enforced on the write path instead: `transition`
-/// requires it to reach `activating`, so no new record can get there without
-/// it.
+/// preserve. New writes do not require this field.
 const MIGRATE_V1_TO_V2: &str = r#"
 ALTER TABLE improvements ADD COLUMN ci_evidence TEXT;
 "#;
@@ -349,6 +347,16 @@ pub struct ReleaseSubmission<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImplementationStart<'a> {
+    pub improvement_id: i64,
+    pub expected_revision: u64,
+    pub actor: &'a str,
+    pub plan_digest: &'a str,
+    pub source_base_sha: &'a str,
+    pub now_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StateTransition<'a> {
     pub improvement_id: i64,
     pub expected_revision: u64,
@@ -356,9 +364,8 @@ pub struct StateTransition<'a> {
     pub to: ImprovementState,
     pub failure_reason: Option<&'a str>,
     pub active_release_digest: Option<&'a str>,
-    /// Required to reach `activating` and refused anywhere else. This is what
-    /// makes "a release activates only on green remote CI" a property of the
-    /// store rather than a convention the caller is trusted to keep.
+    /// Optional remote-check diagnostics. Refused outside `activating` so the
+    /// field retains one unambiguous meaning for old and new records.
     pub ci_evidence: Option<&'a str>,
     pub now_ms: i64,
 }
@@ -777,6 +784,69 @@ impl ImprovementStore {
             "release_submitted",
             input.actor,
             Some(input.release_manifest_digest),
+            input.now_ms,
+        )?;
+        finish_mutation(transaction, input.improvement_id)
+    }
+
+    /// Bind an internal work brief and begin implementation without publishing
+    /// or approving a separate plan artifact.
+    pub fn begin_implementation(
+        &mut self,
+        input: ImplementationStart<'_>,
+    ) -> Stored<ImprovementRecord> {
+        validate_row_id(input.improvement_id, "improvement_id")?;
+        validate_identifier(input.actor, "actor")?;
+        validate_identifier(input.plan_digest, "plan_digest")?;
+        validate_identifier(input.source_base_sha, "source_base_sha")?;
+        validate_time(input.now_ms, "now_ms")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = require_current(&transaction, input.improvement_id, input.expected_revision)?;
+        if current.state != ImprovementState::Draft {
+            return Err(ImprovementStoreError::IllegalTransition {
+                from: current.state,
+                to: ImprovementState::Implementing,
+            });
+        }
+        let prepared =
+            read_prepared_plan(&transaction, input.improvement_id, input.expected_revision)?
+                .ok_or(ImprovementStoreError::NotFound("prepared plan"))?;
+        if prepared.plan_digest != input.plan_digest
+            || prepared.source_base_sha != input.source_base_sha
+        {
+            return Err(ImprovementStoreError::IdempotencyConflict);
+        }
+        let next = next_revision(current.revision)?;
+        transaction.execute(
+            "UPDATE improvements SET state = 'implementing', revision = ?1,
+                plan_digest = ?2, source_base_sha = ?3,
+                plan_head_sha = NULL, issue_number = NULL, issue_url = NULL,
+                plan_pr_number = NULL, plan_pr_url = NULL,
+                implementation_head_sha = NULL, implementation_tree_sha = NULL,
+                release_manifest_digest = NULL, implementation_pr_number = NULL,
+                implementation_pr_url = NULL, active_release_digest = NULL,
+                failure_reason = NULL, ci_evidence = NULL,
+                last_actor = ?4, updated_at_ms = ?5
+             WHERE entry_id = ?6 AND revision = ?7",
+            params![
+                to_db_u64(next, "revision")?,
+                input.plan_digest,
+                input.source_base_sha,
+                input.actor,
+                input.now_ms,
+                input.improvement_id,
+                to_db_u64(input.expected_revision, "expected_revision")?
+            ],
+        )?;
+        insert_event(
+            &transaction,
+            input.improvement_id,
+            next,
+            "implementation_started",
+            input.actor,
+            Some(input.plan_digest),
             input.now_ms,
         )?;
         finish_mutation(transaction, input.improvement_id)
@@ -1527,16 +1597,10 @@ fn validate_transition(input: &StateTransition<'_>) -> Stored<()> {
     if input.to != ImprovementState::Completed && input.active_release_digest.is_some() {
         return Err(ImprovementStoreError::InvalidField("active_release_digest"));
     }
-    // `activating` is the state in which the release link is switched, so this
-    // is the last point at which "CI was green for exactly this commit" can be
-    // required rather than assumed. Any other target carrying evidence is a
-    // caller confusion, not a harmless extra.
     if input.to == ImprovementState::Activating {
-        validate_ci_evidence(
-            input
-                .ci_evidence
-                .ok_or(ImprovementStoreError::InvalidField("ci_evidence"))?,
-        )?;
+        if let Some(details) = input.ci_evidence {
+            validate_ci_evidence(details)?;
+        }
     } else if input.ci_evidence.is_some() {
         return Err(ImprovementStoreError::InvalidField("ci_evidence"));
     }

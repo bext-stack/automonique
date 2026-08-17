@@ -3,7 +3,7 @@
 //! R1-05 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-05.md`.
+//! `docs/product-plan/requirements/verification-and-rollout.md`.
 
 use automonique_protocol::codec::{CodecError, MajorVersion, VersionRange};
 use automonique_protocol::primitives::ValueError;

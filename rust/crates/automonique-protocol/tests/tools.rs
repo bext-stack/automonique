@@ -3,7 +3,7 @@
 //! R1-21 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-21.md`. The rows that require a value to be
+//! `docs/product-plan/requirements/tools-extensions-and-hooks.md`. The rows that require a value to be
 //! *unrepresentable* are carried by paired `compile_fail`/`no_run` doc tests
 //! on the types themselves, because an integration test can only exercise
 //! programs that compile; those pairs run under `cargo test --doc`.

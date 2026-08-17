@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+name: licence
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  licence-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Check SPDX boundary
+        run: python3 tools/check_licenses.py

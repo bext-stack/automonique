@@ -5,9 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use automonique_store::improvements::{
-    ApprovalAttempt, ApprovalKind, IMPROVEMENT_STORE_SCHEMA_VERSION, ImprovementState,
-    ImprovementStore, ImprovementStoreError, MAX_CI_EVIDENCE_BYTES, NewApprovalChallenge,
-    NewImprovement, PlanSubmission, ReleaseSubmission, StateTransition,
+    ApprovalAttempt, ApprovalKind, IMPROVEMENT_STORE_SCHEMA_VERSION, ImplementationStart,
+    ImprovementState, ImprovementStore, ImprovementStoreError, MAX_CI_EVIDENCE_BYTES,
+    NewApprovalChallenge, NewImprovement, PlanSubmission, ReleaseSubmission, StateTransition,
 };
 use tempfile::TempDir;
 
@@ -235,6 +235,43 @@ fn request_delivery_is_idempotent_but_payload_reuse_is_not() {
         })
         .expect_err("conflicting retry");
     assert!(matches!(error, ImprovementStoreError::IdempotencyConflict));
+}
+
+#[test]
+fn a_prepared_brief_starts_implementation_without_plan_review() {
+    let (_private, mut store) = store();
+    let id = create(&mut store);
+    store
+        .prepare_plan(
+            id,
+            1,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "sha256:direct-brief",
+            "# Internal work brief\n",
+            1_500,
+        )
+        .expect("prepare brief");
+    let implementing = store
+        .begin_implementation(ImplementationStart {
+            improvement_id: id,
+            expected_revision: 1,
+            actor: "automonique:lab",
+            plan_digest: "sha256:direct-brief",
+            source_base_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            now_ms: 2_000,
+        })
+        .expect("begin implementation");
+    assert_eq!(implementing.state, ImprovementState::Implementing);
+    assert_eq!(implementing.revision, 2);
+    assert_eq!(
+        implementing.plan_digest.as_deref(),
+        Some("sha256:direct-brief")
+    );
+    assert_eq!(implementing.plan_pr_number, None);
+    assert_eq!(
+        store.events(id).expect("events")[1].kind,
+        "implementation_started"
+    );
 }
 
 #[test]
@@ -530,24 +567,14 @@ fn begin_activation(
 }
 
 #[test]
-fn activation_is_unreachable_without_recorded_ci_evidence() {
+fn activation_does_not_require_remote_ci_evidence() {
     let (_private, mut store) = store();
     let id = release_approved(&mut store);
-    assert!(matches!(
-        begin_activation(&mut store, id, None).expect_err("evidence is required"),
-        ImprovementStoreError::InvalidField("ci_evidence")
-    ));
-    // The refusal must not have moved the record: a release that could not
-    // prove its CI is still approved, not half-activated.
-    let current = store.get(id).expect("read").expect("record");
-    assert_eq!(current.state, ImprovementState::ReleaseApproved);
-    assert_eq!(current.revision, 6);
-    assert_eq!(current.ci_evidence, None);
-
-    begin_activation(&mut store, id, Some(CI_EVIDENCE)).expect("green evidence activates");
+    begin_activation(&mut store, id, None).expect("owner-approved release activates");
     let current = store.get(id).expect("read").expect("record");
     assert_eq!(current.state, ImprovementState::Activating);
-    assert_eq!(current.ci_evidence.as_deref(), Some(CI_EVIDENCE));
+    assert_eq!(current.revision, 7);
+    assert_eq!(current.ci_evidence, None);
 }
 
 #[test]

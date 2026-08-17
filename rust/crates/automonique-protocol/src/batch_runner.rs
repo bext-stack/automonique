@@ -3,7 +3,7 @@
 //! The batch runner's typed model: a bounded set of run submissions tracked as
 //! one unit.
 //!
-//! `docs/product-plan/reference/work-breakdown.md` R15-01 names the item —
+//! `docs/product-plan/requirements/models-media-and-execution.md` names the item —
 //! "**Batch runner:** bounded parallel datasets, per-record profile/tools/
 //! workspace/media, checkpoint/resume and structured output" — and
 //! `docs/product-plan/requirements/models-media-and-execution.md` § Batch,
@@ -81,10 +81,8 @@
 //! - **A dataset ceiling, not a dataset.** [`MAX_BATCH_MEMBERS`] bounds one
 //!   *document*. A dataset larger than it is not representable as one batch,
 //!   which is a real limit of this shape rather than a configuration.
-//! - **Lease.** `plan/work-graph.toml` gives R15-01 the paths
-//!   `rust/crates/automonique-artifacts/` and `tools/eval/`, neither of which
-//!   exists. These values sit in `automonique-protocol` beside
-//!   [`crate::runs_api`], whose run vocabulary they reuse.
+//! - These values sit in `automonique-protocol` beside [`crate::runs_api`],
+//!   whose run vocabulary they reuse.
 //!
 //! # The seam this leaves open
 //!

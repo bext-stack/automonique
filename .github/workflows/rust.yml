@@ -120,6 +120,7 @@ jobs:
   # decision to make once the number is known, and an instrumented rebuild of
   # the whole workspace does not belong on the pull-request critical path.
   coverage:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

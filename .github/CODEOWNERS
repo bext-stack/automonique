@@ -18,11 +18,9 @@
 /PROVENANCE.md                      @benfavre
 /SECURITY.md                        @benfavre
 /.github/                           @benfavre
-/.github/identity/                  @benfavre
 
-# The product requirements corpus and the improvement program.
+# The product requirements corpus.
 /docs/product-plan/                 @benfavre
-/docs/improvement-plan/             @benfavre
 
 # Protected security boundaries.
 /tools/oracle/                      @benfavre

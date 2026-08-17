@@ -177,7 +177,7 @@ pub struct TraceWorkspace {
 pub struct TraceHeader {
     /// Parity scope this trace belongs to.
     pub scope: String,
-    /// The `plan/ledgers/parity.json` entry key this trace is evidence for.
+    /// The stable product capability key this trace exercises.
     pub parity_row: String,
     /// How representative this trace is, for the weighted score.
     ///

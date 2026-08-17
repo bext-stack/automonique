@@ -5,8 +5,8 @@
 //! One typed composition model serves every client surface. R12-01 names it
 //! "multiline/history, command/reference completion, queue editing,
 //! retry/undo/stop/compress and context meter across clients"
-//! (`docs/product-plan/reference/work-breakdown.md`); the capability ledger
-//! records the same row as "Shared command registry, composer history and
+//! (`docs/product-plan/requirements/operator-tui.md`); the capability document
+//! describes the same surface as "Shared command registry, composer history and
 //! generated completion" (`docs/product-plan/requirements/external-capability-ledger.md`).
 //!
 //! # What this module is, and is not
@@ -1068,8 +1068,8 @@ impl BodyFit {
 /// A draft has **no durable identity**. It is a local composition, and durable
 /// identity appears only when it becomes something else — a queued item's
 /// [`crate::interaction::QueueItemId`] or a submission's
-/// [`crate::interaction::RequestRef`]. `plan/contracts/R1-25.md` puts the
-/// durable identity on the queued item, and this type does not compete with it.
+/// [`crate::interaction::RequestRef`]. Durable identity belongs to the queued
+/// item, and this type does not compete with it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Draft {
     surface: SurfaceKind,

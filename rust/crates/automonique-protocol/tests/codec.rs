@@ -3,7 +3,7 @@
 //! R1-03 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-03.md`.
+//! `docs/product-plan/requirements/state-and-protocols.md`.
 
 use automonique_protocol::codec::{
     CodecError, DepthGuard, Envelope, FrameDecode, LENGTH_PREFIX_BYTES, MAX_ENUM_VALUE_BYTES,

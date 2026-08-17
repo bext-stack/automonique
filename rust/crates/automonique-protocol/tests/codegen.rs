@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! R1-11 verification contract: the TypeScript codegen spike.
+//! TypeScript code generation checks.
 //!
-//! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-11.md`. The spike's verdict is recorded in
-//! `sdk/typescript/packages/protocol/generated/VERDICT.md`.
+//! The generated SDK output and its compatibility behavior are checked here.
 //!
 //! Running this test regenerates `generated/spike.ts`. CI's zero-diff rule is
 //! the reproducibility check: if regeneration changes the checked-in file, the
-//! working tree is dirty and the plan workflow fails.
+//! working tree is dirty.
 
 use std::path::PathBuf;
 use std::process::Command;

@@ -22,7 +22,7 @@ body:
       label: Commit / version
       description: The `main` commit or release the daemon was running.
   - type: textarea
-    id: evidence
+    id: diagnostics
     attributes:
       label: Logs / status
       description: Relevant `automonique status`, `doctor`, or journal output. Redact any private identifier before pasting into this public repo.

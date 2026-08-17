@@ -15,9 +15,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use automonique_store::improvements::{
-    ApprovalAttempt, ApprovalKind, ImprovementRecord, ImprovementState, ImprovementStore,
-    ImprovementStoreError, NewApprovalChallenge, NewImprovement, PlanSubmission, PreparedPlan,
-    ReleaseSubmission, StateTransition,
+    ApprovalAttempt, ApprovalKind, ImplementationStart, ImprovementRecord, ImprovementState,
+    ImprovementStore, ImprovementStoreError, NewApprovalChallenge, NewImprovement, PlanSubmission,
+    PreparedPlan, ReleaseSubmission, StateTransition,
 };
 use automonique_transport_runtime::{ApprovalKeyboard, SendMessageRequest};
 use sha2::{Digest, Sha256};
@@ -149,14 +149,14 @@ impl ImprovementPlan {
     ) -> Result<RenderedPlan, ImprovementError> {
         validate_text(&self.title, "title", 256)?;
         validate_text(&self.intent, "intent", 8_192)?;
+        validate_items(&self.scope, "scope")?;
+        validate_items(&self.acceptance, "acceptance")?;
         for (items, field) in [
-            (&self.scope, "scope"),
             (&self.exclusions, "exclusions"),
-            (&self.acceptance, "acceptance"),
             (&self.risks, "risks"),
             (&self.activation, "activation"),
         ] {
-            validate_items(items, field)?;
+            validate_optional_items(items, field)?;
         }
         let public_id = improvement.public_id();
         let mut markdown = format!(
@@ -169,7 +169,7 @@ impl ImprovementPlan {
         append_section(&mut markdown, "Risks and rollback", &self.risks);
         append_section(&mut markdown, "Activation", &self.activation);
         markdown.push_str(
-            "\n## Approval contract\n\nApproving this plan authorizes implementation of this exact plan digest only. It does not authorize release or activation; those require a second approval bound to the tested implementation SHA and release manifest.\n",
+            "\nThis is an internal work brief, not an approval artifact. The owner reviews the resulting release before merge and activation.\n",
         );
         if markdown.len() > MAX_PLAN_DOCUMENT_BYTES {
             return Err(ImprovementError::InvalidField("plan_document"));
@@ -184,6 +184,9 @@ impl ImprovementPlan {
 }
 
 fn append_section(output: &mut String, heading: &str, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
     output.push_str("\n## ");
     output.push_str(heading);
     output.push_str("\n\n");
@@ -494,6 +497,25 @@ impl ImprovementCoordinator {
         )
     }
 
+    pub fn start_planned_implementation(
+        &mut self,
+        improvement_id: i64,
+        expected_revision: u64,
+        plan: &PreparedRenderedPlan,
+        now_ms: i64,
+    ) -> Result<ImprovementRecord, ImprovementError> {
+        self.store
+            .begin_implementation(ImplementationStart {
+                improvement_id,
+                expected_revision,
+                actor: "automonique:lab",
+                plan_digest: &plan.plan.sha256,
+                source_base_sha: &plan.source_base_sha,
+                now_ms,
+            })
+            .map_err(ImprovementError::Store)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn record_release_candidate(
         &mut self,
@@ -521,15 +543,12 @@ impl ImprovementCoordinator {
             .map_err(ImprovementError::Store)
     }
 
-    /// Enter activation, carrying the remote-CI evidence for exactly the
-    /// commit that was merged. The parameter is required rather than optional
-    /// so that no caller — including one written later — can reach `activating`
-    /// without having read a green verdict first.
+    /// Enter activation after the owner approved and the exact candidate was
+    /// merged. Remote check details are diagnostics, not an activation key.
     pub fn start_activation(
         &mut self,
         improvement_id: i64,
         expected_revision: u64,
-        ci_evidence: &str,
         now_ms: i64,
     ) -> Result<ImprovementRecord, ImprovementError> {
         self.transition_with_evidence(
@@ -539,7 +558,7 @@ impl ImprovementCoordinator {
             "automonique:activator",
             None,
             None,
-            Some(ci_evidence),
+            None,
             now_ms,
         )
     }
@@ -781,7 +800,14 @@ fn chat(id: i64) -> String {
 }
 
 fn validate_items(items: &[String], field: &'static str) -> Result<(), ImprovementError> {
-    if items.is_empty() || items.len() > MAX_PLAN_ITEMS {
+    if items.is_empty() {
+        return Err(ImprovementError::InvalidField(field));
+    }
+    validate_optional_items(items, field)
+}
+
+fn validate_optional_items(items: &[String], field: &'static str) -> Result<(), ImprovementError> {
+    if items.len() > MAX_PLAN_ITEMS {
         return Err(ImprovementError::InvalidField(field));
     }
     for item in items {
@@ -941,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_plan_states_that_release_needs_a_second_gate() {
+    fn canonical_brief_states_that_release_is_the_only_gate() {
         let (_directory, mut coordinator) = coordinator();
         let intent = ImprovementIntent {
             request: "Improve Automonique".to_owned(),
@@ -961,7 +987,11 @@ mod tests {
         .render(&draft)
         .expect("render");
         assert_eq!(plan.repository_path, "plans/IMP-000001.md");
-        assert!(plan.markdown.contains("require a second approval"));
+        assert!(plan.markdown.contains("internal work brief"));
+        assert!(
+            plan.markdown
+                .contains("owner reviews the resulting release")
+        );
         assert!(plan.sha256.starts_with("sha256:"));
     }
 }

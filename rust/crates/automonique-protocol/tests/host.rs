@@ -3,7 +3,7 @@
 //! R1-15 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-15.md`.
+//! `docs/product-plan/requirements/models-media-and-execution.md`.
 
 use automonique_protocol::host::{
     AttemptId, AttemptLog, ClaimRegistry, ExecutionHost, HostBoundary, HostError, HostId,

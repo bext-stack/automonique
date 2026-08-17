@@ -8,8 +8,7 @@
 //! Codex and opencode plus direct/custom model providers", where "provider
 //! plugins declare models, modalities, context/output limits, reasoning
 //! controls, tool/structured-output support, regions/data policy, pricing and
-//! auth methods". `docs/product-plan/reference/work-breakdown.md` R14-01 adds
-//! "and conformance".
+//! auth methods" and conformance information.
 //!
 //! Two of those layers already exist and are reused rather than restated:
 //!
@@ -100,10 +99,8 @@
 //!   is carried — [`ProviderCatalogEntry::model`] returns the whole
 //!   [`ModelCatalogEntry`] — it is only the text rendering that stops at fields
 //!   whose spelling already has an owner.
-//! - **Lease.** `plan/work-graph.toml` gives R14-01 the paths
-//!   `rust/crates/automonique-models/`, which does not exist. This vocabulary
-//!   sits beside `models.rs` in `automonique-protocol`, where R1-24 put the
-//!   model and provider catalog values it extends.
+//! - This vocabulary sits beside `models.rs` in `automonique-protocol`, where
+//!   the model and provider catalog values it extends live.
 //!
 //! # Cross-crate spellings this crate cannot import
 //!

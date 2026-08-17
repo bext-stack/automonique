@@ -7,13 +7,8 @@ properties `launch-roadmap.md` calls "decisions that cannot be inferred", and
 `reference/feature-parity.md:90` calls it "the largest single gap" — the
 scheduler core is entirely unpinned by fixtures.
 
-**This document is also the M8 #45 scheduler specification.** It is written once
-and cited twice, deliberately.
-`docs/improvement-plan/implementation/M8-scheduler-reload-isolation.md` #45
-builds bounded parallelism, per-scope serialization and pause/cancel; those are
-the same three properties this document specifies, and the conformance suite
-below is the gate that issue closes against. Two documents would have become two
-answers.
+The scheduler conformance suite covers bounded parallelism, per-scope
+serialization, and pause/cancel behavior.
 
 ## The property
 

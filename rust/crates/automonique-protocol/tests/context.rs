@@ -3,7 +3,7 @@
 //! R1-20 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-20.md`.
+//! `docs/product-plan/requirements/context-memory-and-learning.md`.
 
 use automonique_protocol::context::{
     AuthorizationState, CandidateMemory, ComponentCaps, ComponentClass, CompressionParts,

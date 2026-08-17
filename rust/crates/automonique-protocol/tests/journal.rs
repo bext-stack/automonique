@@ -3,7 +3,7 @@
 //! R1-12 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-12.md`.
+//! `docs/product-plan/requirements/state-and-protocols.md`.
 
 use automonique_protocol::codec::{MajorVersion, VersionRange};
 use automonique_protocol::journal::{
@@ -807,7 +807,7 @@ mod cursor_monotonicity {
     /// the boundary before the next event it will receive, so the resumable set
     /// is one larger than the retained set — and resyncing this consumer would
     /// hand it a snapshot of history it already has, then leave it at the same
-    /// position, forever. Recorded as amendment A2 in `plan/contracts/R1-12.md`
+    /// position, forever. This convention is retained for wire compatibility.
     /// rather than treated as settled by this test.
     #[test]
     fn the_caught_up_position_is_live_and_is_the_only_such_position() {

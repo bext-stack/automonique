@@ -3,7 +3,7 @@
 //! R1-25 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-25.md`.
+//! `docs/product-plan/requirements/client-experience-and-surfaces.md`.
 
 use automonique_protocol::interaction::{
     AttemptLineage, AttemptRef, CancelRequest, CancelScope, CheckpointLog, CheckpointRef,

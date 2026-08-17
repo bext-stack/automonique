@@ -42,11 +42,8 @@ pub const MAX_COMPAT_FIELD_BYTES: usize = 256;
 /// Re-sending delivered email and re-importing an entire chat history are the
 /// two failures that would follow.
 ///
-/// They live here for the same reason the registry does: this module is one of
-/// the sanctioned homes for a legacy spelling
-/// (`plan/gates.md#gate-scrub`, enforced by
-/// `plan/check.py::check_legacy_identifier_location`), so a surface that must
-/// keep the bytes can name a constant instead of repeating the spelling. The
+/// They live here so a surface that must keep legacy bytes can name a constant
+/// instead of repeating the spelling. The
 /// wire contract is unchanged; only where it is written down moved.
 pub mod legacy_spelling {
     /// Prefix of the idempotency key carried by one outbound support email.

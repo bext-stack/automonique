@@ -3,7 +3,7 @@
 //! R1-14 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-14.md`.
+//! `docs/product-plan/requirements/sandbox-management.md`.
 
 use automonique_protocol::primitives::Revision;
 use automonique_protocol::release::ArtifactDigest;

@@ -3,7 +3,7 @@
 //! R1-24 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-24.md`. No test contacts a model, vendor or media
+//! `docs/product-plan/requirements/models-media-and-execution.md`. No test contacts a model, vendor or media
 //! backend; every instant and observation below is supplied by the test.
 
 use automonique_protocol::models::{

@@ -37,15 +37,12 @@
 //! evidence that a decision was taken, with enough pinned to it that a later
 //! registry edit cannot rewrite what was known at the time.
 //!
-//! # The registry is read here, not in the protocol crate
+//! # Optional registries
 //!
-//! `plan/ledgers/deviations.json` is a human-reviewable derived ledger, so it is
-//! pretty-printed and therefore not canonical JSON. The protocol crate's decoder
-//! refuses non-canonical input by design, so this module parses the ledger with
-//! `serde_json`, builds typed entries, and hands them to
-//! [`DeviationRegistry::new`], which re-canonicalizes them and computes the
-//! digest a decision pins. The ledger stays readable and the digest stays
-//! canonical.
+//! A caller may supply a human-readable deviation registry. This module parses
+//! it with `serde_json`, builds typed entries, and hands them to
+//! [`DeviationRegistry::new`], which re-canonicalizes the entries for stable
+//! comparison metrics.
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;

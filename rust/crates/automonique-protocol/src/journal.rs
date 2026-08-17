@@ -1297,7 +1297,7 @@ impl JournalCursor {
     /// and is nonetheless live. That is forced: a cursor names the boundary
     /// before the next event it will receive, so the resumable set is always
     /// one larger than the retained set, whichever end the convention is
-    /// anchored to. `plan/contracts/R1-12.md` records it as amendment A2.
+    /// anchored to. This convention is retained for wire compatibility.
     ///
     /// Not consistent with `event::resolve_subscription`, which classifies only
     /// the below-window case and returns live for everything above. That module

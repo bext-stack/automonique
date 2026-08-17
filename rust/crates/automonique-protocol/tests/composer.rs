@@ -1,24 +1,15 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! R12-01 verification contract.
+//! Shared composer semantics checks.
 //!
-//! R12-01 "Shared composer semantics" has no per-item contract file: there is
-//! no `plan/contracts/R12-01.md`, and `plan/work-graph.toml` lists the item as
-//! `status = "blocked"` behind `R11-10`. The check rows below are therefore
-//! derived from the product documents that do describe the composer —
-//! `docs/product-plan/reference/work-breakdown.md` (R12-01),
+//! The checks below are derived from the product documents that describe the
+//! composer —
 //! `docs/product-plan/requirements/operator-tui.md` (the session input bar,
 //! free-form intake, and `queue/edit/withdraw`),
 //! `docs/product-plan/requirements/external-capability-ledger.md` (multiline
 //! editor, history and slash autocomplete; typed authorized context
-//! references) and `plan/contracts/R1-25.md` (durable queued input) — rather
-//! than from a check table this item does not have.
-//!
-//! `plan/work-graph.toml` also scopes R12-01's `allowed_paths` to `apps/`,
-//! `sdk/typescript/packages/ui/` and `rust/crates/automonique-tui/`. The shared
-//! *semantics* are values, and every vocabulary they compose already lives in
-//! `automonique-protocol`, so they land here; the client surfaces those paths
-//! name are what would consume this module.
+//! references), and `docs/product-plan/requirements/
+//! client-experience-and-surfaces.md` (durable queued input).
 
 use automonique_protocol::admin::MAX_ADMIN_CANONICAL_BYTES;
 use automonique_protocol::command_registry::{CommandId, CommandRegistry, admin_command_registry};

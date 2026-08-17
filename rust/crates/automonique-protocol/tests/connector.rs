@@ -3,7 +3,7 @@
 //! R1-16 verification contract.
 //!
 //! Each module corresponds to one row of the check table in
-//! `plan/contracts/R1-16.md`.
+//! `docs/product-plan/requirements/connector-catalog.md`.
 
 use std::path::PathBuf;
 

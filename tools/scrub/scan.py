@@ -59,20 +59,14 @@ REQUIRED_FAMILIES = frozenset(
 # distinction is the whole difference between this gate and a green tick, and it
 # is easy to lose when reading CI output, so the run states it itself.
 COVERAGE_NOTE = (
-    "note: no protected rules were installed, so this run could only have found "
-    "the public synthetic values. It is evidence that the scanner works, not "
-    "that private identifiers are absent; only a run with the protected rule "
-    "bundle can support that claim. See plan/gates.md#gate-scrub."
+    "note: public synthetic rules only; use --require-protected for a publication scan"
 )
 # The same distinction the coverage note makes, for the other axis. A tree
 # scope pass says the checkout is clean; it says nothing about what stays
 # reachable in history, and a reader deciding whether a repository is safe to
 # publish needs to be told which question was answered.
 SCOPE_NOTE = (
-    "note: this run used --scope tree, so it read only the currently tracked "
-    "blobs and their path names. Historical blobs and commit messages outside "
-    "any --commits range were not read; only a --scope full run can support a "
-    "claim about what remains reachable."
+    "note: tree scope; history was not scanned"
 )
 RULE_ID = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\Z")
 PROTECTED_RULE_ID = re.compile(r"p[12]-[0-9]{3}\Z")
@@ -86,16 +80,16 @@ COMMIT_RANGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/^~@{}-]{0,255}\Z")
 EXPECTED_ALLOWLIST = {
     "product-mascot": (
         "Monique",
-        "plan/contracts/BOOT-003.md#allow-list--retained-by-decision",
+        "AGENTS.md#guardrails",
     ),
     "repository-organization": (
         "bext-stack",
-        "plan/contracts/BOOT-003.md#allow-list--retained-by-decision",
+        "SECURITY.md",
     ),
-    "neutral-compatibility-prefix": ("legacy*", "plan/gates.md#gate-scrub"),
+    "neutral-compatibility-prefix": ("legacy*", "PROVENANCE.md#structural-references"),
     "structural-reference-names": (
         "legacy source filenames, commands, and environment names",
-        "plan/gates.md#gate-scrub",
+        "PROVENANCE.md#structural-references",
     ),
 }
 

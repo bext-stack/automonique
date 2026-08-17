@@ -771,11 +771,7 @@ pub const GENERATED_DIRECTORY: &str = "sdk/typescript/packages/protocol/generate
 /// Extension the generated modules are written with.
 ///
 /// Held apart from the names below so that each name stays a bare stem. It
-/// belongs to the target language rather than to any one schema, and a
-/// constant spelling `"doctor.ts"` in shipped source reads as an unversioned
-/// protocol name to the namespace gate in `tests/namespace.rs`, which records
-/// that class rather than scanning it. A file name is not a protocol identity
-/// and does not belong in that record.
+/// belongs to the target language rather than to any one schema.
 const MODULE_EXTENSION: &str = ".ts";
 
 /// Shared helpers every other generated module imports.

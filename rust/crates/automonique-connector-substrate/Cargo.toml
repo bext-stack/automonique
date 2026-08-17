@@ -13,11 +13,7 @@ publish.workspace = true
 # network" is a property worth keeping legible in a manifest, and
 # `cargo tree -p automonique-transports` is where it stays checkable.
 #
-# The name carries the project prefix because the namespace gate in
-# `automonique-protocol/tests/namespace.rs` scans manifest features alongside
-# binaries and crate names. There is deliberately no `default` key: Cargo
-# reserves that spelling, so it cannot be namespaced, and an implicit empty
-# default costs the five HTTP consumers one explicit `features = [...]` each.
+# There is deliberately no `default` key; consumers opt into HTTP explicitly.
 [features]
 automonique_http = ["dep:ureq"]
 

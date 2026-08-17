@@ -48,6 +48,6 @@ operator procedure in [`../../self-improvement-workflow.md`](../../self-improvem
 
 ## Current status
 
-The former executable-plan artifacts under `plan/` and `.automonique/dev/` are
-archived. They may be used for experiments, but product work does not wait for
-their graph, metrics, evidence, or exit conditions.
+The executable-plan experiment has been removed. The remaining isolated
+executor is an optional product capability; ordinary repository work does not
+use it.

@@ -50,13 +50,11 @@
 //!
 //! Named rather than silently approximated:
 //!
-//! - **Lease.** `plan/work-graph.toml` gives R13-01 the paths
-//!   `connectors/typescript/`, which does not exist in this tree. This is the
-//!   Rust-side value vocabulary, and it sits beside [`crate::connector`], where
-//!   R1-16 put the neutral connector vocabulary it extends.
+//! - This Rust-side value vocabulary sits beside [`crate::connector`], which
+//!   owns the neutral connector vocabulary it extends.
 //! - **Two kinds, a named catalog of planned ones.** `docs/product-plan/
 //!   requirements/connector-catalog.md` § Planned catalog and the R13 rows of
-//!   `docs/product-plan/reference/work-breakdown.md` name a long list of
+//!   `docs/product-plan/requirements/connector-catalog.md` name a long list of
 //!   families. This build has exactly two connector cores, so [`ConnectorKind`]
 //!   has two variants and the rest are listed in [`PLANNED_CONNECTOR_KINDS`]:
 //!   [`ConnectorKind::resolve`] refuses them with
@@ -149,7 +147,7 @@ pub const MAX_CONFORMANCE_INPUT_BYTES: usize = 8 * 1024;
 /// [`ConformanceError::PlannedConnectorKind`] rather than
 /// [`ConformanceError::UnknownConnectorKind`]. Sourced from
 /// `docs/product-plan/requirements/connector-catalog.md` § Planned catalog and
-/// the R13 rows of `docs/product-plan/reference/work-breakdown.md`. Sorted, so
+/// `docs/product-plan/requirements/connector-catalog.md`. Sorted, so
 /// a new entry lands in one obvious place.
 pub const PLANNED_CONNECTOR_KINDS: [&str; 21] = [
     "dingtalk",
