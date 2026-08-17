@@ -2843,6 +2843,45 @@ fn contextual_github_issue_review(text: &str, context: &str) -> Option<String> {
         .flatten()
 }
 
+/// Resolve a short execution follow-up against the sole GitHub issue in the
+/// current Slack thread. The URL comes only from durable thread context; the
+/// user's short phrase can authorize opening a gate, but can never select a
+/// different target.
+fn contextual_github_issue_work(text: &str, context: &str) -> Option<String> {
+    if one_issue_url(text).ok().flatten().is_some() {
+        return None;
+    }
+    let normalized = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|character: char| !character.is_alphanumeric())
+        .to_lowercase();
+    let requests_work = matches!(
+        normalized.as_str(),
+        "do it"
+            | "go ahead"
+            | "run it"
+            | "execute it"
+            | "handle it"
+            | "fix it"
+            | "implement it"
+            | "fais le"
+            | "fais-le"
+            | "fait le"
+            | "fait-le"
+            | "vas y"
+            | "vas-y"
+            | "lance le"
+            | "lance-le"
+            | "execute le"
+            | "exécute le"
+    );
+    requests_work
+        .then(|| one_issue_url(context).ok().flatten())
+        .flatten()
+}
+
 fn ticket_approval_failure(reason: &str) -> &'static str {
     match reason {
         "executor_unavailable" => {
@@ -2856,6 +2895,65 @@ fn ticket_approval_failure(reason: &str) -> &'static str {
 }
 
 impl<P: SlackTicketPoster> SlackTicketRouter<P> {
+    fn open_ticket_gate(&mut self, event: &SlackTicketEvent, issue_url: String) {
+        if !self.features.contains(&SlackFeature::Approvals) {
+            return;
+        }
+        match self.manage.dispatch_ticket(&issue_url, &event.source_key) {
+            Ok(receipt) if !receipt.approved => {
+                let registered = self.gates.lock().ok().is_some_and(|mut gates| {
+                    gates
+                        .register(crate::telegram_bridge::PendingTicketGate {
+                            job_id: receipt.job_id.clone(),
+                            issue_url,
+                            source_key: event.source_key.clone(),
+                        })
+                        .is_ok()
+                });
+                if !registered {
+                    let _ = self.poster.post_thread(
+                        &event.channel,
+                        &event.parent,
+                        "The ticket is pending in Manage, but Monique could not retain its cross-channel confirmation coordinates. Confirm it in Manage; no work has been released.",
+                    );
+                    return;
+                }
+                if self.interactive_decisions {
+                    let _ = self.poster.post_approval_card(
+                        &event.channel,
+                        &event.parent,
+                        &receipt,
+                        self.manage_url.as_ref(),
+                    );
+                } else {
+                    let short = receipt.job_id.get(..12).unwrap_or(&receipt.job_id);
+                    let _ = self.poster.post_thread(
+                        &event.channel,
+                        &event.parent,
+                        &format!(
+                            "🔐 Confirmation required for `{}`\n{}\nMonique job `{short}` is pending approval. A configured Slack admin can reply `confirm {short}`; the same request can also be confirmed in Telegram or Manage. No work starts before confirmation.",
+                            receipt.issue_title, receipt.issue_url
+                        ),
+                    );
+                }
+            }
+            Ok(_) => {
+                let _ = self.poster.post_thread(
+                    &event.channel,
+                    &event.parent,
+                    "Manage returned an already-approved job to an unconfirmed Slack intake. The gate contract was violated; check Manage immediately.",
+                );
+            }
+            Err(_) => {
+                let _ = self.poster.post_thread(
+                    &event.channel,
+                    &event.parent,
+                    "Manage could not create the pending ticket confirmation, so no work was released.",
+                );
+            }
+        }
+    }
+
     fn handle_monique_command(&mut self, command: SlackMoniqueCommand, context: &str) {
         self.poster.begin_source(&command.source_key);
         if !self.features.contains(&SlackFeature::Commands) {
@@ -3793,7 +3891,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                     |answerer| {
                         answerer.issue_review(
                             &issue_url,
-                            "Summarize this GitHub issue briefly in the language of its content, report its current state, and ask what the user wants Monique to do next. Do not start work from a bare link.",
+                            "Summarize this GitHub issue briefly in the language of its content and report its current state. Do not ask what to do next: a separate Slack confirmation card follows. Do not claim work has started before that card is approved.",
                             context,
                             true,
                         )
@@ -3802,6 +3900,11 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                 let _ = self
                     .poster
                     .post_thread(&event.channel, &event.parent, &answer);
+                // A bare link is also the intake gesture on Slack: prepare the
+                // durable gate and render its native confirmation controls.
+                // The gate remains pending, so the summary itself never starts
+                // work and the user needs no follow-up just to request tools.
+                self.open_ticket_gate(&event, issue_url);
                 return;
             }
             if is_github_issue_status_question(trimmed)
@@ -3841,6 +3944,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             && (event.app_mention
                 || event.continues_conversation
                 || event.channel.as_str().starts_with('D'));
+        let mut contextual_work_url = None;
         if conversational {
             if let Some(answer) = deterministic_conversation_answer(trimmed) {
                 let _ = self
@@ -3881,6 +3985,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                     .post_thread(&event.channel, &event.parent, &answer);
                 return;
             }
+            contextual_work_url = contextual_github_issue_work(trimmed, context);
             if is_github_issue_status_question(trimmed)
                 && let Ok(Some(issue_url)) = one_issue_url(trimmed)
             {
@@ -3945,6 +4050,9 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
         }
         let issue_url = match one_issue_url(trimmed) {
             Ok(Some(issue_url)) => issue_url,
+            Ok(None) if contextual_work_url.is_some() => {
+                contextual_work_url.expect("checked contextual work target")
+            }
             Ok(None) => {
                 if conversational {
                     let answer = self.question_answerer.as_mut().map_or_else(
@@ -4005,62 +4113,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                 return;
             }
         };
-        if !self.features.contains(&SlackFeature::Approvals) {
-            return;
-        }
-        match self.manage.dispatch_ticket(&issue_url, &event.source_key) {
-            Ok(receipt) if !receipt.approved => {
-                let registered = self.gates.lock().ok().is_some_and(|mut gates| {
-                    gates
-                        .register(crate::telegram_bridge::PendingTicketGate {
-                            job_id: receipt.job_id.clone(),
-                            issue_url,
-                            source_key: event.source_key,
-                        })
-                        .is_ok()
-                });
-                if !registered {
-                    let _ = self.poster.post_thread(
-                        &event.channel,
-                        &event.parent,
-                        "The ticket is pending in Manage, but Monique could not retain its cross-channel confirmation coordinates. Confirm it in Manage; no work has been released.",
-                    );
-                    return;
-                }
-                if self.interactive_decisions {
-                    let _ = self.poster.post_approval_card(
-                        &event.channel,
-                        &event.parent,
-                        &receipt,
-                        self.manage_url.as_ref(),
-                    );
-                } else {
-                    let short = receipt.job_id.get(..12).unwrap_or(&receipt.job_id);
-                    let _ = self.poster.post_thread(
-                        &event.channel,
-                        &event.parent,
-                        &format!(
-                            "🔐 Confirmation required for `{}`\n{}\nMonique job `{short}` is pending approval. A configured Slack admin can reply `confirm {short}`; the same request can also be confirmed in Telegram or Manage. No work starts before confirmation.",
-                            receipt.issue_title, receipt.issue_url
-                        ),
-                    );
-                }
-            }
-            Ok(_) => {
-                let _ = self.poster.post_thread(
-                    &event.channel,
-                    &event.parent,
-                    "Manage returned an already-approved job to an unconfirmed Slack intake. The gate contract was violated; check Manage immediately.",
-                );
-            }
-            Err(_) => {
-                let _ = self.poster.post_thread(
-                    &event.channel,
-                    &event.parent,
-                    "Manage could not create the pending ticket confirmation, so no work was released.",
-                );
-            }
-        }
+        self.open_ticket_gate(&event, issue_url);
     }
 
     fn confirm(&mut self, event: &SlackTicketEvent, reference: &str) {
@@ -7979,7 +8032,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_admin_issue_url_is_read_before_the_user_selects_an_action() {
+    fn a_plain_admin_issue_url_is_summarized_and_opens_a_confirmation_gate() {
         let poster = FakeTicketPoster::default();
         let messages = Arc::clone(&poster.messages);
         let manage = FakeManage::default();
@@ -8016,16 +8069,65 @@ mod tests {
             ),
             "",
         );
-        assert!(opened.lock().expect("opened").is_empty());
+        assert_eq!(opened.lock().expect("opened").len(), 1);
         let reviews = reviews.lock().expect("reviews");
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].0, "https://github.com/example/project/issues/42");
-        assert!(reviews[0].1.contains("Do not start work from a bare link"));
+        assert!(reviews[0].1.contains("confirmation card follows"));
+        assert!(reviews[0].1.contains("Do not ask what to do next"));
         assert!(reviews[0].2);
-        assert_eq!(
-            messages.lock().expect("messages").as_slice(),
-            [String::from("Typed GitHub issue review")]
+        let messages = messages.lock().expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0], "Typed GitHub issue review");
+        assert!(messages[1].contains("Confirmation required"));
+        assert!(messages[1].contains("No work starts before confirmation"));
+    }
+
+    #[test]
+    fn a_short_work_follow_up_uses_the_threads_exact_issue_target() {
+        let poster = FakeTicketPoster::default();
+        let messages = Arc::clone(&poster.messages);
+        let manage = FakeManage::default();
+        let opened = Arc::clone(&manage.opened);
+        let mut router = SlackTicketRouter {
+            poster,
+            manage: Box::new(manage),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
+            channels: ChannelMap(vec![(
+                name("ops"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![SlackFeature::Approvals, SlackFeature::Conversation],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+            approvals: None,
+            approval_lane: None,
+            question_answerer: None,
+        };
+        let mut follow_up = ticket_event("U0ADMIN001", "do it", "EvDoIt");
+        follow_up.in_thread = true;
+        follow_up.continues_conversation = true;
+        router.handle_with_context(
+            follow_up,
+            "user: https://github.com/example/project/issues/42\nassistant: issue summary",
         );
+
+        assert_eq!(
+            opened.lock().expect("opened").as_slice(),
+            [(
+                String::from("https://github.com/example/project/issues/42"),
+                String::from("slack:T0RESERVED:event:EvDoIt"),
+            )]
+        );
+        let messages = messages.lock().expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("Confirmation required"));
     }
 
     #[test]
