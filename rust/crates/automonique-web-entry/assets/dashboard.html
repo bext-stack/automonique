@@ -244,11 +244,59 @@
 
           <section class="view" data-panel="configuration" aria-labelledby="configuration-title">
             <div class="page-heading compact">
-              <div><p class="kicker">EFFECTIVE / SECRET-SAFE PROJECTION</p><h1 id="configuration-title">Configuration</h1><p class="page-lede">Effective capabilities, boundaries, and limits—not credentials or private coordinates.</p></div>
-              <div class="heading-actions"><button class="button secondary" id="configuration-refresh" type="button">Refresh</button><span class="tag success">SECRETS CONCEALED</span></div>
+              <div><p class="kicker">SYSTEM / WORKSPACE / PREFERENCES</p><h1 id="configuration-title">Configuration</h1><p class="page-lede">Tune your workspace and understand every active system boundary from one place.</p></div>
+              <div class="heading-actions"><button class="button secondary" id="configuration-refresh" type="button">Refresh</button><span class="tag success">SECRET-SAFE</span></div>
             </div>
-            <div class="config-notice"><strong>Values are allowlisted.</strong><span>Credentials, account identifiers, filesystem locations and provider payloads are structurally absent from this API.</span></div>
-            <div class="config-grid" id="configuration-grid"><article class="panel loading-panel">Loading effective configuration…</article></div>
+            <div class="config-summary" aria-label="Configuration summary">
+              <article><span class="config-summary-icon" aria-hidden="true">✦</span><div><small>Workspace</small><strong id="configuration-workspace-state">Personalized</strong><p>Saved in this browser</p></div></article>
+              <article><span class="config-summary-icon" aria-hidden="true">◎</span><div><small>AI Operations</small><strong id="configuration-manage-state">Checking…</strong><p>Tools and ticket control plane</p></div></article>
+              <article><span class="config-summary-icon" aria-hidden="true">↗</span><div><small>Connections</small><strong id="configuration-connections-state">Checking…</strong><p>Enabled system integrations</p></div></article>
+              <article><span class="config-summary-icon" aria-hidden="true">◇</span><div><small>Security</small><strong>Protected</strong><p>TLS, authentication and approvals</p></div></article>
+            </div>
+            <div class="config-toolbar panel">
+              <label class="config-search" for="configuration-search"><span aria-hidden="true">⌕</span><input id="configuration-search" type="search" maxlength="120" placeholder="Search settings and integrations"></label>
+              <div class="config-filters" role="group" aria-label="Filter configuration"><button class="is-active" type="button" data-config-filter="all">All</button><button type="button" data-config-filter="preferences">Workspace</button><button type="button" data-config-filter="ai">AI &amp; operations</button><button type="button" data-config-filter="integrations">Integrations</button><button type="button" data-config-filter="security">Security</button></div>
+            </div>
+            <div class="config-layout">
+              <div class="config-primary">
+                <article class="panel config-editor" data-config-card data-config-category="preferences">
+                  <div class="config-card-heading"><div><span class="config-eyebrow">YOUR WORKSPACE</span><h2>Interface &amp; accessibility</h2><p>These settings apply immediately and remain on this browser.</p></div><span class="config-scope">LOCAL</span></div>
+                  <div class="config-form-grid">
+                    <label class="config-field" for="configuration-theme"><span><strong>Color theme</strong><small>Choose from every installed visual theme</small></span><select id="configuration-theme"><option value="system">System</option><option value="dark">Carbon</option><option value="light">Paper</option><option value="midnight">Midnight</option><option value="ocean">Ocean</option><option value="forest">Forest</option><option value="monokai">Monokai</option><option value="dracula">Dracula</option><option value="nord">Nord</option><option value="sand">Sand</option><option value="rose">Rose</option><option value="contrast">High contrast</option></select></label>
+                    <label class="config-field" for="configuration-language"><span><strong>Language</strong><small>Interface, labels and navigation</small></span><select id="configuration-language"><option value="en">English</option><option value="fr">Français</option></select></label>
+                    <label class="config-field" for="configuration-text-scale"><span><strong>Text size</strong><small>Scalable typography across the whole app</small></span><select id="configuration-text-scale"><option value="compact">Compact</option><option value="standard">Standard</option><option value="comfortable">Comfortable</option><option value="large">Large</option><option value="extra-large">Extra large</option></select></label>
+                    <label class="config-field" for="configuration-density"><span><strong>Interface density</strong><small>Control information spacing</small></span><select id="configuration-density"><option value="compact">Compact</option><option value="comfortable">Comfortable</option><option value="spacious">Spacious</option></select></label>
+                    <label class="config-field" for="configuration-startup"><span><strong>Start page</strong><small>Default destination when opening Monique</small></span><select id="configuration-startup"><option value="chat">Chat</option><option value="overview">Overview</option><option value="operations">AI Operations</option><option value="tickets">Tickets</option></select></label>
+                    <label class="config-field switch-field" for="configuration-motion"><span><strong>Reduce motion</strong><small>Limit animation and interface transitions</small></span><input class="switch" id="configuration-motion" type="checkbox"></label>
+                  </div>
+                </article>
+
+                <article class="panel config-editor" data-config-card data-config-category="ai">
+                  <div class="config-card-heading"><div><span class="config-eyebrow">ASSISTANT DEFAULTS</span><h2>AI &amp; live behavior</h2><p>Choose how Monique starts conversations and refreshes operational context.</p></div><span class="config-scope">WORKSPACE</span></div>
+                  <div class="config-form-grid">
+                    <label class="config-field" for="configuration-profile"><span><strong>Default reasoning profile</strong><small>Used for new conversations</small></span><select id="configuration-profile"><option value="conversation">Fast conversation</option><option value="operational">Operational reasoning</option></select></label>
+                    <label class="config-field" for="configuration-refresh-rate"><span><strong>Live refresh rate</strong><small>Status polling while this tab is visible</small></span><select id="configuration-refresh-rate"><option value="5000">Every 5 seconds</option><option value="10000">Every 10 seconds</option><option value="30000">Every 30 seconds</option><option value="60000">Every minute</option></select></label>
+                    <label class="config-field switch-field" for="configuration-technical-values"><span><strong>Technical values</strong><small>Show detailed limits and runtime vocabulary</small></span><input class="switch" id="configuration-technical-values" type="checkbox" checked></label>
+                    <label class="config-field switch-field" for="configuration-notifications"><span><strong>Attention notifications</strong><small>Notify when a new operational risk appears</small></span><input class="switch" id="configuration-notifications" type="checkbox"></label>
+                  </div>
+                </article>
+
+                <div class="config-section-heading" data-config-card data-config-category="all"><div><span class="config-eyebrow">EFFECTIVE SYSTEM</span><h2>Runtime configuration</h2><p>Validated, secret-safe values reported by the running system.</p></div><span id="configuration-last-read">Checking…</span></div>
+                <div class="config-grid" id="configuration-grid"><article class="panel loading-panel">Loading effective configuration…</article></div>
+                <div class="config-empty panel" id="configuration-empty" hidden><strong>No matching settings</strong><span>Try a broader search or another category.</span></div>
+              </div>
+              <aside class="config-aside">
+                <article class="panel config-guidance" data-config-card data-config-category="integrations ai">
+                  <span class="config-eyebrow">GUIDED SETUP</span><h2>Configure safely with Monique</h2><p>Credentials remain outside this browser. Monique can inspect the active contract, collect only the missing details, and stage reviewable changes.</p>
+                  <button class="button primary" type="button" data-chat-prompt="Review the complete system configuration. Identify missing or unhealthy integrations, explain the safest next configuration change, and stage any mutation for my explicit approval.">Review configuration</button>
+                </article>
+                <article class="panel config-protection" data-config-card data-config-category="security">
+                  <span class="config-eyebrow">CONTROL BOUNDARY</span><h2>Protected by design</h2>
+                  <ul><li><span>✓</span><div><strong>Secrets never rendered</strong><small>Tokens and credentials are structurally absent.</small></div></li><li><span>✓</span><div><strong>Mutations require approval</strong><small>AI Operations actions remain staged first.</small></div></li><li><span>✓</span><div><strong>Runtime-owned settings</strong><small>Deployment settings stay validated and auditable.</small></div></li></ul>
+                </article>
+                <article class="config-notice"><strong>Secret-safe projection</strong><span>Account identifiers, filesystem locations, provider payloads and credential material are never returned by this screen.</span></article>
+              </aside>
+            </div>
           </section>
         </main>
 

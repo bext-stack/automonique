@@ -25,6 +25,10 @@ let chatBusy = false;
 let newChatArmed = false;
 let newChatTimer = null;
 let lastStatusSnapshot = null;
+let configurationFilter = "all";
+let configurationQuery = "";
+let statusRefreshTimer = null;
+let lastNotifiedAttentionKey = null;
 const frenchUi = Object.freeze({
   "Skip to workspace": "Aller à l’espace de travail",
   "Primary navigation": "Navigation principale",
@@ -262,6 +266,89 @@ const frenchUi = Object.freeze({
   "Loading canonical store…": "Chargement du stockage canonique…",
   "Typed memory evidence graph": "Graphe typé des éléments de mémoire",
   "EFFECTIVE / SECRET-SAFE PROJECTION": "PROJECTION EFFECTIVE / SANS SECRETS",
+  "SYSTEM / WORKSPACE / PREFERENCES": "SYSTÈME / ESPACE / PRÉFÉRENCES",
+  "Tune your workspace and understand every active system boundary from one place.": "Personnalisez votre espace et comprenez chaque périmètre actif du système depuis un seul endroit.",
+  "SECRET-SAFE": "SANS SECRETS",
+  "Configuration summary": "Résumé de la configuration",
+  "Workspace": "Espace de travail",
+  "Personalized": "Personnalisé",
+  "Saved in this browser": "Enregistré dans ce navigateur",
+  "Checking…": "Vérification…",
+  "Tools and ticket control plane": "Plan de contrôle des outils et tickets",
+  "Connections": "Connexions",
+  "Enabled system integrations": "Intégrations système activées",
+  "Security": "Sécurité",
+  "Protected": "Protégé",
+  "TLS, authentication and approvals": "TLS, authentification et approbations",
+  "Search settings and integrations": "Rechercher des paramètres et intégrations",
+  "Filter configuration": "Filtrer la configuration",
+  "Workspace": "Espace de travail",
+  "AI & operations": "IA et opérations",
+  "Integrations": "Intégrations",
+  "YOUR WORKSPACE": "VOTRE ESPACE",
+  "Interface & accessibility": "Interface et accessibilité",
+  "These settings apply immediately and remain on this browser.": "Ces paramètres s’appliquent immédiatement et restent dans ce navigateur.",
+  "LOCAL": "LOCAL",
+  "Choose from every installed visual theme": "Choisissez parmi tous les thèmes visuels installés",
+  "Interface, labels and navigation": "Interface, libellés et navigation",
+  "Scalable typography across the whole app": "Typographie adaptable dans toute l’application",
+  "Control information spacing": "Ajuster l’espacement des informations",
+  "Default destination when opening Monique": "Destination par défaut à l’ouverture de Monique",
+  "ASSISTANT DEFAULTS": "PARAMÈTRES DE L’ASSISTANTE",
+  "AI & live behavior": "IA et comportement en temps réel",
+  "Choose how Monique starts conversations and refreshes operational context.": "Choisissez comment Monique démarre les conversations et actualise le contexte opérationnel.",
+  "Default reasoning profile": "Profil de raisonnement par défaut",
+  "Used for new conversations": "Utilisé pour les nouvelles conversations",
+  "Live refresh rate": "Fréquence d’actualisation",
+  "Status polling while this tab is visible": "Actualisation de l’état lorsque cet onglet est visible",
+  "Every 5 seconds": "Toutes les 5 secondes",
+  "Every 10 seconds": "Toutes les 10 secondes",
+  "Every 30 seconds": "Toutes les 30 secondes",
+  "Every minute": "Chaque minute",
+  "Technical values": "Valeurs techniques",
+  "Show detailed limits and runtime vocabulary": "Afficher les limites détaillées et le vocabulaire d’exécution",
+  "Attention notifications": "Notifications d’attention",
+  "Notify when a new operational risk appears": "Notifier lorsqu’un nouveau risque opérationnel apparaît",
+  "EFFECTIVE SYSTEM": "SYSTÈME EFFECTIF",
+  "Runtime configuration": "Configuration d’exécution",
+  "Validated, secret-safe values reported by the running system.": "Valeurs validées et sans secrets signalées par le système actif.",
+  "No matching settings": "Aucun paramètre correspondant",
+  "Try a broader search or another category.": "Essayez une recherche plus large ou une autre catégorie.",
+  "GUIDED SETUP": "CONFIGURATION GUIDÉE",
+  "Configure safely with Monique": "Configurer en sécurité avec Monique",
+  "Credentials remain outside this browser. Monique can inspect the active contract, collect only the missing details, and stage reviewable changes.": "Les identifiants restent hors de ce navigateur. Monique peut examiner le contrat actif, recueillir uniquement les éléments manquants et préparer des changements vérifiables.",
+  "Review configuration": "Examiner la configuration",
+  "Protected by design": "Protégé dès la conception",
+  "Secrets never rendered": "Secrets jamais affichés",
+  "Tokens and credentials are structurally absent.": "Les jetons et identifiants sont structurellement absents.",
+  "Mutations require approval": "Modifications soumises à approbation",
+  "AI Operations actions remain staged first.": "Les actions AI Operations sont toujours préparées avant exécution.",
+  "Runtime-owned settings": "Paramètres gérés par l’exécution",
+  "Deployment settings stay validated and auditable.": "Les paramètres de déploiement restent validés et auditables.",
+  "Secret-safe projection": "Projection sans secrets",
+  "Account identifiers, filesystem locations, provider payloads and credential material are never returned by this screen.": "Les références de compte, emplacements de fichiers, données fournisseur et identifiants ne sont jamais renvoyés par cet écran.",
+  "Configuration preference saved.": "Préférence de configuration enregistrée.",
+  "Notifications are not available in this browser.": "Les notifications ne sont pas disponibles dans ce navigateur.",
+  "Notification permission was not granted.": "L’autorisation de notification n’a pas été accordée.",
+  "Runtime configuration refreshed.": "La configuration d’exécution a été actualisée.",
+  "Authenticated network boundary and request limits.": "Périmètre réseau authentifié et limites de requête.",
+  "Durable evidence, retention and retrieval behavior.": "Éléments durables, conservation et comportement de récupération.",
+  "Contained model execution and provider readiness.": "Exécution cloisonnée des modèles et disponibilité des fournisseurs.",
+  "Channels and external service connections.": "Canaux et connexions aux services externes.",
+  "Live tools, tickets and approval-aware control plane.": "Outils en temps réel, tickets et plan de contrôle soumis aux approbations.",
+  "Governance & safety": "Gouvernance et sécurité",
+  "Approval, audit, backup and observation controls.": "Contrôles d’approbation, d’audit, de sauvegarde et d’observation.",
+  "Extensions & automation": "Extensions et automatisation",
+  "MCP, knowledge, skills and automation surfaces.": "Surfaces MCP, connaissances, compétences et automatisation.",
+  "Effective runtime configuration.": "Configuration d’exécution effective.",
+  "INTEGRATION": "INTÉGRATION",
+  "INTELLIGENCE": "INTELLIGENCE",
+  "SYSTEM": "SYSTÈME",
+  "Connected": "Connecté",
+  "Not attached": "Non connecté",
+  "Effective · secret-safe": "Effectif · sans secrets",
+  "Configure with Monique →": "Configurer avec Monique →",
+  "Review the complete system configuration. Identify missing or unhealthy integrations, explain the safest next configuration change, and stage any mutation for my explicit approval.": "Examine la configuration complète du système. Identifie les intégrations manquantes ou défaillantes, explique la prochaine modification la plus sûre et prépare toute action pour mon approbation explicite.",
   "Effective capabilities, boundaries, and limits—not credentials or private coordinates.": "Fonctionnalités, limites et périmètres effectifs — sans identifiants ni coordonnées privées.",
   "SECRETS CONCEALED": "SECRETS MASQUÉS",
   "Values are allowlisted.": "Les valeurs sont explicitement autorisées.",
@@ -428,6 +515,16 @@ const frenchUi = Object.freeze({
   "Profile Source Configured": "Source de profil configurée",
   "Ai Operations Worker Configured": "Worker AI Operations configuré",
   "Agent Tools Configured": "Outils d’agent configurés",
+  "Approval Policy Configured": "Politique d’approbation configurée",
+  "Memory Policy Configured": "Politique de mémoire configurée",
+  "Shadow Observation Configured": "Observation parallèle configurée",
+  "Backup Store Available": "Stockage de sauvegarde disponible",
+  "Audit Store Available": "Stockage d’audit disponible",
+  "Mcp Registry Configured": "Registre MCP configuré",
+  "Local Knowledge Configured": "Connaissances locales configurées",
+  "Improvement Lab Configured": "Laboratoire d’amélioration configuré",
+  "Automations Store Available": "Stockage d’automatisations disponible",
+  "Skills Store Available": "Stockage de compétences disponible",
   "Dashboard Authority": "Autorité du tableau de bord",
   "Console": "Console",
   "High": "Élevée",
@@ -463,6 +560,7 @@ function translatePhraseForFrench(value) {
     [/^(\d+)s ago$/, (match) => `il y a ${match[1]} s`],
     [/^(\d+)m ago$/, (match) => `il y a ${match[1]} min`],
     [/^(\d+)h ago$/, (match) => `il y a ${match[1]} h`],
+    [/^(\d+) connected$/, (match) => `${match[1]} connecté${match[1] === "1" ? "" : "s"}`],
     [/^(\d+) invariants? need attention$/, (match) => `${match[1]} invariant${match[1] === "1" ? " requiert" : "s requièrent"} votre attention`],
     [/^(.+?) active$/, (match) => `${match[1]} en cours`],
     [/^(.+?) pending$/, (match) => `${match[1]} en attente`],
@@ -484,6 +582,7 @@ function translatePhraseForFrench(value) {
     [/^The contained conversation lane refused this turn \((.+)\)\.$/, (match) => `La voie de conversation cloisonnée a refusé cet échange (${match[1]}).`],
     [/^Help me use the AI Operations capability “(.+)”\. Explain what it does, collect any required details, and stage any mutation for my approval\.$/, (match) => `Aide-moi à utiliser la fonctionnalité AI Operations « ${match[1]} ». Explique son rôle, recueille les détails nécessaires et prépare toute modification pour mon approbation.`],
     [/^Review ticket (.+): “(.+)”\. Summarize its current state and recommend the next action\.$/, (match) => `Examine le ticket ${match[1]} : « ${match[2]} ». Résume son état actuel et recommande la prochaine action.`],
+    [/^Review the (.+) configuration\. Explain its current effective state, identify anything missing, and stage any safe change for my explicit approval\.$/, (match) => `Examine la configuration ${translatePhraseForFrench(match[1])}. Explique son état effectif, identifie les éléments manquants et prépare tout changement sûr pour mon approbation explicite.`],
   ];
   for (const [pattern, replacement] of replacements) {
     const match = source.match(pattern);
@@ -562,6 +661,7 @@ function applyLanguage(language, persist = true) {
   document.documentElement.lang = currentLanguage;
   document.documentElement.dataset.language = currentLanguage;
   byId("language-select").value = currentLanguage;
+  if (byId("configuration-language")) byId("configuration-language").value = currentLanguage;
   const target = currentLanguage === "en" ? "fr" : "en";
   byId("language-cycle").textContent = target.toUpperCase();
   byId("language-cycle").setAttribute("aria-label", target === "fr" ? "Switch to French" : "Switch to English");
@@ -658,6 +758,7 @@ function applyTheme(theme, persist = true) {
   if (!themes.includes(theme)) theme = "system";
   document.documentElement.dataset.theme = theme;
   byId("theme-select").value = theme;
+  if (byId("configuration-theme")) byId("configuration-theme").value = theme;
   const resolved = resolvedTheme(theme);
   byId("theme-cycle").dataset.theme = theme;
   byId("theme-cycle").setAttribute("aria-label", `Appearance. Current theme: ${themeNames[theme]}`);
@@ -679,6 +780,7 @@ function applyTextScale(scale, persist = true) {
   byId("text-scale-cycle").setAttribute("aria-label", `Text size: ${textScaleNames[scale]}. Increase text size`);
   byId("text-scale-name").textContent = textScaleNames[scale];
   byId("text-scale-input").value = String(textScales.indexOf(scale));
+  if (byId("configuration-text-scale")) byId("configuration-text-scale").value = scale;
   if (persist) savePreference("monique-text-scale", scale);
 }
 
@@ -696,6 +798,7 @@ function applySidebar(state, persist = true) {
 function applyDensity(density, persist = true) {
   if (!densities.includes(density)) density = "comfortable";
   document.documentElement.dataset.density = density;
+  if (byId("configuration-density")) byId("configuration-density").value = density;
   document.querySelectorAll("[data-density-choice]").forEach((button) => {
     const active = button.dataset.densityChoice === density;
     button.classList.toggle("is-active", active);
@@ -708,12 +811,14 @@ function applyMotion(mode, persist = true) {
   if (!motionModes.includes(mode)) mode = "full";
   document.documentElement.dataset.motion = mode;
   byId("reduce-motion").checked = mode === "reduce";
+  if (byId("configuration-motion")) byId("configuration-motion").checked = mode === "reduce";
   if (persist) savePreference("monique-motion", mode);
 }
 
 function applyStartupView(view, persist = true) {
   if (!startupViews.includes(view)) view = "chat";
   byId("startup-view").value = view;
+  if (byId("configuration-startup")) byId("configuration-startup").value = view;
   if (persist) savePreference("monique-start-view", view);
 }
 
@@ -905,6 +1010,13 @@ function renderStatus(status) {
   const health = ["operational", "degraded", "unavailable"].includes(status.health) ? status.health : "unavailable";
   document.documentElement.dataset.health = health;
   const issues = attention(status);
+  const attentionKey = `${health}:${issues.join("|")}`;
+  if (lastNotifiedAttentionKey !== null && attentionKey !== lastNotifiedAttentionKey && issues.length > 0
+      && storedPreference("monique-notifications", ["on", "off"], "off") === "on"
+      && "Notification" in window && Notification.permission === "granted") {
+    new Notification("Monique · attention required", { body: issues.join(" · "), tag: "monique-operational-attention" });
+  }
+  lastNotifiedAttentionKey = attentionKey;
   byId("global-health").textContent = health;
   byId("generation").textContent = `GEN ${count(status.generation)}`;
   byId("footer-state").textContent = `${health.toUpperCase()} / GEN ${count(status.generation)}`;
@@ -1508,15 +1620,47 @@ function label(value) {
   return String(value).replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+const configurationSectionMeta = Object.freeze({
+  "Web boundary": { category: "security", description: "Authenticated network boundary and request limits." },
+  Memory: { category: "ai", description: "Durable evidence, retention and retrieval behavior." },
+  Providers: { category: "ai", description: "Contained model execution and provider readiness." },
+  Connectors: { category: "integrations", description: "Channels and external service connections." },
+  "Manage AI Operations": { category: "integrations ai", description: "Live tools, tickets and approval-aware control plane." },
+  "Governance & safety": { category: "security", description: "Approval, audit, backup and observation controls." },
+  "Extensions & automation": { category: "ai integrations", description: "MCP, knowledge, skills and automation surfaces." },
+});
+
+function configurePrompt(title) {
+  return `Review the ${title} configuration. Explain its current effective state, identify anything missing, and stage any safe change for my explicit approval.`;
+}
+
 function renderConfigSection(title, values) {
+  const metadata = configurationSectionMeta[title] || { category: "security", description: "Effective runtime configuration." };
   const card = document.createElement("article");
   card.className = "panel config-card";
+  card.dataset.configCard = "";
+  card.dataset.configCategory = metadata.category;
+  const headingWrap = document.createElement("div");
+  headingWrap.className = "config-card-heading";
+  const headingText = document.createElement("div");
+  const eyebrow = document.createElement("span");
+  eyebrow.className = "config-eyebrow";
+  eyebrow.textContent = metadata.category.includes("integrations") ? "INTEGRATION" : metadata.category === "ai" ? "INTELLIGENCE" : "SYSTEM";
   const heading = document.createElement("h2");
   heading.textContent = title;
+  const description = document.createElement("p");
+  description.textContent = metadata.description;
+  headingText.append(eyebrow, heading, description);
+  const configuredValues = Object.values(values || {}).filter((value) => typeof value === "boolean");
+  const state = document.createElement("span");
+  state.className = "config-scope";
+  state.textContent = configuredValues.length === 0 || configuredValues.some(Boolean) ? "ACTIVE" : "OFF";
+  headingWrap.append(headingText, state);
   const list = document.createElement("dl");
   list.className = "config-list";
   Object.entries(values || {}).forEach(([key, value]) => {
     const row = document.createElement("div");
+    if (/(seconds|bytes|count|depth|limit)/.test(key)) row.dataset.configTechnical = "true";
     const term = document.createElement("dt");
     term.textContent = label(key);
     const detail = document.createElement("dd");
@@ -1525,8 +1669,40 @@ function renderConfigSection(title, values) {
     row.append(term, detail);
     list.append(row);
   });
-  card.append(heading, list);
+  const footer = document.createElement("div");
+  footer.className = "config-card-footer";
+  const scope = document.createElement("small");
+  scope.textContent = "Effective · secret-safe";
+  const action = document.createElement("button");
+  action.className = "config-inline-action";
+  action.type = "button";
+  action.textContent = "Configure with Monique →";
+  action.dataset.chatPrompt = configurePrompt(title);
+  footer.append(scope, action);
+  card.append(headingWrap, list, footer);
+  card.dataset.configSearch = `${title} ${metadata.description} ${Object.keys(values || {}).join(" ")}`.toLowerCase();
   return card;
+}
+
+function applyConfigurationFilter() {
+  const cards = [...document.querySelectorAll("[data-config-card]")];
+  let visible = 0;
+  cards.forEach((card) => {
+    const category = card.dataset.configCategory || "all";
+    const categoryMatch = configurationFilter === "all" || category === "all" || category.split(" ").includes(configurationFilter);
+    const haystack = `${card.dataset.configSearch || ""} ${card.textContent || ""}`.toLocaleLowerCase(localeTag());
+    const queryMatch = !configurationQuery || haystack.includes(configurationQuery);
+    card.hidden = !(categoryMatch && queryMatch);
+    if (!card.hidden && card.closest(".config-primary") && !card.classList.contains("config-section-heading")) visible += 1;
+  });
+  byId("configuration-empty").hidden = visible > 0 || configurationQuery.length === 0;
+}
+
+function updateConfigurationSummary(config) {
+  const connections = Object.values(config.connectors || {}).filter((value) => value === true).length;
+  byId("configuration-connections-state").textContent = `${connections} connected`;
+  byId("configuration-manage-state").textContent = config.manage?.configured ? "Connected" : "Not attached";
+  byId("configuration-last-read").textContent = `Updated ${new Date().toLocaleTimeString(localeTag(), { hour: "2-digit", minute: "2-digit" })}`;
 }
 
 function syncManageIntegration(manage) {
@@ -1565,6 +1741,8 @@ async function loadConfiguration(force = false) {
     delete core.providers;
     delete core.connectors;
     delete core.manage;
+    delete core.governance;
+    delete core.extensions;
     syncManageIntegration(config.manage);
     const manage = { ...config.manage };
     delete manage.console_url;
@@ -1575,9 +1753,13 @@ async function loadConfiguration(force = false) {
       renderConfigSection("Providers", config.providers),
       renderConfigSection("Connectors", config.connectors),
       renderConfigSection("Manage AI Operations", manage),
+      renderConfigSection("Governance & safety", config.governance),
+      renderConfigSection("Extensions & automation", config.extensions),
     );
+    updateConfigurationSummary(config);
+    applyConfigurationFilter();
     root.dataset.loaded = "true";
-    if (force) toast("Effective configuration refreshed.");
+    if (force) toast("Runtime configuration refreshed.");
   } catch (error) {
     root.replaceChildren(renderConfigSection("Configuration unavailable", { category: error.message }));
     toast("Configuration projection is unavailable.", "error");
@@ -1585,6 +1767,77 @@ async function loadConfiguration(force = false) {
 }
 
 byId("configuration-refresh").addEventListener("click", () => loadConfiguration(true));
+
+const chatProfiles = ["conversation", "operational"];
+const refreshRates = [5000, 10000, 30000, 60000];
+
+function saveConfigurationPreference(message = true) {
+  if (message) toast("Configuration preference saved.");
+}
+
+function applyDefaultProfile(profile, persist = true) {
+  if (!chatProfiles.includes(profile)) profile = "conversation";
+  byId("configuration-profile").value = profile;
+  byId("chat-profile").value = profile;
+  if (persist) savePreference("monique-chat-profile", profile);
+}
+
+function applyRefreshRate(value, persist = true) {
+  const rate = refreshRates.includes(Number(value)) ? Number(value) : 10000;
+  byId("configuration-refresh-rate").value = String(rate);
+  if (persist) savePreference("monique-refresh-rate", String(rate));
+  scheduleStatusRefresh(rate);
+}
+
+function applyTechnicalValues(enabled, persist = true) {
+  document.documentElement.dataset.configDetails = enabled ? "detailed" : "concise";
+  byId("configuration-technical-values").checked = enabled;
+  if (persist) savePreference("monique-technical-values", enabled ? "on" : "off");
+}
+
+async function applyNotifications(enabled, persist = true) {
+  if (!("Notification" in window)) {
+    byId("configuration-notifications").checked = false;
+    toast("Notifications are not available in this browser.", "error");
+    return;
+  }
+  if (enabled && Notification.permission !== "granted") {
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") {
+      byId("configuration-notifications").checked = false;
+      if (persist) savePreference("monique-notifications", "off");
+      toast("Notification permission was not granted.", "error");
+      return;
+    }
+  }
+  byId("configuration-notifications").checked = enabled;
+  if (persist) savePreference("monique-notifications", enabled ? "on" : "off");
+}
+
+applyDefaultProfile(storedPreference("monique-chat-profile", chatProfiles, "conversation"), false);
+applyRefreshRate(Number(storedPreference("monique-refresh-rate", refreshRates.map(String), "10000")), false);
+applyTechnicalValues(storedPreference("monique-technical-values", ["on", "off"], "on") === "on", false);
+byId("configuration-notifications").checked = storedPreference("monique-notifications", ["on", "off"], "off") === "on" && "Notification" in window && Notification.permission === "granted";
+
+byId("configuration-theme").addEventListener("change", (event) => { applyTheme(event.target.value); saveConfigurationPreference(); });
+byId("configuration-language").addEventListener("change", (event) => { applyLanguage(event.target.value); saveConfigurationPreference(); });
+byId("configuration-text-scale").addEventListener("change", (event) => { applyTextScale(event.target.value); saveConfigurationPreference(); });
+byId("configuration-density").addEventListener("change", (event) => { applyDensity(event.target.value); saveConfigurationPreference(); });
+byId("configuration-startup").addEventListener("change", (event) => { applyStartupView(event.target.value); saveConfigurationPreference(); });
+byId("configuration-motion").addEventListener("change", (event) => { applyMotion(event.target.checked ? "reduce" : "full"); saveConfigurationPreference(); });
+byId("configuration-profile").addEventListener("change", (event) => { applyDefaultProfile(event.target.value); saveConfigurationPreference(); });
+byId("configuration-refresh-rate").addEventListener("change", (event) => { applyRefreshRate(event.target.value); saveConfigurationPreference(); });
+byId("configuration-technical-values").addEventListener("change", (event) => { applyTechnicalValues(event.target.checked); saveConfigurationPreference(); });
+byId("configuration-notifications").addEventListener("change", (event) => applyNotifications(event.target.checked));
+byId("configuration-search").addEventListener("input", (event) => {
+  configurationQuery = event.target.value.trim().toLocaleLowerCase(localeTag());
+  applyConfigurationFilter();
+});
+document.querySelectorAll("[data-config-filter]").forEach((button) => button.addEventListener("click", () => {
+  configurationFilter = button.dataset.configFilter;
+  document.querySelectorAll("[data-config-filter]").forEach((item) => item.classList.toggle("is-active", item === button));
+  applyConfigurationFilter();
+}));
 
 function renderMessageMeta(meta) {
   const createdAt = Number(meta.dataset.createdAt);
@@ -2215,7 +2468,14 @@ document.addEventListener("keydown", (event) => {
 refreshStatus();
 loadConfiguration();
 showView(window.location.hash.slice(1) || storedPreference("monique-start-view", startupViews, "chat"));
-window.setInterval(() => { if (!document.hidden) refreshStatus(); }, 10_000);
+function scheduleStatusRefresh(delay = 10000) {
+  if (statusRefreshTimer !== null) window.clearTimeout(statusRefreshTimer);
+  statusRefreshTimer = window.setTimeout(async () => {
+    if (!document.hidden) await refreshStatus();
+    scheduleStatusRefresh(Number(byId("configuration-refresh-rate").value));
+  }, delay);
+}
+scheduleStatusRefresh(Number(byId("configuration-refresh-rate").value));
 window.setInterval(updateObservedAge, 1_000);
 window.setInterval(renderPulse, 1_000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshStatus(); });

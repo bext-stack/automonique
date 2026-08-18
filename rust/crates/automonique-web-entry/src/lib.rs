@@ -581,6 +581,8 @@ struct ConfigurationView {
     providers: ProviderConfigurationView,
     connectors: ConnectorConfigurationView,
     manage: ManageConfigurationView,
+    governance: GovernanceConfigurationView,
+    extensions: ExtensionConfigurationView,
 }
 
 #[derive(Serialize)]
@@ -617,6 +619,24 @@ struct ManageConfigurationView {
     ai_operations_worker_configured: bool,
     agent_tools_configured: bool,
     dashboard_authority: &'static str,
+}
+
+#[derive(Serialize)]
+struct GovernanceConfigurationView {
+    approval_policy_configured: bool,
+    memory_policy_configured: bool,
+    shadow_observation_configured: bool,
+    backup_store_available: bool,
+    audit_store_available: bool,
+}
+
+#[derive(Serialize)]
+struct ExtensionConfigurationView {
+    mcp_registry_configured: bool,
+    local_knowledge_configured: bool,
+    improvement_lab_configured: bool,
+    automations_store_available: bool,
+    skills_store_available: bool,
 }
 
 #[derive(Serialize)]
@@ -849,8 +869,9 @@ impl WebIntegration {
 
     fn configuration(&self) -> ConfigurationView {
         let exists = |relative: &str| self.state_dir.join(relative).is_file();
+        let directory_exists = |relative: &str| self.state_dir.join(relative).is_dir();
         ConfigurationView {
-            schema: "automonique.dashboard.configuration/v2",
+            schema: "automonique.dashboard.configuration/v3",
             canonical_host: self.config.hosts.canonical().to_owned(),
             authentication: "HTTP Basic / SHA-256 verifier",
             transport_security: "HTTPS required",
@@ -895,6 +916,20 @@ impl WebIntegration {
                 } else {
                     "not attached"
                 },
+            },
+            governance: GovernanceConfigurationView {
+                approval_policy_configured: exists("approvals/approvals.conf"),
+                memory_policy_configured: exists("memory/memory.conf"),
+                shadow_observation_configured: exists("shadow/shadow.conf"),
+                backup_store_available: directory_exists("backups"),
+                audit_store_available: exists("audit-chain.sqlite3"),
+            },
+            extensions: ExtensionConfigurationView {
+                mcp_registry_configured: exists("mcp/servers.json"),
+                local_knowledge_configured: exists("knowledge/catalog.json"),
+                improvement_lab_configured: exists("improvement-lab.json"),
+                automations_store_available: exists("automations.sqlite3"),
+                skills_store_available: directory_exists("skills"),
             },
         }
     }
@@ -3153,6 +3188,37 @@ mod tests {
         ] {
             assert!(DASHBOARD_HTML.contains(&format!("value=\"{theme}\"")));
         }
+    }
+
+    #[test]
+    fn configuration_is_a_complete_secret_safe_control_surface() {
+        for control in [
+            "configuration-search",
+            "configuration-theme",
+            "configuration-language",
+            "configuration-text-scale",
+            "configuration-density",
+            "configuration-startup",
+            "configuration-motion",
+            "configuration-profile",
+            "configuration-refresh-rate",
+            "configuration-technical-values",
+            "configuration-notifications",
+        ] {
+            assert!(
+                DASHBOARD_HTML.contains(&format!("id=\"{control}\"")),
+                "missing configuration control {control}"
+            );
+        }
+        for category in ["preferences", "ai", "integrations", "security"] {
+            assert!(DASHBOARD_HTML.contains(&format!("data-config-filter=\"{category}\"")));
+        }
+        assert!(DASHBOARD_JS.contains("monique-chat-profile"));
+        assert!(DASHBOARD_JS.contains("monique-refresh-rate"));
+        assert!(DASHBOARD_JS.contains("monique-notifications"));
+        assert!(DASHBOARD_JS.contains("applyConfigurationFilter"));
+        assert!(DASHBOARD_HTML.contains("Credentials remain outside this browser."));
+        assert!(!DASHBOARD_HTML.contains("type=\"password\""));
     }
 
     #[test]
