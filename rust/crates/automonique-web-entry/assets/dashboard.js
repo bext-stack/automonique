@@ -330,7 +330,9 @@ const frenchUi = Object.freeze({
   "Unassigned": "Non attribué",
   "Details": "Détails",
   "Hide details": "Masquer les détails",
+  "Ticket ID": "ID du ticket",
   "Workflow": "Flux de travail",
+  "Lifecycle and workflow aligned": "Cycle et flux alignés",
   "Assignee": "Responsable",
   "Requester": "Demandeur",
   "Site": "Site",
@@ -1213,6 +1215,12 @@ function ticketPriorityRank(priority) {
   return { urgent: 0, high: 1, normal: 2, low: 3 }[priority] ?? 4;
 }
 
+function ticketReferenceLabel(value) {
+  const raw = String(value || "unknown").replace(/^#/, "");
+  if (raw.length <= 12) return `#${raw}`;
+  return `#${raw.slice(0, 8)}…`;
+}
+
 function ticketStatusRank(ticket) {
   const status = ticket.workflow === "blocked" ? "blocked" : ticket.workflow === "in_progress" ? "in_progress" : ticket.status;
   return { blocked: 0, in_progress: 1, triaging: 2, open: 3, unknown: 4, done: 5, closed: 6 }[status] ?? 7;
@@ -1342,7 +1350,10 @@ function renderTickets() {
     const dot = document.createElement("i");
     dot.setAttribute("aria-label", `${operationLabel(ticket.priority)} priority`);
     const id = document.createElement("span");
-    id.textContent = ticket.id.startsWith("#") ? ticket.id : `#${ticket.id}`;
+    const fullReference = ticket.id.startsWith("#") ? ticket.id : `#${ticket.id}`;
+    id.setAttribute("data-i18n-skip", "");
+    id.textContent = ticketReferenceLabel(ticket.id);
+    reference.title = fullReference;
     reference.append(dot, id);
     const body = document.createElement("div");
     body.className = "ticket-body";
@@ -1373,10 +1384,13 @@ function renderTickets() {
     const workflow = document.createElement("small");
     workflow.className = "ticket-workflow";
     const workflowConflict = (ticket.status === "closed" || ticket.status === "done") && !["closed", "done", "unknown"].includes(ticket.workflow);
+    const workflowAligned = ticket.status === ticket.workflow;
     if (workflowConflict) workflow.classList.add("is-conflict");
     workflow.textContent = workflowConflict
       ? `Workflow mismatch · ${ticketStatusLabel(ticket.workflow)}`
-      : `Workflow · ${ticketStatusLabel(ticket.workflow)}`;
+      : workflowAligned
+        ? "Lifecycle and workflow aligned"
+        : `Workflow · ${ticketStatusLabel(ticket.workflow)}`;
     lifecycle.append(status, workflow);
     const actions = document.createElement("div");
     actions.className = "ticket-actions";
@@ -1405,6 +1419,7 @@ function renderTickets() {
     details.id = detailId;
     details.hidden = true;
     [
+      ["Ticket ID", fullReference],
       ["Priority", operationLabel(ticket.priority)],
       ["Workflow", ticketStatusLabel(ticket.workflow)],
       ["Assignee", ticket.assignee || "Unassigned"],

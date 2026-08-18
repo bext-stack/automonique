@@ -1715,14 +1715,17 @@ fn ticket_bounded_count(object: &serde_json::Map<String, Value>, keys: &[&str]) 
 }
 
 fn ticket_identifier(object: &serde_json::Map<String, Value>) -> String {
-    ticket_string(object, &["reference", "ticket_id", "id", "number"])
-        .filter(|value| {
-            value.len() <= 120
-                && value.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'#' | b'_' | b'-' | b'.' | b':')
-                })
-        })
-        .unwrap_or_else(|| String::from("unreferenced"))
+    ticket_string(
+        object,
+        &["reference", "ticket_id", "ticket_number", "number", "id"],
+    )
+    .filter(|value| {
+        value.len() <= 120
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'#' | b'_' | b'-' | b'.' | b':')
+            })
+    })
+    .unwrap_or_else(|| String::from("unreferenced"))
 }
 
 fn normalized_ticket_status(value: Option<String>) -> String {
@@ -3019,6 +3022,7 @@ mod tests {
             "data": {
                 "items": [{
                     "number": 42,
+                    "id": "7079b98c-acc1-4660-b616-fbc6493fa379",
                     "title": "Repair the dashboard",
                 "state": "working",
                 "lifecycle": "open",
