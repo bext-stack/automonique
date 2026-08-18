@@ -28,6 +28,8 @@ const MAX_MANIFEST_BYTES: u64 = 8 * 1024;
 pub const MAX_PRISM_APPS: usize = 128;
 /// Most enabled Prism hostnames one snapshot retains.
 pub const MAX_PRISM_SITES: usize = 256;
+/// Most enabled DNS hostnames retained across all Nginx applications.
+pub const MAX_ENABLED_HOSTS: usize = 512;
 const MANAGE_PROFILE_ENDPOINT: &str = "http://127.0.0.1/__bext/sdk/kv/get";
 const MAX_MANAGE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MANAGE_PROFILES: usize = 500;
@@ -48,6 +50,18 @@ impl PrismSiteInventory {
     }
 
     /// Unique enabled DNS hostnames backed by a Prism app.
+    #[must_use]
+    pub fn sites(&self) -> &[String] {
+        &self.sites
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnabledHostInventory {
+    sites: Vec<String>,
+}
+
+impl EnabledHostInventory {
     #[must_use]
     pub fn sites(&self) -> &[String] {
         &self.sites
@@ -389,6 +403,49 @@ pub fn prism_sites(root: &Path) -> Result<PrismSiteInventory, SiteInventoryFailu
     })
 }
 
+/// Read all literal DNS hostnames from secure enabled Nginx vhosts.
+///
+/// This deliberately retains no filesystem paths, proxy destinations, TLS
+/// material, or configuration text.
+pub fn enabled_hosts(root: &Path) -> Result<EnabledHostInventory, SiteInventoryFailure> {
+    let metadata = fs::metadata(root).map_err(|_| SiteInventoryFailure::Unavailable)?;
+    if !metadata.is_dir() || metadata.permissions().mode() & 0o022 != 0 {
+        return Err(SiteInventoryFailure::Insecure);
+    }
+    let mut seen = 0_usize;
+    let mut sites = BTreeSet::new();
+    for entry in fs::read_dir(root).map_err(|_| SiteInventoryFailure::Unavailable)? {
+        seen = seen.saturating_add(1);
+        if seen > MAX_DIRECTORY_ENTRIES {
+            return Err(SiteInventoryFailure::TooManyEntries);
+        }
+        let entry = entry.map_err(|_| SiteInventoryFailure::Unavailable)?;
+        let metadata = entry
+            .metadata()
+            .map_err(|_| SiteInventoryFailure::Unavailable)?;
+        if !metadata.is_file() {
+            continue;
+        }
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return Err(SiteInventoryFailure::Insecure);
+        }
+        let text = read_bounded_text(&entry.path(), MAX_VHOST_BYTES)?;
+        for value in nginx_directive_values(&text, "server_name") {
+            for host in value.split_ascii_whitespace() {
+                if is_dns_host(host) {
+                    sites.insert(host.to_owned());
+                }
+            }
+        }
+        if sites.len() > MAX_ENABLED_HOSTS {
+            return Err(SiteInventoryFailure::TooManySites);
+        }
+    }
+    Ok(EnabledHostInventory {
+        sites: sites.into_iter().collect(),
+    })
+}
+
 fn read_bounded_text(path: &Path, limit: u64) -> Result<String, SiteInventoryFailure> {
     let file = fs::File::open(path).map_err(|_| SiteInventoryFailure::Unavailable)?;
     let metadata = file
@@ -569,6 +626,20 @@ mod tests {
         let inventory = prism_sites(&enabled).expect("inventory");
         assert!(inventory.apps().is_empty());
         assert!(inventory.sites().is_empty());
+    }
+
+    #[test]
+    fn enabled_host_inventory_includes_non_prism_vhosts_without_paths() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let enabled = fixture.path().join("enabled");
+        fs::create_dir(&enabled).expect("enabled");
+        fs::set_permissions(&enabled, fs::Permissions::from_mode(0o700)).expect("root mode");
+        secure_file(
+            &enabled.join("sites.conf"),
+            "server_name www.example.test example.test;\nroot /private/application;\n",
+        );
+        let inventory = enabled_hosts(&enabled).expect("inventory");
+        assert_eq!(inventory.sites(), ["example.test", "www.example.test"]);
     }
 
     #[test]

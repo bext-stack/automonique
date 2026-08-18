@@ -112,7 +112,8 @@ use std::time::{Duration, Instant};
 pub use automonique_core::conversation::utc_rfc3339_from_unix_millis;
 use automonique_core::conversation::{
     is_current_time_question, is_deferred_placeholder_answer, is_enabled_site_inventory_question,
-    is_named_entity_description_question, is_site_inventory_question, is_site_profile_question,
+    is_named_entity_description_question, is_pm2_process_question, is_site_inventory_question,
+    is_site_profile_question,
 };
 use automonique_github_connector::IssueLocator;
 use automonique_protocol::admin::ExecutionState;
@@ -11063,6 +11064,7 @@ fn question_profile(question: &str) -> QuestionProfile {
     let asks_about_account_usage = is_codex_usage_terms(&terms);
     if asks_about_account_usage
         || is_site_inventory_question(question)
+        || is_pm2_process_question(question)
         || is_operator_inventory_terms(&terms)
         || terms.contains("claude")
         || terms.contains("activity")
@@ -11199,6 +11201,7 @@ pub struct QuestionSources {
     host_load: bool,
     operators: bool,
     sites: bool,
+    processes: bool,
     knowledge: bool,
     models: bool,
     tickets: bool,
@@ -11212,6 +11215,7 @@ impl QuestionSources {
             host_load: false,
             operators: false,
             sites: false,
+            processes: false,
             knowledge: false,
             models: false,
             tickets: false,
@@ -11225,6 +11229,7 @@ impl QuestionSources {
             host_load: true,
             operators: true,
             sites: true,
+            processes: true,
             knowledge: true,
             models: true,
             tickets: true,
@@ -11237,6 +11242,7 @@ impl QuestionSources {
             || self.host_load
             || self.operators
             || self.sites
+            || self.processes
             || self.knowledge
             || self.models
             || self.tickets
@@ -11247,6 +11253,7 @@ impl QuestionSources {
         self.status
             || self.operators
             || self.sites
+            || self.processes
             || self.knowledge
             || self.models
             || self.tickets
@@ -11257,6 +11264,7 @@ impl QuestionSources {
         self.status
             || self.host_load
             || self.operators
+            || self.processes
             || self.knowledge
             || self.models
             || self.tickets
@@ -11481,6 +11489,7 @@ fn question_sources(question: &str) -> QuestionSources {
                 "agence",
                 "agences",
             ]),
+        processes: is_pm2_process_question(question),
         knowledge: false,
         models: requests_models,
         tickets: contains(&[
@@ -11517,6 +11526,7 @@ fn question_sources(question: &str) -> QuestionSources {
         && !sources.host_load
         && !sources.operators
         && !sources.sites
+        && !sources.processes
         && !sources.knowledge
         && !sources.models
         && !sources.tickets
@@ -12001,7 +12011,7 @@ fn question_intent_prompt(
          When and only when the current admin message explicitly asks to compose and send or post text to one configured Slack channel that it names, return {{\"kind\":\"slack_post\",\"channel\":\"exact configured label without #\",\"text\":\"final message to preview\"}}. This schema creates a Telegram approval preview; it does not post by itself, so never claim it was sent. Distinguish asking about, reading, quoting, or discussing a channel from asking to post to it. Never select a channel solely from memory.\n\
          When a discovered MCP tool directly fulfills the user's intent, return {{\"kind\":\"mcp_call\",\"server\":\"exact discovered server\",\"tool\":\"exact discovered tool\",\"arguments\":{{...}}}}. Choose by semantic intent, not keyword matching. MCP writes return contextual approval requests and are not executed until approved; never claim a write completed before the tool result says so. Never invent a server, tool, argument, URL, credential, or hidden field.\n\
          When the current admin message explicitly asks for a GitHub write in one configured repository, use the native GitHub tool: create={{\"kind\":\"github_action\",\"action\":\"create\",\"alias\":\"exact configured alias\"}}; reply={{\"kind\":\"github_action\",\"action\":\"reply\",\"issue_url\":\"exact canonical issue URL from the current message\"}}; checklist={{\"kind\":\"github_action\",\"action\":\"check\",\"issue_url\":\"exact canonical issue URL from the current message\",\"checked\":true}}; management={{\"kind\":\"github_action\",\"action\":\"manage\",\"domain\":\"issue|label|milestone|epic|project\"}}. Select these by meaning and paraphrase, including minor spelling or accent errors. Never invent an alias or issue URL.\n\
-         Allowed sources are status, host_load, operators, sites, knowledge, models, tickets, activity. The sites source covers enabled deployments and Manage profiles. The knowledge source covers provenance-bearing product procedures and operating facts. Select knowledge for questions about how a named local product such as Company Manager works; add sites only when deployment or site-profile state is also material. Select only sources materially needed.\n\
+         Allowed sources are status, host_load, operators, sites, processes, knowledge, models, tickets, activity. The sites source covers enabled deployments and Manage profiles. The processes source covers the current sanitized PM2 registry and must be selected for PM2 or running host-process questions. The knowledge source covers provenance-bearing product procedures and operating facts. Select knowledge for questions about how a named local product such as Company Manager works; add sites only when deployment or site-profile state is also material. Select only sources materially needed.\n\
          slack_channel may be one exact configured label listed below, or null. github_issues is true only when the question or recent conversation identifies concrete GitHub issue references to read.\n\
          Read plans are read-only. Never encode an action, command, mutation, recipient, shell instruction, filesystem path, or approval in them. Requests to change, send, post, approve, run, or modify something require an available native or MCP tool; otherwise answer conversationally.\n\
          Your answer text is itself posted as Monique's one visible reply on the current transport surface, so reaching people already in this conversation needs no tool: a request to notify, tell, ping, remind, or relay something to a person here is fulfilled by returning kind answer whose text is that message, written to that person in the user's language. Only delivery somewhere else — another channel, a DM, or an external system — needs slack_post or an MCP tool. Never claim you cannot send or post messages on the current surface; the reply you are returning is one.\n\
@@ -12057,7 +12067,7 @@ fn model_question_intent(
                 return None;
             }
             let requested = object.get("sources")?.as_array()?;
-            if requested.len() > 8 {
+            if requested.len() > 9 {
                 return None;
             }
             let mut sources = QuestionSources::none();
@@ -12072,6 +12082,7 @@ fn model_question_intent(
                     "host_load" => sources.host_load = true,
                     "operators" => sources.operators = true,
                     "sites" => sources.sites = true,
+                    "processes" => sources.processes = true,
                     "knowledge" => sources.knowledge = true,
                     "models" => sources.models = true,
                     "tickets" => sources.tickets = true,
@@ -13360,54 +13371,59 @@ mod clock_tests {
         struct Case {
             question: &'static str,
             profile: QuestionProfile,
-            selected: [bool; 8],
+            selected: [bool; 9],
         }
 
         let cases = [
             Case {
                 question: "why is the sky blue?",
                 profile: QuestionProfile::Conversation,
-                selected: [true, false, false, false, false, false, false, false],
+                selected: [true, false, false, false, false, false, false, false, false],
             },
             Case {
                 question: "what sites do we manage on this server",
                 profile: QuestionProfile::OperationalLookup,
-                selected: [false, false, false, true, false, false, false, false],
+                selected: [false, false, false, true, false, false, false, false, false],
             },
             Case {
                 question: "liste les domaines hébergés sur ce serveur",
                 profile: QuestionProfile::OperationalLookup,
-                selected: [false, false, false, true, false, false, false, false],
+                selected: [false, false, false, true, false, false, false, false, false],
+            },
+            Case {
+                question: "which PM2 processes are running?",
+                profile: QuestionProfile::OperationalLookup,
+                selected: [false, false, false, false, true, false, false, false, false],
             },
             Case {
                 question: "what models do you have access to?",
                 profile: QuestionProfile::OperationalLookup,
-                selected: [false, false, false, false, false, true, false, false],
+                selected: [false, false, false, false, false, false, true, false, false],
             },
             Case {
                 question: "who are the configured admins?",
                 profile: QuestionProfile::OperationalLookup,
-                selected: [false, false, true, false, false, false, false, false],
+                selected: [false, false, true, false, false, false, false, false, false],
             },
             Case {
                 question: "summarize ticket #12",
                 profile: QuestionProfile::Operational,
-                selected: [false, false, false, false, false, false, true, false],
+                selected: [false, false, false, false, false, false, false, true, false],
             },
             Case {
                 question: "why is the client site down?",
                 profile: QuestionProfile::Operational,
-                selected: [false, false, false, true, false, false, true, false],
+                selected: [false, false, false, true, false, false, false, true, false],
             },
             Case {
                 question: "do you know how to create accounts in company manager?",
                 profile: QuestionProfile::Operational,
-                selected: [false, false, false, true, false, false, false, false],
+                selected: [false, false, false, true, false, false, false, false, false],
             },
             Case {
                 question: "what agent activity happened today?",
                 profile: QuestionProfile::OperationalLookup,
-                selected: [false, false, false, false, false, false, false, true],
+                selected: [false, false, false, false, false, false, false, false, true],
             },
         ];
 
@@ -13425,6 +13441,7 @@ mod clock_tests {
                     sources.host_load,
                     sources.operators,
                     sources.sites,
+                    sources.processes,
                     sources.knowledge,
                     sources.models,
                     sources.tickets,
@@ -14649,6 +14666,32 @@ impl ControlSurface for StoreControlSurface {
             ),
             None => String::from("status=not_requested"),
         };
+        let enabled_hosts = if sources.sites {
+            match self
+                .prism_sites_root
+                .as_deref()
+                .ok_or(crate::site_inventory::SiteInventoryFailure::Unavailable)
+                .and_then(crate::site_inventory::enabled_hosts)
+            {
+                Ok(inventory) => {
+                    let question_terms = local_entity_terms(question);
+                    let (sites, included) =
+                        ranked_entity_values(inventory.sites(), &question_terms, 3_072);
+                    format!(
+                        "source=all enabled nginx vhosts, hostnames only\nstatus=available\nhostname_count={}\nhostnames_included={}\nhostnames_omitted={}\nhostnames={}",
+                        inventory.sites().len(),
+                        included,
+                        inventory.sites().len().saturating_sub(included),
+                        sites,
+                    )
+                }
+                Err(_) => String::from(
+                    "source=nginx_sites_enabled\nstatus=unavailable\nhostname_count=unavailable\nhostnames=unavailable",
+                ),
+            }
+        } else {
+            String::from("status=not_requested")
+        };
         let manage_profiles = if let (true, Some(profile_app)) =
             (sources.sites, self.manage_profile_app.as_ref())
         {
@@ -14738,6 +14781,14 @@ impl ControlSurface for StoreControlSurface {
         } else {
             String::from("status=not_requested")
         };
+        let pm2_processes = if sources.processes {
+            crate::pm2_inventory::current().map_or_else(
+                |_| String::from("source=PM2 jlist sanitized read model\nstatus=unavailable"),
+                |inventory| inventory.render(),
+            )
+        } else {
+            String::from("status=not_requested")
+        };
         let configured_models = if sources.models {
             self.provider_state_dir.as_deref().map_or_else(
                 || {
@@ -14819,6 +14870,7 @@ impl ControlSurface for StoreControlSurface {
              selected_sources.host_load={}\n\
              selected_sources.operators={}\n\
              selected_sources.sites={}\n\
+             selected_sources.processes={}\n\
              selected_sources.knowledge={}\n\
              selected_sources.models={}\n\
              selected_sources.tickets={}\n\
@@ -14833,8 +14885,10 @@ impl ControlSurface for StoreControlSurface {
              [daemon_status]\n{}\n\n\
              [host_load]\n{}\n\n\
              [managed_prism_sites]\n{}\n\n\
+             [enabled_nginx_hostnames]\n{}\n\n\
              [manage_site_profiles]\n{}\n\n\
              [local_entity_knowledge]\n{}\n\n\
+             [pm2_processes]\n{}\n\n\
              [configured_model_routes]\n{}\n\n\
              [local_agent_activity]\n{}\n\n\
              [ticket_observed_metadata]\n\
@@ -14850,6 +14904,7 @@ impl ControlSurface for StoreControlSurface {
             if sources.host_load { "yes" } else { "no" },
             if sources.operators { "yes" } else { "no" },
             if sources.sites { "yes" } else { "no" },
+            if sources.processes { "yes" } else { "no" },
             if sources.knowledge { "yes" } else { "no" },
             if sources.models { "yes" } else { "no" },
             if sources.tickets { "yes" } else { "no" },
@@ -14872,8 +14927,10 @@ impl ControlSurface for StoreControlSurface {
             status,
             host_load,
             prism_sites,
+            enabled_hosts,
             manage_profiles,
             local_knowledge,
+            pm2_processes,
             configured_models,
             agent_activity,
             question_values(&observed_tenants),

@@ -18,8 +18,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use automonique_core::conversation::{
-    is_current_time_question, is_deferred_placeholder_answer, is_site_profile_question,
-    utc_rfc3339_from_unix_millis,
+    is_current_time_question, is_deferred_placeholder_answer, is_pm2_process_question,
+    is_site_profile_question, utc_rfc3339_from_unix_millis,
 };
 #[cfg(test)]
 use automonique_core::conversation::{
@@ -35,7 +35,7 @@ use automonique_daemon::telegram_bridge::{QuestionProfile, RunFailure, RunLane, 
 use automonique_daemon::{
     manage_config::{ManageConfig, ManageProfileApp},
     mcp_client::{McpCallResult, McpRegistry, McpToolDescriptor},
-    site_inventory::{NGINX_SITES_ENABLED, manage_profiles, prism_sites},
+    site_inventory::{NGINX_SITES_ENABLED, enabled_hosts, manage_profiles, prism_sites},
 };
 use automonique_store::agent_memory::{AgentMemoryStore, MemoryRecord, MessageInput};
 use automonique_transport_runtime::ChannelName;
@@ -954,6 +954,8 @@ struct ChatPromptContext<'a> {
     status: &'a DashboardStatus,
     request_time_utc: &'a str,
     live_sites: Option<&'a LiveSiteContext>,
+    live_knowledge: Option<&'a str>,
+    live_processes: Option<&'a str>,
     manage: &'a ManageIntegration,
 }
 
@@ -1526,6 +1528,18 @@ impl WebIntegration {
             .is_none()
             .then(|| self.site_context(message))
             .flatten();
+        let knowledge_context = direct_answer
+            .is_none()
+            .then(|| self.knowledge_context(message))
+            .flatten();
+        let process_context = if direct_answer.is_none() && is_pm2_process_question(message) {
+            Some(automonique_daemon::pm2_inventory::current().map_or_else(
+                |_| String::from("source=PM2 jlist sanitized read model\nstatus=unavailable"),
+                |inventory| inventory.render(),
+            ))
+        } else {
+            None
+        };
         let mut live_sources = live_context
             .map(|(channel, _)| vec![format!("slack:{channel}")])
             .unwrap_or_default();
@@ -1545,6 +1559,12 @@ impl WebIntegration {
                 live_sources.push(String::from("manage:profiles"));
             }
         }
+        if knowledge_context.is_some() {
+            live_sources.push(String::from("knowledge:local"));
+        }
+        if process_context.is_some() {
+            live_sources.push(String::from("host:pm2"));
+        }
         let prompt = compose_chat_prompt(
             message,
             &history,
@@ -1556,6 +1576,8 @@ impl WebIntegration {
                 status,
                 request_time_utc: &request_time_utc,
                 live_sites: site_context.as_ref(),
+                live_knowledge: knowledge_context.as_deref(),
+                live_processes: process_context.as_deref(),
                 manage: &self.manage,
             },
         );
@@ -1625,16 +1647,20 @@ impl WebIntegration {
         if !is_site_profile_question(message) {
             return None;
         }
-        let enabled_sites = match prism_sites(Path::new(NGINX_SITES_ENABLED)) {
-            Ok(inventory) => format!(
-                "status=available\napp_count={}\napps={}\nhostname_count={}\nhostnames={}",
-                inventory.apps().len(),
-                bounded_values(inventory.apps(), 2_000),
-                inventory.sites().len(),
-                bounded_values(inventory.sites(), 5_000),
+        let prism = prism_sites(Path::new(NGINX_SITES_ENABLED));
+        let all_hosts = enabled_hosts(Path::new(NGINX_SITES_ENABLED));
+        let enabled_sites = match (prism, all_hosts) {
+            (Ok(prism), Ok(all_hosts)) => format!(
+                "status=available\nprism_app_count={}\nprism_apps={}\nprism_hostname_count={}\nprism_hostnames={}\nenabled_hostname_count={}\nenabled_hostnames={}",
+                prism.apps().len(),
+                bounded_values(prism.apps(), 2_000),
+                prism.sites().len(),
+                bounded_values(prism.sites(), 5_000),
+                all_hosts.sites().len(),
+                bounded_values(all_hosts.sites(), 7_500),
             ),
-            Err(_) => String::from(
-                "status=unavailable\napp_count=unavailable\napps=unavailable\nhostname_count=unavailable\nhostnames=unavailable",
+            _ => String::from(
+                "status=unavailable\nprism_app_count=unavailable\nprism_apps=unavailable\nprism_hostname_count=unavailable\nprism_hostnames=unavailable\nenabled_hostname_count=unavailable\nenabled_hostnames=unavailable",
             ),
         };
         let manage_profiles = self.manage.profile_app.as_ref().map(|profile_app| {
@@ -1647,6 +1673,48 @@ impl WebIntegration {
             enabled_sites,
             manage_profiles,
         })
+    }
+
+    fn knowledge_context(&self, message: &str) -> Option<String> {
+        let path = automonique_daemon::local_knowledge::catalog_path(&self.state_dir);
+        let selection = automonique_daemon::local_knowledge::lookup(&path, message)
+            .ok()
+            .flatten()?;
+        if selection.matched.is_empty() {
+            return None;
+        }
+        let mut rendered = format!(
+            "source=operator-maintained local entity catalog\nstatus=available\nmatched={}",
+            selection.matched.len()
+        );
+        for entity in selection.matched {
+            rendered.push_str(&format!(
+                "\nentity id={} name={} aliases={}",
+                safe_prompt_field(&entity.id, 64),
+                safe_prompt_field(&entity.name, 128),
+                entity
+                    .aliases
+                    .iter()
+                    .map(|alias| safe_prompt_field(alias, 128))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ));
+            rendered.push_str(&format!(
+                "\ndescription text={} basis={} source={}",
+                safe_prompt_field(&entity.description.text, 512),
+                entity.description.basis.as_str(),
+                safe_prompt_field(&entity.description.source, 256),
+            ));
+            for fact in entity.facts {
+                rendered.push_str(&format!(
+                    "\nfact text={} basis={} source={}",
+                    safe_prompt_field(&fact.text, 512),
+                    fact.basis.as_str(),
+                    safe_prompt_field(&fact.source, 256),
+                ));
+            }
+        }
+        Some(rendered.chars().take(6_000).collect())
     }
 
     fn slack_tool(
@@ -2539,6 +2607,16 @@ fn compose_chat_prompt(
             prompt.push_str("\n[/live_tool]\n");
         }
     }
+    if let Some(knowledge) = context.live_knowledge {
+        prompt.push_str("[live_tool capability=local_entity_knowledge freshness=request_time trust=untrusted_data]\n");
+        push_bounded(&mut prompt, knowledge, 6_000);
+        prompt.push_str("\n[/live_tool]\n");
+    }
+    if let Some(processes) = context.live_processes {
+        prompt.push_str("[live_tool capability=pm2_process_inventory freshness=request_time trust=untrusted_data]\n");
+        push_bounded(&mut prompt, processes, 8_000);
+        prompt.push_str("\n[/live_tool]\n");
+    }
     prompt.push_str("[/dashboard_context]\n[user_message]\n");
     prompt.push_str(message);
     prompt.push_str("\n[/user_message]");
@@ -2659,6 +2737,25 @@ fn bounded_values(values: &[String], characters: usize) -> String {
         rendered.push_str(value);
     }
     rendered
+}
+
+fn safe_prompt_field(value: &str, characters: usize) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(characters)
+        .collect()
 }
 
 fn push_bounded(target: &mut String, value: &str, characters: usize) {
@@ -4317,6 +4414,8 @@ mod tests {
                 status: &fixture_status(),
                 request_time_utc: "2026-08-17T00:38:00Z",
                 live_sites: None,
+                live_knowledge: None,
+                live_processes: None,
                 manage: &ManageIntegration {
                     console_url: None,
                     profile_app: None,
@@ -4360,6 +4459,8 @@ mod tests {
                 status: &fixture_status(),
                 request_time_utc: "2026-08-18T17:38:00Z",
                 live_sites: None,
+                live_knowledge: None,
+                live_processes: None,
                 manage: &ManageIntegration {
                     console_url: None,
                     profile_app: None,
@@ -4427,6 +4528,8 @@ mod tests {
                 status: &fixture_status(),
                 request_time_utc: "2026-08-17T00:38:00Z",
                 live_sites: None,
+                live_knowledge: None,
+                live_processes: None,
                 manage: &ManageIntegration {
                     console_url: Some(String::from("https://manage.example.test/")),
                     profile_app: None,
@@ -4464,6 +4567,8 @@ mod tests {
                 status: &fixture_status(),
                 request_time_utc: "2026-08-17T00:38:00Z",
                 live_sites: Some(&sites),
+                live_knowledge: None,
+                live_processes: None,
                 manage: &ManageIntegration {
                     console_url: None,
                     profile_app: None,

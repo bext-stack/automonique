@@ -29,7 +29,7 @@ const MAX_CLAIM_BYTES: usize = 512;
 const MAX_SOURCE_BYTES: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum CatalogFailure {
+pub enum CatalogFailure {
     Insecure,
     Unavailable,
     Malformed,
@@ -37,14 +37,14 @@ pub(crate) enum CatalogFailure {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ClaimBasis {
+pub enum ClaimBasis {
     OperatorAsserted,
     LocalObservation,
     PrimarySource,
 }
 
 impl ClaimBasis {
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::OperatorAsserted => "operator_asserted",
             Self::LocalObservation => "local_observation",
@@ -55,20 +55,20 @@ impl ClaimBasis {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct KnowledgeClaim {
-    pub(crate) text: String,
-    pub(crate) basis: ClaimBasis,
-    pub(crate) source: String,
+pub struct KnowledgeClaim {
+    pub text: String,
+    pub basis: ClaimBasis,
+    pub source: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct KnowledgeEntity {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) aliases: Vec<String>,
-    pub(crate) description: KnowledgeClaim,
-    pub(crate) facts: Vec<KnowledgeClaim>,
+pub struct KnowledgeEntity {
+    pub id: String,
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub description: KnowledgeClaim,
+    pub facts: Vec<KnowledgeClaim>,
 }
 
 #[derive(Deserialize)]
@@ -78,20 +78,17 @@ struct CatalogDocument {
     entities: Vec<KnowledgeEntity>,
 }
 
-pub(crate) struct KnowledgeSelection {
-    pub(crate) total: usize,
-    pub(crate) matched: Vec<KnowledgeEntity>,
+pub struct KnowledgeSelection {
+    pub total: usize,
+    pub matched: Vec<KnowledgeEntity>,
 }
 
-pub(crate) fn catalog_path(state_dir: &Path) -> PathBuf {
+pub fn catalog_path(state_dir: &Path) -> PathBuf {
     state_dir.join(CATALOG_RELATIVE)
 }
 
 /// Load and match the optional catalog without creating it.
-pub(crate) fn lookup(
-    path: &Path,
-    question: &str,
-) -> Result<Option<KnowledgeSelection>, CatalogFailure> {
+pub fn lookup(path: &Path, question: &str) -> Result<Option<KnowledgeSelection>, CatalogFailure> {
     let Some(document) = load(path)? else {
         return Ok(None);
     };

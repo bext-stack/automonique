@@ -120,6 +120,32 @@ pub fn is_site_profile_question(question: &str) -> bool {
     is_site_inventory_question(question) || is_named_entity_description_question(question)
 }
 
+/// Whether a question asks for the host's current PM2 process projection.
+///
+/// This only routes a read. The process reader itself uses a fixed executable
+/// and returns a deliberately narrow projection with no environment, command
+/// line, working directory, or log data.
+#[must_use]
+pub fn is_pm2_process_question(question: &str) -> bool {
+    let normalized = question.to_lowercase();
+    let terms: BTreeSet<&str> = normalized
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .collect();
+    terms.contains("pm2")
+        || (terms.iter().any(|term| {
+            matches!(
+                *term,
+                "process" | "processes" | "service" | "services" | "app" | "apps"
+            )
+        }) && terms.iter().any(|term| {
+            matches!(
+                *term,
+                "running" | "online" | "stopped" | "runtime" | "server" | "serveur"
+            )
+        }))
+}
+
 /// Whether the enabled-vhost projection alone can answer a site question.
 #[must_use]
 pub fn is_enabled_site_inventory_question(question: &str) -> bool {
@@ -314,6 +340,13 @@ mod tests {
         ));
         assert!(is_site_profile_question("what sites do we manage?"));
         assert!(!is_site_profile_question("why is the sky blue?"));
+    }
+
+    #[test]
+    fn pm2_process_questions_are_recognized_without_catching_generic_prose() {
+        assert!(is_pm2_process_question("which PM2 processes are running?"));
+        assert!(is_pm2_process_question("running services on the server"));
+        assert!(!is_pm2_process_question("what is a process?"));
     }
 
     #[test]
