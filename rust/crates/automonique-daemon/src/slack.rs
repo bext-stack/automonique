@@ -6998,6 +6998,58 @@ mod tests {
         seen: Arc<std::sync::Mutex<Vec<(String, String)>>>,
     }
 
+    struct DeferredRunLane {
+        answers: std::collections::VecDeque<String>,
+        profiles: Vec<QuestionProfile>,
+    }
+
+    impl DeferredRunLane {
+        fn new(answers: &[&str]) -> Self {
+            Self {
+                answers: answers.iter().map(|answer| (*answer).to_owned()).collect(),
+                profiles: Vec::new(),
+            }
+        }
+    }
+
+    impl crate::telegram_bridge::RunLane for DeferredRunLane {
+        fn run(&mut self, _task: &str) -> Result<String, crate::telegram_bridge::RunFailure> {
+            self.answers
+                .pop_front()
+                .ok_or(crate::telegram_bridge::RunFailure::Failed)
+        }
+
+        fn run_question(
+            &mut self,
+            _task: &str,
+            profile: QuestionProfile,
+        ) -> Result<String, crate::telegram_bridge::RunFailure> {
+            self.profiles.push(profile);
+            self.answers
+                .pop_front()
+                .ok_or(crate::telegram_bridge::RunFailure::Failed)
+        }
+    }
+
+    #[test]
+    fn slack_wait_placeholders_run_the_shared_completion_pass() {
+        let mut lane = DeferredRunLane::new(&[
+            "I'll search for that and get back to you.",
+            "The Slack reply now contains the completed result.",
+        ]);
+        let answer = run_question_to_completion(
+            &mut lane,
+            "bounded Slack prompt",
+            QuestionProfile::Conversation,
+        )
+        .expect("completion pass");
+        assert_eq!(answer, "The Slack reply now contains the completed result.");
+        assert_eq!(
+            lane.profiles,
+            [QuestionProfile::Conversation, QuestionProfile::Operational]
+        );
+    }
+
     impl SlackQuestionAnswerer for FakeQuestionAnswerer {
         fn answer(
             &mut self,
