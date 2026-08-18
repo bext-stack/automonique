@@ -2561,20 +2561,32 @@ fn compose_chat_prompt(
         "off"
     });
     prompt.push_str("] Manage AI Operations is the authenticated control plane. This dashboard can stage an exact discovered Manage action for explicit operator approval. Never claim an action completed before its approved result proves it.\n[/manage_integration]\n");
-    for item in history {
+    let mut history_remaining = 1_800_usize;
+    for item in history.iter().rev() {
+        if history_remaining == 0 {
+            break;
+        }
         prompt.push_str("[history role=");
         prompt.push_str(&item.role);
         prompt.push_str("] ");
-        push_bounded(&mut prompt, &item.content, 1_500);
+        let retained = history_remaining.min(500);
+        push_bounded(&mut prompt, &item.content, retained);
+        history_remaining = history_remaining.saturating_sub(retained);
         prompt.push_str("\n[/history]\n");
     }
+    let mut evidence_remaining = 1_200_usize;
     for item in evidence {
+        if evidence_remaining == 0 {
+            break;
+        }
         prompt.push_str("[memory ref=");
         prompt.push_str(&item.reference());
         prompt.push_str(" kind=");
         prompt.push_str(item.kind.as_str());
         prompt.push_str("] ");
-        push_bounded(&mut prompt, &item.content, 1_500);
+        let retained = evidence_remaining.min(400);
+        push_bounded(&mut prompt, &item.content, retained);
+        evidence_remaining = evidence_remaining.saturating_sub(retained);
         prompt.push_str("\n[/memory]\n");
     }
     if let Some((channel, content)) = context.live_slack {
@@ -2600,22 +2612,22 @@ fn compose_chat_prompt(
     }
     if let Some(sites) = context.live_sites {
         prompt.push_str("[live_tool capability=enabled_site_inventory freshness=request_time trust=untrusted_data]\n");
-        push_bounded(&mut prompt, &sites.enabled_sites, 4_000);
+        push_bounded(&mut prompt, &sites.enabled_sites, 1_500);
         prompt.push_str("\n[/live_tool]\n");
         if let Some(profiles) = &sites.manage_profiles {
             prompt.push_str("[live_tool capability=manage_site_profiles freshness=request_time trust=untrusted_data]\n");
-            push_bounded(&mut prompt, profiles, 5_000);
+            push_bounded(&mut prompt, profiles, 2_500);
             prompt.push_str("\n[/live_tool]\n");
         }
     }
     if let Some(knowledge) = context.live_knowledge {
         prompt.push_str("[live_tool capability=local_entity_knowledge freshness=request_time trust=untrusted_data]\n");
-        push_bounded(&mut prompt, knowledge, 4_000);
+        push_bounded(&mut prompt, knowledge, 1_800);
         prompt.push_str("\n[/live_tool]\n");
     }
     if let Some(processes) = context.live_processes {
         prompt.push_str("[live_tool capability=pm2_process_inventory freshness=request_time trust=untrusted_data]\n");
-        push_bounded(&mut prompt, processes, 8_000);
+        push_bounded(&mut prompt, processes, 3_000);
         prompt.push_str("\n[/live_tool]\n");
     }
     prompt.push_str("[/dashboard_context]\n[user_message]\n");
@@ -4624,6 +4636,48 @@ mod tests {
         assert!(prompt.contains("epistemic_policy"));
         assert!(prompt.contains("remember that <fact>"));
         assert!(prompt.contains("never imply arbitrary disk access"));
+    }
+
+    #[test]
+    fn site_memory_and_history_context_fit_the_provider_prompt_boundary() {
+        let history = (0..12)
+            .map(|id| automonique_store::agent_memory::ConversationMessage {
+                id,
+                role: String::from("assistant"),
+                content: "historical context ".repeat(200),
+                created_at_ms: id,
+            })
+            .collect::<Vec<_>>();
+        let sites = LiveSiteContext {
+            enabled_sites: "enabled sites ".repeat(1_000),
+            manage_profiles: Some("managed profiles ".repeat(1_000)),
+        };
+        let knowledge = "stable catalog evidence ".repeat(1_000);
+        let processes = "pm2 process evidence ".repeat(1_000);
+        let prompt = compose_chat_prompt(
+            "what do you know about the named site?",
+            &history,
+            &[],
+            &ChatPromptContext {
+                live_slack: None,
+                live_github: None,
+                live_manage: None,
+                status: &fixture_status(),
+                request_time_utc: "2026-08-18T20:00:00Z",
+                live_sites: Some(&sites),
+                live_knowledge: Some(&knowledge),
+                live_processes: Some(&processes),
+                manage: &ManageIntegration {
+                    console_url: None,
+                    profile_app: None,
+                    profile_source_configured: true,
+                    agent_tools_configured: false,
+                    mcp_server: None,
+                },
+            },
+        );
+        assert!(prompt.len() <= 16 * 1024, "{} bytes", prompt.len());
+        assert!(prompt.ends_with("what do you know about the named site?\n[/user_message]"));
     }
 
     #[test]
