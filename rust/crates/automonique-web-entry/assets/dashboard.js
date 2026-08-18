@@ -17,6 +17,7 @@ let memoryQuery = null;
 let operationsSnapshot = null;
 let processesSnapshot = null;
 let processFilter = "all";
+const expandedProcesses = new Set();
 let ticketFilter = "all";
 let ticketQuery = "";
 let ticketSort = "updated_desc";
@@ -409,7 +410,7 @@ const frenchUi = Object.freeze({
   "Details required": "Détails requis",
   "Ready to plan": "Prêt à planifier",
   "Use with Monique →": "Utiliser avec Monique →",
-  "See every active and recent agent process, then work directly with the connected control plane. Safe reads are live; every mutation remains staged for explicit approval.": "Consultez chaque processus d’agent actif ou récent, puis travaillez directement avec le plan de contrôle connecté. Les lectures sûres sont en temps réel ; chaque modification reste soumise à une approbation explicite.",
+  "See every active and recent agent process, inspect its live output, and open the exact run in Manage. Every mutation remains staged for explicit approval.": "Consultez chaque processus d’agent actif ou récent, inspectez sa sortie en direct et ouvrez l’exécution exacte dans Manage. Chaque modification reste soumise à une approbation explicite.",
   "EXECUTION MONITOR": "SUIVI DES EXÉCUTIONS",
   "Agent processes": "Processus des agents",
   "Waiting for worker snapshot": "En attente de l’instantané du worker",
@@ -465,6 +466,10 @@ const frenchUi = Object.freeze({
   "Unassigned": "Non attribué",
   "Details": "Détails",
   "Hide details": "Masquer les détails",
+  "AI Operation ↗": "Opération IA ↗",
+  "Live agent output": "Sortie de l’agent en direct",
+  "The worker has not published output for this process yet.": "Le worker n’a pas encore publié de sortie pour ce processus.",
+  "TRUNCATED": "TRONQUÉ",
   "Ticket ID": "ID du ticket",
   "Workflow": "Flux de travail",
   "Lifecycle and workflow aligned": "Cycle et flux alignés",
@@ -1577,6 +1582,15 @@ function renderProcesses(view) {
       issueLink.textContent = "Open ↗";
       lifecycle.append(issueLink);
     }
+    const manageHref = safeTicketLink(job.manage_url);
+    if (manageHref) {
+      const manageLink = document.createElement("a");
+      manageLink.href = manageHref;
+      manageLink.target = "_blank";
+      manageLink.rel = "noreferrer";
+      manageLink.textContent = "AI Operation ↗";
+      lifecycle.append(manageLink);
+    }
     const details = document.createElement("div");
     details.className = "process-details";
     details.id = detailsId;
@@ -1592,12 +1606,64 @@ function renderProcesses(view) {
       ["Created", job.created_at ? ticketDateLabel(job.created_at) : null, job.created_at],
       ["Updated", job.updated_at ? ticketDateLabel(job.updated_at) : null, job.updated_at],
     ].filter(([, value]) => value).forEach(([labelText, value, exact]) => details.append(processDetail(labelText, value, exact)));
+    const output = document.createElement("section");
+    output.className = "process-output";
+    output.setAttribute("aria-label", "Live agent output");
+    const outputHead = document.createElement("div");
+    const outputTitle = document.createElement("strong");
+    outputTitle.textContent = "Live agent output";
+    const outputCount = document.createElement("small");
+    const outputLines = Array.isArray(job.output) ? job.output : [];
+    outputCount.textContent = `${outputLines.length.toLocaleString(localeTag())} events`;
+    outputHead.append(outputTitle, outputCount);
+    const outputLog = document.createElement("div");
+    outputLog.className = "process-output-log";
+    outputLog.setAttribute("role", "log");
+    if (outputLines.length === 0) {
+      const emptyOutput = document.createElement("p");
+      emptyOutput.textContent = "The worker has not published output for this process yet.";
+      outputLog.append(emptyOutput);
+    } else {
+      outputLines.forEach((line) => {
+        const entry = document.createElement("article");
+        const meta = document.createElement("div");
+        const kind = document.createElement("span");
+        kind.textContent = operationLabel(line.kind);
+        const at = document.createElement("time");
+        const timestamp = Number.isSafeInteger(line.at_ms) ? new Date(line.at_ms).toISOString() : null;
+        at.textContent = timestamp ? processTimeLabel(timestamp) : "—";
+        if (timestamp) {
+          at.dateTime = timestamp;
+          at.title = ticketDateLabel(timestamp);
+        }
+        meta.append(kind, at);
+        if (line.truncated) {
+          const truncated = document.createElement("i");
+          truncated.textContent = "TRUNCATED";
+          meta.append(truncated);
+        }
+        const text = document.createElement("pre");
+        text.setAttribute("data-i18n-skip", "");
+        text.textContent = line.text;
+        entry.append(meta, text);
+        outputLog.append(entry);
+      });
+    }
+    output.append(outputHead, outputLog);
+    details.append(output);
+    const initiallyExpanded = expandedProcesses.has(job.id);
+    detailsButton.setAttribute("aria-expanded", String(initiallyExpanded));
+    detailsButton.textContent = initiallyExpanded ? "Hide details" : "Details";
+    details.hidden = !initiallyExpanded;
+    card.classList.toggle("is-expanded", initiallyExpanded);
     detailsButton.addEventListener("click", () => {
       const expanded = detailsButton.getAttribute("aria-expanded") === "true";
       detailsButton.setAttribute("aria-expanded", String(!expanded));
       detailsButton.textContent = expanded ? "Details" : "Hide details";
       details.hidden = expanded;
       card.classList.toggle("is-expanded", !expanded);
+      if (expanded) expandedProcesses.delete(job.id);
+      else expandedProcesses.add(job.id);
     });
     row.append(reference, execution, timing, lifecycle);
     card.append(row, details);

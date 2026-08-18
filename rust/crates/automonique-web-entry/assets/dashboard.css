@@ -975,6 +975,19 @@ kbd { padding: 1px 4px; border: 1px solid var(--line-bright); border-bottom-colo
 .process-lifecycle button, .process-lifecycle a { display: inline-flex; min-height: 30px; align-items: center; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: var(--panel); font-size: var(--font-xs); text-decoration: none; cursor: pointer; }
 .process-lifecycle button:hover, .process-lifecycle a:hover { border-color: var(--accent-border); color: var(--green); background: var(--accent-surface); }
 .process-details { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; margin: 0 18px 14px 52px; overflow: hidden; border: 1px solid var(--line); border-radius: 9px; background: var(--line); }
+.process-output { grid-column: 1 / -1; min-width: 0; padding: 13px; background: var(--panel); }
+.process-output > div:first-child { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 9px; }
+.process-output > div:first-child strong { font-size: var(--font-sm); }
+.process-output > div:first-child small { color: var(--quiet); font: var(--font-2xs) ui-monospace, monospace; }
+.process-output-log { max-height: 360px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--code-surface, #10171a); }
+.process-output-log > p { margin: 0; padding: 16px; color: var(--quiet); font-size: var(--font-sm); }
+.process-output-log article { padding: 11px 13px; border-bottom: 1px solid rgba(255, 255, 255, .08); }
+.process-output-log article:last-child { border-bottom: 0; }
+.process-output-log article > div { display: flex; gap: 8px; align-items: center; margin-bottom: 7px; color: #93aaa8; font: var(--font-2xs) ui-monospace, monospace; }
+.process-output-log article > div span { color: #8fd0b9; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
+.process-output-log article > div time { margin-left: auto; }
+.process-output-log article > div i { padding: 2px 4px; border: 1px solid rgba(225, 169, 83, .45); border-radius: 4px; color: #e1a953; font-style: normal; }
+.process-output-log pre { margin: 0; overflow-wrap: anywhere; color: #dce8e4; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }
 .process-empty { min-height: 130px; }
 .ticket-metric { color: var(--text); text-align: left; cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .16s ease; }
 .ticket-metric small { display: block; margin-top: 4px; overflow: hidden; color: var(--quiet); font-size: var(--font-xs); text-overflow: ellipsis; white-space: nowrap; }

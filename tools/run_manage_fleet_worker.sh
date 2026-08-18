@@ -36,6 +36,7 @@ fi
 fleet_config=$state_dir/support/fleet.conf
 provider_config=$state_dir/provider
 runtime_dir=$state_dir/manage-fleet-worker
+output_dir=$runtime_dir/process-output
 aggregate_auth_health_file=$runtime_dir/auth-health.json
 agent_auth_dir=${AUTOMONIQUE_AGENT_AUTH_DIR:-}
 account_registry=${agent_auth_dir:+$agent_auth_dir/accounts.json}
@@ -72,6 +73,8 @@ fi
 umask 077
 mkdir -p -- "$runtime_dir"
 chmod 700 -- "$runtime_dir"
+mkdir -p -- "$output_dir"
+chmod 700 -- "$output_dir"
 
 auth_method=unknown
 selected_provider=codex
@@ -324,6 +327,7 @@ publish_process_snapshot() {
     snapshot=$1
     observed_at=$(date +%s%3N)
     issue_links='{}'
+    output_map='{}'
     ticket_jobs=$state_dir/slack-ticket-jobs.v1.json
     if [[ -f "$ticket_jobs" && ! -L "$ticket_jobs" ]]; then
         issue_links=$(jq -cer '
@@ -335,12 +339,25 @@ publish_process_snapshot() {
             | from_entries
         ' "$ticket_jobs" 2>/dev/null) || issue_links='{}'
     fi
+    output_files=("$output_dir"/*.json)
+    if [[ -e "${output_files[0]}" ]]; then
+        output_map=$(jq -sc '
+            [ .[]
+              | select(.schema == "automonique.manage-process-output/v1")
+              | select(.job_id | type == "string" and test("^[A-Za-z0-9._-]{8,120}$"))
+              | select(.lines | type == "array" and length <= 12)
+              | {key:.job_id, value:.lines} ]
+            | from_entries
+        ' "${output_files[@]}" 2>/dev/null) || output_map='{}'
+    fi
     temporary=$(mktemp "$runtime_dir/.processes.XXXXXX") || return 1
     if ! jq -e \
         --arg instance "$fleet_instance" \
         --arg provider "$selected_provider" \
         --arg auth "$(auth_health_status)" \
+        --arg fleet_base "${fleet_base%/}" \
         --argjson issue_links "$issue_links" \
+        --argjson output_map "$output_map" \
         --argjson concurrency "$max_concurrency" \
         --argjson observed "$observed_at" '
         def safe_text($limit):
@@ -355,6 +372,11 @@ publish_process_snapshot() {
         def safe_id:
             if type == "string" and length > 0 and length <= 160
                 and test("^[A-Za-z0-9._:#/-]+$") then .
+            else null end;
+        def output_text:
+            if type == "string" then
+                (gsub("\u0000"; "�") | .[0:1000]) as $value
+                | if ($value | length) > 0 then $value else null end
             else null end;
         select(.ok == true and (.instances | type == "array") and (.jobs | type == "array"))
         | ([.instances[] | select(.id == $instance)] | first) as $worker
@@ -391,6 +413,10 @@ publish_process_snapshot() {
                 source: (.source | safe_state),
                 issue_id: (.issue_id | safe_id),
                 issue_url: $issue_links[.id],
+                manage_url: (if (.issue_id | type) == "string"
+                    and (.issue_id | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+                    then ($fleet_base + "/manage/ai-operations/issues?issue=" + .issue_id)
+                    else null end),
                 site_id: (.site_id | safe_id),
                 session_id: (.session_id | safe_id),
                 provider: (.claimed_agent | safe_state),
@@ -399,8 +425,21 @@ publish_process_snapshot() {
                 approved: ((.approved_by | type) == "string" and (.approved_by | length) > 0),
                 decision_count: (if (.decisions | type) == "array" then (.decisions | length) else 0 end),
                 created_at: (.created_at | safe_text(64)),
-                updated_at: (.updated_at | safe_text(64))
-            } | select(.id != null)] | sort_by(.updated_at // "") | reverse | .[:100])
+                updated_at: (.updated_at | safe_text(64)),
+                output: (($output_map[.id] // []) as $live
+                    | (.result | output_text) as $final
+                    | if ($live | length) > 0 then $live[-12:]
+                      elif $final != null then [{
+                        at_ms: $observed,
+                        kind: "final",
+                        text: $final,
+                        truncated: ((.result | length) > 1000)
+                      }]
+                      else [] end)
+            } | select(.id != null)]
+                | sort_by(.updated_at // "") | reverse | .[:100]
+                | to_entries
+                | map(if .key < 10 then .value else (.value | .output = []) end))
         }
     ' <<<"$snapshot" >"$temporary"
     then
@@ -476,12 +515,65 @@ report_job() {
     jq -e '.ok == true' >/dev/null <<<"$response"
 }
 
+record_job_output() {
+    job_id=$1
+    kind=$2
+    text=$3
+    at_ms=$4
+    target=$output_dir/$job_id.json
+    temporary=$(mktemp "$output_dir/.output.XXXXXX") || return 1
+    if [[ -f "$target" && ! -L "$target" ]]; then
+        jq -e \
+            --arg job "$job_id" \
+            --arg kind "${kind:0:40}" \
+            --arg text "$text" \
+            --argjson at "$at_ms" '
+            select(.schema == "automonique.manage-process-output/v1" and .job_id == $job and (.lines | type == "array"))
+            | .observed_at_ms = $at
+            | .lines = ((.lines + [{
+                at_ms: $at,
+                kind: ($kind | if test("^[A-Za-z0-9._-]{1,40}$") then ascii_downcase else "output" end),
+                text: ($text | gsub("\u0000"; "�") | .[0:1000]),
+                truncated: (($text | length) > 1000)
+            }])[-12:])
+        ' "$target" >"$temporary" || {
+            rm -f -- "$temporary"
+            return 1
+        }
+    else
+        jq -n \
+            --arg job "$job_id" \
+            --arg kind "${kind:0:40}" \
+            --arg text "$text" \
+            --argjson at "$at_ms" '{
+            schema: "automonique.manage-process-output/v1",
+            job_id: $job,
+            observed_at_ms: $at,
+            lines: [{
+                at_ms: $at,
+                kind: ($kind | if test("^[A-Za-z0-9._-]{1,40}$") then ascii_downcase else "output" end),
+                text: ($text | gsub("\u0000"; "�") | .[0:1000]),
+                truncated: (($text | length) > 1000)
+            }]
+        }' >"$temporary" || {
+            rm -f -- "$temporary"
+            return 1
+        }
+    fi
+    chmod 600 -- "$temporary"
+    mv -f -- "$temporary" "$target"
+    refresh_process_snapshot || true
+}
+
 post_job_log() {
     job_id=$1
     kind=$2
     text=$3
     [[ -n "$text" ]] || return 0
     now_ms=$(date +%s%3N)
+    if [[ "$kind" != provider_stderr ]]; then
+        record_job_output "$job_id" "$kind" "$text" "$now_ms" || true
+    fi
     body=$(jq -cn \
         --arg job "$job_id" \
         --arg kind "${kind:0:40}" \

@@ -21,7 +21,11 @@ The timer writes an online recovery set every five minutes.
 external transports and refuses provider starts.
 `automonique-manage-worker.service` heartbeats the configured Manage instance,
 claims confirmed jobs with bounded parallelism, and streams their progress back
-to AI Operations. It runs from the same immutable release as the daemon. The
+to AI Operations. It also publishes an owner-only dashboard projection with a
+bounded tail of parsed agent output and a link to the corresponding issue in
+the configured Manage origin. Raw provider frames, stderr, prompts and fleet
+credentials are not copied into that projection. It runs from the same
+immutable release as the daemon. The
 worker maintains a private `manage-fleet-worker/auth-health.json` projection:
 local credentials begin as `configured_unverified`, a successful provider turn
 proves `authenticated`, and recognized sign-out or token-refresh failures become

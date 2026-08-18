@@ -745,6 +745,7 @@ struct ProcessJobView {
     source: String,
     issue_id: Option<String>,
     issue_url: Option<String>,
+    manage_url: Option<String>,
     site_id: Option<String>,
     session_id: Option<String>,
     provider: String,
@@ -754,6 +755,16 @@ struct ProcessJobView {
     decision_count: u64,
     created_at: Option<String>,
     updated_at: Option<String>,
+    output: Vec<ProcessOutputLineView>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessOutputLineView {
+    at_ms: u64,
+    kind: String,
+    text: String,
+    truncated: bool,
 }
 
 #[derive(Serialize)]
@@ -2832,6 +2843,10 @@ fn process_snapshot(bytes: &[u8]) -> Option<ProcessSnapshotView> {
             || !process_state(&job.source)
             || !job.issue_id.as_deref().is_none_or(process_id)
             || !job.issue_url.as_deref().is_none_or(process_issue_url)
+            || !job
+                .manage_url
+                .as_deref()
+                .is_none_or(|value| process_manage_url(value, job.issue_id.as_deref()))
             || !job.site_id.as_deref().is_none_or(process_id)
             || !job.session_id.as_deref().is_none_or(process_id)
             || !process_state(&job.provider)
@@ -2839,6 +2854,18 @@ fn process_snapshot(bytes: &[u8]) -> Option<ProcessSnapshotView> {
             || job.decision_count > 1_000
             || !optional_process_text(job.created_at.as_deref(), 64)
             || !optional_process_text(job.updated_at.as_deref(), 64)
+            || job.output.len() > 12
+            || job.output.iter().any(|line| {
+                line.at_ms == 0
+                    || line.at_ms > MAX_SAFE_INTEGER
+                    || !process_state(&line.kind)
+                    || line.text.is_empty()
+                    || line.text.chars().count() > 1_000
+                    || line
+                        .text
+                        .chars()
+                        .any(|character| character == '\0' || character == '\u{7f}')
+            })
         {
             return None;
         }
@@ -2879,6 +2906,20 @@ fn process_issue_url(value: &str) -> bool {
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
         })
         && parts[3].parse::<u64>().is_ok_and(|number| number > 0)
+}
+
+fn process_manage_url(value: &str, issue_id: Option<&str>) -> bool {
+    let Some(issue_id) = issue_id else {
+        return false;
+    };
+    let Some((origin, linked_issue)) = value.split_once("/manage/ai-operations/issues?issue=")
+    else {
+        return false;
+    };
+    let Some(host) = origin.strip_prefix("https://") else {
+        return false;
+    };
+    normalize_host(host).is_some() && linked_issue == issue_id
 }
 
 fn optional_process_text(value: Option<&str>, limit: usize) -> bool {
@@ -3559,10 +3600,12 @@ mod tests {
             "last_seen_at":"2026-08-18T17:13:20Z"},
           "jobs":[{"id":"job-12345678","status":"running","source":"slack_ticket",
             "issue_id":"2711","issue_url":"https://github.com/example/site/issues/2711",
+            "manage_url":"https://manage.example.com/manage/ai-operations/issues?issue=2711",
             "site_id":null,"session_id":"session-12345678",
             "provider":"codex","runtime":"worker","assigned_to_worker":true,
             "approved":true,"decision_count":1,"created_at":"2026-08-18T17:11:00Z",
-            "updated_at":"2026-08-18T17:13:00Z"}]
+            "updated_at":"2026-08-18T17:13:00Z","output":[{"at_ms":1787066000000,
+            "kind":"agent_message","text":"Inspecting the delivery logs now.","truncated":false}]}]
         }"#;
         let snapshot = process_snapshot(valid.as_bytes()).expect("valid process snapshot");
         assert_eq!("automonique.dashboard.processes/v1", snapshot.schema);
@@ -3573,6 +3616,11 @@ mod tests {
             snapshot.jobs[0].issue_url.as_deref()
         );
         assert!(snapshot.jobs[0].assigned_to_worker);
+        assert_eq!(1, snapshot.jobs[0].output.len());
+        assert_eq!(
+            "Inspecting the delivery logs now.",
+            snapshot.jobs[0].output[0].text
+        );
 
         let secret = valid.replace(
             "\n        }",
@@ -3605,6 +3653,8 @@ mod tests {
         assert!(MANAGE_WORKER.contains("unset OPENAI_API_KEY ANTHROPIC_API_KEY"));
         assert!(MANAGE_WORKER.contains(".authMethod == \"claude.ai\""));
         assert!(MANAGE_WORKER.contains("automonique.manage-processes/v1"));
+        assert!(MANAGE_WORKER.contains("automonique.manage-process-output/v1"));
+        assert!(MANAGE_WORKER.contains("/manage/ai-operations/issues?issue="));
         assert!(MANAGE_WORKER.contains("refresh_process_snapshot"));
         assert!(MANAGE_WORKER.contains("exact permalink of the completion-summary comment"));
         assert!(MANAGE_WORKER.contains("#issuecomment-<number>"));
@@ -3614,8 +3664,9 @@ mod tests {
             .and_then(|value| value.split("refresh_process_snapshot()").next())
             .expect("process projection function");
         assert!(!process_projection.contains(".prompt"));
-        assert!(!process_projection.contains(".result"));
         assert!(!process_projection.contains(".requested_by"));
+        assert!(process_projection.contains(".result | output_text"));
+        assert!(process_projection.contains(".[0:1000]"));
     }
 
     #[test]
