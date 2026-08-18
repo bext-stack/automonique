@@ -1653,11 +1653,11 @@ impl WebIntegration {
             (Ok(prism), Ok(all_hosts)) => format!(
                 "status=available\nprism_app_count={}\nprism_apps={}\nprism_hostname_count={}\nprism_hostnames={}\nenabled_hostname_count={}\nenabled_hostnames={}",
                 prism.apps().len(),
-                bounded_values(prism.apps(), 2_000),
+                bounded_ranked_values(prism.apps(), message, 1_000),
                 prism.sites().len(),
-                bounded_values(prism.sites(), 5_000),
+                bounded_ranked_values(prism.sites(), message, 1_500),
                 all_hosts.sites().len(),
-                bounded_values(all_hosts.sites(), 7_500),
+                bounded_ranked_values(all_hosts.sites(), message, 2_000),
             ),
             _ => String::from(
                 "status=unavailable\nprism_app_count=unavailable\nprism_apps=unavailable\nprism_hostname_count=unavailable\nprism_hostnames=unavailable\nenabled_hostname_count=unavailable\nenabled_hostnames=unavailable",
@@ -1714,7 +1714,7 @@ impl WebIntegration {
                 ));
             }
         }
-        Some(rendered.chars().take(6_000).collect())
+        Some(rendered.chars().take(4_000).collect())
     }
 
     fn slack_tool(
@@ -2600,17 +2600,17 @@ fn compose_chat_prompt(
     }
     if let Some(sites) = context.live_sites {
         prompt.push_str("[live_tool capability=enabled_site_inventory freshness=request_time trust=untrusted_data]\n");
-        push_bounded(&mut prompt, &sites.enabled_sites, 7_500);
+        push_bounded(&mut prompt, &sites.enabled_sites, 4_000);
         prompt.push_str("\n[/live_tool]\n");
         if let Some(profiles) = &sites.manage_profiles {
             prompt.push_str("[live_tool capability=manage_site_profiles freshness=request_time trust=untrusted_data]\n");
-            push_bounded(&mut prompt, profiles, 7_500);
+            push_bounded(&mut prompt, profiles, 5_000);
             prompt.push_str("\n[/live_tool]\n");
         }
     }
     if let Some(knowledge) = context.live_knowledge {
         prompt.push_str("[live_tool capability=local_entity_knowledge freshness=request_time trust=untrusted_data]\n");
-        push_bounded(&mut prompt, knowledge, 6_000);
+        push_bounded(&mut prompt, knowledge, 4_000);
         prompt.push_str("\n[/live_tool]\n");
     }
     if let Some(processes) = context.live_processes {
@@ -2738,6 +2738,37 @@ fn bounded_values(values: &[String], characters: usize) -> String {
         rendered.push_str(value);
     }
     rendered
+}
+
+fn bounded_ranked_values(values: &[String], question: &str, characters: usize) -> String {
+    let terms = normalized_terms(question)
+        .into_iter()
+        .filter(|term| term.len() >= 3)
+        .filter(|term| {
+            !matches!(
+                term.as_str(),
+                "about"
+                    | "app"
+                    | "application"
+                    | "com"
+                    | "dev"
+                    | "domain"
+                    | "know"
+                    | "site"
+                    | "tell"
+                    | "the"
+                    | "what"
+                    | "www"
+                    | "you"
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut ranked = values.to_vec();
+    ranked.sort_by_key(|value| {
+        let value = value.to_lowercase();
+        std::cmp::Reverse(terms.iter().filter(|term| value.contains(*term)).count())
+    });
+    bounded_values(&ranked, characters)
 }
 
 fn safe_prompt_field(value: &str, characters: usize) -> String {
