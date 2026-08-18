@@ -2950,6 +2950,46 @@ fn ordinary_question_automatically_uses_public_web_when_the_router_selects_it() 
     );
 }
 
+#[test]
+fn deferred_router_promise_becomes_a_real_public_web_continuation() {
+    let fixture = Fixture::new(&[]);
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering_sequence(&[
+        r#"{"kind":"answer","answer":"I'll search the web and get back to you."}"#,
+        r#"{"kind":"read","sources":[],"slack_channel":null,"github_issues":false,"depth":"web"}"#,
+        "Completed research with https://example.com/current",
+    ]);
+    let mut bridge = bridge_with_lane(
+        &fixture,
+        FakeClient::new([updates(&[(
+            2,
+            OPERATOR,
+            "what is the latest public release?",
+        )])]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+    );
+
+    assert_eq!(
+        poll(&mut bridge).expect("question queues").questions_queued,
+        1
+    );
+    assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
+    let prompts = lane.tasks();
+    assert_eq!(prompts.len(), 3);
+    assert!(prompts[0].contains("AUTOMONIQUE_CONVERSATIONAL_TOOL_ROUTER_V1"));
+    assert_eq!(
+        prompts[0], prompts[1],
+        "the router is retried with more capable execution"
+    );
+    assert!(prompts[2].contains("AUTOMONIQUE_CONTEXTUAL_WEB_RESEARCH_V2"));
+    let messages = outbound.messages();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].contains("https://example.com/current"));
+    assert!(!messages[0].contains("get back to you"));
+}
+
 /// The three commands this build performs are answered from the real read
 /// surfaces, and each answer is the one an operator would receive.
 #[test]
