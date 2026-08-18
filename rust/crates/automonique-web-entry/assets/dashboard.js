@@ -13,6 +13,11 @@ const safeMetric = (value) => Number.isSafeInteger(value) && value >= 0 ? value 
 const statusHistory = [];
 let memorySnapshot = null;
 let memoryKind = "all";
+let memoryStatus = "all";
+let memorySensitivity = "all";
+let memorySort = "updated_desc";
+let memoryMode = storedPreference("monique-memory-view", ["graph", "list", "timeline"], "graph");
+let selectedMemoryReference = null;
 let memoryQuery = null;
 let operationsSnapshot = null;
 let processesSnapshot = null;
@@ -98,7 +103,6 @@ const frenchUi = Object.freeze({
   "CONTROL PLANE / LIVE": "PLAN DE CONTRÔLE / TEMPS RÉEL",
   "Operations overview": "Vue d’ensemble des opérations",
   "A live, secret-safe view of Monique’s execution path and delivery certainty.": "Une vue en temps réel et sans secrets du parcours d’exécution de Monique et de la certitude de livraison.",
-  "Ask Monique": "Demander à Monique",
   "Open Manage ↗": "Ouvrir Manage ↗",
   "Establishing snapshot": "Établissement de l’instantané",
   "Waiting for the daemon’s sanitized operational projection.": "En attente de la projection opérationnelle assainie du démon.",
@@ -262,11 +266,49 @@ const frenchUi = Object.freeze({
   "ACTIVE": "ACTIFS",
   "PROPOSALS": "PROPOSITIONS",
   "SUPERSEDED": "REMPLACÉS",
+  "DELETED": "SUPPRIMÉS",
+  "REVIEW DUE": "À RÉEXAMINER",
   "MESSAGES": "MESSAGES",
+  "Canonical memory counts": "Compteurs de mémoire canonique",
+  "Memory view": "Vue de la mémoire",
   "Evidence graph": "Graphe des éléments",
   "Records": "Enregistrements",
+  "Timeline": "Chronologie",
   "Kind": "Type",
   "All evidence": "Tous les éléments",
+  "All statuses": "Tous les états",
+  "Sensitivity": "Sensibilité",
+  "All levels": "Tous les niveaux",
+  "Sort": "Tri",
+  "Highest confidence": "Confiance la plus élevée",
+  "Review date": "Date de réexamen",
+  "Reference": "Référence",
+  "Reset filters": "Réinitialiser les filtres",
+  "Select evidence": "Sélectionnez un élément",
+  "Choose a graph node, record, or timeline event to inspect its provenance and review state.": "Choisissez un nœud, un enregistrement ou un événement pour examiner sa provenance et son état de révision.",
+  "Evidence details": "Détails de l’élément",
+  "Confidence": "Confiance",
+  "Visibility": "Visibilité",
+  "Provenance": "Provenance",
+  "Revision": "Révision",
+  "Updated": "Mis à jour",
+  "Next review": "Prochain réexamen",
+  "No review scheduled": "Aucun réexamen planifié",
+  "Review due": "Réexamen requis",
+  "Copy content": "Copier le contenu",
+  "Ask Monique": "Demander à Monique",
+  "Memory content copied.": "Contenu de la mémoire copié.",
+  "Clipboard access is unavailable.": "L’accès au presse-papiers est indisponible.",
+  "active": "actif",
+  "candidate": "proposition",
+  "superseded": "remplacé",
+  "deleted": "supprimé",
+  "personal": "personnel",
+  "private": "privé",
+  "user profile": "profil utilisateur",
+  "No memory evidence matches this view.": "Aucun élément de mémoire ne correspond à cette vue.",
+  "No evidence nodes to display.": "Aucun nœud à afficher.",
+  "No timeline events to display.": "Aucun événement à afficher dans la chronologie.",
   "Loading canonical store…": "Chargement du stockage canonique…",
   "Typed memory evidence graph": "Graphe typé des éléments de mémoire",
   "EFFECTIVE / SECRET-SAFE PROJECTION": "PROJECTION EFFECTIVE / SANS SECRETS",
@@ -708,6 +750,7 @@ function translatePhraseForFrench(value) {
     [/^(.+?) pending$/, (match) => `${match[1]} en attente`],
     [/^(.+?) of (.+?) tickets$/, (match) => `${match[1]} ticket${match[1] === "1" ? "" : "s"} sur ${match[2]}`],
     [/^(.+?) of (.+?) processes$/, (match) => `${match[1]} processus sur ${match[2]}`],
+    [/^Review due · (.+)$/, (match) => `Réexamen requis · ${match[1]}`],
     [/^Observed (.+)$/, (match) => `Observé ${match[1]}`],
     [/^(.+?) of (.+?) slots active$/, (match) => `${match[1]} emplacement${match[1] === "1" ? "" : "s"} actif${match[1] === "1" ? "" : "s"} sur ${match[2]}`],
     [/^(.+?) evidence records?(?: for “(.+)”)?$/, (match) => `${match[1]} enregistrement${match[1] === "1" ? "" : "s"} d’éléments${match[2] ? ` pour « ${match[2]} »` : ""}`],
@@ -1234,45 +1277,88 @@ byId("status-refresh").addEventListener("click", () => refreshStatus({ announce:
 
 function selectedMemoryEntries() {
   const entries = memorySnapshot?.entries || [];
-  return memoryKind === "all" ? entries : entries.filter((entry) => entry.kind === memoryKind);
+  return entries
+    .filter((entry) => memoryKind === "all" || entry.kind === memoryKind)
+    .filter((entry) => memoryStatus === "all" || entry.status === memoryStatus)
+    .filter((entry) => memorySensitivity === "all" || entry.sensitivity === memorySensitivity)
+    .sort((left, right) => {
+      if (memorySort === "confidence_desc") return right.confidence - left.confidence || right.updated_at_ms - left.updated_at_ms;
+      if (memorySort === "review_asc") return (left.review_at_ms ?? Number.MAX_SAFE_INTEGER) - (right.review_at_ms ?? Number.MAX_SAFE_INTEGER) || right.updated_at_ms - left.updated_at_ms;
+      if (memorySort === "reference") return left.reference.localeCompare(right.reference, localeTag(), { numeric: true });
+      return right.updated_at_ms - left.updated_at_ms || left.reference.localeCompare(right.reference, localeTag(), { numeric: true });
+    });
 }
 
-function updateMemoryKinds(entries) {
-  const select = byId("memory-kind");
-  const kinds = [...new Set(entries.map((entry) => entry.kind).filter((kind) => typeof kind === "string"))].sort();
-  const previous = memoryKind;
+function updateMemoryFacet(id, entries, field, allLabel, previous) {
+  const select = byId(id);
+  const values = [...new Set(entries.map((entry) => entry[field]).filter((value) => typeof value === "string"))].sort();
   select.replaceChildren();
   const all = document.createElement("option");
   all.value = "all";
-  all.textContent = "All evidence";
+  all.textContent = allLabel;
   select.append(all);
-  kinds.forEach((kind) => {
+  values.forEach((value) => {
     const option = document.createElement("option");
-    option.value = kind;
-    option.textContent = label(kind);
+    option.value = value;
+    option.textContent = label(value);
     select.append(option);
   });
-  memoryKind = kinds.includes(previous) ? previous : "all";
-  select.value = memoryKind;
+  const selected = values.includes(previous) ? previous : "all";
+  select.value = selected;
+  return selected;
+}
+
+function memoryDateLabel(value) {
+  if (!Number.isSafeInteger(value) || value <= 0) return "—";
+  return new Intl.DateTimeFormat(localeTag(), { dateStyle: "medium", timeStyle: "short" }).format(value);
+}
+
+function memoryReviewLabel(value) {
+  if (!Number.isSafeInteger(value) || value <= 0) return "No review scheduled";
+  return value <= Date.now() ? `Review due · ${memoryDateLabel(value)}` : memoryDateLabel(value);
+}
+
+function setMemoryMode(mode) {
+  memoryMode = ["graph", "list", "timeline"].includes(mode) ? mode : "graph";
+  savePreference("monique-memory-view", memoryMode);
+  document.querySelectorAll("[data-memory-mode]").forEach((item) => {
+    const active = item.dataset.memoryMode === memoryMode;
+    item.classList.toggle("is-active", active);
+    item.setAttribute("aria-pressed", String(active));
+  });
+  byId("memory-graph").hidden = memoryMode !== "graph";
+  byId("memory-list").hidden = memoryMode !== "list";
+  byId("memory-timeline").hidden = memoryMode !== "timeline";
 }
 
 function renderMemory(view) {
   memorySnapshot = view;
+  const entries = view.entries || [];
   byId("memory-active").textContent = count(view.counts?.active);
   byId("memory-candidates").textContent = count(view.counts?.candidates);
   byId("memory-superseded").textContent = count(view.counts?.superseded);
+  byId("memory-deleted").textContent = count(view.counts?.deleted);
+  byId("memory-review-due").textContent = count(entries.filter((entry) => Number.isSafeInteger(entry.review_at_ms) && entry.review_at_ms <= Date.now()).length);
   byId("memory-messages").textContent = count(view.counts?.messages);
-  updateMemoryKinds(view.entries || []);
+  memoryKind = updateMemoryFacet("memory-kind", entries, "kind", "All evidence", memoryKind);
+  memoryStatus = updateMemoryFacet("memory-status", entries, "status", "All statuses", memoryStatus);
+  memorySensitivity = updateMemoryFacet("memory-sensitivity", entries, "sensitivity", "All levels", memorySensitivity);
+  if (!entries.some((entry) => entry.reference === selectedMemoryReference)) selectedMemoryReference = entries[0]?.reference || null;
+  setMemoryMode(memoryMode);
   renderSelectedMemory();
 }
 
 function renderSelectedMemory() {
   const entries = selectedMemoryEntries();
+  if (!entries.some((entry) => entry.reference === selectedMemoryReference)) selectedMemoryReference = entries[0]?.reference || null;
   const scope = memoryKind === "all" ? "evidence" : words(memoryKind);
   const query = memoryQuery ? ` for “${memoryQuery}”` : "";
   byId("memory-result-label").textContent = `${count(entries.length)} ${scope} record${entries.length === 1 ? "" : "s"}${query}`;
   renderMemoryList(entries);
   renderMemoryGraph(entries);
+  renderMemoryTimeline(entries);
+  renderMemoryInspector(entries.find((entry) => entry.reference === selectedMemoryReference) || null);
+  byId("memory-reset").disabled = memoryKind === "all" && memoryStatus === "all" && memorySensitivity === "all" && memorySort === "updated_desc";
 }
 
 function memoryEmpty(message) {
@@ -1290,8 +1376,11 @@ function renderMemoryList(entries) {
     return;
   }
   entries.forEach((entry) => {
-    const card = document.createElement("article");
+    const card = document.createElement("button");
+    card.type = "button";
     card.className = "memory-record";
+    card.classList.toggle("is-selected", entry.reference === selectedMemoryReference);
+    card.setAttribute("aria-pressed", String(entry.reference === selectedMemoryReference));
     const ref = document.createElement("strong");
     ref.textContent = entry.reference;
     const text = document.createElement("p");
@@ -1299,8 +1388,12 @@ function renderMemoryList(entries) {
     text.textContent = entry.content;
     const meta = document.createElement("div");
     meta.className = "record-meta";
-    meta.textContent = `${words(entry.kind)} · ${entry.confidence / 10}% confidence\n${entry.visibility} · rev ${entry.revision}`;
+    meta.textContent = `${words(entry.status)} · ${entry.confidence / 10}% confidence\n${memoryDateLabel(entry.updated_at_ms)}`;
     card.append(ref, text, meta);
+    card.addEventListener("click", () => {
+      selectedMemoryReference = entry.reference;
+      renderSelectedMemory();
+    });
     root.append(card);
   });
 }
@@ -1322,6 +1415,7 @@ function renderMemoryGraph(entries) {
     const node = document.createElement("button");
     node.type = "button";
     node.className = `graph-node slot-${index}`;
+    node.classList.toggle("is-selected", entry.reference === selectedMemoryReference);
     node.setAttribute("aria-label", `Open ${entry.reference} in the record list`);
     const reference = document.createElement("span");
     reference.textContent = `${entry.reference} / ${words(entry.kind).toUpperCase()}`;
@@ -1332,12 +1426,139 @@ function renderMemoryGraph(entries) {
     metadata.textContent = `${entry.confidence / 10}% · ${entry.provenance} · R${entry.revision}`;
     node.append(reference, content, metadata);
     node.addEventListener("click", () => {
-      document.querySelector("[data-memory-mode='list']").click();
-      const match = [...byId("memory-list").children].find((card) => card.firstChild?.textContent === entry.reference);
-      match?.scrollIntoView({ behavior: "smooth", block: "center" });
+      selectedMemoryReference = entry.reference;
+      renderSelectedMemory();
     });
     graph.append(node);
   });
+}
+
+function renderMemoryTimeline(entries) {
+  const root = byId("memory-timeline");
+  root.replaceChildren();
+  if (entries.length === 0) {
+    root.append(memoryEmpty("No timeline events to display."));
+    return;
+  }
+  [...entries].sort((left, right) => right.updated_at_ms - left.updated_at_ms).forEach((entry) => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "memory-timeline-item";
+    item.classList.toggle("is-selected", entry.reference === selectedMemoryReference);
+    const marker = document.createElement("i");
+    marker.setAttribute("aria-hidden", "true");
+    const date = document.createElement("time");
+    date.dateTime = Number.isSafeInteger(entry.updated_at_ms) ? new Date(entry.updated_at_ms).toISOString() : "";
+    date.textContent = memoryDateLabel(entry.updated_at_ms);
+    const body = document.createElement("div");
+    const heading = document.createElement("strong");
+    heading.textContent = entry.reference;
+    const content = document.createElement("p");
+    content.setAttribute("data-i18n-skip", "");
+    content.textContent = entry.content;
+    const meta = document.createElement("small");
+    meta.textContent = `${words(entry.kind)} · ${words(entry.status)} · R${entry.revision}`;
+    body.append(heading, content, meta);
+    item.append(marker, date, body);
+    item.addEventListener("click", () => {
+      selectedMemoryReference = entry.reference;
+      renderSelectedMemory();
+    });
+    root.append(item);
+  });
+}
+
+function memoryInspectorFact(labelText, value) {
+  const row = document.createElement("div");
+  const term = document.createElement("dt");
+  term.textContent = labelText;
+  const detail = document.createElement("dd");
+  detail.setAttribute("data-i18n-skip", "");
+  detail.textContent = value || "—";
+  row.append(term, detail);
+  return row;
+}
+
+function renderMemoryInspector(entry) {
+  const root = byId("memory-inspector");
+  root.replaceChildren();
+  if (!entry) {
+    const empty = document.createElement("div");
+    empty.className = "memory-inspector-empty";
+    const icon = document.createElement("span");
+    icon.textContent = "◇";
+    const title = document.createElement("strong");
+    title.textContent = "Select evidence";
+    const detail = document.createElement("p");
+    detail.textContent = "Choose a graph node, record, or timeline event to inspect its provenance and review state.";
+    empty.append(icon, title, detail);
+    root.append(empty);
+    return;
+  }
+  const head = document.createElement("div");
+  head.className = "memory-inspector-head";
+  const headingCopy = document.createElement("div");
+  const eyebrow = document.createElement("span");
+  eyebrow.textContent = "Evidence details";
+  const title = document.createElement("h2");
+  title.setAttribute("data-i18n-skip", "");
+  title.textContent = entry.reference;
+  headingCopy.append(eyebrow, title);
+  const status = document.createElement("i");
+  status.textContent = words(entry.status).toUpperCase();
+  status.dataset.state = entry.status;
+  head.append(headingCopy, status);
+  const content = document.createElement("p");
+  content.className = "memory-inspector-content";
+  content.setAttribute("data-i18n-skip", "");
+  content.textContent = entry.content;
+  const confidence = document.createElement("div");
+  confidence.className = "memory-confidence";
+  const confidenceLabel = document.createElement("div");
+  const confidenceName = document.createElement("span");
+  confidenceName.textContent = "Confidence";
+  const confidenceValue = document.createElement("strong");
+  confidenceValue.textContent = `${entry.confidence / 10}%`;
+  confidenceLabel.append(confidenceName, confidenceValue);
+  const meter = document.createElement("meter");
+  meter.min = 0;
+  meter.max = 100;
+  meter.value = entry.confidence / 10;
+  meter.textContent = `${entry.confidence / 10}%`;
+  confidence.append(confidenceLabel, meter);
+  const facts = document.createElement("dl");
+  facts.className = "memory-inspector-facts";
+  [
+    ["Kind", words(entry.kind)],
+    ["Status", words(entry.status)],
+    ["Sensitivity", words(entry.sensitivity)],
+    ["Visibility", words(entry.visibility)],
+    ["Provenance", entry.provenance],
+    ["Revision", `R${entry.revision}`],
+    ["Updated", memoryDateLabel(entry.updated_at_ms)],
+    ["Next review", memoryReviewLabel(entry.review_at_ms)],
+  ].forEach(([labelText, value]) => facts.append(memoryInspectorFact(labelText, value)));
+  const actions = document.createElement("div");
+  actions.className = "memory-inspector-actions";
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.className = "button secondary";
+  copy.textContent = "Copy content";
+  copy.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(entry.content);
+      toast("Memory content copied.");
+    } catch (_error) {
+      toast("Clipboard access is unavailable.", "error");
+    }
+  });
+  const ask = document.createElement("button");
+  ask.type = "button";
+  ask.className = "button primary";
+  ask.textContent = "Ask Monique";
+  ask.dataset.openChat = `Review memory evidence ${entry.reference}. Explain what it establishes, its provenance and confidence, whether it needs review, and how it should influence current work.`;
+  actions.append(copy, ask);
+  root.append(head, content, confidence, facts, actions);
 }
 
 async function loadMemory(query = null) {
@@ -1371,11 +1592,31 @@ byId("memory-kind").addEventListener("change", (event) => {
   memoryKind = event.target.value;
   renderSelectedMemory();
 });
+byId("memory-status").addEventListener("change", (event) => {
+  memoryStatus = event.target.value;
+  renderSelectedMemory();
+});
+byId("memory-sensitivity").addEventListener("change", (event) => {
+  memorySensitivity = event.target.value;
+  renderSelectedMemory();
+});
+byId("memory-sort").addEventListener("change", (event) => {
+  memorySort = event.target.value;
+  renderSelectedMemory();
+});
+byId("memory-reset").addEventListener("click", () => {
+  memoryKind = "all";
+  memoryStatus = "all";
+  memorySensitivity = "all";
+  memorySort = "updated_desc";
+  byId("memory-kind").value = memoryKind;
+  byId("memory-status").value = memoryStatus;
+  byId("memory-sensitivity").value = memorySensitivity;
+  byId("memory-sort").value = memorySort;
+  renderSelectedMemory();
+});
 document.querySelectorAll("[data-memory-mode]").forEach((button) => button.addEventListener("click", () => {
-  document.querySelectorAll("[data-memory-mode]").forEach((item) => item.classList.toggle("is-active", item === button));
-  const graphMode = button.dataset.memoryMode === "graph";
-  byId("memory-graph").hidden = !graphMode;
-  byId("memory-list").hidden = graphMode;
+  setMemoryMode(button.dataset.memoryMode);
 }));
 
 function operationLabel(value) {

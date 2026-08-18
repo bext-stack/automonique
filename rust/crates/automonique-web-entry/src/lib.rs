@@ -3782,6 +3782,12 @@ mod tests {
             "status-pulse",
             "data-chat-prompt",
             "memory-kind",
+            "memory-status",
+            "memory-sensitivity",
+            "memory-sort",
+            "memory-reset",
+            "memory-timeline",
+            "memory-inspector",
             "configuration-refresh",
             "theme-select",
             "text-scale-cycle",
@@ -3812,6 +3818,10 @@ mod tests {
         assert!(DASHBOARD_JS.contains("monique-density"));
         assert!(DASHBOARD_JS.contains("monique-start-view"));
         assert!(DASHBOARD_JS.contains("monique-language"));
+        assert!(DASHBOARD_JS.contains("monique-memory-view"));
+        assert!(DASHBOARD_JS.contains("renderMemoryTimeline"));
+        assert!(DASHBOARD_JS.contains("renderMemoryInspector"));
+        assert!(DASHBOARD_CSS.contains(".memory-workspace"));
         for theme in [
             "midnight", "ocean", "forest", "monokai", "dracula", "nord", "sand", "rose", "contrast",
         ] {

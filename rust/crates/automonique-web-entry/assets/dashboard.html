@@ -8,8 +8,8 @@
     <meta name="theme-color" id="theme-color" content="#0b0d10">
     <title>Monique</title>
     <link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=9">
-    <script src="/assets/dashboard.js?v=9" defer></script>
+    <link rel="stylesheet" href="/assets/dashboard.css?v=10">
+    <script src="/assets/dashboard.js?v=10" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -243,19 +243,33 @@
               <div><p class="kicker">TYPED / REVISIONED / PROVENANCE-BOUND</p><h1 id="memory-title">Memory system</h1><p class="page-lede">Inspect the evidence Monique can retrieve without exposing raw private state.</p></div>
               <form class="search" id="memory-search"><input id="memory-query" maxlength="512" aria-label="Search memory evidence" placeholder="Search memory evidence"><button class="search-clear" id="memory-clear" type="button" aria-label="Clear memory search" hidden>×</button><button type="submit">Search</button></form>
             </div>
-            <div class="memory-metrics">
+            <div class="memory-metrics" aria-label="Canonical memory counts">
               <article><span>ACTIVE</span><strong id="memory-active">—</strong></article>
               <article><span>PROPOSALS</span><strong id="memory-candidates">—</strong></article>
               <article><span>SUPERSEDED</span><strong id="memory-superseded">—</strong></article>
+              <article><span>DELETED</span><strong id="memory-deleted">—</strong></article>
+              <article><span>REVIEW DUE</span><strong id="memory-review-due">—</strong></article>
               <article><span>MESSAGES</span><strong id="memory-messages">—</strong></article>
             </div>
-            <div class="memory-toolbar">
-              <div><button class="segmented is-active" type="button" data-memory-mode="graph">Evidence graph</button><button class="segmented" type="button" data-memory-mode="list">Records</button></div>
-              <label class="memory-filter">Kind <select id="memory-kind"><option value="all">All evidence</option></select></label>
+            <div class="memory-toolbar panel">
+              <div class="memory-modes" role="group" aria-label="Memory view"><button class="segmented is-active" type="button" data-memory-mode="graph">Evidence graph</button><button class="segmented" type="button" data-memory-mode="list">Records</button><button class="segmented" type="button" data-memory-mode="timeline">Timeline</button></div>
+              <div class="memory-filters">
+                <label class="memory-filter">Kind <select id="memory-kind"><option value="all">All evidence</option></select></label>
+                <label class="memory-filter">Status <select id="memory-status"><option value="all">All statuses</option></select></label>
+                <label class="memory-filter">Sensitivity <select id="memory-sensitivity"><option value="all">All levels</option></select></label>
+                <label class="memory-filter">Sort <select id="memory-sort"><option value="updated_desc">Recently updated</option><option value="confidence_desc">Highest confidence</option><option value="review_asc">Review date</option><option value="reference">Reference</option></select></label>
+                <button class="button secondary" id="memory-reset" type="button">Reset filters</button>
+              </div>
               <span id="memory-result-label" role="status">Loading canonical store…</span>
             </div>
-            <article class="memory-graph panel" id="memory-graph" aria-label="Typed memory evidence graph"></article>
-            <div class="memory-list" id="memory-list" hidden></div>
+            <div class="memory-workspace">
+              <div class="memory-views">
+                <article class="memory-graph panel" id="memory-graph" aria-label="Typed memory evidence graph"></article>
+                <div class="memory-list" id="memory-list" hidden></div>
+                <div class="memory-timeline" id="memory-timeline" hidden></div>
+              </div>
+              <aside class="memory-inspector panel" id="memory-inspector" aria-live="polite"><div class="memory-inspector-empty"><span>◇</span><strong>Select evidence</strong><p>Choose a graph node, record, or timeline event to inspect its provenance and review state.</p></div></aside>
+            </div>
           </section>
 
           <section class="view" data-panel="configuration" aria-labelledby="configuration-title">
