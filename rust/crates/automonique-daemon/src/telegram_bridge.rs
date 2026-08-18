@@ -111,7 +111,8 @@ use std::time::{Duration, Instant};
 
 pub use automonique_core::conversation::utc_rfc3339_from_unix_millis;
 use automonique_core::conversation::{
-    is_current_time_question, is_enabled_site_inventory_question, is_site_inventory_question,
+    is_current_time_question, is_deferred_placeholder_answer, is_enabled_site_inventory_question,
+    is_site_inventory_question,
 };
 use automonique_github_connector::IssueLocator;
 use automonique_protocol::admin::ExecutionState;
@@ -2684,7 +2685,7 @@ where
                         .saturating_add(started_at.duration_since(job.prepared_at).as_millis());
                     let queue_expired = started_at.duration_since(job.prepared_at)
                         > MAX_QUESTION_QUEUE_WAIT;
-                    let (runtime, outcome) = if queue_expired {
+                    let (mut runtime, mut outcome) = if queue_expired {
                         (
                             QuestionRuntime::codex(job.profile),
                             Err(RunFailure::TimedOut),
@@ -2706,6 +2707,24 @@ where
                         ),
                         }
                     };
+                    if !queue_expired
+                        && outcome
+                            .as_ref()
+                            .is_ok_and(|answer| is_deferred_placeholder_answer(answer))
+                    {
+                        match lane.lock() {
+                            Ok(mut lane) => {
+                                runtime = lane.question_runtime(QuestionProfile::Operational);
+                                lane.set_draft_target(Some(job.chat_id));
+                                outcome = lane.run_question(
+                                    &job.prompt,
+                                    QuestionProfile::Operational,
+                                );
+                                lane.set_draft_target(None);
+                            }
+                            Err(_) => outcome = Err(RunFailure::Unavailable),
+                        }
+                    }
                     let execution_ms = started_at.elapsed().as_millis();
                     let total_ms = job.accepted_at.elapsed().as_millis();
                     let mut continuation = None;
@@ -2784,6 +2803,12 @@ where
                                 Some(ModelQuestionIntent::Refused(answer)) => (false, answer),
                                 None => (true, answer),
                             },
+                            QuestionStage::Answer if is_deferred_placeholder_answer(&answer) => (
+                                false,
+                                String::from(
+                                    "The provider returned another wait message instead of the completed answer. No background lookup is still running; please retry.",
+                                ),
+                            ),
                             QuestionStage::Answer => (true, answer),
                         },
                         Err(RunFailure::Failed)
@@ -10638,6 +10663,37 @@ fn slack_thread_transport_context(roster: Option<&str>) -> String {
     }
 }
 
+/// Run one conversational pass to a completed answer or typed plan.
+///
+/// Fast providers may occasionally return a promise to search or act later.
+/// No transport treats that text as a scheduled continuation. Retry once on
+/// the intelligent profile while retaining the exact original prompt, then
+/// fail explicitly if the second provider still does not complete the turn.
+fn run_question_completion_pass(
+    lane: &mut dyn RunLane,
+    prompt: &str,
+    profile: QuestionProfile,
+) -> Result<(String, QuestionRuntime), RunFailure> {
+    let mut runtime = lane.question_runtime(profile);
+    let mut answer = lane.run_question(prompt, profile)?;
+    if is_deferred_placeholder_answer(&answer) {
+        runtime = lane.question_runtime(QuestionProfile::Operational);
+        answer = lane.run_question(prompt, QuestionProfile::Operational)?;
+    }
+    if is_deferred_placeholder_answer(&answer) {
+        return Err(RunFailure::Failed);
+    }
+    Ok((answer, runtime))
+}
+
+pub(crate) fn run_question_to_completion(
+    lane: &mut dyn RunLane,
+    prompt: &str,
+    profile: QuestionProfile,
+) -> Result<String, RunFailure> {
+    run_question_completion_pass(lane, prompt, profile).map(|(answer, _)| answer)
+}
+
 /// Run the same closed conversational router for a non-Telegram transport.
 ///
 /// The caller supplies only already-admitted prose, bounded conversation
@@ -10714,8 +10770,11 @@ pub(crate) fn answer_read_only_transport_question(
             };
             let lookup_ms = lookup_started.elapsed().as_millis();
             let execution_started = Instant::now();
-            let runtime = lane.question_runtime(QuestionProfile::OperationalLookup);
-            let answer = match lane.run_question(&prompt, QuestionProfile::OperationalLookup) {
+            let (answer, runtime) = match run_question_completion_pass(
+                lane,
+                &prompt,
+                QuestionProfile::OperationalLookup,
+            ) {
                 Ok(answer) => answer,
                 Err(failure) => return String::from(question_failure_reply(failure)),
             };
@@ -10756,8 +10815,8 @@ pub(crate) fn answer_read_only_transport_question(
         );
     };
     let routing_started = Instant::now();
-    let routing_runtime = lane.question_runtime(profile);
-    let routed = match lane.run_question(&intent_prompt, profile) {
+    let (routed, routing_runtime) = match run_question_completion_pass(lane, &intent_prompt, profile)
+    {
         Ok(answer) => answer,
         Err(failure) => return String::from(question_failure_reply(failure)),
     };
@@ -10811,8 +10870,7 @@ pub(crate) fn answer_read_only_transport_question(
                 .saturating_sub(first_execution_ms)
                 .saturating_add(selected_started.elapsed().as_millis());
             let execution_started = Instant::now();
-            let runtime = lane.question_runtime(plan.profile);
-            let answer = match lane.run_question(&prompt, plan.profile) {
+            let (answer, runtime) = match run_question_completion_pass(lane, &prompt, plan.profile) {
                 Ok(answer) => answer,
                 Err(failure) => return String::from(question_failure_reply(failure)),
             };
@@ -10889,8 +10947,7 @@ pub(crate) fn answer_typed_github_issue_question(
         );
     };
     let execution_started = Instant::now();
-    let runtime = lane.question_runtime(profile);
-    let answer = match lane.run_question(&prompt, profile) {
+    let (answer, runtime) = match run_question_completion_pass(lane, &prompt, profile) {
         Ok(answer) => answer,
         Err(failure) => return String::from(question_failure_reply(failure)),
     };
@@ -12004,7 +12061,15 @@ fn model_question_intent(
                 return None;
             }
             let answer = object.get("answer")?.as_str()?.trim();
-            (!answer.is_empty()).then(|| ModelQuestionIntent::Answer(bounded_reply(answer)))
+            if answer.is_empty() {
+                None
+            } else if is_deferred_placeholder_answer(answer) {
+                Some(ModelQuestionIntent::Refused(String::from(
+                    "The provider did not complete the requested lookup or action plan, and no background continuation was scheduled. Please retry.",
+                )))
+            } else {
+                Some(ModelQuestionIntent::Answer(bounded_reply(answer)))
+            }
         }
         "read" => {
             if !object.keys().all(|key| {
@@ -12446,6 +12511,7 @@ fn question_prompt(question: &str, context: &str, profile: QuestionProfile) -> O
          Answer concisely in the user's language. Lead with the result and include only details that help the user decide or act.\n\
          Use only the supplied facts; missing authority or truncation must be stated.\n\
          The snapshot was assembled by deterministic typed read tools selected from the question. Synthesize their results into ordinary language; do not narrate routing or claim that any unselected tool ran.\n\
+         For GitHub delivery detail, distinguish the canonical open/closed state from completion evidence in the checklist and recent comments, preferring newer comments when they supersede older progress.\n\
          Do not enumerate source fields, provenance, checks, or caveats unless they materially change the answer or the user asks for them.\n\
          Retrieved durable memory and recent conversation are relevant context, not live measurements; when they conflict, prefer the current typed source and state the conflict.\n\
          Local entity-catalog claims are read-only evidence: distinguish operator assertions, local observations, and primary sources, and name the supplied provenance for material identity claims.\n\
@@ -12459,6 +12525,7 @@ fn question_prompt(question: &str, context: &str, profile: QuestionProfile) -> O
          If the selected sources are insufficient, state the gap plainly; the intent router, not the user, is responsible for selecting public-web research before this answer stage.\n\
          Do not request public-web research for private host facts or arbitrary disk access; name the missing approved local source instead.\n\
          A live GitHub issue read is not a writable repository workspace. If asked to implement or fix an issue, explain that code execution is unavailable until that repository has an explicitly mapped writable workspace; never claim a read or draft completed the issue.\n\
+         This is an answer-producing pass. Return the completed answer now; never say you will fetch, look into, or answer later.\n\
          Return only the answer, with no tools or control instructions.\n\n\
          BEGIN_ADMIN_QUESTION ({} UTF-8 bytes)\n{}\nEND_ADMIN_QUESTION\n\n\
          BEGIN_READ_ONLY_FACT_SNAPSHOT\n{}\nEND_READ_ONLY_FACT_SNAPSHOT\n",

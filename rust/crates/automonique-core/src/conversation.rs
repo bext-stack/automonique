@@ -106,6 +106,99 @@ pub fn is_enabled_site_inventory_question(question: &str) -> bool {
         })
 }
 
+/// Whether a provider returned a promise to answer later instead of the
+/// complete one-shot answer every conversational transport requires.
+///
+/// The bound keeps this deliberately narrow: a long answer that happens to
+/// discuss a future lookup is not rejected, while short acknowledgements such
+/// as "I'll fetch that — one moment" cannot be mistaken for an asynchronous
+/// job that the caller never scheduled.
+#[must_use]
+pub fn is_deferred_placeholder_answer(answer: &str) -> bool {
+    let normalized = answer
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    if normalized.is_empty() || normalized.len() > 600 {
+        return false;
+    }
+    [
+        "i'll fetch",
+        "i will fetch",
+        "let me fetch",
+        "i'll look into",
+        "i will look into",
+        "let me look into",
+        "i'll check that",
+        "i will check that",
+        "i'll search",
+        "i will search",
+        "let me search",
+        "i'll browse",
+        "i will browse",
+        "i'll research",
+        "i will research",
+        "i'll run that",
+        "i will run that",
+        "i'll do that",
+        "i will do that",
+        "i'll send",
+        "i will send",
+        "i'll post",
+        "i will post",
+        "i'll execute",
+        "i will execute",
+        "je vais chercher",
+        "je vais rechercher",
+        "je vais vérifier",
+        "je vais verifier",
+        "je vais consulter",
+        "je vais le faire",
+        "je vais exécuter",
+        "je vais executer",
+        "je vais envoyer",
+        "je vais publier",
+        "laisse-moi vérifier",
+        "laisse moi verifier",
+    ]
+    .iter()
+    .any(|promise| normalized.contains(promise))
+        || ([
+            "one moment",
+            "please wait",
+            "give me a moment",
+            "un instant",
+            "un moment",
+            "patientez",
+        ]
+        .iter()
+        .any(|wait| normalized.contains(wait))
+            && [
+                "fetch",
+                "look into",
+                "check",
+                "search",
+                "browse",
+                "research",
+                "run",
+                "execute",
+                "send",
+                "post",
+                "chercher",
+                "rechercher",
+                "consulter",
+                "executer",
+                "exécuter",
+                "envoyer",
+                "publier",
+                "vérifier",
+                "verifier",
+            ]
+            .iter()
+            .any(|action| normalized.contains(action)))
+}
+
 /// Render non-negative Unix milliseconds as an exact UTC RFC 3339 timestamp.
 #[must_use]
 pub fn utc_rfc3339_from_unix_millis(unix_ms: i64) -> Option<String> {
@@ -162,6 +255,28 @@ mod tests {
         ));
         assert!(!is_enabled_site_inventory_question(
             "what sites do we manage?"
+        ));
+    }
+
+    #[test]
+    fn deferred_one_shot_placeholders_are_detected_without_rejecting_answers() {
+        assert!(is_deferred_placeholder_answer(
+            "I can look into that issue for you — I'll fetch its details. One moment."
+        ));
+        assert!(is_deferred_placeholder_answer(
+            "Je vais rechercher les détails, un instant."
+        ));
+        assert!(is_deferred_placeholder_answer(
+            "I'll search the web and get back to you."
+        ));
+        assert!(is_deferred_placeholder_answer(
+            "Je vais envoyer le message après vérification."
+        ));
+        assert!(!is_deferred_placeholder_answer(
+            "The issue is open, but its latest delivery comment reports that production verification passed."
+        ));
+        assert!(!is_deferred_placeholder_answer(
+            "I checked the issue and found that it is still open."
         ));
     }
 

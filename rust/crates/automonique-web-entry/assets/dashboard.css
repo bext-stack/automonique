@@ -966,6 +966,7 @@ kbd { padding: 1px 4px; border: 1px solid var(--line-bright); border-bottom-colo
 .process-metrics span, .process-metrics small { display: block; overflow: hidden; color: var(--quiet); font-size: var(--font-xs); text-overflow: ellipsis; white-space: nowrap; }
 .process-metrics span { font-family: ui-monospace, monospace; letter-spacing: .08em; }
 .process-metrics strong { display: block; margin: 7px 0 3px; font: var(--font-display-sm) ui-monospace, monospace; }
+.process-semantics { margin: 0; padding: 9px 18px; border-bottom: 1px solid var(--line); color: var(--quiet); background: var(--panel-2); font-size: var(--font-xs); line-height: 1.45; }
 .process-worker { display: grid; grid-template-columns: minmax(220px, 1fr) auto; gap: 14px 18px; align-items: center; padding: 15px 18px; border-bottom: 1px solid var(--line); background: linear-gradient(90deg, var(--panel), var(--panel-2)); }
 .process-worker-identity { display: flex; min-width: 0; gap: 11px; align-items: center; }
 .process-worker-identity > i { flex: 0 0 11px; width: 11px; height: 11px; border: 3px solid var(--accent-border); border-radius: 50%; background: var(--green); box-shadow: 0 0 0 5px var(--accent-glow); }

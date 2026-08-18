@@ -1024,6 +1024,20 @@ pub fn natural_issue_request(text: &str) -> Result<Option<GitHubIssueRequestInte
         ],
     );
     let review = status_read
+        || contains_any(
+            &normalized,
+            &[
+                "what can you tell me about",
+                "tell me about",
+                "what do you know about",
+                "que peux tu me dire",
+                "que peux-tu me dire",
+                "que pouvez vous me dire",
+                "que pouvez-vous me dire",
+                "qu est ce que tu sais sur",
+                "qu'est-ce que tu sais sur",
+            ],
+        )
         || terms.iter().any(|term| {
             matches!(
                 *term,
@@ -1479,6 +1493,8 @@ mod tests {
             format!("check {ISSUE}"),
             format!("review {ISSUE}"),
             format!("inspect {ISSUE}"),
+            format!("what can you tell me about {ISSUE} ?"),
+            format!("que peux-tu me dire sur {ISSUE} ?"),
             format!("what is the status of this {ISSUE}"),
             format!("{ISSUE} il est fait celui là ?"),
         ] {

@@ -9,6 +9,14 @@ The store retains four distinct things:
 - revisioned long-term memories with provenance, confidence, sensitivity, visibility, review dates, and tombstones;
 - a full audit trail for proposals, approvals, denials, supersession, and forgetting.
 
+Use canonical memory for stable, reviewed facts and preferences that should
+shape later conversations. Keep product architecture, operational state
+semantics, and recovery procedures in repository documentation and tests. Do
+not preserve live job state, timestamps, process identifiers, credentials,
+channel coordinates, logs, or customer data as long-term memory. The operator
+source-of-truth map is documented in
+[`operational-state.md`](operational-state.md).
+
 FTS5 is the initial retrieval projection. It requires no resident embedding model and keeps idle memory use low. A semantic adapter should only be added after an evaluation corpus demonstrates a material recall improvement that justifies its RAM, latency, and operational cost.
 
 ## The tenant

@@ -33,6 +33,25 @@ stage, or plan update is required to start or finish repository work.
   remotes without explicit authority. Stop on conflicts or a non-fast-forward
   push rather than forcing through them.
 
+## Operational source of truth
+
+- Treat the Automonique daemon, dashboard, Manage fleet worker, provider
+  processes, GitHub issues, and Slack messages as distinct surfaces. Do not
+  infer one surface's state from another.
+- A Manage `pending` job is queued control-plane state, not proof of execution.
+  Call work running only from a fresh `running` job and matching worker/runtime
+  evidence. A worker being `online` only means its polling service is healthy.
+- Determine delivery from the canonical GitHub issue, its checklist, trusted
+  completion comments, merged changes, and live verification. Report the
+  issue's formal open/closed state separately: an issue may intentionally stay
+  open after completed delivery.
+- Slack replies and dashboard projections are presentation state. When they
+  disagree with GitHub or fresh runtime evidence, report the discrepancy; do
+  not silently cancel, complete, close, or restart anything.
+- A request to stop work targets the exact active job or provider session. Do
+  not stop long-lived daemon, dashboard, or polling services when no active job
+  exists. See `docs/operational-state.md` for the full operator map.
+
 ## Licensing and commits
 
 Product code is `Elastic-2.0`; `sdk/` is the only `Apache-2.0` root. Moving code

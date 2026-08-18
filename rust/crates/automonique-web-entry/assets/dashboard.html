@@ -8,8 +8,8 @@
     <meta name="theme-color" id="theme-color" content="#0b0d10">
     <title>Monique</title>
     <link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=10">
-    <script src="/assets/dashboard.js?v=10" defer></script>
+    <link rel="stylesheet" href="/assets/dashboard.css?v=11">
+    <script src="/assets/dashboard.js?v=11" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -191,6 +191,7 @@
                 <article><span>COMPLETED</span><strong id="process-completed">—</strong><small>visible recent history</small></article>
                 <article><span>FAILED</span><strong id="process-failed">—</strong><small>requires review or retry</small></article>
               </div>
+              <p class="process-semantics">Queued is Manage control-plane state. Only Running means an agent is executing.</p>
               <div class="process-worker" id="process-worker"><div class="integration-empty">Loading the selected worker and its execution harness…</div></div>
               <div class="process-toolbar">
                 <div class="process-filters" role="group" aria-label="Filter agent processes"><button class="is-active" type="button" data-process-filter="all">All <b id="process-filter-all">0</b></button><button type="button" data-process-filter="active">Active <b id="process-filter-active">0</b></button><button type="button" data-process-filter="queued">Queued <b id="process-filter-queued">0</b></button><button type="button" data-process-filter="failed">Failed <b id="process-filter-failed">0</b></button><button type="button" data-process-filter="completed">Completed <b id="process-filter-completed">0</b></button></div>

@@ -59,6 +59,7 @@ enables an external surface updates this section in the same pull request; see
 
 ```text
 docs/product-plan/       product goals, requirements, architecture, migration
+docs/operational-state.md runtime ownership and source-of-truth runbook
 rust/crates/             Rust product crates and tests
 sdk/                     Apache-2.0 client SDKs
 tools/                   development and diagnostic tools

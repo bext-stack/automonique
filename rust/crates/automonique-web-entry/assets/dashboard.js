@@ -455,6 +455,15 @@ const frenchUi = Object.freeze({
   "See every active and recent agent process, inspect its live output, and open the exact run in Manage. Every mutation remains staged for explicit approval.": "Consultez chaque processus d’agent actif ou récent, inspectez sa sortie en direct et ouvrez l’exécution exacte dans Manage. Chaque modification reste soumise à une approbation explicite.",
   "EXECUTION MONITOR": "SUIVI DES EXÉCUTIONS",
   "Agent processes": "Processus des agents",
+  "Queued is Manage control-plane state. Only Running means an agent is executing.": "En attente décrit l’état du plan de contrôle Manage. Seul En cours signifie qu’un agent s’exécute.",
+  "Queued in Manage": "En attente dans Manage",
+  "Awaiting worker claim": "En attente de prise en charge",
+  "Active agent execution": "Exécution active de l’agent",
+  "Completed agent execution": "Exécution de l’agent terminée",
+  "Failed agent execution": "Échec de l’exécution de l’agent",
+  "Cancelled agent execution": "Exécution de l’agent annulée",
+  "No active session reported": "Aucune session active signalée",
+  "Live session reported": "Session active signalée",
   "Waiting for worker snapshot": "En attente de l’instantané du worker",
   "Agent process counts": "Nombre de processus d’agents",
   "RUNNING": "EN COURS",
@@ -1634,7 +1643,7 @@ function operationsMessage(health) {
 }
 
 function processStatusLabel(status) {
-  const labels = { pending: "Queued", running: "Running", done: "Completed", failed: "Failed", cancelled: "Cancelled", unknown: "Unknown" };
+  const labels = { pending: "Queued in Manage", running: "Running", done: "Completed", failed: "Failed", cancelled: "Cancelled", unknown: "Unknown" };
   return labels[status] || operationLabel(status);
 }
 
@@ -1784,10 +1793,19 @@ function renderProcesses(view) {
     const execution = document.createElement("div");
     execution.className = "process-execution";
     const executionTitle = document.createElement("strong");
-    executionTitle.textContent = [operationLabel(job.provider), operationLabel(job.runtime)].filter((value) => value !== "Unknown").join(" · ") || "Agent execution";
+    const executionName = [operationLabel(job.provider), operationLabel(job.runtime)].filter((value) => value !== "Unknown").join(" · ");
+    const executionState = {
+      pending: "Awaiting worker claim",
+      running: "Active agent execution",
+      done: "Completed agent execution",
+      failed: "Failed agent execution",
+      cancelled: "Cancelled agent execution",
+    }[job.status] || "Agent execution";
+    executionTitle.textContent = executionName || executionState;
     const facts = document.createElement("div");
     facts.className = "process-facts";
-    [operationLabel(job.source), job.assigned_to_worker ? "Assigned to this worker" : "Unassigned from this worker", job.approved ? "Approval recorded" : "No approval recorded"]
+    [operationLabel(job.source), job.assigned_to_worker ? "Assigned to this worker" : "Unassigned from this worker", job.approved ? "Approval recorded" : "No approval recorded", job.status === "running" && job.session_id ? "Live session reported" : job.status === "pending" ? "No active session reported" : null]
+      .filter(Boolean)
       .forEach((value) => {
         const fact = document.createElement("span");
         fact.textContent = value;

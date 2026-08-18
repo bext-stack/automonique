@@ -60,6 +60,8 @@ const REPLY_ACTION: &str = "reply";
 const CHECKLIST_ACTION: &str = "checklist";
 const MAX_CONFIG_BYTES: u64 = 16_384;
 const MAX_ISSUE_BODY_CONTEXT_BYTES: usize = 2_000;
+const MAX_ISSUE_FACT_COMMENTS: usize = 5;
+const MAX_ISSUE_COMMENT_CONTEXT_BYTES: usize = 1_000;
 const MAX_CONFIGURED_REPOSITORIES: usize = 16;
 const MAX_REPOSITORY_ALIAS_BYTES: usize = 32;
 const MAX_ACTION_COMMENTS: u32 = 1_000;
@@ -96,6 +98,20 @@ pub trait GitHubSurface: Send {
             "status=refused reason=github_actions_unavailable",
         ))
     }
+}
+
+/// Read one canonical issue URL through an already configured typed surface.
+///
+/// Keeping URL parsing beside the connector prevents presentation layers from
+/// growing their own GitHub URL grammar or reaching for an unbounded web tool.
+pub fn issue_facts_from_url(
+    surface: &mut dyn GitHubSurface,
+    issue_url: &str,
+    detail: IssueFactDetail,
+) -> Result<String, String> {
+    let locator = IssueLocator::parse(issue_url)
+        .ok_or_else(|| String::from("status=refused reason=github_issue_url_not_canonical"))?;
+    surface.issue_facts(&locator, detail)
 }
 
 /// Bounded issue context supplied to the GitHub drafting worker.
@@ -930,6 +946,18 @@ impl GitHubSurface for GitHubWorkspace {
             facts.push_str(&single_line(&issue.created_at));
             facts.push_str("\nbody_untrusted=");
             facts.push_str(&bounded_field(&issue.body, MAX_ISSUE_BODY_CONTEXT_BYTES));
+            match self.recent_issue_comments(locator, issue.comment_count, MAX_ISSUE_FACT_COMMENTS)
+            {
+                Ok(comments) => append_recent_comment_facts(
+                    &mut facts,
+                    &comments,
+                    issue.comment_count as usize > comments.len(),
+                ),
+                Err(error) => {
+                    facts.push_str("\nrecent_comments_status=unavailable\nrecent_comments_reason=");
+                    facts.push_str(&single_line(&error));
+                }
+            }
         }
         Ok(facts)
     }
@@ -1100,27 +1128,7 @@ impl GitHubActionSurface for GitHubWorkspace {
                 .map_err(unavailable)?,
         )?;
         let keep = recent_comments.min(PAGE_SIZE as usize);
-        let comments = if issue.comment_count == 0 || keep == 0 {
-            Vec::new()
-        } else {
-            let (first_page, last_page) = recent_comment_pages(issue.comment_count, keep)
-                .ok_or_else(|| String::from("status=refused reason=issue_history_too_large"))?;
-            let mut comments = Vec::new();
-            for number in first_page..=last_page {
-                let page = Page::new(number, PAGE_SIZE)
-                    .map_err(|_| String::from("status=refused reason=issue_history_too_large"))?;
-                comments.extend(accepted(
-                    self.client
-                        .get_comments(&GetCommentsRequest::new(
-                            locator.target().clone(),
-                            locator.number(),
-                            page,
-                        ))
-                        .map_err(unavailable)?,
-                )?);
-            }
-            comments
-        };
+        let comments = self.recent_issue_comments(locator, issue.comment_count, keep)?;
         let comments = comments
             .into_iter()
             .rev()
@@ -1329,6 +1337,62 @@ impl GitHubActionSurface for GitHubWorkspace {
                 }
             })
             .collect()
+    }
+}
+
+impl GitHubWorkspace {
+    fn recent_issue_comments(
+        &self,
+        locator: &IssueLocator,
+        comment_count: u32,
+        keep: usize,
+    ) -> Result<Vec<GitHubComment>, String> {
+        if comment_count == 0 || keep == 0 {
+            return Ok(Vec::new());
+        }
+        let (first_page, last_page) = recent_comment_pages(comment_count, keep)
+            .ok_or_else(|| String::from("status=refused reason=issue_history_too_large"))?;
+        let mut comments = Vec::new();
+        for number in first_page..=last_page {
+            let page = Page::new(number, PAGE_SIZE)
+                .map_err(|_| String::from("status=refused reason=issue_history_too_large"))?;
+            comments.extend(accepted(
+                self.client
+                    .get_comments(&GetCommentsRequest::new(
+                        locator.target().clone(),
+                        locator.number(),
+                        page,
+                    ))
+                    .map_err(unavailable)?,
+            )?);
+        }
+        Ok(comments
+            .into_iter()
+            .rev()
+            .take(keep)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect())
+    }
+}
+
+fn append_recent_comment_facts(facts: &mut String, comments: &[GitHubComment], truncated: bool) {
+    facts.push_str("\nrecent_comments_status=available\nrecent_comments_returned=");
+    facts.push_str(&comments.len().to_string());
+    facts.push_str("\nrecent_comments_truncated=");
+    facts.push_str(if truncated { "true" } else { "false" });
+    for (index, comment) in comments.iter().enumerate() {
+        let number = index + 1;
+        facts.push_str(&format!("\ncomment_{number}_author="));
+        facts.push_str(&single_line(&comment.author));
+        facts.push_str(&format!("\ncomment_{number}_updated="));
+        facts.push_str(&single_line(&comment.updated_at));
+        facts.push_str(&format!("\ncomment_{number}_body_untrusted="));
+        facts.push_str(&bounded_field(
+            &comment.body,
+            MAX_ISSUE_COMMENT_CONTEXT_BYTES,
+        ));
     }
 }
 
@@ -2562,6 +2626,35 @@ mod tests {
         assert_eq!(recent_comment_pages(150, 20), Some((2, 2)));
         assert_eq!(recent_comment_pages(0, 20), None);
         assert_eq!(recent_comment_pages(10, 0), None);
+    }
+
+    #[test]
+    fn recent_issue_comment_facts_are_bounded_and_marked_untrusted() {
+        let comments = vec![
+            GitHubComment {
+                id: 1,
+                author: String::from("operator"),
+                body: String::from("Older progress"),
+                created_at: String::from("2026-08-18T10:00:00Z"),
+                updated_at: String::from("2026-08-18T10:00:00Z"),
+            },
+            GitHubComment {
+                id: 2,
+                author: String::from("delivery"),
+                body: "verified ".repeat(300),
+                created_at: String::from("2026-08-18T11:00:00Z"),
+                updated_at: String::from("2026-08-18T11:30:00Z"),
+            },
+        ];
+        let mut facts = String::from("status=available");
+        append_recent_comment_facts(&mut facts, &comments, true);
+        assert!(facts.contains("recent_comments_returned=2"));
+        assert!(facts.contains("recent_comments_truncated=true"));
+        assert!(facts.contains("comment_1_body_untrusted=Older progress"));
+        assert!(facts.contains("comment_2_author=delivery"));
+        assert!(facts.contains("comment_2_body_untrusted=verified"));
+        assert!(facts.contains("[…truncated]"));
+        assert!(facts.len() < 1_500);
     }
 
     #[test]
