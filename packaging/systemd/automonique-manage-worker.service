@@ -10,7 +10,11 @@ Type=simple
 ExecStart=%S/automonique/improvement-code/current/bin/automonique-manage-worker
 Restart=on-failure
 RestartSec=5s
-TimeoutStopSec=90s
+# Signal only the worker shell first. Its TERM trap stops intake and waits for
+# every accepted Codex child before exiting; signalling the whole cgroup would
+# kill those children before the drain can happen.
+KillMode=mixed
+TimeoutStopSec=infinity
 StateDirectory=automonique
 StateDirectoryMode=0700
 Environment=AUTOMONIQUE_STATE_DIR=%S/automonique

@@ -8117,6 +8117,61 @@ mod tests {
     }
 
     #[test]
+    fn github_comment_permalink_completion_question_reads_delivery_detail() {
+        let poster = FakeTicketPoster::default();
+        let messages = Arc::clone(&poster.messages);
+        let manage = FakeManage::default();
+        let opened = Arc::clone(&manage.opened);
+        let issue_reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut router = SlackTicketRouter {
+            poster,
+            manage: Box::new(manage),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
+            channels: ChannelMap(vec![(
+                name("ops"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            features: vec![SlackFeature::Approvals, SlackFeature::Conversation],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+            approvals: None,
+            approval_lane: None,
+            question_answerer: Some(Box::new(FakeIssueReviewAnswerer {
+                seen: Arc::clone(&issue_reads),
+            })),
+        };
+        let mut mention = ticket_event(
+            "U0ADMIN001",
+            "<@B0APP> did you do https://github.com/example/project/issues/42#issuecomment-5325231229 ?",
+            "EvCommentStatus",
+        );
+        mention.app_mention = true;
+        router.handle_with_context(mention, "");
+
+        assert_eq!(
+            issue_reads.lock().expect("issue reads").as_slice(),
+            [(
+                String::from("https://github.com/example/project/issues/42"),
+                String::from(
+                    "did you do https://github.com/example/project/issues/42#issuecomment-5325231229"
+                ),
+                true,
+            )]
+        );
+        assert_eq!(
+            messages.lock().expect("messages").as_slice(),
+            [String::from("Typed GitHub issue review")]
+        );
+        assert!(opened.lock().expect("opened").is_empty());
+    }
+
+    #[test]
     fn progress_follow_up_reads_the_manage_job_bound_to_the_slack_thread() {
         let poster = FakeTicketPoster::default();
         let messages = Arc::clone(&poster.messages);

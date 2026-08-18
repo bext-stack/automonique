@@ -147,10 +147,16 @@ where
         let urls = issue_urls(text);
         let uncheck = contains_any(&normalized, &["uncheck", "décoche", "decoche"]);
         let check = !uncheck && contains_any(&normalized, &["check", "coche"]);
-        let reply = contains_any(
-            &normalized,
-            &["reply", "respond", "comment", "répond", "repond"],
-        );
+        // Match mutation verbs as complete words. A GitHub comment permalink
+        // contains `issuecomment-…`; treating that URL fragment as the verb
+        // "comment" turns a read-only question into a malformed write.
+        let words = normalized
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .collect::<BTreeSet<_>>();
+        let reply = ["reply", "respond", "comment", "repond"]
+            .iter()
+            .any(|word| words.contains(word));
         let create = contains_any(&normalized, &["create", "open", "crée", "cree", "ouvre"])
             && (normalized.contains("github") || website_aliases.len() == 1)
             && contains_any(&normalized, &["issue", "ticket"])
@@ -912,6 +918,40 @@ fn issue_urls(text: &str) -> Vec<String> {
     urls.into_iter().collect()
 }
 
+/// Canonical issue coordinates carried by trusted HTTPS GitHub issue links.
+///
+/// Read-only questions may legitimately point at a comment permalink. The
+/// comment fragment selects context, while the typed GitHub reader still
+/// addresses the containing issue. Mutations continue to use [`issue_urls`]
+/// and therefore require an exact canonical issue URL.
+fn issue_references(text: &str) -> (Vec<String>, bool) {
+    let mut urls = BTreeSet::new();
+    let mut comment_permalink = false;
+    for token in text.split_whitespace() {
+        let token = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '"' | '\'' | '!'
+            )
+        });
+        let token = token.split_once('|').map_or(token, |(url, _)| url);
+        let token = token.strip_suffix('.').unwrap_or(token);
+        if !token.starts_with("https://github.com/") {
+            continue;
+        }
+        let Some(locator) = IssueLocator::parse(token) else {
+            continue;
+        };
+        comment_permalink |= token.contains("#issuecomment-");
+        urls.insert(format!(
+            "https://github.com/{}/issues/{}",
+            locator.target(),
+            locator.number().get()
+        ));
+    }
+    (urls.into_iter().collect(), comment_permalink)
+}
+
 /// Separate issue review from ticket work before either transport considers a
 /// checklist mutation or generic conversational routing.
 pub fn natural_issue_request(text: &str) -> Result<Option<GitHubIssueRequestIntent>, String> {
@@ -919,7 +959,7 @@ pub fn natural_issue_request(text: &str) -> Result<Option<GitHubIssueRequestInte
     // vocabulary. This router only owns a message once the sender supplied a
     // canonical GitHub issue URL; without one, the rest of conversational
     // routing must remain reachable.
-    let urls = issue_urls(text);
+    let (urls, comment_permalink) = issue_references(text);
     if urls.is_empty() {
         return Ok(None);
     }
@@ -939,6 +979,10 @@ pub fn natural_issue_request(text: &str) -> Result<Option<GitHubIssueRequestInte
             "is this resolved",
             "has this been done",
             "has this been completed",
+            "did you do",
+            "did you finish",
+            "did you complete",
+            "have you done",
             "what is the status",
             "what's the status",
             "status of this",
@@ -1056,7 +1100,9 @@ pub fn natural_issue_request(text: &str) -> Result<Option<GitHubIssueRequestInte
         ));
     };
     if review {
-        let deep = !status_read;
+        // A comment permalink is a request about delivery detail, not merely
+        // the issue's open/closed bit. Load the full body/checklist/comments.
+        let deep = comment_permalink || !status_read;
         return Ok(Some(GitHubIssueRequestIntent::Read {
             issue_url: issue_url.clone(),
             deep,
@@ -1461,6 +1507,28 @@ mod tests {
             None
         );
         assert!(natural_issue_request(&format!("review and fix {ISSUE}")).is_err());
+    }
+
+    #[test]
+    fn comment_permalink_completion_questions_are_deep_reads_not_mutations() {
+        const COMMENT: &str =
+            "https://github.com/example/company-manager/issues/1212#issuecomment-5325231229";
+        assert_eq!(
+            natural_issue_request(&format!("did you do {COMMENT} ?"))
+                .expect("comment completion question"),
+            Some(GitHubIssueRequestIntent::Read {
+                issue_url: String::from("https://github.com/example/company-manager/issues/1212"),
+                deep: true,
+            })
+        );
+
+        let (engine, _, _) = engine("this answer must not be read");
+        assert_eq!(
+            engine
+                .natural_request(&format!("did you do {COMMENT} ?"))
+                .expect("must not become a reply mutation"),
+            None
+        );
     }
 
     #[test]
