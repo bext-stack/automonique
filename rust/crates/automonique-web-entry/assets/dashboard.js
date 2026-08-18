@@ -11,14 +11,55 @@ const statusHistory = [];
 let memorySnapshot = null;
 let memoryKind = "all";
 let memoryQuery = null;
+let operationsSnapshot = null;
+let ticketFilter = "all";
 let lastObservedMs = null;
 let lastStatusKey = null;
 let lastPulseChangeAt = null;
 let chatBusy = false;
 let newChatArmed = false;
 let newChatTimer = null;
-const themes = ["system", "dark", "light"];
-const textScales = ["standard", "comfortable", "large"];
+const themeNames = {
+  system: "System",
+  dark: "Carbon",
+  light: "Paper",
+  midnight: "Midnight",
+  ocean: "Ocean",
+  forest: "Forest",
+  monokai: "Monokai",
+  dracula: "Dracula",
+  nord: "Nord",
+  sand: "Sand",
+  rose: "Rose",
+  contrast: "High contrast",
+};
+const themeColors = {
+  dark: "#0b0d10",
+  light: "#f7f7f5",
+  midnight: "#090a14",
+  ocean: "#061116",
+  forest: "#0a110d",
+  monokai: "#272822",
+  dracula: "#282a36",
+  nord: "#2e3440",
+  sand: "#f5efe5",
+  rose: "#faf2f4",
+  contrast: "#000000",
+};
+const themes = Object.keys(themeNames);
+const textScaleNames = {
+  compact: "Compact",
+  standard: "Standard",
+  comfortable: "Comfortable",
+  large: "Large",
+  "extra-large": "Extra large",
+};
+const textScales = Object.keys(textScaleNames);
+const sidebarStates = ["expanded", "collapsed"];
+const densityNames = { compact: "Compact", comfortable: "Comfortable", spacious: "Spacious" };
+const densities = Object.keys(densityNames);
+const motionModes = ["full", "reduce"];
+const startupViews = ["chat", "overview", "operations", "tickets"];
 
 function storedPreference(key, allowed, fallback) {
   try {
@@ -48,40 +89,136 @@ function applyTheme(theme, persist = true) {
   document.documentElement.dataset.theme = theme;
   byId("theme-select").value = theme;
   const resolved = resolvedTheme(theme);
-  byId("theme-cycle").dataset.theme = resolved;
-  byId("theme-cycle").setAttribute("aria-label", `Color theme: ${theme}. Change theme`);
-  byId("theme-color").content = resolved === "light" ? "#f7f7f5" : "#0b0d10";
+  byId("theme-cycle").dataset.theme = theme;
+  byId("theme-cycle").setAttribute("aria-label", `Appearance. Current theme: ${themeNames[theme]}`);
+  byId("theme-cycle").title = `Appearance · ${themeNames[theme]}`;
+  byId("sidebar-theme-name").textContent = themeNames[theme];
+  byId("theme-color").content = themeColors[resolved] || themeColors.dark;
+  document.querySelectorAll("[data-theme-choice]").forEach((button) => {
+    const active = button.dataset.themeChoice === theme;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
   if (persist) savePreference("monique-theme", theme);
 }
 
 function applyTextScale(scale, persist = true) {
   if (!textScales.includes(scale)) scale = "comfortable";
   document.documentElement.dataset.textScale = scale;
-  document.querySelectorAll("[data-text-scale]").forEach((button) => {
-    const active = button.dataset.textScale === scale;
+  byId("text-scale-cycle").dataset.scale = scale;
+  byId("text-scale-cycle").setAttribute("aria-label", `Text size: ${textScaleNames[scale]}. Increase text size`);
+  byId("text-scale-name").textContent = textScaleNames[scale];
+  byId("text-scale-input").value = String(textScales.indexOf(scale));
+  if (persist) savePreference("monique-text-scale", scale);
+}
+
+function applySidebar(state, persist = true) {
+  if (!sidebarStates.includes(state)) state = "expanded";
+  document.documentElement.dataset.sidebar = state;
+  const expanded = state === "expanded";
+  byId("sidebar-toggle").setAttribute("aria-expanded", String(expanded));
+  byId("sidebar-collapse").setAttribute("aria-label", expanded ? "Collapse sidebar" : "Expand sidebar");
+  byId("sidebar-collapse").title = expanded ? "Collapse sidebar" : "Expand sidebar";
+  byId("sidebar-collapse").firstElementChild.textContent = expanded ? "‹" : "›";
+  if (persist) savePreference("monique-sidebar", state);
+}
+
+function applyDensity(density, persist = true) {
+  if (!densities.includes(density)) density = "comfortable";
+  document.documentElement.dataset.density = density;
+  document.querySelectorAll("[data-density-choice]").forEach((button) => {
+    const active = button.dataset.densityChoice === density;
     button.classList.toggle("is-active", active);
     button.setAttribute("aria-pressed", String(active));
   });
-  byId("text-scale-cycle").dataset.scale = scale;
-  byId("text-scale-cycle").setAttribute("aria-label", `Text size: ${scale}. Increase text size`);
-  if (persist) savePreference("monique-text-scale", scale);
+  if (persist) savePreference("monique-density", density);
+}
+
+function applyMotion(mode, persist = true) {
+  if (!motionModes.includes(mode)) mode = "full";
+  document.documentElement.dataset.motion = mode;
+  byId("reduce-motion").checked = mode === "reduce";
+  if (persist) savePreference("monique-motion", mode);
+}
+
+function applyStartupView(view, persist = true) {
+  if (!startupViews.includes(view)) view = "chat";
+  byId("startup-view").value = view;
+  if (persist) savePreference("monique-start-view", view);
 }
 
 applyTheme(storedPreference("monique-theme", themes, "system"), false);
 applyTextScale(storedPreference("monique-text-scale", textScales, "comfortable"), false);
+applySidebar(storedPreference("monique-sidebar", sidebarStates, "expanded"), false);
+applyDensity(storedPreference("monique-density", densities, "comfortable"), false);
+applyMotion(storedPreference("monique-motion", motionModes, "full"), false);
+applyStartupView(storedPreference("monique-start-view", startupViews, "chat"), false);
 
 byId("theme-select").addEventListener("change", (event) => applyTheme(event.target.value));
-document.querySelectorAll("[data-text-scale]").forEach((button) => button.addEventListener("click", () => applyTextScale(button.dataset.textScale)));
-byId("theme-cycle").addEventListener("click", () => {
-  const current = document.documentElement.dataset.theme || "system";
-  applyTheme(themes[(themes.indexOf(current) + 1) % themes.length]);
-});
+document.querySelectorAll("[data-theme-choice]").forEach((button) => button.addEventListener("click", () => applyTheme(button.dataset.themeChoice)));
 byId("text-scale-cycle").addEventListener("click", () => {
   const current = document.documentElement.dataset.textScale || "comfortable";
   applyTextScale(textScales[(textScales.indexOf(current) + 1) % textScales.length]);
 });
+byId("text-scale-input").addEventListener("input", (event) => applyTextScale(textScales[Number(event.target.value)]));
+byId("text-scale-down").addEventListener("click", () => {
+  const current = textScales.indexOf(document.documentElement.dataset.textScale || "comfortable");
+  applyTextScale(textScales[Math.max(0, current - 1)]);
+});
+byId("text-scale-up").addEventListener("click", () => {
+  const current = textScales.indexOf(document.documentElement.dataset.textScale || "comfortable");
+  applyTextScale(textScales[Math.min(textScales.length - 1, current + 1)]);
+});
 window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
   if (document.documentElement.dataset.theme === "system") applyTheme("system", false);
+});
+
+function appearanceOpen(open) {
+  byId("appearance-panel").hidden = !open;
+  byId("theme-cycle").setAttribute("aria-expanded", String(open));
+  byId("sidebar-appearance").setAttribute("aria-expanded", String(open));
+  if (open) byId("appearance-close").focus();
+}
+
+function mobileSidebarOpen(open) {
+  if (open) document.documentElement.dataset.mobileSidebar = "open";
+  else delete document.documentElement.dataset.mobileSidebar;
+  byId("sidebar-backdrop").hidden = !open;
+  byId("sidebar-toggle").setAttribute("aria-expanded", String(open));
+}
+
+[byId("theme-cycle"), byId("sidebar-appearance")].forEach((button) => button.addEventListener("click", () => {
+  appearanceOpen(byId("appearance-panel").hidden);
+}));
+byId("appearance-close").addEventListener("click", () => appearanceOpen(false));
+byId("sidebar-collapse").addEventListener("click", () => {
+  const current = document.documentElement.dataset.sidebar || "expanded";
+  applySidebar(current === "expanded" ? "collapsed" : "expanded");
+});
+byId("sidebar-toggle").addEventListener("click", () => {
+  if (window.matchMedia("(max-width: 760px)").matches) {
+    mobileSidebarOpen(document.documentElement.dataset.mobileSidebar !== "open");
+  } else {
+    const current = document.documentElement.dataset.sidebar || "expanded";
+    applySidebar(current === "expanded" ? "collapsed" : "expanded");
+  }
+});
+byId("sidebar-backdrop").addEventListener("click", () => mobileSidebarOpen(false));
+document.querySelectorAll("[data-density-choice]").forEach((button) => button.addEventListener("click", () => applyDensity(button.dataset.densityChoice)));
+byId("reduce-motion").addEventListener("change", (event) => applyMotion(event.target.checked ? "reduce" : "full"));
+byId("startup-view").addEventListener("change", (event) => applyStartupView(event.target.value));
+byId("reset-appearance").addEventListener("click", () => {
+  applyTheme("system");
+  applyTextScale("comfortable");
+  applyDensity("comfortable");
+  applyMotion("full");
+  applyStartupView("chat");
+  toast("Appearance settings reset.");
+});
+document.addEventListener("pointerdown", (event) => {
+  if (byId("appearance-panel").hidden) return;
+  if (event.target.closest("#appearance-panel, #theme-cycle, #sidebar-appearance")) return;
+  appearanceOpen(false);
 });
 
 async function api(path, options = {}) {
@@ -240,7 +377,7 @@ async function refreshStatus({ announce = false } = {}) {
 }
 
 function showView(name) {
-  const allowed = ["overview", "chat", "memory", "configuration"];
+  const allowed = ["overview", "chat", "operations", "tickets", "memory", "configuration"];
   if (!allowed.includes(name)) name = "overview";
   document.querySelectorAll("[data-panel]").forEach((node) => node.classList.toggle("is-visible", node.dataset.panel === name));
   document.querySelectorAll("[data-view]").forEach((node) => {
@@ -251,8 +388,10 @@ function showView(name) {
   byId("current-view").textContent = name.toUpperCase();
   if (window.location.hash !== `#${name}`) history.replaceState(null, "", `#${name}`);
   if (name === "memory") loadMemory(memoryQuery);
+  if (name === "operations" || name === "tickets") loadOperations();
   if (name === "configuration") loadConfiguration();
   if (name === "chat") loadChatHistory();
+  if (window.matchMedia("(max-width: 760px)").matches) mobileSidebarOpen(false);
 }
 
 document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view)));
@@ -403,6 +542,199 @@ document.querySelectorAll("[data-memory-mode]").forEach((button) => button.addEv
   byId("memory-list").hidden = graphMode;
 }));
 
+function operationLabel(value) {
+  return String(value || "operation").replaceAll("_", " ").replaceAll("-", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function operationsMessage(health) {
+  const messages = {
+    attached: ["AI Operations connected", "Live tools are discovered from the authenticated control plane."],
+    not_attached: ["AI Operations is not attached", "Configure one same-origin Manage MCP server to enable live capabilities."],
+    unavailable: ["AI Operations is unavailable", "The configured control plane did not return a valid capability catalog."],
+    busy: ["AI Operations is busy", "Another contained request is using the live tool connection. Try again shortly."],
+  };
+  return messages[health] || ["AI Operations state unknown", "Refresh to discover the current control-plane state."];
+}
+
+function renderOperationsCatalog(tools) {
+  const root = byId("operations-tool-grid");
+  root.replaceChildren();
+  if (tools.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "integration-empty";
+    empty.textContent = "No AI Operations tools are currently available to this dashboard.";
+    root.append(empty);
+    return;
+  }
+  tools.forEach((tool) => {
+    const card = document.createElement("article");
+    card.className = "tool-card";
+    const head = document.createElement("div");
+    const category = document.createElement("span");
+    category.textContent = operationLabel(tool.category);
+    const authority = document.createElement("i");
+    authority.className = tool.authority === "read_only" ? "safe" : "approval";
+    authority.textContent = tool.authority === "read_only" ? "SAFE READ" : "APPROVAL";
+    head.append(category, authority);
+    const title = document.createElement("strong");
+    title.textContent = operationLabel(tool.name);
+    const description = document.createElement("p");
+    description.textContent = tool.description || "Live AI Operations capability.";
+    const footer = document.createElement("div");
+    const input = document.createElement("small");
+    input.textContent = tool.requires_input ? "Details required" : "Ready to plan";
+    const use = document.createElement("button");
+    use.type = "button";
+    use.textContent = "Use with Monique →";
+    use.dataset.openChat = `Help me use the AI Operations capability “${operationLabel(tool.name)}”. Explain what it does, collect any required details, and stage any mutation for my approval.`;
+    footer.append(input, use);
+    card.append(head, title, description, footer);
+    root.append(card);
+  });
+}
+
+function ticketStatusLabel(status) {
+  const labels = { in_progress: "In progress", triaging: "Triaging", blocked: "Blocked", done: "Done", closed: "Closed", open: "Open", unknown: "Unknown" };
+  return labels[status] || operationLabel(status);
+}
+
+function filteredTickets() {
+  const items = operationsSnapshot?.tickets?.items || [];
+  if (ticketFilter === "all") return items;
+  if (ticketFilter === "done") return items.filter((ticket) => ticket.status === "done" || ticket.status === "closed");
+  return items.filter((ticket) => ticket.status === ticketFilter);
+}
+
+function safeTicketLink(value) {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "https:" && !parsed.username && !parsed.password ? parsed.href : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function ticketEmptyMessage(health) {
+  const messages = {
+    empty: "The connected ticket queue is currently empty.",
+    no_read_surface: "AI Operations is connected, but it does not advertise a zero-input read-only ticket list.",
+    input_required: "The ticket source needs additional scope. Ask Monique to retrieve the exact queue you need.",
+    unavailable: "The live ticket source is temporarily unavailable.",
+    not_attached: "Attach AI Operations to load the live ticket queue.",
+  };
+  return messages[health] || "No tickets match this filter.";
+}
+
+function renderTickets() {
+  const tickets = operationsSnapshot?.tickets?.items || [];
+  const open = tickets.filter((ticket) => ticket.status === "open" || ticket.status === "triaging").length;
+  byId("tickets-total").textContent = count(tickets.length);
+  byId("tickets-open").textContent = count(open);
+  byId("tickets-progress").textContent = count(tickets.filter((ticket) => ticket.status === "in_progress").length);
+  byId("tickets-blocked").textContent = count(tickets.filter((ticket) => ticket.status === "blocked").length);
+  byId("tickets-urgent").textContent = count(tickets.filter((ticket) => ticket.priority === "urgent").length);
+  const visible = filteredTickets();
+  const health = operationsSnapshot?.tickets?.health || "not_attached";
+  byId("tickets-state").textContent = health === "ready"
+    ? `${visible.length.toLocaleString()} of ${tickets.length.toLocaleString()} tickets`
+    : ticketEmptyMessage(health);
+  const root = byId("ticket-list");
+  root.replaceChildren();
+  if (visible.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "integration-empty ticket-empty";
+    const title = document.createElement("strong");
+    title.textContent = ticketEmptyMessage(health === "ready" ? "filtered" : health);
+    const action = document.createElement("button");
+    action.type = "button";
+    action.textContent = "Ask Monique about tickets";
+    action.dataset.openChat = "Inspect the available AI Operations ticket capabilities and help me retrieve or review the right ticket queue.";
+    empty.append(title, action);
+    root.append(empty);
+    return;
+  }
+  visible.forEach((ticket) => {
+    const row = document.createElement("article");
+    row.className = `ticket-row priority-${ticket.priority}`;
+    const reference = document.createElement("div");
+    reference.className = "ticket-reference";
+    const dot = document.createElement("i");
+    dot.setAttribute("aria-label", `${operationLabel(ticket.priority)} priority`);
+    const id = document.createElement("span");
+    id.textContent = ticket.id.startsWith("#") ? ticket.id : `#${ticket.id}`;
+    reference.append(dot, id);
+    const body = document.createElement("div");
+    body.className = "ticket-body";
+    const title = document.createElement("strong");
+    title.textContent = ticket.title;
+    const meta = document.createElement("small");
+    meta.textContent = [ticket.assignee ? `Assigned to ${ticket.assignee}` : "Unassigned", ticket.updated_at ? `Updated ${ticket.updated_at}` : null].filter(Boolean).join(" · ");
+    body.append(title, meta);
+    const status = document.createElement("span");
+    status.className = `ticket-status status-${ticket.status}`;
+    status.textContent = ticketStatusLabel(ticket.status);
+    const actions = document.createElement("div");
+    actions.className = "ticket-actions";
+    const ask = document.createElement("button");
+    ask.type = "button";
+    ask.textContent = "Ask Monique";
+    ask.dataset.openChat = `Review ticket ${ticket.id}: “${ticket.title}”. Summarize its current state and recommend the next action.`;
+    actions.append(ask);
+    const href = safeTicketLink(ticket.url);
+    if (href) {
+      const openLink = document.createElement("a");
+      openLink.href = href;
+      openLink.target = "_blank";
+      openLink.rel = "noreferrer";
+      openLink.textContent = "Open ↗";
+      actions.append(openLink);
+    }
+    row.append(reference, body, status, actions);
+    root.append(row);
+  });
+}
+
+function renderOperations(view) {
+  operationsSnapshot = view;
+  const [title, detail] = operationsMessage(view.health);
+  byId("operations-banner").dataset.state = view.health;
+  byId("operations-health").textContent = title;
+  byId("operations-detail").textContent = detail;
+  byId("operations-authority").textContent = view.health === "attached" ? "AUTHORITY BOUNDED" : "NOT ATTACHED";
+  byId("operations-tools").textContent = count(view.tools_total);
+  byId("operations-reads").textContent = count(view.read_only_tools);
+  byId("operations-actions").textContent = count(view.approval_tools);
+  byId("operations-pending").textContent = count(view.pending_actions);
+  byId("operations-catalog-tag").textContent = view.health === "attached" ? `${count(view.tools_total)} LIVE` : "UNAVAILABLE";
+  renderOperationsCatalog(view.tools || []);
+  renderTickets();
+}
+
+async function loadOperations(force = false) {
+  if (operationsSnapshot && !force) return;
+  [byId("operations-refresh"), byId("tickets-refresh")].forEach((button) => { button.disabled = true; });
+  try {
+    renderOperations(await api("/api/operations"));
+    if (force) toast("AI Operations and tickets refreshed.");
+  } catch (error) {
+    byId("operations-banner").dataset.state = "unavailable";
+    byId("operations-health").textContent = "AI Operations unavailable";
+    byId("operations-detail").textContent = error.message;
+    byId("tickets-state").textContent = "Ticket intake unavailable";
+    toast("AI Operations could not be refreshed.", "error");
+  } finally {
+    [byId("operations-refresh"), byId("tickets-refresh")].forEach((button) => { button.disabled = false; });
+  }
+}
+
+byId("operations-refresh").addEventListener("click", () => loadOperations(true));
+byId("tickets-refresh").addEventListener("click", () => loadOperations(true));
+document.querySelectorAll("[data-ticket-filter]").forEach((button) => button.addEventListener("click", () => {
+  ticketFilter = button.dataset.ticketFilter;
+  document.querySelectorAll("[data-ticket-filter]").forEach((item) => item.classList.toggle("is-active", item === button));
+  renderTickets();
+}));
+
 function label(value) {
   return String(value).replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
@@ -429,7 +761,6 @@ function renderConfigSection(title, values) {
 }
 
 function syncManageIntegration(manage) {
-  const link = byId("manage-link");
   const configuredUrl = typeof manage?.console_url === "string" ? manage.console_url : null;
   let safeUrl = null;
   if (configuredUrl) {
@@ -440,13 +771,15 @@ function syncManageIntegration(manage) {
       safeUrl = null;
     }
   }
-  if (safeUrl) {
-    link.href = safeUrl;
-    link.hidden = false;
-  } else {
-    link.removeAttribute("href");
-    link.hidden = true;
-  }
+  document.querySelectorAll("[data-manage-link]").forEach((link) => {
+    if (safeUrl) {
+      link.href = safeUrl;
+      link.hidden = false;
+    } else {
+      link.removeAttribute("href");
+      link.hidden = true;
+    }
+  });
   byId("chat-manage-state").hidden = manage?.dashboard_authority !== "discovered tools / explicit approval";
 }
 
@@ -807,14 +1140,24 @@ document.addEventListener("keydown", (event) => {
   } else if (!editing && event.key.toLowerCase() === "r") {
     event.preventDefault();
     refreshStatus({ announce: true });
+  } else if (!editing && event.key.toLowerCase() === "n") {
+    event.preventDefault();
+    showView("chat");
+    byId("new-chat").click();
   } else if (event.key === "Escape" && newChatArmed) {
     resetNewChatButton();
+  } else if (event.key === "Escape" && !byId("appearance-panel").hidden) {
+    appearanceOpen(false);
+    byId("theme-cycle").focus();
+  } else if (event.key === "Escape" && document.documentElement.dataset.mobileSidebar === "open") {
+    mobileSidebarOpen(false);
+    byId("sidebar-toggle").focus();
   }
 });
 
 refreshStatus();
 loadConfiguration();
-showView(window.location.hash.slice(1) || "chat");
+showView(window.location.hash.slice(1) || storedPreference("monique-start-view", startupViews, "chat"));
 window.setInterval(() => { if (!document.hidden) refreshStatus(); }, 10_000);
 window.setInterval(updateObservedAge, 1_000);
 window.setInterval(renderPulse, 1_000);

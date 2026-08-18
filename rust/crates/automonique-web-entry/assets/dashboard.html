@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Elastic-2.0 -->
 <!doctype html>
-<html lang="en" data-health="loading" data-theme="system" data-text-scale="comfortable">
+<html lang="en" data-health="loading" data-theme="system" data-text-scale="comfortable" data-density="comfortable" data-motion="full" data-sidebar="expanded">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8,30 +8,32 @@
     <meta name="theme-color" id="theme-color" content="#0b0d10">
     <title>Monique</title>
     <link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=4">
-    <script src="/assets/dashboard.js?v=4" defer></script>
+    <link rel="stylesheet" href="/assets/dashboard.css?v=5">
+    <script src="/assets/dashboard.js?v=5" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
     <div class="app-shell">
-      <aside class="sidebar">
-        <a class="identity" href="#chat" aria-label="Open Monique chat">
-          <span class="identity-mark">M</span>
-          <span><strong>Monique</strong><small>AI Operations</small></span>
-        </a>
-        <button class="sidebar-new-chat" id="sidebar-new-chat" type="button"><span class="sidebar-new-icon" aria-hidden="true">＋</span><span id="sidebar-new-chat-label">New conversation</span></button>
+      <aside class="sidebar" id="sidebar" aria-label="Primary navigation">
+        <div class="sidebar-header">
+          <a class="identity" href="#chat" aria-label="Open Monique chat">
+            <span class="identity-mark">M</span>
+            <span class="identity-copy"><strong>Monique</strong><small>AI Operations</small></span>
+          </a>
+          <button class="sidebar-collapse" id="sidebar-collapse" type="button" aria-label="Collapse sidebar" title="Collapse sidebar"><span aria-hidden="true">‹</span></button>
+        </div>
+        <button class="sidebar-new-chat" id="sidebar-new-chat" type="button"><span class="sidebar-new-icon" aria-hidden="true">＋</span><span id="sidebar-new-chat-label">New conversation</span><kbd>N</kbd></button>
         <p class="nav-section-label">Workspace</p>
         <nav class="primary-nav" aria-label="Operations sections">
-          <button class="nav-item is-active" data-view="overview"><span class="nav-icon" aria-hidden="true">⌂</span><span class="nav-label">Overview</span></button>
-          <button class="nav-item" data-view="chat"><span class="nav-icon" aria-hidden="true">✦</span><span class="nav-label">Chat</span></button>
-          <button class="nav-item" data-view="memory"><span class="nav-icon" aria-hidden="true">◇</span><span class="nav-label">Memory</span></button>
-          <button class="nav-item" data-view="configuration"><span class="nav-icon" aria-hidden="true">⚙</span><span class="nav-label">Configuration</span></button>
+          <button class="nav-item is-active" data-view="overview" title="Overview"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"></path></svg></span><span class="nav-label">Overview</span></button>
+          <button class="nav-item" data-view="chat" title="Chat"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 5h14v11H9l-4 3z"></path></svg></span><span class="nav-label">Chat</span></button>
+          <button class="nav-item" data-view="operations" title="AI Operations"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 7h14M5 12h14M5 17h14M8 4v6M16 9v6M11 14v6"></path></svg></span><span class="nav-label">AI Operations</span></button>
+          <button class="nav-item" data-view="tickets" title="Tickets"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 5h14v14H5zM8 9h8M8 13h5M8 17h3"></path></svg></span><span class="nav-label">Tickets</span></button>
+          <button class="nav-item" data-view="memory" title="Memory"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 4.5 7v10L12 21l7.5-4V7zM4.5 7 12 11l7.5-4M12 11v10"></path></svg></span><span class="nav-label">Memory</span></button>
+          <button class="nav-item" data-view="configuration" title="Configuration"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7zM19 12l2-1-2-3.5-2.2.5a8 8 0 0 0-1.7-1L14.5 5h-5L9 7a8 8 0 0 0-1.8 1L5 7.5 3 11l2 1v2l-2 1 2 3.5 2.2-.5a8 8 0 0 0 1.8 1l.5 2h5l.6-2a8 8 0 0 0 1.7-1l2.2.5 2-3.5-2-1z"></path></svg></span><span class="nav-label">Configuration</span></button>
         </nav>
-        <section class="sidebar-preferences" aria-labelledby="appearance-title">
-          <p class="nav-section-label" id="appearance-title">Appearance</p>
-          <label class="preference-row" for="theme-select"><span>Theme</span><select id="theme-select"><option value="system">System</option><option value="dark">Dark</option><option value="light">Light</option></select></label>
-          <div class="preference-row"><span>Text size</span><div class="text-scale-control" role="group" aria-label="Text size"><button type="button" data-text-scale="standard" aria-label="Standard text size">A</button><button type="button" data-text-scale="comfortable" aria-label="Comfortable text size">A+</button><button type="button" data-text-scale="large" aria-label="Large text size">A++</button></div></div>
-        </section>
+        <div class="sidebar-spacer"></div>
+        <button class="sidebar-appearance" id="sidebar-appearance" type="button" title="Appearance settings"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9c0-1.1-.9-2-2-2h-2.2a2 2 0 0 1-2-2V5a2 2 0 0 0-2.8-2zM7.5 10.5h.01M9.5 6.5h.01M7 15h.01"></path></svg></span><span>Appearance</span><small id="sidebar-theme-name">System</small></button>
         <div class="sidebar-foot">
           <span class="lock-mark" aria-hidden="true">◆</span>
           <div><strong>PROTECTED</strong><small>Basic auth · TLS only</small></div>
@@ -40,13 +42,16 @@
 
       <div class="main-column">
         <header class="topbar">
-          <div class="breadcrumb"><span>PRODUCTION</span><b>/</b><strong id="current-view">OVERVIEW</strong></div>
+          <div class="topbar-leading">
+            <button class="sidebar-toggle" id="sidebar-toggle" type="button" aria-controls="sidebar" aria-expanded="true" aria-label="Toggle sidebar"><span aria-hidden="true">☰</span></button>
+            <div class="breadcrumb"><span>PRODUCTION</span><b>/</b><strong id="current-view">OVERVIEW</strong></div>
+          </div>
           <div class="topbar-status">
             <span class="status-dot" aria-hidden="true"></span>
             <strong id="global-health">Connecting</strong>
             <span id="global-observed">No snapshot</span>
             <button class="appearance-button" id="text-scale-cycle" type="button" aria-label="Increase text size" title="Change text size">Aa</button>
-            <button class="appearance-button" id="theme-cycle" type="button" aria-label="Change color theme" title="Change color theme">◐</button>
+            <button class="appearance-button" id="theme-cycle" type="button" aria-label="Open appearance settings" title="Appearance"><span class="theme-button-swatch" aria-hidden="true"></span></button>
             <button class="refresh-button" id="status-refresh" type="button" aria-label="Refresh operational status" title="Refresh status">↻</button>
           </div>
         </header>
@@ -55,7 +60,7 @@
           <section class="view is-visible" data-panel="overview" aria-labelledby="overview-title">
             <div class="page-heading">
               <div><p class="kicker">CONTROL PLANE / LIVE</p><h1 id="overview-title">Operations overview</h1><p class="page-lede">A live, secret-safe view of Monique’s execution path and delivery certainty.</p></div>
-              <div class="heading-actions"><button class="button primary" type="button" data-open-chat="Explain Monique’s current operational health and name anything that needs attention.">Ask Monique</button><a class="button secondary" id="manage-link" rel="noreferrer" target="_blank" hidden>Open Manage ↗</a></div>
+              <div class="heading-actions"><button class="button primary" type="button" data-open-chat="Explain Monique’s current operational health and name anything that needs attention.">Ask Monique</button><a class="button secondary" id="manage-link" data-manage-link rel="noreferrer" target="_blank" hidden>Open Manage ↗</a></div>
             </div>
 
             <div class="attention-bar" id="attention-bar">
@@ -165,6 +170,50 @@
             </div>
           </section>
 
+          <section class="view" data-panel="operations" aria-labelledby="operations-title">
+            <div class="page-heading compact">
+              <div><p class="kicker">DISCOVERED / AUTHORITY-AWARE / LIVE</p><h1 id="operations-title">AI Operations</h1><p class="page-lede">Work directly with the connected control plane. Safe reads are live; every mutation remains staged for explicit approval.</p></div>
+              <div class="heading-actions"><button class="button secondary" id="operations-refresh" type="button">Refresh</button><a class="button primary" id="operations-manage-link" data-manage-link rel="noreferrer" target="_blank" hidden>Open AI Operations ↗</a></div>
+            </div>
+            <div class="integration-banner" id="operations-banner" data-state="loading"><span class="integration-orb" aria-hidden="true"></span><div><strong id="operations-health">Connecting to AI Operations</strong><small id="operations-detail">Discovering the live capability catalog…</small></div><span class="tag" id="operations-authority">CHECKING</span></div>
+            <div class="operations-metrics" aria-label="AI Operations capability counts">
+              <article><span>TOOLS</span><strong id="operations-tools">—</strong><small>discovered capabilities</small></article>
+              <article><span>SAFE READS</span><strong id="operations-reads">—</strong><small>available immediately</small></article>
+              <article><span>APPROVAL ACTIONS</span><strong id="operations-actions">—</strong><small>staged before execution</small></article>
+              <article><span>PENDING</span><strong id="operations-pending">—</strong><small>awaiting your decision</small></article>
+            </div>
+            <div class="operations-layout">
+              <article class="panel operations-catalog">
+                <div class="panel-head"><div><p class="kicker">LIVE MCP CATALOG</p><h2>Connected capabilities</h2></div><span class="tag" id="operations-catalog-tag">DISCOVERING</span></div>
+                <div class="tool-grid" id="operations-tool-grid"><div class="integration-empty">Loading AI Operations capabilities…</div></div>
+              </article>
+              <aside class="panel authority-panel">
+                <div class="panel-head"><div><p class="kicker">CONTROL BOUNDARY</p><h2>How actions run</h2></div></div>
+                <ol class="authority-steps"><li><span>1</span><div><strong>Discover</strong><small>Only tools advertised by the live control plane appear here.</small></div></li><li><span>2</span><div><strong>Review</strong><small>Mutations show exact arguments and impact before anything runs.</small></div></li><li><span>3</span><div><strong>Approve</strong><small>Your one-time decision authorizes one exact action.</small></div></li></ol>
+                <button class="operations-chat-cta" type="button" data-open-chat="Show me the most useful AI Operations actions available right now and help me choose one."><span>Ask Monique to operate</span><small>Plan with the live catalog →</small></button>
+              </aside>
+            </div>
+          </section>
+
+          <section class="view" data-panel="tickets" aria-labelledby="tickets-title">
+            <div class="page-heading compact">
+              <div><p class="kicker">LIVE / TRIAGED / ACTIONABLE</p><h1 id="tickets-title">Tickets</h1><p class="page-lede">A focused queue from AI Operations, with live status and safe handoff into Monique for follow-up.</p></div>
+              <div class="heading-actions"><button class="button secondary" id="tickets-refresh" type="button">Refresh</button><button class="button primary" type="button" data-open-chat="Review the current ticket queue, summarize priorities, and recommend the next action.">Review with Monique</button></div>
+            </div>
+            <div class="ticket-metrics" aria-label="Ticket counts">
+              <article><span>TOTAL</span><strong id="tickets-total">—</strong></article>
+              <article><span>OPEN</span><strong id="tickets-open">—</strong></article>
+              <article><span>IN PROGRESS</span><strong id="tickets-progress">—</strong></article>
+              <article><span>BLOCKED</span><strong id="tickets-blocked">—</strong></article>
+              <article><span>URGENT</span><strong id="tickets-urgent">—</strong></article>
+            </div>
+            <div class="ticket-toolbar">
+              <div class="ticket-filters" role="group" aria-label="Filter tickets"><button class="is-active" type="button" data-ticket-filter="all">All</button><button type="button" data-ticket-filter="open">Open</button><button type="button" data-ticket-filter="in_progress">In progress</button><button type="button" data-ticket-filter="blocked">Blocked</button><button type="button" data-ticket-filter="done">Done</button></div>
+              <span id="tickets-state" role="status">Connecting to ticket intake…</span>
+            </div>
+            <div class="ticket-list panel" id="ticket-list"><div class="integration-empty">Loading the live ticket queue…</div></div>
+          </section>
+
           <section class="view" data-panel="memory" aria-labelledby="memory-title">
             <div class="page-heading compact">
               <div><p class="kicker">TYPED / REVISIONED / PROVENANCE-BOUND</p><h1 id="memory-title">Memory system</h1><p class="page-lede">Inspect the evidence Monique can retrieve without exposing raw private state.</p></div>
@@ -198,6 +247,37 @@
         <footer><span>MONIQUE / AUTOMONIQUE</span><span><kbd>/</kbd> CHAT · <kbd>R</kbd> REFRESH</span><span id="footer-state">NO VERIFIED SNAPSHOT</span></footer>
       </div>
     </div>
+    <button class="sidebar-backdrop" id="sidebar-backdrop" type="button" aria-label="Close navigation" hidden></button>
+    <section class="appearance-panel" id="appearance-panel" aria-labelledby="appearance-title" hidden>
+      <div class="appearance-panel-head"><div><p>Personalize</p><h2 id="appearance-title">Appearance</h2></div><button id="appearance-close" type="button" aria-label="Close appearance settings">×</button></div>
+      <label class="theme-select-row" for="theme-select"><span>Color theme</span><select id="theme-select"><option value="system">System</option><option value="dark">Carbon</option><option value="light">Paper</option><option value="midnight">Midnight</option><option value="ocean">Ocean</option><option value="forest">Forest</option><option value="monokai">Monokai</option><option value="dracula">Dracula</option><option value="nord">Nord</option><option value="sand">Sand</option><option value="rose">Rose</option><option value="contrast">High contrast</option></select></label>
+      <div class="theme-grid" role="group" aria-label="Color theme">
+        <button type="button" data-theme-choice="system"><i class="theme-preview system"><span></span></i><span>System</span></button>
+        <button type="button" data-theme-choice="dark"><i class="theme-preview carbon"><span></span></i><span>Carbon</span></button>
+        <button type="button" data-theme-choice="light"><i class="theme-preview paper"><span></span></i><span>Paper</span></button>
+        <button type="button" data-theme-choice="midnight"><i class="theme-preview midnight"><span></span></i><span>Midnight</span></button>
+        <button type="button" data-theme-choice="ocean"><i class="theme-preview ocean"><span></span></i><span>Ocean</span></button>
+        <button type="button" data-theme-choice="forest"><i class="theme-preview forest"><span></span></i><span>Forest</span></button>
+        <button type="button" data-theme-choice="monokai"><i class="theme-preview monokai"><span></span></i><span>Monokai</span></button>
+        <button type="button" data-theme-choice="dracula"><i class="theme-preview dracula"><span></span></i><span>Dracula</span></button>
+        <button type="button" data-theme-choice="nord"><i class="theme-preview nord"><span></span></i><span>Nord</span></button>
+        <button type="button" data-theme-choice="sand"><i class="theme-preview sand"><span></span></i><span>Sand</span></button>
+        <button type="button" data-theme-choice="rose"><i class="theme-preview rose"><span></span></i><span>Rose</span></button>
+        <button type="button" data-theme-choice="contrast"><i class="theme-preview contrast"><span></span></i><span>Contrast</span></button>
+      </div>
+      <div class="type-setting">
+        <div><span>Text size</span><strong id="text-scale-name">Comfortable</strong></div>
+        <div class="type-scale-control"><button type="button" id="text-scale-down" aria-label="Decrease text size">−</button><input id="text-scale-input" type="range" min="0" max="4" step="1" value="2" aria-label="Text size"><button type="button" id="text-scale-up" aria-label="Increase text size">＋</button></div>
+        <p class="type-preview">Monique adapts to the way you prefer to read.</p>
+      </div>
+      <div class="interface-settings">
+        <div class="setting-block"><span>Interface density</span><div class="density-control" role="group" aria-label="Interface density"><button type="button" data-density-choice="compact">Compact</button><button type="button" data-density-choice="comfortable">Comfortable</button><button type="button" data-density-choice="spacious">Spacious</button></div></div>
+        <label class="setting-row" for="startup-view"><span><strong>Start page</strong><small>Default view when no direct link is used</small></span><select id="startup-view"><option value="chat">Chat</option><option value="overview">Overview</option><option value="operations">AI Operations</option><option value="tickets">Tickets</option></select></label>
+        <label class="setting-row" for="reduce-motion"><span><strong>Reduce motion</strong><small>Limit interface animation and transitions</small></span><input class="switch" id="reduce-motion" type="checkbox"></label>
+        <button class="reset-appearance" id="reset-appearance" type="button">Reset appearance defaults</button>
+      </div>
+      <p class="appearance-note">Appearance is saved only in this browser.</p>
+    </section>
     <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
   </body>
 </html>

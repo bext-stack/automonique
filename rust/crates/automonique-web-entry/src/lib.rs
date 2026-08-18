@@ -74,6 +74,7 @@ pub enum Route {
     ApiMemory,
     ApiMemorySearch,
     ApiConfiguration,
+    ApiOperations,
     ApiChat,
     ApiChatAction,
     ApiChatHistory,
@@ -618,6 +619,47 @@ struct ManageConfigurationView {
     dashboard_authority: &'static str,
 }
 
+#[derive(Serialize)]
+struct OperationsView {
+    schema: &'static str,
+    health: &'static str,
+    console_url: Option<String>,
+    tools_total: usize,
+    read_only_tools: usize,
+    approval_tools: usize,
+    ticket_tools: usize,
+    pending_actions: usize,
+    tools: Vec<OperationsToolView>,
+    tickets: TicketSnapshotView,
+}
+
+#[derive(Serialize)]
+struct OperationsToolView {
+    name: String,
+    description: String,
+    category: &'static str,
+    authority: &'static str,
+    requires_input: bool,
+}
+
+#[derive(Serialize)]
+struct TicketSnapshotView {
+    health: &'static str,
+    source_tool: Option<String>,
+    items: Vec<TicketView>,
+}
+
+#[derive(Serialize)]
+struct TicketView {
+    id: String,
+    title: String,
+    status: String,
+    priority: String,
+    assignee: Option<String>,
+    updated_at: Option<String>,
+    url: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct MemorySearchRequest {
     query: String,
@@ -847,6 +889,126 @@ impl WebIntegration {
                     "not attached"
                 },
             },
+        }
+    }
+
+    fn operations(&self) -> OperationsView {
+        let empty = |health| OperationsView {
+            schema: "automonique.dashboard.operations/v1",
+            health,
+            console_url: self.manage.console_url.clone(),
+            tools_total: 0,
+            read_only_tools: 0,
+            approval_tools: 0,
+            ticket_tools: 0,
+            pending_actions: self
+                .pending_manage_actions
+                .lock()
+                .map(|actions| actions.len())
+                .unwrap_or(0),
+            tools: Vec::new(),
+            tickets: TicketSnapshotView {
+                health: "not_attached",
+                source_tool: None,
+                items: Vec::new(),
+            },
+        };
+        let Some(server) = self.manage.mcp_server.as_deref() else {
+            return empty("not_attached");
+        };
+        let Ok(mut mcp) = self.mcp.try_lock() else {
+            return empty("busy");
+        };
+        let Ok(tools) = mcp.discover_server(server) else {
+            return empty("unavailable");
+        };
+        let read_only_tools = tools.iter().filter(|tool| tool.read_only).count();
+        let ticket_tools = tools
+            .iter()
+            .filter(|tool| tool_category(tool) == "tickets")
+            .count();
+        let mut ticket_candidates = tools
+            .iter()
+            .filter(|tool| {
+                tool.read_only && tool_category(tool) == "tickets" && !tool_requires_input(tool)
+            })
+            .collect::<Vec<_>>();
+        ticket_candidates.sort_by_key(|tool| {
+            let name = tool.name.to_ascii_lowercase();
+            (
+                !name.contains("list"),
+                !name.contains("search"),
+                tool.name.as_str(),
+            )
+        });
+        let tickets = match ticket_candidates.first() {
+            Some(tool) => {
+                let source_tool = Some(tool.name.clone());
+                match mcp.call(
+                    &tool.server,
+                    &tool.name,
+                    Value::Object(Default::default()),
+                    None,
+                ) {
+                    Ok(McpCallResult::Complete {
+                        value,
+                        is_error: false,
+                    }) => {
+                        let items = ticket_views(&value);
+                        TicketSnapshotView {
+                            health: if items.is_empty() { "empty" } else { "ready" },
+                            source_tool,
+                            items,
+                        }
+                    }
+                    Ok(McpCallResult::InputRequired { .. }) => TicketSnapshotView {
+                        health: "input_required",
+                        source_tool,
+                        items: Vec::new(),
+                    },
+                    Ok(McpCallResult::Complete { .. }) | Err(_) => TicketSnapshotView {
+                        health: "unavailable",
+                        source_tool,
+                        items: Vec::new(),
+                    },
+                }
+            }
+            None => TicketSnapshotView {
+                health: "no_read_surface",
+                source_tool: None,
+                items: Vec::new(),
+            },
+        };
+        let tool_views = tools
+            .iter()
+            .take(128)
+            .map(|tool| OperationsToolView {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                category: tool_category(tool),
+                authority: if tool.read_only {
+                    "read_only"
+                } else {
+                    "explicit_approval"
+                },
+                requires_input: tool_requires_input(tool),
+            })
+            .collect();
+        OperationsView {
+            schema: "automonique.dashboard.operations/v1",
+            health: "attached",
+            console_url: self.manage.console_url.clone(),
+            tools_total: tools.len(),
+            read_only_tools,
+            approval_tools: tools.len().saturating_sub(read_only_tools),
+            ticket_tools,
+            pending_actions: self
+                .pending_manage_actions
+                .lock()
+                .map(|actions| actions.len())
+                .unwrap_or(0),
+            tools: tool_views,
+            tickets,
         }
     }
 
@@ -1458,6 +1620,156 @@ fn memory_entry(record: MemoryRecord) -> MemoryEntryView {
     }
 }
 
+fn tool_category(tool: &McpToolDescriptor) -> &'static str {
+    let text = format!("{} {}", tool.name, tool.description).to_ascii_lowercase();
+    if text.contains("ticket") || text.contains("issue") || text.contains("support") {
+        "tickets"
+    } else if text.contains("approval") || text.contains("review") {
+        "approvals"
+    } else if text.contains("automation") || text.contains("schedule") || text.contains("workflow")
+    {
+        "automation"
+    } else if text.contains("agent") || text.contains("run") || text.contains("job") {
+        "execution"
+    } else if text.contains("site") || text.contains("profile") || text.contains("tenant") {
+        "workspace"
+    } else {
+        "operations"
+    }
+}
+
+fn tool_requires_input(tool: &McpToolDescriptor) -> bool {
+    tool.input_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| !required.is_empty())
+}
+
+fn find_ticket_array(value: &Value, depth: u8) -> Option<&[Value]> {
+    if depth > 4 {
+        return None;
+    }
+    match value {
+        Value::Array(items)
+            if items.iter().any(|item| {
+                item.as_object().is_some_and(|object| {
+                    ["title", "subject", "name"]
+                        .iter()
+                        .any(|key| object.get(*key).and_then(Value::as_str).is_some())
+                })
+            }) =>
+        {
+            Some(items)
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| find_ticket_array(item, depth + 1)),
+        Value::Object(object) => ["tickets", "issues", "items", "results", "data"]
+            .iter()
+            .filter_map(|key| object.get(*key))
+            .find_map(|item| find_ticket_array(item, depth + 1))
+            .or_else(|| {
+                object
+                    .values()
+                    .find_map(|item| find_ticket_array(item, depth + 1))
+            }),
+        _ => None,
+    }
+}
+
+fn ticket_string(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| match object.get(*key) {
+        Some(Value::String(value)) if !value.trim().is_empty() => {
+            Some(value.trim().chars().take(300).collect())
+        }
+        Some(Value::Number(value)) => Some(value.to_string()),
+        _ => None,
+    })
+}
+
+fn ticket_person(object: &serde_json::Map<String, Value>) -> Option<String> {
+    match object.get("assignee").or_else(|| object.get("owner")) {
+        Some(Value::String(value)) if !value.trim().is_empty() => {
+            Some(value.trim().chars().take(120).collect())
+        }
+        Some(Value::Object(person)) => ticket_string(person, &["name", "login", "label"]),
+        _ => None,
+    }
+}
+
+fn ticket_identifier(object: &serde_json::Map<String, Value>) -> String {
+    ticket_string(object, &["reference", "ticket_id", "id", "number"])
+        .filter(|value| {
+            value.len() <= 120
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'#' | b'_' | b'-' | b'.' | b':')
+                })
+        })
+        .unwrap_or_else(|| String::from("unreferenced"))
+}
+
+fn normalized_ticket_status(value: Option<String>) -> String {
+    let value = value
+        .unwrap_or_else(|| String::from("unknown"))
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_");
+    match value.as_str() {
+        "open" | "triaging" | "in_progress" | "blocked" | "done" | "closed" => value,
+        "active" | "working" | "started" => String::from("in_progress"),
+        "resolved" | "complete" | "completed" => String::from("done"),
+        _ => String::from("unknown"),
+    }
+}
+
+fn normalized_ticket_priority(value: Option<String>) -> String {
+    let value = value
+        .unwrap_or_else(|| String::from("normal"))
+        .to_ascii_lowercase();
+    match value.as_str() {
+        "low" | "normal" | "high" | "urgent" => value,
+        "critical" => String::from("urgent"),
+        _ => String::from("normal"),
+    }
+}
+
+fn safe_ticket_url(value: Option<String>) -> Option<String> {
+    value.filter(|url| {
+        url.len() <= 512
+            && url.starts_with("https://")
+            && !url.contains('@')
+            && !url.bytes().any(|byte| byte.is_ascii_control())
+    })
+}
+
+fn ticket_views(value: &Value) -> Vec<TicketView> {
+    let Some(items) = find_ticket_array(value, 0) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .take(100)
+        .filter_map(Value::as_object)
+        .filter_map(|object| {
+            let title = ticket_string(object, &["title", "subject", "name"])?;
+            Some(TicketView {
+                id: ticket_identifier(object),
+                title,
+                status: normalized_ticket_status(ticket_string(object, &["status", "state"])),
+                priority: normalized_ticket_priority(ticket_string(
+                    object,
+                    &["priority", "urgency"],
+                )),
+                assignee: ticket_person(object),
+                updated_at: ticket_string(
+                    object,
+                    &["updated_at", "updatedAt", "modified_at", "created_at"],
+                ),
+                url: safe_ticket_url(ticket_string(object, &["url", "html_url", "web_url"])),
+            })
+        })
+        .collect()
+}
+
 fn manage_router_prompt(
     message: &str,
     history: &[automonique_store::agent_memory::ConversationMessage],
@@ -1976,6 +2288,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/api/memory" => Route::ApiMemory,
                 "/api/memory/search" => Route::ApiMemorySearch,
                 "/api/configuration" => Route::ApiConfiguration,
+                "/api/operations" => Route::ApiOperations,
                 "/api/chat" => Route::ApiChat,
                 "/api/chat/action" => Route::ApiChatAction,
                 "/api/chat/history" => Route::ApiChatHistory,
@@ -2161,6 +2474,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         Route::ApiMemory
         | Route::ApiMemorySearch
         | Route::ApiConfiguration
+        | Route::ApiOperations
         | Route::ApiChat
         | Route::ApiChatAction
         | Route::ApiChatHistory
@@ -2234,6 +2548,7 @@ fn api_response(
             }
         }
         Route::ApiConfiguration => json_response("200 OK", &integration.configuration()),
+        Route::ApiOperations => json_response("200 OK", &integration.operations()),
         Route::ApiChat => match serde_json::from_slice::<ChatRequest>(body) {
             Ok(request) => match integration.chat(request, &state.snapshot()) {
                 Ok(answer) => json_response("200 OK", &answer),
@@ -2436,6 +2751,7 @@ fn handle(
         Route::ApiMemory
             | Route::ApiMemorySearch
             | Route::ApiConfiguration
+            | Route::ApiOperations
             | Route::ApiChat
             | Route::ApiChatAction
             | Route::ApiChatHistory
@@ -2620,6 +2936,7 @@ mod tests {
             ("/assets/dashboard.css", Route::Styles),
             ("/assets/dashboard.js", Route::Script),
             ("/api/status?fresh=1", Route::ApiStatus),
+            ("/api/operations", Route::ApiOperations),
             ("/missing", Route::NotFound),
         ];
         for (path, expected) in cases {
@@ -2640,6 +2957,40 @@ mod tests {
         assert_eq!(Some(true), status.provider_available);
         assert_eq!(Some(1234), status.observed_ms);
         assert!(!status.stale);
+    }
+
+    #[test]
+    fn operations_catalog_classifies_authority_and_ticket_shapes() {
+        let tool = McpToolDescriptor {
+            server: String::from("business"),
+            name: String::from("tickets_list"),
+            description: String::from("List current support tickets"),
+            input_schema: serde_json::json!({ "type": "object", "required": [] }),
+            read_only: true,
+        };
+        assert_eq!("tickets", tool_category(&tool));
+        assert!(!tool_requires_input(&tool));
+        let tickets = ticket_views(&serde_json::json!({
+            "data": {
+                "items": [{
+                    "number": 42,
+                    "title": "Repair the dashboard",
+                    "state": "working",
+                    "urgency": "critical",
+                    "assignee": { "name": "Operations" },
+                    "html_url": "https://example.test/issues/42"
+                }]
+            }
+        }));
+        assert_eq!(1, tickets.len());
+        assert_eq!("42", tickets[0].id);
+        assert_eq!("in_progress", tickets[0].status);
+        assert_eq!("urgent", tickets[0].priority);
+        assert_eq!(Some("Operations"), tickets[0].assignee.as_deref());
+        assert_eq!(
+            Some("https://example.test/issues/42"),
+            tickets[0].url.as_deref()
+        );
     }
 
     #[test]
@@ -2700,7 +3051,14 @@ mod tests {
             "configuration-refresh",
             "theme-select",
             "text-scale-cycle",
+            "text-scale-input",
             "sidebar-new-chat",
+            "sidebar-collapse",
+            "appearance-panel",
+            "operations-refresh",
+            "tickets-refresh",
+            "startup-view",
+            "reduce-motion",
         ] {
             assert!(
                 DASHBOARD_HTML.contains(interaction),
@@ -2709,6 +3067,14 @@ mod tests {
         }
         assert!(DASHBOARD_JS.contains("monique-theme"));
         assert!(DASHBOARD_JS.contains("monique-text-scale"));
+        assert!(DASHBOARD_JS.contains("monique-sidebar"));
+        assert!(DASHBOARD_JS.contains("monique-density"));
+        assert!(DASHBOARD_JS.contains("monique-start-view"));
+        for theme in [
+            "midnight", "ocean", "forest", "monokai", "dracula", "nord", "sand", "rose", "contrast",
+        ] {
+            assert!(DASHBOARD_HTML.contains(&format!("value=\"{theme}\"")));
+        }
     }
 
     #[test]
