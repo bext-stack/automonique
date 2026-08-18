@@ -32,6 +32,8 @@ fi
 fleet_config=$state_dir/support/fleet.conf
 provider_config=$state_dir/provider
 runtime_dir=$state_dir/manage-fleet-worker
+auth_health_file=$runtime_dir/auth-health.json
+auth_revision_file=$runtime_dir/auth-revision
 
 private_value() {
     key=$1
@@ -60,6 +62,146 @@ fi
 umask 077
 mkdir -p -- "$runtime_dir"
 chmod 700 -- "$runtime_dir"
+
+auth_method=unknown
+
+credential_revision() {
+    auth_file=$worker_home/auth.json
+    if [[ ! -f "$auth_file" ]]; then
+        printf '%s' missing
+        return
+    fi
+    stat -c '%y:%s:%i' -- "$auth_file" 2>/dev/null || printf '%s' unreadable
+}
+
+probe_local_auth() {
+    auth_method=unknown
+    local_status=$(CODEX_HOME="$worker_home" "$provider_binary" login status 2>&1) || return 1
+    case "$local_status" in
+        *'Logged in using ChatGPT'*) auth_method=chatgpt ;;
+        *'Logged in using an API key'*) auth_method=api_key ;;
+        *'Logged in using an access token'*) auth_method=access_token ;;
+    esac
+    return 0
+}
+
+previous_verified_at() {
+    if [[ ! -f "$auth_health_file" ]]; then
+        printf '%s' null
+        return
+    fi
+    jq -r '.last_verified_at_ms // null | if . == null or (type == "number" and . >= 0) then . else error("invalid") end' \
+        "$auth_health_file" 2>/dev/null || printf '%s' null
+}
+
+write_auth_health() {
+    auth_status=$1
+    auth_reason=$2
+    last_verified_at=${3:-null}
+    now_ms=$(date +%s%3N)
+    temporary=$(mktemp "$runtime_dir/.auth-health.XXXXXX") || return 1
+    if ! jq -n \
+        --arg status "$auth_status" \
+        --arg method "$auth_method" \
+        --arg reason "$auth_reason" \
+        --argjson observed "$now_ms" \
+        --argjson verified "$last_verified_at" \
+        '{schema:"automonique.provider-auth-health/v1",provider:"codex",surface:"manage-fleet-worker",status:$status,method:$method,reason:$reason,observed_at_ms:$observed,last_verified_at_ms:$verified}' \
+        >"$temporary"
+    then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    chmod 600 -- "$temporary"
+    mv -f -- "$temporary" "$auth_health_file"
+}
+
+write_auth_revision() {
+    revision=$1
+    temporary=$(mktemp "$runtime_dir/.auth-revision.XXXXXX") || return 1
+    printf '%s\n' "$revision" >"$temporary"
+    chmod 600 -- "$temporary"
+    mv -f -- "$temporary" "$auth_revision_file"
+}
+
+auth_health_status() {
+    jq -er '.status | select(. == "authenticated" or . == "configured_unverified" or . == "expired" or . == "signed_out" or . == "unavailable")' \
+        "$auth_health_file" 2>/dev/null || printf '%s' unavailable
+}
+
+refresh_auth_after_credential_change() {
+    current_revision=$(credential_revision)
+    previous_revision=$(sed -n '1p' "$auth_revision_file" 2>/dev/null || true)
+    [[ "$current_revision" == "$previous_revision" ]] && return
+    if probe_local_auth; then
+        write_auth_health configured_unverified credentials_changed "$(previous_verified_at)" || true
+    else
+        write_auth_health signed_out local_session_missing "$(previous_verified_at)" || true
+    fi
+    write_auth_revision "$current_revision" || true
+}
+
+auth_failure_reason() {
+    output=$1
+    error_output=$2
+    if jq -ers '
+        any(.[];
+            (.type == "error" or .type == "turn.failed")
+            and ((.message // .error.message // "") | ascii_downcase
+                | test("access token could not be refreshed|refresh token.*(revoked|invalid)|token.*invalidated|session has ended|not logged in")))
+    ' "$output" >/dev/null 2>&1 \
+        || grep -Eqi '(codex_models_manager|codex_login|responses_websocket).*(401 Unauthorized|token_invalidated|refresh_token_invalidated)' "$error_output"
+    then
+        if grep -Eqi 'not logged in' "$output" "$error_output"; then
+            printf '%s' local_session_missing
+        else
+            printf '%s' refresh_token_rejected
+        fi
+        return 0
+    fi
+    return 1
+}
+
+latest_job_auth_failure_reason() {
+    latest_output=
+    for candidate in "$runtime_dir"/*.jsonl; do
+        [[ -f "$candidate" ]] || continue
+        if [[ -z "$latest_output" || "$candidate" -nt "$latest_output" ]]; then
+            latest_output=$candidate
+        fi
+    done
+    [[ -n "$latest_output" ]] || return 1
+    latest_error=${latest_output%.jsonl}.stderr
+    [[ -f "$latest_error" ]] || return 1
+    auth_failure_reason "$latest_output" "$latest_error"
+}
+
+initialize_auth_health() {
+    current_revision=$(credential_revision)
+    previous_revision=$(sed -n '1p' "$auth_revision_file" 2>/dev/null || true)
+    previous_status=$(auth_health_status)
+    historical_failure=$(latest_job_auth_failure_reason || true)
+    if ! probe_local_auth; then
+        write_auth_health signed_out local_session_missing "$(previous_verified_at)" || true
+    elif [[ "$current_revision" == "$previous_revision" ]] \
+        && [[ "$previous_status" == authenticated || "$previous_status" == expired ]]
+    then
+        :
+    elif [[ -z "$previous_revision" && -n "$historical_failure" ]]; then
+        if [[ "$historical_failure" == local_session_missing ]]; then
+            write_auth_health signed_out "$historical_failure" "$(previous_verified_at)" || true
+        else
+            write_auth_health expired "$historical_failure" "$(previous_verified_at)" || true
+        fi
+    elif [[ -n "$previous_revision" && "$current_revision" != "$previous_revision" ]]; then
+        write_auth_health configured_unverified credentials_changed "$(previous_verified_at)" || true
+    else
+        write_auth_health configured_unverified local_session_present "$(previous_verified_at)" || true
+    fi
+    write_auth_revision "$current_revision" || true
+}
+
+initialize_auth_health
 
 fleet_post() {
     body=$1
@@ -101,13 +243,15 @@ active_jobs() {
 heartbeat() {
     status=$1
     active=$2
-    detail="Monique Codex worker: ${active}/${max_concurrency} active"
+    auth_status=$(auth_health_status)
+    detail="Monique Codex worker: ${active}/${max_concurrency} active; auth ${auth_status}"
     body=$(jq -cn \
         --arg id "$fleet_instance" \
         --arg status "$status" \
         --arg detail "$detail" \
         --arg binary "$(basename -- "$provider_binary")" \
-        '{action:"heartbeat",id:$id,status:$status,detail:$detail,version:"automonique-manage-worker/v1",harness:{agent:"codex",binary:$binary,available:true,auth_status:"configured",permission_mode:"confirmed-ticket"}}')
+        --arg auth "$auth_status" \
+        '{action:"heartbeat",id:$id,status:$status,detail:$detail,version:"automonique-manage-worker/v1",harness:{agent:"codex",binary:$binary,available:true,auth_status:$auth,permission_mode:"confirmed-ticket"}}')
     response=$(fleet_post "$body") || return 1
     jq -e '.ok == true' >/dev/null <<<"$response"
 }
@@ -223,10 +367,20 @@ run_job() {
         [[ -n "$result" ]] || result='Codex completed without a final text receipt.'
         report_job "$job_id" "done" "$result" "$session_id" || true
         post_job_log "$job_id" lifecycle 'Codex completed.'
+        probe_local_auth || true
+        write_auth_health authenticated execution_succeeded "$(date +%s%3N)" || true
     else
         [[ -n "$result" ]] || result="Codex exited with status $provider_status."
         report_job "$job_id" "failed" "$result" "$session_id" || true
         post_job_log "$job_id" lifecycle 'Codex failed.'
+        if reason=$(auth_failure_reason "$output" "$error_output"); then
+            probe_local_auth || true
+            if [[ "$reason" == local_session_missing ]]; then
+                write_auth_health signed_out "$reason" "$(previous_verified_at)" || true
+            else
+                write_auth_health expired "$reason" "$(previous_verified_at)" || true
+            fi
+        fi
     fi
 }
 
@@ -243,6 +397,7 @@ heartbeat online 0 || {
 }
 
 while (( stopping == 0 )); do
+    refresh_auth_after_credential_change
     active=$(active_jobs)
     now=$(date +%s)
     if (( now - last_heartbeat >= heartbeat_seconds )); then
@@ -251,7 +406,11 @@ while (( stopping == 0 )); do
         last_heartbeat=$now
     fi
 
-    while (( active < max_concurrency && stopping == 0 )); do
+    while (( active < max_concurrency && stopping == 0 )) \
+        && [[ "$(auth_health_status)" != expired ]] \
+        && [[ "$(auth_health_status)" != signed_out ]] \
+        && [[ "$(auth_health_status)" != unavailable ]]
+    do
         job=$(claim_one) || break
         [[ "$job" != null ]] || break
         run_job "$job" &

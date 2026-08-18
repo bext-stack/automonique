@@ -280,6 +280,8 @@ const frenchUi = Object.freeze({
   "Security": "Sécurité",
   "Protected": "Protégé",
   "TLS, authentication and approvals": "TLS, authentification et approbations",
+  "Agent authentication": "Authentification des agents",
+  "Execution access without credential exposure": "Accès d’exécution sans exposition des identifiants",
   "Search settings and integrations": "Rechercher des paramètres et intégrations",
   "Filter configuration": "Filtrer la configuration",
   "Workspace": "Espace de travail",
@@ -334,6 +336,7 @@ const frenchUi = Object.freeze({
   "Authenticated network boundary and request limits.": "Périmètre réseau authentifié et limites de requête.",
   "Durable evidence, retention and retrieval behavior.": "Éléments durables, conservation et comportement de récupération.",
   "Contained model execution and provider readiness.": "Exécution cloisonnée des modèles et disponibilité des fournisseurs.",
+  "Verified execution access for connected agent surfaces.": "Accès d’exécution vérifié pour les surfaces d’agent connectées.",
   "Channels and external service connections.": "Canaux et connexions aux services externes.",
   "Live tools, tickets and approval-aware control plane.": "Outils en temps réel, tickets et plan de contrôle soumis aux approbations.",
   "Governance & safety": "Gouvernance et sécurité",
@@ -436,6 +439,7 @@ const frenchUi = Object.freeze({
   "AI Operations could not be refreshed.": "AI Operations n’a pas pu être actualisé.",
   "Web boundary": "Périmètre web",
   "Providers": "Fournisseurs",
+  "AI Operations ticket worker": "Worker de tickets AI Operations",
   "Connectors": "Connecteurs",
   "CONFIGURED": "CONFIGURÉ",
   "OFF": "DÉSACTIVÉ",
@@ -508,6 +512,14 @@ const frenchUi = Object.freeze({
   "Raw Message Retention Days": "Conservation des messages bruts en jours",
   "Writable History": "Historique inscriptible",
   "Primary Configured": "Fournisseur principal configuré",
+  "Provider Configured": "Fournisseur configuré",
+  "Worker Configured": "Worker configuré",
+  "Surface": "Surface",
+  "Method": "Méthode",
+  "Evidence": "Élément de preuve",
+  "Observed At Ms": "Observé le",
+  "Last Verified At Ms": "Dernière vérification",
+  "Remediation": "Correction",
   "Conversation Configured": "Conversation configurée",
   "Egress Policy Configured": "Politique de sortie configurée",
   "Support": "Assistance",
@@ -542,6 +554,28 @@ const frenchUi = Object.freeze({
   "same-origin authenticated API": "API authentifiée de même origine",
   "reviewed typed evidence": "éléments typés vérifiés",
   "configured": "configuré",
+  "Authenticated": "Authentifié",
+  "Configured Unverified": "Configuré, non vérifié",
+  "Expired": "Expiré",
+  "Signed Out": "Déconnecté",
+  "Not Configured": "Non configuré",
+  "ChatGPT": "ChatGPT",
+  "API key": "Clé API",
+  "Access token": "Jeton d’accès",
+  "Execution Succeeded": "Exécution réussie",
+  "Credentials Changed": "Identifiants modifiés",
+  "Local Session Present": "Session locale présente",
+  "Local Session Missing": "Session locale absente",
+  "Refresh Token Rejected": "Jeton de renouvellement rejeté",
+  "Provider Configuration Missing": "Configuration fournisseur absente",
+  "Health Record Missing": "État d’authentification absent",
+  "Health Record Unavailable": "État d’authentification indisponible",
+  "Health Record Invalid": "État d’authentification invalide",
+  "No action required.": "Aucune action requise.",
+  "Run one contained agent task to verify remote provider access.": "Exécutez une tâche d’agent cloisonnée pour vérifier l’accès distant au fournisseur.",
+  "Reauthenticate the Codex worker, refresh this screen, then relaunch blocked work.": "Réauthentifiez le worker Codex, actualisez cet écran, puis relancez le travail bloqué.",
+  "Configure an execution provider before enabling agent work.": "Configurez un fournisseur d’exécution avant d’activer le travail des agents.",
+  "Inspect the worker and its private authentication health record.": "Examinez le worker et son état privé d’authentification.",
 });
 const localizedTextSources = new WeakMap();
 const localizedAttributeSources = new WeakMap();
@@ -1623,6 +1657,7 @@ function label(value) {
 const configurationSectionMeta = Object.freeze({
   "Web boundary": { category: "security", description: "Authenticated network boundary and request limits." },
   Memory: { category: "ai", description: "Durable evidence, retention and retrieval behavior." },
+  "Agent authentication": { category: "ai security", description: "Verified execution access for connected agent surfaces." },
   Providers: { category: "ai", description: "Contained model execution and provider readiness." },
   Connectors: { category: "integrations", description: "Channels and external service connections." },
   "Manage AI Operations": { category: "integrations ai", description: "Live tools, tickets and approval-aware control plane." },
@@ -1632,6 +1667,32 @@ const configurationSectionMeta = Object.freeze({
 
 function configurePrompt(title) {
   return `Review the ${title} configuration. Explain its current effective state, identify anything missing, and stage any safe change for my explicit approval.`;
+}
+
+function authenticationLabel(status) {
+  const labels = {
+    authenticated: "Authenticated",
+    configured_unverified: "Configured Unverified",
+    expired: "Expired",
+    signed_out: "Signed Out",
+    unavailable: "Unavailable",
+    not_configured: "Not Configured",
+  };
+  return labels[status] || "Unavailable";
+}
+
+function configurationValue(key, value) {
+  if (typeof value === "boolean") return value ? "CONFIGURED" : "OFF";
+  if (value === null || value === undefined) return "—";
+  if (key.endsWith("_at_ms") && Number.isSafeInteger(value) && value > 0) {
+    return new Intl.DateTimeFormat(localeTag(), { dateStyle: "medium", timeStyle: "short" }).format(value);
+  }
+  if (key === "status") return authenticationLabel(value);
+  if (key === "method") {
+    return { chatgpt: "ChatGPT", api_key: "API key", access_token: "Access token", unknown: "Unknown" }[value] || "Unknown";
+  }
+  if (key === "evidence") return label(value);
+  return String(value);
 }
 
 function renderConfigSection(title, values) {
@@ -1654,7 +1715,12 @@ function renderConfigSection(title, values) {
   const configuredValues = Object.values(values || {}).filter((value) => typeof value === "boolean");
   const state = document.createElement("span");
   state.className = "config-scope";
-  state.textContent = configuredValues.length === 0 || configuredValues.some(Boolean) ? "ACTIVE" : "OFF";
+  if (title === "Agent authentication") {
+    state.textContent = authenticationLabel(values.status);
+    state.dataset.state = values.status || "unavailable";
+  } else {
+    state.textContent = configuredValues.length === 0 || configuredValues.some(Boolean) ? "ACTIVE" : "OFF";
+  }
   headingWrap.append(headingText, state);
   const list = document.createElement("dl");
   list.className = "config-list";
@@ -1664,8 +1730,11 @@ function renderConfigSection(title, values) {
     const term = document.createElement("dt");
     term.textContent = label(key);
     const detail = document.createElement("dd");
-    detail.textContent = typeof value === "boolean" ? (value ? "CONFIGURED" : "OFF") : String(value ?? "—");
+    detail.textContent = configurationValue(key, value);
     if (typeof value === "boolean") detail.className = value ? "boolean-true" : "boolean-false";
+    if (title === "Agent authentication" && key === "status") {
+      detail.className = value === "authenticated" ? "auth-good" : value === "configured_unverified" ? "auth-warning" : "auth-danger";
+    }
     row.append(term, detail);
     list.append(row);
   });
@@ -1680,7 +1749,7 @@ function renderConfigSection(title, values) {
   action.dataset.chatPrompt = configurePrompt(title);
   footer.append(scope, action);
   card.append(headingWrap, list, footer);
-  card.dataset.configSearch = `${title} ${metadata.description} ${Object.keys(values || {}).join(" ")}`.toLowerCase();
+  card.dataset.configSearch = `${title} ${metadata.description} ${Object.keys(values || {}).join(" ")} ${Object.values(values || {}).join(" ")}`.toLowerCase();
   return card;
 }
 
@@ -1702,6 +1771,9 @@ function updateConfigurationSummary(config) {
   const connections = Object.values(config.connectors || {}).filter((value) => value === true).length;
   byId("configuration-connections-state").textContent = `${connections} connected`;
   byId("configuration-manage-state").textContent = config.manage?.configured ? "Connected" : "Not attached";
+  const authStatus = config.agent_authentication?.status || "unavailable";
+  byId("configuration-auth-summary").dataset.state = authStatus;
+  byId("configuration-auth-state").textContent = authenticationLabel(authStatus);
   byId("configuration-last-read").textContent = `Updated ${new Date().toLocaleTimeString(localeTag(), { hour: "2-digit", minute: "2-digit" })}`;
 }
 
@@ -1738,6 +1810,7 @@ async function loadConfiguration(force = false) {
     const core = { ...config };
     delete core.schema;
     delete core.memory;
+    delete core.agent_authentication;
     delete core.providers;
     delete core.connectors;
     delete core.manage;
@@ -1750,6 +1823,7 @@ async function loadConfiguration(force = false) {
     root.append(
       renderConfigSection("Web boundary", core),
       renderConfigSection("Memory", config.memory),
+      renderConfigSection("Agent authentication", config.agent_authentication),
       renderConfigSection("Providers", config.providers),
       renderConfigSection("Connectors", config.connectors),
       renderConfigSection("Manage AI Operations", manage),

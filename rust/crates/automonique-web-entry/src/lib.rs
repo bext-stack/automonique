@@ -51,6 +51,7 @@ const RATE_WINDOW: Duration = Duration::from_secs(60);
 const RATE_LIMIT: u32 = 600;
 const AUTH_CONFIG_LIMIT: u64 = 4 * 1024;
 const INTEGRATION_CONFIG_LIMIT: u64 = 4 * 1024;
+const PROVIDER_AUTH_HEALTH_LIMIT: u64 = 4 * 1024;
 const REQUEST_LIMIT: usize = 48 * 1024;
 const BODY_LIMIT: usize = 24 * 1024;
 const MAX_PENDING_MANAGE_ACTIONS: usize = 32;
@@ -578,11 +579,39 @@ struct ConfigurationView {
     queue_depth: usize,
     rate_limit_per_minute: u32,
     memory: MemoryConfigurationView,
+    agent_authentication: AgentAuthenticationView,
     providers: ProviderConfigurationView,
     connectors: ConnectorConfigurationView,
     manage: ManageConfigurationView,
     governance: GovernanceConfigurationView,
     extensions: ExtensionConfigurationView,
+}
+
+#[derive(Serialize)]
+struct AgentAuthenticationView {
+    provider: &'static str,
+    surface: &'static str,
+    provider_configured: bool,
+    worker_configured: bool,
+    status: String,
+    method: String,
+    evidence: String,
+    observed_at_ms: Option<u64>,
+    last_verified_at_ms: Option<u64>,
+    remediation: &'static str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderAuthHealthRecord {
+    schema: String,
+    provider: String,
+    surface: String,
+    status: String,
+    method: String,
+    reason: String,
+    observed_at_ms: u64,
+    last_verified_at_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -870,8 +899,10 @@ impl WebIntegration {
     fn configuration(&self) -> ConfigurationView {
         let exists = |relative: &str| self.state_dir.join(relative).is_file();
         let directory_exists = |relative: &str| self.state_dir.join(relative).is_dir();
+        let provider_configured = exists("provider");
+        let worker_configured = exists("support/fleet.conf");
         ConfigurationView {
-            schema: "automonique.dashboard.configuration/v3",
+            schema: "automonique.dashboard.configuration/v4",
             canonical_host: self.config.hosts.canonical().to_owned(),
             authentication: "HTTP Basic / SHA-256 verifier",
             transport_security: "HTTPS required",
@@ -889,8 +920,9 @@ impl WebIntegration {
                 raw_message_retention_days: 90,
                 writable_history: self.memory_path.is_file(),
             },
+            agent_authentication: self.agent_authentication(provider_configured, worker_configured),
             providers: ProviderConfigurationView {
-                primary_configured: exists("provider"),
+                primary_configured: provider_configured,
                 conversation_configured: exists("conversation-provider"),
                 egress_policy_configured: exists("egress-destinations"),
                 execution: "durable contained run lane",
@@ -931,6 +963,53 @@ impl WebIntegration {
                 automations_store_available: exists("automations.sqlite3"),
                 skills_store_available: directory_exists("skills"),
             },
+        }
+    }
+
+    fn agent_authentication(
+        &self,
+        provider_configured: bool,
+        worker_configured: bool,
+    ) -> AgentAuthenticationView {
+        let fallback = |status: &str, evidence: &str| AgentAuthenticationView {
+            provider: "Codex",
+            surface: "AI Operations ticket worker",
+            provider_configured,
+            worker_configured,
+            status: status.to_owned(),
+            method: String::from("unknown"),
+            evidence: evidence.to_owned(),
+            observed_at_ms: None,
+            last_verified_at_ms: None,
+            remediation: authentication_remediation(status),
+        };
+        if !provider_configured {
+            return fallback("not_configured", "provider_configuration_missing");
+        }
+        let path = self
+            .state_dir
+            .join("manage-fleet-worker")
+            .join("auth-health.json");
+        if !path.is_file() {
+            return fallback("configured_unverified", "health_record_missing");
+        }
+        let Ok(bytes) = read_private_config(&path, PROVIDER_AUTH_HEALTH_LIMIT) else {
+            return fallback("unavailable", "health_record_unavailable");
+        };
+        let Some(record) = provider_auth_health_record(&bytes) else {
+            return fallback("unavailable", "health_record_invalid");
+        };
+        AgentAuthenticationView {
+            provider: "Codex",
+            surface: "AI Operations ticket worker",
+            provider_configured,
+            worker_configured,
+            remediation: authentication_remediation(&record.status),
+            status: record.status,
+            method: record.method,
+            evidence: record.reason,
+            observed_at_ms: Some(record.observed_at_ms),
+            last_verified_at_ms: record.last_verified_at_ms,
         }
     }
 
@@ -2453,6 +2532,58 @@ pub fn dashboard_status(admin_json: &[u8], observed_ms: u64) -> Option<Dashboard
     })
 }
 
+fn provider_auth_health_record(bytes: &[u8]) -> Option<ProviderAuthHealthRecord> {
+    let record: ProviderAuthHealthRecord = serde_json::from_slice(bytes).ok()?;
+    let valid_status = matches!(
+        record.status.as_str(),
+        "authenticated" | "configured_unverified" | "expired" | "signed_out" | "unavailable"
+    );
+    let valid_method = matches!(
+        record.method.as_str(),
+        "chatgpt" | "api_key" | "access_token" | "unknown"
+    );
+    let valid_evidence = matches!(
+        (record.status.as_str(), record.reason.as_str()),
+        ("authenticated", "execution_succeeded")
+            | (
+                "configured_unverified",
+                "credentials_changed" | "local_session_present"
+            )
+            | ("expired", "refresh_token_rejected")
+            | ("signed_out", "local_session_missing")
+            | ("unavailable", "provider_unavailable")
+    );
+    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+    let valid_verified_at = record.last_verified_at_ms.is_none_or(|verified| {
+        verified > 0 && verified <= record.observed_at_ms && verified <= MAX_SAFE_INTEGER
+    });
+    if record.schema != "automonique.provider-auth-health/v1"
+        || record.provider != "codex"
+        || record.surface != "manage-fleet-worker"
+        || !valid_status
+        || !valid_method
+        || !valid_evidence
+        || record.observed_at_ms == 0
+        || record.observed_at_ms > MAX_SAFE_INTEGER
+        || !valid_verified_at
+    {
+        return None;
+    }
+    Some(record)
+}
+
+fn authentication_remediation(status: &str) -> &'static str {
+    match status {
+        "authenticated" => "No action required.",
+        "configured_unverified" => "Run one contained agent task to verify remote provider access.",
+        "expired" | "signed_out" => {
+            "Reauthenticate the Codex worker, refresh this screen, then relaunch blocked work."
+        }
+        "not_configured" => "Configure an execution provider before enabling agent work.",
+        _ => "Inspect the worker and its private authentication health record.",
+    }
+}
+
 fn bounded_state(value: &str) -> Option<String> {
     if value.is_empty()
         || value.len() > 64
@@ -2926,6 +3057,7 @@ mod tests {
 
     const CANONICAL_HOST: &str = concat!("dashboard", ".", "example", ".", "invalid");
     const LEGACY_HOST: &str = concat!("retired", ".", "example", ".", "invalid");
+    const MANAGE_WORKER: &str = include_str!("../../../../tools/run_manage_fleet_worker.sh");
 
     fn fixture_hosts() -> DashboardHosts {
         DashboardHosts::new(CANONICAL_HOST, LEGACY_HOST).expect("fixture hosts")
@@ -3040,6 +3172,48 @@ mod tests {
         assert_eq!(Some(true), status.provider_available);
         assert_eq!(Some(1234), status.observed_ms);
         assert!(!status.stale);
+    }
+
+    #[test]
+    fn provider_authentication_health_is_strict_and_secret_safe() {
+        let valid = r#"{
+          "schema":"automonique.provider-auth-health/v1",
+          "provider":"codex",
+          "surface":"manage-fleet-worker",
+          "status":"expired",
+          "method":"chatgpt",
+          "reason":"refresh_token_rejected",
+          "observed_at_ms":1787057640000,
+          "last_verified_at_ms":1787057000000
+        }"#;
+        let record = provider_auth_health_record(valid.as_bytes()).expect("valid auth health");
+        assert_eq!("expired", record.status);
+        assert_eq!("chatgpt", record.method);
+        assert_eq!("refresh_token_rejected", record.reason);
+
+        let unknown = valid.replace(
+            "\n        }",
+            ",\n          \"token\":\"secret\"\n        }",
+        );
+        assert!(provider_auth_health_record(unknown.as_bytes()).is_none());
+        assert!(
+            provider_auth_health_record(valid.replace("expired", "healthy").as_bytes()).is_none()
+        );
+        assert!(
+            provider_auth_health_record(valid.replace("1787057000000", "1787058000000").as_bytes())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fleet_worker_reports_execution_proven_authentication() {
+        assert!(MANAGE_WORKER.contains("configured_unverified"));
+        assert!(MANAGE_WORKER.contains("refresh_token_rejected"));
+        assert!(MANAGE_WORKER.contains("latest_job_auth_failure_reason"));
+        assert!(MANAGE_WORKER.contains("write_auth_health authenticated execution_succeeded"));
+        assert!(MANAGE_WORKER.contains("--arg auth \"$auth_status\""));
+        assert!(!MANAGE_WORKER.contains("auth_status:\"configured\""));
+        assert!(MANAGE_WORKER.contains("[[ \"$(auth_health_status)\" != expired ]]"));
     }
 
     #[test]
@@ -3192,6 +3366,10 @@ mod tests {
 
     #[test]
     fn configuration_is_a_complete_secret_safe_control_surface() {
+        assert!(DASHBOARD_HTML.contains("id=\"configuration-auth-state\""));
+        assert!(DASHBOARD_JS.contains("Agent authentication"));
+        assert!(DASHBOARD_JS.contains("configurationValue"));
+        assert!(DASHBOARD_CSS.contains("data-state=\"expired\""));
         for control in [
             "configuration-search",
             "configuration-theme",
@@ -3219,6 +3397,7 @@ mod tests {
         assert!(DASHBOARD_JS.contains("applyConfigurationFilter"));
         assert!(DASHBOARD_HTML.contains("Credentials remain outside this browser."));
         assert!(!DASHBOARD_HTML.contains("type=\"password\""));
+        assert!(!DASHBOARD_JS.contains("credential_revision"));
     }
 
     #[test]

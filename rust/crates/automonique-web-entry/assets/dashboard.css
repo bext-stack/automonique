@@ -1002,6 +1002,12 @@ kbd { padding: 1px 4px; border: 1px solid var(--line-bright); border-bottom-colo
 .config-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }
 .config-summary article { display: flex; min-width: 0; gap: 12px; align-items: center; padding: 15px 16px; border: 1px solid var(--line); border-radius: 10px; background: linear-gradient(145deg, color-mix(in srgb, var(--panel) 96%, var(--blue) 4%), var(--panel)); box-shadow: 0 8px 24px var(--shadow-color); transition: transform .18s ease, border-color .18s ease; }
 .config-summary article:hover { transform: translateY(-1px); border-color: var(--line-bright); }
+.config-summary article[data-state="authenticated"] { border-color: var(--success-border); background: var(--success-surface); }
+.config-summary article[data-state="configured_unverified"] { border-color: var(--warning-border); background: var(--warning-surface); }
+.config-summary article[data-state="expired"],
+.config-summary article[data-state="signed_out"],
+.config-summary article[data-state="unavailable"],
+.config-summary article[data-state="not_configured"] { border-color: var(--danger-border); background: var(--danger-surface); }
 .config-summary-icon { display: grid; flex: 0 0 34px; width: 34px; height: 34px; place-items: center; border: 1px solid var(--info-border); border-radius: 9px; background: var(--info-surface); color: var(--blue); font-size: var(--font-lg); }
 .config-summary div { min-width: 0; }
 .config-summary small, .config-summary p { display: block; color: var(--muted); font-size: var(--font-xs); }
@@ -1023,7 +1029,13 @@ kbd { padding: 1px 4px; border: 1px solid var(--line-bright); border-bottom-colo
 .config-card-heading h2, .config-section-heading h2 { margin: 3px 0 4px; font-size: var(--font-xl); letter-spacing: -.02em; }
 .config-card-heading p, .config-section-heading p { margin: 0; color: var(--muted); font-size: var(--font-sm); line-height: 1.5; }
 .config-eyebrow { color: var(--blue); font: 720 var(--font-xs) ui-monospace, monospace; letter-spacing: .08em; }
-.config-scope { flex: 0 0 auto; padding: 4px 7px; border: 1px solid var(--info-border); border-radius: 5px; background: var(--info-surface); color: var(--blue); font: 700 var(--font-xs) ui-monospace, monospace; }
+.config-scope { flex: 0 0 auto; padding: 4px 7px; border: 1px solid var(--info-border); border-radius: 5px; background: var(--info-surface); color: var(--blue); font: 700 var(--font-xs) ui-monospace, monospace; text-transform: uppercase; }
+.config-scope[data-state="authenticated"] { border-color: var(--success-border); background: var(--success-surface); color: var(--green); }
+.config-scope[data-state="configured_unverified"] { border-color: var(--warning-border); background: var(--warning-surface); color: var(--amber); }
+.config-scope[data-state="expired"],
+.config-scope[data-state="signed_out"],
+.config-scope[data-state="unavailable"],
+.config-scope[data-state="not_configured"] { border-color: var(--danger-border); background: var(--danger-surface); color: var(--red); }
 .config-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; overflow: hidden; border: 1px solid var(--line); border-radius: 9px; background: var(--line); }
 .config-field { display: flex; min-width: 0; min-height: 72px; gap: 18px; align-items: center; justify-content: space-between; padding: 13px 14px; background: var(--panel); transition: background .16s ease; }
 .config-field:hover { background: var(--hover-surface); }
@@ -1040,6 +1052,9 @@ kbd { padding: 1px 4px; border: 1px solid var(--line-bright); border-bottom-colo
 .config-list div { display: grid; grid-template-columns: minmax(0, 1fr) minmax(100px, 1fr); gap: 15px; min-height: 42px; align-items: center; border-top: 1px solid var(--line); }
 .config-list dt { color: var(--muted); font-size: var(--font-sm); }
 .config-list dd { margin: 0; overflow-wrap: anywhere; color: var(--text); font: 600 var(--font-sm) ui-monospace, monospace; text-align: right; }
+.config-list dd.auth-good { color: var(--green); }
+.config-list dd.auth-warning { color: var(--amber); }
+.config-list dd.auth-danger { color: var(--red); }
 .config-card-footer { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-top: 12px; padding-top: 11px; border-top: 1px solid var(--line); }
 .config-card-footer small { color: var(--muted); font-size: var(--font-xs); }
 .config-inline-action { padding: 4px 0; border: 0; background: transparent; color: var(--blue); font: 650 var(--font-sm) inherit; cursor: pointer; }

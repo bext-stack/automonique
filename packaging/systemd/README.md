@@ -21,7 +21,14 @@ The timer writes an online recovery set every five minutes.
 external transports and refuses provider starts.
 `automonique-manage-worker.service` heartbeats the configured Manage instance,
 claims confirmed jobs with bounded parallelism, and streams their progress back
-to AI Operations. It runs from the same immutable release as the daemon.
+to AI Operations. It runs from the same immutable release as the daemon. The
+worker maintains a private `manage-fleet-worker/auth-health.json` projection:
+local credentials begin as `configured_unverified`, a successful provider turn
+proves `authenticated`, and recognized sign-out or token-refresh failures become
+`signed_out` or `expired`. Unhealthy authentication pauses new claims until the
+private credential revision changes. The dashboard exposes only these closed
+states, the sign-in method, safe evidence codes, and timestamps; it never returns
+the credential, account identity, provider home, or raw provider output.
 
 The optional hosted dashboard is deliberately separate from the daemon.
 `automonique-web-entry.service` binds a small Rust operations console to
