@@ -654,8 +654,15 @@ struct TicketView {
     id: String,
     title: String,
     status: String,
+    workflow: String,
     priority: String,
     assignee: Option<String>,
+    requester: Option<String>,
+    tenant: Option<String>,
+    site: Option<String>,
+    source: Option<String>,
+    comments: Option<u64>,
+    created_at: Option<String>,
     updated_at: Option<String>,
     url: Option<String>,
 }
@@ -1697,6 +1704,16 @@ fn ticket_person(object: &serde_json::Map<String, Value>) -> Option<String> {
     }
 }
 
+fn ticket_bounded_count(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| match object.get(*key) {
+            Some(Value::Number(value)) => value.as_u64(),
+            Some(Value::String(value)) => value.parse().ok(),
+            _ => None,
+        })
+        .filter(|value| *value <= 10_000)
+}
+
 fn ticket_identifier(object: &serde_json::Map<String, Value>) -> String {
     ticket_string(object, &["reference", "ticket_id", "id", "number"])
         .filter(|value| {
@@ -1751,20 +1768,48 @@ fn ticket_views(value: &Value) -> Vec<TicketView> {
         .filter_map(Value::as_object)
         .filter_map(|object| {
             let title = ticket_string(object, &["title", "subject", "name"])?;
+            let status =
+                normalized_ticket_status(ticket_string(object, &["lifecycle", "state", "status"]));
+            let workflow = normalized_ticket_status(ticket_string(
+                object,
+                &[
+                    "fleet_status",
+                    "workflow_status",
+                    "status",
+                    "state",
+                    "lifecycle",
+                ],
+            ));
             Some(TicketView {
                 id: ticket_identifier(object),
                 title,
-                status: normalized_ticket_status(ticket_string(object, &["status", "state"])),
+                status,
+                workflow,
                 priority: normalized_ticket_priority(ticket_string(
                     object,
                     &["priority", "urgency"],
                 )),
                 assignee: ticket_person(object),
+                requester: ticket_string(
+                    object,
+                    &["requested_by", "requester", "author", "created_by"],
+                ),
+                tenant: ticket_string(object, &["tenant_name", "tenant", "client", "project"]),
+                site: ticket_string(object, &["site_label", "site", "website"]),
+                source: ticket_string(object, &["source", "origin", "provider"]),
+                comments: ticket_bounded_count(
+                    object,
+                    &["comment_count", "comments_count", "comments"],
+                ),
+                created_at: ticket_string(object, &["created_at", "createdAt", "opened_at"]),
                 updated_at: ticket_string(
                     object,
-                    &["updated_at", "updatedAt", "modified_at", "created_at"],
+                    &["updated_at", "updatedAt", "modified_at", "last_synced_at"],
                 ),
-                url: safe_ticket_url(ticket_string(object, &["url", "html_url", "web_url"])),
+                url: safe_ticket_url(ticket_string(
+                    object,
+                    &["url", "html_url", "web_url", "issue_url", "github_url"],
+                )),
             })
         })
         .collect()
@@ -2975,18 +3020,41 @@ mod tests {
                 "items": [{
                     "number": 42,
                     "title": "Repair the dashboard",
-                    "state": "working",
-                    "urgency": "critical",
-                    "assignee": { "name": "Operations" },
-                    "html_url": "https://example.test/issues/42"
+                "state": "working",
+                "lifecycle": "open",
+                "fleet_status": "working",
+                "urgency": "critical",
+                "assignee": { "name": "Operations" },
+                "requested_by": "Laly",
+                "tenant_name": "ACTIV Communication",
+                "site_label": "Bext platform",
+                "source": "GitHub",
+                "comment_count": 11,
+                "created_at": "2026-08-17T13:06:45Z",
+                "updated_at": "2026-08-18T07:51:45Z",
+                "html_url": "https://example.test/issues/42"
                 }]
             }
         }));
         assert_eq!(1, tickets.len());
         assert_eq!("42", tickets[0].id);
-        assert_eq!("in_progress", tickets[0].status);
+        assert_eq!("open", tickets[0].status);
+        assert_eq!("in_progress", tickets[0].workflow);
         assert_eq!("urgent", tickets[0].priority);
         assert_eq!(Some("Operations"), tickets[0].assignee.as_deref());
+        assert_eq!(Some("Laly"), tickets[0].requester.as_deref());
+        assert_eq!(Some("ACTIV Communication"), tickets[0].tenant.as_deref());
+        assert_eq!(Some("Bext platform"), tickets[0].site.as_deref());
+        assert_eq!(Some("GitHub"), tickets[0].source.as_deref());
+        assert_eq!(Some(11), tickets[0].comments);
+        assert_eq!(
+            Some("2026-08-17T13:06:45Z"),
+            tickets[0].created_at.as_deref()
+        );
+        assert_eq!(
+            Some("2026-08-18T07:51:45Z"),
+            tickets[0].updated_at.as_deref()
+        );
         assert_eq!(
             Some("https://example.test/issues/42"),
             tickets[0].url.as_deref()
@@ -3059,6 +3127,9 @@ mod tests {
             "appearance-panel",
             "operations-refresh",
             "tickets-refresh",
+            "tickets-search",
+            "tickets-search-clear",
+            "tickets-sort",
             "startup-view",
             "reduce-motion",
         ] {

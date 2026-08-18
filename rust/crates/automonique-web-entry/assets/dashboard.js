@@ -16,6 +16,8 @@ let memoryKind = "all";
 let memoryQuery = null;
 let operationsSnapshot = null;
 let ticketFilter = "all";
+let ticketQuery = "";
+let ticketSort = "updated_desc";
 let lastObservedMs = null;
 let lastStatusKey = null;
 let lastPulseChangeAt = null;
@@ -212,10 +214,24 @@ const frenchUi = Object.freeze({
   "Review with Monique": "Examiner avec Monique",
   "Ticket counts": "Compteurs de tickets",
   "TOTAL": "TOTAL",
+  "in the live queue": "dans la file en temps réel",
   "OPEN": "OUVERTS",
+  "awaiting progress": "en attente d’avancement",
   "IN PROGRESS": "EN COURS",
+  "actively handled": "pris en charge",
   "BLOCKED": "BLOQUÉS",
+  "needs attention": "nécessite une attention",
   "URGENT": "URGENTS",
+  "highest priority": "priorité maximale",
+  "Search tickets": "Rechercher des tickets",
+  "ID, title, tenant, site or person": "ID, titre, espace, site ou personne",
+  "Clear ticket search": "Effacer la recherche de tickets",
+  "Sort by": "Trier par",
+  "Recently updated": "Récemment mis à jour",
+  "Priority": "Priorité",
+  "Status": "État",
+  "Oldest first": "Plus anciens d’abord",
+  "Title": "Titre",
   "Filter tickets": "Filtrer les tickets",
   "All": "Tous",
   "Open": "Ouvert",
@@ -223,6 +239,11 @@ const frenchUi = Object.freeze({
   "Blocked": "Bloqué",
   "Done": "Terminé",
   "Connecting to ticket intake…": "Connexion à la file de tickets…",
+  "Waiting for a live source": "En attente d’une source en temps réel",
+  "Ticket": "Ticket",
+  "Context": "Contexte",
+  "Lifecycle": "Cycle de vie",
+  "Actions": "Actions",
   "Loading the live ticket queue…": "Chargement de la file de tickets en temps réel…",
   "TYPED / REVISIONED / PROVENANCE-BOUND": "TYPÉ / VERSIONNÉ / PROVENANCE LIÉE",
   "Memory system": "Système de mémoire",
@@ -304,8 +325,19 @@ const frenchUi = Object.freeze({
   "The live ticket source is temporarily unavailable.": "La source de tickets en temps réel est temporairement indisponible.",
   "Attach AI Operations to load the live ticket queue.": "Connectez AI Operations pour charger la file de tickets en temps réel.",
   "No tickets match this filter.": "Aucun ticket ne correspond à ce filtre.",
+  "Clear filters": "Effacer les filtres",
   "Ask Monique about tickets": "Interroger Monique sur les tickets",
   "Unassigned": "Non attribué",
+  "Details": "Détails",
+  "Hide details": "Masquer les détails",
+  "Workflow": "Flux de travail",
+  "Assignee": "Responsable",
+  "Requester": "Demandeur",
+  "Site": "Site",
+  "Source": "Source",
+  "Comments": "Commentaires",
+  "Created": "Créé",
+  "Updated": "Mis à jour",
   "Open ↗": "Ouvrir ↗",
   "AUTHORITY BOUNDED": "AUTORITÉ LIMITÉE",
   "NOT ATTACHED": "NON CONNECTÉ",
@@ -439,6 +471,9 @@ function translatePhraseForFrench(value) {
     [/^Assigned to (.+?)(?: · Updated (.+))?$/, (match) => `Attribué à ${match[1]}${match[2] ? ` · Mis à jour ${match[2]}` : ""}`],
     [/^Unassigned(?: · Updated (.+))?$/, (match) => `Non attribué${match[1] ? ` · Mis à jour ${match[1]}` : ""}`],
     [/^(.+) priority$/, (match) => `Priorité ${translatePhraseForFrench(match[1]).toLowerCase()}`],
+    [/^Live source · (.+)$/, (match) => `Source en temps réel · ${match[1]}`],
+    [/^Workflow · (.+)$/, (match) => `Flux de travail · ${translatePhraseForFrench(match[1])}`],
+    [/^Workflow mismatch · (.+)$/, (match) => `Écart de flux · ${translatePhraseForFrench(match[1])}`],
     [/^(\S+) LIVE$/, (match) => `${match[1]} EN TEMPS RÉEL`],
     [/^LIVE · (.+)$/, (match) => `TEMPS RÉEL · ${translatePhraseForFrench(match[1])}`],
     [/^Monique is working · (.+)$/, (match) => `Monique travaille · ${match[1]}`],
@@ -1140,11 +1175,68 @@ function ticketStatusLabel(status) {
   return labels[status] || operationLabel(status);
 }
 
+function ticketMatchesStatus(ticket, filter) {
+  if (filter === "all") return true;
+  if (filter === "open") return ticket.status === "open" || ticket.status === "triaging";
+  if (filter === "in_progress") return ticket.status === "in_progress" || ticket.workflow === "in_progress";
+  if (filter === "blocked") return ticket.status === "blocked" || ticket.workflow === "blocked";
+  if (filter === "urgent") return ticket.priority === "urgent";
+  if (filter === "done") return ticket.status === "done" || ticket.status === "closed";
+  return false;
+}
+
+function ticketTimestamp(value) {
+  const timestamp = typeof value === "string" ? Date.parse(value) : NaN;
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function ticketRelativeTime(value) {
+  const timestamp = ticketTimestamp(value);
+  if (timestamp === null) return null;
+  const delta = timestamp - Date.now();
+  const absolute = Math.abs(delta);
+  const [divisor, unit] = absolute >= 86_400_000
+    ? [86_400_000, "day"]
+    : absolute >= 3_600_000
+      ? [3_600_000, "hour"]
+      : [60_000, "minute"];
+  return new Intl.RelativeTimeFormat(localeTag(), { numeric: "auto" }).format(Math.round(delta / divisor), unit);
+}
+
+function ticketDateLabel(value) {
+  const timestamp = ticketTimestamp(value);
+  if (timestamp === null) return value || "—";
+  return new Intl.DateTimeFormat(localeTag(), { dateStyle: "medium", timeStyle: "short" }).format(timestamp);
+}
+
+function ticketPriorityRank(priority) {
+  return { urgent: 0, high: 1, normal: 2, low: 3 }[priority] ?? 4;
+}
+
+function ticketStatusRank(ticket) {
+  const status = ticket.workflow === "blocked" ? "blocked" : ticket.workflow === "in_progress" ? "in_progress" : ticket.status;
+  return { blocked: 0, in_progress: 1, triaging: 2, open: 3, unknown: 4, done: 5, closed: 6 }[status] ?? 7;
+}
+
 function filteredTickets() {
   const items = operationsSnapshot?.tickets?.items || [];
-  if (ticketFilter === "all") return items;
-  if (ticketFilter === "done") return items.filter((ticket) => ticket.status === "done" || ticket.status === "closed");
-  return items.filter((ticket) => ticket.status === ticketFilter);
+  const query = ticketQuery.trim().toLocaleLowerCase(localeTag());
+  const visible = items.filter((ticket) => {
+    if (!ticketMatchesStatus(ticket, ticketFilter)) return false;
+    if (!query) return true;
+    return [ticket.id, ticket.title, ticket.tenant, ticket.site, ticket.assignee, ticket.requester, ticket.source, ticket.status, ticket.workflow]
+      .filter(Boolean)
+      .some((value) => String(value).toLocaleLowerCase(localeTag()).includes(query));
+  });
+  return visible.sort((left, right) => {
+    let order = 0;
+    if (ticketSort === "priority") order = ticketPriorityRank(left.priority) - ticketPriorityRank(right.priority);
+    if (ticketSort === "status") order = ticketStatusRank(left) - ticketStatusRank(right);
+    if (ticketSort === "created_asc") order = (ticketTimestamp(left.created_at) ?? Number.MAX_SAFE_INTEGER) - (ticketTimestamp(right.created_at) ?? Number.MAX_SAFE_INTEGER);
+    if (ticketSort === "title") order = left.title.localeCompare(right.title, localeTag());
+    if (ticketSort === "updated_desc") order = (ticketTimestamp(right.updated_at) ?? 0) - (ticketTimestamp(left.updated_at) ?? 0);
+    return order || String(left.id).localeCompare(String(right.id), localeTag(), { numeric: true });
+  });
 }
 
 function safeTicketLink(value) {
@@ -1167,19 +1259,53 @@ function ticketEmptyMessage(health) {
   return messages[health] || "No tickets match this filter.";
 }
 
+function setTicketFilter(filter) {
+  ticketFilter = filter;
+  document.querySelectorAll("[data-ticket-filter]").forEach((item) => {
+    const active = item.dataset.ticketFilter === filter;
+    item.classList.toggle("is-active", active);
+    item.setAttribute("aria-pressed", String(active));
+  });
+  document.querySelectorAll("[data-ticket-filter-shortcut]").forEach((item) => {
+    item.classList.toggle("is-active", item.dataset.ticketFilterShortcut === filter);
+  });
+}
+
+function ticketDetail(labelText, value, title = null) {
+  const detail = document.createElement("div");
+  detail.className = "ticket-detail";
+  const labelNode = document.createElement("span");
+  labelNode.textContent = labelText;
+  const valueNode = document.createElement("strong");
+  valueNode.setAttribute("data-i18n-skip", "");
+  valueNode.textContent = value || "—";
+  if (title) valueNode.title = title;
+  detail.append(labelNode, valueNode);
+  return detail;
+}
+
 function renderTickets() {
   const tickets = operationsSnapshot?.tickets?.items || [];
-  const open = tickets.filter((ticket) => ticket.status === "open" || ticket.status === "triaging").length;
+  const open = tickets.filter((ticket) => ticketMatchesStatus(ticket, "open")).length;
+  const progress = tickets.filter((ticket) => ticketMatchesStatus(ticket, "in_progress")).length;
+  const blocked = tickets.filter((ticket) => ticketMatchesStatus(ticket, "blocked")).length;
+  const urgent = tickets.filter((ticket) => ticketMatchesStatus(ticket, "urgent")).length;
+  const done = tickets.filter((ticket) => ticketMatchesStatus(ticket, "done")).length;
   byId("tickets-total").textContent = count(tickets.length);
   byId("tickets-open").textContent = count(open);
-  byId("tickets-progress").textContent = count(tickets.filter((ticket) => ticket.status === "in_progress").length);
-  byId("tickets-blocked").textContent = count(tickets.filter((ticket) => ticket.status === "blocked").length);
-  byId("tickets-urgent").textContent = count(tickets.filter((ticket) => ticket.priority === "urgent").length);
+  byId("tickets-progress").textContent = count(progress);
+  byId("tickets-blocked").textContent = count(blocked);
+  byId("tickets-urgent").textContent = count(urgent);
+  [["all", tickets.length], ["open", open], ["progress", progress], ["blocked", blocked], ["urgent", urgent], ["done", done]].forEach(([name, value]) => {
+    byId(`ticket-filter-${name}`).textContent = count(value);
+  });
   const visible = filteredTickets();
   const health = operationsSnapshot?.tickets?.health || "not_attached";
   byId("tickets-state").textContent = health === "ready"
     ? `${visible.length.toLocaleString(localeTag())} of ${tickets.length.toLocaleString(localeTag())} tickets`
     : ticketEmptyMessage(health);
+  const source = operationsSnapshot?.tickets?.source_tool;
+  byId("tickets-source").textContent = source ? `Live source · ${operationLabel(source)}` : "Waiting for a live source";
   const root = byId("ticket-list");
   root.replaceChildren();
   if (visible.length === 0) {
@@ -1189,15 +1315,28 @@ function renderTickets() {
     title.textContent = ticketEmptyMessage(health === "ready" ? "filtered" : health);
     const action = document.createElement("button");
     action.type = "button";
-    action.textContent = "Ask Monique about tickets";
-    action.dataset.openChat = "Inspect the available AI Operations ticket capabilities and help me retrieve or review the right ticket queue.";
+    if (health === "ready" && (ticketFilter !== "all" || ticketQuery)) {
+      action.textContent = "Clear filters";
+      action.addEventListener("click", () => {
+        setTicketFilter("all");
+        ticketQuery = "";
+        byId("tickets-search").value = "";
+        byId("tickets-search-clear").hidden = true;
+        renderTickets();
+      });
+    } else {
+      action.textContent = "Ask Monique about tickets";
+      action.dataset.openChat = "Inspect the available AI Operations ticket capabilities and help me retrieve or review the right ticket queue.";
+    }
     empty.append(title, action);
     root.append(empty);
     return;
   }
-  visible.forEach((ticket) => {
-    const row = document.createElement("article");
-    row.className = `ticket-row priority-${ticket.priority}`;
+  visible.forEach((ticket, index) => {
+    const card = document.createElement("article");
+    card.className = `ticket-card priority-${ticket.priority}`;
+    const row = document.createElement("div");
+    row.className = "ticket-row";
     const reference = document.createElement("div");
     reference.className = "ticket-reference";
     const dot = document.createElement("i");
@@ -1211,18 +1350,47 @@ function renderTickets() {
     title.setAttribute("data-i18n-skip", "");
     title.textContent = ticket.title;
     const meta = document.createElement("small");
-    meta.textContent = [ticket.assignee ? `Assigned to ${ticket.assignee}` : "Unassigned", ticket.updated_at ? `Updated ${ticket.updated_at}` : null].filter(Boolean).join(" · ");
-    body.append(title, meta);
+    const relative = ticketRelativeTime(ticket.updated_at);
+    meta.textContent = [ticket.assignee ? `Assigned to ${ticket.assignee}` : "Unassigned", relative ? `Updated ${relative}` : null].filter(Boolean).join(" · ");
+    if (ticket.updated_at) meta.title = ticketDateLabel(ticket.updated_at);
+    const facts = document.createElement("div");
+    facts.className = "ticket-facts";
+    [ticket.tenant, ticket.site, ticket.requester ? `By ${ticket.requester}` : null, Number.isSafeInteger(ticket.comments) ? `${ticket.comments} comments` : null]
+      .filter(Boolean)
+      .slice(0, 3)
+      .forEach((value) => {
+        const fact = document.createElement("span");
+        fact.setAttribute("data-i18n-skip", "");
+        fact.textContent = value;
+        facts.append(fact);
+      });
+    body.append(title, meta, facts);
+    const lifecycle = document.createElement("div");
+    lifecycle.className = "ticket-lifecycle";
     const status = document.createElement("span");
     status.className = `ticket-status status-${ticket.status}`;
     status.textContent = ticketStatusLabel(ticket.status);
+    const workflow = document.createElement("small");
+    workflow.className = "ticket-workflow";
+    const workflowConflict = (ticket.status === "closed" || ticket.status === "done") && !["closed", "done", "unknown"].includes(ticket.workflow);
+    if (workflowConflict) workflow.classList.add("is-conflict");
+    workflow.textContent = workflowConflict
+      ? `Workflow mismatch · ${ticketStatusLabel(ticket.workflow)}`
+      : `Workflow · ${ticketStatusLabel(ticket.workflow)}`;
+    lifecycle.append(status, workflow);
     const actions = document.createElement("div");
     actions.className = "ticket-actions";
+    const detailId = `ticket-details-${index}`;
+    const detailsButton = document.createElement("button");
+    detailsButton.type = "button";
+    detailsButton.textContent = "Details";
+    detailsButton.setAttribute("aria-expanded", "false");
+    detailsButton.setAttribute("aria-controls", detailId);
     const ask = document.createElement("button");
     ask.type = "button";
-    ask.textContent = "Ask Monique";
+    ask.textContent = "Review";
     ask.dataset.openChat = `Review ticket ${ticket.id}: “${ticket.title}”. Summarize its current state and recommend the next action.`;
-    actions.append(ask);
+    actions.append(detailsButton, ask);
     const href = safeTicketLink(ticket.url);
     if (href) {
       const openLink = document.createElement("a");
@@ -1232,8 +1400,32 @@ function renderTickets() {
       openLink.textContent = "Open ↗";
       actions.append(openLink);
     }
-    row.append(reference, body, status, actions);
-    root.append(row);
+    const details = document.createElement("div");
+    details.className = "ticket-details";
+    details.id = detailId;
+    details.hidden = true;
+    [
+      ["Priority", operationLabel(ticket.priority)],
+      ["Workflow", ticketStatusLabel(ticket.workflow)],
+      ["Assignee", ticket.assignee || "Unassigned"],
+      ["Requester", ticket.requester],
+      ["Tenant", ticket.tenant],
+      ["Site", ticket.site],
+      ["Source", ticket.source],
+      ["Comments", Number.isSafeInteger(ticket.comments) ? String(ticket.comments) : null],
+      ["Created", ticket.created_at ? ticketDateLabel(ticket.created_at) : null, ticket.created_at],
+      ["Updated", ticket.updated_at ? ticketDateLabel(ticket.updated_at) : null, ticket.updated_at],
+    ].filter(([, value]) => value).forEach(([labelText, value, exact]) => details.append(ticketDetail(labelText, value, exact)));
+    detailsButton.addEventListener("click", () => {
+      const expanded = detailsButton.getAttribute("aria-expanded") === "true";
+      detailsButton.setAttribute("aria-expanded", String(!expanded));
+      detailsButton.textContent = expanded ? "Details" : "Hide details";
+      details.hidden = expanded;
+      card.classList.toggle("is-expanded", !expanded);
+    });
+    row.append(reference, body, lifecycle, actions);
+    card.append(row, details);
+    root.append(card);
   });
 }
 
@@ -1273,10 +1465,29 @@ async function loadOperations(force = false) {
 byId("operations-refresh").addEventListener("click", () => loadOperations(true));
 byId("tickets-refresh").addEventListener("click", () => loadOperations(true));
 document.querySelectorAll("[data-ticket-filter]").forEach((button) => button.addEventListener("click", () => {
-  ticketFilter = button.dataset.ticketFilter;
-  document.querySelectorAll("[data-ticket-filter]").forEach((item) => item.classList.toggle("is-active", item === button));
+  setTicketFilter(button.dataset.ticketFilter);
   renderTickets();
 }));
+document.querySelectorAll("[data-ticket-filter-shortcut]").forEach((button) => button.addEventListener("click", () => {
+  setTicketFilter(button.dataset.ticketFilterShortcut);
+  renderTickets();
+}));
+byId("tickets-search").addEventListener("input", (event) => {
+  ticketQuery = event.target.value.slice(0, 160);
+  byId("tickets-search-clear").hidden = ticketQuery.length === 0;
+  renderTickets();
+});
+byId("tickets-search-clear").addEventListener("click", () => {
+  ticketQuery = "";
+  byId("tickets-search").value = "";
+  byId("tickets-search-clear").hidden = true;
+  byId("tickets-search").focus();
+  renderTickets();
+});
+byId("tickets-sort").addEventListener("change", (event) => {
+  ticketSort = event.target.value;
+  renderTickets();
+});
 
 function label(value) {
   return String(value).replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());

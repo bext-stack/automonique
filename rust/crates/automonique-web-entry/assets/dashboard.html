@@ -202,17 +202,24 @@
               <div class="heading-actions"><button class="button secondary" id="tickets-refresh" type="button">Refresh</button><button class="button primary" type="button" data-open-chat="Review the current ticket queue, summarize priorities, and recommend the next action.">Review with Monique</button></div>
             </div>
             <div class="ticket-metrics" aria-label="Ticket counts">
-              <article><span>TOTAL</span><strong id="tickets-total">—</strong></article>
-              <article><span>OPEN</span><strong id="tickets-open">—</strong></article>
-              <article><span>IN PROGRESS</span><strong id="tickets-progress">—</strong></article>
-              <article><span>BLOCKED</span><strong id="tickets-blocked">—</strong></article>
-              <article><span>URGENT</span><strong id="tickets-urgent">—</strong></article>
+              <button class="ticket-metric is-active" type="button" data-ticket-filter-shortcut="all"><span>TOTAL</span><strong id="tickets-total">—</strong><small>in the live queue</small></button>
+              <button class="ticket-metric" type="button" data-ticket-filter-shortcut="open"><span>OPEN</span><strong id="tickets-open">—</strong><small>awaiting progress</small></button>
+              <button class="ticket-metric" type="button" data-ticket-filter-shortcut="in_progress"><span>IN PROGRESS</span><strong id="tickets-progress">—</strong><small>actively handled</small></button>
+              <button class="ticket-metric" type="button" data-ticket-filter-shortcut="blocked"><span>BLOCKED</span><strong id="tickets-blocked">—</strong><small>needs attention</small></button>
+              <button class="ticket-metric" type="button" data-ticket-filter-shortcut="urgent"><span>URGENT</span><strong id="tickets-urgent">—</strong><small>highest priority</small></button>
+            </div>
+            <div class="ticket-controls panel">
+              <label class="ticket-search" for="tickets-search"><span>Search tickets</span><div><i aria-hidden="true">⌕</i><input id="tickets-search" type="search" maxlength="160" autocomplete="off" placeholder="ID, title, tenant, site or person"><button id="tickets-search-clear" type="button" aria-label="Clear ticket search" hidden>×</button></div></label>
+              <label class="ticket-sort" for="tickets-sort"><span>Sort by</span><select id="tickets-sort"><option value="updated_desc">Recently updated</option><option value="priority">Priority</option><option value="status">Status</option><option value="created_asc">Oldest first</option><option value="title">Title</option></select></label>
             </div>
             <div class="ticket-toolbar">
-              <div class="ticket-filters" role="group" aria-label="Filter tickets"><button class="is-active" type="button" data-ticket-filter="all">All</button><button type="button" data-ticket-filter="open">Open</button><button type="button" data-ticket-filter="in_progress">In progress</button><button type="button" data-ticket-filter="blocked">Blocked</button><button type="button" data-ticket-filter="done">Done</button></div>
-              <span id="tickets-state" role="status">Connecting to ticket intake…</span>
+              <div class="ticket-filters" role="group" aria-label="Filter tickets"><button class="is-active" type="button" data-ticket-filter="all">All <b id="ticket-filter-all">0</b></button><button type="button" data-ticket-filter="open">Open <b id="ticket-filter-open">0</b></button><button type="button" data-ticket-filter="in_progress">In progress <b id="ticket-filter-progress">0</b></button><button type="button" data-ticket-filter="blocked">Blocked <b id="ticket-filter-blocked">0</b></button><button type="button" data-ticket-filter="urgent">Urgent <b id="ticket-filter-urgent">0</b></button><button type="button" data-ticket-filter="done">Done <b id="ticket-filter-done">0</b></button></div>
+              <div class="ticket-result-state"><strong id="tickets-state" role="status">Connecting to ticket intake…</strong><small id="tickets-source">Waiting for a live source</small></div>
             </div>
-            <div class="ticket-list panel" id="ticket-list"><div class="integration-empty">Loading the live ticket queue…</div></div>
+            <div class="ticket-queue panel">
+              <div class="ticket-list-head" aria-hidden="true"><span>Ticket</span><span>Context</span><span>Lifecycle</span><span>Actions</span></div>
+              <div class="ticket-list" id="ticket-list"><div class="integration-empty">Loading the live ticket queue…</div></div>
+            </div>
           </section>
 
           <section class="view" data-panel="memory" aria-labelledby="memory-title">
