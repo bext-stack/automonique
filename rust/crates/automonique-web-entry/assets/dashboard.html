@@ -8,8 +8,8 @@
     <meta name="theme-color" id="theme-color" content="#0b0d10">
     <title>Monique</title>
     <link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=6">
-    <script src="/assets/dashboard.js?v=6" defer></script>
+    <link rel="stylesheet" href="/assets/dashboard.css?v=7">
+    <script src="/assets/dashboard.js?v=7" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -173,7 +173,7 @@
 
           <section class="view" data-panel="operations" aria-labelledby="operations-title">
             <div class="page-heading compact">
-              <div><p class="kicker">DISCOVERED / AUTHORITY-AWARE / LIVE</p><h1 id="operations-title">AI Operations</h1><p class="page-lede">Work directly with the connected control plane. Safe reads are live; every mutation remains staged for explicit approval.</p></div>
+              <div><p class="kicker">DISCOVERED / AUTHORITY-AWARE / LIVE</p><h1 id="operations-title">AI Operations</h1><p class="page-lede">See every active and recent agent process, then work directly with the connected control plane. Safe reads are live; every mutation remains staged for explicit approval.</p></div>
               <div class="heading-actions"><button class="button secondary" id="operations-refresh" type="button">Refresh</button><a class="button primary" id="operations-manage-link" data-manage-link rel="noreferrer" target="_blank" hidden>Open AI Operations ↗</a></div>
             </div>
             <div class="integration-banner" id="operations-banner" data-state="loading"><span class="integration-orb" aria-hidden="true"></span><div><strong id="operations-health">Connecting to AI Operations</strong><small id="operations-detail">Discovering the live capability catalog…</small></div><span class="tag" id="operations-authority">CHECKING</span></div>
@@ -183,6 +183,22 @@
               <article><span>APPROVAL ACTIONS</span><strong id="operations-actions">—</strong><small>staged before execution</small></article>
               <article><span>PENDING</span><strong id="operations-pending">—</strong><small>awaiting your decision</small></article>
             </div>
+            <article class="panel process-monitor" aria-labelledby="process-monitor-title">
+              <div class="panel-head process-monitor-head"><div><p class="kicker">EXECUTION MONITOR</p><h2 id="process-monitor-title">Agent processes</h2></div><div class="process-monitor-actions"><small id="process-observed">Waiting for worker snapshot</small><button class="button secondary" id="processes-refresh" type="button">Refresh</button><span class="tag" id="processes-health">LOADING</span></div></div>
+              <div class="process-metrics" aria-label="Agent process counts">
+                <article><span>RUNNING</span><strong id="process-running">—</strong><small>executing now</small></article>
+                <article><span>QUEUED</span><strong id="process-queued">—</strong><small>waiting for a worker</small></article>
+                <article><span>COMPLETED</span><strong id="process-completed">—</strong><small>visible recent history</small></article>
+                <article><span>FAILED</span><strong id="process-failed">—</strong><small>requires review or retry</small></article>
+              </div>
+              <div class="process-worker" id="process-worker"><div class="integration-empty">Loading the selected worker and its execution harness…</div></div>
+              <div class="process-toolbar">
+                <div class="process-filters" role="group" aria-label="Filter agent processes"><button class="is-active" type="button" data-process-filter="all">All <b id="process-filter-all">0</b></button><button type="button" data-process-filter="active">Active <b id="process-filter-active">0</b></button><button type="button" data-process-filter="queued">Queued <b id="process-filter-queued">0</b></button><button type="button" data-process-filter="failed">Failed <b id="process-filter-failed">0</b></button><button type="button" data-process-filter="completed">Completed <b id="process-filter-completed">0</b></button></div>
+                <strong id="process-result-state" role="status">Connecting to the worker…</strong>
+              </div>
+              <div class="process-list-head" aria-hidden="true"><span>Process</span><span>Execution</span><span>Timing</span><span>State</span></div>
+              <div class="process-list" id="process-list"><div class="integration-empty">Loading active and recent agent processes…</div></div>
+            </article>
             <div class="operations-layout">
               <article class="panel operations-catalog">
                 <div class="panel-head"><div><p class="kicker">LIVE MCP CATALOG</p><h2>Connected capabilities</h2></div><span class="tag" id="operations-catalog-tag">DISCOVERING</span></div>

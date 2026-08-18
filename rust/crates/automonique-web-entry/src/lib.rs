@@ -58,6 +58,7 @@ const RATE_LIMIT: u32 = 600;
 const AUTH_CONFIG_LIMIT: u64 = 4 * 1024;
 const INTEGRATION_CONFIG_LIMIT: u64 = 4 * 1024;
 const PROVIDER_AUTH_HEALTH_LIMIT: u64 = 4 * 1024;
+const PROCESS_SNAPSHOT_LIMIT: u64 = 256 * 1024;
 const REQUEST_LIMIT: usize = 48 * 1024;
 const BODY_LIMIT: usize = 24 * 1024;
 const MAX_PENDING_MANAGE_ACTIONS: usize = 32;
@@ -84,6 +85,7 @@ pub enum Route {
     ApiAgentAccounts,
     ApiAgentAccountsAction,
     ApiOperations,
+    ApiProcesses,
     ApiChat,
     ApiChatAction,
     ApiChatHistory,
@@ -695,6 +697,65 @@ struct OperationsView {
     tickets: TicketSnapshotView,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessSnapshotView {
+    schema: String,
+    health: String,
+    observed_at_ms: u64,
+    stats: ProcessStatsView,
+    worker: Option<ProcessWorkerView>,
+    jobs: Vec<ProcessJobView>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessStatsView {
+    total: u64,
+    queued: u64,
+    running: u64,
+    completed: u64,
+    failed: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessWorkerView {
+    name: Option<String>,
+    status: String,
+    status_detail: Option<String>,
+    provider: String,
+    agent: String,
+    model: Option<String>,
+    runtime: String,
+    binary: Option<String>,
+    cli_version: Option<String>,
+    permission_mode: String,
+    auth_status: String,
+    active_jobs: u64,
+    concurrency: u64,
+    last_seen_at: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessJobView {
+    id: String,
+    status: String,
+    source: String,
+    issue_id: Option<String>,
+    issue_url: Option<String>,
+    site_id: Option<String>,
+    session_id: Option<String>,
+    provider: String,
+    runtime: String,
+    assigned_to_worker: bool,
+    approved: bool,
+    decision_count: u64,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+}
+
 #[derive(Serialize)]
 struct OperationsToolView {
     name: String,
@@ -1236,6 +1297,24 @@ impl WebIntegration {
             tools: tool_views,
             tickets,
         }
+    }
+
+    fn processes(&self) -> ProcessSnapshotView {
+        let now = now_ms();
+        let path = self
+            .state_dir
+            .join("manage-fleet-worker")
+            .join("processes.json");
+        let Ok(bytes) = read_private_config(&path, PROCESS_SNAPSHOT_LIMIT) else {
+            return unavailable_process_snapshot(now);
+        };
+        let Some(mut snapshot) = process_snapshot(&bytes) else {
+            return unavailable_process_snapshot(now);
+        };
+        if now.saturating_sub(snapshot.observed_at_ms) > 90_000 {
+            snapshot.health = String::from("stale");
+        }
+        snapshot
     }
 
     fn chat(
@@ -2558,6 +2637,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/api/agent-accounts" => Route::ApiAgentAccounts,
                 "/api/agent-accounts/action" => Route::ApiAgentAccountsAction,
                 "/api/operations" => Route::ApiOperations,
+                "/api/processes" => Route::ApiProcesses,
                 "/api/chat" => Route::ApiChat,
                 "/api/chat/action" => Route::ApiChatAction,
                 "/api/chat/history" => Route::ApiChatHistory,
@@ -2681,6 +2761,130 @@ fn provider_auth_health_record(bytes: &[u8]) -> Option<ProviderAuthHealthRecord>
         return None;
     }
     Some(record)
+}
+
+fn unavailable_process_snapshot(observed_at_ms: u64) -> ProcessSnapshotView {
+    ProcessSnapshotView {
+        schema: String::from("automonique.dashboard.processes/v1"),
+        health: String::from("unavailable"),
+        observed_at_ms,
+        stats: ProcessStatsView {
+            total: 0,
+            queued: 0,
+            running: 0,
+            completed: 0,
+            failed: 0,
+        },
+        worker: None,
+        jobs: Vec::new(),
+    }
+}
+
+fn process_snapshot(bytes: &[u8]) -> Option<ProcessSnapshotView> {
+    let mut snapshot: ProcessSnapshotView = serde_json::from_slice(bytes).ok()?;
+    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+    let counts = [
+        snapshot.stats.total,
+        snapshot.stats.queued,
+        snapshot.stats.running,
+        snapshot.stats.completed,
+        snapshot.stats.failed,
+    ];
+    if snapshot.schema != "automonique.manage-processes/v1"
+        || !matches!(snapshot.health.as_str(), "ready" | "degraded")
+        || snapshot.observed_at_ms == 0
+        || snapshot.observed_at_ms > MAX_SAFE_INTEGER
+        || counts.into_iter().any(|count| count > 1_000_000)
+        || snapshot.jobs.len() > 100
+    {
+        return None;
+    }
+    if let Some(worker) = &snapshot.worker
+        && (!optional_process_text(worker.name.as_deref(), 120)
+            || !process_state(&worker.status)
+            || !optional_process_text(worker.status_detail.as_deref(), 240)
+            || !matches!(worker.provider.as_str(), "codex" | "claude")
+            || !process_state(&worker.agent)
+            || !optional_process_text(worker.model.as_deref(), 120)
+            || !process_state(&worker.runtime)
+            || !optional_process_text(worker.binary.as_deref(), 120)
+            || !optional_process_text(worker.cli_version.as_deref(), 80)
+            || !process_state(&worker.permission_mode)
+            || !matches!(
+                worker.auth_status.as_str(),
+                "authenticated"
+                    | "configured_unverified"
+                    | "authenticating"
+                    | "expired"
+                    | "signed_out"
+                    | "unavailable"
+            )
+            || worker.concurrency == 0
+            || worker.concurrency > 8
+            || worker.active_jobs > worker.concurrency
+            || !optional_process_text(worker.last_seen_at.as_deref(), 64))
+    {
+        return None;
+    }
+    for job in &snapshot.jobs {
+        if !process_id(&job.id)
+            || !process_state(&job.status)
+            || !process_state(&job.source)
+            || !job.issue_id.as_deref().is_none_or(process_id)
+            || !job.issue_url.as_deref().is_none_or(process_issue_url)
+            || !job.site_id.as_deref().is_none_or(process_id)
+            || !job.session_id.as_deref().is_none_or(process_id)
+            || !process_state(&job.provider)
+            || !process_state(&job.runtime)
+            || job.decision_count > 1_000
+            || !optional_process_text(job.created_at.as_deref(), 64)
+            || !optional_process_text(job.updated_at.as_deref(), 64)
+        {
+            return None;
+        }
+    }
+    snapshot.schema = String::from("automonique.dashboard.processes/v1");
+    Some(snapshot)
+}
+
+fn process_state(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-')
+        })
+}
+
+fn process_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
+        && value.is_ascii()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b':' | b'#' | b'/')
+        })
+}
+
+fn process_issue_url(value: &str) -> bool {
+    let Some(path) = value.strip_prefix("https://github.com/") else {
+        return false;
+    };
+    let parts = path.split('/').collect::<Vec<_>>();
+    parts.len() == 4
+        && parts[2] == "issues"
+        && [parts[0], parts[1]].into_iter().all(|part| {
+            !part.is_empty()
+                && part.len() <= 100
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+        })
+        && parts[3].parse::<u64>().is_ok_and(|number| number > 0)
+}
+
+fn optional_process_text(value: Option<&str>, limit: usize) -> bool {
+    value.is_none_or(|value| {
+        !value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
+    })
 }
 
 fn authentication_remediation(status: &str) -> &'static str {
@@ -2807,6 +3011,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiAgentAccounts
         | Route::ApiAgentAccountsAction
         | Route::ApiOperations
+        | Route::ApiProcesses
         | Route::ApiChat
         | Route::ApiChatAction
         | Route::ApiChatHistory
@@ -2892,6 +3097,7 @@ fn api_response(
             Err(_) => json_error("400 Bad Request", "invalid_json"),
         },
         Route::ApiOperations => json_response("200 OK", &integration.operations()),
+        Route::ApiProcesses => json_response("200 OK", &integration.processes()),
         Route::ApiChat => match serde_json::from_slice::<ChatRequest>(body) {
             Ok(request) => match integration.chat(request, &state.snapshot()) {
                 Ok(answer) => json_response("200 OK", &answer),
@@ -3097,6 +3303,7 @@ fn handle(
             | Route::ApiAgentAccounts
             | Route::ApiAgentAccountsAction
             | Route::ApiOperations
+            | Route::ApiProcesses
             | Route::ApiChat
             | Route::ApiChatAction
             | Route::ApiChatHistory
@@ -3283,6 +3490,7 @@ mod tests {
             ("/assets/dashboard.js", Route::Script),
             ("/api/status?fresh=1", Route::ApiStatus),
             ("/api/operations", Route::ApiOperations),
+            ("/api/processes", Route::ApiProcesses),
             ("/api/agent-accounts", Route::ApiAgentAccounts),
             ("/missing", Route::NotFound),
         ];
@@ -3338,6 +3546,51 @@ mod tests {
     }
 
     #[test]
+    fn process_snapshot_is_strict_bounded_and_secret_safe() {
+        let valid = r#"{
+          "schema":"automonique.manage-processes/v1",
+          "health":"ready",
+          "observed_at_ms":1787066000000,
+          "stats":{"total":2,"queued":0,"running":1,"completed":1,"failed":0},
+          "worker":{"name":"Monique production","status":"busy","status_detail":"1/3 active",
+            "provider":"codex","agent":"codex","model":"gpt-5","runtime":"worker",
+            "binary":"codex","cli_version":"0.147.0","permission_mode":"confirmed-ticket",
+            "auth_status":"authenticated","active_jobs":1,"concurrency":3,
+            "last_seen_at":"2026-08-18T17:13:20Z"},
+          "jobs":[{"id":"job-12345678","status":"running","source":"slack_ticket",
+            "issue_id":"2711","issue_url":"https://github.com/example/site/issues/2711",
+            "site_id":null,"session_id":"session-12345678",
+            "provider":"codex","runtime":"worker","assigned_to_worker":true,
+            "approved":true,"decision_count":1,"created_at":"2026-08-18T17:11:00Z",
+            "updated_at":"2026-08-18T17:13:00Z"}]
+        }"#;
+        let snapshot = process_snapshot(valid.as_bytes()).expect("valid process snapshot");
+        assert_eq!("automonique.dashboard.processes/v1", snapshot.schema);
+        assert_eq!(1, snapshot.stats.running);
+        assert_eq!(Some("2711"), snapshot.jobs[0].issue_id.as_deref());
+        assert_eq!(
+            Some("https://github.com/example/site/issues/2711"),
+            snapshot.jobs[0].issue_url.as_deref()
+        );
+        assert!(snapshot.jobs[0].assigned_to_worker);
+
+        let secret = valid.replace(
+            "\n        }",
+            ",\n          \"token\":\"must-not-cross\"\n        }",
+        );
+        assert!(process_snapshot(secret.as_bytes()).is_none());
+        assert!(
+            process_snapshot(
+                valid
+                    .replace("\"concurrency\":3", "\"concurrency\":0")
+                    .as_bytes()
+            )
+            .is_none()
+        );
+        assert!(process_snapshot(valid.replace("slack_ticket", "<script>").as_bytes()).is_none());
+    }
+
+    #[test]
     fn fleet_worker_reports_execution_proven_authentication() {
         assert!(MANAGE_WORKER.contains("configured_unverified"));
         assert!(MANAGE_WORKER.contains("refresh_token_rejected"));
@@ -3351,6 +3604,16 @@ mod tests {
         assert!(MANAGE_WORKER.contains("--output-format stream-json"));
         assert!(MANAGE_WORKER.contains("unset OPENAI_API_KEY ANTHROPIC_API_KEY"));
         assert!(MANAGE_WORKER.contains(".authMethod == \"claude.ai\""));
+        assert!(MANAGE_WORKER.contains("automonique.manage-processes/v1"));
+        assert!(MANAGE_WORKER.contains("refresh_process_snapshot"));
+        let process_projection = MANAGE_WORKER
+            .split("publish_process_snapshot()")
+            .nth(1)
+            .and_then(|value| value.split("refresh_process_snapshot()").next())
+            .expect("process projection function");
+        assert!(!process_projection.contains(".prompt"));
+        assert!(!process_projection.contains(".result"));
+        assert!(!process_projection.contains(".requested_by"));
     }
 
     #[test]
@@ -3476,6 +3739,8 @@ mod tests {
             "sidebar-collapse",
             "appearance-panel",
             "operations-refresh",
+            "processes-refresh",
+            "process-list",
             "tickets-refresh",
             "tickets-search",
             "tickets-search-clear",

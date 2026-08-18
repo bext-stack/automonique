@@ -15,6 +15,8 @@ let memorySnapshot = null;
 let memoryKind = "all";
 let memoryQuery = null;
 let operationsSnapshot = null;
+let processesSnapshot = null;
+let processFilter = "all";
 let ticketFilter = "all";
 let ticketQuery = "";
 let ticketSort = "updated_desc";
@@ -407,6 +409,48 @@ const frenchUi = Object.freeze({
   "Details required": "Détails requis",
   "Ready to plan": "Prêt à planifier",
   "Use with Monique →": "Utiliser avec Monique →",
+  "See every active and recent agent process, then work directly with the connected control plane. Safe reads are live; every mutation remains staged for explicit approval.": "Consultez chaque processus d’agent actif ou récent, puis travaillez directement avec le plan de contrôle connecté. Les lectures sûres sont en temps réel ; chaque modification reste soumise à une approbation explicite.",
+  "EXECUTION MONITOR": "SUIVI DES EXÉCUTIONS",
+  "Agent processes": "Processus des agents",
+  "Waiting for worker snapshot": "En attente de l’instantané du worker",
+  "Agent process counts": "Nombre de processus d’agents",
+  "RUNNING": "EN COURS",
+  "QUEUED": "EN ATTENTE",
+  "COMPLETED": "TERMINÉS",
+  "FAILED": "ÉCHECS",
+  "executing now": "en cours d’exécution",
+  "waiting for a worker": "en attente d’un worker",
+  "visible recent history": "historique récent visible",
+  "requires review or retry": "à examiner ou relancer",
+  "Loading the selected worker and its execution harness…": "Chargement du worker sélectionné et de son environnement d’exécution…",
+  "Filter agent processes": "Filtrer les processus d’agents",
+  "All": "Tous",
+  "Active": "Actifs",
+  "Queued": "En attente",
+  "Completed": "Terminés",
+  "Connecting to the worker…": "Connexion au worker…",
+  "Process": "Processus",
+  "Execution": "Exécution",
+  "Timing": "Chronologie",
+  "State": "État",
+  "Loading active and recent agent processes…": "Chargement des processus d’agents actifs et récents…",
+  "No processes match this filter.": "Aucun processus ne correspond à ce filtre.",
+  "No worker process snapshot is available yet.": "Aucun instantané des processus du worker n’est encore disponible.",
+  "Process visibility refreshed.": "La visibilité des processus a été actualisée.",
+  "Process visibility is unavailable.": "La visibilité des processus est indisponible.",
+  "ONLINE": "EN LIGNE",
+  "BUSY": "OCCUPÉ",
+  "OFFLINE": "HORS LIGNE",
+  "UNKNOWN": "INCONNU",
+  "Worker": "Worker",
+  "Harness": "Environnement",
+  "Model": "Modèle",
+  "Authentication": "Authentification",
+  "Capacity": "Capacité",
+  "Approval recorded": "Approbation enregistrée",
+  "No approval recorded": "Aucune approbation enregistrée",
+  "Assigned to this worker": "Attribué à ce worker",
+  "Unassigned from this worker": "Non attribué à ce worker",
   "Triaging": "Triage",
   "Closed": "Fermé",
   "Unknown": "Inconnu",
@@ -658,6 +702,9 @@ function translatePhraseForFrench(value) {
     [/^(.+?) active$/, (match) => `${match[1]} en cours`],
     [/^(.+?) pending$/, (match) => `${match[1]} en attente`],
     [/^(.+?) of (.+?) tickets$/, (match) => `${match[1]} ticket${match[1] === "1" ? "" : "s"} sur ${match[2]}`],
+    [/^(.+?) of (.+?) processes$/, (match) => `${match[1]} processus sur ${match[2]}`],
+    [/^Observed (.+)$/, (match) => `Observé ${match[1]}`],
+    [/^(.+?) of (.+?) slots active$/, (match) => `${match[1]} emplacement${match[1] === "1" ? "" : "s"} actif${match[1] === "1" ? "" : "s"} sur ${match[2]}`],
     [/^(.+?) evidence records?(?: for “(.+)”)?$/, (match) => `${match[1]} enregistrement${match[1] === "1" ? "" : "s"} d’éléments${match[2] ? ` pour « ${match[2]} »` : ""}`],
     [/^Memory unavailable · (.+)$/, (match) => `Mémoire indisponible · ${match[1]}`],
     [/^Open (.+) in the record list$/, (match) => `Ouvrir ${match[1]} dans la liste des enregistrements`],
@@ -767,6 +814,7 @@ function applyLanguage(language, persist = true) {
   }
   if (memorySnapshot) renderSelectedMemory();
   if (operationsSnapshot) renderOperations(operationsSnapshot);
+  if (processesSnapshot) renderProcesses(processesSnapshot);
   document.querySelectorAll(".message-meta[data-created-at]").forEach(renderMessageMeta);
   localizeUi(document.body);
 }
@@ -1169,6 +1217,7 @@ function showView(name) {
   if (window.location.hash !== `#${name}`) history.replaceState(null, "", `#${name}`);
   if (name === "memory") loadMemory(memoryQuery);
   if (name === "operations" || name === "tickets") loadOperations();
+  if (name === "operations") loadProcesses();
   if (name === "configuration") loadConfiguration();
   if (name === "chat") loadChatHistory();
   if (window.matchMedia("(max-width: 760px)").matches) mobileSidebarOpen(false);
@@ -1336,6 +1385,238 @@ function operationsMessage(health) {
     busy: ["AI Operations is busy", "Another contained request is using the live tool connection. Try again shortly."],
   };
   return messages[health] || ["AI Operations state unknown", "Refresh to discover the current control-plane state."];
+}
+
+function processStatusLabel(status) {
+  const labels = { pending: "Queued", running: "Running", done: "Completed", failed: "Failed", cancelled: "Cancelled", unknown: "Unknown" };
+  return labels[status] || operationLabel(status);
+}
+
+function processMatches(job, filter) {
+  if (filter === "all") return true;
+  if (filter === "active") return job.status === "running";
+  if (filter === "queued") return job.status === "pending";
+  if (filter === "completed") return job.status === "done";
+  if (filter === "failed") return job.status === "failed";
+  return false;
+}
+
+function shortProcessReference(value) {
+  const text = String(value || "unknown");
+  return text.length <= 16 ? text : `${text.slice(0, 12)}…`;
+}
+
+function processIssueReference(job) {
+  const href = safeTicketLink(job.issue_url);
+  if (href) {
+    const parsed = new URL(href);
+    const match = parsed.pathname.match(/^\/([^/]+)\/([^/]+)\/issues\/([1-9][0-9]*)$/);
+    if (match) return { label: `${match[2]}#${match[3]}`, href };
+  }
+  return { label: job.issue_id ? `Ticket ${shortProcessReference(job.issue_id)}` : shortProcessReference(job.id), href: null };
+}
+
+function processTimeLabel(value) {
+  const timestamp = ticketTimestamp(value);
+  if (timestamp === null) return "—";
+  return ticketRelativeTime(value) || ticketDateLabel(value);
+}
+
+function processDetail(labelText, value, title = null) {
+  const detail = document.createElement("div");
+  detail.className = "process-detail";
+  const labelNode = document.createElement("span");
+  labelNode.textContent = labelText;
+  const valueNode = document.createElement("strong");
+  valueNode.setAttribute("data-i18n-skip", "");
+  valueNode.textContent = value || "—";
+  if (title) valueNode.title = title;
+  detail.append(labelNode, valueNode);
+  return detail;
+}
+
+function renderProcessWorker(worker, health) {
+  const root = byId("process-worker");
+  root.replaceChildren();
+  if (!worker) {
+    const empty = document.createElement("div");
+    empty.className = "integration-empty process-empty";
+    empty.textContent = "No worker process snapshot is available yet.";
+    root.append(empty);
+    return;
+  }
+  root.dataset.state = health;
+  const identity = document.createElement("div");
+  identity.className = "process-worker-identity";
+  const orb = document.createElement("i");
+  orb.setAttribute("aria-hidden", "true");
+  const copy = document.createElement("div");
+  const name = document.createElement("strong");
+  name.setAttribute("data-i18n-skip", "");
+  name.textContent = worker.name || "Selected worker";
+  const detail = document.createElement("small");
+  detail.textContent = worker.status_detail || `${worker.provider} · ${worker.runtime}`;
+  copy.append(name, detail);
+  identity.append(orb, copy);
+  const status = document.createElement("span");
+  status.className = `process-worker-status status-${worker.status}`;
+  status.textContent = worker.status.toUpperCase();
+  const facts = document.createElement("div");
+  facts.className = "process-worker-facts";
+  [
+    ["Harness", [worker.agent, worker.binary, worker.cli_version].filter(Boolean).join(" · ")],
+    ["Model", worker.model],
+    ["Authentication", `${worker.provider} · ${processStatusLabel(worker.auth_status)}`],
+    ["Capacity", `${count(worker.active_jobs)} of ${count(worker.concurrency)} slots active`],
+    ["Updated", processTimeLabel(worker.last_seen_at), worker.last_seen_at],
+  ].forEach(([labelText, value, exact]) => facts.append(processDetail(labelText, value, exact)));
+  root.append(identity, status, facts);
+}
+
+function setProcessFilter(filter) {
+  processFilter = ["all", "active", "queued", "failed", "completed"].includes(filter) ? filter : "all";
+  document.querySelectorAll("[data-process-filter]").forEach((button) => {
+    const active = button.dataset.processFilter === processFilter;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+}
+
+function renderProcesses(view) {
+  processesSnapshot = view;
+  const jobs = Array.isArray(view.jobs) ? view.jobs : [];
+  const health = String(view.health || "unavailable");
+  byId("processes-health").textContent = health.toUpperCase();
+  byId("processes-health").dataset.state = health;
+  const observed = Number.isSafeInteger(view.observed_at_ms) ? new Date(view.observed_at_ms).toISOString() : null;
+  byId("process-observed").textContent = observed ? `Observed ${processTimeLabel(observed)}` : "Waiting for worker snapshot";
+  byId("process-observed").title = observed ? ticketDateLabel(observed) : "";
+  byId("process-running").textContent = count(view.stats?.running);
+  byId("process-queued").textContent = count(view.stats?.queued);
+  byId("process-completed").textContent = count(view.stats?.completed);
+  byId("process-failed").textContent = count(view.stats?.failed);
+  renderProcessWorker(view.worker, health);
+  const filterCounts = {
+    all: jobs.length,
+    active: jobs.filter((job) => processMatches(job, "active")).length,
+    queued: jobs.filter((job) => processMatches(job, "queued")).length,
+    failed: jobs.filter((job) => processMatches(job, "failed")).length,
+    completed: jobs.filter((job) => processMatches(job, "completed")).length,
+  };
+  Object.entries(filterCounts).forEach(([name, value]) => { byId(`process-filter-${name}`).textContent = count(value); });
+  const visible = jobs.filter((job) => processMatches(job, processFilter));
+  byId("process-result-state").textContent = `${visible.length.toLocaleString(localeTag())} of ${jobs.length.toLocaleString(localeTag())} processes`;
+  const root = byId("process-list");
+  root.replaceChildren();
+  if (visible.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "integration-empty process-empty";
+    empty.textContent = health === "unavailable" ? "No worker process snapshot is available yet." : "No processes match this filter.";
+    root.append(empty);
+    return;
+  }
+  visible.forEach((job, index) => {
+    const card = document.createElement("article");
+    card.className = `process-card status-${job.status}`;
+    const row = document.createElement("div");
+    row.className = "process-row";
+    const reference = document.createElement("div");
+    reference.className = "process-reference";
+    const dot = document.createElement("i");
+    dot.setAttribute("aria-hidden", "true");
+    const referenceCopy = document.createElement("div");
+    const referenceTitle = document.createElement("strong");
+    referenceTitle.setAttribute("data-i18n-skip", "");
+    const issueReference = processIssueReference(job);
+    referenceTitle.textContent = issueReference.label;
+    const referenceId = document.createElement("small");
+    referenceId.setAttribute("data-i18n-skip", "");
+    referenceId.textContent = shortProcessReference(job.id);
+    referenceId.title = job.id;
+    referenceCopy.append(referenceTitle, referenceId);
+    reference.append(dot, referenceCopy);
+    const execution = document.createElement("div");
+    execution.className = "process-execution";
+    const executionTitle = document.createElement("strong");
+    executionTitle.textContent = [operationLabel(job.provider), operationLabel(job.runtime)].filter((value) => value !== "Unknown").join(" · ") || "Agent execution";
+    const facts = document.createElement("div");
+    facts.className = "process-facts";
+    [operationLabel(job.source), job.assigned_to_worker ? "Assigned to this worker" : "Unassigned from this worker", job.approved ? "Approval recorded" : "No approval recorded"]
+      .forEach((value) => {
+        const fact = document.createElement("span");
+        fact.textContent = value;
+        facts.append(fact);
+      });
+    execution.append(executionTitle, facts);
+    const timing = document.createElement("div");
+    timing.className = "process-timing";
+    const updated = document.createElement("strong");
+    updated.textContent = processTimeLabel(job.updated_at);
+    if (job.updated_at) updated.title = ticketDateLabel(job.updated_at);
+    const created = document.createElement("small");
+    created.textContent = job.created_at ? `Created ${processTimeLabel(job.created_at)}` : "Created —";
+    if (job.created_at) created.title = ticketDateLabel(job.created_at);
+    timing.append(updated, created);
+    const lifecycle = document.createElement("div");
+    lifecycle.className = "process-lifecycle";
+    const status = document.createElement("span");
+    status.className = `process-status status-${job.status}`;
+    status.textContent = processStatusLabel(job.status);
+    const detailsButton = document.createElement("button");
+    detailsButton.type = "button";
+    detailsButton.textContent = "Details";
+    const detailsId = `process-details-${index}`;
+    detailsButton.setAttribute("aria-controls", detailsId);
+    detailsButton.setAttribute("aria-expanded", "false");
+    lifecycle.append(status, detailsButton);
+    if (issueReference.href) {
+      const issueLink = document.createElement("a");
+      issueLink.href = issueReference.href;
+      issueLink.target = "_blank";
+      issueLink.rel = "noreferrer";
+      issueLink.textContent = "Open ↗";
+      lifecycle.append(issueLink);
+    }
+    const details = document.createElement("div");
+    details.className = "process-details";
+    details.id = detailsId;
+    details.hidden = true;
+    [
+      ["Process", job.id],
+      ["Issue", job.issue_id],
+      ["Session", job.session_id],
+      ["Site", job.site_id],
+      ["Provider", operationLabel(job.provider)],
+      ["Runtime", operationLabel(job.runtime)],
+      ["Decisions", String(job.decision_count)],
+      ["Created", job.created_at ? ticketDateLabel(job.created_at) : null, job.created_at],
+      ["Updated", job.updated_at ? ticketDateLabel(job.updated_at) : null, job.updated_at],
+    ].filter(([, value]) => value).forEach(([labelText, value, exact]) => details.append(processDetail(labelText, value, exact)));
+    detailsButton.addEventListener("click", () => {
+      const expanded = detailsButton.getAttribute("aria-expanded") === "true";
+      detailsButton.setAttribute("aria-expanded", String(!expanded));
+      detailsButton.textContent = expanded ? "Details" : "Hide details";
+      details.hidden = expanded;
+      card.classList.toggle("is-expanded", !expanded);
+    });
+    row.append(reference, execution, timing, lifecycle);
+    card.append(row, details);
+    root.append(card);
+  });
+}
+
+async function loadProcesses({ announce = false } = {}) {
+  const button = byId("processes-refresh");
+  button.disabled = true;
+  try {
+    renderProcesses(await api("/api/processes"));
+    if (announce) toast("Process visibility refreshed.");
+  } catch (_error) {
+    renderProcesses({ health: "unavailable", observed_at_ms: Date.now(), stats: {}, worker: null, jobs: [] });
+    if (announce) toast("Process visibility is unavailable.", "error");
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function renderOperationsCatalog(tools) {
@@ -1682,7 +1963,15 @@ async function loadOperations(force = false) {
   }
 }
 
-byId("operations-refresh").addEventListener("click", () => loadOperations(true));
+byId("operations-refresh").addEventListener("click", () => {
+  loadOperations(true);
+  loadProcesses({ announce: true });
+});
+byId("processes-refresh").addEventListener("click", () => loadProcesses({ announce: true }));
+document.querySelectorAll("[data-process-filter]").forEach((button) => button.addEventListener("click", () => {
+  setProcessFilter(button.dataset.processFilter);
+  if (processesSnapshot) renderProcesses(processesSnapshot);
+}));
 byId("tickets-refresh").addEventListener("click", () => loadOperations(true));
 document.querySelectorAll("[data-ticket-filter]").forEach((button) => button.addEventListener("click", () => {
   setTicketFilter(button.dataset.ticketFilter);
@@ -2811,4 +3100,7 @@ function scheduleStatusRefresh(delay = 10000) {
 scheduleStatusRefresh(Number(byId("configuration-refresh-rate").value));
 window.setInterval(updateObservedAge, 1_000);
 window.setInterval(renderPulse, 1_000);
+window.setInterval(() => {
+  if (!document.hidden && document.querySelector('[data-panel="operations"]')?.classList.contains("is-visible")) loadProcesses();
+}, 5_000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshStatus(); });

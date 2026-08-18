@@ -320,6 +320,102 @@ fleet_snapshot() {
         --header 'Accept: application/json'
 }
 
+publish_process_snapshot() {
+    snapshot=$1
+    observed_at=$(date +%s%3N)
+    issue_links='{}'
+    ticket_jobs=$state_dir/slack-ticket-jobs.v1.json
+    if [[ -f "$ticket_jobs" && ! -L "$ticket_jobs" ]]; then
+        issue_links=$(jq -cer '
+            [ .[]
+              | select((.job_id | type) == "string" and (.issue_url | type) == "string")
+              | select(.job_id | test("^[A-Za-z0-9._-]{8,120}$"))
+              | select(.issue_url | test("^https://github\\.com/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}/issues/[1-9][0-9]{0,19}$"))
+              | {key:.job_id, value:.issue_url} ]
+            | from_entries
+        ' "$ticket_jobs" 2>/dev/null) || issue_links='{}'
+    fi
+    temporary=$(mktemp "$runtime_dir/.processes.XXXXXX") || return 1
+    if ! jq -e \
+        --arg instance "$fleet_instance" \
+        --arg provider "$selected_provider" \
+        --arg auth "$(auth_health_status)" \
+        --argjson issue_links "$issue_links" \
+        --argjson concurrency "$max_concurrency" \
+        --argjson observed "$observed_at" '
+        def safe_text($limit):
+            if type == "string" then
+                (gsub("[\u0000-\u001f\u007f]"; " ") | .[0:$limit]) as $value
+                | if ($value | length) > 0 then $value else null end
+            else null end;
+        def safe_state:
+            if type == "string" and length > 0 and length <= 64
+                and test("^[A-Za-z0-9._-]+$") then ascii_downcase
+            else "unknown" end;
+        def safe_id:
+            if type == "string" and length > 0 and length <= 160
+                and test("^[A-Za-z0-9._:#/-]+$") then .
+            else null end;
+        select(.ok == true and (.instances | type == "array") and (.jobs | type == "array"))
+        | ([.instances[] | select(.id == $instance)] | first) as $worker
+        | {
+            schema: "automonique.manage-processes/v1",
+            health: (if $worker == null then "degraded" else "ready" end),
+            observed_at_ms: $observed,
+            stats: {
+                total: ([.jobs[]] | length),
+                queued: ([.jobs[] | select(.status == "pending")] | length),
+                running: ([.jobs[] | select(.status == "running")] | length),
+                completed: ([.jobs[] | select(.status == "done")] | length),
+                failed: ([.jobs[] | select(.status == "failed")] | length)
+            },
+            worker: (if $worker == null then null else {
+                name: ($worker.name | safe_text(120)),
+                status: ($worker.status | safe_state),
+                status_detail: ($worker.status_detail | safe_text(240)),
+                provider: $provider,
+                agent: (($worker.runtime_harness.agent // $worker.agent) | safe_state),
+                model: (($worker.runtime_harness.model // $worker.model) | safe_text(120)),
+                runtime: ($worker.runtime | safe_state),
+                binary: ($worker.runtime_harness.binary | safe_text(120)),
+                cli_version: (($worker.runtime_harness.cli_version // $worker.agent_version) | safe_text(80)),
+                permission_mode: ($worker.runtime_harness.permission_mode | safe_state),
+                auth_status: $auth,
+                active_jobs: ([.jobs[] | select(.instance_id == $instance and .status == "running")] | length),
+                concurrency: $concurrency,
+                last_seen_at: ($worker.last_seen_at | safe_text(64))
+            } end),
+            jobs: ([.jobs[] | {
+                id: (.id | safe_id),
+                status: (.status | safe_state),
+                source: (.source | safe_state),
+                issue_id: (.issue_id | safe_id),
+                issue_url: $issue_links[.id],
+                site_id: (.site_id | safe_id),
+                session_id: (.session_id | safe_id),
+                provider: (.claimed_agent | safe_state),
+                runtime: (.claimed_runtime | safe_state),
+                assigned_to_worker: (.instance_id == $instance),
+                approved: ((.approved_by | type) == "string" and (.approved_by | length) > 0),
+                decision_count: (if (.decisions | type) == "array" then (.decisions | length) else 0 end),
+                created_at: (.created_at | safe_text(64)),
+                updated_at: (.updated_at | safe_text(64))
+            } | select(.id != null)] | sort_by(.updated_at // "") | reverse | .[:100])
+        }
+    ' <<<"$snapshot" >"$temporary"
+    then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    chmod 600 -- "$temporary"
+    mv -f -- "$temporary" "$runtime_dir/processes.json"
+}
+
+refresh_process_snapshot() {
+    snapshot=$(fleet_snapshot) || return 1
+    publish_process_snapshot "$snapshot"
+}
+
 load_instance_root() {
     snapshot=$(fleet_snapshot) || return 1
     jq -er --arg id "$fleet_instance" \
@@ -339,6 +435,8 @@ instance_root=$(realpath -e -- "$instance_root") || {
 active_jobs() {
     jobs -pr | wc -l
 }
+
+refresh_process_snapshot || true
 
 heartbeat() {
     status=$1
@@ -520,6 +618,7 @@ run_job() {
             fi
         fi
     fi
+    refresh_process_snapshot || true
 }
 
 stopping=0
@@ -555,9 +654,11 @@ while (( stopping == 0 )); do
     if (( now - last_heartbeat >= heartbeat_seconds )); then
         if (( active > 0 )); then status=busy; else status=online; fi
         heartbeat "$status" "$active" || true
+        refresh_process_snapshot || true
         last_heartbeat=$now
     fi
 
+    before_claim=$active
     while (( active < max_concurrency && stopping == 0 )) \
         && [[ "$(auth_health_status)" != expired ]] \
         && [[ "$(auth_health_status)" != signed_out ]] \
@@ -569,10 +670,14 @@ while (( stopping == 0 )); do
         run_job "$job" &
         active=$((active + 1))
     done
+    if (( active != before_claim )); then
+        refresh_process_snapshot || true
+    fi
     sleep "$poll_seconds" &
     wait $! || true
 done
 
 active=$(active_jobs)
 heartbeat offline "$active" || true
+refresh_process_snapshot || true
 wait || true
