@@ -2,6 +2,10 @@
 
 #![forbid(unsafe_code)]
 
+mod agent_auth;
+
+pub use agent_auth::AgentAuthConfig;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
@@ -34,6 +38,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
+
+use crate::agent_auth::{AgentAuthAction, AgentAuthManager};
 
 const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
 const DASHBOARD_CSS: &str = include_str!("../assets/dashboard.css");
@@ -75,6 +81,8 @@ pub enum Route {
     ApiMemory,
     ApiMemorySearch,
     ApiConfiguration,
+    ApiAgentAccounts,
+    ApiAgentAccountsAction,
     ApiOperations,
     ApiChat,
     ApiChatAction,
@@ -511,6 +519,7 @@ pub struct WebIntegration {
     mcp: Mutex<McpRegistry>,
     pending_manage_actions: Mutex<BTreeMap<String, PendingManageAction>>,
     sequence: Mutex<u64>,
+    agent_auth: Option<AgentAuthManager>,
 }
 
 struct ManageIntegration {
@@ -593,6 +602,10 @@ struct AgentAuthenticationView {
     surface: &'static str,
     provider_configured: bool,
     worker_configured: bool,
+    account_count: usize,
+    authenticated_accounts: usize,
+    worker_provider: String,
+    selected_account: String,
     status: String,
     method: String,
     evidence: String,
@@ -821,6 +834,25 @@ impl WebIntegration {
         state_dir: &Path,
         runtime_dir: &Path,
     ) -> Result<Self, &'static str> {
+        Self::open_inner(config, state_dir, runtime_dir, None)
+    }
+
+    pub fn open_with_agent_auth(
+        config: IntegrationConfig,
+        state_dir: &Path,
+        runtime_dir: &Path,
+        agent_auth_config: AgentAuthConfig,
+    ) -> Result<Self, &'static str> {
+        let agent_auth = AgentAuthManager::open(agent_auth_config)?;
+        Self::open_inner(config, state_dir, runtime_dir, Some(agent_auth))
+    }
+
+    fn open_inner(
+        config: IntegrationConfig,
+        state_dir: &Path,
+        runtime_dir: &Path,
+        agent_auth: Option<AgentAuthManager>,
+    ) -> Result<Self, &'static str> {
         if !state_dir.is_absolute() || !runtime_dir.is_absolute() {
             return Err("integration paths must be absolute");
         }
@@ -863,6 +895,7 @@ impl WebIntegration {
             mcp: Mutex::new(mcp),
             pending_manage_actions: Mutex::new(BTreeMap::new()),
             sequence: Mutex::new(0),
+            agent_auth,
         })
     }
 
@@ -971,11 +1004,62 @@ impl WebIntegration {
         provider_configured: bool,
         worker_configured: bool,
     ) -> AgentAuthenticationView {
+        if let Some(manager) = &self.agent_auth
+            && let Ok(view) = manager.view()
+        {
+            let authenticated_accounts = view
+                .accounts()
+                .iter()
+                .filter(|account| account.status() == "authenticated")
+                .count();
+            if let Some(account) = view
+                .accounts()
+                .iter()
+                .find(|account| account.worker_selected())
+            {
+                return AgentAuthenticationView {
+                    provider: account.provider_name(),
+                    surface: "AI Operations ticket worker",
+                    provider_configured: true,
+                    worker_configured,
+                    account_count: view.accounts().len(),
+                    authenticated_accounts,
+                    worker_provider: account.provider().to_owned(),
+                    selected_account: account.label().to_owned(),
+                    status: account.status().to_owned(),
+                    method: account.method().to_owned(),
+                    evidence: account.evidence().to_owned(),
+                    observed_at_ms: account.observed_at_ms(),
+                    last_verified_at_ms: account.last_verified_at_ms(),
+                    remediation: authentication_remediation(account.status()),
+                };
+            }
+            return AgentAuthenticationView {
+                provider: "Codex CLI / Claude Code",
+                surface: "AI Operations ticket worker",
+                provider_configured: true,
+                worker_configured,
+                account_count: view.accounts().len(),
+                authenticated_accounts,
+                worker_provider: view.worker_provider().unwrap_or("none").to_owned(),
+                selected_account: String::from("none"),
+                status: String::from("not_configured"),
+                method: String::from("native_subscription"),
+                evidence: String::from("account_selection_missing"),
+                observed_at_ms: None,
+                last_verified_at_ms: None,
+                remediation: authentication_remediation("not_configured"),
+            };
+        }
         let fallback = |status: &str, evidence: &str| AgentAuthenticationView {
             provider: "Codex",
             surface: "AI Operations ticket worker",
             provider_configured,
             worker_configured,
+            account_count: 0,
+            authenticated_accounts: 0,
+            worker_provider: String::from("codex"),
+            selected_account: String::from("legacy"),
             status: status.to_owned(),
             method: String::from("unknown"),
             evidence: evidence.to_owned(),
@@ -1004,6 +1088,10 @@ impl WebIntegration {
             surface: "AI Operations ticket worker",
             provider_configured,
             worker_configured,
+            account_count: 0,
+            authenticated_accounts: 0,
+            worker_provider: String::from("codex"),
+            selected_account: String::from("legacy"),
             remediation: authentication_remediation(&record.status),
             status: record.status,
             method: record.method,
@@ -1011,6 +1099,23 @@ impl WebIntegration {
             observed_at_ms: Some(record.observed_at_ms),
             last_verified_at_ms: record.last_verified_at_ms,
         }
+    }
+
+    fn agent_accounts(&self) -> Result<agent_auth::AgentAccountsView, &'static str> {
+        self.agent_auth
+            .as_ref()
+            .ok_or("agent_authentication_unavailable")?
+            .view()
+    }
+
+    fn agent_accounts_action(
+        &self,
+        action: AgentAuthAction,
+    ) -> Result<agent_auth::AgentAccountsView, &'static str> {
+        self.agent_auth
+            .as_ref()
+            .ok_or("agent_authentication_unavailable")?
+            .action(action)
     }
 
     fn operations(&self) -> OperationsView {
@@ -2450,6 +2555,8 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/api/memory" => Route::ApiMemory,
                 "/api/memory/search" => Route::ApiMemorySearch,
                 "/api/configuration" => Route::ApiConfiguration,
+                "/api/agent-accounts" => Route::ApiAgentAccounts,
+                "/api/agent-accounts/action" => Route::ApiAgentAccountsAction,
                 "/api/operations" => Route::ApiOperations,
                 "/api/chat" => Route::ApiChat,
                 "/api/chat/action" => Route::ApiChatAction,
@@ -2460,7 +2567,11 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
             };
             let post_route = matches!(
                 route,
-                Route::ApiMemorySearch | Route::ApiChat | Route::ApiChatAction | Route::ApiChatNew
+                Route::ApiMemorySearch
+                    | Route::ApiAgentAccountsAction
+                    | Route::ApiChat
+                    | Route::ApiChatAction
+                    | Route::ApiChatNew
             );
             if (request.method == Method::Post) != post_route {
                 Route::MethodNotAllowed
@@ -2575,11 +2686,16 @@ fn provider_auth_health_record(bytes: &[u8]) -> Option<ProviderAuthHealthRecord>
 fn authentication_remediation(status: &str) -> &'static str {
     match status {
         "authenticated" => "No action required.",
-        "configured_unverified" => "Run one contained agent task to verify remote provider access.",
-        "expired" | "signed_out" => {
-            "Reauthenticate the Codex worker, refresh this screen, then relaunch blocked work."
+        "configured_unverified" => {
+            "Verify the selected native subscription account before relaunching work."
         }
-        "not_configured" => "Configure an execution provider before enabling agent work.",
+        "authenticating" => "Complete the native provider sign-in in your browser.",
+        "expired" | "signed_out" => {
+            "Reauthenticate the selected provider account, then relaunch blocked work."
+        }
+        "not_configured" => {
+            "Add a native Codex or Claude account and explicitly select it for the worker."
+        }
         _ => "Inspect the worker and its private authentication health record.",
     }
 }
@@ -2688,6 +2804,8 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         Route::ApiMemory
         | Route::ApiMemorySearch
         | Route::ApiConfiguration
+        | Route::ApiAgentAccounts
+        | Route::ApiAgentAccountsAction
         | Route::ApiOperations
         | Route::ApiChat
         | Route::ApiChatAction
@@ -2762,6 +2880,17 @@ fn api_response(
             }
         }
         Route::ApiConfiguration => json_response("200 OK", &integration.configuration()),
+        Route::ApiAgentAccounts => match integration.agent_accounts() {
+            Ok(view) => json_response("200 OK", &view),
+            Err(category) => json_error("503 Service Unavailable", category),
+        },
+        Route::ApiAgentAccountsAction => match serde_json::from_slice::<AgentAuthAction>(body) {
+            Ok(request) => match integration.agent_accounts_action(request) {
+                Ok(view) => json_response("200 OK", &view),
+                Err(category) => json_error("409 Conflict", category),
+            },
+            Err(_) => json_error("400 Bad Request", "invalid_json"),
+        },
         Route::ApiOperations => json_response("200 OK", &integration.operations()),
         Route::ApiChat => match serde_json::from_slice::<ChatRequest>(body) {
             Ok(request) => match integration.chat(request, &state.snapshot()) {
@@ -2965,6 +3094,8 @@ fn handle(
         Route::ApiMemory
             | Route::ApiMemorySearch
             | Route::ApiConfiguration
+            | Route::ApiAgentAccounts
+            | Route::ApiAgentAccountsAction
             | Route::ApiOperations
             | Route::ApiChat
             | Route::ApiChatAction
@@ -3152,6 +3283,7 @@ mod tests {
             ("/assets/dashboard.js", Route::Script),
             ("/api/status?fresh=1", Route::ApiStatus),
             ("/api/operations", Route::ApiOperations),
+            ("/api/agent-accounts", Route::ApiAgentAccounts),
             ("/missing", Route::NotFound),
         ];
         for (path, expected) in cases {
@@ -3214,6 +3346,11 @@ mod tests {
         assert!(MANAGE_WORKER.contains("--arg auth \"$auth_status\""));
         assert!(!MANAGE_WORKER.contains("auth_status:\"configured\""));
         assert!(MANAGE_WORKER.contains("[[ \"$(auth_health_status)\" != expired ]]"));
+        assert!(MANAGE_WORKER.contains("automonique.agent-accounts/v1"));
+        assert!(MANAGE_WORKER.contains("CLAUDE_CONFIG_DIR=\"$selected_home\""));
+        assert!(MANAGE_WORKER.contains("--output-format stream-json"));
+        assert!(MANAGE_WORKER.contains("unset OPENAI_API_KEY ANTHROPIC_API_KEY"));
+        assert!(MANAGE_WORKER.contains(".authMethod == \"claude.ai\""));
     }
 
     #[test]
@@ -3367,7 +3504,14 @@ mod tests {
     #[test]
     fn configuration_is_a_complete_secret_safe_control_surface() {
         assert!(DASHBOARD_HTML.contains("id=\"configuration-auth-state\""));
+        assert!(DASHBOARD_HTML.contains("id=\"agent-accounts-manager\""));
+        assert!(DASHBOARD_HTML.contains("data-add-agent-provider=\"codex\""));
+        assert!(DASHBOARD_HTML.contains("data-add-agent-provider=\"claude\""));
         assert!(DASHBOARD_JS.contains("Agent authentication"));
+        assert!(DASHBOARD_JS.contains("/api/agent-accounts/action"));
+        assert!(DASHBOARD_JS.contains("submit_authorization_code"));
+        assert!(DASHBOARD_JS.contains("auth.openai.com"));
+        assert!(DASHBOARD_JS.contains("claude.com"));
         assert!(DASHBOARD_JS.contains("configurationValue"));
         assert!(DASHBOARD_CSS.contains("data-state=\"expired\""));
         for control in [

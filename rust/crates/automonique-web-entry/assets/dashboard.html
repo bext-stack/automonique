@@ -281,6 +281,14 @@
                   </div>
                 </article>
 
+                <article class="panel agent-accounts" id="agent-accounts-manager" data-config-card data-config-category="ai security">
+                  <div class="config-card-heading"><div><span class="config-eyebrow">NATIVE SUBSCRIPTIONS</span><h2>Agent accounts</h2><p>Connect isolated Codex CLI and Claude Code accounts with their native subscription sign-in.</p></div><span class="config-scope">NO API KEYS</span></div>
+                  <div class="agent-account-actions"><button class="button secondary" type="button" data-add-agent-provider="codex">Add Codex account</button><button class="button secondary" type="button" data-add-agent-provider="claude">Add Claude account</button></div>
+                  <div class="agent-login-sessions" id="agent-login-sessions" aria-live="polite"></div>
+                  <div class="agent-account-list" id="agent-account-list"><div class="agent-account-empty">Loading native accounts…</div></div>
+                  <p class="agent-account-boundary">Each account has a private provider profile. Switching the worker is explicit; Monique never rotates across subscriptions automatically.</p>
+                </article>
+
                 <div class="config-section-heading" data-config-card data-config-category="all"><div><span class="config-eyebrow">EFFECTIVE SYSTEM</span><h2>Runtime configuration</h2><p>Validated, secret-safe values reported by the running system.</p></div><span id="configuration-last-read">Checking…</span></div>
                 <div class="config-grid" id="configuration-grid"><article class="panel loading-panel">Loading effective configuration…</article></div>
                 <div class="config-empty panel" id="configuration-empty" hidden><strong>No matching settings</strong><span>Try a broader search or another category.</span></div>
@@ -294,7 +302,7 @@
                   <span class="config-eyebrow">CONTROL BOUNDARY</span><h2>Protected by design</h2>
                   <ul><li><span>✓</span><div><strong>Secrets never rendered</strong><small>Tokens and credentials are structurally absent.</small></div></li><li><span>✓</span><div><strong>Mutations require approval</strong><small>AI Operations actions remain staged first.</small></div></li><li><span>✓</span><div><strong>Runtime-owned settings</strong><small>Deployment settings stay validated and auditable.</small></div></li></ul>
                 </article>
-                <article class="config-notice"><strong>Secret-safe projection</strong><span>Account identifiers, filesystem locations, provider payloads and credential material are never returned by this screen.</span></article>
+                <article class="config-notice"><strong>Secret-safe projection</strong><span>Only local account aliases and opaque references are shown. Provider identity, filesystem locations, raw payloads and credential material are never returned.</span></article>
               </aside>
             </div>
           </section>

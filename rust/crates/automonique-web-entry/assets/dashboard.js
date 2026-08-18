@@ -27,6 +27,7 @@ let newChatTimer = null;
 let lastStatusSnapshot = null;
 let configurationFilter = "all";
 let configurationQuery = "";
+let agentAccountsPollTimer = null;
 let statusRefreshTimer = null;
 let lastNotifiedAttentionKey = null;
 const frenchUi = Object.freeze({
@@ -513,7 +514,12 @@ const frenchUi = Object.freeze({
   "Writable History": "Historique inscriptible",
   "Primary Configured": "Fournisseur principal configuré",
   "Provider Configured": "Fournisseur configuré",
+  "Provider": "Fournisseur",
   "Worker Configured": "Worker configuré",
+  "Account Count": "Nombre de comptes",
+  "Authenticated Accounts": "Comptes authentifiés",
+  "Worker Provider": "Fournisseur du worker",
+  "Selected Account": "Compte sélectionné",
   "Surface": "Surface",
   "Method": "Méthode",
   "Evidence": "Élément de preuve",
@@ -556,10 +562,17 @@ const frenchUi = Object.freeze({
   "configured": "configuré",
   "Authenticated": "Authentifié",
   "Configured Unverified": "Configuré, non vérifié",
+  "Authenticating": "Authentification en cours",
+  "Awaiting Sign-in": "Connexion en attente",
+  "Verifying": "Vérification",
   "Expired": "Expiré",
   "Signed Out": "Déconnecté",
   "Not Configured": "Non configuré",
+  "Failed": "Échec",
+  "Cancelled": "Annulé",
   "ChatGPT": "ChatGPT",
+  "Claude.ai": "Claude.ai",
+  "Native subscription": "Abonnement natif",
   "API key": "Clé API",
   "Access token": "Jeton d’accès",
   "Execution Succeeded": "Exécution réussie",
@@ -568,6 +581,8 @@ const frenchUi = Object.freeze({
   "Local Session Missing": "Session locale absente",
   "Refresh Token Rejected": "Jeton de renouvellement rejeté",
   "Provider Configuration Missing": "Configuration fournisseur absente",
+  "Account Selection Missing": "Sélection de compte absente",
+  "none": "aucun",
   "Health Record Missing": "État d’authentification absent",
   "Health Record Unavailable": "État d’authentification indisponible",
   "Health Record Invalid": "État d’authentification invalide",
@@ -576,6 +591,50 @@ const frenchUi = Object.freeze({
   "Reauthenticate the Codex worker, refresh this screen, then relaunch blocked work.": "Réauthentifiez le worker Codex, actualisez cet écran, puis relancez le travail bloqué.",
   "Configure an execution provider before enabling agent work.": "Configurez un fournisseur d’exécution avant d’activer le travail des agents.",
   "Inspect the worker and its private authentication health record.": "Examinez le worker et son état privé d’authentification.",
+  "NATIVE SUBSCRIPTIONS": "ABONNEMENTS NATIFS",
+  "Agent accounts": "Comptes d’agents",
+  "Connect isolated Codex CLI and Claude Code accounts with their native subscription sign-in.": "Connectez des comptes Codex CLI et Claude Code isolés avec l’authentification native de leur abonnement.",
+  "NO API KEYS": "SANS CLÉS API",
+  "Add Codex account": "Ajouter un compte Codex",
+  "Add Claude account": "Ajouter un compte Claude",
+  "Loading native accounts…": "Chargement des comptes natifs…",
+  "Each account has a private provider profile. Switching the worker is explicit; Monique never rotates across subscriptions automatically.": "Chaque compte dispose d’un profil fournisseur privé. Le changement de compte du worker est explicite ; Monique ne bascule jamais automatiquement entre les abonnements.",
+  "Only local account aliases and opaque references are shown. Provider identity, filesystem locations, raw payloads and credential material are never returned.": "Seuls les alias locaux et références opaques sont affichés. L’identité fournisseur, les emplacements de fichiers, les données brutes et les identifiants ne sont jamais renvoyés.",
+  "Choose a local alias for this subscription account.": "Choisissez un alias local pour ce compte d’abonnement.",
+  "Native sign-in": "Authentification native",
+  "Native sign-in started.": "Authentification native démarrée.",
+  "Native sign-in cancelled.": "Authentification native annulée.",
+  "Subscription account authenticated.": "Compte d’abonnement authentifié.",
+  "Sign-in did not complete.": "L’authentification n’a pas abouti.",
+  "Complete sign-in with the provider, then return here.": "Terminez l’authentification auprès du fournisseur, puis revenez ici.",
+  "Continue with ChatGPT ↗": "Continuer avec ChatGPT ↗",
+  "Continue with Claude.ai ↗": "Continuer avec Claude.ai ↗",
+  "Cancel": "Annuler",
+  "ACTIVE WORKER": "WORKER ACTIF",
+  "Use for worker": "Utiliser pour le worker",
+  "Verify": "Vérifier",
+  "Sign in again": "Se reconnecter",
+  "Sign out": "Se déconnecter",
+  "Remove": "Supprimer",
+  "Worker account selected.": "Compte du worker sélectionné.",
+  "Account status refreshed.": "État du compte actualisé.",
+  "Account signed out.": "Compte déconnecté.",
+  "Account removed.": "Compte supprimé.",
+  "Sign out this native subscription account?": "Déconnecter ce compte d’abonnement natif ?",
+  "Remove this local account profile and its native credentials?": "Supprimer ce profil de compte local et ses identifiants natifs ?",
+  "No native subscription account is configured yet.": "Aucun compte d’abonnement natif n’est encore configuré.",
+  "Native account management is unavailable.": "La gestion des comptes natifs est indisponible.",
+  "Complete native sign-in before selecting this account.": "Terminez l’authentification native avant de sélectionner ce compte.",
+  "Select another worker account before removing this one.": "Sélectionnez un autre compte de worker avant de supprimer celui-ci.",
+  "Confirmation is required for this account change.": "Une confirmation est requise pour modifier ce compte.",
+  "Native provider sign-in could not be started.": "L’authentification native du fournisseur n’a pas pu démarrer.",
+  "Paste authorization code if Claude asks for it": "Collez le code d’autorisation si Claude le demande",
+  "Submit authorization code": "Envoyer le code d’autorisation",
+  "Authorization code submitted.": "Code d’autorisation envoyé.",
+  "Verify the selected native subscription account before relaunching work.": "Vérifiez le compte d’abonnement natif sélectionné avant de relancer le travail.",
+  "Complete the native provider sign-in in your browser.": "Terminez l’authentification native du fournisseur dans votre navigateur.",
+  "Reauthenticate the selected provider account, then relaunch blocked work.": "Réauthentifiez le compte fournisseur sélectionné, puis relancez le travail bloqué.",
+  "Add a native Codex or Claude account and explicitly select it for the worker.": "Ajoutez un compte Codex ou Claude natif et sélectionnez-le explicitement pour le worker.",
 });
 const localizedTextSources = new WeakMap();
 const localizedAttributeSources = new WeakMap();
@@ -1673,10 +1732,15 @@ function authenticationLabel(status) {
   const labels = {
     authenticated: "Authenticated",
     configured_unverified: "Configured Unverified",
+    authenticating: "Authenticating",
+    awaiting_user: "Awaiting Sign-in",
+    verifying: "Verifying",
     expired: "Expired",
     signed_out: "Signed Out",
     unavailable: "Unavailable",
     not_configured: "Not Configured",
+    failed: "Failed",
+    cancelled: "Cancelled",
   };
   return labels[status] || "Unavailable";
 }
@@ -1689,7 +1753,7 @@ function configurationValue(key, value) {
   }
   if (key === "status") return authenticationLabel(value);
   if (key === "method") {
-    return { chatgpt: "ChatGPT", api_key: "API key", access_token: "Access token", unknown: "Unknown" }[value] || "Unknown";
+    return { chatgpt: "ChatGPT", claude_ai: "Claude.ai", native_subscription: "Native subscription", api_key: "API key", access_token: "Access token", unknown: "Unknown" }[value] || "Unknown";
   }
   if (key === "evidence") return label(value);
   return String(value);
@@ -1800,6 +1864,199 @@ function syncManageIntegration(manage) {
   byId("chat-manage-state").hidden = manage?.dashboard_authority !== "discovered tools / explicit approval";
 }
 
+function safeAgentAuthorizationUrl(session) {
+  if (typeof session?.authorization_url !== "string") return null;
+  try {
+    const url = new URL(session.authorization_url);
+    if (url.protocol !== "https:" || url.username || url.password) return null;
+    if (session.provider === "codex" && url.hostname === "auth.openai.com" && url.pathname === "/codex/device" && !url.search) return url.href;
+    if (session.provider === "claude" && url.hostname === "claude.com" && url.pathname === "/cai/oauth/authorize" && url.search) return url.href;
+  } catch (_error) {
+    return null;
+  }
+  return null;
+}
+
+function agentProviderName(provider) {
+  return provider === "claude" ? "Claude Code" : "Codex CLI";
+}
+
+function agentAccountButton(text, action, disabled = false) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = translatePhrase(text);
+  button.disabled = disabled;
+  button.addEventListener("click", action);
+  return button;
+}
+
+async function mutateAgentAccounts(payload, successMessage) {
+  try {
+    const view = await api("/api/agent-accounts/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    renderAgentAccounts(view);
+    if (successMessage) toast(successMessage);
+    byId("configuration-grid").dataset.loaded = "false";
+    return view;
+  } catch (error) {
+    const messages = {
+      account_not_authenticated: "Complete native sign-in before selecting this account.",
+      selected_account_cannot_be_removed: "Select another worker account before removing this one.",
+      confirmation_required: "Confirmation is required for this account change.",
+      native_login_unavailable: "Native provider sign-in could not be started.",
+    };
+    toast(messages[error.message] || `Agent account action failed (${error.message}).`, "error");
+    return null;
+  }
+}
+
+async function startAgentLogin(provider, account = null) {
+  const proposed = account?.label || `${agentProviderName(provider)} ${new Date().toLocaleDateString(localeTag(), { month: "short", day: "numeric" })}`;
+  const alias = window.prompt(translatePhrase("Choose a local alias for this subscription account."), proposed);
+  if (alias === null || !alias.trim()) return;
+  await mutateAgentAccounts({ action: "start_login", provider, label: alias.trim(), account_id: account?.id || null }, "Native sign-in started.");
+  scheduleAgentAccountsPoll(true);
+}
+
+function renderAgentLoginSession(session) {
+  const card = document.createElement("div");
+  card.className = "agent-login-card";
+  const head = document.createElement("div");
+  head.className = "agent-account-head";
+  const identity = document.createElement("div");
+  identity.className = "agent-account-identity";
+  const title = document.createElement("strong");
+  title.textContent = `${agentProviderName(session.provider)} · ${translatePhrase("Native sign-in")}`;
+  const detail = document.createElement("small");
+  detail.textContent = session.status === "authenticated" ? translatePhrase("Subscription account authenticated.") : session.status === "failed" || session.status === "cancelled" ? translatePhrase("Sign-in did not complete.") : translatePhrase("Complete sign-in with the provider, then return here.");
+  identity.append(title, detail);
+  const status = document.createElement("span");
+  status.className = "agent-account-status";
+  status.dataset.state = session.status;
+  status.textContent = authenticationLabel(session.status);
+  head.append(identity, status);
+  const instructions = document.createElement("div");
+  instructions.className = "agent-login-instructions";
+  const authorizationUrl = safeAgentAuthorizationUrl(session);
+  if (authorizationUrl) {
+    const link = document.createElement("a");
+    link.className = "agent-login-link";
+    link.href = authorizationUrl;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = translatePhrase(session.provider === "claude" ? "Continue with Claude.ai ↗" : "Continue with ChatGPT ↗");
+    instructions.append(link);
+  }
+  if (typeof session.user_code === "string") {
+    const code = document.createElement("code");
+    code.className = "agent-login-code";
+    code.dataset.i18nSkip = "";
+    code.textContent = session.user_code;
+    instructions.append(code);
+  }
+  if (session.accepts_authorization_code === true) {
+    const codeInput = document.createElement("input");
+    codeInput.className = "agent-authorization-input";
+    codeInput.type = "text";
+    codeInput.autocomplete = "off";
+    codeInput.spellcheck = false;
+    codeInput.maxLength = 4096;
+    codeInput.placeholder = translatePhrase("Paste authorization code if Claude asks for it");
+    const submit = agentAccountButton("Submit authorization code", async () => {
+      const code = codeInput.value.trim();
+      if (!code) return;
+      submit.disabled = true;
+      const view = await mutateAgentAccounts({ action: "submit_authorization_code", session_id: session.id, code }, "Authorization code submitted.");
+      codeInput.value = "";
+      if (!view) submit.disabled = false;
+    });
+    instructions.append(codeInput, submit);
+  }
+  if (!["authenticated", "failed", "cancelled"].includes(session.status)) {
+    instructions.append(agentAccountButton("Cancel", () => mutateAgentAccounts({ action: "cancel_login", session_id: session.id }, "Native sign-in cancelled.")));
+  }
+  card.append(head);
+  if (instructions.childNodes.length) card.append(instructions);
+  return card;
+}
+
+function renderAgentAccount(account) {
+  const card = document.createElement("div");
+  card.className = "agent-account-card";
+  const head = document.createElement("div");
+  head.className = "agent-account-head";
+  const identity = document.createElement("div");
+  identity.className = "agent-account-identity";
+  const labelNode = document.createElement("strong");
+  labelNode.dataset.i18nSkip = "";
+  labelNode.textContent = account.label;
+  const provider = document.createElement("small");
+  provider.textContent = `${account.provider_name} · ${account.method === "claude_ai" ? "Claude.ai" : "ChatGPT"}${account.worker_selected ? ` · ${translatePhrase("ACTIVE WORKER")}` : ""}`;
+  identity.append(labelNode, provider);
+  const status = document.createElement("span");
+  status.className = "agent-account-status";
+  status.dataset.state = account.status;
+  status.textContent = authenticationLabel(account.status);
+  head.append(identity, status);
+  const meta = document.createElement("div");
+  meta.className = "agent-account-meta";
+  meta.textContent = `${translatePhrase("Evidence")}: ${label(account.evidence)}${account.last_verified_at_ms ? ` · ${new Intl.DateTimeFormat(localeTag(), { dateStyle: "medium", timeStyle: "short" }).format(account.last_verified_at_ms)}` : ""}`;
+  const actions = document.createElement("div");
+  actions.className = "agent-account-buttons";
+  actions.append(
+    agentAccountButton("Use for worker", () => mutateAgentAccounts({ action: "select", account_id: account.id }, "Worker account selected."), account.worker_selected || !["authenticated", "configured_unverified"].includes(account.status)),
+    agentAccountButton("Verify", () => mutateAgentAccounts({ action: "refresh", account_id: account.id }, "Account status refreshed.")),
+    agentAccountButton("Sign in again", () => startAgentLogin(account.provider, account)),
+    agentAccountButton("Sign out", () => {
+      if (window.confirm(translatePhrase("Sign out this native subscription account?"))) mutateAgentAccounts({ action: "logout", account_id: account.id, confirm: true }, "Account signed out.");
+    }),
+    agentAccountButton("Remove", () => {
+      if (window.confirm(translatePhrase("Remove this local account profile and its native credentials?"))) mutateAgentAccounts({ action: "remove", account_id: account.id, confirm: true }, "Account removed.");
+    }, account.worker_selected),
+  );
+  card.append(head, meta, actions);
+  return card;
+}
+
+function renderAgentAccounts(view) {
+  const sessionsRoot = byId("agent-login-sessions");
+  const accountsRoot = byId("agent-account-list");
+  sessionsRoot.replaceChildren(...(view.login_sessions || []).map(renderAgentLoginSession));
+  const accounts = Array.isArray(view.accounts) ? view.accounts : [];
+  if (accounts.length) {
+    accountsRoot.replaceChildren(...accounts.map(renderAgentAccount));
+  } else {
+    const empty = document.createElement("div");
+    empty.className = "agent-account-empty";
+    empty.textContent = translatePhrase("No native subscription account is configured yet.");
+    accountsRoot.replaceChildren(empty);
+  }
+  const activeLogin = (view.login_sessions || []).some((session) => !["authenticated", "failed", "cancelled"].includes(session.status));
+  if (activeLogin) scheduleAgentAccountsPoll();
+}
+
+function scheduleAgentAccountsPoll(immediate = false) {
+  if (agentAccountsPollTimer !== null) window.clearTimeout(agentAccountsPollTimer);
+  agentAccountsPollTimer = window.setTimeout(() => loadAgentAccounts(true), immediate ? 100 : 2000);
+}
+
+async function loadAgentAccounts(polling = false) {
+  try {
+    const view = await api("/api/agent-accounts");
+    renderAgentAccounts(view);
+  } catch (error) {
+    if (!polling) {
+      const empty = document.createElement("div");
+      empty.className = "agent-account-empty";
+      empty.textContent = translatePhrase("Native account management is unavailable.");
+      byId("agent-account-list").replaceChildren(empty);
+    }
+  }
+}
+
 async function loadConfiguration(force = false) {
   const root = byId("configuration-grid");
   if (!force && root.dataset.loaded === "true") return;
@@ -1831,6 +2088,7 @@ async function loadConfiguration(force = false) {
       renderConfigSection("Extensions & automation", config.extensions),
     );
     updateConfigurationSummary(config);
+    await loadAgentAccounts();
     applyConfigurationFilter();
     root.dataset.loaded = "true";
     if (force) toast("Runtime configuration refreshed.");
@@ -1841,6 +2099,7 @@ async function loadConfiguration(force = false) {
 }
 
 byId("configuration-refresh").addEventListener("click", () => loadConfiguration(true));
+document.querySelectorAll("[data-add-agent-provider]").forEach((button) => button.addEventListener("click", () => startAgentLogin(button.dataset.addAgentProvider)));
 
 const chatProfiles = ["conversation", "operational"];
 const refreshRates = [5000, 10000, 30000, 60000];

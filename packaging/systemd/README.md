@@ -28,7 +28,21 @@ proves `authenticated`, and recognized sign-out or token-refresh failures become
 `signed_out` or `expired`. Unhealthy authentication pauses new claims until the
 private credential revision changes. The dashboard exposes only these closed
 states, the sign-in method, safe evidence codes, and timestamps; it never returns
-the credential, account identity, provider home, or raw provider output.
+the credential, provider-reported account identity, provider home, or raw
+provider output.
+
+The hosted dashboard also owns a native subscription-account broker under
+`%S/automonique/agent-auth`. Codex CLI accounts authenticate with ChatGPT in an
+isolated `CODEX_HOME`; Claude Code accounts authenticate with Claude.ai in an
+isolated `CLAUDE_CONFIG_DIR`. The browser receives only the provider's
+short-lived authorization URL and, when required, one-time code. Reusable
+credentials, provider-reported identity and raw CLI output remain in the private
+server-side profile. Operator-defined aliases and opaque local account IDs are
+safe dashboard metadata. Multiple accounts can coexist for each provider, but
+the worker uses only the account selected explicitly by the operator and never
+rotates across subscriptions automatically. The worker unsets API-key and raw
+OAuth-token environment variables and accepts only native ChatGPT or Claude.ai
+login status.
 
 The optional hosted dashboard is deliberately separate from the daemon.
 `automonique-web-entry.service` binds a small Rust operations console to

@@ -10,6 +10,10 @@
 
 set -uo pipefail
 
+# Native subscription accounts are the only accepted provider authority for
+# this worker. Environment API credentials are deliberately excluded.
+unset OPENAI_API_KEY ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CODEX_API_KEY
+
 state_dir=${AUTOMONIQUE_STATE_DIR:?AUTOMONIQUE_STATE_DIR is required}
 max_concurrency=${AUTOMONIQUE_FLEET_CONCURRENCY:-3}
 poll_seconds=${AUTOMONIQUE_FLEET_POLL_SECONDS:-2}
@@ -32,8 +36,10 @@ fi
 fleet_config=$state_dir/support/fleet.conf
 provider_config=$state_dir/provider
 runtime_dir=$state_dir/manage-fleet-worker
-auth_health_file=$runtime_dir/auth-health.json
-auth_revision_file=$runtime_dir/auth-revision
+aggregate_auth_health_file=$runtime_dir/auth-health.json
+agent_auth_dir=${AUTOMONIQUE_AGENT_AUTH_DIR:-}
+account_registry=${agent_auth_dir:+$agent_auth_dir/accounts.json}
+claude_binary=${AUTOMONIQUE_FLEET_CLAUDE_BINARY:-}
 
 private_value() {
     key=$1
@@ -58,15 +64,75 @@ if [[ ! -x "$provider_binary" || ! -d "$worker_home" ]]; then
     printf '%s\n' 'configured Codex provider is unavailable' >&2
     exit 2
 fi
+if [[ -n "$agent_auth_dir" && ( ! -d "$agent_auth_dir" || ! -x "$claude_binary" ) ]]; then
+    printf '%s\n' 'configured native account directory or Claude provider is unavailable' >&2
+    exit 2
+fi
 
 umask 077
 mkdir -p -- "$runtime_dir"
 chmod 700 -- "$runtime_dir"
 
 auth_method=unknown
+selected_provider=codex
+selected_account=legacy
+selected_binary=$provider_binary
+selected_home=$worker_home
+auth_health_file=$aggregate_auth_health_file
+auth_revision_file=$runtime_dir/auth-revision-legacy
+
+load_selected_account() {
+    if [[ -z "$account_registry" || ! -f "$account_registry" ]]; then
+        selected_provider=codex
+        selected_account=legacy
+        selected_binary=$provider_binary
+        selected_home=$worker_home
+        auth_health_file=$aggregate_auth_health_file
+        auth_revision_file=$runtime_dir/auth-revision-legacy
+        return 0
+    fi
+    selection=$(jq -er '
+        select(.schema == "automonique.agent-accounts/v1")
+        | .worker_provider as $provider
+        | select($provider == "codex" or $provider == "claude")
+        | .selected[$provider] as $account
+        | select($account | type == "string" and test("^acct-[0-9a-f]{24}$"))
+        | [.accounts[] | select(.id == $account and .provider == $provider)]
+        | select(length == 1)
+        | .[0]
+        | [.provider, .id, .label]
+        | @tsv
+    ' "$account_registry" 2>/dev/null) || return 1
+    IFS=$'\t' read -r next_provider next_account next_label <<<"$selection"
+    [[ "$next_label" != *$'\n'* && "$next_label" != *$'\r'* && -n "$next_label" ]] || return 1
+    next_home=$agent_auth_dir/profiles/$next_account
+    [[ -d "$next_home" ]] || return 1
+    resolved_home=$(realpath -e -- "$next_home") || return 1
+    resolved_root=$(realpath -e -- "$agent_auth_dir/profiles") || return 1
+    [[ "$resolved_home" == "$resolved_root"/* ]] || return 1
+    selected_provider=$next_provider
+    selected_account=$next_account
+    selected_home=$resolved_home
+    if [[ "$selected_provider" == codex ]]; then
+        selected_binary=$provider_binary
+    else
+        selected_binary=$claude_binary
+    fi
+    auth_health_file=$agent_auth_dir/health/$selected_account.json
+    auth_revision_file=$runtime_dir/auth-revision-$selected_account
+}
+
+load_selected_account || {
+    printf '%s\n' 'native account selection is missing or invalid' >&2
+    exit 2
+}
 
 credential_revision() {
-    auth_file=$worker_home/auth.json
+    if [[ "$selected_provider" == codex ]]; then
+        auth_file=$selected_home/auth.json
+    else
+        auth_file=$selected_home/.credentials.json
+    fi
     if [[ ! -f "$auth_file" ]]; then
         printf '%s' missing
         return
@@ -75,14 +141,22 @@ credential_revision() {
 }
 
 probe_local_auth() {
-    auth_method=unknown
-    local_status=$(CODEX_HOME="$worker_home" "$provider_binary" login status 2>&1) || return 1
-    case "$local_status" in
-        *'Logged in using ChatGPT'*) auth_method=chatgpt ;;
-        *'Logged in using an API key'*) auth_method=api_key ;;
-        *'Logged in using an access token'*) auth_method=access_token ;;
-    esac
-    return 0
+    if [[ "$selected_provider" == codex ]]; then auth_method=chatgpt; else auth_method=claude_ai; fi
+    if [[ "$selected_provider" == codex ]]; then
+        local_status=$(CODEX_HOME="$selected_home" "$selected_binary" login status 2>&1) || return 1
+        case "$local_status" in
+            *'Logged in using ChatGPT'*) return 0 ;;
+            *'Logged in using an API key'*) return 1 ;;
+            *'Logged in using an access token'*) return 1 ;;
+        esac
+        return 1
+    fi
+    local_status=$(CLAUDE_CONFIG_DIR="$selected_home" "$selected_binary" auth status --json 2>/dev/null) || return 1
+    if jq -e '.loggedIn == true and .authMethod == "claude.ai"' >/dev/null <<<"$local_status"; then
+        auth_method=claude_ai
+        return 0
+    fi
+    return 1
 }
 
 previous_verified_at() {
@@ -100,20 +174,43 @@ write_auth_health() {
     last_verified_at=${3:-null}
     now_ms=$(date +%s%3N)
     temporary=$(mktemp "$runtime_dir/.auth-health.XXXXXX") || return 1
+    if [[ "$selected_account" != legacy ]]; then
+        account_temporary=$(mktemp "$agent_auth_dir/health/.account-health.XXXXXX") || {
+            rm -f -- "$temporary"
+            return 1
+        }
+        if ! jq -n \
+            --arg provider "$selected_provider" \
+            --arg account "$selected_account" \
+            --arg status "$auth_status" \
+            --arg method "$auth_method" \
+            --arg reason "$auth_reason" \
+            --argjson observed "$now_ms" \
+            --argjson verified "$last_verified_at" \
+            '{schema:"automonique.provider-account-health/v1",provider:$provider,account_id:$account,status:$status,method:$method,reason:$reason,observed_at_ms:$observed,last_verified_at_ms:$verified}' \
+            >"$account_temporary"
+        then
+            rm -f -- "$temporary" "$account_temporary"
+            return 1
+        fi
+        chmod 600 -- "$account_temporary"
+        mv -f -- "$account_temporary" "$auth_health_file"
+    fi
     if ! jq -n \
+        --arg provider "$selected_provider" \
         --arg status "$auth_status" \
         --arg method "$auth_method" \
         --arg reason "$auth_reason" \
         --argjson observed "$now_ms" \
         --argjson verified "$last_verified_at" \
-        '{schema:"automonique.provider-auth-health/v1",provider:"codex",surface:"manage-fleet-worker",status:$status,method:$method,reason:$reason,observed_at_ms:$observed,last_verified_at_ms:$verified}' \
+        '{schema:"automonique.provider-auth-health/v1",provider:$provider,surface:"manage-fleet-worker",status:$status,method:$method,reason:$reason,observed_at_ms:$observed,last_verified_at_ms:$verified}' \
         >"$temporary"
     then
         rm -f -- "$temporary"
         return 1
     fi
     chmod 600 -- "$temporary"
-    mv -f -- "$temporary" "$auth_health_file"
+    mv -f -- "$temporary" "$aggregate_auth_health_file"
 }
 
 write_auth_revision() {
@@ -125,7 +222,7 @@ write_auth_revision() {
 }
 
 auth_health_status() {
-    jq -er '.status | select(. == "authenticated" or . == "configured_unverified" or . == "expired" or . == "signed_out" or . == "unavailable")' \
+    jq -er '.status | select(. == "authenticated" or . == "configured_unverified" or . == "authenticating" or . == "expired" or . == "signed_out" or . == "unavailable")' \
         "$auth_health_file" 2>/dev/null || printf '%s' unavailable
 }
 
@@ -148,9 +245,9 @@ auth_failure_reason() {
         any(.[];
             (.type == "error" or .type == "turn.failed")
             and ((.message // .error.message // "") | ascii_downcase
-                | test("access token could not be refreshed|refresh token.*(revoked|invalid)|token.*invalidated|session has ended|not logged in")))
+                | test("access token could not be refreshed|refresh token.*(revoked|invalid)|token.*invalidated|session has ended|not logged in|login expired|please run /login|authentication[_ ]error")))
     ' "$output" >/dev/null 2>&1 \
-        || grep -Eqi '(codex_models_manager|codex_login|responses_websocket).*(401 Unauthorized|token_invalidated|refresh_token_invalidated)' "$error_output"
+        || grep -Eqi '((codex_models_manager|codex_login|responses_websocket).*(401 Unauthorized|token_invalidated|refresh_token_invalidated)|login expired|please run /login|oauth token.*expired|authentication[_ ]error)' "$error_output"
     then
         if grep -Eqi 'not logged in' "$output" "$error_output"; then
             printf '%s' local_session_missing
@@ -183,6 +280,8 @@ initialize_auth_health() {
     historical_failure=$(latest_job_auth_failure_reason || true)
     if ! probe_local_auth; then
         write_auth_health signed_out local_session_missing "$(previous_verified_at)" || true
+    elif [[ "$selected_account" != legacy && "$previous_status" == authenticated ]]; then
+        :
     elif [[ "$current_revision" == "$previous_revision" ]] \
         && [[ "$previous_status" == authenticated || "$previous_status" == expired ]]
     then
@@ -202,6 +301,7 @@ initialize_auth_health() {
 }
 
 initialize_auth_health
+selection_key=$selected_provider:$selected_account
 
 fleet_post() {
     body=$1
@@ -244,14 +344,15 @@ heartbeat() {
     status=$1
     active=$2
     auth_status=$(auth_health_status)
-    detail="Monique Codex worker: ${active}/${max_concurrency} active; auth ${auth_status}"
+    detail="Monique ${selected_provider} worker: ${active}/${max_concurrency} active; auth ${auth_status}"
     body=$(jq -cn \
         --arg id "$fleet_instance" \
         --arg status "$status" \
         --arg detail "$detail" \
-        --arg binary "$(basename -- "$provider_binary")" \
+        --arg provider "$selected_provider" \
+        --arg binary "$(basename -- "$selected_binary")" \
         --arg auth "$auth_status" \
-        '{action:"heartbeat",id:$id,status:$status,detail:$detail,version:"automonique-manage-worker/v1",harness:{agent:"codex",binary:$binary,available:true,auth_status:$auth,permission_mode:"confirmed-ticket"}}')
+        '{action:"heartbeat",id:$id,status:$status,detail:$detail,version:"automonique-manage-worker/v1",harness:{agent:$provider,binary:$binary,available:true,auth_status:$auth,permission_mode:"confirmed-ticket"}}')
     response=$(fleet_post "$body") || return 1
     jq -e '.ok == true' >/dev/null <<<"$response"
 }
@@ -307,16 +408,26 @@ workspace_for() {
     esac
 }
 
-log_codex_line() {
+log_provider_line() {
     job_id=$1
     line=$2
     kind=$(jq -r '.type // "output"' <<<"$line" 2>/dev/null) || kind=output
-    text=$(jq -r '
-        if .type == "item.completed" and .item.type == "agent_message" then .item.text
-        elif .type == "item.started" then ("started " + (.item.type // "item"))
-        elif .type == "error" then (.message // "provider error")
-        else empty end
-    ' <<<"$line" 2>/dev/null) || text=
+    if [[ "$selected_provider" == codex ]]; then
+        text=$(jq -r '
+            if .type == "item.completed" and .item.type == "agent_message" then .item.text
+            elif .type == "item.started" then ("started " + (.item.type // "item"))
+            elif .type == "error" then (.message // "provider error")
+            else empty end
+        ' <<<"$line" 2>/dev/null) || text=
+    else
+        text=$(jq -r '
+            if .type == "assistant" then
+                [.message.content[]? | select(.type == "text") | .text] | join("\n")
+            elif .type == "result" then (.result // empty)
+            elif .type == "error" then (.error.message // .message // "provider error")
+            else empty end
+        ' <<<"$line" 2>/dev/null) || text=
+    fi
     post_job_log "$job_id" "$kind" "$text"
 }
 
@@ -339,40 +450,67 @@ run_job() {
     chmod 600 -- "$output"
     chmod 600 -- "$error_output"
 
-    report_job "$job_id" running 'Codex started by Monique.' || return
-    post_job_log "$job_id" lifecycle 'Codex started by Monique.'
+    report_job "$job_id" running "${selected_provider} started by Monique." || return
+    post_job_log "$job_id" lifecycle "${selected_provider} started by Monique."
 
     set +e
-    printf '%s\n' "$prompt" \
-        | CODEX_HOME="$worker_home" "$provider_binary" exec \
-            --json \
-            --dangerously-bypass-approvals-and-sandbox \
-            --skip-git-repo-check \
-            -C "$cwd" \
-            - 2> >(while IFS= read -r line; do
-                printf '%s\n' "$line" >>"$error_output"
-                post_job_log "$job_id" provider_stderr "$line"
-            done) \
-        | tee "$output" \
-        | while IFS= read -r line; do
-            log_codex_line "$job_id" "$line"
-        done
-    statuses=("${PIPESTATUS[@]}")
+    if [[ "$selected_provider" == codex ]]; then
+        printf '%s\n' "$prompt" \
+            | CODEX_HOME="$selected_home" "$selected_binary" exec \
+                --json \
+                --dangerously-bypass-approvals-and-sandbox \
+                --skip-git-repo-check \
+                -C "$cwd" \
+                - 2> >(while IFS= read -r line; do
+                    printf '%s\n' "$line" >>"$error_output"
+                    post_job_log "$job_id" provider_stderr "$line"
+                done) \
+            | tee "$output" \
+            | while IFS= read -r line; do
+                log_provider_line "$job_id" "$line"
+            done
+        provider_status=${PIPESTATUS[1]:-1}
+    else
+        cd -- "$cwd" || {
+            set -u
+            report_job "$job_id" failed 'Claude could not enter the selected workspace.' || true
+            return
+        }
+        printf '%s\n' "$prompt" \
+            | CLAUDE_CONFIG_DIR="$selected_home" "$selected_binary" \
+                --print \
+                --output-format stream-json \
+                --verbose \
+                --dangerously-skip-permissions \
+                2> >(while IFS= read -r line; do
+                    printf '%s\n' "$line" >>"$error_output"
+                    post_job_log "$job_id" provider_stderr "$line"
+                done) \
+            | tee "$output" \
+            | while IFS= read -r line; do
+                log_provider_line "$job_id" "$line"
+            done
+        provider_status=${PIPESTATUS[1]:-1}
+    fi
     set -u
-    provider_status=${statuses[1]:-1}
 
-    session_id=$(jq -rs '[.[] | select(.type == "thread.started") | .thread_id] | first // ""' "$output" 2>/dev/null) || session_id=
-    result=$(jq -rs '[.[] | select(.type == "item.completed" and .item.type == "agent_message") | .item.text] | last // ""' "$output" 2>/dev/null) || result=
+    if [[ "$selected_provider" == codex ]]; then
+        session_id=$(jq -rs '[.[] | select(.type == "thread.started") | .thread_id] | first // ""' "$output" 2>/dev/null) || session_id=
+        result=$(jq -rs '[.[] | select(.type == "item.completed" and .item.type == "agent_message") | .item.text] | last // ""' "$output" 2>/dev/null) || result=
+    else
+        session_id=$(jq -rs '[.[] | select(.type == "result") | .session_id] | last // ""' "$output" 2>/dev/null) || session_id=
+        result=$(jq -rs '[.[] | select(.type == "result") | .result] | last // ""' "$output" 2>/dev/null) || result=
+    fi
     if (( provider_status == 0 )); then
-        [[ -n "$result" ]] || result='Codex completed without a final text receipt.'
+        [[ -n "$result" ]] || result="${selected_provider} completed without a final text receipt."
         report_job "$job_id" "done" "$result" "$session_id" || true
-        post_job_log "$job_id" lifecycle 'Codex completed.'
+        post_job_log "$job_id" lifecycle "${selected_provider} completed."
         probe_local_auth || true
         write_auth_health authenticated execution_succeeded "$(date +%s%3N)" || true
     else
-        [[ -n "$result" ]] || result="Codex exited with status $provider_status."
+        [[ -n "$result" ]] || result="${selected_provider} exited with status $provider_status."
         report_job "$job_id" "failed" "$result" "$session_id" || true
-        post_job_log "$job_id" lifecycle 'Codex failed.'
+        post_job_log "$job_id" lifecycle "${selected_provider} failed."
         if reason=$(auth_failure_reason "$output" "$error_output"); then
             probe_local_auth || true
             if [[ "$reason" == local_session_missing ]]; then
@@ -397,7 +535,21 @@ heartbeat online 0 || {
 }
 
 while (( stopping == 0 )); do
-    refresh_auth_after_credential_change
+    previous_selection=$selection_key
+    if load_selected_account; then
+        selection_key=$selected_provider:$selected_account
+        if [[ "$selection_key" != "$previous_selection" ]]; then
+            initialize_auth_health
+            last_heartbeat=0
+        else
+            refresh_auth_after_credential_change
+        fi
+    else
+        auth_method=unknown
+        auth_health_file=$aggregate_auth_health_file
+        write_auth_health unavailable provider_unavailable "$(previous_verified_at)" || true
+        selection_key=invalid
+    fi
     active=$(active_jobs)
     now=$(date +%s)
     if (( now - last_heartbeat >= heartbeat_seconds )); then
@@ -409,6 +561,7 @@ while (( stopping == 0 )); do
     while (( active < max_concurrency && stopping == 0 )) \
         && [[ "$(auth_health_status)" != expired ]] \
         && [[ "$(auth_health_status)" != signed_out ]] \
+        && [[ "$(auth_health_status)" != authenticating ]] \
         && [[ "$(auth_health_status)" != unavailable ]]
     do
         job=$(claim_one) || break

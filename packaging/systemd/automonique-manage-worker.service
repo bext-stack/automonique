@@ -11,7 +11,7 @@ ExecStart=%S/automonique/improvement-code/current/bin/automonique-manage-worker
 Restart=on-failure
 RestartSec=5s
 # Signal only the worker shell first. Its TERM trap stops intake and waits for
-# every accepted Codex child before exiting; signalling the whole cgroup would
+# every accepted provider child before exiting; signalling the whole cgroup would
 # kill those children before the drain can happen.
 KillMode=mixed
 TimeoutStopSec=infinity
@@ -19,8 +19,10 @@ StateDirectory=automonique
 StateDirectoryMode=0700
 Environment=AUTOMONIQUE_STATE_DIR=%S/automonique
 Environment=AUTOMONIQUE_FLEET_CONCURRENCY=3
-# Optional: set this to an owner-managed Codex home with the full operational
-# tool host. The daemon's isolated conversation home may deliberately disable it.
+Environment=AUTOMONIQUE_AGENT_AUTH_DIR=%S/automonique/agent-auth
+Environment=AUTOMONIQUE_FLEET_CLAUDE_BINARY=%h/.local/bin/claude
+# Legacy fallback used only until the native account registry has an explicit
+# worker selection. New Codex and Claude accounts use private isolated profiles.
 # Environment=AUTOMONIQUE_FLEET_CODEX_HOME=%h/.codex
 
 [Install]

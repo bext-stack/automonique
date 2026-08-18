@@ -23,6 +23,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut integration_config = None;
     let mut state_dir = None;
     let mut runtime_dir = None;
+    let mut agent_auth_dir = None;
+    let mut codex_binary = None;
+    let mut claude_binary = None;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -50,6 +53,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     arguments.next().ok_or("--runtime-dir requires a value")?,
                 ));
             }
+            "--agent-auth-dir" => {
+                agent_auth_dir = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or("--agent-auth-dir requires a value")?,
+                ));
+            }
+            "--codex-binary" => {
+                codex_binary = Some(PathBuf::from(
+                    arguments.next().ok_or("--codex-binary requires a value")?,
+                ));
+            }
+            "--claude-binary" => {
+                claude_binary = Some(PathBuf::from(
+                    arguments.next().ok_or("--claude-binary requires a value")?,
+                ));
+            }
             _ => return Err(format!("unknown argument {argument}").into()),
         }
     }
@@ -63,17 +83,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let integration_config = integration_config.ok_or("--integration-config is required")?;
     let state_dir = state_dir.ok_or("--state-dir is required")?;
     let runtime_dir = runtime_dir.ok_or("--runtime-dir is required")?;
-    if [&auth_config, &integration_config, &state_dir, &runtime_dir]
-        .iter()
-        .any(|path| !path.is_absolute())
+    let agent_auth_dir = agent_auth_dir.ok_or("--agent-auth-dir is required")?;
+    let codex_binary = codex_binary.ok_or("--codex-binary is required")?;
+    let claude_binary = claude_binary.ok_or("--claude-binary is required")?;
+    if [
+        &auth_config,
+        &integration_config,
+        &state_dir,
+        &runtime_dir,
+        &agent_auth_dir,
+        &codex_binary,
+        &claude_binary,
+    ]
+    .iter()
+    .any(|path| !path.is_absolute())
     {
         return Err("dashboard paths must be absolute".into());
     }
     let auth = automonique_web_entry::BasicAuth::from_file(&auth_config)?;
     let integration_config =
         automonique_web_entry::IntegrationConfig::from_file(&integration_config)?;
-    let integration =
-        automonique_web_entry::WebIntegration::open(integration_config, &state_dir, &runtime_dir)?;
+    let agent_auth =
+        automonique_web_entry::AgentAuthConfig::new(agent_auth_dir, codex_binary, claude_binary)?;
+    let integration = automonique_web_entry::WebIntegration::open_with_agent_auth(
+        integration_config,
+        &state_dir,
+        &runtime_dir,
+        agent_auth,
+    )?;
     let listener = TcpListener::bind(SocketAddr::new(bind, port))?;
     automonique_web_entry::serve(listener, auth, integration)?;
     Ok(())

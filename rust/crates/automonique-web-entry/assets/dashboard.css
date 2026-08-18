@@ -1025,6 +1025,31 @@ kbd { padding: 1px 4px; border: 1px solid var(--line-bright); border-bottom-colo
 .config-primary { display: grid; min-width: 0; gap: 14px; }
 .config-aside { display: grid; position: sticky; top: 14px; gap: 14px; }
 .config-editor { padding: 20px; }
+.agent-accounts { display: grid; gap: 14px; padding: 20px; }
+.agent-accounts .config-card-heading { margin-bottom: 0; }
+.agent-account-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.agent-account-list, .agent-login-sessions { display: grid; gap: 10px; }
+.agent-login-sessions:empty { display: none; }
+.agent-account-card, .agent-login-card { display: grid; gap: 11px; padding: 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--field-surface); }
+.agent-account-head { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; }
+.agent-account-identity { display: grid; min-width: 0; gap: 3px; }
+.agent-account-identity strong { overflow: hidden; color: var(--text); font-size: var(--font-md); text-overflow: ellipsis; white-space: nowrap; }
+.agent-account-identity small, .agent-account-meta, .agent-account-boundary, .agent-account-empty { color: var(--muted); font-size: var(--font-xs); line-height: 1.45; }
+.agent-account-status { flex: 0 0 auto; padding: 4px 7px; border: 1px solid var(--line-bright); border-radius: 5px; color: var(--muted); font: 700 var(--font-xs) ui-monospace, monospace; text-transform: uppercase; }
+.agent-account-status[data-state="authenticated"] { border-color: var(--success-border); background: var(--success-surface); color: var(--green); }
+.agent-account-status[data-state="configured_unverified"], .agent-account-status[data-state="authenticating"], .agent-account-status[data-state="awaiting_user"], .agent-account-status[data-state="verifying"] { border-color: var(--warning-border); background: var(--warning-surface); color: var(--amber); }
+.agent-account-status[data-state="expired"], .agent-account-status[data-state="signed_out"], .agent-account-status[data-state="unavailable"], .agent-account-status[data-state="failed"] { border-color: var(--danger-border); background: var(--danger-surface); color: var(--red); }
+.agent-account-buttons { display: flex; flex-wrap: wrap; gap: 7px; }
+.agent-account-buttons button, .agent-login-link { min-height: 32px; padding: 0 10px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--panel); color: var(--text); font: 650 var(--font-xs) inherit; cursor: pointer; text-decoration: none; }
+.agent-account-buttons button:hover, .agent-login-link:hover { border-color: var(--blue); color: var(--blue); }
+.agent-account-buttons button:disabled { opacity: .45; cursor: not-allowed; }
+.agent-login-instructions { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; }
+.agent-login-link { display: inline-flex; align-items: center; background: var(--selected-surface); color: var(--blue); }
+.agent-login-code { padding: 7px 9px; border: 1px dashed var(--line-bright); border-radius: 6px; background: var(--panel); color: var(--text); font: 750 var(--font-md) ui-monospace, monospace; letter-spacing: .08em; }
+.agent-authorization-input { flex: 1 1 260px; min-width: 0; min-height: 34px; padding: 0 10px; border: 1px solid var(--line-bright); border-radius: 7px; outline: 0; background: var(--panel); color: var(--text); font: 600 var(--font-sm) ui-monospace, monospace; }
+.agent-authorization-input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 16%, transparent); }
+.agent-account-boundary { margin: 0; padding-top: 11px; border-top: 1px solid var(--line); }
+.agent-account-empty { padding: 18px; border: 1px dashed var(--line); border-radius: 8px; text-align: center; }
 .config-card-heading { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; margin-bottom: 16px; }
 .config-card-heading h2, .config-section-heading h2 { margin: 3px 0 4px; font-size: var(--font-xl); letter-spacing: -.02em; }
 .config-card-heading p, .config-section-heading p { margin: 0; color: var(--muted); font-size: var(--font-sm); line-height: 1.5; }
