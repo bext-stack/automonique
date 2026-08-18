@@ -764,9 +764,38 @@ h2 { margin-bottom: 0; font-size: var(--font-title); font-weight: 580; letter-sp
 .message.user .message-avatar { display: none; }
 .message-content { position: relative; min-width: 0; padding: 0 4px; border: 1px solid transparent; border-radius: 16px; color: var(--text); background: transparent; font-size: var(--font-body-lg); line-height: 1.72; }
 .message.user .message-content { padding: 11px 16px; border-color: var(--line-bright); background: var(--user-surface); }
-.message-content p { margin-bottom: 10px; }
-.message-content p { white-space: pre-wrap; overflow-wrap: anywhere; }
-.message-content p:last-child { margin-bottom: 0; }
+.message-content p { margin: 0 0 12px; overflow-wrap: anywhere; }
+.message-content > :first-child { margin-top: 0; }
+.message-content > :last-child { margin-bottom: 0; }
+.message-content h1, .message-content h2, .message-content h3, .message-content h4, .message-content h5, .message-content h6 { margin: 22px 0 9px; color: var(--text); font-weight: 650; line-height: 1.28; letter-spacing: -.018em; }
+.message-content h1 { font-size: 1.5em; }
+.message-content h2 { font-size: 1.3em; }
+.message-content h3 { font-size: 1.14em; }
+.message-content h4, .message-content h5, .message-content h6 { font-size: 1em; }
+.message-content ul, .message-content ol { margin: 7px 0 14px; padding-left: 1.55em; }
+.message-content li { margin: 4px 0; padding-left: .18em; }
+.message-content li::marker { color: var(--quiet); }
+.message-content .task-item { display: flex; gap: 9px; align-items: flex-start; margin-left: -1.35em; list-style: none; }
+.message-content .task-check { display: inline-grid; flex: 0 0 17px; width: 17px; height: 17px; margin-top: .3em; place-items: center; border: 1px solid var(--line-bright); border-radius: 4px; color: var(--on-accent); background: var(--accent-surface); font: 700 11px/1 ui-monospace, monospace; }
+.message-content .task-check:not(:empty) { border-color: var(--green); background: var(--green); }
+.message-content blockquote { margin: 13px 0; padding: 2px 0 2px 16px; border-left: 3px solid var(--accent-border); color: var(--muted); }
+.message-content blockquote > :last-child { margin-bottom: 0; }
+.message-content code { padding: .16em .38em; border: 1px solid var(--line); border-radius: 5px; color: var(--code-text, var(--green)); background: var(--code-surface, var(--surface-strong)); font: .88em/1.5 ui-monospace, "SFMono-Regular", Consolas, monospace; overflow-wrap: anywhere; }
+.message-content pre { max-width: 100%; margin: 14px 0; padding: 14px 16px; overflow: auto; border: 1px solid var(--line-bright); border-radius: 10px; background: var(--code-surface, var(--surface-strong)); }
+.message-content pre code { display: block; min-width: max-content; padding: 0; border: 0; border-radius: 0; color: var(--code-text, var(--text)); background: transparent; white-space: pre; overflow-wrap: normal; }
+.message-content a { color: var(--blue); text-decoration: underline; text-decoration-color: color-mix(in srgb, currentColor 38%, transparent); text-underline-offset: 3px; }
+.message-content a:hover { color: var(--green); text-decoration-color: currentColor; }
+.message-content strong { color: var(--text); font-weight: 700; }
+.message-content del { color: var(--quiet); }
+.message-content hr { height: 1px; margin: 18px 0; border: 0; background: var(--line-bright); }
+.message-content .markdown-table-wrap { max-width: 100%; margin: 14px 0; overflow-x: auto; border: 1px solid var(--line-bright); border-radius: 10px; }
+.message-content table { width: 100%; border-collapse: collapse; font-size: .92em; line-height: 1.5; }
+.message-content th, .message-content td { min-width: 100px; padding: 9px 12px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.message-content th { color: var(--text); background: var(--surface-strong); font-weight: 650; }
+.message-content tr:last-child td { border-bottom: 0; }
+.message-content th:last-child, .message-content td:last-child { border-right: 0; }
+.message-content .align-center { text-align: center; }
+.message-content .align-right { text-align: right; }
 .message.error .message-content { padding: 10px 13px; border-color: var(--danger-border); color: var(--danger-muted); background: var(--danger-surface); }
 .message-meta { margin-top: 9px; color: var(--quiet); font: var(--font-xs) ui-monospace, monospace; }
 .message-tools { display: flex; gap: 6px; align-items: center; margin-top: 9px; }

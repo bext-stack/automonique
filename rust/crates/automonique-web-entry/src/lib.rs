@@ -3078,6 +3078,19 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_chat_markdown_uses_safe_dom_nodes() {
+        assert!(DASHBOARD_JS.contains("function renderMarkdown"));
+        assert!(DASHBOARD_JS.contains("function appendInlineMarkdown"));
+        assert!(DASHBOARD_JS.contains("document.createTextNode"));
+        assert!(DASHBOARD_JS.contains("[\"http:\", \"https:\", \"mailto:\"]"));
+        assert!(DASHBOARD_JS.contains("noopener noreferrer"));
+        assert!(DASHBOARD_CSS.contains(".message-content blockquote"));
+        assert!(DASHBOARD_CSS.contains(".message-content pre code"));
+        assert!(DASHBOARD_CSS.contains(".message-content table"));
+        assert!(!DASHBOARD_JS.contains("innerHTML"));
+    }
+
+    #[test]
     fn legacy_host_redirects_to_canonical_host() {
         let bytes = request("HEAD", "/old/path", LEGACY_HOST);
         let parsed = parse_request(&bytes).unwrap();

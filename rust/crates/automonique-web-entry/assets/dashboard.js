@@ -817,6 +817,280 @@ async function loadConfiguration(force = false) {
 
 byId("configuration-refresh").addEventListener("click", () => loadConfiguration(true));
 
+function safeMarkdownUrl(value) {
+  const raw = String(value).trim();
+  if (!raw || /[\u0000-\u001f\u007f]/.test(raw)) return null;
+  try {
+    const url = new URL(raw, window.location.origin);
+    if (!["http:", "https:", "mailto:"].includes(url.protocol)) return null;
+    return url.href;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function appendInlineMarkdown(parent, source, depth = 0) {
+  const text = String(source);
+  if (depth > 5) {
+    parent.append(document.createTextNode(text));
+    return;
+  }
+  let plain = "";
+  const flush = () => {
+    if (plain) parent.append(document.createTextNode(plain));
+    plain = "";
+  };
+  const paired = (index, marker, tag) => {
+    if (!text.startsWith(marker, index)) return null;
+    const openingNext = text[index + marker.length];
+    if (!openingNext || /\s/.test(openingNext)) return null;
+    if (marker.startsWith("_") && /[A-Za-z0-9]/.test(text[index - 1] || "") && /[A-Za-z0-9]/.test(openingNext)) return null;
+    const end = text.indexOf(marker, index + marker.length);
+    if (end <= index + marker.length || /\s/.test(text[end - 1])) return null;
+    flush();
+    const node = document.createElement(tag);
+    appendInlineMarkdown(node, text.slice(index + marker.length, end), depth + 1);
+    parent.append(node);
+    return end + marker.length;
+  };
+  for (let index = 0; index < text.length;) {
+    if (text[index] === "\\" && index + 1 < text.length && /[\\`*_[\]~]/.test(text[index + 1])) {
+      plain += text[index + 1];
+      index += 2;
+      continue;
+    }
+    if (text[index] === "`") {
+      const marker = text.slice(index).match(/^`+/)?.[0] || "`";
+      const end = text.indexOf(marker, index + marker.length);
+      if (end > index + marker.length) {
+        flush();
+        const code = document.createElement("code");
+        code.textContent = text.slice(index + marker.length, end).replace(/^ | $/g, "");
+        parent.append(code);
+        index = end + marker.length;
+        continue;
+      }
+    }
+    if (text[index] === "[") {
+      const labelEnd = text.indexOf("](", index + 1);
+      const targetEnd = labelEnd < 0 ? -1 : text.indexOf(")", labelEnd + 2);
+      if (labelEnd > index + 1 && targetEnd > labelEnd + 2) {
+        const href = safeMarkdownUrl(text.slice(labelEnd + 2, targetEnd));
+        if (href) {
+          flush();
+          const link = document.createElement("a");
+          link.href = href;
+          link.rel = "noopener noreferrer";
+          if (href.startsWith("http:") || href.startsWith("https:")) link.target = "_blank";
+          appendInlineMarkdown(link, text.slice(index + 1, labelEnd), depth + 1);
+          parent.append(link);
+          index = targetEnd + 1;
+          continue;
+        }
+      }
+    }
+    const strong = paired(index, "**", "strong") || paired(index, "__", "strong");
+    if (strong) {
+      index = strong;
+      continue;
+    }
+    const strike = paired(index, "~~", "del");
+    if (strike) {
+      index = strike;
+      continue;
+    }
+    const emphasis = paired(index, "*", "em") || paired(index, "_", "em");
+    if (emphasis) {
+      index = emphasis;
+      continue;
+    }
+    plain += text[index];
+    index += 1;
+  }
+  flush();
+}
+
+function appendMarkdownLines(parent, lines) {
+  lines.forEach((line, index) => {
+    if (index > 0) parent.append(document.createElement("br"));
+    appendInlineMarkdown(parent, line);
+  });
+}
+
+function markdownTableCells(line) {
+  const cells = [];
+  let cell = "";
+  let codeFence = 0;
+  let escaped = false;
+  const value = String(line).trim().replace(/^\|/, "").replace(/\|$/, "");
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (escaped) {
+      cell += character;
+      escaped = false;
+    } else if (character === "\\" && value[index + 1] === "|") {
+      escaped = true;
+    } else if (character === "`") {
+      codeFence = codeFence === 0 ? 1 : 0;
+      cell += character;
+    } else if (character === "|" && codeFence === 0) {
+      cells.push(cell.trim());
+      cell = "";
+    } else {
+      cell += character;
+    }
+  }
+  if (escaped) cell += "\\";
+  cells.push(cell.trim());
+  return cells;
+}
+
+function markdownTableAlignment(delimiter) {
+  const value = delimiter.trim();
+  if (!/^:?-{3,}:?$/.test(value)) return null;
+  if (value.startsWith(":") && value.endsWith(":")) return "center";
+  if (value.endsWith(":")) return "right";
+  return "left";
+}
+
+function markdownBlockStart(line) {
+  return /^\s*(```|~~~)/.test(line)
+    || /^\s{0,3}#{1,6}\s+/.test(line)
+    || /^\s{0,3}>\s?/.test(line)
+    || /^\s{0,3}([-+*])\s+/.test(line)
+    || /^\s{0,3}\d+[.)]\s+/.test(line)
+    || /^\s{0,3}((\*\s*){3,}|(-\s*){3,}|(_\s*){3,})$/.test(line);
+}
+
+function renderMarkdown(content) {
+  const fragment = document.createDocumentFragment();
+  const lines = String(content).replace(/\r\n?/g, "\n").split("\n");
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+    const fence = line.match(/^\s*(```|~~~)\s*([A-Za-z0-9_+-]*)\s*$/);
+    if (fence) {
+      const codeLines = [];
+      index += 1;
+      while (index < lines.length && !new RegExp(`^\\s*${fence[1]}\\s*$`).test(lines[index])) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      if (fence[2]) code.dataset.language = fence[2].toLowerCase();
+      code.textContent = codeLines.join("\n");
+      pre.append(code);
+      fragment.append(pre);
+      continue;
+    }
+    if (index + 1 < lines.length && line.includes("|")) {
+      const headings = markdownTableCells(line);
+      const delimiters = markdownTableCells(lines[index + 1]);
+      const alignments = delimiters.map(markdownTableAlignment);
+      if (headings.length > 1 && headings.length === delimiters.length && alignments.every(Boolean)) {
+        const wrapper = document.createElement("div");
+        wrapper.className = "markdown-table-wrap";
+        const table = document.createElement("table");
+        const head = document.createElement("thead");
+        const headingRow = document.createElement("tr");
+        headings.forEach((value, column) => {
+          const cell = document.createElement("th");
+          cell.className = `align-${alignments[column]}`;
+          appendInlineMarkdown(cell, value);
+          headingRow.append(cell);
+        });
+        head.append(headingRow);
+        table.append(head);
+        const body = document.createElement("tbody");
+        index += 2;
+        while (index < lines.length && lines[index].trim() && lines[index].includes("|")) {
+          const values = markdownTableCells(lines[index]);
+          if (values.length !== headings.length) break;
+          const row = document.createElement("tr");
+          values.forEach((value, column) => {
+            const cell = document.createElement("td");
+            cell.className = `align-${alignments[column]}`;
+            appendInlineMarkdown(cell, value);
+            row.append(cell);
+          });
+          body.append(row);
+          index += 1;
+        }
+        table.append(body);
+        wrapper.append(table);
+        fragment.append(wrapper);
+        continue;
+      }
+    }
+    const heading = line.match(/^\s{0,3}(#{1,6})\s+(.+?)\s*#*$/);
+    if (heading) {
+      const node = document.createElement(`h${heading[1].length}`);
+      appendInlineMarkdown(node, heading[2]);
+      fragment.append(node);
+      index += 1;
+      continue;
+    }
+    if (/^\s{0,3}((\*\s*){3,}|(-\s*){3,}|(_\s*){3,})$/.test(line)) {
+      fragment.append(document.createElement("hr"));
+      index += 1;
+      continue;
+    }
+    if (/^\s{0,3}>\s?/.test(line)) {
+      const quoted = [];
+      while (index < lines.length && /^\s{0,3}>\s?/.test(lines[index])) {
+        quoted.push(lines[index].replace(/^\s{0,3}>\s?/, ""));
+        index += 1;
+      }
+      const quote = document.createElement("blockquote");
+      quote.append(renderMarkdown(quoted.join("\n")));
+      fragment.append(quote);
+      continue;
+    }
+    const listMatch = line.match(/^\s{0,3}([-+*]|\d+[.)])\s+(.+)$/);
+    if (listMatch) {
+      const ordered = /^\d/.test(listMatch[1]);
+      const list = document.createElement(ordered ? "ol" : "ul");
+      while (index < lines.length) {
+        const item = lines[index].match(/^\s{0,3}([-+*]|\d+[.)])\s+(.+)$/);
+        if (!item || /^\d/.test(item[1]) !== ordered) break;
+        const child = document.createElement("li");
+        const task = !ordered ? item[2].match(/^\[([ xX])\]\s+(.+)$/) : null;
+        if (task) {
+          child.className = "task-item";
+          const check = document.createElement("span");
+          check.className = "task-check";
+          check.setAttribute("aria-hidden", "true");
+          check.textContent = task[1].toLowerCase() === "x" ? "✓" : "";
+          child.append(check);
+          appendInlineMarkdown(child, task[2]);
+        } else {
+          appendInlineMarkdown(child, item[2]);
+        }
+        list.append(child);
+        index += 1;
+      }
+      fragment.append(list);
+      continue;
+    }
+    const paragraph = [line];
+    index += 1;
+    while (index < lines.length && lines[index].trim() && !markdownBlockStart(lines[index])) {
+      paragraph.push(lines[index]);
+      index += 1;
+    }
+    const node = document.createElement("p");
+    appendMarkdownLines(node, paragraph);
+    fragment.append(node);
+  }
+  return fragment;
+}
+
 function appendMessage(role, content, createdAt = Date.now(), details = {}) {
   byId("chat-empty")?.remove();
   const item = document.createElement("article");
@@ -826,11 +1100,7 @@ function appendMessage(role, content, createdAt = Date.now(), details = {}) {
   avatar.textContent = role === "user" ? "YOU" : "M";
   const body = document.createElement("div");
   body.className = "message-content";
-  String(content).split(/\n{2,}/).forEach((paragraph) => {
-    const p = document.createElement("p");
-    p.textContent = paragraph;
-    body.append(p);
-  });
+  body.append(renderMarkdown(content));
   if (role !== "user" && details.action) body.append(createActionCard(details.action));
   const meta = document.createElement("div");
   meta.className = "message-meta";
