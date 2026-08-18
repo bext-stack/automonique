@@ -126,7 +126,7 @@ use crate::telegram_bridge::{
     QuestionProfile, RunLane as _, SlackSurface, StoreControlSurface, TransportToolPlan,
     accepted_mcp_input_responses, answer_read_only_transport_question,
     answer_typed_github_issue_question, deterministic_conversation_answer, mcp_approval_preview,
-    mcp_result_prompt,
+    mcp_result_prompt, run_question_to_completion,
 };
 
 /// Configuration path beneath the daemon's private state directory.
@@ -2447,8 +2447,11 @@ impl LiveSlackQuestionAnswerer {
                             ));
                         };
                         SlackQuestionReply::Text(
-                            self.lane
-                                .run_question(&prompt, QuestionProfile::OperationalLookup)
+                            run_question_to_completion(
+                                &mut self.lane,
+                                &prompt,
+                                QuestionProfile::OperationalLookup,
+                            )
                                 .unwrap_or_else(|_| {
                                     String::from(
                                         "The MCP read completed, but the answer model is unavailable right now.",

@@ -253,6 +253,7 @@ dependencies = [
  "automonique-cli",
  "automonique-core",
  "automonique-daemon",
+ "automonique-github-connector",
  "automonique-store",
  "automonique-transport-runtime",
  "base64 0.22.1",

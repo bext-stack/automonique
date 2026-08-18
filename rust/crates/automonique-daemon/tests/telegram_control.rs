@@ -2312,6 +2312,49 @@ fn direct_issue_review_loads_full_github_context_without_a_router_turn() {
 }
 
 #[test]
+fn deferred_issue_placeholder_is_followed_by_a_completed_answer() {
+    let fixture = Fixture::new(&[]);
+    let github = FakeGitHub::default();
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering_sequence(&[
+        "I can look into that issue for you — I'll fetch its details. One moment.",
+        "The issue is open and its latest delivery evidence reports completion.",
+    ]);
+    let mut bridge = bridge_with_sources(
+        &fixture,
+        FakeClient::new([updates(&[(
+            13,
+            OPERATOR,
+            "what can you tell me about https://github.com/example/company-manager/issues/1212 ?",
+        )])]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+        single_tier_roster(),
+        (None, Some(github.clone())),
+    );
+
+    assert_eq!(
+        poll(&mut bridge)
+            .expect("issue review queues")
+            .questions_queued,
+        1
+    );
+    assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
+    assert_eq!(github.seen(), ["example/company-manager#1212"]);
+    assert_eq!(
+        lane.tasks().len(),
+        2,
+        "the wait reply triggers one completion pass"
+    );
+    let messages = outbound.messages();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].contains("latest delivery evidence reports completion"));
+    assert!(!messages[0].contains("One moment"));
+    assert!(messages[0].contains("route=operational_intelligent"));
+}
+
+#[test]
 fn natural_language_slack_post_composes_then_uses_the_typed_channel_effect() {
     let fixture = Fixture::new(&[]);
     let slack = FakeSlack::posting("Posted to #poetry (ts 1786903071.699).")

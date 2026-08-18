@@ -10815,11 +10815,11 @@ pub(crate) fn answer_read_only_transport_question(
         );
     };
     let routing_started = Instant::now();
-    let (routed, routing_runtime) = match run_question_completion_pass(lane, &intent_prompt, profile)
-    {
-        Ok(answer) => answer,
-        Err(failure) => return String::from(question_failure_reply(failure)),
-    };
+    let (routed, routing_runtime) =
+        match run_question_completion_pass(lane, &intent_prompt, profile) {
+            Ok(answer) => answer,
+            Err(failure) => return String::from(question_failure_reply(failure)),
+        };
     let first_execution_ms = routing_started.elapsed().as_millis();
     match model_question_intent(
         &routed,
@@ -10870,7 +10870,8 @@ pub(crate) fn answer_read_only_transport_question(
                 .saturating_sub(first_execution_ms)
                 .saturating_add(selected_started.elapsed().as_millis());
             let execution_started = Instant::now();
-            let (answer, runtime) = match run_question_completion_pass(lane, &prompt, plan.profile) {
+            let (answer, runtime) = match run_question_completion_pass(lane, &prompt, plan.profile)
+            {
                 Ok(answer) => answer,
                 Err(failure) => return String::from(question_failure_reply(failure)),
             };

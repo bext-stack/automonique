@@ -27,7 +27,7 @@ use automonique_daemon::github::{
 use automonique_daemon::github_actions::{GitHubIssueRequestIntent, natural_issue_request};
 use automonique_daemon::run_lane::SocketRunLane;
 use automonique_daemon::slack::SlackHost;
-use automonique_daemon::telegram_bridge::{QuestionProfile, RunLane, SlackSurface};
+use automonique_daemon::telegram_bridge::{QuestionProfile, RunFailure, RunLane, SlackSurface};
 use automonique_daemon::{
     manage_config::{ManageConfig, ManageProfileApp},
     mcp_client::{McpCallResult, McpRegistry, McpToolDescriptor},
@@ -923,6 +923,21 @@ fn github_tool_decision(
     }
 }
 
+fn run_web_question_to_completion(
+    lane: &mut dyn RunLane,
+    prompt: &str,
+    profile: QuestionProfile,
+) -> Result<String, RunFailure> {
+    let mut answer = lane.run_question(prompt, profile)?;
+    if is_deferred_placeholder_answer(&answer) {
+        answer = lane.run_question(prompt, QuestionProfile::Operational)?;
+    }
+    if is_deferred_placeholder_answer(&answer) {
+        return Err(RunFailure::Failed);
+    }
+    Ok(answer)
+}
+
 struct LiveSiteContext {
     enabled_sites: String,
     manage_profiles: Option<String>,
@@ -1562,19 +1577,10 @@ impl WebIntegration {
                                 ManageToolDecision::None | ManageToolDecision::Snapshot { .. } => {
                                     let mut lane =
                                         self.lane.try_lock().map_err(|_| "chat_lane_busy")?;
-                                    let mut answer = lane
-                                        .run_question(&prompt, profile)
-                                        .map_err(|error| error.category())?;
-                                    if is_deferred_placeholder_answer(&answer) {
-                                        answer = lane
-                                            .run_question(&prompt, QuestionProfile::Operational)
-                                            .map_err(|error| error.category())?;
-                                    }
-                                    if is_deferred_placeholder_answer(&answer) {
-                                        answer = String::from(
-                                            "The provider returned another wait message instead of the completed answer. No background lookup is still running; please retry.",
-                                        );
-                                    }
+                                    let answer = run_web_question_to_completion(
+                                        &mut *lane, &prompt, profile,
+                                    )
+                                    .map_err(|error| error.category())?;
                                     (answer, None)
                                 }
                             }
@@ -1729,7 +1735,7 @@ impl WebIntegration {
         };
         let routed = {
             let mut lane = self.lane.try_lock().map_err(|_| "chat_lane_busy")?;
-            lane.run_question(&prompt, QuestionProfile::OperationalLookup)
+            run_web_question_to_completion(&mut *lane, &prompt, QuestionProfile::OperationalLookup)
                 .map_err(|error| error.category())?
         };
         let Some(plan) = parse_manage_tool_plan(&routed, server, &tools) else {
@@ -1885,8 +1891,12 @@ impl WebIntegration {
                         is_error,
                     )?;
                     let mut lane = self.lane.try_lock().map_err(|_| "chat_lane_busy")?;
-                    lane.run_question(&prompt, QuestionProfile::OperationalLookup)
-                        .map_err(|error| error.category())?
+                    run_web_question_to_completion(
+                        &mut *lane,
+                        &prompt,
+                        QuestionProfile::OperationalLookup,
+                    )
+                    .map_err(|error| error.category())?
                 }
                 McpCallResult::InputRequired { .. } => {
                     return Err("manage_action_additional_approval_refused");
@@ -3551,6 +3561,7 @@ pub fn serve(
 mod tests {
     use super::*;
     use automonique_github_connector::IssueLocator;
+    use std::collections::VecDeque;
     use std::net::Shutdown;
     use std::os::unix::fs::PermissionsExt;
 
@@ -3661,6 +3672,35 @@ mod tests {
                 locator.target(),
                 locator.number(),
             ))
+        }
+    }
+
+    struct FakeQuestionLane {
+        answers: VecDeque<String>,
+        profiles: Vec<QuestionProfile>,
+    }
+
+    impl FakeQuestionLane {
+        fn new(answers: &[&str]) -> Self {
+            Self {
+                answers: answers.iter().map(|answer| (*answer).to_owned()).collect(),
+                profiles: Vec::new(),
+            }
+        }
+    }
+
+    impl RunLane for FakeQuestionLane {
+        fn run(&mut self, _task: &str) -> Result<String, RunFailure> {
+            self.answers.pop_front().ok_or(RunFailure::Failed)
+        }
+
+        fn run_question(
+            &mut self,
+            _task: &str,
+            profile: QuestionProfile,
+        ) -> Result<String, RunFailure> {
+            self.profiles.push(profile);
+            self.answers.pop_front().ok_or(RunFailure::Failed)
         }
     }
 
@@ -4319,6 +4359,41 @@ mod tests {
         assert!(prompt.contains("reference=example/project#1009"));
         assert!(prompt.contains("comment_1_body_untrusted=Delivery verified"));
         assert!(prompt.contains("never ask the operator to wait"));
+    }
+
+    #[test]
+    fn dashboard_wait_placeholders_trigger_a_real_completion_pass() {
+        let mut lane = FakeQuestionLane::new(&[
+            "I'll search for that and get back to you.",
+            "The completed answer uses the available live context.",
+        ]);
+        let answer = run_web_question_to_completion(
+            &mut lane,
+            "bounded prompt",
+            QuestionProfile::Conversation,
+        )
+        .expect("completion pass");
+        assert_eq!(
+            answer,
+            "The completed answer uses the available live context."
+        );
+        assert_eq!(
+            lane.profiles,
+            [QuestionProfile::Conversation, QuestionProfile::Operational]
+        );
+
+        let mut incomplete = FakeQuestionLane::new(&[
+            "One moment while I check that.",
+            "I'll check that and answer later.",
+        ]);
+        assert_eq!(
+            run_web_question_to_completion(
+                &mut incomplete,
+                "bounded prompt",
+                QuestionProfile::Conversation,
+            ),
+            Err(RunFailure::Failed)
+        );
     }
 
     #[test]
