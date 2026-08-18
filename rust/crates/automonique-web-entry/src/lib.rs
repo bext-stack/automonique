@@ -3052,6 +3052,8 @@ mod tests {
             "theme-select",
             "text-scale-cycle",
             "text-scale-input",
+            "language-cycle",
+            "language-select",
             "sidebar-new-chat",
             "sidebar-collapse",
             "appearance-panel",
@@ -3070,6 +3072,7 @@ mod tests {
         assert!(DASHBOARD_JS.contains("monique-sidebar"));
         assert!(DASHBOARD_JS.contains("monique-density"));
         assert!(DASHBOARD_JS.contains("monique-start-view"));
+        assert!(DASHBOARD_JS.contains("monique-language"));
         for theme in [
             "midnight", "ocean", "forest", "monokai", "dracula", "nord", "sand", "rose", "contrast",
         ] {
@@ -3088,6 +3091,19 @@ mod tests {
         assert!(DASHBOARD_CSS.contains(".message-content pre code"));
         assert!(DASHBOARD_CSS.contains(".message-content table"));
         assert!(!DASHBOARD_JS.contains("innerHTML"));
+    }
+
+    #[test]
+    fn dashboard_ui_supports_persisted_english_and_french() {
+        assert!(DASHBOARD_HTML.contains("data-language=\"en\""));
+        assert!(DASHBOARD_HTML.contains("<option value=\"en\">English</option>"));
+        assert!(DASHBOARD_HTML.contains("<option value=\"fr\">Français</option>"));
+        assert!(DASHBOARD_JS.contains("const supportedLanguages = [\"en\", \"fr\"]"));
+        assert!(DASHBOARD_JS.contains("fr-FR"));
+        assert!(DASHBOARD_JS.contains("Passer au français"));
+        assert!(DASHBOARD_JS.contains("MutationObserver"));
+        assert!(DASHBOARD_JS.contains("data-i18n-skip"));
+        assert!(DASHBOARD_CSS.contains(".message-markdown"));
     }
 
     #[test]

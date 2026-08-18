@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Elastic-2.0 -->
 <!doctype html>
-<html lang="en" data-health="loading" data-theme="system" data-text-scale="comfortable" data-density="comfortable" data-motion="full" data-sidebar="expanded">
+<html lang="en" data-language="en" data-health="loading" data-theme="system" data-text-scale="comfortable" data-density="comfortable" data-motion="full" data-sidebar="expanded">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8,8 +8,8 @@
     <meta name="theme-color" id="theme-color" content="#0b0d10">
     <title>Monique</title>
     <link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=5">
-    <script src="/assets/dashboard.js?v=5" defer></script>
+    <link rel="stylesheet" href="/assets/dashboard.css?v=6">
+    <script src="/assets/dashboard.js?v=6" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -50,6 +50,7 @@
             <span class="status-dot" aria-hidden="true"></span>
             <strong id="global-health">Connecting</strong>
             <span id="global-observed">No snapshot</span>
+            <button class="appearance-button language-button" id="language-cycle" type="button" aria-label="Switch to French" title="Language">FR</button>
             <button class="appearance-button" id="text-scale-cycle" type="button" aria-label="Increase text size" title="Change text size">Aa</button>
             <button class="appearance-button" id="theme-cycle" type="button" aria-label="Open appearance settings" title="Appearance"><span class="theme-button-swatch" aria-hidden="true"></span></button>
             <button class="refresh-button" id="status-refresh" type="button" aria-label="Refresh operational status" title="Refresh status">↻</button>
@@ -271,6 +272,7 @@
         <p class="type-preview">Monique adapts to the way you prefer to read.</p>
       </div>
       <div class="interface-settings">
+        <label class="setting-row" for="language-select"><span><strong>Language</strong><small>Interface and navigation language</small></span><select id="language-select"><option value="en">English</option><option value="fr">Français</option></select></label>
         <div class="setting-block"><span>Interface density</span><div class="density-control" role="group" aria-label="Interface density"><button type="button" data-density-choice="compact">Compact</button><button type="button" data-density-choice="comfortable">Comfortable</button><button type="button" data-density-choice="spacious">Spacious</button></div></div>
         <label class="setting-row" for="startup-view"><span><strong>Start page</strong><small>Default view when no direct link is used</small></span><select id="startup-view"><option value="chat">Chat</option><option value="overview">Overview</option><option value="operations">AI Operations</option><option value="tickets">Tickets</option></select></label>
         <label class="setting-row" for="reduce-motion"><span><strong>Reduce motion</strong><small>Limit interface animation and transitions</small></span><input class="switch" id="reduce-motion" type="checkbox"></label>

@@ -3,9 +3,12 @@
 "use strict";
 
 const byId = (id) => document.getElementById(id);
-const count = (value) => Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString() : "—";
-const words = (value) => typeof value === "string" ? value.replaceAll("_", " ") : "—";
-const yesNo = (value) => value === true ? "YES" : value === false ? "NO" : "—";
+const supportedLanguages = ["en", "fr"];
+let currentLanguage = storedPreference("monique-language", supportedLanguages, navigator.language.toLowerCase().startsWith("fr") ? "fr" : "en");
+const localeTag = () => currentLanguage === "fr" ? "fr-FR" : "en-US";
+const count = (value) => Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString(localeTag()) : "—";
+const words = (value) => typeof value === "string" ? translatePhrase(value.replaceAll("_", " ")) : "—";
+const yesNo = (value) => value === true ? translatePhrase("YES") : value === false ? translatePhrase("NO") : "—";
 const safeMetric = (value) => Number.isSafeInteger(value) && value >= 0 ? value : 0;
 const statusHistory = [];
 let memorySnapshot = null;
@@ -19,6 +22,536 @@ let lastPulseChangeAt = null;
 let chatBusy = false;
 let newChatArmed = false;
 let newChatTimer = null;
+let lastStatusSnapshot = null;
+const frenchUi = Object.freeze({
+  "Skip to workspace": "Aller à l’espace de travail",
+  "Primary navigation": "Navigation principale",
+  "Open Monique chat": "Ouvrir la discussion avec Monique",
+  "Collapse sidebar": "Réduire la barre latérale",
+  "Expand sidebar": "Déployer la barre latérale",
+  "Toggle sidebar": "Afficher ou masquer la barre latérale",
+  "Close navigation": "Fermer la navigation",
+  "New conversation": "Nouvelle conversation",
+  "Confirm new conversation": "Confirmer la nouvelle conversation",
+  "Workspace": "Espace de travail",
+  "Operations sections": "Sections opérationnelles",
+  "Overview": "Vue d’ensemble",
+  "OVERVIEW": "VUE D’ENSEMBLE",
+  "Chat": "Discussion",
+  "CHAT": "DISCUSSION",
+  "Tickets": "Tickets",
+  "TICKETS": "TICKETS",
+  "Memory": "Mémoire",
+  "MEMORY": "MÉMOIRE",
+  "Configuration": "Configuration",
+  "CONFIGURATION": "CONFIGURATION",
+  "Appearance settings": "Paramètres d’apparence",
+  "Open appearance settings": "Ouvrir les paramètres d’apparence",
+  "Appearance": "Apparence",
+  "Personalize": "Personnaliser",
+  "PROTECTED": "PROTÉGÉ",
+  "Basic auth · TLS only": "Authentification basique · TLS uniquement",
+  "Connecting": "Connexion",
+  "No snapshot": "Aucun instantané",
+  "Switch to French": "Passer au français",
+  "Switch to English": "Passer à l’anglais",
+  "Language": "Langue",
+  "Interface and navigation language": "Langue de l’interface et de la navigation",
+  "English": "Anglais",
+  "Increase text size": "Augmenter la taille du texte",
+  "Decrease text size": "Réduire la taille du texte",
+  "Change text size": "Modifier la taille du texte",
+  "Text size": "Taille du texte",
+  "System": "Système",
+  "Paper": "Papier",
+  "Midnight": "Minuit",
+  "Ocean": "Océan",
+  "Forest": "Forêt",
+  "High contrast": "Contraste élevé",
+  "Contrast": "Contraste",
+  "Standard": "Standard",
+  "Comfortable": "Confortable",
+  "Large": "Grand",
+  "Extra large": "Très grand",
+  "Spacious": "Spacieux",
+  "Color theme": "Thème de couleurs",
+  "Close appearance settings": "Fermer les paramètres d’apparence",
+  "Monique adapts to the way you prefer to read.": "Monique s’adapte à votre confort de lecture.",
+  "Interface density": "Densité de l’interface",
+  "Start page": "Page de démarrage",
+  "Default view when no direct link is used": "Vue par défaut lorsqu’aucun lien direct n’est utilisé",
+  "Reduce motion": "Réduire les animations",
+  "Limit interface animation and transitions": "Limiter les animations et transitions de l’interface",
+  "Reset appearance defaults": "Rétablir les réglages d’apparence",
+  "Appearance is saved only in this browser.": "L’apparence est enregistrée uniquement dans ce navigateur.",
+  "Appearance settings reset.": "Les paramètres d’apparence ont été réinitialisés.",
+  "CONTROL PLANE / LIVE": "PLAN DE CONTRÔLE / TEMPS RÉEL",
+  "Operations overview": "Vue d’ensemble des opérations",
+  "A live, secret-safe view of Monique’s execution path and delivery certainty.": "Une vue en temps réel et sans secrets du parcours d’exécution de Monique et de la certitude de livraison.",
+  "Ask Monique": "Demander à Monique",
+  "Open Manage ↗": "Ouvrir Manage ↗",
+  "Establishing snapshot": "Établissement de l’instantané",
+  "Waiting for the daemon’s sanitized operational projection.": "En attente de la projection opérationnelle assainie du démon.",
+  "Operational counters": "Compteurs opérationnels",
+  "ACTIVE RUNS": "EXÉCUTIONS ACTIVES",
+  "executing now": "en cours maintenant",
+  "INBOX": "BOÎTE D’ENTRÉE",
+  "awaiting intake": "en attente d’admission",
+  "OUTBOX": "BOÎTE DE SORTIE",
+  "awaiting delivery": "en attente de livraison",
+  "RECONCILE": "RÉCONCILIATION",
+  "manual outcomes": "résultats manuels",
+  "AMBIGUOUS": "AMBIGU",
+  "uncertain effects": "effets incertains",
+  "ATTENTION": "ATTENTION",
+  "failed invariants": "invariants en échec",
+  "Suggested operational questions": "Questions opérationnelles suggérées",
+  "QUICK BRIEFS": "RÉSUMÉS RAPIDES",
+  "Explain health": "Expliquer l’état de santé",
+  "Read Slack activity": "Lire l’activité Slack",
+  "Review memory": "Examiner la mémoire",
+  "PIPELINE": "PIPELINE",
+  "Work path": "Parcours de travail",
+  "LIVE": "TEMPS RÉEL",
+  "Work pipeline": "Pipeline de travail",
+  "Intake": "Admission",
+  "Durable admission": "Admission durable",
+  "Execution": "Exécution",
+  "Fenced provider runs": "Exécutions fournisseur cloisonnées",
+  "Delivery": "Livraison",
+  "Idempotent effects": "Effets idempotents",
+  "Reconcile": "Réconcilier",
+  "Outcome certainty": "Certitude du résultat",
+  "INVARIANTS": "INVARIANTS",
+  "Runtime posture": "Posture d’exécution",
+  "CHECKING": "VÉRIFICATION",
+  "Daemon": "Démon",
+  "Provider lane": "Voie fournisseur",
+  "Accepting intake": "Admission ouverte",
+  "Telegram": "Telegram",
+  "Snapshot": "Instantané",
+  "CLIENT OBSERVATION WINDOW": "FENÊTRE D’OBSERVATION CLIENT",
+  "System pulse": "Pouls du système",
+  "COLLECTING": "COLLECTE",
+  "Recent operational queue levels": "Niveaux récents des files opérationnelles",
+  "Client-observed history for running work, inbox, and outbox counts.": "Historique observé côté client des travaux en cours et des files d’entrée et de sortie.",
+  "Running": "En cours",
+  "Inbox": "Entrée",
+  "Outbox": "Sortie",
+  "Samples": "Échantillons",
+  "Window": "Fenêtre",
+  "Last change": "Dernier changement",
+  "Just started": "À l’instant",
+  "Waiting": "En attente",
+  "Chat with Monique": "Discuter avec Monique",
+  "Contained assistant": "Assistante cloisonnée",
+  "Conversation context": "Contexte de conversation",
+  "memory": "mémoire",
+  "live": "temps réel",
+  "last turn": "dernier échange",
+  "Actions ready": "Actions disponibles",
+  "＋ New chat": "＋ Nouvelle discussion",
+  "What can I help with?": "Comment puis-je vous aider ?",
+  "How can I help?": "Comment puis-je vous aider ?",
+  "Ask naturally. I can reason with reviewed memory, use configured live sources, and prepare actions for your approval.": "Posez votre question naturellement. Je peux raisonner à partir de la mémoire vérifiée, utiliser les sources en temps réel configurées et préparer des actions soumises à votre approbation.",
+  "Ask naturally. I can use reviewed memory, live sources, and prepare actions for your approval.": "Posez votre question naturellement. Je peux utiliser la mémoire vérifiée, les sources en temps réel et préparer des actions soumises à votre approbation.",
+  "Explain system health": "Expliquer l’état du système",
+  "Review live status and surface risks": "Examiner l’état en temps réel et signaler les risques",
+  "Catch me up": "Me mettre à jour",
+  "Read recent configured Slack context": "Lire le contexte Slack configuré récent",
+  "Explore memory": "Explorer la mémoire",
+  "Use reviewed durable evidence": "Utiliser des éléments durables vérifiés",
+  "Work in Manage": "Travailler dans Manage",
+  "Prepare a reviewable AI Operations action": "Préparer une action AI Operations vérifiable",
+  "Message Monique…": "Écrire à Monique…",
+  "Message Monique": "Écrire à Monique",
+  "Route": "Profil",
+  "Fast conversation": "Conversation rapide",
+  "Operational reasoning": "Raisonnement opérationnel",
+  "send": "envoyer",
+  "Ready": "Prêt",
+  "Send message": "Envoyer le message",
+  "Monique can make mistakes. Durable memory and live sources are labeled when they support an answer.": "Monique peut se tromper. La mémoire durable et les sources en temps réel sont signalées lorsqu’elles étayent une réponse.",
+  "DISCOVERED / AUTHORITY-AWARE / LIVE": "DÉCOUVERT / AUTORITÉ MAÎTRISÉE / TEMPS RÉEL",
+  "Work directly with the connected control plane. Safe reads are live; every mutation remains staged for explicit approval.": "Travaillez directement avec le plan de contrôle connecté. Les lectures sûres sont immédiates ; chaque modification reste en attente d’une approbation explicite.",
+  "Refresh": "Actualiser",
+  "Refresh operational status": "Actualiser l’état opérationnel",
+  "Refresh status": "Actualiser l’état",
+  "Open AI Operations ↗": "Ouvrir AI Operations ↗",
+  "Connecting to AI Operations": "Connexion à AI Operations",
+  "Discovering the live capability catalog…": "Découverte du catalogue de fonctionnalités en temps réel…",
+  "AI Operations capability counts": "Compteurs de fonctionnalités AI Operations",
+  "TOOLS": "OUTILS",
+  "discovered capabilities": "fonctionnalités découvertes",
+  "SAFE READS": "LECTURES SÛRES",
+  "available immediately": "disponibles immédiatement",
+  "APPROVAL ACTIONS": "ACTIONS À APPROUVER",
+  "staged before execution": "préparées avant exécution",
+  "PENDING": "EN ATTENTE",
+  "awaiting your decision": "en attente de votre décision",
+  "LIVE MCP CATALOG": "CATALOGUE MCP EN TEMPS RÉEL",
+  "Connected capabilities": "Fonctionnalités connectées",
+  "Operations": "Opérations",
+  "Deployments": "Déploiements",
+  "General": "Général",
+  "Read Only": "Lecture seule",
+  "DISCOVERING": "DÉCOUVERTE",
+  "Loading AI Operations capabilities…": "Chargement des fonctionnalités AI Operations…",
+  "CONTROL BOUNDARY": "PÉRIMÈTRE DE CONTRÔLE",
+  "How actions run": "Déroulement des actions",
+  "Discover": "Découvrir",
+  "Only tools advertised by the live control plane appear here.": "Seuls les outils annoncés par le plan de contrôle en temps réel apparaissent ici.",
+  "Review": "Examiner",
+  "Mutations show exact arguments and impact before anything runs.": "Les modifications affichent les arguments exacts et leur impact avant toute exécution.",
+  "Approve": "Approuver",
+  "Your one-time decision authorizes one exact action.": "Votre décision ponctuelle autorise une seule action précise.",
+  "Ask Monique to operate": "Demander à Monique d’agir",
+  "Plan with the live catalog →": "Planifier avec le catalogue en temps réel →",
+  "LIVE / TRIAGED / ACTIONABLE": "TEMPS RÉEL / TRIÉ / ACTIONNABLE",
+  "A focused queue from AI Operations, with live status and safe handoff into Monique for follow-up.": "Une file ciblée issue d’AI Operations, avec un état en temps réel et un transfert sûr vers Monique pour le suivi.",
+  "Review with Monique": "Examiner avec Monique",
+  "Ticket counts": "Compteurs de tickets",
+  "TOTAL": "TOTAL",
+  "OPEN": "OUVERTS",
+  "IN PROGRESS": "EN COURS",
+  "BLOCKED": "BLOQUÉS",
+  "URGENT": "URGENTS",
+  "Filter tickets": "Filtrer les tickets",
+  "All": "Tous",
+  "Open": "Ouvert",
+  "In progress": "En cours",
+  "Blocked": "Bloqué",
+  "Done": "Terminé",
+  "Connecting to ticket intake…": "Connexion à la file de tickets…",
+  "Loading the live ticket queue…": "Chargement de la file de tickets en temps réel…",
+  "TYPED / REVISIONED / PROVENANCE-BOUND": "TYPÉ / VERSIONNÉ / PROVENANCE LIÉE",
+  "Memory system": "Système de mémoire",
+  "Inspect the evidence Monique can retrieve without exposing raw private state.": "Examinez les éléments que Monique peut récupérer sans exposer l’état privé brut.",
+  "Search memory evidence": "Rechercher dans les éléments de mémoire",
+  "Clear memory search": "Effacer la recherche en mémoire",
+  "Search": "Rechercher",
+  "ACTIVE": "ACTIFS",
+  "PROPOSALS": "PROPOSITIONS",
+  "SUPERSEDED": "REMPLACÉS",
+  "MESSAGES": "MESSAGES",
+  "Evidence graph": "Graphe des éléments",
+  "Records": "Enregistrements",
+  "Kind": "Type",
+  "All evidence": "Tous les éléments",
+  "Loading canonical store…": "Chargement du stockage canonique…",
+  "Typed memory evidence graph": "Graphe typé des éléments de mémoire",
+  "EFFECTIVE / SECRET-SAFE PROJECTION": "PROJECTION EFFECTIVE / SANS SECRETS",
+  "Effective capabilities, boundaries, and limits—not credentials or private coordinates.": "Fonctionnalités, limites et périmètres effectifs — sans identifiants ni coordonnées privées.",
+  "SECRETS CONCEALED": "SECRETS MASQUÉS",
+  "Values are allowlisted.": "Les valeurs sont explicitement autorisées.",
+  "Credentials, account identifiers, filesystem locations and provider payloads are structurally absent from this API.": "Les identifiants, références de compte, emplacements de fichiers et charges utiles fournisseur sont structurellement absents de cette API.",
+  "Loading effective configuration…": "Chargement de la configuration effective…",
+  "REFRESH": "ACTUALISER",
+  "NO VERIFIED SNAPSHOT": "AUCUN INSTANTANÉ VÉRIFIÉ",
+  "YES": "OUI",
+  "NO": "NON",
+  "WAIT": "ATTENTE",
+  "REVIEW": "À EXAMINER",
+  "ACTIVE": "ACTIF",
+  "CLEAR": "CLAIR",
+  "AVAILABLE": "DISPONIBLE",
+  "UNAVAILABLE": "INDISPONIBLE",
+  "STALE": "PÉRIMÉ",
+  "CURRENT": "ACTUEL",
+  "operational": "opérationnel",
+  "degraded": "dégradé",
+  "unavailable": "indisponible",
+  "ready": "prêt",
+  "All operational invariants hold": "Tous les invariants opérationnels sont respectés",
+  "Provider, intake, delivery certainty and reconciliation are clear.": "Le fournisseur, l’admission, la certitude de livraison et la réconciliation sont au clair.",
+  "runtime health": "santé de l’exécution",
+  "stale snapshot": "instantané périmé",
+  "reconciliation": "réconciliation",
+  "ambiguous effects": "effets ambigus",
+  "provider lane": "voie fournisseur",
+  "intake closed": "admission fermée",
+  "Operational status refreshed.": "L’état opérationnel a été actualisé.",
+  "The operational snapshot is unavailable.": "L’instantané opérationnel est indisponible.",
+  "All evidence": "Tous les éléments",
+  "No memory evidence matches this view.": "Aucun élément de mémoire ne correspond à cette vue.",
+  "No evidence nodes to display.": "Aucun nœud d’élément à afficher.",
+  "Searching canonical memory…": "Recherche dans la mémoire canonique…",
+  "Loading canonical memory…": "Chargement de la mémoire canonique…",
+  "Memory retrieval is unavailable.": "La récupération de la mémoire est indisponible.",
+  "AI Operations connected": "AI Operations connecté",
+  "Live tools are discovered from the authenticated control plane.": "Les outils en temps réel sont découverts depuis le plan de contrôle authentifié.",
+  "AI Operations is not attached": "AI Operations n’est pas connecté",
+  "Configure one same-origin Manage MCP server to enable live capabilities.": "Configurez un serveur MCP Manage de même origine pour activer les fonctionnalités en temps réel.",
+  "AI Operations is unavailable": "AI Operations est indisponible",
+  "The configured control plane did not return a valid capability catalog.": "Le plan de contrôle configuré n’a pas renvoyé de catalogue de fonctionnalités valide.",
+  "AI Operations is busy": "AI Operations est occupé",
+  "Another contained request is using the live tool connection. Try again shortly.": "Une autre requête cloisonnée utilise la connexion aux outils. Réessayez dans un instant.",
+  "AI Operations state unknown": "État d’AI Operations inconnu",
+  "Refresh to discover the current control-plane state.": "Actualisez pour connaître l’état actuel du plan de contrôle.",
+  "No AI Operations tools are currently available to this dashboard.": "Aucun outil AI Operations n’est actuellement disponible dans ce tableau de bord.",
+  "SAFE READ": "LECTURE SÛRE",
+  "APPROVAL": "APPROBATION",
+  "Live AI Operations capability.": "Fonctionnalité AI Operations en temps réel.",
+  "Details required": "Détails requis",
+  "Ready to plan": "Prêt à planifier",
+  "Use with Monique →": "Utiliser avec Monique →",
+  "Triaging": "Triage",
+  "Closed": "Fermé",
+  "Unknown": "Inconnu",
+  "The connected ticket queue is currently empty.": "La file de tickets connectée est actuellement vide.",
+  "AI Operations is connected, but it does not advertise a zero-input read-only ticket list.": "AI Operations est connecté, mais ne propose aucune liste de tickets en lecture seule sans paramètres.",
+  "The ticket source needs additional scope. Ask Monique to retrieve the exact queue you need.": "La source de tickets nécessite un périmètre supplémentaire. Demandez à Monique de récupérer la file précise dont vous avez besoin.",
+  "The live ticket source is temporarily unavailable.": "La source de tickets en temps réel est temporairement indisponible.",
+  "Attach AI Operations to load the live ticket queue.": "Connectez AI Operations pour charger la file de tickets en temps réel.",
+  "No tickets match this filter.": "Aucun ticket ne correspond à ce filtre.",
+  "Ask Monique about tickets": "Interroger Monique sur les tickets",
+  "Unassigned": "Non attribué",
+  "Open ↗": "Ouvrir ↗",
+  "AUTHORITY BOUNDED": "AUTORITÉ LIMITÉE",
+  "NOT ATTACHED": "NON CONNECTÉ",
+  "AI Operations and tickets refreshed.": "AI Operations et les tickets ont été actualisés.",
+  "AI Operations unavailable": "AI Operations indisponible",
+  "Ticket intake unavailable": "File de tickets indisponible",
+  "AI Operations could not be refreshed.": "AI Operations n’a pas pu être actualisé.",
+  "Web boundary": "Périmètre web",
+  "Providers": "Fournisseurs",
+  "Connectors": "Connecteurs",
+  "CONFIGURED": "CONFIGURÉ",
+  "OFF": "DÉSACTIVÉ",
+  "Effective configuration refreshed.": "La configuration effective a été actualisée.",
+  "Configuration unavailable": "Configuration indisponible",
+  "Configuration projection is unavailable.": "La projection de configuration est indisponible.",
+  "YOU": "VOUS",
+  "OPERATOR": "OPÉRATEUR",
+  "COPY": "COPIER",
+  "COPIED": "COPIÉ",
+  "Copy is unavailable in this browser.": "La copie est indisponible dans ce navigateur.",
+  "APPROVAL REQUIRED": "APPROBATION REQUISE",
+  "Review Manage action": "Examiner l’action Manage",
+  "Review this action before it runs.": "Examinez cette action avant son exécution.",
+  "This action can change external state.": "Cette action peut modifier un état externe.",
+  "Deny": "Refuser",
+  "Approve and run": "Approuver et exécuter",
+  "Running approved action…": "Exécution de l’action approuvée…",
+  "Recording denial…": "Enregistrement du refus…",
+  "Action completed": "Action terminée",
+  "Action denied": "Action refusée",
+  "The approved action returned a result.": "L’action approuvée a renvoyé un résultat.",
+  "The action was denied.": "L’action a été refusée.",
+  "Action refused": "Action rejetée",
+  "The action was not completed.": "L’action n’a pas été exécutée.",
+  "Monique is working": "Monique travaille",
+  "This Manage action is still awaiting your decision.": "Cette action Manage attend toujours votre décision.",
+  "History unavailable": "Historique indisponible",
+  "Durable chat history is unavailable.": "L’historique durable de la discussion est indisponible.",
+  "Monique is finishing another contained turn. Try again in a moment.": "Monique termine un autre échange cloisonné. Réessayez dans un instant.",
+  "The configured Slack read is temporarily unavailable.": "La lecture Slack configurée est temporairement indisponible.",
+  "The Slack read surface is temporarily busy.": "La surface de lecture Slack est temporairement occupée.",
+  "Durable memory is temporarily unavailable.": "La mémoire durable est temporairement indisponible.",
+  "This turn could not be retained safely, so it was not run.": "Cet échange n’a pas pu être conservé en toute sécurité et n’a donc pas été exécuté.",
+  "Manage AI Operations is temporarily unavailable. No action was run.": "Manage AI Operations est temporairement indisponible. Aucune action n’a été exécutée.",
+  "That Manage action is no longer pending. Nothing was run.": "Cette action Manage n’est plus en attente. Rien n’a été exécuté.",
+  "That Manage action expired. Ask Monique to prepare it again.": "Cette action Manage a expiré. Demandez à Monique de la préparer à nouveau.",
+  "Manage requested another approval step, so execution stopped.": "Manage a demandé une approbation supplémentaire ; l’exécution a donc été arrêtée.",
+  "Monique is working…": "Monique travaille…",
+  "Turn refused": "Échange refusé",
+  "Monique could not complete that turn.": "Monique n’a pas pu terminer cet échange.",
+  "Wait for the current turn to finish before starting a new conversation.": "Attendez la fin de l’échange actuel avant de démarrer une nouvelle conversation.",
+  "The previous durable conversation was archived. Long-term memory remains available.": "La conversation durable précédente a été archivée. La mémoire à long terme reste disponible.",
+  "New durable session": "Nouvelle session durable",
+  "A new durable conversation is ready.": "Une nouvelle conversation durable est prête.",
+  "The current conversation was not changed.": "La conversation actuelle n’a pas été modifiée.",
+  "Explain the current operational health and any risks.": "Explique l’état opérationnel actuel et les risques éventuels.",
+  "Summarize the latest relevant Slack messages.": "Résume les derniers messages Slack pertinents.",
+  "What do you remember that is most relevant right now? Cite memory references.": "Que retiens-tu de plus pertinent actuellement ? Cite les références de mémoire.",
+  "Show me the useful actions available in Manage AI Operations and help me choose the right one.": "Présente-moi les actions utiles disponibles dans Manage AI Operations et aide-moi à choisir la bonne.",
+  "Explain Monique’s current operational health and name anything that needs attention.": "Explique l’état opérationnel actuel de Monique et signale tout élément nécessitant une attention.",
+  "Summarize the latest relevant Slack messages. Ask me which configured channel if the target is ambiguous.": "Résume les derniers messages Slack pertinents. Demande-moi quel canal configuré utiliser si la cible est ambiguë.",
+  "What durable memory is most relevant to the current operational state? Cite its memory references.": "Quelle mémoire durable est la plus pertinente pour l’état opérationnel actuel ? Cite ses références.",
+  "Show me the most useful AI Operations actions available right now and help me choose one.": "Présente-moi les actions AI Operations les plus utiles actuellement et aide-moi à en choisir une.",
+  "Review the current ticket queue, summarize priorities, and recommend the next action.": "Examine la file de tickets actuelle, résume les priorités et recommande la prochaine action.",
+  "Inspect the available AI Operations ticket capabilities and help me retrieve or review the right ticket queue.": "Examine les fonctionnalités de tickets AI Operations disponibles et aide-moi à récupérer ou examiner la bonne file.",
+  "Canonical Host": "Hôte canonique",
+  "Authentication": "Authentification",
+  "Transport Security": "Sécurité du transport",
+  "Bind Scope": "Périmètre d’écoute",
+  "Status Refresh Seconds": "Actualisation de l’état en secondes",
+  "Request Header Limit Bytes": "Limite des en-têtes de requête en octets",
+  "Request Body Limit Bytes": "Limite du corps de requête en octets",
+  "Worker Count": "Nombre de workers",
+  "Queue Depth": "Profondeur de file",
+  "Rate Limit Per Minute": "Limite de débit par minute",
+  "Store": "Stockage",
+  "Retrieval": "Récupération",
+  "Tenant": "Espace locataire",
+  "Raw Message Retention Days": "Conservation des messages bruts en jours",
+  "Writable History": "Historique inscriptible",
+  "Primary Configured": "Fournisseur principal configuré",
+  "Conversation Configured": "Conversation configurée",
+  "Egress Policy Configured": "Politique de sortie configurée",
+  "Support": "Assistance",
+  "Mcp": "MCP",
+  "Profile Source Configured": "Source de profil configurée",
+  "Ai Operations Worker Configured": "Worker AI Operations configuré",
+  "Agent Tools Configured": "Outils d’agent configurés",
+  "Dashboard Authority": "Autorité du tableau de bord",
+  "Console": "Console",
+  "High": "Élevée",
+  "Medium": "Moyenne",
+  "Low": "Faible",
+  "Normal": "Normale",
+  "Urgent": "Urgente",
+  "just now": "à l’instant",
+  "unknown": "inconnu",
+  "conversation": "conversation",
+  "sandbox enforceable lane wired": "voie cloisonnée opérationnelle",
+  "polling live": "scrutation active",
+  "discovered tools / explicit approval": "outils découverts / approbation explicite",
+  "contained daemon run lane": "voie d’exécution cloisonnée du démon",
+  "same-origin authenticated API": "API authentifiée de même origine",
+  "reviewed typed evidence": "éléments typés vérifiés",
+  "configured": "configuré",
+});
+const localizedTextSources = new WeakMap();
+const localizedAttributeSources = new WeakMap();
+const localizedAttributes = ["aria-label", "placeholder", "title", "data-chat-prompt", "data-open-chat"];
+let localizingUi = false;
+
+function translatePhraseForFrench(value) {
+  const source = String(value);
+  if (frenchUi[source]) return frenchUi[source];
+  const replacements = [
+    [/^Appearance\. Current theme: (.+)$/, (match) => `Apparence. Thème actuel : ${translatePhraseForFrench(match[1])}`],
+    [/^Appearance · (.+)$/, (match) => `Apparence · ${translatePhraseForFrench(match[1])}`],
+    [/^Text size: (.+)\. Increase text size$/, (match) => `Taille du texte : ${translatePhraseForFrench(match[1])}. Augmenter la taille du texte`],
+    [/^Updated (.+)$/, (match) => `Mis à jour ${match[1]}`],
+    [/^(\d+) seconds$/, (match) => `${match[1]} secondes`],
+    [/^(\d+)s ago$/, (match) => `il y a ${match[1]} s`],
+    [/^(\d+)m ago$/, (match) => `il y a ${match[1]} min`],
+    [/^(\d+)h ago$/, (match) => `il y a ${match[1]} h`],
+    [/^(\d+) invariants? need attention$/, (match) => `${match[1]} invariant${match[1] === "1" ? " requiert" : "s requièrent"} votre attention`],
+    [/^(.+?) active$/, (match) => `${match[1]} en cours`],
+    [/^(.+?) pending$/, (match) => `${match[1]} en attente`],
+    [/^(.+?) of (.+?) tickets$/, (match) => `${match[1]} ticket${match[1] === "1" ? "" : "s"} sur ${match[2]}`],
+    [/^(.+?) evidence records?(?: for “(.+)”)?$/, (match) => `${match[1]} enregistrement${match[1] === "1" ? "" : "s"} d’éléments${match[2] ? ` pour « ${match[2]} »` : ""}`],
+    [/^Memory unavailable · (.+)$/, (match) => `Mémoire indisponible · ${match[1]}`],
+    [/^Open (.+) in the record list$/, (match) => `Ouvrir ${match[1]} dans la liste des enregistrements`],
+    [/^Assigned to (.+?)(?: · Updated (.+))?$/, (match) => `Attribué à ${match[1]}${match[2] ? ` · Mis à jour ${match[2]}` : ""}`],
+    [/^Unassigned(?: · Updated (.+))?$/, (match) => `Non attribué${match[1] ? ` · Mis à jour ${match[1]}` : ""}`],
+    [/^(.+) priority$/, (match) => `Priorité ${translatePhraseForFrench(match[1]).toLowerCase()}`],
+    [/^(\S+) LIVE$/, (match) => `${match[1]} EN TEMPS RÉEL`],
+    [/^LIVE · (.+)$/, (match) => `TEMPS RÉEL · ${translatePhraseForFrench(match[1])}`],
+    [/^Monique is working · (.+)$/, (match) => `Monique travaille · ${match[1]}`],
+    [/^(.+) · retained$/, (match) => `${translatePhraseForFrench(match[1])} · conservé`],
+    [/^New chat refused · (.+)$/, (match) => `Nouvelle discussion refusée · ${match[1]}`],
+    [/^The contained conversation lane refused this turn \((.+)\)\.$/, (match) => `La voie de conversation cloisonnée a refusé cet échange (${match[1]}).`],
+    [/^Help me use the AI Operations capability “(.+)”\. Explain what it does, collect any required details, and stage any mutation for my approval\.$/, (match) => `Aide-moi à utiliser la fonctionnalité AI Operations « ${match[1]} ». Explique son rôle, recueille les détails nécessaires et prépare toute modification pour mon approbation.`],
+    [/^Review ticket (.+): “(.+)”\. Summarize its current state and recommend the next action\.$/, (match) => `Examine le ticket ${match[1]} : « ${match[2]} ». Résume son état actuel et recommande la prochaine action.`],
+  ];
+  for (const [pattern, replacement] of replacements) {
+    const match = source.match(pattern);
+    if (match) return replacement(match);
+  }
+  return source;
+}
+
+function translatePhrase(value) {
+  return currentLanguage === "fr" ? translatePhraseForFrench(value) : String(value);
+}
+
+function translateSpacingForFrench(value) {
+  const match = String(value).match(/^(\s*)(.*?)(\s*)$/s);
+  return `${match[1]}${translatePhraseForFrench(match[2])}${match[3]}`;
+}
+
+function translateSpacing(value) {
+  return currentLanguage === "fr" ? translateSpacingForFrench(value) : String(value);
+}
+
+function localizationSkipped(node) {
+  const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+  return Boolean(element?.closest("[data-i18n-skip]"));
+}
+
+function localizeTextNode(node) {
+  if (localizationSkipped(node) || !node.nodeValue?.trim()) return;
+  const current = node.nodeValue;
+  let source = localizedTextSources.get(node);
+  if (source === undefined || (current !== source && current !== translateSpacingForFrench(source))) {
+    source = current;
+    localizedTextSources.set(node, source);
+  }
+  const localized = currentLanguage === "fr" ? translateSpacing(source) : source;
+  if (node.nodeValue !== localized) node.nodeValue = localized;
+}
+
+function localizeAttribute(element, attribute) {
+  if (localizationSkipped(element) || !element.hasAttribute(attribute)) return;
+  let sources = localizedAttributeSources.get(element);
+  if (!sources) {
+    sources = new Map();
+    localizedAttributeSources.set(element, sources);
+  }
+  const current = element.getAttribute(attribute);
+  let source = sources.get(attribute);
+  if (source === undefined || (current !== source && current !== translatePhraseForFrench(source))) {
+    source = current;
+    sources.set(attribute, source);
+  }
+  const localized = currentLanguage === "fr" ? translatePhrase(source) : source;
+  if (current !== localized) element.setAttribute(attribute, localized);
+}
+
+function localizeUi(root = document.body) {
+  if (!root || localizingUi) return;
+  localizingUi = true;
+  try {
+    const base = root.nodeType === Node.TEXT_NODE ? root.parentElement : root;
+    if (!base) return;
+    const walker = document.createTreeWalker(base, NodeFilter.SHOW_TEXT);
+    if (root.nodeType === Node.TEXT_NODE) localizeTextNode(root);
+    else while (walker.nextNode()) localizeTextNode(walker.currentNode);
+    const elements = [];
+    if (base.nodeType === Node.ELEMENT_NODE) elements.push(base);
+    elements.push(...base.querySelectorAll("*"));
+    elements.forEach((element) => localizedAttributes.forEach((attribute) => localizeAttribute(element, attribute)));
+  } finally {
+    localizingUi = false;
+  }
+}
+
+function applyLanguage(language, persist = true) {
+  currentLanguage = supportedLanguages.includes(language) ? language : "en";
+  document.documentElement.lang = currentLanguage;
+  document.documentElement.dataset.language = currentLanguage;
+  byId("language-select").value = currentLanguage;
+  const target = currentLanguage === "en" ? "fr" : "en";
+  byId("language-cycle").textContent = target.toUpperCase();
+  byId("language-cycle").setAttribute("aria-label", target === "fr" ? "Switch to French" : "Switch to English");
+  byId("language-cycle").title = "Language";
+  if (persist) savePreference("monique-language", currentLanguage);
+  if (lastStatusSnapshot) renderStatus(lastStatusSnapshot);
+  else {
+    updateObservedAge();
+    renderPulse();
+  }
+  if (memorySnapshot) renderSelectedMemory();
+  if (operationsSnapshot) renderOperations(operationsSnapshot);
+  document.querySelectorAll(".message-meta[data-created-at]").forEach(renderMessageMeta);
+  localizeUi(document.body);
+}
+
+function observeLocalization() {
+  const observer = new MutationObserver((mutations) => {
+    if (localizingUi) return;
+    mutations.forEach((mutation) => {
+      if (mutation.type === "characterData") localizeUi(mutation.target);
+      else if (mutation.type === "attributes") localizeUi(mutation.target);
+      else mutation.addedNodes.forEach((node) => localizeUi(node));
+    });
+  });
+  observer.observe(document.body, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: localizedAttributes });
+}
 const themeNames = {
   system: "System",
   dark: "Carbon",
@@ -153,7 +686,11 @@ applySidebar(storedPreference("monique-sidebar", sidebarStates, "expanded"), fal
 applyDensity(storedPreference("monique-density", densities, "comfortable"), false);
 applyMotion(storedPreference("monique-motion", motionModes, "full"), false);
 applyStartupView(storedPreference("monique-start-view", startupViews, "chat"), false);
+applyLanguage(currentLanguage, false);
+observeLocalization();
 
+byId("language-select").addEventListener("change", (event) => applyLanguage(event.target.value));
+byId("language-cycle").addEventListener("click", () => applyLanguage(currentLanguage === "en" ? "fr" : "en"));
 byId("theme-select").addEventListener("change", (event) => applyTheme(event.target.value));
 document.querySelectorAll("[data-theme-choice]").forEach((button) => button.addEventListener("click", () => applyTheme(button.dataset.themeChoice)));
 byId("text-scale-cycle").addEventListener("click", () => {
@@ -284,7 +821,7 @@ function updateObservedAge() {
   }
   const observed = new Date(lastObservedMs);
   byId("global-observed").textContent = `Updated ${relativeDuration(Date.now() - lastObservedMs)}`;
-  byId("global-observed").title = observed.toLocaleString();
+  byId("global-observed").title = observed.toLocaleString(localeTag());
 }
 
 function recordStatus(status) {
@@ -327,6 +864,7 @@ function renderPulse() {
 }
 
 function renderStatus(status) {
+  lastStatusSnapshot = status;
   const health = ["operational", "degraded", "unavailable"].includes(status.health) ? status.health : "unavailable";
   document.documentElement.dataset.health = health;
   const issues = attention(status);
@@ -461,6 +999,7 @@ function renderMemoryList(entries) {
     const ref = document.createElement("strong");
     ref.textContent = entry.reference;
     const text = document.createElement("p");
+    text.setAttribute("data-i18n-skip", "");
     text.textContent = entry.content;
     const meta = document.createElement("div");
     meta.className = "record-meta";
@@ -491,6 +1030,7 @@ function renderMemoryGraph(entries) {
     const reference = document.createElement("span");
     reference.textContent = `${entry.reference} / ${words(entry.kind).toUpperCase()}`;
     const content = document.createElement("strong");
+    content.setAttribute("data-i18n-skip", "");
     content.textContent = entry.content;
     const metadata = document.createElement("small");
     metadata.textContent = `${entry.confidence / 10}% · ${entry.provenance} · R${entry.revision}`;
@@ -577,8 +1117,10 @@ function renderOperationsCatalog(tools) {
     authority.textContent = tool.authority === "read_only" ? "SAFE READ" : "APPROVAL";
     head.append(category, authority);
     const title = document.createElement("strong");
+    title.setAttribute("data-i18n-skip", "");
     title.textContent = operationLabel(tool.name);
     const description = document.createElement("p");
+    if (tool.description) description.setAttribute("data-i18n-skip", "");
     description.textContent = tool.description || "Live AI Operations capability.";
     const footer = document.createElement("div");
     const input = document.createElement("small");
@@ -636,7 +1178,7 @@ function renderTickets() {
   const visible = filteredTickets();
   const health = operationsSnapshot?.tickets?.health || "not_attached";
   byId("tickets-state").textContent = health === "ready"
-    ? `${visible.length.toLocaleString()} of ${tickets.length.toLocaleString()} tickets`
+    ? `${visible.length.toLocaleString(localeTag())} of ${tickets.length.toLocaleString(localeTag())} tickets`
     : ticketEmptyMessage(health);
   const root = byId("ticket-list");
   root.replaceChildren();
@@ -666,6 +1208,7 @@ function renderTickets() {
     const body = document.createElement("div");
     body.className = "ticket-body";
     const title = document.createElement("strong");
+    title.setAttribute("data-i18n-skip", "");
     title.textContent = ticket.title;
     const meta = document.createElement("small");
     meta.textContent = [ticket.assignee ? `Assigned to ${ticket.assignee}` : "Unassigned", ticket.updated_at ? `Updated ${ticket.updated_at}` : null].filter(Boolean).join(" · ");
@@ -816,6 +1359,15 @@ async function loadConfiguration(force = false) {
 }
 
 byId("configuration-refresh").addEventListener("click", () => loadConfiguration(true));
+
+function renderMessageMeta(meta) {
+  const createdAt = Number(meta.dataset.createdAt);
+  const durationMs = Number(meta.dataset.durationMs);
+  const role = meta.dataset.role === "user" ? "user" : "assistant";
+  const duration = Number.isSafeInteger(durationMs) && durationMs >= 0 ? ` · ${durationMs.toLocaleString(localeTag())}ms` : "";
+  const time = new Date(createdAt).toLocaleTimeString(localeTag(), { hour: "2-digit", minute: "2-digit" });
+  meta.textContent = `${role === "user" ? "OPERATOR" : "MONIQUE"} · ${time}${duration}`;
+}
 
 function safeMarkdownUrl(value) {
   const raw = String(value).trim();
@@ -1100,12 +1652,18 @@ function appendMessage(role, content, createdAt = Date.now(), details = {}) {
   avatar.textContent = role === "user" ? "YOU" : "M";
   const body = document.createElement("div");
   body.className = "message-content";
-  body.append(renderMarkdown(content));
+  const markdown = document.createElement("div");
+  markdown.className = "message-markdown";
+  if (!details.error && !details.localized) markdown.setAttribute("data-i18n-skip", "");
+  markdown.append(renderMarkdown(content));
+  body.append(markdown);
   if (role !== "user" && details.action) body.append(createActionCard(details.action));
   const meta = document.createElement("div");
   meta.className = "message-meta";
-  const duration = Number.isSafeInteger(details.durationMs) ? ` · ${details.durationMs.toLocaleString()}ms` : "";
-  meta.textContent = `${role === "user" ? "OPERATOR" : "MONIQUE"} · ${new Date(createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}${duration}`;
+  meta.dataset.createdAt = String(createdAt);
+  meta.dataset.role = role === "user" ? "user" : "assistant";
+  if (Number.isSafeInteger(details.durationMs)) meta.dataset.durationMs = String(details.durationMs);
+  renderMessageMeta(meta);
   body.append(meta);
   if (role !== "user") {
     const tools = document.createElement("div");
@@ -1145,11 +1703,14 @@ function createActionCard(action) {
   const eyebrow = document.createElement("span");
   eyebrow.textContent = "APPROVAL REQUIRED";
   const title = document.createElement("strong");
-  title.textContent = String(action.title || "Review Manage action");
+  if (action.title) title.setAttribute("data-i18n-skip", "");
+  title.textContent = action.title ? String(action.title) : "Review Manage action";
   const detail = document.createElement("p");
-  detail.textContent = String(action.detail || "Review this action before it runs.");
+  if (action.detail) detail.setAttribute("data-i18n-skip", "");
+  detail.textContent = action.detail ? String(action.detail) : "Review this action before it runs.";
   const impact = document.createElement("small");
-  impact.textContent = String(action.impact || "This action can change external state.");
+  if (action.impact) impact.setAttribute("data-i18n-skip", "");
+  impact.textContent = action.impact ? String(action.impact) : "This action can change external state.";
   const controls = document.createElement("div");
   controls.className = "action-controls";
   const deny = document.createElement("button");
@@ -1186,7 +1747,7 @@ async function resolveChatAction(card, decision) {
     const sources = Array.isArray(answer.live_sources) ? answer.live_sources : [];
     appendMessage("assistant", answer.answer, Date.now(), { sources, durationMs: answer.duration_ms, action: answer.action });
     byId("chat-source-count").textContent = count(sources.length);
-    byId("chat-latency").textContent = Number.isSafeInteger(answer.duration_ms) ? `${answer.duration_ms.toLocaleString()} ms` : "—";
+    byId("chat-latency").textContent = Number.isSafeInteger(answer.duration_ms) ? `${answer.duration_ms.toLocaleString(localeTag())} ms` : "—";
     byId("chat-state").textContent = decision === "approve" ? "Action completed" : "Action denied";
     toast(decision === "approve" ? "The approved action returned a result." : "The action was denied.");
   } catch (error) {
@@ -1263,7 +1824,7 @@ async function loadChatHistory() {
       history.messages.forEach((message) => appendMessage(message.role, message.content, message.created_at_ms));
     }
     (history.pending_actions || []).forEach((action) => {
-      appendMessage("assistant", "This Manage action is still awaiting your decision.", Date.now(), { action });
+      appendMessage("assistant", "This Manage action is still awaiting your decision.", Date.now(), { action, localized: true });
     });
     thread.dataset.loaded = "true";
   } catch (_error) {
@@ -1315,7 +1876,7 @@ byId("chat-form").addEventListener("submit", async (event) => {
     appendMessage("assistant", answer.answer, Date.now(), { sources, durationMs: answer.duration_ms, action: answer.action });
     byId("chat-memory-count").textContent = count(answer.memory_evidence);
     byId("chat-source-count").textContent = count(sources.length);
-    byId("chat-latency").textContent = Number.isSafeInteger(answer.duration_ms) ? `${answer.duration_ms.toLocaleString()} ms` : `${Math.round(performance.now() - started).toLocaleString()} ms`;
+    byId("chat-latency").textContent = Number.isSafeInteger(answer.duration_ms) ? `${answer.duration_ms.toLocaleString(localeTag())} ms` : `${Math.round(performance.now() - started).toLocaleString(localeTag())} ms`;
     byId("chat-state").textContent = `${words(answer.profile)} · retained`;
   } catch (error) {
     pending.remove();
@@ -1337,7 +1898,7 @@ byId("chat-input").addEventListener("keydown", (event) => {
   }
 });
 byId("chat-input").addEventListener("input", (event) => {
-  byId("chat-count").textContent = event.target.value.length.toLocaleString();
+  byId("chat-count").textContent = event.target.value.length.toLocaleString(localeTag());
 });
 
 function resetNewChatButton() {
@@ -1390,7 +1951,7 @@ function seedChatPrompt(prompt) {
   showView("chat");
   const input = byId("chat-input");
   input.value = prompt;
-  byId("chat-count").textContent = prompt.length.toLocaleString();
+  byId("chat-count").textContent = prompt.length.toLocaleString(localeTag());
   input.focus();
 }
 
