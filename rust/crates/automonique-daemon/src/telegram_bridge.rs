@@ -3188,6 +3188,50 @@ pub(crate) struct SlackTicketJobBinding {
     pub(crate) issue_url: String,
 }
 
+/// One durable terminal-status notification owed to a Slack ticket requester.
+///
+/// This is deliberately separate from `slack-ticket-jobs.v1.json`. Older
+/// releases can continue to read that progress-binding file during rollback,
+/// while this release can retain the requester and its delivery disposition.
+/// `Ambiguous` is written before the Slack effect: an unknown transport result
+/// is never retried into a duplicate completion announcement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SlackTicketNotificationState {
+    Pending,
+    Ambiguous,
+    Delivered,
+}
+
+impl SlackTicketNotificationState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Ambiguous => "ambiguous",
+            Self::Delivered => "delivered",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "ambiguous" => Some(Self::Ambiguous),
+            "delivered" => Some(Self::Delivered),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SlackTicketNotification {
+    pub(crate) team_id: String,
+    pub(crate) channel: String,
+    pub(crate) thread_ts: String,
+    pub(crate) requester_user: String,
+    pub(crate) job_id: String,
+    pub(crate) issue_url: String,
+    state: SlackTicketNotificationState,
+}
+
 /// In-process projection of Manage's durable pending gates. Slack and Telegram
 /// share this registry so a gate created in either transport can be confirmed
 /// from the other without copying authority into user text.
@@ -3197,6 +3241,8 @@ pub(crate) struct TicketGateRegistry {
     path: Option<PathBuf>,
     slack_jobs: Vec<SlackTicketJobBinding>,
     slack_jobs_path: Option<PathBuf>,
+    slack_notifications: Vec<SlackTicketNotification>,
+    slack_notifications_path: Option<PathBuf>,
 }
 
 impl TicketGateRegistry {
@@ -3235,11 +3281,26 @@ impl TicketGateRegistry {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(_) => return Err(()),
         };
+        let slack_notifications_path = path.with_file_name("slack-ticket-notifications.v1.json");
+        if let Ok(metadata) = std::fs::symlink_metadata(&slack_notifications_path)
+            && (!metadata.is_file()
+                || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+                || metadata.mode() & 0o077 != 0)
+        {
+            return Err(());
+        }
+        let slack_notifications = match std::fs::read(&slack_notifications_path) {
+            Ok(bytes) => decode_slack_ticket_notifications(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(_) => return Err(()),
+        };
         Ok(Self {
             gates,
             path: Some(path),
             slack_jobs,
             slack_jobs_path: Some(slack_jobs_path),
+            slack_notifications,
+            slack_notifications_path: Some(slack_notifications_path),
         })
     }
 
@@ -3276,6 +3337,7 @@ impl TicketGateRegistry {
         team_id: &str,
         channel: &str,
         thread_ts: &str,
+        requester_user: &str,
         job_id: &str,
         issue_url: &str,
     ) -> Result<(), ()> {
@@ -3301,8 +3363,43 @@ impl TicketGateRegistry {
             }
             jobs.push(binding);
         }
+        let mut notifications = self.slack_notifications.clone();
+        if let Some(existing) = notifications.iter_mut().find(|existing| {
+            existing.team_id == team_id
+                && existing.channel == channel
+                && existing.thread_ts == thread_ts
+                && existing.job_id == job_id
+        }) {
+            existing.requester_user = requester_user.to_owned();
+            existing.issue_url = issue_url.to_owned();
+        } else {
+            if notifications.len() >= 256 {
+                notifications.remove(0);
+            }
+            notifications.push(SlackTicketNotification {
+                team_id: team_id.to_owned(),
+                channel: channel.to_owned(),
+                thread_ts: thread_ts.to_owned(),
+                requester_user: requester_user.to_owned(),
+                job_id: job_id.to_owned(),
+                issue_url: issue_url.to_owned(),
+                state: SlackTicketNotificationState::Pending,
+            });
+        }
+        let notification = notifications
+            .iter()
+            .find(|notification| {
+                notification.team_id == team_id
+                    && notification.channel == channel
+                    && notification.thread_ts == thread_ts
+                    && notification.job_id == job_id
+            })
+            .ok_or(())?;
+        validate_slack_ticket_notification(notification)?;
         self.persist_slack_jobs(&jobs)?;
+        self.persist_slack_notifications(&notifications)?;
         self.slack_jobs = jobs;
+        self.slack_notifications = notifications;
         Ok(())
     }
 
@@ -3323,6 +3420,66 @@ impl TicketGateRegistry {
             })
             .cloned()
             .collect()
+    }
+
+    pub(crate) fn pending_slack_notifications(&self, limit: usize) -> Vec<SlackTicketNotification> {
+        self.slack_notifications
+            .iter()
+            .filter(|notification| notification.state == SlackTicketNotificationState::Pending)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// Fence one notification before its Slack effect.
+    ///
+    /// The durable state moves to `ambiguous` first. Only an explicit Slack
+    /// rejection moves it back to pending; a transport error remains
+    /// ambiguous because Slack may already have accepted the message.
+    pub(crate) fn claim_slack_notification(&mut self, job_id: &str) -> Result<bool, ()> {
+        self.transition_slack_notification(
+            job_id,
+            SlackTicketNotificationState::Pending,
+            SlackTicketNotificationState::Ambiguous,
+        )
+    }
+
+    pub(crate) fn retry_slack_notification(&mut self, job_id: &str) -> Result<bool, ()> {
+        self.transition_slack_notification(
+            job_id,
+            SlackTicketNotificationState::Ambiguous,
+            SlackTicketNotificationState::Pending,
+        )
+    }
+
+    pub(crate) fn complete_slack_notification(&mut self, job_id: &str) -> Result<bool, ()> {
+        self.transition_slack_notification(
+            job_id,
+            SlackTicketNotificationState::Ambiguous,
+            SlackTicketNotificationState::Delivered,
+        )
+    }
+
+    fn transition_slack_notification(
+        &mut self,
+        job_id: &str,
+        expected: SlackTicketNotificationState,
+        next: SlackTicketNotificationState,
+    ) -> Result<bool, ()> {
+        let mut notifications = self.slack_notifications.clone();
+        let Some(notification) = notifications
+            .iter_mut()
+            .find(|notification| notification.job_id == job_id)
+        else {
+            return Ok(false);
+        };
+        if notification.state != expected {
+            return Ok(false);
+        }
+        notification.state = next;
+        self.persist_slack_notifications(&notifications)?;
+        self.slack_notifications = notifications;
+        Ok(true)
     }
 
     pub(crate) fn resolve(&mut self, job_id: &str) -> Result<(), ()> {
@@ -3385,6 +3542,54 @@ impl TicketGateRegistry {
                     "thread_ts": binding.thread_ts,
                     "job_id": binding.job_id,
                     "issue_url": binding.issue_url,
+                })
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&rows).map_err(|_| ())?;
+        let temporary = path.with_extension("v1.tmp");
+        use std::io::Write as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        if let Ok(metadata) = std::fs::symlink_metadata(&temporary) {
+            if !metadata.is_file()
+                || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+                || metadata.mode() & 0o077 != 0
+            {
+                return Err(());
+            }
+            std::fs::remove_file(&temporary).map_err(|_| ())?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|_| ())?;
+        file.write_all(&bytes).map_err(|_| ())?;
+        file.sync_all().map_err(|_| ())?;
+        std::fs::rename(&temporary, path).map_err(|_| ())?;
+        std::fs::File::open(path.parent().ok_or(())?)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| ())
+    }
+
+    fn persist_slack_notifications(
+        &self,
+        notifications: &[SlackTicketNotification],
+    ) -> Result<(), ()> {
+        let Some(path) = self.slack_notifications_path.as_ref() else {
+            return Ok(());
+        };
+        let rows: Vec<serde_json::Value> = notifications
+            .iter()
+            .map(|notification| {
+                serde_json::json!({
+                    "team_id": notification.team_id,
+                    "channel": notification.channel,
+                    "thread_ts": notification.thread_ts,
+                    "requester_user": notification.requester_user,
+                    "job_id": notification.job_id,
+                    "issue_url": notification.issue_url,
+                    "state": notification.state.as_str(),
                 })
             })
             .collect();
@@ -3477,6 +3682,78 @@ fn validate_slack_ticket_job(binding: &SlackTicketJobBinding) -> Result<(), ()> 
     {
         return Err(());
     }
+    Ok(())
+}
+
+fn decode_slack_ticket_notifications(bytes: &[u8]) -> Result<Vec<SlackTicketNotification>, ()> {
+    if bytes.len() > 256 * 1024 {
+        return Err(());
+    }
+    let rows = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|_| ())?;
+    let rows = rows.as_array().ok_or(())?;
+    if rows.len() > 256 {
+        return Err(());
+    }
+    rows.iter()
+        .map(|row| {
+            let row = row.as_object().ok_or(())?;
+            if row.len() != 7 {
+                return Err(());
+            }
+            let notification = SlackTicketNotification {
+                team_id: row
+                    .get("team_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?
+                    .to_owned(),
+                channel: row
+                    .get("channel")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?
+                    .to_owned(),
+                thread_ts: row
+                    .get("thread_ts")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?
+                    .to_owned(),
+                requester_user: row
+                    .get("requester_user")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?
+                    .to_owned(),
+                job_id: row
+                    .get("job_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?
+                    .to_owned(),
+                issue_url: row
+                    .get("issue_url")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?
+                    .to_owned(),
+                state: SlackTicketNotificationState::parse(
+                    row.get("state")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(())?,
+                )
+                .ok_or(())?,
+            };
+            validate_slack_ticket_notification(&notification)?;
+            Ok(notification)
+        })
+        .collect()
+}
+
+fn validate_slack_ticket_notification(notification: &SlackTicketNotification) -> Result<(), ()> {
+    let binding = SlackTicketJobBinding {
+        team_id: notification.team_id.clone(),
+        channel: notification.channel.clone(),
+        thread_ts: notification.thread_ts.clone(),
+        job_id: notification.job_id.clone(),
+        issue_url: notification.issue_url.clone(),
+    };
+    validate_slack_ticket_job(&binding)?;
+    automonique_slack_connector::UserId::new(&notification.requester_user).map_err(|_| ())?;
     Ok(())
 }
 
@@ -15198,6 +15475,7 @@ mod cross_transport_gate_tests {
                 "T0RESERVED",
                 "C0RESERVED01",
                 "1723542000.000100",
+                "U0REQUEST01",
                 "job-running-123",
                 "https://github.com/example/project/issues/42",
             )
@@ -15214,5 +15492,23 @@ mod cross_transport_gate_tests {
             bindings[0].issue_url,
             "https://github.com/example/project/issues/42"
         );
+        let pending = reopened.pending_slack_notifications(8);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].requester_user, "U0REQUEST01");
+        let mut reopened = reopened;
+        assert!(
+            reopened
+                .claim_slack_notification("job-running-123")
+                .expect("notification claims")
+        );
+        assert!(
+            reopened
+                .complete_slack_notification("job-running-123")
+                .expect("notification completes")
+        );
+        let reopened =
+            TicketGateRegistry::open(directory.path().join("ticket-confirmations.v1.json"))
+                .expect("registry reopens after notification delivery");
+        assert!(reopened.pending_slack_notifications(8).is_empty());
     }
 }

@@ -536,6 +536,8 @@ run_job() {
         report_job "$job_id" failed 'Manage returned an invalid job prompt.' || true
         return
     }
+    completion_receipt=$'Monique completion receipt contract:\nAfter implementing and verifying the ticket, update the GitHub issue as authorized. Your final response must include the exact permalink of the completion-summary comment, in the form https://github.com/<owner>/<repo>/issues/<number>#issuecomment-<number>. Do not report completion without that permalink.'
+    provider_prompt=$(printf '%s\n\n%s\n' "$prompt" "$completion_receipt")
     requested_cwd=$(jq -r '.cwd // ""' <<<"$job")
     cwd=$(workspace_for "$requested_cwd") || {
         report_job "$job_id" failed 'Manage returned a workspace outside the configured execution roots.' || true
@@ -553,7 +555,7 @@ run_job() {
 
     set +e
     if [[ "$selected_provider" == codex ]]; then
-        printf '%s\n' "$prompt" \
+        printf '%s\n' "$provider_prompt" \
             | CODEX_HOME="$selected_home" "$selected_binary" exec \
                 --json \
                 --dangerously-bypass-approvals-and-sandbox \
@@ -574,7 +576,7 @@ run_job() {
             report_job "$job_id" failed 'Claude could not enter the selected workspace.' || true
             return
         }
-        printf '%s\n' "$prompt" \
+        printf '%s\n' "$provider_prompt" \
             | CLAUDE_CONFIG_DIR="$selected_home" "$selected_binary" \
                 --print \
                 --output-format stream-json \

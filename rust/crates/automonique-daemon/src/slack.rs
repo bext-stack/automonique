@@ -77,7 +77,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use automonique_github_connector::IssueLocator;
 use automonique_protocol::event::EventKind;
@@ -99,7 +99,9 @@ use automonique_store::slack_interactions::{
     SlackInteractionAction, SlackInteractionInput, SlackInteractionRecord, SlackInteractionState,
     SlackInteractionStore,
 };
-use automonique_support_connector::{TicketDecision, TicketDecisionOutcome};
+use automonique_support_connector::{
+    TicketDecision, TicketDecisionOutcome, TicketJobStatus, TicketStatus,
+};
 use automonique_transport_runtime::{
     CallPriority, ChannelName, GitHubChecklistItem, GitHubIssueUrl, GitHubRepoAlias, GitHubRequest,
     SlackBudgetedMethod, SlackCallBudget,
@@ -156,6 +158,10 @@ const MAX_PENDING_SLACK_TOOL_APPROVALS: usize = 64;
 /// has years of history. Slack currently caps a page at `MAX_PAGE_LIMIT`, so
 /// the total is at most 4,000 messages.
 const MAX_CHANNEL_TICKET_AUDIT_PAGES: usize = 20;
+/// Cadence for the bounded Slack terminal-job monitor.
+const SLACK_TICKET_STATUS_POLL: Duration = Duration::from_secs(3);
+/// Most outstanding ticket jobs one Socket Mode cadence may inspect.
+const MAX_SLACK_TICKET_STATUS_POLLS: usize = 8;
 
 /// Independently staged Slack product capabilities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1772,6 +1778,13 @@ struct PreparedSlackTicketInteraction {
     record: SlackInteractionRecord,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SlackEffectOutcome {
+    Accepted,
+    Rejected,
+    Ambiguous,
+}
+
 /// The Slack effect seam.
 ///
 /// `pub(crate)` rather than private so [`crate::shadow`] can decorate it from a
@@ -1806,6 +1819,23 @@ pub(crate) trait SlackTicketPoster {
     ) -> Result<(), ()>;
 
     fn post_channel(&mut self, channel: &ChannelId, text: &str) -> Result<(), ()>;
+
+    /// Publish one fenced terminal ticket notification.
+    ///
+    /// Unlike the conversational helpers, this preserves Slack's distinction
+    /// between an explicit rejection and an unknown transport result. The
+    /// durable notification registry may retry only the former.
+    fn post_ticket_notification(
+        &mut self,
+        channel: &ChannelId,
+        parent: &MessageTs,
+        text: &str,
+    ) -> SlackEffectOutcome {
+        match self.post_thread(channel, parent, text) {
+            Ok(()) => SlackEffectOutcome::Accepted,
+            Err(()) => SlackEffectOutcome::Ambiguous,
+        }
+    }
 
     fn post_approval_card(
         &mut self,
@@ -1951,6 +1981,20 @@ impl SlackTicketPoster for LiveSlackTicketPoster {
         <Arc<SlackClient> as SlackTicketPoster>::post_channel(&mut self.client, channel, text)
     }
 
+    fn post_ticket_notification(
+        &mut self,
+        channel: &ChannelId,
+        parent: &MessageTs,
+        text: &str,
+    ) -> SlackEffectOutcome {
+        <Arc<SlackClient> as SlackTicketPoster>::post_ticket_notification(
+            &mut self.client,
+            channel,
+            parent,
+            text,
+        )
+    }
+
     fn post_approval_card(
         &mut self,
         channel: &ChannelId,
@@ -2075,6 +2119,23 @@ impl SlackTicketPoster for Arc<SlackClient> {
         match SlackClient::post_message(self.as_ref(), &request).map_err(|_| ())? {
             SlackOutcome::Accepted(_) => Ok(()),
             SlackOutcome::Rejected(_) => Err(()),
+        }
+    }
+
+    fn post_ticket_notification(
+        &mut self,
+        channel: &ChannelId,
+        parent: &MessageTs,
+        text: &str,
+    ) -> SlackEffectOutcome {
+        let Ok(text) = MessageText::new(text) else {
+            return SlackEffectOutcome::Rejected;
+        };
+        let request = PostMessageRequest::new(channel.clone(), text).in_thread(parent.clone());
+        match SlackClient::post_message(self.as_ref(), &request) {
+            Ok(SlackOutcome::Accepted(_)) => SlackEffectOutcome::Accepted,
+            Ok(SlackOutcome::Rejected(_)) => SlackEffectOutcome::Rejected,
+            Err(_) => SlackEffectOutcome::Ambiguous,
         }
     }
 
@@ -3002,6 +3063,57 @@ fn slack_ticket_status_text(status: &automonique_support_connector::TicketStatus
     text
 }
 
+fn completion_comment_permalink(result: &str, issue_url: &str) -> Option<String> {
+    let prefix = format!("{issue_url}#issuecomment-");
+    let start = result.find(&prefix)?;
+    let suffix = &result[start + prefix.len()..];
+    let digits = suffix.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    Some(format!("{prefix}{}", &suffix[..digits]))
+}
+
+fn slack_ticket_terminal_text(
+    notification: &crate::telegram_bridge::SlackTicketNotification,
+    status: &TicketStatus,
+) -> Option<String> {
+    if notification.job_id != status.job_id || notification.issue_url != status.issue_url {
+        return None;
+    }
+    let short = status.job_id.get(..12).unwrap_or(&status.job_id);
+    let requester = &notification.requester_user;
+    match status.job_status {
+        TicketJobStatus::Done => {
+            let destination = completion_comment_permalink(&status.result, &status.issue_url)
+                .map_or_else(
+                    || {
+                        format!(
+                            "<{}|Open the GitHub issue> — the job receipt did not include the completion-comment permalink.",
+                            status.issue_url
+                        )
+                    },
+                    |url| format!("<{url}|View the completion summary on GitHub>"),
+                );
+            Some(format!(
+                "✅ <@{requester}> Monique completed the ticket work.\n{destination}\nMonique job `{short}` is done."
+            ))
+        }
+        TicketJobStatus::Failed => Some(format!(
+            "❌ <@{requester}> Monique's ticket work failed.\n<{}|Open the GitHub issue>\nMonique job `{short}` is failed.",
+            status.issue_url
+        )),
+        TicketJobStatus::Cancelled => Some(format!(
+            "⛔ <@{requester}> Monique's ticket work was cancelled.\n<{}|Open the GitHub issue>\nMonique job `{short}` is cancelled.",
+            status.issue_url
+        )),
+        TicketJobStatus::PendingApproval
+        | TicketJobStatus::Pending
+        | TicketJobStatus::Claimed
+        | TicketJobStatus::Running => None,
+    }
+}
+
 /// Resolve a read-only issue follow-up against the current Slack thread.
 ///
 /// The first turn commonly carries the canonical URL while a human follow-up
@@ -3109,6 +3221,54 @@ fn ticket_approval_failure(reason: &str) -> &'static str {
 }
 
 impl<P: SlackTicketPoster> SlackTicketRouter<P> {
+    fn poll_ticket_notifications(&mut self) {
+        let notifications = self.gates.lock().map_or_else(
+            |_| Vec::new(),
+            |gates| gates.pending_slack_notifications(MAX_SLACK_TICKET_STATUS_POLLS),
+        );
+        for notification in notifications {
+            let Ok(status) = self.manage.ticket_status(&notification.job_id) else {
+                continue;
+            };
+            let Some(text) = slack_ticket_terminal_text(&notification, &status) else {
+                continue;
+            };
+            let claimed = self
+                .gates
+                .lock()
+                .ok()
+                .and_then(|mut gates| gates.claim_slack_notification(&notification.job_id).ok())
+                .unwrap_or(false);
+            if !claimed {
+                continue;
+            }
+            let Ok(channel) = ChannelId::new(&notification.channel) else {
+                continue;
+            };
+            let Ok(parent) = MessageTs::new(&notification.thread_ts) else {
+                continue;
+            };
+            match self
+                .poster
+                .post_ticket_notification(&channel, &parent, &text)
+            {
+                SlackEffectOutcome::Accepted => {
+                    let _ = self
+                        .gates
+                        .lock()
+                        .map(|mut gates| gates.complete_slack_notification(&notification.job_id));
+                }
+                SlackEffectOutcome::Rejected => {
+                    let _ = self
+                        .gates
+                        .lock()
+                        .map(|mut gates| gates.retry_slack_notification(&notification.job_id));
+                }
+                SlackEffectOutcome::Ambiguous => {}
+            }
+        }
+    }
+
     fn open_ticket_gate(&mut self, event: &SlackTicketEvent, issue_url: String) {
         if !self.features.contains(&SlackFeature::Approvals) {
             return;
@@ -3129,6 +3289,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                                 &event.team_id,
                                 event.channel.as_str(),
                                 event.parent.as_str(),
+                                event.user.as_str(),
                                 &receipt.job_id,
                                 &issue_url,
                             )
@@ -4572,6 +4733,7 @@ pub(crate) struct SlackTicketWorker {
     memory: AgentMemoryStore,
     interactions: SlackInteractionStore,
     generation_canary: Option<SlackGenerationCanary>,
+    last_ticket_status_poll: Option<Instant>,
     /// The reference engine's half of the parity comparison.
     ///
     /// `None` unless an installation configures an identity to observe. It
@@ -4803,6 +4965,7 @@ impl SlackTicketHost {
                 )
                 .map_err(|_| SlackConfigError::TicketActionsUnavailable)?,
                 generation_canary,
+                last_ticket_status_poll: None,
                 router: SlackTicketRouter {
                     poster: LiveSlackTicketPoster::new(client),
                     manage: Box::new(manage),
@@ -4925,7 +5088,10 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
                 // shutdown cadence. Silence is not a failed Socket Mode
                 // connection: keep the established websocket and check the
                 // stop flag again instead of churning apps.connections.open.
-                SlackReceiveDisposition::Idle => continue,
+                SlackReceiveDisposition::Idle => {
+                    poll_slack_ticket_notifications(worker);
+                    continue;
+                }
                 SlackReceiveDisposition::Reconnect => break,
             };
             let envelope_id = match socket_envelope_id(envelope.as_str()) {
@@ -5061,8 +5227,21 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
             if let Some(command) = monique_command {
                 worker.router.handle_monique_command(command, "");
             }
+            poll_slack_ticket_notifications(worker);
         }
     }
+}
+
+fn poll_slack_ticket_notifications(worker: &mut SlackTicketWorker) {
+    let now = Instant::now();
+    if worker
+        .last_ticket_status_poll
+        .is_some_and(|last| now.duration_since(last) < SLACK_TICKET_STATUS_POLL)
+    {
+        return;
+    }
+    worker.last_ticket_status_poll = Some(now);
+    worker.router.poll_ticket_notifications();
 }
 
 fn generation_canary_message(
@@ -6972,6 +7151,21 @@ mod tests {
         }
     }
 
+    fn done_ticket_status() -> automonique_support_connector::TicketStatus {
+        automonique_support_connector::TicketStatus {
+            issue_id: String::from("issue-fixture"),
+            issue_url: String::from("https://github.com/example/project/issues/42"),
+            issue_title: String::from("Repair the form"),
+            job_id: String::from("job-fixture-123456"),
+            job_status: automonique_support_connector::TicketJobStatus::Done,
+            result: String::from(
+                "Implemented and verified. Completion summary: https://github.com/example/project/issues/42#issuecomment-9001",
+            ),
+            created_at: String::from("2026-08-17T20:42:00Z"),
+            updated_at: String::from("2026-08-17T21:02:00Z"),
+        }
+    }
+
     impl crate::telegram_bridge::TicketActionSurface for FakeManage {
         fn dispatch_ticket(
             &mut self,
@@ -8234,6 +8428,66 @@ mod tests {
         assert!(progress.contains("Last updated: 2026-08-17T20:54:00Z"));
         assert!(progress.contains("Implementing the requested change."));
         assert!(!progress.contains("GitHub still marks this issue as open"));
+    }
+
+    #[test]
+    fn terminal_ticket_status_mentions_the_requester_and_links_the_completion_comment_once() {
+        let poster = FakeTicketPoster::default();
+        let messages = Arc::clone(&poster.messages);
+        let manage = FakeManage {
+            status: Some(done_ticket_status()),
+            ..FakeManage::default()
+        };
+        let status_reads = Arc::clone(&manage.status_reads);
+        let mut router = SlackTicketRouter {
+            poster,
+            manage: Box::new(manage),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
+            channels: ChannelMap(vec![(
+                name("ops"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: vec![UserId::new("U0REQUEST01").expect("member")],
+            features: vec![SlackFeature::Approvals, SlackFeature::Conversation],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+            approvals: None,
+            approval_lane: None,
+            question_answerer: None,
+        };
+
+        router.handle_with_context(
+            ticket_event(
+                "U0REQUEST01",
+                "https://github.com/example/project/issues/42",
+                "EvCompletion",
+            ),
+            "",
+        );
+        router.poll_ticket_notifications();
+        router.poll_ticket_notifications();
+
+        assert_eq!(
+            status_reads.lock().expect("status reads").as_slice(),
+            [String::from("job-fixture-123456")]
+        );
+        let messages = messages.lock().expect("messages");
+        let completions: Vec<_> = messages
+            .iter()
+            .filter(|message| message.contains("Monique completed the ticket work"))
+            .collect();
+        assert_eq!(completions.len(), 1, "one completion reply: {messages:?}");
+        let completion = completions[0];
+        assert!(completion.contains("<@U0REQUEST01>"));
+        assert!(completion.contains(
+            "<https://github.com/example/project/issues/42#issuecomment-9001|View the completion summary on GitHub>"
+        ));
+        assert!(completion.contains("Monique job `job-fixture-` is done."));
     }
 
     #[test]

@@ -3606,6 +3606,8 @@ mod tests {
         assert!(MANAGE_WORKER.contains(".authMethod == \"claude.ai\""));
         assert!(MANAGE_WORKER.contains("automonique.manage-processes/v1"));
         assert!(MANAGE_WORKER.contains("refresh_process_snapshot"));
+        assert!(MANAGE_WORKER.contains("exact permalink of the completion-summary comment"));
+        assert!(MANAGE_WORKER.contains("#issuecomment-<number>"));
         let process_projection = MANAGE_WORKER
             .split("publish_process_snapshot()")
             .nth(1)
