@@ -945,7 +945,7 @@ kbd { padding: 1px 4px; border: 1px solid var(--line-bright); border-bottom-colo
 .process-filters button:hover { color: var(--text); background: var(--hover-surface); }
 .process-filters button.is-active { border-color: var(--accent-border); color: var(--green); background: var(--accent-surface); }
 .process-filters b { min-width: 20px; padding: 2px 5px; border-radius: 999px; color: var(--quiet); background: var(--panel-2); font: 600 var(--font-2xs) ui-monospace, monospace; text-align: center; }
-.process-list-head, .process-row { display: grid; grid-template-columns: minmax(150px, .9fr) minmax(250px, 1.5fr) minmax(150px, .8fr) 150px; gap: 16px; align-items: center; }
+.process-list-head, .process-row { display: grid; grid-template-columns: minmax(150px, .8fr) minmax(220px, 1.25fr) minmax(140px, .7fr) minmax(280px, auto); gap: 16px; align-items: center; }
 .process-list-head { padding: 9px 18px; border-bottom: 1px solid var(--line); color: var(--quiet); background: var(--panel-2); font: var(--font-2xs) ui-monospace, monospace; letter-spacing: .08em; text-transform: uppercase; }
 .process-list-head span:last-child { text-align: right; }
 .process-list { min-height: 150px; }
@@ -967,12 +967,12 @@ kbd { padding: 1px 4px; border: 1px solid var(--line-bright); border-bottom-colo
 .process-facts { display: flex; max-width: 100%; gap: 5px; margin-top: 7px; overflow: hidden; }
 .process-facts span { overflow: hidden; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); background: var(--panel-2); font-size: var(--font-2xs); text-overflow: ellipsis; white-space: nowrap; }
 .process-timing strong { color: var(--muted); font-size: var(--font-sm); }
-.process-lifecycle { display: flex; gap: 8px; align-items: center; justify-content: flex-end; }
+.process-lifecycle { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-end; }
 .process-status { padding: 5px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: var(--panel-2); font-size: var(--font-xs); white-space: nowrap; }
 .process-status.status-running { border-color: var(--success-border); color: var(--green); background: var(--success-surface); }
 .process-status.status-pending { border-color: var(--info-border); color: var(--blue); background: var(--info-surface); }
 .process-status.status-failed { border-color: var(--danger-border); color: var(--red); background: var(--danger-surface); }
-.process-lifecycle button, .process-lifecycle a { display: inline-flex; min-height: 30px; align-items: center; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: var(--panel); font-size: var(--font-xs); text-decoration: none; cursor: pointer; }
+.process-lifecycle button, .process-lifecycle a { display: inline-flex; min-height: 30px; align-items: center; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: var(--panel); font-size: var(--font-xs); text-decoration: none; white-space: nowrap; cursor: pointer; }
 .process-lifecycle button:hover, .process-lifecycle a:hover { border-color: var(--accent-border); color: var(--green); background: var(--accent-surface); }
 .process-details { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; margin: 0 18px 14px 52px; overflow: hidden; border: 1px solid var(--line); border-radius: 9px; background: var(--line); }
 .process-output { grid-column: 1 / -1; min-width: 0; padding: 13px; background: var(--panel); }
@@ -1327,7 +1327,7 @@ html[data-health="unavailable"] .attention-bar { border-color: var(--danger-bord
   .metric-grid { grid-template-columns: repeat(3, 1fr); }
   .span-7, .span-5 { grid-column: 1 / -1; }
   .operations-layout { grid-template-columns: 1fr; }
-  .process-list-head, .process-row { grid-template-columns: minmax(140px, .8fr) minmax(230px, 1.4fr) 150px; }
+  .process-list-head, .process-row { grid-template-columns: minmax(140px, .75fr) minmax(210px, 1.15fr) minmax(260px, auto); }
   .process-list-head span:nth-child(3), .process-timing { display: none; }
   .process-worker-facts, .process-details { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .ticket-list-head, .ticket-row { grid-template-columns: 96px minmax(220px, 1fr) 150px; }
@@ -1390,7 +1390,7 @@ html[data-health="unavailable"] .attention-bar { border-color: var(--danger-bord
   .process-toolbar { align-items: flex-start; flex-direction: column; }
   .process-list-head { display: none; }
   .process-row { grid-template-columns: minmax(120px, .8fr) minmax(180px, 1.2fr); gap: 11px 14px; padding: 14px; }
-  .process-lifecycle { grid-column: 2; justify-content: flex-start; }
+  .process-lifecycle { grid-column: 1 / -1; justify-content: flex-start; }
   .process-details { grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 0 14px 14px; }
   .ticket-metrics { grid-template-columns: repeat(3, 1fr); }
   .ticket-controls { grid-template-columns: 1fr; }

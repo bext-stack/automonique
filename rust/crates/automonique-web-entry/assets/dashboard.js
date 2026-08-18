@@ -1579,7 +1579,7 @@ function renderProcesses(view) {
       issueLink.href = issueReference.href;
       issueLink.target = "_blank";
       issueLink.rel = "noreferrer";
-      issueLink.textContent = "Open ↗";
+      issueLink.textContent = "GitHub ↗";
       lifecycle.append(issueLink);
     }
     const manageHref = safeTicketLink(job.manage_url);
@@ -1588,7 +1588,7 @@ function renderProcesses(view) {
       manageLink.href = manageHref;
       manageLink.target = "_blank";
       manageLink.rel = "noreferrer";
-      manageLink.textContent = "AI Operation ↗";
+      manageLink.textContent = "Manage ↗";
       lifecycle.append(manageLink);
     }
     const details = document.createElement("div");
