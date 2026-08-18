@@ -77,6 +77,49 @@ pub fn is_site_inventory_question(question: &str) -> bool {
     names_inventory && inventory_cue
 }
 
+/// Whether the user is asking for the identity or description of one named
+/// thing.
+///
+/// This is deliberately a high-recall read-only routing hint, not proof that
+/// the named thing exists in any attached source. Callers may use it to attach
+/// a bounded entity/profile index so the answering model can compare labels,
+/// hostnames and business context semantically instead of requiring the user
+/// to know an exact deployment spelling.
+#[must_use]
+pub fn is_named_entity_description_question(question: &str) -> bool {
+    let normalized = question
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    [
+        "tell me about ",
+        "what do you know about ",
+        "what is ",
+        "who is ",
+        "describe ",
+        "parle-moi de ",
+        "parle moi de ",
+        "que sais-tu de ",
+        "que sais tu de ",
+        "qu'est-ce que ",
+        "qu est ce que ",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
+}
+
+/// Whether a question should receive the bounded local site-profile source.
+///
+/// Inventory questions name the source explicitly. Named-entity description
+/// questions receive the same read-only source at high recall so an AI answer
+/// pass can perform semantic candidate matching. An unrelated profile remains
+/// evidence to ignore, never a positive match.
+#[must_use]
+pub fn is_site_profile_question(question: &str) -> bool {
+    is_site_inventory_question(question) || is_named_entity_description_question(question)
+}
+
 /// Whether the enabled-vhost projection alone can answer a site question.
 #[must_use]
 pub fn is_enabled_site_inventory_question(question: &str) -> bool {
@@ -256,6 +299,21 @@ mod tests {
         assert!(!is_enabled_site_inventory_question(
             "what sites do we manage?"
         ));
+    }
+
+    #[test]
+    fn named_entities_attach_profiles_without_claiming_a_match() {
+        assert!(is_named_entity_description_question(
+            "what do you know about Amis de la ferme?"
+        ));
+        assert!(is_named_entity_description_question(
+            "Parle-moi de la Ferme des Amis"
+        ));
+        assert!(is_site_profile_question(
+            "what do you know about Amis de la ferme?"
+        ));
+        assert!(is_site_profile_question("what sites do we manage?"));
+        assert!(!is_site_profile_question("why is the sky blue?"));
     }
 
     #[test]

@@ -112,7 +112,7 @@ use std::time::{Duration, Instant};
 pub use automonique_core::conversation::utc_rfc3339_from_unix_millis;
 use automonique_core::conversation::{
     is_current_time_question, is_deferred_placeholder_answer, is_enabled_site_inventory_question,
-    is_site_inventory_question,
+    is_named_entity_description_question, is_site_inventory_question, is_site_profile_question,
 };
 use automonique_github_connector::IssueLocator;
 use automonique_protocol::admin::ExecutionState;
@@ -11351,33 +11351,6 @@ fn exact_hostname_candidates(question: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Whether the user is asking for the identity or description of one named
-/// thing. Exact runtime entity matching still decides whether this changes the
-/// route; this grammar only prevents domain words such as `support` from
-/// pre-empting that match as generic operational vocabulary.
-fn is_named_entity_description_question(question: &str) -> bool {
-    let normalized = question
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    [
-        "tell me about ",
-        "what do you know about ",
-        "what is ",
-        "who is ",
-        "describe ",
-        "parle-moi de ",
-        "parle moi de ",
-        "que sais-tu de ",
-        "que sais tu de ",
-        "qu'est-ce que ",
-        "qu est ce que ",
-    ]
-    .iter()
-    .any(|prefix| normalized.starts_with(prefix))
-}
-
 fn local_entity_value_matches(terms: &BTreeSet<String>, value: &str) -> bool {
     value
         .to_lowercase()
@@ -11488,6 +11461,7 @@ fn question_sources(question: &str) -> QuestionSources {
         host_load: is_host_load_question(question),
         operators: names_people || (contains(&["access", "accès"]) && !requests_models),
         sites: names_company_manager
+            || is_site_profile_question(question)
             || contains(&[
                 "prism",
                 "site",
@@ -12516,6 +12490,7 @@ fn question_prompt(question: &str, context: &str, profile: QuestionProfile) -> O
          For GitHub delivery detail, distinguish the canonical open/closed state from completion evidence in the checklist and recent comments, preferring newer comments when they supersede older progress.\n\
          Do not enumerate source fields, provenance, checks, or caveats unless they materially change the answer or the user asks for them.\n\
          Retrieved durable memory and recent conversation are relevant context, not live measurements; when they conflict, prefer the current typed source and state the conflict.\n\
+         For a named entity, compare the supplied profile labels, references, hostnames, business context and rules semantically. The user's wording need not exactly match a deployment identifier; do not claim a match when the supplied profiles are unrelated.\n\
          Local entity-catalog claims are read-only evidence: distinguish operator assertions, local observations, and primary sources, and name the supplied provenance for material identity claims.\n\
          Never infer provider account usage, quota, or remaining allowance from successful calls, model availability, or timing metadata.\n\
          Explanation only: perform or promise no action. If the answer needs non-trivial computation or local inspection unsupported by the selected tools, you may suggest a bounded scratchpad task, but state that an administrator must review and explicitly submit `/run <task>` and that nothing has been created or executed.\n\
@@ -13951,12 +13926,19 @@ impl StoreControlSurface {
             return (QuestionSources::none(), None);
         }
         let mut sources = QuestionSources::none();
+        // A configured Manage profile projection is a bounded read-only entity
+        // index. Attach it at high recall for named-entity descriptions and
+        // let the answer model compare label/ref/host/context/rules
+        // semantically; deployment-name substring matching remains only a fast
+        // path, not the gate that decides whether the source exists.
+        sources.sites =
+            self.manage_profile_app.is_some() && is_named_entity_description_question(question);
         let prism_inventory = self
             .prism_sites_root
             .as_deref()
             .and_then(|root| crate::site_inventory::prism_sites(root).ok());
         if let Some(inventory) = prism_inventory.as_ref() {
-            sources.sites = inventory
+            sources.sites |= inventory
                 .apps()
                 .iter()
                 .chain(inventory.sites())

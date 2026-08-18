@@ -155,6 +155,30 @@ fn decode_manage_profiles(
         .to_lowercase()
         .split(|character: char| !character.is_alphanumeric())
         .filter(|term| term.len() >= 3)
+        .filter(|term| {
+            !matches!(
+                *term,
+                "about"
+                    | "are"
+                    | "can"
+                    | "describe"
+                    | "des"
+                    | "know"
+                    | "les"
+                    | "moi"
+                    | "parle"
+                    | "propos"
+                    | "que"
+                    | "quoi"
+                    | "sais"
+                    | "savez"
+                    | "tell"
+                    | "the"
+                    | "what"
+                    | "who"
+                    | "you"
+            )
+        })
         .map(ToOwned::to_owned)
         .collect();
     let names_company_manager = (terms.contains("company") && terms.contains("manager"))
@@ -211,35 +235,59 @@ fn decode_manage_profiles(
             .cmp(&right.kind)
             .then_with(|| left.reference.cmp(&right.reference))
     });
-    let selected = profiles
+    let relevance = |profile: &ManageProfile| {
+        if terms.is_empty() {
+            return 1_usize;
+        }
+        let identity = format!(
+            "{} {} {} {}",
+            profile.kind,
+            profile.reference,
+            profile.label,
+            profile.host.as_deref().unwrap_or_default(),
+        )
+        .to_lowercase();
+        let context = profile.context.to_lowercase();
+        let rules = profile.rules.join(" ").to_lowercase();
+        let lexical = terms
+            .iter()
+            .map(|term| {
+                if identity.contains(term) {
+                    16
+                } else if context.contains(term) {
+                    4
+                } else if rules.contains(term) {
+                    1
+                } else {
+                    0
+                }
+            })
+            .sum::<usize>();
+        lexical.saturating_add(usize::from(names_company_manager && profile.kind == "cm") * 1_024)
+    };
+    let mut ranked = profiles
         .iter()
-        .filter(|profile| {
-            if terms.is_empty() {
-                return true;
-            }
-            if names_company_manager && profile.kind == "cm" {
-                return true;
-            }
-            let haystack = format!(
-                "{} {} {} {} {}",
-                profile.kind,
-                profile.reference,
-                profile.label,
-                profile.host.as_deref().unwrap_or_default(),
-                profile.context
-            )
-            .to_lowercase();
-            terms.iter().any(|term| haystack.contains(term))
+        .filter_map(|profile| {
+            let score = relevance(profile);
+            (score > 0).then_some((score, profile))
         })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|(left_score, left), (right_score, right)| {
+        right_score.cmp(left_score).then_with(|| {
+            left.kind
+                .cmp(&right.kind)
+                .then_with(|| left.reference.cmp(&right.reference))
+        })
+    });
+    let mut unique = BTreeSet::new();
+    let selected = ranked
+        .into_iter()
+        .map(|(_, profile)| profile)
         .chain(profiles.iter())
+        .filter(|profile| unique.insert((profile.kind.clone(), profile.reference.clone())))
         .take(MAX_SELECTED_PROFILES)
         .cloned()
         .collect::<Vec<_>>();
-    let mut unique = BTreeSet::new();
-    let selected = selected
-        .into_iter()
-        .filter(|profile| unique.insert((profile.kind.clone(), profile.reference.clone())))
-        .collect();
     Ok(ManageProfileInventory {
         total: profiles.len(),
         ecosystem,
@@ -613,6 +661,47 @@ mod tests {
         assert_eq!(
             inventory.selected[0].rules,
             ["Confirm the customer scope before creation"]
+        );
+    }
+
+    #[test]
+    fn named_entity_query_ignores_prompt_scaffolding_and_keeps_business_context() {
+        let rows = serde_json::json!([
+            {
+                "kind": "ecosystem",
+                "ref": "amifermestock-prism",
+                "label": "amifermestock-prism",
+                "host": "stock.example",
+                "context": "Registre de stock AMISFERME et commandes fournisseurs"
+            },
+            {
+                "kind": "ecosystem",
+                "ref": "unrelated-prism",
+                "label": "Unrelated",
+                "context": "Ordinary site"
+            },
+            {
+                "kind": "ecosystem",
+                "ref": "amisdelaferme-prism",
+                "label": "Amis de la ferme",
+                "host": "amis.example",
+                "context": "E-commerce fermier de produits locaux",
+                "rules": ["Keep checkout on the principal application"]
+            }
+        ]);
+        let bytes = serde_json::to_vec(&serde_json::json!({ "value": rows })).expect("fixture");
+
+        let inventory = decode_manage_profiles(&bytes, "what do you know about amis de la ferme?")
+            .expect("profiles");
+
+        assert_eq!(inventory.selected[0].reference, "amisdelaferme-prism");
+        assert_eq!(
+            inventory.selected[0].context,
+            "E-commerce fermier de produits locaux"
+        );
+        assert_eq!(
+            inventory.selected[0].rules,
+            ["Keep checkout on the principal application"]
         );
     }
 
