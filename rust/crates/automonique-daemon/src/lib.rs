@@ -193,6 +193,7 @@ mod telegram;
 pub mod telegram_bridge;
 pub mod ticket_intake;
 pub mod ticket_work;
+pub mod work_brief;
 
 use attempt_host::DaemonAttemptHost;
 

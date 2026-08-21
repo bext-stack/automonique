@@ -41,6 +41,28 @@ release does not require restarting the daemon or fleet worker.
 - snapshot `stale`: the projection is too old for a current-state conclusion.
   Retain it for context but do not present it as live evidence.
 
+## What a question sees
+
+Every conversational question, on Telegram, Slack or the dashboard lane that
+shares the router, reaches the intent router with a small always-on baseline:
+the daemon clock, the durable status snapshot, host load, the enabled-site
+headline and the newest tickets, plus durable memory and the recent
+conversation. Simple questions are answered from that baseline; deeper ones
+select a typed read plan.
+
+When neither the baseline nor any allowed read covers the ask, the router does
+not answer with what it cannot see. It raises an escalation: an approve/deny
+card naming the deeper lane (every local source plus configured GitHub issue
+reads on the intelligent model, or read-only public-web research). Nothing
+runs until an administrator approves; a denied or expired card runs nothing.
+
+An approved Manage job receives, in addition to the prompt Manage composed,
+the local context block rendered by `automonique work-brief`: the Slack thread
+that requested the work, the owner's standing preferences and matching
+memories, the local entity catalog, the managed sites the request names, and
+the approved skills. The block is read-only context, never instructions, and a
+job is never refused for lack of it.
+
 ## Answering operator questions
 
 ### Is it running?

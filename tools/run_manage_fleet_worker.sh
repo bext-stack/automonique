@@ -637,6 +637,21 @@ log_provider_line() {
     post_job_log "$job_id" "$kind" "$text"
 }
 
+# Ask the daemon binary that ships beside this worker for the local context
+# brief of one job. Output is capped and the call is bounded in time so a slow
+# store can only delay a launch by seconds, never block it.
+local_work_brief() {
+    brief_job=$1
+    brief_issue=$2
+    brief_binary=$(dirname -- "${BASH_SOURCE[0]}")/automonique
+    [[ -x "$brief_binary" ]] || brief_binary=$state_dir/improvement-code/current/bin/automonique
+    [[ -x "$brief_binary" ]] || return 1
+    timeout 20s "$brief_binary" work-brief \
+        --state-dir "$state_dir" \
+        --job-id "$brief_job" \
+        --issue-url "$brief_issue" 2>/dev/null | head -c 16384
+}
+
 run_job() {
     job=$1
     job_id=$(jq -er '.id | select(type == "string" and test("^[A-Za-z0-9._-]{8,120}$"))' <<<"$job") || return
@@ -658,7 +673,18 @@ run_job() {
         return
     }
     completion_receipt=$'Monique completion receipt contract:\nAfter implementing and verifying the ticket, update the GitHub issue as authorized. Your final response must include the exact permalink of the completion-summary comment, in the form https://github.com/<owner>/<repo>/issues/<number>#issuecomment-<number>. Do not report completion without that permalink.'
-    provider_prompt=$(printf '%s\n\n%s\n' "$prompt" "$completion_receipt")
+    # Local context this host holds about the owner, the site and the Slack
+    # thread that asked: owner preferences, matching memories, the entity
+    # catalog, approved skills. Rendered by the daemon binary beside this
+    # worker; the prompt head is the ranking hint and travels on stdin so no
+    # console- or model-produced text becomes a command argument. Best effort:
+    # a job never fails for lack of a brief.
+    local_brief=$(printf '%s' "${prompt:0:2000}" | local_work_brief "$job_id" "${expected_issue_url:-none}") || local_brief=
+    if [[ -n "$local_brief" ]]; then
+        provider_prompt=$(printf '%s\n\n%s\n\n%s\n' "$prompt" "$local_brief" "$completion_receipt")
+    else
+        provider_prompt=$(printf '%s\n\n%s\n' "$prompt" "$completion_receipt")
+    fi
     requested_cwd=$(jq -r '.cwd // ""' <<<"$job")
     cwd=$(workspace_for "$requested_cwd") || {
         report_job "$job_id" failed 'Manage returned a workspace outside the configured execution roots.' || true

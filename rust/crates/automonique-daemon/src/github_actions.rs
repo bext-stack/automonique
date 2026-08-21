@@ -218,10 +218,13 @@ where
         if kinds == 0 {
             return Ok(None);
         }
+        // More than one candidate verb ("check if we missed any follow-up
+        // comments") is an ordinary sentence, not a malformed mutation. The
+        // deterministic binder only claims unambiguous writes; everything else
+        // falls through to the conversational router, which can still select a
+        // typed GitHub action with an exact target or simply answer.
         if kinds != 1 {
-            return Err(String::from(
-                "Name exactly one GitHub action or management domain.",
-            ));
+            return Ok(None);
         }
         if create {
             if !urls.is_empty() {
@@ -241,9 +244,9 @@ where
                 .filter(|alias| tokens.contains(alias) || website_aliases.contains(alias))
                 .collect();
             let [alias] = aliases.as_slice() else {
-                return Err(String::from(
-                    "Name exactly one configured GitHub repository alias.",
-                ));
+                // Zero or several aliases: let the router resolve the repository
+                // from conversation context or ask, rather than refusing.
+                return Ok(None);
             };
             return Ok(Some(GitHubActionRequest::Create {
                 alias: alias.clone(),
@@ -257,9 +260,10 @@ where
             }));
         }
         let [issue_url] = urls.as_slice() else {
-            return Err(String::from(
-                "Name exactly one full GitHub issue URL for that action.",
-            ));
+            // A verb without exactly one canonical issue URL in this message
+            // ("check that", "reply to him") is resolved by the router against
+            // the recent conversation, not refused here.
+            return Ok(None);
         };
         if reply {
             return Ok(Some(GitHubActionRequest::Reply {
@@ -1545,6 +1549,43 @@ mod tests {
                 .expect("must not become a reply mutation"),
             None
         );
+    }
+
+    #[test]
+    fn ambiguous_sentences_defer_to_the_router_instead_of_refusing() {
+        let (engine, _, _) = engine("this answer must not be read");
+        // Two candidate verbs in an ordinary sentence.
+        assert_eq!(
+            engine
+                .natural_request(
+                    "check if we missed handling any of the tickets or follow up comments posted in the channel",
+                )
+                .expect("ordinary sentence"),
+            None
+        );
+        // A mutation verb with no canonical issue URL in this message.
+        assert_eq!(
+            engine
+                .natural_request("reply to him that it is deployed")
+                .expect("no target in message"),
+            None
+        );
+        // A creation request naming no configured alias.
+        assert_eq!(
+            engine
+                .natural_request("create a github issue for the thing we discussed")
+                .expect("no alias"),
+            None
+        );
+        // Unambiguous writes still bind deterministically.
+        assert!(matches!(
+            engine
+                .natural_request(
+                    "reply on https://github.com/example/repo/issues/12 that the fix is live"
+                )
+                .expect("bound reply"),
+            Some(GitHubActionRequest::Reply { .. })
+        ));
     }
 
     #[test]

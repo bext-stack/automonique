@@ -64,6 +64,9 @@ fn main() -> ExitCode {
             }
         };
     }
+    if command.as_deref() == Some(std::ffi::OsStr::new("work-brief")) {
+        return work_brief_command(arguments.collect());
+    }
     if command.as_deref() == Some(std::ffi::OsStr::new("backup")) {
         return backup_command(arguments.collect());
     }
@@ -75,6 +78,50 @@ fn main() -> ExitCode {
         std::io::stdout().lock(),
         std::io::stderr().lock(),
     ))
+}
+
+/// `automonique work-brief --state-dir D --job-id J --issue-url U` prints the
+/// local context block for one approved job. The ranking hint (the job's
+/// prompt head) arrives on stdin, never as an argument: it is model- and
+/// console-produced text and must not become part of a command line.
+fn work_brief_command(values: Vec<std::ffi::OsString>) -> ExitCode {
+    const MAX_HINT_BYTES: usize = 8 * 1024;
+    if values.len() != 6
+        || values[0] != "--state-dir"
+        || values[2] != "--job-id"
+        || values[4] != "--issue-url"
+    {
+        eprintln!(
+            "usage: automonique work-brief --state-dir DIR --job-id ID --issue-url URL < hint"
+        );
+        return ExitCode::from(2);
+    }
+    let Some(state_dir) = values[1].to_str().map(std::path::Path::new) else {
+        return ExitCode::from(2);
+    };
+    let (Some(job_id), Some(issue_url)) = (values[3].to_str(), values[5].to_str()) else {
+        return ExitCode::from(2);
+    };
+    let mut hint = Vec::new();
+    {
+        use std::io::Read as _;
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock().take(MAX_HINT_BYTES as u64);
+        if handle.read_to_end(&mut hint).is_err() {
+            hint.clear();
+        }
+    }
+    let hint = String::from_utf8_lossy(&hint).into_owned();
+    let brief = automonique_daemon::work_brief::render(
+        state_dir,
+        &automonique_daemon::work_brief::WorkBriefRequest {
+            job_id: job_id.to_owned(),
+            issue_url: issue_url.to_owned(),
+            hint,
+        },
+    );
+    println!("{brief}");
+    ExitCode::SUCCESS
 }
 
 fn backup_command(values: Vec<std::ffi::OsString>) -> ExitCode {

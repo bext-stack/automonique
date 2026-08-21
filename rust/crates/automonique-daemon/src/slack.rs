@@ -2357,6 +2357,8 @@ enum PendingSlackTool {
         plan: crate::telegram_bridge::QuestionMcpCallPlan,
         requests: serde_json::Value,
     },
+    /// The deeper lane for one question the chat lane could not answer.
+    Escalate(crate::telegram_bridge::QuestionEscalation),
 }
 
 struct PendingSlackToolEntry {
@@ -2504,6 +2506,24 @@ impl LiveSlackQuestionAnswerer {
                     ))
                 }
             }
+            TransportToolPlan::Escalate(escalation) => {
+                if !approvals_enabled {
+                    // No buttons on this workspace: say what was found and
+                    // what the deeper lane would do, without running it.
+                    let mut text = escalation.plan.preview();
+                    text.push_str(
+                        "\n\nInteractive approvals are not enabled in this workspace, so ask an administrator here or on Telegram to run it.",
+                    );
+                    return SlackQuestionReply::Text(text);
+                }
+                let preview = escalation.plan.preview();
+                self.stage_tool(
+                    source_key,
+                    channel,
+                    PendingSlackTool::Escalate(escalation),
+                    preview,
+                )
+            }
         }
     }
 
@@ -2593,6 +2613,19 @@ impl LiveSlackQuestionAnswerer {
                         "Slack did not confirm the approved post. Its outcome is unknown and Monique did not retry it.",
                     ),
                 }
+            }
+            PendingSlackTool::Escalate(escalation) => {
+                crate::telegram_bridge::answer_approved_escalation(
+                    &mut self.surface,
+                    &mut self.lane,
+                    self.github
+                        .as_deref_mut()
+                        .map(|github| github as &mut dyn GitHubSurface),
+                    &escalation,
+                    &self.administrators,
+                    &self.configured,
+                    "slack_question_worker",
+                )
             }
             PendingSlackTool::McpCall { plan, requests } => {
                 let Some(responses) = accepted_mcp_input_responses(&requests) else {
@@ -3296,7 +3329,12 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
         }
     }
 
-    fn open_ticket_gate(&mut self, event: &SlackTicketEvent, issue_url: String) {
+    fn open_ticket_gate(
+        &mut self,
+        event: &SlackTicketEvent,
+        issue_url: String,
+        thread_context: &str,
+    ) {
         if !self.features.contains(&SlackFeature::Approvals) {
             return;
         }
@@ -3321,6 +3359,17 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                                 &issue_url,
                             )
                             .is_ok();
+                        // The thread that asked is the one context the
+                        // approved job cannot get from GitHub. Best effort:
+                        // the gate opens whether or not this sidecar wrote.
+                        if tracked && let Some(state_dir) = gates.state_dir() {
+                            let _ = crate::work_brief::record_ticket_thread_context(
+                                &state_dir,
+                                &receipt.job_id,
+                                &issue_url,
+                                thread_context,
+                            );
+                        }
                         (registered, tracked)
                     });
                 if !registered {
@@ -4332,7 +4381,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                 // durable gate and render its native confirmation controls.
                 // The gate remains pending, so the summary itself never starts
                 // work and the user needs no follow-up just to request tools.
-                self.open_ticket_gate(&event, issue_url);
+                self.open_ticket_gate(&event, issue_url, context);
                 return;
             }
             if is_github_issue_status_question(trimmed)
@@ -4585,7 +4634,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                 return;
             }
         };
-        self.open_ticket_gate(&event, issue_url);
+        self.open_ticket_gate(&event, issue_url, context);
     }
 
     fn confirm(&mut self, event: &SlackTicketEvent, reference: &str) {
