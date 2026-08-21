@@ -3211,15 +3211,39 @@ fn contextual_github_issue_work(text: &str, context: &str) -> Option<String> {
         .flatten()
 }
 
-fn ticket_approval_failure(reason: &str) -> &'static str {
+fn ticket_approval_failure(reason: &str) -> String {
     match reason {
-        "executor_unavailable" => {
-            "Manage has no live code-execution worker for this ticket. The gate remains pending and no work was released."
+        "executor_unavailable" => String::from(
+            "Manage has no live code-execution worker for this ticket. The gate remains pending and no work was released.",
+        ),
+        "source_mismatch" => String::from(
+            "Manage linked this confirmation to a different pending request. The gate remains pending and no work was released.",
+        ),
+        "manage_unavailable" | "decision_unavailable" => String::from(
+            "Manage's decision endpoint was unavailable or timed out. The gate remains pending and no work was released.",
+        ),
+        "approval_expired" | "expired" => String::from(
+            "This confirmation expired before Manage accepted it. Post the issue URL again to create a fresh gate; no work was released.",
+        ),
+        "already_decided" | "approval_already_decided" => String::from(
+            "Manage reports that this gate was already decided. Check the job's current status before creating another request.",
+        ),
+        "decision_receipt_mismatch" => String::from(
+            "Manage returned a decision receipt for different coordinates. The gate remains pending and no work was released.",
+        ),
+        _ if !reason.is_empty()
+            && reason.len() <= 80
+            && reason
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_') =>
+        {
+            format!(
+                "Manage refused the approval with reason `{reason}`. The gate remains pending and no work was released."
+            )
         }
-        "source_mismatch" => {
-            "Manage linked this confirmation to a different pending request. The gate remains pending and no work was released."
-        }
-        _ => "Manage did not accept that approval, so no work was released.",
+        _ => String::from(
+            "Manage did not accept that approval. The gate remains pending and no work was released.",
+        ),
     }
 }
 
@@ -3515,7 +3539,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                         receipt.job_status.as_str()
                     )
                 }
-                Err(reason) => String::from(ticket_approval_failure(&reason)),
+                Err(reason) => ticket_approval_failure(&reason),
                 Ok(_) => String::from("Manage kept that ticket pending, so no work was released."),
             };
             let _ = self.poster.post_channel(&command.channel, &reply);
@@ -4623,7 +4647,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                 let _ = self.poster.post_thread(
                     &event.channel,
                     &event.parent,
-                    ticket_approval_failure(&reason),
+                    &ticket_approval_failure(&reason),
                 );
             }
         }
@@ -9070,7 +9094,15 @@ mod tests {
         );
         assert_eq!(
             ticket_approval_failure("manage_unavailable"),
-            "Manage did not accept that approval, so no work was released."
+            "Manage's decision endpoint was unavailable or timed out. The gate remains pending and no work was released."
+        );
+        assert_eq!(
+            ticket_approval_failure("approval_expired"),
+            "This confirmation expired before Manage accepted it. Post the issue URL again to create a fresh gate; no work was released."
+        );
+        assert_eq!(
+            ticket_approval_failure("job_not_pending"),
+            "Manage refused the approval with reason `job_not_pending`. The gate remains pending and no work was released."
         );
     }
 
@@ -9118,6 +9150,7 @@ mod tests {
         let messages = router.poster.messages.lock().expect("messages");
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("Approval failed"));
+        assert!(messages[0].contains("ticket_decisions_unavailable"));
         assert!(messages[0].contains("remains pending"));
         assert!(messages[0].contains("/monique approve job-fixture"));
     }

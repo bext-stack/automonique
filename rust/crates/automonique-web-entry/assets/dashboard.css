@@ -53,6 +53,10 @@
   --info-surface: #101a26;
   --info-border: #365174;
   --info-muted: #8ea4bf;
+  --source-accent: var(--blue);
+  --source-surface: color-mix(in srgb, var(--source-accent) 8%, var(--panel));
+  --source-border: color-mix(in srgb, var(--source-accent) 34%, var(--line));
+  --source-text: color-mix(in srgb, var(--source-accent) 72%, var(--text));
   --warning-surface: #211b11;
   --warning-border: #674f29;
   --warning-muted: #c9c0b0;
@@ -801,10 +805,16 @@ h2 { margin-bottom: 0; font-size: var(--font-title); font-weight: 580; letter-sp
 .message-content .align-right { text-align: right; }
 .message.error .message-content { padding: 10px 13px; border-color: var(--danger-border); color: var(--danger-muted); background: var(--danger-surface); }
 .message-meta { margin-top: 9px; color: var(--quiet); font: var(--font-xs) ui-monospace, monospace; }
-.message-tools { display: flex; gap: 6px; align-items: center; margin-top: 9px; }
-.source-chip { padding: 4px 7px; border: 1px solid var(--info-border); border-radius: 999px; color: var(--blue); background: var(--info-surface); font: var(--font-2xs) ui-monospace, monospace; }
-.copy-message { margin-left: auto; padding: 2px 5px; border: 0; color: var(--quiet); background: transparent; font: var(--font-xs) ui-monospace, monospace; opacity: .5; cursor: pointer; }
-.copy-message:hover { color: var(--green); }
+.message-tools { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 14px; align-items: center; margin-top: 11px; }
+.message-sources { display: flex; min-width: 0; flex-wrap: wrap; gap: 6px; align-items: center; }
+.source-group-label { display: inline-flex; flex: 0 0 auto; gap: 6px; align-items: center; margin-right: 1px; color: var(--source-accent); font: 700 var(--font-2xs)/1 ui-monospace, monospace; letter-spacing: .09em; }
+.source-group-label::before { width: 5px; height: 5px; border-radius: 50%; background: var(--source-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--source-accent) 14%, transparent); content: ""; }
+.source-chip { display: inline-flex; min-width: 0; max-width: min(100%, 22rem); min-height: 26px; flex: 0 1 auto; align-items: center; padding: 4px 9px; border: 1px solid var(--source-border); border-radius: 8px; color: var(--source-text); background: linear-gradient(145deg, color-mix(in srgb, var(--source-accent) 5%, var(--source-surface)), var(--source-surface)); box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent); font: var(--font-2xs)/1.2 ui-monospace, monospace; }
+.source-chip-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.copy-message { display: inline-flex; min-height: 26px; gap: 6px; align-items: center; justify-self: end; padding: 3px 7px; border: 1px solid transparent; border-radius: 7px; color: var(--quiet); background: transparent; font: var(--font-xs) ui-monospace, monospace; opacity: .72; cursor: pointer; }
+.copy-message::before { width: 9px; height: 9px; border: 1px solid currentColor; border-radius: 2px; box-shadow: 3px -3px 0 -1px var(--panel), 3px -3px 0 0 currentColor; content: ""; }
+.copy-message:hover { border-color: var(--line); color: var(--green); background: var(--hover-surface); opacity: 1; }
+.copy-message:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; opacity: 1; }
 .message.pending .message-content { min-width: 88px; color: var(--muted); }
 .action-card { max-width: 620px; margin-top: 18px; padding: 18px; border: 1px solid var(--warning-border); border-radius: 13px; background: var(--warning-surface); box-shadow: 0 12px 35px var(--shadow-color); }
 .action-card > span { display: block; margin-bottom: 9px; color: var(--amber); font: var(--font-xs) ui-monospace, monospace; letter-spacing: .13em; }
@@ -1474,6 +1484,8 @@ html[data-health="unavailable"] .attention-bar { border-color: var(--danger-bord
   .message { gap: 10px; }
   .message.user { max-width: 90%; }
   .message-content { font-size: var(--font-body); }
+  .message-tools { grid-template-columns: 1fr; }
+  .copy-message { justify-self: start; }
   .action-card { padding: 14px; }
   .action-controls { flex-direction: column-reverse; }
   .action-controls button { width: 100%; }

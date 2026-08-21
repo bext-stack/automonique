@@ -4007,6 +4007,9 @@ mod tests {
         assert!(MANAGE_WORKER.contains("refresh_process_snapshot"));
         assert!(MANAGE_WORKER.contains("exact permalink of the completion-summary comment"));
         assert!(MANAGE_WORKER.contains("#issuecomment-<number>"));
+        assert!(MANAGE_WORKER.contains("completion_comment_permalink()"));
+        assert!(MANAGE_WORKER.contains("Completion receipt rejected:"));
+        assert!(MANAGE_WORKER.contains("report_job \"$job_id\" \"failed\" \"$result\""));
         let process_projection = MANAGE_WORKER
             .split("publish_process_snapshot()")
             .nth(1)
@@ -4233,6 +4236,10 @@ mod tests {
         assert!(DASHBOARD_CSS.contains(".message-content blockquote"));
         assert!(DASHBOARD_CSS.contains(".message-content pre code"));
         assert!(DASHBOARD_CSS.contains(".message-content table"));
+        assert!(DASHBOARD_JS.contains("className = \"message-sources\""));
+        assert!(DASHBOARD_JS.contains("className = \"source-chip-name\""));
+        assert!(DASHBOARD_CSS.contains("--source-accent: var(--blue)"));
+        assert!(DASHBOARD_CSS.contains(".source-chip-name"));
         assert!(!DASHBOARD_JS.contains("innerHTML"));
     }
 

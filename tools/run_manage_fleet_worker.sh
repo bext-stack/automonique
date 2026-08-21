@@ -584,6 +584,22 @@ post_job_log() {
     jq -e '.ok == true' >/dev/null <<<"$response" || true
 }
 
+# Extract the one receipt that proves the provider reached Automonique's
+# GitHub handoff contract. A successful provider process is not, by itself,
+# proof that ticket delivery finished: the final message must identify the
+# completion-summary comment recorded on the canonical issue.
+completion_comment_permalink() {
+    final_text=$1
+    expected_issue=${2:-}
+    printf '%s' "$final_text" | jq -Rsr --arg issue "$expected_issue" '
+        [ .
+          | scan("https://github[.]com/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}/issues/[1-9][0-9]{0,19}#issuecomment-[1-9][0-9]{0,19}")
+        ]
+        | map(select($issue == "" or startswith($issue + "#issuecomment-")))
+        | first // empty
+    '
+}
+
 workspace_for() {
     requested=$1
     if [[ -z "$requested" ]]; then
@@ -624,6 +640,19 @@ log_provider_line() {
 run_job() {
     job=$1
     job_id=$(jq -er '.id | select(type == "string" and test("^[A-Za-z0-9._-]{8,120}$"))' <<<"$job") || return
+    expected_issue_url=
+    ticket_jobs=$state_dir/slack-ticket-jobs.v1.json
+    if [[ -f "$ticket_jobs" && ! -L "$ticket_jobs" ]]; then
+        expected_issue_url=$(jq -er --arg job "$job_id" '
+            [ .[]
+              | select(.job_id == $job)
+              | .issue_url
+              | select(type == "string")
+              | select(test("^https://github[.]com/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}/issues/[1-9][0-9]{0,19}$"))
+            ]
+            | first // empty
+        ' "$ticket_jobs" 2>/dev/null) || expected_issue_url=
+    fi
     prompt=$(jq -er '.prompt | select(type == "string" and length > 0 and length <= 8000)' <<<"$job") || {
         report_job "$job_id" failed 'Manage returned an invalid job prompt.' || true
         return
@@ -694,11 +723,17 @@ run_job() {
         result=$(jq -rs '[.[] | select(.type == "result") | .result] | last // ""' "$output" 2>/dev/null) || result=
     fi
     if (( provider_status == 0 )); then
-        [[ -n "$result" ]] || result="${selected_provider} completed without a final text receipt."
-        report_job "$job_id" "done" "$result" "$session_id" || true
-        post_job_log "$job_id" lifecycle "${selected_provider} completed."
         probe_local_auth || true
         write_auth_health authenticated execution_succeeded "$(date +%s%3N)" || true
+        completion_permalink=$(completion_comment_permalink "$result" "$expected_issue_url") || completion_permalink=
+        if [[ -n "$completion_permalink" ]]; then
+            report_job "$job_id" "done" "$result" "$session_id" || true
+            post_job_log "$job_id" lifecycle "${selected_provider} completed with a verified GitHub receipt."
+        else
+            result="Completion receipt rejected: ${selected_provider} exited successfully but did not return the required GitHub completion-comment permalink. Delivery remains unverified. Last provider message: ${result:-none}"
+            report_job "$job_id" "failed" "$result" "$session_id" || true
+            post_job_log "$job_id" lifecycle "${selected_provider} completion receipt was rejected."
+        fi
     else
         [[ -n "$result" ]] || result="${selected_provider} exited with status $provider_status."
         report_job "$job_id" "failed" "$result" "$session_id" || true

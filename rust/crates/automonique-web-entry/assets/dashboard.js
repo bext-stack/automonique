@@ -163,6 +163,7 @@ const frenchUi = Object.freeze({
   "memory": "mémoire",
   "live": "temps réel",
   "last turn": "dernier échange",
+  "Live sources": "Sources en temps réel",
   "Actions ready": "Actions disponibles",
   "＋ New chat": "＋ Nouvelle discussion",
   "What can I help with?": "Comment puis-je vous aider ?",
@@ -3094,12 +3095,32 @@ function appendMessage(role, content, createdAt = Date.now(), details = {}) {
   if (role !== "user") {
     const tools = document.createElement("div");
     tools.className = "message-tools";
-    (details.sources || []).forEach((source) => {
-      const chip = document.createElement("span");
-      chip.className = "source-chip";
-      chip.textContent = `LIVE · ${words(source)}`;
-      tools.append(chip);
-    });
+    const sources = details.sources || [];
+    if (sources.length > 0) {
+      const sourceList = document.createElement("div");
+      sourceList.className = "message-sources";
+      sourceList.setAttribute("role", "list");
+      sourceList.setAttribute("aria-label", "Live sources");
+      const sourceLabel = document.createElement("span");
+      sourceLabel.className = "source-group-label";
+      sourceLabel.textContent = "LIVE";
+      sourceLabel.setAttribute("aria-hidden", "true");
+      sourceList.append(sourceLabel);
+      sources.forEach((source) => {
+        const sourceName = words(source);
+        const chip = document.createElement("span");
+        chip.className = "source-chip";
+        chip.setAttribute("role", "listitem");
+        chip.setAttribute("aria-label", `Live source · ${sourceName}`);
+        chip.title = sourceName;
+        const name = document.createElement("span");
+        name.className = "source-chip-name";
+        name.textContent = sourceName;
+        chip.append(name);
+        sourceList.append(chip);
+      });
+      tools.append(sourceList);
+    }
     const copy = document.createElement("button");
     copy.type = "button";
     copy.className = "copy-message";
