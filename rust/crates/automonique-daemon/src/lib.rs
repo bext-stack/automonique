@@ -221,6 +221,14 @@ use attempt_host::DaemonAttemptHost;
 /// Socket filename inside the private product runtime directory.
 pub const ADMIN_SOCKET_NAME: &str = concat!("admin", ".sock");
 
+/// Minimum interval between live provider model-catalog reads.
+///
+/// Snapshot and subscription clients can poll much faster than the provider
+/// catalog changes. Keeping the observation in the durable platform store and
+/// refreshing it at this bounded cadence avoids spawning an App Server for
+/// every UI tick while a daemon restart still forces an immediate read.
+const PLATFORM_MODEL_REFRESH_MILLIS: i64 = 30_000;
+
 /// Database filename inside the private product state directory.
 pub const DATABASE_NAME: &str = concat!("automonique", ".sqlite3");
 
@@ -1202,6 +1210,10 @@ pub struct Daemon {
     run_index: RunIndex,
     /// Durable platform-v1 action, cursor, attachment, and control state.
     platform: PlatformStore,
+    /// Wall-clock instant of the last provider model-catalog projection.
+    /// `None` forces the first platform read after every daemon start to
+    /// reconcile the durable projection with the live provider authority.
+    platform_models_observed_ms: Option<i64>,
     /// The hash-chained audit record of what this daemon was asked to do.
     ///
     /// A plain field for the reason [`Daemon::run_index`] is one: it owns no
@@ -1790,6 +1802,7 @@ impl Daemon {
             run_submissions,
             run_index,
             platform,
+            platform_models_observed_ms: None,
             audit_chain,
             automations,
             approvals,
@@ -3235,6 +3248,14 @@ impl Daemon {
         now_ms: i64,
     ) -> Result<(), DaemonError> {
         let wants_all = requested.is_empty();
+        let wants_models = wants_all
+            || requested.iter().any(|resource| {
+                resource.authority == ResourceAuthority::Provider
+                    && resource.kind == ResourceKind::Model
+            });
+        if wants_models {
+            self.refresh_platform_models(now_ms)?;
+        }
         let wants_node = wants_all
             || requested.iter().any(|resource| {
                 resource.authority == ResourceAuthority::Automonique
@@ -3292,6 +3313,124 @@ impl Daemon {
                 .upsert_resource("resources", &resource)
                 .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
         }
+        Ok(())
+    }
+
+    /// Reconcile the credential-free provider model inventory into platform
+    /// resources. Model IDs come only from the bounded `model/list` decoder;
+    /// credentials and provider response bodies never enter the projection.
+    fn refresh_platform_models(&mut self, now_ms: i64) -> Result<(), DaemonError> {
+        if self.platform_models_observed_ms.is_some_and(|observed_ms| {
+            now_ms >= observed_ms
+                && now_ms.saturating_sub(observed_ms) < PLATFORM_MODEL_REFRESH_MILLIS
+        }) {
+            return Ok(());
+        }
+
+        let (resources, _) = self
+            .platform
+            .snapshot(&[], "resources")
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        let existing: Vec<ResourceRecord> = resources
+            .into_iter()
+            .filter(|record| {
+                record.resource.authority == ResourceAuthority::Provider
+                    && record.resource.kind == ResourceKind::Model
+            })
+            .collect();
+
+        match model_inventory::configured_codex_catalog(&self.state_dir) {
+            model_inventory::ModelCatalogRead::Available(catalog) => {
+                let available: std::collections::BTreeSet<&str> = catalog
+                    .models
+                    .iter()
+                    .map(|model| model.id.as_str())
+                    .collect();
+                for model in &catalog.models {
+                    let coordinate = ResourceCoordinate::new(
+                        ResourceAuthority::Provider,
+                        ResourceKind::Model,
+                        ResourceId::new(&model.id)
+                            .map_err(|_| DaemonError::PlatformStoreFailed("model_id_invalid"))?,
+                    );
+                    let summary = if model.is_default {
+                        "available; default=true"
+                    } else {
+                        "available; default=false"
+                    };
+                    self.upsert_platform_observation(
+                        coordinate,
+                        FreshnessState::Fresh,
+                        summary,
+                        now_ms,
+                    )?;
+                }
+                for record in existing
+                    .iter()
+                    .filter(|record| !available.contains(record.resource.id.as_str()))
+                {
+                    self.upsert_platform_observation(
+                        record.resource.clone(),
+                        FreshnessState::Stale,
+                        "absent from current catalog",
+                        now_ms,
+                    )?;
+                }
+            }
+            model_inventory::ModelCatalogRead::Unavailable(_) => {
+                for record in existing {
+                    self.upsert_platform_observation(
+                        record.resource,
+                        FreshnessState::Unknown,
+                        "catalog temporarily unavailable",
+                        now_ms,
+                    )?;
+                }
+            }
+        }
+        self.platform_models_observed_ms = Some(now_ms);
+        Ok(())
+    }
+
+    /// Upsert one observation with a revision that advances only when its
+    /// semantic state changes. Observation time alone does not create a
+    /// subscription event, matching `PlatformStore::upsert_resource`.
+    fn upsert_platform_observation(
+        &mut self,
+        coordinate: ResourceCoordinate,
+        state: FreshnessState,
+        summary: &str,
+        now_ms: i64,
+    ) -> Result<(), DaemonError> {
+        let summary = PlatformText::new(summary)
+            .map_err(|_| DaemonError::PlatformStoreFailed("model_summary_invalid"))?;
+        let current = self
+            .platform
+            .resource(&coordinate)
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        let revision = match current.as_ref() {
+            Some(record) if record.freshness.state == state && record.summary == summary => {
+                record.freshness.revision
+            }
+            Some(record) => record
+                .freshness
+                .revision
+                .checked_next()
+                .map_err(|_| DaemonError::PlatformStoreFailed("revision_exhausted"))?,
+            None => Revision::FIRST,
+        };
+        let record = ResourceRecord {
+            resource: coordinate,
+            freshness: Freshness {
+                state,
+                observed_at: automonique_protocol::primitives::EpochMillis::from_millis(now_ms),
+                revision,
+            },
+            summary,
+        };
+        self.platform
+            .upsert_resource("resources", &record)
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
         Ok(())
     }
 

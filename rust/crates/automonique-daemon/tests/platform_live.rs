@@ -5,6 +5,7 @@
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -39,6 +40,40 @@ fn fixture() -> (tempfile::TempDir, DaemonConfig) {
             state_root: state,
         },
     )
+}
+
+fn write_catalog_provider(config: &DaemonConfig, model: &str, is_default: bool) -> PathBuf {
+    let home = config.state_dir().join("platform-provider-home");
+    std::fs::create_dir_all(&home).expect("provider home");
+    let binary = config.state_dir().join("platform-provider");
+    rewrite_catalog_provider(&binary, model, is_default);
+    let provider = config
+        .state_dir()
+        .join(automonique_daemon::compose::PROVIDER_CONFIG_NAME);
+    std::fs::write(
+        &provider,
+        format!(
+            "binary={}\nhome={}\nversion=platform-fixture\narg={{answer}}\n",
+            binary.display(),
+            home.display(),
+        ),
+    )
+    .expect("provider configuration");
+    std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o600))
+        .expect("private provider configuration");
+    binary
+}
+
+fn rewrite_catalog_provider(binary: &Path, model: &str, is_default: bool) {
+    std::fs::write(
+        binary,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{{\"id\":2,\"result\":{{\"data\":[{{\"id\":\"{model}\",\"model\":\"{model}\",\"hidden\":false,\"isDefault\":{is_default}}}],\"nextCursor\":null}}}}'\n"
+        ),
+    )
+    .expect("fixture provider");
+    std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o700))
+        .expect("executable provider");
 }
 
 fn exchange(config: &DaemonConfig, payload: &[u8]) -> Vec<u8> {
@@ -138,6 +173,7 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
     std::fs::create_dir(config.state_dir()).expect("product state");
     std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
         .expect("private product state");
+    let catalog_provider = write_catalog_provider(&config, "gpt-5.6-sol", true);
     let mut journal = ProviderJournal::open(config.provider_journal_path()).expect("journal");
     let process = journal
         .record_process(ProcessSpawn {
@@ -177,6 +213,15 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
         resource.resource.authority == ResourceAuthority::Automonique
             && resource.resource.kind == ResourceKind::Node
     }));
+    let model = snapshot
+        .resources
+        .iter()
+        .find(|resource| resource.resource.kind == ResourceKind::Model)
+        .expect("provider model is projected");
+    assert_eq!(model.resource.authority, ResourceAuthority::Provider);
+    assert_eq!(model.resource.id.as_str(), "gpt-5.6-sol");
+    assert_eq!(model.freshness.state.as_str(), "fresh");
+    assert_eq!(model.summary.as_str(), "available; default=true");
 
     let PlatformResponse::Sessions(sessions) = platform(
         &config,
@@ -215,6 +260,7 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
     assert_eq!(replay, first);
 
     serving.shutdown(&config);
+    rewrite_catalog_provider(&catalog_provider, "gpt-5.6-terra", false);
     let serving = serve(&config);
     let PlatformResponse::ControlClaimed(restarted_replay) = platform(
         &config,
@@ -228,5 +274,26 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
         panic!("restart replay")
     };
     assert_eq!(restarted_replay, first);
+    let PlatformResponse::Snapshot(restarted_snapshot) = platform(
+        &config,
+        "snapshot-after-catalog-change",
+        PlatformRequest::Snapshot(SnapshotRequest::new(Vec::new()).expect("snapshot request")),
+    ) else {
+        panic!("snapshot after catalog change")
+    };
+    let old_model = restarted_snapshot
+        .resources
+        .iter()
+        .find(|resource| resource.resource.id.as_str() == "gpt-5.6-sol")
+        .expect("removed model remains explicit");
+    assert_eq!(old_model.freshness.state.as_str(), "stale");
+    assert_eq!(old_model.summary.as_str(), "absent from current catalog");
+    let current_model = restarted_snapshot
+        .resources
+        .iter()
+        .find(|resource| resource.resource.id.as_str() == "gpt-5.6-terra")
+        .expect("replacement model is projected");
+    assert_eq!(current_model.freshness.state.as_str(), "fresh");
+    assert_eq!(current_model.summary.as_str(), "available; default=false");
     serving.shutdown(&config);
 }
