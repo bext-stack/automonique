@@ -305,6 +305,10 @@ use crate::batch_runner::{BatchError, BatchState, ConcurrencyKind, MemberProgres
 use crate::codec::CodecError;
 use crate::digest::Sha256;
 use crate::event::{Authority, EventKind, MAX_RETRY_AFTER_MS, RetryCategory, StepStatus};
+use crate::platform::{
+    FreshnessState, PlatformAction, PlatformMethod, PlatformTransport, ReceiptOutcome,
+    ResourceAuthority, ResourceKind,
+};
 use crate::primitives::ValueError;
 use crate::progress_api::{StreamMessageKind, StreamRefusal};
 use crate::provenance::MAX_PROVENANCE_ID_BYTES;
@@ -803,6 +807,9 @@ pub const BATCH_MODULE: &str = "batch";
 
 /// The `automonique.progress/v1` frame surface.
 pub const PROGRESS_MODULE: &str = "progress";
+
+/// The federated `automonique.platform/v1` client contract.
+pub const PLATFORM_MODULE: &str = "platform";
 
 /// The file one module is written to.
 #[must_use]
@@ -5880,6 +5887,201 @@ fn stream_refusal_values() -> Vec<String> {
         .collect()
 }
 
+fn platform_values<T: Copy>(values: &[T], spelling: impl Fn(T) -> &'static str) -> Vec<String> {
+    values
+        .iter()
+        .copied()
+        .map(|value| spelling(value).to_owned())
+        .collect()
+}
+
+/// The shared platform identities and service descriptions.
+fn platform_module() -> GeneratedModule {
+    let security_enum = |name: &str, values: Vec<String>| GeneratedEnum {
+        name: name.to_owned(),
+        sensitivity: EnumSensitivity::SecuritySensitive,
+        values,
+        wire_order: None,
+    };
+    GeneratedModule {
+        file_name: module_file_name(PLATFORM_MODULE),
+        doc: "Federated resource identity, freshness, cursor, action, receipt, and service types."
+            .to_owned(),
+        source: "automonique_protocol::platform".to_owned(),
+        constants: vec![
+            Constant {
+                name: "MAX_CAPABILITY_METHODS".to_owned(),
+                doc: "Maximum methods advertised by one endpoint.".to_owned(),
+                value: ConstantValue::Count(crate::platform::MAX_CAPABILITY_METHODS),
+            },
+            Constant {
+                name: "MAX_SNAPSHOT_RESOURCES".to_owned(),
+                doc: "Maximum resources carried by one snapshot.".to_owned(),
+                value: ConstantValue::Count(crate::platform::MAX_SNAPSHOT_RESOURCES),
+            },
+            Constant {
+                name: "PLATFORM_PROTOCOL".to_owned(),
+                doc: "Stable platform protocol name.".to_owned(),
+                value: ConstantValue::Text(crate::platform::PLATFORM_PROTOCOL.to_owned()),
+            },
+            Constant {
+                name: "PLATFORM_SCHEMA_V1".to_owned(),
+                doc: "Stable version-one schema identifier.".to_owned(),
+                value: ConstantValue::Text(crate::platform::PLATFORM_SCHEMA_V1.to_owned()),
+            },
+        ],
+        branded_ids: [
+            "ClientId",
+            "ControlLeaseId",
+            "IdempotencyKey",
+            "ReceiptId",
+            "ResourceId",
+        ]
+        .into_iter()
+        .map(|name| BrandedId {
+            name: name.to_owned(),
+            max_bytes: crate::platform::MAX_PLATFORM_FIELD_BYTES,
+            pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+        })
+        .collect(),
+        bounded_strings: vec![
+            BoundedString {
+                name: "CursorTopic".to_owned(),
+                max_bytes: crate::platform::MAX_PLATFORM_FIELD_BYTES,
+                pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+            },
+            BoundedString {
+                name: "PlatformText".to_owned(),
+                max_bytes: crate::platform::MAX_PLATFORM_FIELD_BYTES,
+                pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+            },
+        ],
+        bounded_integers: vec![
+            BoundedInteger {
+                name: "PlatformEpochMillis".to_owned(),
+                min: i64::MIN,
+                max: i64::MAX,
+            },
+            BoundedInteger {
+                name: "PlatformRevision".to_owned(),
+                min: 1,
+                max: i64::MAX,
+            },
+        ],
+        enums: vec![
+            security_enum(
+                "FreshnessState",
+                platform_values(&FreshnessState::ALL, FreshnessState::as_str),
+            ),
+            security_enum(
+                "PlatformAction",
+                platform_values(&PlatformAction::ALL, PlatformAction::as_str),
+            ),
+            security_enum(
+                "PlatformMethod",
+                platform_values(&PlatformMethod::ALL, PlatformMethod::as_str),
+            ),
+            security_enum(
+                "PlatformTransport",
+                platform_values(&PlatformTransport::ALL, PlatformTransport::as_str),
+            ),
+            security_enum(
+                "ReceiptOutcome",
+                platform_values(&ReceiptOutcome::ALL, ReceiptOutcome::as_str),
+            ),
+            security_enum(
+                "ResourceAuthority",
+                platform_values(&ResourceAuthority::ALL, ResourceAuthority::as_str),
+            ),
+            security_enum(
+                "ResourceKind",
+                platform_values(&ResourceKind::ALL, ResourceKind::as_str),
+            ),
+        ],
+        interfaces: vec![
+            Interface {
+                name: "ActionReceipt".to_owned(),
+                doc: "Durable result of one idempotent action.".to_owned(),
+                fields: vec![
+                    required("action", "PlatformAction"),
+                    nullable("explanation", "PlatformText"),
+                    required("id", "ReceiptId"),
+                    required("outcome", "ReceiptOutcome"),
+                    required("recorded_at", "PlatformEpochMillis"),
+                    required("revision", "PlatformRevision"),
+                    required("target", "ResourceCoordinate"),
+                ],
+            },
+            Interface {
+                name: "Capabilities".to_owned(),
+                doc: "Methods and transport projections supported by an endpoint.".to_owned(),
+                fields: vec![
+                    required("methods", "readonly PlatformMethod[]"),
+                    required("protocol", "typeof PLATFORM_PROTOCOL"),
+                    required("schema", "typeof PLATFORM_SCHEMA_V1"),
+                    required("transports", "readonly PlatformTransport[]"),
+                ],
+            },
+            Interface {
+                name: "ExecuteRequest".to_owned(),
+                doc: "The only general mutation request in the public contract.".to_owned(),
+                fields: vec![
+                    required("action", "PlatformAction"),
+                    nullable("expected_revision", "PlatformRevision"),
+                    required("idempotency_key", "IdempotencyKey"),
+                    nullable("parameter", "PlatformText"),
+                    required("target", "ResourceCoordinate"),
+                ],
+            },
+            Interface {
+                name: "Freshness".to_owned(),
+                doc: "Revision and observation time attached to a projection.".to_owned(),
+                fields: vec![
+                    required("observed_at", "PlatformEpochMillis"),
+                    required("revision", "PlatformRevision"),
+                    required("state", "FreshnessState"),
+                ],
+            },
+            Interface {
+                name: "PlatformCursor".to_owned(),
+                doc: "Resume coordinate within one authority-owned topic.".to_owned(),
+                fields: vec![
+                    required("authority", "ResourceAuthority"),
+                    required("sequence", "PlatformRevision"),
+                    required("topic", "CursorTopic"),
+                ],
+            },
+            Interface {
+                name: "ResourceCoordinate".to_owned(),
+                doc: "Authority-qualified resource identity.".to_owned(),
+                fields: vec![
+                    required("authority", "ResourceAuthority"),
+                    required("id", "ResourceId"),
+                    required("kind", "ResourceKind"),
+                ],
+            },
+            Interface {
+                name: "ResourceRecord".to_owned(),
+                doc: "One bounded, freshness-qualified resource projection.".to_owned(),
+                fields: vec![
+                    required("freshness", "Freshness"),
+                    required("resource", "ResourceCoordinate"),
+                    required("summary", "PlatformText"),
+                ],
+            },
+            Interface {
+                name: "Snapshot".to_owned(),
+                doc: "Bounded point-in-time resource collection and resume cursor.".to_owned(),
+                fields: vec![
+                    required("cursor", "PlatformCursor"),
+                    required("resources", "readonly ResourceRecord[]"),
+                ],
+            },
+        ],
+        ..GeneratedModule::default()
+    }
+}
+
 /// The stream message arms, each carrying its body under one shared key.
 ///
 /// Written as a match over the closed kind set rather than a list, so a kind
@@ -5919,6 +6121,7 @@ pub fn maintained_modules() -> Vec<GeneratedModule> {
         automation_module(),
         approval_module(),
         batch_module(),
+        platform_module(),
         progress_module(),
     ];
     modules.sort_by(|left, right| left.file_name.cmp(&right.file_name));
