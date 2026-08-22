@@ -118,6 +118,18 @@ export class HttpsPlatformTransport implements PlatformAdapter {
 }
 
 function decodeRemoteResponse(method: PlatformRequest["method"], body: Record<string, unknown>): PlatformResponse {
+  if (body.refusal !== undefined) {
+    const refusal = object(body.refusal);
+    const outcome = refusal.outcome;
+    const explanation = refusal.explanation;
+    if (
+      (outcome !== "conflict" && outcome !== "rejected" && outcome !== "resync_required" && outcome !== "unknown")
+      || typeof explanation !== "string"
+    ) {
+      throw new PlatformTransportError(502, "invalid_refusal");
+    }
+    return {kind: "refused", outcome, explanation};
+  }
   if (body.capabilities !== undefined) {
     const capabilities = object(body.capabilities);
     if (capabilities.protocol !== PLATFORM_PROTOCOL || capabilities.schema !== PLATFORM_SCHEMA_V1) {

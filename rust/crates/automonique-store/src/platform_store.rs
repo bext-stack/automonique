@@ -337,6 +337,23 @@ impl PlatformStore {
         ))
     }
 
+    pub fn resource(&self, coordinate: &ResourceCoordinate) -> Stored<Option<ResourceRecord>> {
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT authority,kind,resource_id,freshness_state,observed_at_ms,revision,summary
+                 FROM platform_resources WHERE authority=?1 AND kind=?2 AND resource_id=?3",
+                params![
+                    coordinate.authority.as_str(),
+                    coordinate.kind.as_str(),
+                    coordinate.id.as_str()
+                ],
+                raw_record,
+            )
+            .optional()?;
+        raw.map(record_from_row).transpose()
+    }
+
     pub fn subscribe(
         &self,
         requested: Option<&PlatformCursor>,

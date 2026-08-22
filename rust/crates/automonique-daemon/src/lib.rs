@@ -3048,7 +3048,7 @@ impl Daemon {
                     .as_ref()
                     .map_or("resources", |cursor| cursor.topic.as_str());
                 if topic == "sessions" {
-                    self.refresh_platform_sessions()?;
+                    self.refresh_platform_sessions(now_ms)?;
                 } else {
                     self.refresh_platform_resources(&[], now_ms)?;
                 }
@@ -3071,7 +3071,7 @@ impl Daemon {
                 if request.authority != ResourceAuthority::Automonique {
                     platform_refusal(ReceiptOutcome::Rejected, "authority_not_local")?
                 } else {
-                    self.refresh_platform_sessions()?;
+                    self.refresh_platform_sessions(now_ms)?;
                     if let Some(cursor) = request.cursor.as_ref()
                         && let Err(error) = self.platform.subscribe(Some(cursor), "sessions")
                     {
@@ -3085,10 +3085,10 @@ impl Daemon {
                             .into_iter()
                             .filter(|record| record.resource.kind == ResourceKind::Session)
                             .map(|session| SessionRecord {
-                                session,
+                                attachable: session.summary.as_str() == "open",
+                                controllable: session.summary.as_str() == "open",
                                 run: None,
-                                attachable: true,
-                                controllable: true,
+                                session,
                             })
                             .collect();
                         PlatformResponse::Sessions(
@@ -3099,12 +3099,19 @@ impl Daemon {
                 }
             }
             PlatformRequest::Attach(request) => {
-                match self
-                    .platform
-                    .attach(&request.session, &request.client, now_ms, "sessions")
-                {
-                    Ok(attachment) => PlatformResponse::Attached(attachment),
-                    Err(error) => platform_store_response(&error),
+                self.refresh_platform_sessions(now_ms)?;
+                if !self.platform_session_is_open(&request.session)? {
+                    platform_refusal(ReceiptOutcome::Rejected, "session_not_attachable")?
+                } else {
+                    match self.platform.attach(
+                        &request.session,
+                        &request.client,
+                        now_ms,
+                        "sessions",
+                    ) {
+                        Ok(attachment) => PlatformResponse::Attached(attachment),
+                        Err(error) => platform_store_response(&error),
+                    }
                 }
             }
             PlatformRequest::Detach(request) => {
@@ -3116,18 +3123,25 @@ impl Daemon {
                     Err(error) => platform_store_response(&error),
                 }
             }
-            PlatformRequest::ClaimControl(request) => match self.platform.claim_control(
-                &request.session,
-                &request.client,
-                &request.idempotency_key,
-                now_ms,
-            ) {
-                Ok(
-                    automonique_store::platform_store::ControlAdmission::New(lease)
-                    | automonique_store::platform_store::ControlAdmission::Replay(lease),
-                ) => PlatformResponse::ControlClaimed(lease),
-                Err(error) => platform_store_response(&error),
-            },
+            PlatformRequest::ClaimControl(request) => {
+                self.refresh_platform_sessions(now_ms)?;
+                if !self.platform_session_is_open(&request.session)? {
+                    platform_refusal(ReceiptOutcome::Rejected, "session_not_controllable")?
+                } else {
+                    match self.platform.claim_control(
+                        &request.session,
+                        &request.client,
+                        &request.idempotency_key,
+                        now_ms,
+                    ) {
+                        Ok(
+                            automonique_store::platform_store::ControlAdmission::New(lease)
+                            | automonique_store::platform_store::ControlAdmission::Replay(lease),
+                        ) => PlatformResponse::ControlClaimed(lease),
+                        Err(error) => platform_store_response(&error),
+                    }
+                }
+            }
             PlatformRequest::ReleaseControl(request) => match self.platform.release_control(
                 &request.session,
                 &request.client,
@@ -3156,7 +3170,7 @@ impl Daemon {
         Ok(())
     }
 
-    fn refresh_platform_sessions(&mut self) -> Result<(), DaemonError> {
+    fn refresh_platform_sessions(&mut self, now_ms: i64) -> Result<(), DaemonError> {
         let path = self.state_dir.join(PROVIDER_JOURNAL_NAME);
         if !path.exists() {
             return Ok(());
@@ -3188,7 +3202,7 @@ impl Daemon {
                 freshness: Freshness {
                     state: freshness,
                     observed_at: automonique_protocol::primitives::EpochMillis::from_millis(
-                        session.closed_ms.unwrap_or(session.opened_ms),
+                        session.closed_ms.unwrap_or(now_ms),
                     ),
                     revision: Revision::new(session.revision)
                         .map_err(|_| DaemonError::PlatformStoreFailed("revision_invalid"))?,
@@ -3201,6 +3215,18 @@ impl Daemon {
                 .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
         }
         Ok(())
+    }
+
+    fn platform_session_is_open(&self, session: &ResourceCoordinate) -> Result<bool, DaemonError> {
+        if session.authority != ResourceAuthority::Automonique
+            || session.kind != ResourceKind::Session
+        {
+            return Ok(false);
+        }
+        self.platform
+            .resource(session)
+            .map(|record| record.is_some_and(|record| record.summary.as_str() == "open"))
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))
     }
 
     fn refresh_platform_resources(

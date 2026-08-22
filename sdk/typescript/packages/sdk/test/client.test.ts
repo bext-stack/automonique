@@ -38,3 +38,16 @@ test("receipt lookup requires exactly one durable coordinate", () => {
   const client = new PlatformClient(transport);
   expect(() => client.getReceipt({id: null, idempotency_key: null})).toThrow(PlatformTransportError);
 });
+
+test("HTTPS transport preserves typed remote refusals", async () => {
+  const fetcher = (async () => new Response(JSON.stringify({
+    ok: true,
+    refusal: {outcome: "resync_required", explanation: "cursor_out_of_range"},
+  }))) as unknown as typeof fetch;
+  const client = new PlatformClient(new HttpsPlatformTransport("https://manage.example/api/platform", () => "token", fetcher));
+  expect(await client.subscribe(null)).toEqual({
+    kind: "refused",
+    outcome: "resync_required",
+    explanation: "cursor_out_of_range",
+  });
+});

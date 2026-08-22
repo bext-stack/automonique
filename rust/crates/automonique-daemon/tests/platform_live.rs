@@ -128,7 +128,7 @@ fn session() -> ResourceCoordinate {
     ResourceCoordinate::new(
         ResourceAuthority::Automonique,
         ResourceKind::Session,
-        ResourceId::new("session-live-1").expect("session id"),
+        ResourceId::new("platform-live-session").expect("session id"),
     )
 }
 
