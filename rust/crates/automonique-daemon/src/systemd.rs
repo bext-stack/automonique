@@ -189,6 +189,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn web_entry_restarts_after_an_unexpected_clean_exit() {
+        let unit = include_str!("../../../../packaging/systemd/automonique-web-entry.service");
+        for directive in ["Restart=always", "RestartSec=5s"] {
+            assert!(
+                unit.lines().any(|line| line == directive),
+                "missing web-entry availability directive: {directive}"
+            );
+        }
+    }
+
     fn receive(socket: &UnixDatagram) -> Vec<u8> {
         let mut buffer = [0_u8; 64];
         let size = socket.recv(&mut buffer).expect("notification");

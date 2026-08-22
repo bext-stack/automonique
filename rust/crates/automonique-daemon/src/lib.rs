@@ -152,6 +152,7 @@ use nix::unistd::geteuid;
 
 mod agent_activity;
 pub mod agent_harness;
+pub mod agent_lane_journal;
 pub mod agent_profile;
 pub mod agent_runtime;
 pub mod agent_tool_broker;

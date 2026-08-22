@@ -2396,7 +2396,7 @@ fn natural_language_slack_post_composes_then_uses_the_typed_channel_effect() {
     let prompts = lane.tasks();
     assert_eq!(prompts.len(), 1, "composition and intent share one turn");
     assert!(prompts[0].contains("AUTOMONIQUE_CONVERSATIONAL_TOOL_ROUTER_V1"));
-    assert!(prompts[0].contains(r#""kind":"slack_post""#));
+    assert!(prompts[0].contains("call slack_post with channel and text"));
     assert!(prompts[0].contains("slack_channels=deploiements,poetry"));
     assert!(
         outbound
@@ -3351,6 +3351,10 @@ fn a_completion_during_poll_frees_the_slot_before_follow_up_dispatch() {
         assert!(std::time::Instant::now() < deadline);
         std::thread::yield_now();
     }
+    // The lane records the task before the worker validates and publishes the
+    // provider step. Give that bounded post-provider phase time to reach the
+    // completion channel; observing the task alone is not a completion fence.
+    std::thread::sleep(Duration::from_millis(10));
     let second = poll(&mut bridge).expect("follow-up commits");
     assert_eq!(second.questions_answered, 1, "first completion was settled");
     assert_eq!(second.questions_queued, 1, "follow-up was admitted");
@@ -3618,6 +3622,11 @@ fn completed_ticket_question_lists_closed_rows_before_the_open_backlog() {
         )
         .expect("completion context renders");
     assert!(context.contains("row_order=closed tickets newest first"));
+    assert!(context.contains("snapshot_current_utc="));
+    assert!(context.contains("relative_date_rule=yesterday means the previous UTC calendar day"));
+    assert!(context.contains(
+        "completion_time_basis=lifecycle=closed proves Automonique currently treats the row as complete"
+    ));
     assert!(context.contains("thread_id=DONE-YESTERDAY-1"));
     assert!(context.contains("thread_id=DONE-YESTERDAY-2"));
     assert!(context.contains("lifecycle=closed"));

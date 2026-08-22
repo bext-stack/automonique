@@ -10,12 +10,16 @@
 
 use sha2::{Digest as _, Sha256};
 
+use automonique_protocol::tools::{ApprovalRequirement, SideEffectClass};
+
 use crate::agent_harness::{
-    CatalogError, ToolApproval, ToolBroker, ToolBrokerFailure, ToolBrokerOutcome, ToolCall,
-    ToolDefinition, ToolResultPayload,
+    AgentHarness, AgentProvider, CatalogError, HarnessFailure, HarnessLimits, HarnessOutcome,
+    ProviderDecision, ProviderFailure, ProviderTurn, ToolApproval, ToolBroker, ToolBrokerFailure,
+    ToolBrokerOutcome, ToolCall, ToolDefinition, ToolResultPayload, TranscriptInput,
 };
 use crate::agent_tool_broker::{
-    AgentToolBroker, BrokerOutcome, GrantedToolCatalog, ToolDenial, ToolInvocation,
+    AgentToolBroker, AgentToolExecutor, BrokerOutcome, GrantedToolCatalog, LocalToolDescriptor,
+    ReplayPolicy, ToolDenial, ToolExecutionRequest, ToolInvocation,
 };
 
 const MAX_REPLAY_NAMESPACE_BYTES: usize = 256;
@@ -24,6 +28,93 @@ const MAX_REPLAY_NAMESPACE_BYTES: usize = 256;
 pub enum AgentRuntimeError {
     InvalidReplayNamespace,
     InvalidCatalog,
+}
+
+/// One provider step admitted through the same harness and broker contracts as
+/// a full multi-round agent turn.
+///
+/// Live transports use this while tool execution still belongs to their
+/// existing continuation workers. A selected tool is therefore returned as a
+/// typed, schema-checked call; no executor runs in this adapter. This is a
+/// migration seam, not a second authority path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentRuntimeStep {
+    Final(String),
+    ToolCall(ToolCall),
+}
+
+/// Validate one raw provider response against a revision-pinned tool catalog.
+///
+/// The temporary broker marks every catalog entry as approval-bound so its
+/// executor is unreachable. That lets [`AgentHarness`] apply its closed wire
+/// decoder, catalog checks, argument schema validation and budgets before the
+/// transport maps the call to its established read/effect custodian.
+pub fn validate_provider_step(
+    provider_bytes: &[u8],
+    persona: &str,
+    policy: &str,
+    transcript: Vec<TranscriptInput>,
+    definitions: &[ToolDefinition],
+    replay_namespace: &str,
+) -> Result<AgentRuntimeStep, HarnessFailure> {
+    let mut local = AgentToolBroker::new(1);
+    for definition in definitions {
+        let descriptor = LocalToolDescriptor::new(
+            definition.id(),
+            definition.description(),
+            definition.input_schema().clone(),
+            SideEffectClass::ExternalEffect,
+            ApprovalRequirement::PerInvocation,
+            ReplayPolicy::AtMostOnce,
+        )
+        .map_err(|_| HarnessFailure::Catalog(CatalogError::InvalidTool))?;
+        local
+            .register(descriptor, Box::new(UnreachableExecutor))
+            .map_err(|_| HarnessFailure::Catalog(CatalogError::DuplicateTool))?;
+    }
+    let names = definitions
+        .iter()
+        .map(ToolDefinition::id)
+        .collect::<Vec<_>>();
+    let granted = local
+        .granted_catalog(&names)
+        .map_err(|_| HarnessFailure::Catalog(CatalogError::InvalidTool))?;
+    let mut broker = AgentRuntimeBroker::new(&mut local, granted, replay_namespace)
+        .map_err(|_| HarnessFailure::Catalog(CatalogError::InvalidTool))?;
+    let mut provider = OneStepProvider {
+        bytes: Some(provider_bytes),
+    };
+    let mut harness =
+        AgentHarness::new(persona, policy, transcript, HarnessLimits::conversational())
+            .map_err(|_| HarnessFailure::Provider(ProviderFailure::Refused))?;
+    match harness.drive(&mut provider, &mut broker)? {
+        HarnessOutcome::Complete(answer) => Ok(AgentRuntimeStep::Final(answer.as_str().to_owned())),
+        HarnessOutcome::AwaitingApproval(pause) => {
+            Ok(AgentRuntimeStep::ToolCall(pause.call().clone()))
+        }
+    }
+}
+
+struct OneStepProvider<'a> {
+    bytes: Option<&'a [u8]>,
+}
+
+impl AgentProvider for OneStepProvider<'_> {
+    fn decide(&mut self, _turn: ProviderTurn<'_>) -> Result<ProviderDecision, ProviderFailure> {
+        let bytes = self.bytes.take().ok_or(ProviderFailure::Refused)?;
+        crate::agent_harness::decode_provider_decision(bytes)
+    }
+}
+
+struct UnreachableExecutor;
+
+impl AgentToolExecutor for UnreachableExecutor {
+    fn execute(
+        &mut self,
+        _request: ToolExecutionRequest<'_>,
+    ) -> Result<serde_json::Value, &'static str> {
+        Err("approval-bound planner tool cannot execute in validation adapter")
+    }
 }
 
 /// One revision-pinned granted catalog attached to the harness broker seam.
@@ -263,6 +354,73 @@ mod tests {
             )
             .unwrap();
         (broker, calls)
+    }
+
+    fn transcript() -> Vec<TranscriptInput> {
+        vec![
+            TranscriptInput::message(
+                crate::agent_harness::TranscriptRole::User,
+                "show yesterday's tickets",
+            )
+            .unwrap(),
+        ]
+    }
+
+    fn definition() -> ToolDefinition {
+        ToolDefinition::new("tickets.read", "Read tickets", schema()).unwrap()
+    }
+
+    #[test]
+    fn live_step_adapter_admits_final_answers_through_the_harness() {
+        let step = validate_provider_step(
+            br#"{"kind":"final","answer":"Three tickets were completed."}"#,
+            "Monique",
+            "Use tools for current facts.",
+            transcript(),
+            &[definition()],
+            "telegram:turn-7",
+        )
+        .unwrap();
+        assert_eq!(
+            step,
+            AgentRuntimeStep::Final(String::from("Three tickets were completed."))
+        );
+    }
+
+    #[test]
+    fn live_step_adapter_returns_a_schema_checked_tool_call_without_execution() {
+        let step = validate_provider_step(
+            br#"{"kind":"tool_call","call_id":"call-1","tool":"tickets.read","arguments":{"number":7}}"#,
+            "Monique",
+            "Use tools for current facts.",
+            transcript(),
+            &[definition()],
+            "slack:turn-9",
+        )
+        .unwrap();
+        assert!(matches!(
+            step,
+            AgentRuntimeStep::ToolCall(call)
+                if call.tool() == "tickets.read" && call.arguments() == &json!({"number": 7})
+        ));
+    }
+
+    #[test]
+    fn live_step_adapter_fails_closed_on_unknown_tools_and_bad_arguments() {
+        for bytes in [
+            br#"{"kind":"tool_call","call_id":"call-1","tool":"shell.run","arguments":{"number":7}}"#.as_slice(),
+            br#"{"kind":"tool_call","call_id":"call-1","tool":"tickets.read","arguments":{"number":"seven"}}"#.as_slice(),
+        ] {
+            assert!(validate_provider_step(
+                bytes,
+                "Monique",
+                "Use tools for current facts.",
+                transcript(),
+                &[definition()],
+                "telegram:turn-7",
+            )
+            .is_err());
+        }
     }
 
     #[test]
