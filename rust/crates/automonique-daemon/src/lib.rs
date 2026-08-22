@@ -179,7 +179,7 @@ pub mod local_knowledge;
 pub mod manage_config;
 pub mod mcp_client;
 pub mod memory_config;
-mod model_inventory;
+pub mod model_inventory;
 pub mod parity_trace;
 pub mod pm2_inventory;
 pub mod progress;

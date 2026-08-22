@@ -2533,13 +2533,13 @@ impl LiveSlackQuestionAnswerer {
                 if !approvals_enabled {
                     // No buttons on this workspace: say what was found and
                     // what the deeper lane would do, without running it.
-                    let mut text = escalation.plan.preview();
+                    let mut text = escalation.preview();
                     text.push_str(
                         "\n\nInteractive approvals are not enabled in this workspace, so ask an administrator here or on Telegram to run it.",
                     );
                     return SlackQuestionReply::Text(text);
                 }
-                let preview = escalation.plan.preview();
+                let preview = escalation.preview();
                 self.stage_tool(
                     source_key,
                     channel,

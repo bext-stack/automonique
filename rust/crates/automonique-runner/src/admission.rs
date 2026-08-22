@@ -1069,8 +1069,8 @@ fn check_sandbox_fields(spec: &RunSpec) -> Result<(), AdmissionRefusal> {
     if !sandbox.allowlists().as_slice().is_empty() {
         // An allowlist entry is a name, a Landlock grant is a path, and no
         // registry here maps one to the other. An empty allowlist is the only
-        // one this plan enforces completely: it grants execute on exactly the
-        // program the spec names and on nothing else.
+        // one this plan enforces completely. Executable authority is expressed
+        // by the program plus exact read_execute path grants, not named entries.
         return Err(AdmissionRefusal::UnmappableField("sandbox.allowlists"));
     }
     if !sandbox.prohibited_capabilities().is_empty() {
@@ -1319,6 +1319,7 @@ fn build_plan(
     for grant in spec.sandbox().path_grants().as_slice() {
         let intent = match grant.access() {
             PathAccess::ReadOnly => PathIntent::Read,
+            PathAccess::ReadExecute => PathIntent::ReadExecute,
             PathAccess::ReadWrite => PathIntent::ReadWrite,
         };
         plan = plan

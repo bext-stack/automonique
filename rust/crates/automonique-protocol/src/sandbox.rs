@@ -607,24 +607,27 @@ impl fmt::Display for SandboxPath {
     }
 }
 
-/// How much of a granted path the workload may do, ordered least to most.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+/// How much of a granted path the workload may do.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PathAccess {
     /// Read only.
     ReadOnly,
+    /// Read and execute, without write authority.
+    ReadExecute,
     /// Read and write.
     ReadWrite,
 }
 
 impl PathAccess {
     /// Every path access mode, for closed-codec coverage.
-    pub const ALL: [Self; 2] = [Self::ReadOnly, Self::ReadWrite];
+    pub const ALL: [Self; 3] = [Self::ReadOnly, Self::ReadExecute, Self::ReadWrite];
 
     /// Stable spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ReadOnly => "read_only",
+            Self::ReadExecute => "read_execute",
             Self::ReadWrite => "read_write",
         }
     }
@@ -635,6 +638,28 @@ impl PathAccess {
         Self::ALL
             .into_iter()
             .find(|access| access.as_str() == value)
+    }
+
+    /// Safe intersection of two access modes.
+    ///
+    /// Write and execute are independent capabilities. When one side reviewed
+    /// write and the other requested execute, only their shared read authority
+    /// survives.
+    const fn intersect(self, other: Self) -> Self {
+        if matches!(self, Self::ReadOnly) || matches!(other, Self::ReadOnly) {
+            Self::ReadOnly
+        } else if matches!(self, Self::ReadExecute) && matches!(other, Self::ReadExecute) {
+            Self::ReadExecute
+        } else if matches!(self, Self::ReadWrite) && matches!(other, Self::ReadWrite) {
+            Self::ReadWrite
+        } else {
+            Self::ReadOnly
+        }
+    }
+
+    /// Whether this mode contains every capability in `requested`.
+    fn covers(self, requested: Self) -> bool {
+        matches!(requested, Self::ReadOnly) || self == requested
     }
 }
 
@@ -762,8 +787,8 @@ impl PathGrants {
             .filter(|grant| grant.access == PathAccess::ReadWrite)
     }
 
-    /// Intersect with a requested set, keeping the lower access of each shared
-    /// path.
+    /// Intersect with a requested set, keeping only shared capabilities for
+    /// each shared path.
     ///
     /// The result is always a subset of `self` at no higher access, so a
     /// request cannot use this to acquire a path or a mode the reviewed set
@@ -780,7 +805,7 @@ impl PathGrants {
                     .find(|other| other.path == grant.path)
                     .map(|other| PathGrant {
                         path: grant.path.clone(),
-                        access: grant.access.min(other.access),
+                        access: grant.access.intersect(other.access),
                     })
             })
             .collect();
@@ -795,7 +820,7 @@ impl PathGrants {
             other
                 .grants
                 .iter()
-                .any(|held| held.path == grant.path && held.access >= grant.access)
+                .any(|held| held.path == grant.path && held.access.covers(grant.access))
         })
     }
 

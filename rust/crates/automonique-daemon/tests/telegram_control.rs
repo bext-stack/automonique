@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use automonique_daemon::github::{
     GitHubActionSurface, GitHubIssueContext, GitHubMutationReceipt, GitHubSurface, IssueFactDetail,
-    RepositoryActivityWindow,
+    RepositoryActivityWindow, RepositoryIssueSelection,
 };
 use automonique_daemon::slack::SLACK_NOT_CONFIGURED;
 use automonique_daemon::telegram_bridge::{
@@ -1157,6 +1157,7 @@ impl SlackSurface for FakeSlack {
 struct FakeGitHub {
     seen: Arc<Mutex<Vec<String>>>,
     activity_reads: Arc<Mutex<Vec<(RepositoryActivityWindow, i64)>>>,
+    issue_inventory_reads: Arc<Mutex<Vec<(RepositoryIssueSelection, i64)>>>,
     actions: Arc<Mutex<Vec<(String, String)>>>,
 }
 
@@ -1167,6 +1168,13 @@ impl FakeGitHub {
 
     fn activity_reads(&self) -> Vec<(RepositoryActivityWindow, i64)> {
         self.activity_reads.lock().expect("github activity").clone()
+    }
+
+    fn issue_inventory_reads(&self) -> Vec<(RepositoryIssueSelection, i64)> {
+        self.issue_inventory_reads
+            .lock()
+            .expect("github issue inventory")
+            .clone()
     }
 }
 
@@ -1192,6 +1200,21 @@ impl GitHubSurface for FakeGitHub {
         Ok(format!(
             "status=available\nscope=configured_repository_allowlist\nactivity_basis=github_repository_pushed_at\nwindow={}\nrepositories_checked=2\nrepositories_with_push_activity=1\nactive_repository=example/active pushed_at=2026-08-21T17:04:11Z{legacy}\nrepositories_unavailable=0\nscope_note=This is the configured local allowlist, not an organization-wide inventory. pushed_at proves Git push activity, not issue, project, or local unpushed work.",
             window.as_str()
+        ))
+    }
+
+    fn repository_issue_inventory(
+        &mut self,
+        selection: RepositoryIssueSelection,
+        now_ms: i64,
+    ) -> Result<String, String> {
+        self.issue_inventory_reads
+            .lock()
+            .expect("github issue inventory")
+            .push((selection, now_ms));
+        Ok(format!(
+            "status=available\nscope=configured_repository_allowlist\nissue_basis=github_repository_issues\ntime_basis=github_issue_updated_at\nselection={}\nrepositories_checked=2\nissues_matched=3\nissues_open=2\nissues_closed=1\nissue_rows_included=3\nissue_rows_omitted=0\ninventory_truncated=no\nrepository=example/active matched=2 open=1 closed=1\nrepository=example/read-repo matched=1 open=1 closed=0\nissue=example/active#12 state=closed updated_at=2026-08-21T17:04:11Z title_untrusted=Shipped fix\nissue=example/active#13 state=open updated_at=2026-08-20T10:00:00Z title_untrusted=Follow-up\nscope_note=This is GitHub issue state for the configured local repository allowlist, not Manage support tickets or an organization-wide inventory.",
+            selection.as_str()
         ))
     }
 
@@ -1827,11 +1850,7 @@ fn explicit_email_composes_one_body_and_sends_to_the_server_bound_recipient() {
 
     let sends = actions.sends();
     assert_eq!(sends.len(), 1);
-    assert!(
-        sends[0].action_id.starts_with(
-            automonique_protocol::compat::legacy_spelling::SUPPORT_EMAIL_ACTION_PREFIX
-        )
-    );
+    assert!(sends[0].action_id.starts_with("automonique-email:"));
     assert_eq!(sends[0].to, "owner@example.invalid");
     assert_eq!(sends[0].subject, "Récapitulatif des travaux IA du jour");
     assert_eq!(
@@ -2115,31 +2134,70 @@ fn composite_operational_questions_use_typed_reads_then_answer_in_general_langua
 }
 
 #[test]
-fn complex_script_requests_require_an_explicit_admin_scratchpad_boundary() {
+fn complex_script_requests_stage_an_admin_approved_agentic_scratchpad() {
     let fixture = Fixture::new(&[]);
     let outbound = FakeOutbound::default();
-    let lane = FakeRunLane::answering("must not run");
+    let client = FakeClient::new([updates(&[(
+        1,
+        OPERATOR,
+        "write a Python script to scan all logs",
+    )])]);
+    let lane = FakeRunLane::answering_sequence(&[
+        "plain model prose cannot bypass the host gate",
+        "Created analyzer.py, ran its fixture checks, and summarized the available inputs.",
+    ]);
     let mut bridge = bridge_with_lane(
         &fixture,
-        FakeClient::new([updates(&[(
-            1,
-            OPERATOR,
-            "write a Python script to scan all logs",
-        )])]),
+        client.clone(),
         outbound.clone(),
         FakeSink::default(),
         lane.clone(),
     );
 
-    let report = poll(&mut bridge).expect("scratchpad proposal answers");
-    assert_eq!(report.answered, 1);
-    assert_eq!(report.questions_queued, 0);
-    assert!(lane.tasks().is_empty());
-    let message = &outbound.messages()[0];
-    assert!(message.contains("bounded scratchpad task"));
-    assert!(message.contains("administrator must review"));
-    assert!(message.contains("/run <task>"));
-    assert!(message.contains("nothing is created or run"));
+    let report = poll(&mut bridge).expect("scratchpad request queues routing");
+    assert_eq!(report.answered, 0);
+    assert_eq!(report.questions_queued, 1);
+    assert!(lane.tasks().is_empty(), "the queued router has not run yet");
+    assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
+    assert_eq!(lane.tasks().len(), 1, "only the read-only router ran");
+
+    let preview = outbound
+        .sent()
+        .into_iter()
+        .find(|call| {
+            call.method == "sendMessage" && call.body.contains("Agentic scratchpad approval")
+        })
+        .expect("agentic approval card");
+    assert!(preview.body.contains("Frozen task"));
+    assert!(
+        preview
+            .body
+            .contains("write a Python script to scan all logs")
+    );
+    assert!(preview.body.contains("one auditable contained run"));
+    assert_eq!(lane.tasks().len(), 1, "a card alone executes nothing");
+
+    let preview_json: serde_json::Value =
+        serde_json::from_str(&preview.body).expect("preview JSON");
+    let approve_callback = preview_json["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        .as_str()
+        .expect("approve callback")
+        .to_owned();
+    client.push(callback_updates(&[(2, OPERATOR, &approve_callback)]));
+    let approved = poll(&mut bridge).expect("approved scratchpad runs");
+    assert_eq!(approved.answered, 1);
+
+    let tasks = lane.tasks();
+    assert_eq!(tasks.len(), 2, "approval creates exactly one contained run");
+    assert!(tasks[1].contains("AUTOMONIQUE_AGENTIC_SCRATCHPAD_V1"));
+    assert!(tasks[1].contains("BEGIN_FROZEN_CHAT_TASK"));
+    assert!(tasks[1].contains("write a Python script to scan all logs"));
+    assert!(
+        outbound
+            .messages()
+            .iter()
+            .any(|message| message.contains("Agentic scratchpad run completed"))
+    );
 }
 
 #[test]
@@ -2371,6 +2429,67 @@ fn configured_repository_activity_is_an_automatic_typed_read_with_clocked_synthe
     assert!(!prompts[2].contains("example/legacy"));
     assert!(prompts[2].contains("not an organization-wide inventory"));
     assert!(outbound.messages()[0].contains("example/active"));
+}
+
+#[test]
+fn repository_linked_internal_tickets_use_github_issue_inventory_not_support_tickets() {
+    let fixture = Fixture::new(&[]);
+    let github = FakeGitHub::default();
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering_sequence(&[
+        r#"{"kind":"read","sources":[],"github_issues":false,"github_repository_issues":"last_7_days","depth":"fast"}"#,
+        "Across the configured repositories, 3 GitHub issues were active in the last 7 days: 1 closed and 2 open.",
+    ]);
+    let mut bridge = bridge_with_sources(
+        &fixture,
+        FakeClient::new([updates(&[(
+            1,
+            OPERATOR,
+            "what about all the internal tickets linked to our git repo?",
+        )])]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+        single_tier_roster(),
+        (None, Some(github.clone())),
+    );
+
+    assert_eq!(
+        poll(&mut bridge)
+            .expect("issue inventory queues")
+            .questions_queued,
+        1
+    );
+    assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
+    assert_eq!(
+        github
+            .issue_inventory_reads()
+            .iter()
+            .map(|(selection, _)| *selection)
+            .collect::<Vec<_>>(),
+        [RepositoryIssueSelection::Last7Days]
+    );
+    assert!(github.seen().is_empty(), "no exact issue read was selected");
+    assert!(
+        github.activity_reads().is_empty(),
+        "push activity is a separate source"
+    );
+    let prompts = lane.tasks();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("github_repository_issues (one of open, all"));
+    assert!(
+        prompts[0].contains("Internal tickets linked to Git repos are GitHub repository issues")
+    );
+    assert!(
+        prompts[0]
+            .contains("what did we work on last week needs github_repository_issues=last_7_days")
+    );
+    assert!(prompts[1].contains("[live_github_repository_issues]"));
+    assert!(prompts[1].contains("selection=last_7_days"));
+    assert!(prompts[1].contains("issues_open=2"));
+    assert!(prompts[1].contains("issues_closed=1"));
+    assert!(prompts[1].contains("not Manage support tickets"));
+    assert!(outbound.messages()[0].contains("3 GitHub issues"));
 }
 
 #[test]

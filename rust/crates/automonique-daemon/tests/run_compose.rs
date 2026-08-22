@@ -101,7 +101,7 @@ use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_protocol::digest::Sha256;
 use automonique_protocol::sandbox::{
-    Digest, ExecutionBackendId, HostFeature, ImplementationDigest,
+    Digest, ExecutionBackendId, HostFeature, ImplementationDigest, PathAccess,
 };
 use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmittedLaunch, BrokeredDestination, BrokeredScope,
@@ -678,6 +678,58 @@ fn read_only_question_profile_lowers_reasoning_without_reading_task_text() {
             .any(|argument| argument == "--search"),
         "ordinary operational questions must remain no-search"
     );
+
+    let scratchpad = compose_with_profile(
+        "create and run a small Python program",
+        &CompositionInputs {
+            state_dir: &state_dir,
+            run_id: "agentic-scratchpad1",
+            provider: &provider,
+            offered_features: &offered,
+            egress_configured: true,
+        },
+        ProviderRunProfile::AgenticScratchpad,
+    )
+    .expect("agentic scratchpad profile composes");
+    let scratchpad =
+        RunSpec::from_canonical_bytes(scratchpad.document()).expect("document decodes");
+    let scratchpad_arguments: Vec<String> = scratchpad
+        .arguments()
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        scratchpad_arguments
+            .windows(2)
+            .any(|pair| pair == ["-s", "workspace-write"]),
+        "the trusted scratchpad profile must enable Codex workspace writes: {scratchpad_arguments:?}"
+    );
+    for runtime in ["/usr/bin", "/usr/lib"] {
+        assert!(
+            scratchpad
+                .sandbox()
+                .path_grants()
+                .as_slice()
+                .iter()
+                .any(|grant| grant.path().as_str() == runtime
+                    && grant.access() == PathAccess::ReadExecute),
+            "scratchpad runtime {runtime} must be executable but not writable"
+        );
+    }
+    assert_eq!(
+        scratchpad.sandbox().budgets().cgroup_memory().quantity(),
+        COMPOSE_MEMORY_BYTES,
+        "agentic work retains the bounded complex-work memory ceiling"
+    );
+    assert!(
+        standard
+            .sandbox()
+            .path_grants()
+            .as_slice()
+            .iter()
+            .all(|grant| grant.access() != PathAccess::ReadExecute),
+        "ordinary work must not inherit scratchpad runtime execution"
+    );
 }
 
 /// A deployment that configured nothing composes nothing, and says so.
@@ -967,6 +1019,39 @@ fn a_contained_run_answers_through_the_real_lane() {
         "operator content must not outlive the run that consumed it"
     );
 
+    serving.shutdown(&fixture.config);
+}
+
+/// The approved profile's defining capability: a provider process may create
+/// a script in its empty workspace and execute a system interpreter, while the
+/// ordinary run profile carries no such runtime grant.
+#[test]
+fn an_agentic_scratchpad_creates_and_executes_a_workspace_script() {
+    let test = "an_agentic_scratchpad_creates_and_executes_a_workspace_script";
+    if let Some(reason) = first_failing_gate() {
+        not_proven(test, reason);
+        return;
+    }
+    if !Path::new("/usr/bin/python3").exists() {
+        not_proven(test, "no Python interpreter at /usr/bin/python3");
+        return;
+    }
+
+    let argv = vec![
+        String::from("sh"),
+        String::from("-c"),
+        format!(
+            "{BUSYBOX} printf 'print(\"scratchpad-script-ok\")\\n' > {WORKSPACE_PLACEHOLDER}/task.py; /usr/bin/python3 {WORKSPACE_PLACEHOLDER}/task.py > {ANSWER_PLACEHOLDER}"
+        ),
+    ];
+    let fixture = contained_fixture(&argv);
+    let serving = serve(&fixture.config);
+    let mut lane = open_lane(&fixture);
+    assert_eq!(
+        lane.run_agentic_scratchpad("create, run, and verify the script"),
+        Ok(String::from("scratchpad-script-ok")),
+        "the trusted agentic profile must support iterative workspace scripts"
+    );
     serving.shutdown(&fixture.config);
 }
 
