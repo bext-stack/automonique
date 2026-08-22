@@ -193,7 +193,16 @@ Candidate panes display an unavoidable canary banner. Candidate-generated text c
 
 ## Implementation shape
 
-Add an `automonique tui` subcommand using Ratatui and Crossterm after a short compatibility spike. The legacy binary is a thin launcher or symlink, not a second codebase. Keep these layers separate:
+Ship `automonique tui` from the maintained MIT-licensed JCode fork rather than
+building a second terminal interaction stack. JCode retains standalone mode;
+managed mode uses an `AutomoniqueBackend` over the shared Rust client and must
+not fall through to direct provider control. The compatibility binary is a thin
+launcher or symlink, not another TUI codebase.
+
+Reuse JCode's Ratatui/Crossterm terminal lifecycle, composer, viewport,
+rendering, side-panel, picker and golden-test infrastructure. Automonique owns
+the protocol reducers, authority-qualified view models and action semantics.
+Keep these layers separate:
 
 - protocol client and reconnect state machine;
 - multiplexed attachment registry with one reducer/cursor per pane;
@@ -206,6 +215,9 @@ Add an `automonique tui` subcommand using Ratatui and Crossterm after a short co
 - dynamic tiling, focus and local workspace persistence;
 - typed action preview/confirmation flow;
 - terminal lifecycle guard.
+
+The fork pins its upstream base, retains MIT notices on directly adapted files
+and passes both standalone JCode tests and Automonique semantic conformance.
 
 Most behavior should be testable without a real terminal. Golden screen tests use a fixed terminal size and sanitized data; reducer/property tests cover duplicates, gaps, reorder rejection, reconnects and stale revisions.
 

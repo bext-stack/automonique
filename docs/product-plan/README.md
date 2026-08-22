@@ -99,6 +99,11 @@ Start with the requested outcome, then read only the requirements relevant to
 the code being changed. Roadmaps and reference material are optional context,
 not a development checklist.
 
+The accepted cross-repository integration and migration program for AI
+Operations, the maintained JCode fork, ShellDeck and `monique.1clic.pro` is
+[`unified-client-platform.md`](unified-client-platform.md). It specializes the
+client boundary without changing the authority precedence above.
+
 ## Safety property specifications
 
 **Amended 2026-08-15.** Four requirement documents join `requirements/`. They
@@ -140,5 +145,6 @@ each property is still waiting for.
 | reviewing an implementation | the requirement and the exact change |
 | deciding whether a thing is in scope | Non-goals above, then `requirements/external-capability-ledger.md` |
 | new to the project | `architecture.md`, then `requirements/goals-and-invariants.md` |
+| integrating AI Operations, JCode, ShellDeck or the web client | `unified-client-platform.md`, then the relevant client/protocol requirement |
 | implementing one of the four safety properties | Safety property specifications above, then its suite |
 | tracing why something is designed this way | `reference/plan-review.md` |
