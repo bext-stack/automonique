@@ -19,6 +19,7 @@ pub mod context_memory;
 pub mod generation_audit;
 pub mod improvements;
 pub mod operator_members;
+pub mod platform_store;
 pub mod provider_deployments;
 pub mod provider_journal;
 pub mod run_index;

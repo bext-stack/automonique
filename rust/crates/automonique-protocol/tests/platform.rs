@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Elastic-2.0
 
+use automonique_protocol::codec::RequestId;
 use automonique_protocol::platform::*;
+use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
 use automonique_protocol::primitives::{EpochMillis, Revision, ValueError};
 
 fn coordinate(authority: ResourceAuthority, kind: ResourceKind) -> ResourceCoordinate {
@@ -126,6 +128,181 @@ fn every_compatibility_adapter_names_consumers_and_removal_test() {
             COMPATIBILITY_ADAPTERS[..index]
                 .iter()
                 .all(|earlier| earlier.name != adapter.name)
+        );
+    }
+}
+
+fn cursor(sequence: u64) -> PlatformCursor {
+    PlatformCursor {
+        authority: ResourceAuthority::Automonique,
+        topic: CursorTopic::new("operator").unwrap(),
+        sequence: Revision::new(sequence).unwrap(),
+    }
+}
+
+fn record(kind: ResourceKind, id: &str, revision: u64) -> ResourceRecord {
+    ResourceRecord {
+        resource: ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            kind,
+            ResourceId::new(id).unwrap(),
+        ),
+        freshness: Freshness {
+            state: FreshnessState::Fresh,
+            observed_at: EpochMillis::from_millis(1_000),
+            revision: Revision::new(revision).unwrap(),
+        },
+        summary: PlatformText::new("ready").unwrap(),
+    }
+}
+
+#[test]
+fn every_platform_request_has_one_canonical_round_trip() {
+    let session = record(ResourceKind::Session, "session-1", 2).resource;
+    let client = ClientId::new("client-1").unwrap();
+    let key = IdempotencyKey::new("retry-1").unwrap();
+    let requests = vec![
+        PlatformRequest::Capabilities,
+        PlatformRequest::Snapshot(SnapshotRequest::new(vec![session.clone()]).unwrap()),
+        PlatformRequest::Subscribe(SubscribeRequest {
+            cursor: Some(cursor(2)),
+        }),
+        PlatformRequest::Execute(
+            ExecuteRequest::new(
+                PlatformAction::StartRun,
+                ResourceCoordinate::new(
+                    ResourceAuthority::Automonique,
+                    ResourceKind::Run,
+                    ResourceId::new("run-1").unwrap(),
+                ),
+                key.clone(),
+                Some(Revision::new(3).unwrap()),
+                Some(PlatformText::new("interactive").unwrap()),
+            )
+            .unwrap(),
+        ),
+        PlatformRequest::GetReceipt(GetReceiptRequest::by_id(
+            ReceiptId::new("receipt-1").unwrap(),
+        )),
+        PlatformRequest::GetReceipt(GetReceiptRequest::by_idempotency_key(
+            IdempotencyKey::new("retry-lookup").unwrap(),
+        )),
+        PlatformRequest::ListSessions(ListSessionsRequest {
+            authority: ResourceAuthority::Automonique,
+            cursor: None,
+        }),
+        PlatformRequest::Attach(AttachRequest {
+            session: session.clone(),
+            client: client.clone(),
+        }),
+        PlatformRequest::Detach(DetachRequest {
+            session: session.clone(),
+            client: client.clone(),
+        }),
+        PlatformRequest::ClaimControl(ClaimControlRequest {
+            session: session.clone(),
+            client: client.clone(),
+            idempotency_key: key.clone(),
+        }),
+        PlatformRequest::ReleaseControl(ReleaseControlRequest {
+            session,
+            client,
+            lease: ControlLeaseId::new("lease-1").unwrap(),
+            idempotency_key: key,
+        }),
+    ];
+    for (index, request) in requests.into_iter().enumerate() {
+        let framed = PlatformRequestMessage::new(
+            RequestId::new(format!("platform-request-{index}")).unwrap(),
+            request,
+        );
+        let bytes = framed.to_message().unwrap().to_canonical_bytes();
+        assert_eq!(
+            PlatformRequestMessage::from_canonical_bytes(&bytes).unwrap(),
+            framed
+        );
+    }
+}
+
+#[test]
+fn every_platform_response_has_one_canonical_round_trip() {
+    let session_record = record(ResourceKind::Session, "session-1", 2);
+    let session = session_record.resource.clone();
+    let client = ClientId::new("client-1").unwrap();
+    let receipt = ActionReceipt {
+        id: ReceiptId::new("receipt-1").unwrap(),
+        action: PlatformAction::StartRun,
+        target: ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Run,
+            ResourceId::new("run-1").unwrap(),
+        ),
+        outcome: ReceiptOutcome::Accepted,
+        revision: Revision::new(3).unwrap(),
+        recorded_at: EpochMillis::from_millis(2_000),
+        explanation: None,
+    };
+    let responses = vec![
+        PlatformResponse::Capabilities(Capabilities::platform_v1()),
+        PlatformResponse::Snapshot(Snapshot::new(vec![session_record.clone()], cursor(2)).unwrap()),
+        PlatformResponse::Subscription(
+            Subscription::new(
+                vec![PlatformEvent {
+                    cursor: cursor(2),
+                    resource: session_record.clone(),
+                }],
+                cursor(2),
+            )
+            .unwrap(),
+        ),
+        PlatformResponse::Receipt(receipt),
+        PlatformResponse::Sessions(
+            SessionList::new(
+                vec![SessionRecord {
+                    session: session_record,
+                    run: None,
+                    attachable: true,
+                    controllable: true,
+                }],
+                cursor(2),
+            )
+            .unwrap(),
+        ),
+        PlatformResponse::Attached(Attachment {
+            session: session.clone(),
+            client: client.clone(),
+            cursor: cursor(2),
+        }),
+        PlatformResponse::Detached {
+            session: session.clone(),
+            client: client.clone(),
+        },
+        PlatformResponse::ControlClaimed(ControlLease {
+            id: ControlLeaseId::new("lease-1").unwrap(),
+            session: session.clone(),
+            client: client.clone(),
+            expires_at: EpochMillis::from_millis(30_000),
+            revision: Revision::new(4).unwrap(),
+        }),
+        PlatformResponse::ControlReleased {
+            session,
+            client,
+            lease: ControlLeaseId::new("lease-1").unwrap(),
+        },
+        PlatformResponse::Refused {
+            outcome: ReceiptOutcome::ResyncRequired,
+            explanation: PlatformText::new("fresh snapshot required").unwrap(),
+        },
+    ];
+    for (index, response) in responses.into_iter().enumerate() {
+        let framed = PlatformResponseMessage::new(
+            RequestId::new(format!("platform-response-{index}")).unwrap(),
+            response,
+        );
+        let bytes = framed.to_message().unwrap().to_canonical_bytes();
+        assert_eq!(
+            PlatformResponseMessage::from_canonical_bytes(&bytes).unwrap(),
+            framed
         );
     }
 }

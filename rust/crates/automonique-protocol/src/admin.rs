@@ -18,13 +18,14 @@
 //! Carrying is all it does: see that type's documentation for what a carried
 //! pair does *not* establish.
 //!
-//! # One socket, six protocols
+//! # One socket, seven protocols
 //!
 //! [`LocalRequest`] is what a local endpoint decodes a frame into. The local
 //! socket serves this protocol, [`crate::runs_api`]'s read surface,
 //! [`crate::automation_api`]'s control surface, [`crate::approval_api`]'s
 //! decision surface, [`crate::batch_api`]'s batch control surface *and*
-//! [`crate::execute_api`]'s execution verb, and the
+//! [`crate::execute_api`]'s execution verb, plus [`crate::platform_api`]'s
+//! federated platform contract, and the
 //! envelope's declared protocol name is what separates them — not a heuristic,
 //! not a fallback chain, and not a widening of [`AdminCommand`]. That is the
 //! arrangement `runs_api` asks for in as many words: its values travel "on the
@@ -38,7 +39,7 @@
 //! Adding the third lane cost this module one enum arm, one match arm and one
 //! frame-fit assertion, and cost the admin lane nothing at all — which is the
 //! property the arrangement was chosen for. The fourth cost exactly the same
-//! three lines, and so did the fifth and the sixth
+//! three lines, and so did the fifth, sixth, and seventh
 //! ([`crate::execute_api`], the one lane on this socket that *starts* something),
 //! which is the evidence that the property holds rather than merely having held
 //! once.
@@ -55,6 +56,10 @@ use crate::codec::{
 };
 use crate::digest::{Sha256, Sha256Digest};
 use crate::execute_api::{EXECUTE_PROTOCOL, ExecuteApiError, ExecuteRequest};
+use crate::platform::PLATFORM_PROTOCOL;
+use crate::platform_api::{
+    MAX_PLATFORM_REQUEST_CANONICAL_BYTES, PlatformApiError, PlatformRequestMessage,
+};
 use crate::provenance::{CausationId, CorrelationId, TraceId};
 use crate::runs_api::{RUNS_PROTOCOL, RunsApiError, RunsRequest};
 use crate::tools::RunId;
@@ -190,7 +195,8 @@ const _: () = assert!(
 /// - **3** — added trace, correlation and causation ids to reconciliation evidence.
 /// - **4** — corrected `execution_state` to report that the execution lane is
 ///   wired; the former `*_no_lane` values remain decode-only aliases.
-pub const ADMIN_CAPABILITY: u32 = 4;
+/// - **5** — added the ten-method `automonique.platform/v1` local endpoint.
+pub const ADMIN_CAPABILITY: u32 = 5;
 
 /// How much of a promise an endpoint is.
 ///
@@ -253,10 +259,8 @@ impl fmt::Display for Maturity {
 /// endpoint means marking it deprecated and bumping the capability; a row that
 /// vanished would tell a client the endpoint never existed.
 ///
-/// Every lane here is [`Maturity::Experimental`] at capability 1, and that is
-/// the honest reading rather than modesty: nothing in this build has shipped to
-/// a client that could be broken by a change, so promising stability would be
-/// promising something no one has yet needed.
+/// Every lane is still [`Maturity::Experimental`]. That is the honest reading:
+/// none has yet accumulated a supported-client compatibility promise.
 pub const ENDPOINT_MATURITY: &[(&str, Maturity)] = &[
     ("automonique.admin/status", Maturity::Experimental),
     ("automonique.admin/submit_synthetic", Maturity::Experimental),
@@ -323,6 +327,19 @@ pub const ENDPOINT_MATURITY: &[(&str, Maturity)] = &[
         Maturity::Experimental,
     ),
     ("automonique.admin/metrics", Maturity::Experimental),
+    ("automonique.platform/capabilities", Maturity::Experimental),
+    ("automonique.platform/snapshot", Maturity::Experimental),
+    ("automonique.platform/subscribe", Maturity::Experimental),
+    ("automonique.platform/execute", Maturity::Experimental),
+    ("automonique.platform/get_receipt", Maturity::Experimental),
+    ("automonique.platform/list_sessions", Maturity::Experimental),
+    ("automonique.platform/attach", Maturity::Experimental),
+    ("automonique.platform/detach", Maturity::Experimental),
+    ("automonique.platform/claim_control", Maturity::Experimental),
+    (
+        "automonique.platform/release_control",
+        Maturity::Experimental,
+    ),
 ];
 
 /// A refusal while constructing or decoding an administration message.
@@ -1768,6 +1785,11 @@ const _: () = assert!(
     "a maximal execute frame must fit the local administration read bound"
 );
 
+const _: () = assert!(
+    MAX_PLATFORM_REQUEST_CANONICAL_BYTES <= crate::codec::MAX_FRAME_BYTES,
+    "a maximal platform frame must fit the shared framing bound"
+);
+
 /// A refusal while deciding which protocol one local frame belongs to.
 ///
 /// The six variants say *who* refused, which is the distinction a metric
@@ -1794,6 +1816,8 @@ pub enum LocalRequestError {
     Batch(BatchApiError),
     /// The Execute lane refused the message it was handed.
     Execute(ExecuteApiError),
+    /// The federated platform lane refused the message it was handed.
+    Platform(PlatformApiError),
 }
 
 impl LocalRequestError {
@@ -1808,6 +1832,7 @@ impl LocalRequestError {
             Self::Approval(error) => error.category(),
             Self::Batch(error) => error.category(),
             Self::Execute(error) => error.category(),
+            Self::Platform(error) => error.category(),
         }
     }
 }
@@ -1822,6 +1847,7 @@ impl fmt::Display for LocalRequestError {
             Self::Approval(error) => write!(formatter, "{error}"),
             Self::Batch(error) => write!(formatter, "{error}"),
             Self::Execute(error) => write!(formatter, "{error}"),
+            Self::Platform(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -1883,6 +1909,8 @@ pub enum LocalRequest {
     /// identifier beside its correlation identifier, so it is the smallest body
     /// on this socket, and boxing it would add an allocation to buy nothing.
     Execute(ExecuteRequest),
+    /// A request on the single federated operator surface.
+    Platform(Box<PlatformRequestMessage>),
 }
 
 impl LocalRequest {
@@ -1919,6 +1947,9 @@ impl LocalRequest {
             EXECUTE_PROTOCOL => ExecuteRequest::from_canonical_bytes(payload)
                 .map(Self::Execute)
                 .map_err(LocalRequestError::Execute),
+            PLATFORM_PROTOCOL => PlatformRequestMessage::from_canonical_bytes(payload)
+                .map(|request| Self::Platform(Box::new(request)))
+                .map_err(LocalRequestError::Platform),
             _ => Err(LocalRequestError::Envelope(CodecError::UnknownProtocol)),
         }
     }
@@ -1933,6 +1964,7 @@ impl LocalRequest {
             Self::Approval(_) => APPROVAL_PROTOCOL,
             Self::Batch(_) => BATCH_CONTROL_PROTOCOL,
             Self::Execute(_) => EXECUTE_PROTOCOL,
+            Self::Platform(_) => PLATFORM_PROTOCOL,
         }
     }
 }
