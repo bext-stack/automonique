@@ -10001,7 +10001,25 @@ fn question_field(value: &str, max_bytes: usize) -> String {
 /// were lost. The result never exceeds [`MAX_QUESTION_CONTEXT_BYTES`] bytes.
 fn bounded_question_context(context: &str) -> String {
     const MARK: &str = "\n[snapshot_truncated=yes; additional fact bytes omitted]\n";
-    bounded_utf8(context, MAX_QUESTION_CONTEXT_BYTES, MARK)
+    if context.len() <= MAX_QUESTION_CONTEXT_BYTES {
+        return context.to_owned();
+    }
+    let content_bytes = MAX_QUESTION_CONTEXT_BYTES.saturating_sub(MARK.len());
+    let mut cut = content_bytes;
+    while cut > 0 && !context.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    // Snapshot records are line-shaped. Never leave a trailing fragment that
+    // looks like a real ticket or tool result with its decisive fields cut
+    // away; retain the last complete record and mark everything after it as
+    // omitted.
+    if let Some(newline) = context[..cut].rfind('\n') {
+        cut = newline;
+    }
+    let mut bounded = String::with_capacity(MAX_QUESTION_CONTEXT_BYTES);
+    bounded.push_str(&context[..cut]);
+    bounded.push_str(MARK);
+    bounded
 }
 
 fn bounded_utf8(value: &str, max_bytes: usize, mark: &str) -> String {
@@ -13915,12 +13933,13 @@ mod clock_tests {
     use super::{
         CapabilityTarget, ESCALATION_APPROVAL_PREFIX, EscalationMode, GitHubActionRequest,
         HostLoadSnapshot, INVALID_MODEL_STEP_REPLY, MAX_BASELINE_BRIEF_BYTES,
-        MAX_QUESTION_PROMPT_BYTES, McpToolDescriptor, ModelQuestionIntent, PendingSlackPost,
-        PendingSlackPostResolution, QuestionEscalationPlan, QuestionIntentCapabilities,
-        QuestionMcpCallPlan, QuestionProfile, QuestionRuntime, QuestionTimingBreakdown,
-        SlackPostApprovalRegistry, compact_input_schema, deepseek_balance_text,
-        escalation_approval_callback_data, escalation_approval_key, github_issue_references,
-        host_load_text, is_closed_ticket_inventory_question, is_current_time_question,
+        MAX_QUESTION_CONTEXT_BYTES, MAX_QUESTION_PROMPT_BYTES, McpToolDescriptor,
+        ModelQuestionIntent, PendingSlackPost, PendingSlackPostResolution, QuestionEscalationPlan,
+        QuestionIntentCapabilities, QuestionMcpCallPlan, QuestionProfile, QuestionRuntime,
+        QuestionTimingBreakdown, SlackPostApprovalRegistry, bounded_question_context,
+        compact_input_schema, deepseek_balance_text, escalation_approval_callback_data,
+        escalation_approval_key, github_issue_references, host_load_text,
+        is_closed_ticket_inventory_question, is_current_time_question,
         is_deepseek_balance_question, is_enabled_site_inventory_question,
         is_github_repository_inventory_question, is_host_load_followup, is_host_load_question,
         is_named_entity_description_question, is_support_ticket_inventory_followup,
@@ -14747,6 +14766,19 @@ mod clock_tests {
             Some("2026-08-14T16:56:47.129Z")
         );
         assert_eq!(utc_rfc3339_from_unix_millis(-1), None);
+    }
+
+    #[test]
+    fn bounded_fact_snapshots_never_end_with_a_partial_record() {
+        let complete = format!(
+            "header\nrecord=one\n{}\nrecord=last-complete\n",
+            "x".repeat(10_000)
+        );
+        let bounded = bounded_question_context(&complete);
+        assert!(bounded.len() <= MAX_QUESTION_CONTEXT_BYTES);
+        assert!(bounded.contains("snapshot_truncated=yes"));
+        let before_mark = bounded.split("\n[snapshot_truncated=").next().unwrap();
+        assert_eq!(before_mark, "header\nrecord=one");
     }
 
     #[test]
@@ -16695,7 +16727,7 @@ impl ControlSurface for StoreControlSurface {
              rows_omitted={}\n\
              open_total={}\n\
              lifecycle_counts={}\n\
-             completion_time_basis=lifecycle=closed proves Automonique currently treats the row as complete; the fleet exposes updated_at but no exact closed_at, so for a day-specific completion question list closed rows whose updated date matches that day and label them as closed tickets last updated that day rather than claiming an exact close instant\n\
+             completion_time_basis=lifecycle=closed proves Automonique currently treats the row as complete; the fleet exposes updated_at but no exact closed_at, so for a day-specific completion question list only included complete rows whose updated date exactly matches that day and label them as closed tickets last updated that day rather than claiming an exact close instant; never infer a matching ticket, identifier, or count from rows_omitted or a truncation marker\n\
              row_order={}\n",
             crate::unix_millis()
                 .ok()
