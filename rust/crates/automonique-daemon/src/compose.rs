@@ -199,6 +199,10 @@ pub const QUESTION_REASONING_CONFIG: &str = "model_reasoning_effort=\"none\"";
 /// harness, while operational work retains the configured Sol model.
 pub const QUESTION_MODEL_CONFIG: &str = "model=\"gpt-5.6-luna\"";
 
+/// Codex `-c` override that turns the native web search on for a research
+/// run. Placed directly after `exec`, like [`QUESTION_MODEL_CONFIG`].
+pub const WEB_SEARCH_MODE_CONFIG: &str = "web_search_mode=\"live\"";
+
 /// Largest answer this daemon reads back out of a workspace.
 ///
 /// A reply is bounded far below this by the chat transport; the bound here is
@@ -833,6 +837,16 @@ fn argv(
         // The command itself is selected by trusted dispatch after an
         // explicit `/research` message. User text remains on stdin and can
         // never turn an ordinary question into a web-enabled run.
+        //
+        // Two spellings because the provider has two: the global `--search`
+        // flag enables the native tool, and `web_search_mode="live"` is what
+        // current releases actually consult before deciding whether to call
+        // it. With the flag alone the model answered "web search is
+        // unavailable in this session" and never searched.
+        arguments.splice(
+            1..1,
+            [OsString::from("-c"), OsString::from(WEB_SEARCH_MODE_CONFIG)],
+        );
         arguments.insert(0, OsString::from("--search"));
     }
     if profile == ProviderRunProfile::FastConversation

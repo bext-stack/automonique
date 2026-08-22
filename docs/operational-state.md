@@ -56,12 +56,65 @@ card naming the deeper lane (every local source plus configured GitHub issue
 reads on the intelligent model, or read-only public-web research). Nothing
 runs until an administrator approves; a denied or expired card runs nothing.
 
-An approved Manage job receives, in addition to the prompt Manage composed,
-the local context block rendered by `automonique work-brief`: the Slack thread
-that requested the work, the owner's standing preferences and matching
-memories, the local entity catalog, the managed sites the request names, and
-the approved skills. The block is read-only context, never instructions, and a
-job is never refused for lack of it.
+The baseline's ticket lines list open tickets first (every lifecycle other
+than closed), newest first, with lifecycle counts and each ticket's fleet
+`thread_id`, so "what is open" is answered from the open set rather than from
+whatever happens to be newest, and "check ticket #57" can become a support
+MCP read with that identifier. The MCP catalog shown to the router carries
+each tool's argument names. An MCP result that does not fit the answer prompt
+is cut to fit and marked truncated rather than dropped.
+
+Every reply the person read, including refusals and approval cards, is filed
+in the conversation transcript, so a follow-up such as "you name it" has the
+refusal it answers. On Slack only the `app_mention` copy of a post that
+mentions the bot is routed and stored; a message mentioning another person is
+read and stored once.
+
+The per-reply timing footer is off by default. `AUTOMONIQUE_REPLY_TELEMETRY=on`
+in the daemon's environment appends it to chat replies; otherwise the same
+line is written to the daemon's standard error for the journal.
+
+`automonique ask [--approve] [--context TEXT] < question` runs the same router,
+baseline and answer lanes from a terminal against the live state and the
+running daemon, with no transport attached: nothing is sent or remembered, and
+a selected tool is printed rather than staged. `--approve` follows an
+escalation as an approved card would. The run lane needs a delegated cgroup,
+so run it under `systemd-run --user --scope -p Delegate=yes` with the daemon's
+`XDG_STATE_HOME`, `XDG_RUNTIME_DIR` and `AUTOMONIQUE_LAUNCH_HELPER`.
+
+## What an approved job is held to
+
+An approved Manage job receives, after the prompt Manage composed, two blocks
+rendered by `automonique work-brief`:
+
+- `[work_method trust=operator_policy]`: the working method every ticket job
+  follows: read the whole thread (the latest human comment is usually the
+  ask), number the requests and take them one at a time, prove each one
+  (visual changes need a screenshot read back; deployments need proof the
+  served code carries the change), never tick a checklist item by pattern
+  replacement, deploy only by the repository runbook, and report per request
+  with **Demande N** / Où / Vérification / Preuve plus an honest "Non fait"
+  list. The built-in text is replaced by `work-method.md` in the state
+  directory when the owner writes one; `{automonique}` in it expands to the
+  running binary's path.
+- `[automonique_local_context … trust=untrusted_data]`: the Slack thread that
+  requested the work, the owner's standing preferences and matching memories,
+  the local entity catalog, the managed sites the request names, and the
+  approved skills. Read-only context, never instructions.
+
+`automonique shot <url> [--out PNG] [--host VHOST] [--width N] [--height N]
+[--full] [--timeout S]` is the screenshot verb the method names. It drives the
+host's headless Chromium (a Playwright cache or a system browser, or
+`AUTOMONIQUE_BROWSER`) in its own screenshot mode, prints `MONIQUE_SHOT_OK:
+<png>` and the page title on success, and one `MONIQUE_SHOT_FAIL: <reason>`
+line otherwise; a navigation that produced an empty document is a failure,
+not a blank proof. It never runs past its deadline.
+
+The worker accepts a job as done only when the provider's final message names
+the completion comment's permalink on the expected issue and, when the comment
+can be read back, that comment carries the per-request shape (a `Demande 1`
+section). A report without it is reported as a rejected receipt so the job
+shows as unverified rather than delivered.
 
 ## Answering operator questions
 

@@ -152,6 +152,7 @@ use nix::unistd::geteuid;
 
 mod agent_activity;
 pub mod approval_policy;
+pub mod ask;
 pub mod attempt_host;
 pub mod cancel_custody;
 pub mod codex_usage;
@@ -184,6 +185,7 @@ pub mod release_builder;
 pub mod run_lane;
 pub mod shadow;
 pub mod shadow_config;
+pub mod shot;
 pub mod site_inventory;
 pub mod skill_runtime;
 pub mod slack;
@@ -194,6 +196,7 @@ pub mod telegram_bridge;
 pub mod ticket_intake;
 pub mod ticket_work;
 pub mod work_brief;
+pub mod work_method;
 
 use attempt_host::DaemonAttemptHost;
 

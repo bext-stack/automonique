@@ -655,6 +655,19 @@ fn read_only_question_profile_lowers_reasoning_without_reading_task_text() {
         "the fixed configured exec subcommand must remain directly after the search flag"
     );
     assert_eq!(
+        research_arguments
+            .get(2)
+            .map(|argument| argument.as_os_str()),
+        Some(std::ffi::OsStr::new("-c")),
+        "the live web-search mode override follows the exec subcommand"
+    );
+    assert_eq!(
+        research_arguments
+            .get(3)
+            .map(|argument| argument.as_os_str()),
+        Some(std::ffi::OsStr::new(r#"web_search_mode="live""#)),
+    );
+    assert_eq!(
         research.sandbox().budgets().cgroup_memory().quantity(),
         QUESTION_MEMORY_BYTES
     );

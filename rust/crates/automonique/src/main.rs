@@ -67,6 +67,12 @@ fn main() -> ExitCode {
     if command.as_deref() == Some(std::ffi::OsStr::new("work-brief")) {
         return work_brief_command(arguments.collect());
     }
+    if command.as_deref() == Some(std::ffi::OsStr::new("ask")) {
+        return ask_command(arguments.collect());
+    }
+    if command.as_deref() == Some(std::ffi::OsStr::new("shot")) {
+        return shot_command(arguments.collect());
+    }
     if command.as_deref() == Some(std::ffi::OsStr::new("backup")) {
         return backup_command(arguments.collect());
     }
@@ -120,8 +126,131 @@ fn work_brief_command(values: Vec<std::ffi::OsString>) -> ExitCode {
             hint,
         },
     );
-    println!("{brief}");
+    // The method is operator policy and travels outside the untrusted
+    // local-context block; the screenshot verb is named by this binary's
+    // own absolute path so the agent can call it from any working directory.
+    let binary =
+        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("automonique"));
+    let method = automonique_daemon::work_method::render(state_dir, &binary);
+    println!("{method}\n\n{brief}");
     ExitCode::SUCCESS
+}
+
+/// `automonique ask [--approve] [--context TEXT]` reads one question from
+/// stdin and prints what the conversational surfaces would reply, against
+/// this host's live state and the running daemon. Nothing is sent anywhere
+/// and nothing is remembered. `--approve` follows an escalation the router
+/// asks for, as an approved card would; `--context` stands in for the recent
+/// conversation. The question arrives on stdin so it never becomes part of a
+/// command line.
+fn ask_command(values: Vec<std::ffi::OsString>) -> ExitCode {
+    const MAX_QUESTION_BYTES: usize = 8 * 1024;
+    const MAX_CONTEXT_BYTES: usize = 16 * 1024;
+    let mut approve = false;
+    let mut context = String::new();
+    let mut values = values.into_iter();
+    while let Some(value) = values.next() {
+        if value == "--approve" {
+            approve = true;
+        } else if value == "--context" {
+            match values.next().and_then(|text| text.into_string().ok()) {
+                Some(text) if text.len() <= MAX_CONTEXT_BYTES => context = text,
+                _ => return ask_usage(),
+            }
+        } else {
+            return ask_usage();
+        }
+    }
+    let mut question = Vec::new();
+    {
+        use std::io::Read as _;
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock().take(MAX_QUESTION_BYTES as u64);
+        if handle.read_to_end(&mut question).is_err() {
+            question.clear();
+        }
+    }
+    let question = String::from_utf8_lossy(&question).trim().to_owned();
+    if question.is_empty() {
+        return ask_usage();
+    }
+    let config = match automonique_daemon::DaemonConfig::from_environment() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("automonique ask refused: {}", error.category());
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut host = match automonique_daemon::ask::AskHost::open(&config) {
+        Ok(host) => host,
+        Err(reason) => {
+            eprintln!("automonique ask refused: {reason}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if question == "--probe-lane" {
+        match host.probe_lane() {
+            Ok(answer) => println!("lane ok: {answer}"),
+            Err(failure) => println!("lane failure: {failure}"),
+        }
+        return ExitCode::SUCCESS;
+    }
+    let outcome = host.ask(&question, &context);
+    println!("{}", outcome.answer);
+    if let Some(selected) = outcome.selected {
+        println!("\n[selected] {selected}");
+        if approve && let Some(answer) = host.approve_escalation() {
+            println!("\n[approved escalation answer]\n{answer}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `automonique shot <url> [--out PNG] [--host VHOST] [--width N] [--height N] [--full] [--timeout S]`
+/// captures one rendered page with the host's headless Chromium and prints
+/// `MONIQUE_SHOT_OK: <png>` + `title: …`, or one `MONIQUE_SHOT_FAIL: <reason>`
+/// line. It never hangs past its deadline and never prints a stack trace.
+fn shot_command(values: Vec<std::ffi::OsString>) -> ExitCode {
+    use automonique_daemon::shot::{FAIL_MARKER, OK_MARKER, capture, find_browser, parse};
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let default_out = std::env::temp_dir().join(format!("monique-shot-{stamp}.png"));
+    let request = match parse(&values, default_out) {
+        Ok(request) => request,
+        Err(reason) => {
+            println!("{FAIL_MARKER} {reason}");
+            eprintln!(
+                "usage: automonique shot <url> [--out PNG] [--host VHOST] [--width N] [--height N] [--full] [--timeout S]"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let Some(browser) = find_browser() else {
+        println!(
+            "{FAIL_MARKER} no headless Chromium found (set {} to a browser binary)",
+            automonique_daemon::shot::BROWSER_ENV
+        );
+        return ExitCode::FAILURE;
+    };
+    match capture(&request, &browser) {
+        Ok(outcome) => {
+            println!("{OK_MARKER} {}", outcome.png.display());
+            println!("title: {}", outcome.title);
+            println!("bytes: {}", outcome.bytes);
+            ExitCode::SUCCESS
+        }
+        Err(reason) => {
+            println!("{FAIL_MARKER} {reason}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn ask_usage() -> ExitCode {
+    eprintln!("usage: automonique ask [--approve] [--context TEXT] < question");
+    ExitCode::from(2)
 }
 
 fn backup_command(values: Vec<std::ffi::OsString>) -> ExitCode {

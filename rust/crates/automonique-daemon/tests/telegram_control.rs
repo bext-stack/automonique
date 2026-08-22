@@ -3134,6 +3134,7 @@ fn unknown_and_malformed_slash_commands_reply_their_refusals() {
 /// the URL remains tappable, and no provider output returns to command dispatch.
 #[test]
 fn an_administrator_may_ask_a_read_only_question_from_durable_facts() {
+    automonique_daemon::telegram_bridge::set_reply_telemetry(true);
     let fixture = Fixture::new(&[(7, "run-alpha")]);
     fixture.seed_members(&[NEWCOMER]);
     fixture.seed_prism_sites(&["zeta-prism.example", "alpha-prism.example"]);
@@ -4880,11 +4881,17 @@ fn a_run_reaches_the_lane_and_its_answer_is_the_reply() {
     assert_eq!(report.unavailable, 0, "/run is no longer unavailable");
     assert_eq!(report.sent, 1);
 
-    assert_eq!(
-        lane.tasks(),
-        vec![String::from("summarise the release notes")],
-        "the lane must receive the operator's task, and only the task"
+    // The operator's task leads, verbatim; the host's request-time brief
+    // follows it in a marked block so the run starts from local facts.
+    let tasks = lane.tasks();
+    assert_eq!(tasks.len(), 1);
+    assert!(
+        tasks[0]
+            .starts_with("summarise the release notes\n\n[local_context trust=trusted_snapshot"),
+        "the lane must receive the operator's task first, then the local brief: {tasks:?}"
     );
+    assert!(tasks[0].contains("[daemon_status trust=trusted]"));
+    assert!(tasks[0].trim_end().ends_with("[/local_context]"));
     let messages = outbound.messages();
     assert!(
         messages[0].contains("AUTOMONIQUE-ANSWER-OK"),
@@ -5730,7 +5737,8 @@ fn a_member_reads_but_cannot_spend_or_manage_users() {
     // The same command, from the administrator, is carried out.
     let admin_report = poll(&mut bridge).expect("poll commits");
     assert_eq!(admin_report.runs_answered, 1);
-    assert_eq!(lane.tasks(), vec![String::from("summarize the board")]);
+    assert_eq!(lane.tasks().len(), 1);
+    assert!(lane.tasks()[0].starts_with("summarize the board\n\n[local_context"));
 }
 
 /// The whole point of the feature: an administrator lets somebody in from a
@@ -5999,7 +6007,8 @@ fn a_single_tier_host_keeps_every_authority_it_had() {
     let report = poll(&mut bridge).expect("poll commits");
     assert_eq!(report.runs_answered, 1);
     assert_eq!(report.member_mutations, 1);
-    assert_eq!(lane.tasks(), vec![String::from("summarize the board")]);
+    assert_eq!(lane.tasks().len(), 1);
+    assert!(lane.tasks()[0].starts_with("summarize the board\n\n[local_context"));
     assert_eq!(fixture.stored_members(), vec![NEWCOMER]);
 }
 
@@ -6457,20 +6466,38 @@ fn a_new_modifier_files_its_own_message_in_the_conversation_it_opened() {
             .expect("head")
             .expect("a session")
     };
+    // Only what the operator said: every delivered reply, including the
+    // "cannot answer" one this fixture produces, is also filed, and it is
+    // filed in the same conversation as the question it answers.
     let history = |conversation: &str| {
         AgentMemoryStore::open(&path)
             .expect("canonical store")
             .recent_messages("primary", &actor, conversation, NOW_MS, 10)
             .expect("history")
             .into_iter()
+            .filter(|message| message.role == "user")
             .map(|message| message.content)
             .collect::<Vec<_>>()
+    };
+    let replies = |conversation: &str| {
+        AgentMemoryStore::open(&path)
+            .expect("canonical store")
+            .recent_messages("primary", &actor, conversation, NOW_MS, 10)
+            .expect("history")
+            .into_iter()
+            .filter(|message| message.role == "assistant")
+            .count()
     };
 
     poll(&mut bridge).expect("first poll commits");
     await_question_completion(&mut bridge);
     let first = head();
     assert_eq!(history(&first), vec![String::from("première question")]);
+    assert_eq!(
+        replies(&first),
+        1,
+        "the reply the operator read, even a refusal, is part of the transcript"
+    );
 
     poll(&mut bridge).expect("second poll commits");
     await_question_completion(&mut bridge);

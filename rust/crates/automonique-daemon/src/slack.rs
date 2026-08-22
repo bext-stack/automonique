@@ -123,8 +123,8 @@ use crate::progress_hub::ProgressHub;
 use crate::run_lane::{SlackProgressSink, SlackProgressTarget, SocketRunLane};
 use crate::telegram_bridge::{
     ApprovalDecisionAnswer, ApprovalDecisionFailure, ControlSurface as _, HostFacts,
-    QuestionProfile, RunLane as _, SlackSurface, StoreControlSurface, TransportToolPlan,
-    accepted_mcp_input_responses, answer_read_only_transport_question,
+    QuestionProfile, RunLane as _, SlackSurface, StoreControlSurface, TransportLiveSeams,
+    TransportToolPlan, accepted_mcp_input_responses, answer_read_only_transport_question,
     answer_typed_github_issue_question, deterministic_conversation_answer, mcp_approval_preview,
     mcp_result_prompt, run_question_to_completion,
 };
@@ -1061,6 +1061,23 @@ fn slack_ticket_event(text: &str) -> Option<SlackTicketEvent> {
         continues_conversation: false,
         bot_user,
     })
+}
+
+/// Whether `event` is the general `message` copy of a post whose dedicated
+/// `app_mention` copy also arrives.
+///
+/// With the bot's own id known from the envelope, exactly a mention of the
+/// bot qualifies: "it's <@U0BRUNO>" in a thread is one post with one copy and
+/// must still be read and remembered. Without the id, any mention is treated
+/// as the bot's, which is the only safe reading of an unauthorized envelope.
+fn slack_plain_copy_of_bot_mention(event: &SlackTicketEvent) -> bool {
+    if event.app_mention {
+        return false;
+    }
+    match event.bot_user.as_ref() {
+        Some(bot_user) => mention_token_range(&event.text, Some(bot_user.as_str())).is_some(),
+        None => event.text.contains("<@"),
+    }
 }
 
 /// Remove the bot mention that made Slack classify this as `app_mention`.
@@ -2407,6 +2424,9 @@ struct LiveSlackQuestionAnswerer {
     surface: StoreControlSurface,
     lane: SocketRunLane,
     github: Option<Box<dyn GitHubSurface + Send>>,
+    /// The workspace as a read seam, so a router read plan naming a channel
+    /// is honoured here as it is on Telegram.
+    slack_reader: Option<Box<dyn SlackSurface + Send>>,
     administrators: Vec<i64>,
     configured: Vec<i64>,
     api: Arc<SlackClient>,
@@ -2697,17 +2717,28 @@ impl SlackQuestionAnswerer for LiveSlackQuestionAnswerer {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         let mcp_tools = self.mcp.discover().unwrap_or_default();
+        let github_configured = self.github.is_some();
         let mut selected_tool = None;
         let answer = answer_read_only_transport_question(
             &mut self.surface,
             &mut self.lane,
+            TransportLiveSeams {
+                slack: self
+                    .slack_reader
+                    .as_deref_mut()
+                    .map(|slack| slack as &mut dyn SlackSurface),
+                github: self
+                    .github
+                    .as_deref_mut()
+                    .map(|github| github as &mut dyn GitHubSurface),
+            },
             question,
             context,
             &self.administrators,
             &self.configured,
             roster.as_deref(),
             &slack_channels,
-            self.github.is_some(),
+            github_configured,
             &mcp_tools,
             &self.github_action_aliases,
             &mut selected_tool,
@@ -3767,6 +3798,16 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
         if !self.may_decide(&interaction.user, &interaction.channel) {
             return;
         }
+        // An approved deep lookup runs for minutes; the card says so at once
+        // so the buttons do not look ignored, and is rewritten with the
+        // result when it lands.
+        if interaction.granted {
+            let _ = self.poster.update_decision(
+                &interaction.channel,
+                &interaction.message_ts,
+                "✅ Approved. Running now; the result replaces this card.",
+            );
+        }
         let text = self.question_answerer.as_mut().map_or_else(
             || String::from("Monique's conversational tool surface is unavailable right now."),
             |answerer| {
@@ -4034,6 +4075,10 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                 .0
                 .iter()
                 .any(|(_, channel)| channel == &event.channel)
+            // The mention copy of the same post is the one that is stored;
+            // storing both made every Slack question appear twice in the
+            // transcript the router reads.
+            || slack_plain_copy_of_bot_mention(event)
         {
             return Ok(());
         }
@@ -4348,9 +4393,9 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
         }
         // With both `message.channels` and `app_mention` enabled Slack emits a
         // general message copy and a dedicated mention copy for the same post.
-        // Only the dedicated copy may route a message that carries a user
-        // mention; otherwise one human post can dispatch or answer twice.
-        if !event.app_mention && event.text.contains("<@") {
+        // Only the dedicated copy may route a message that mentions the bot;
+        // otherwise one human post can dispatch or answer twice.
+        if slack_plain_copy_of_bot_mention(&event) {
             return;
         }
         let mention_text = event.app_mention.then(|| {
@@ -5014,6 +5059,9 @@ impl SlackTicketHost {
                 surface,
                 lane,
                 github: github_reader,
+                slack_reader: SlackHost::open(state_dir)
+                    .map_err(|_| SlackConfigError::QuestionSurfaceUnavailable)?
+                    .into_surface(),
                 administrators: question_administrators.clone(),
                 configured: question_configured.clone(),
                 api: Arc::clone(&client),
@@ -8149,6 +8197,22 @@ mod tests {
     }
 
     #[test]
+    fn only_the_plain_copy_of_a_bot_mention_is_a_duplicate() {
+        let plain = ticket_event("U0ADMIN001", "<@U0MONIQUE9> what is open?", "Ev10");
+        assert!(slack_plain_copy_of_bot_mention(&plain));
+        let mut mention = plain.clone();
+        mention.app_mention = true;
+        assert!(!slack_plain_copy_of_bot_mention(&mention));
+        let other_human = ticket_event("U0ADMIN001", "it's <@U0BRUNO001>", "Ev11");
+        assert!(!slack_plain_copy_of_bot_mention(&other_human));
+        let mut unauthorized = other_human.clone();
+        unauthorized.bot_user = None;
+        assert!(slack_plain_copy_of_bot_mention(&unauthorized));
+        let no_mention = ticket_event("U0ADMIN001", "tag him that's fine", "Ev12");
+        assert!(!slack_plain_copy_of_bot_mention(&no_mention));
+    }
+
+    #[test]
     fn app_mentions_are_distinct_from_plain_ticket_messages() {
         let mention = r#"{"envelope_id":"E2","type":"events_api","payload":{"event_id":"Ev2","team_id":"T0RESERVED","event":{"type":"app_mention","channel":"C0RESERVED01","user":"U0ADMIN001","text":"<@B0APP> reply https://github.com/example/project/issues/42 with the verification","ts":"1723542000.000200"}}}"#;
         let parsed = slack_ticket_event(mention).expect("app mention");
@@ -8415,10 +8479,12 @@ mod tests {
                 seen: Arc::clone(&issue_reads),
             })),
         };
-        let text = "<@B0APP> https://github.com/example/project/issues/42 il est fait celui là ?";
+        let text =
+            "<@U0MONIQUE9> https://github.com/example/project/issues/42 il est fait celui là ?";
 
-        // Slack's broad message subscription copy carries the same mention but
-        // is not the event that owns conversational routing.
+        // Slack's broad message subscription copy carries the same mention of
+        // the bot (the envelope's authorized user) but is not the event that
+        // owns conversational routing.
         router.handle_with_context(ticket_event("U0ADMIN001", text, "EvMessageCopy"), "");
         assert!(messages.lock().expect("messages").is_empty());
         assert!(opened.lock().expect("opened").is_empty());

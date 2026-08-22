@@ -649,7 +649,29 @@ local_work_brief() {
     timeout 20s "$brief_binary" work-brief \
         --state-dir "$state_dir" \
         --job-id "$brief_job" \
-        --issue-url "$brief_issue" 2>/dev/null | head -c 16384
+        --issue-url "$brief_issue" 2>/dev/null | head -c 24576
+}
+
+# Read the body of the completion comment a permalink names. The permalink
+# has already passed the strict regex in completion_comment_permalink, so its
+# owner, repository and comment id are safe to place in an API path. Prints
+# nothing when GitHub cannot be read; the caller decides what that means.
+completion_comment_body() {
+    permalink=$1
+    comment_id=${permalink##*#issuecomment-}
+    path=${permalink#https://github.com/}
+    owner=${path%%/*}
+    path=${path#*/}
+    repo=${path%%/*}
+    [[ "$owner" =~ ^[A-Za-z0-9_.-]{1,100}$ && "$repo" =~ ^[A-Za-z0-9_.-]{1,100}$ && "$comment_id" =~ ^[1-9][0-9]{0,19}$ ]] || return 1
+    timeout 20s gh api "repos/$owner/$repo/issues/comments/$comment_id" --jq '.body' 2>/dev/null | head -c 65536
+}
+
+# Whether a completion report follows the per-request shape the work method
+# prescribes: at least one "Demande 1" section. A report without it is the
+# kind the clients answered with "non, ce n'est pas fait".
+completion_report_is_structured() {
+    grep -q 'Demande 1' <<<"$1"
 }
 
 run_job() {
@@ -753,8 +775,18 @@ run_job() {
         write_auth_health authenticated execution_succeeded "$(date +%s%3N)" || true
         completion_permalink=$(completion_comment_permalink "$result" "$expected_issue_url") || completion_permalink=
         if [[ -n "$completion_permalink" ]]; then
-            report_job "$job_id" "done" "$result" "$session_id" || true
-            post_job_log "$job_id" lifecycle "${selected_provider} completed with a verified GitHub receipt."
+            completion_body=$(completion_comment_body "$completion_permalink") || completion_body=
+            if [[ -z "$completion_body" ]]; then
+                report_job "$job_id" "done" "$result" "$session_id" || true
+                post_job_log "$job_id" lifecycle "${selected_provider} completed with a GitHub receipt; the report shape could not be read back."
+            elif completion_report_is_structured "$completion_body"; then
+                report_job "$job_id" "done" "$result" "$session_id" || true
+                post_job_log "$job_id" lifecycle "${selected_provider} completed with a verified, per-request GitHub report."
+            else
+                result="Completion receipt rejected: the completion comment ${completion_permalink} does not follow the per-request report format (no 'Demande 1' section with Vérification and Preuve). Delivery remains unverified. Last provider message: ${result:-none}"
+                report_job "$job_id" "failed" "$result" "$session_id" || true
+                post_job_log "$job_id" lifecycle "${selected_provider} completion report was rejected for its shape."
+            fi
         else
             result="Completion receipt rejected: ${selected_provider} exited successfully but did not return the required GitHub completion-comment permalink. Delivery remains unverified. Last provider message: ${result:-none}"
             report_job "$job_id" "failed" "$result" "$session_id" || true
