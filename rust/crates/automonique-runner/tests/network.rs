@@ -17,6 +17,7 @@
 //! exist to record what stays reachable rather than what is taken away.
 
 use automonique_runner::network::{MAX_ALLOWED_PORTS, TcpBindConnectPolicy, TcpPolicyError};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read as _;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -24,9 +25,11 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
+static CLAIMED_PORTS: OnceLock<Mutex<BTreeSet<u16>>> = OnceLock::new();
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -38,15 +41,24 @@ fn loopback(port: u16) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, port))
 }
 
-/// A free ephemeral port, released before it is handed out.
+/// A free ephemeral port not reused by another probe in this test process.
 ///
-/// Nothing stops the kernel from reusing it in the meantime, so every test that
-/// depends on a port being closed asserts that fact instead of assuming it: a
-/// collision shows up as a failed assertion, never as a test that passed for
-/// the wrong reason.
+/// The listener is held until the port is entered in the process-wide set, so
+/// parallel tests cannot both claim the same released ephemeral port. An
+/// unrelated process could still bind it after release; every test that relies
+/// on a port being closed therefore continues to assert the observed outcome.
 fn free_port() -> u16 {
-    let listener = TcpListener::bind(loopback(0)).expect("reserve port");
-    listener.local_addr().expect("reserved address").port()
+    loop {
+        let listener = TcpListener::bind(loopback(0)).expect("reserve port");
+        let port = listener.local_addr().expect("reserved address").port();
+        let mut claimed = CLAIMED_PORTS
+            .get_or_init(|| Mutex::new(BTreeSet::new()))
+            .lock()
+            .expect("claimed port registry");
+        if claimed.insert(port) {
+            return port;
+        }
+    }
 }
 
 /// Live endpoints for one probe run: an open TCP port, a closed one, a free one
