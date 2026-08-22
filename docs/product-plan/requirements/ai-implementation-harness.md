@@ -48,6 +48,8 @@ operator procedure in [`../../self-improvement-workflow.md`](../../self-improvem
 
 ## Current status
 
-The executable-plan experiment has been removed. The remaining isolated
-executor is an optional product capability; ordinary repository work does not
-use it.
+The executable-plan experiment has been removed. The contained executor can be
+selected from Slack or Telegram as an administrator-approved agentic
+scratchpad: an empty per-run workspace with bounded system runtimes, durable run
+custody, and no automatic repository or production access. Ordinary repository
+work and ticket execution remain separate and do not require this harness.

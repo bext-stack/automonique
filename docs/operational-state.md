@@ -56,6 +56,14 @@ card naming the deeper lane (every local source plus configured GitHub issue
 reads on the intelligent model, or read-only public-web research). Nothing
 runs until an administrator approves; a denied or expired card runs nothing.
 
+Requests that genuinely need iterative code or computation may instead raise
+an `agentic_scratchpad` card. Its preview includes the exact task. Approval
+creates one durable contained run in an empty writable workspace with bounded
+system runtimes; the run may create and execute scripts there and is visible in
+`/runs`. It receives no repository or production mount merely from chat text.
+Ticket processing remains the route for work that needs a mapped repository,
+delivery authority, or the ticket's broader task-specific context.
+
 The baseline's ticket lines list open tickets first (every lifecycle other
 than closed), newest first, with lifecycle counts and each ticket's fleet
 `thread_id`, so "what is open" is answered from the open set rather than from

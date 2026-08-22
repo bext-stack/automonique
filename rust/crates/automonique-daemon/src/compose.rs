@@ -189,6 +189,13 @@ pub enum ProviderRunProfile {
     IntelligentQuestion,
     /// Explicitly authorized public-web research through Codex's native tool.
     WebResearch,
+    /// Administrator-approved work in an empty writable scratchpad.
+    ///
+    /// Unlike conversational profiles, this profile may execute the bounded
+    /// system runtimes declared by [`scratchpad_path_grants`]. It still has no
+    /// repository, production path, ambient credential, or unrestricted
+    /// network grant.
+    AgenticScratchpad,
 }
 
 /// Codex's per-invocation override for latency-sensitive read-only Q&A.
@@ -267,11 +274,19 @@ pub const COMPOSE_SPOOL_BYTES: u64 = 1024 * 1024;
 const CA_DIRECTORY: &str = "/etc/ssl/certs";
 /// The bundle file inside [`CA_DIRECTORY`], named for providers that want a file.
 const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
-/// `PATH` a composed run gets. Nothing on it is executable under the launch's
-/// filesystem policy — only the provider binary carries an execute grant — so
-/// this exists because a provider that reads no `PATH` at all behaves worse than
-/// one whose probes are denied.
+/// `PATH` a composed run gets. Ordinary profiles cannot execute entries on it;
+/// the approved agentic scratchpad grants only the declared runtime roots.
 const COMPOSE_PATH: &str = "/usr/bin:/bin";
+
+/// Read/execute roots available only to an approved agentic scratchpad.
+///
+/// The workspace remains the only writable host path. `/usr/bin` supplies
+/// shells and interpreters, while `/usr/lib` supplies their loaders, shared
+/// libraries, and standard-library modules on merged-/usr Linux hosts. The
+/// CA directory is already a read-only grant for every provider run.
+const SCRATCHPAD_RUNTIME_BIN: &str = "/usr/bin";
+const SCRATCHPAD_RUNTIME_LIB: &str = "/usr/lib";
+const SCRATCHPAD_RUNTIME_SHARE: &str = "/usr/share";
 
 /// Why a task could not be composed into a document.
 ///
@@ -865,6 +880,23 @@ fn argv(
             ],
         );
     }
+    if profile == ProviderRunProfile::AgenticScratchpad
+        && arguments.first().is_some_and(|arg| arg == "exec")
+    {
+        // The execution profile is selected by trusted dispatch after an
+        // authenticated administrator approves the frozen task. User text is
+        // stdin data and cannot select or widen this profile. Replace only
+        // Codex's reviewed `-s read-only` pair; an owner-configured provider
+        // with a different argv retains its exact invocation and remains
+        // bounded by the outer workspace and runtime grants below.
+        for pair in arguments.windows(2).enumerate() {
+            let (index, pair) = pair;
+            if pair[0] == "-s" && pair[1] == "read-only" {
+                arguments[index + 1] = OsString::from("workspace-write");
+                break;
+            }
+        }
+    }
     arguments
 }
 
@@ -918,14 +950,10 @@ fn sandbox(parts: &DocumentParts<'_>, home: &str) -> Result<SandboxSpec, Compose
         // document naming either again would collide, because two grants for
         // one path have no single meaning. What is left is the provider's own
         // home and the CA trust store.
-        path_grants: PathGrants::declare(&[
-            PathGrant::new(home, PathAccess::ReadWrite).map_err(rejected)?,
-            PathGrant::new(CA_DIRECTORY, PathAccess::ReadOnly).map_err(rejected)?,
-        ])
-        .map_err(rejected)?,
-        // Empty is the only allowlist this launch enforces completely: execute
-        // is granted on exactly the program the document names and on nothing
-        // else. A non-empty one is refused by admission rather than approximated.
+        path_grants: scratchpad_path_grants(parts.profile, home)?,
+        // Named execution allowlists remain empty because this launch has no
+        // registry that maps those names. Exact executable authority is carried
+        // by the provider path plus any explicit read_execute path grants.
         allowlists: ExecutionAllowlists::declare(&[]).map_err(rejected)?,
         provider_control_egress: ProviderControlEgress::brokered(egress),
         tool_workload_egress: ToolWorkloadEgress::brokered(egress),
@@ -935,7 +963,9 @@ fn sandbox(parts: &DocumentParts<'_>, home: &str) -> Result<SandboxSpec, Compose
         credentials: CredentialDescriptors::declare(&[]).map_err(rejected)?,
         budgets: Budgets::declare(BudgetQuantities {
             cgroup_memory_bytes: match parts.profile {
-                ProviderRunProfile::Standard => COMPOSE_MEMORY_BYTES,
+                ProviderRunProfile::Standard | ProviderRunProfile::AgenticScratchpad => {
+                    COMPOSE_MEMORY_BYTES
+                }
                 ProviderRunProfile::FastConversation | ProviderRunProfile::IntelligentQuestion => {
                     QUESTION_MEMORY_BYTES
                 }
@@ -963,6 +993,30 @@ fn sandbox(parts: &DocumentParts<'_>, home: &str) -> Result<SandboxSpec, Compose
         prohibited_capabilities: ProhibitedCapabilities::declare(&[]).map_err(rejected)?,
     })
     .map_err(rejected)
+}
+
+/// Declare the profile's complete non-workspace filesystem authority.
+///
+/// The provider home and CA roots are common to all runs. Only the trusted
+/// agentic profile adds executable system runtimes, and those roots remain
+/// non-writable. The per-attempt workspace is supplied separately by
+/// admission from the run's opaque workspace registration.
+fn scratchpad_path_grants(
+    profile: ProviderRunProfile,
+    home: &str,
+) -> Result<PathGrants, ComposeRefusal> {
+    let mut grants = vec![
+        PathGrant::new(home, PathAccess::ReadWrite).map_err(rejected)?,
+        PathGrant::new(CA_DIRECTORY, PathAccess::ReadOnly).map_err(rejected)?,
+    ];
+    if profile == ProviderRunProfile::AgenticScratchpad {
+        grants.extend([
+            PathGrant::new(SCRATCHPAD_RUNTIME_BIN, PathAccess::ReadExecute).map_err(rejected)?,
+            PathGrant::new(SCRATCHPAD_RUNTIME_LIB, PathAccess::ReadExecute).map_err(rejected)?,
+            PathGrant::new(SCRATCHPAD_RUNTIME_SHARE, PathAccess::ReadOnly).map_err(rejected)?,
+        ]);
+    }
+    PathGrants::declare(&grants).map_err(rejected)
 }
 
 /// Require every feature this host offers, at the implementation it offers.

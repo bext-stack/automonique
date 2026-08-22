@@ -374,23 +374,12 @@ The single most useful output of this inventory, for scoping:
 The right-hand column is where the risk is, and none of it can be validated
 against the legacy system because none of it exists there.
 
-## Running the suite safely
+## Retired fixture safety
 
-The suite is fast and hermetic *by convention*, not by construction:
-
-```sh
-JEAN_DB=/tmp/scratch/test.db bun test    # from the legacy tree
-```
-
-**The `JEAN_DB` export is mandatory.** The database module defaults to a
-relative `jean.db` with `create: true`, and only 3 of 32 test files override
-it. Running `bun test` without the override points the remaining 29 files at
-the live production database. This is a live hazard in the legacy tree, not a
-theoretical one, and closing it is the first thing worth doing there.
-
-Verified during capture: with the override set, the production database's
-checksum and mtime were identical before and after the run, and both systemd
-units stayed active.
+The retired fixture suite is not part of supported operations and must not be
+run against production state. Its historical database defaults were unsafe by
+construction; retain captured evidence as read-only input instead of executing
+that suite on a live host.
 
 ## What this changes for the plan
 

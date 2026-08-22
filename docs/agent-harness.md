@@ -50,6 +50,26 @@ Malformed model control output is a typed failure and is never displayed as a
 fallback answer. Repeated calls and exhausted bounds stop the turn rather than
 creating implicit background work.
 
+## Agentic scratchpads from chat
+
+Slack and Telegram conversation may escalate a task that needs non-trivial
+computation or iterative code execution into one `agentic_scratchpad` approval
+card. The card shows the exact frozen task. It creates and runs nothing until a
+configured administrator approves it; denial performs no work.
+
+Approval submits the frozen task through the same durable contained run lane as
+`/run`, under a distinct trusted profile. That profile provides an empty
+writable per-run workspace and read/execute access to bounded system runtimes,
+so the provider may create, execute, test, and revise scripts. Resource limits,
+the brokered network allowlist, run custody, progress, cancellation, and `/runs`
+visibility remain unchanged. No repository, production path, customer data, or
+ambient credential is mounted because chat text names it.
+
+This is not a substitute for ticket execution. A canonical GitHub or Manage
+ticket continues through its mapped workspace and existing authorization flow,
+which may grant task-specific repository and deployment capabilities that an
+empty conversational scratchpad does not have.
+
 ## Approval and replay
 
 An effect proposal freezes the exact tool, canonical arguments, local

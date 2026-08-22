@@ -39,11 +39,12 @@ use automonique_core::conversation::utc_rfc3339_from_unix_millis;
 use automonique_github_connector::{
     CommentId, CommentRequest, CreateIssueRequest, DatabaseId, GetCommentsRequest,
     GetIssueCommentRequest, GetIssueRequest, GetRepositoryRequest, GitHubBase, GitHubClient,
-    GitHubComment, GitHubOutcome, GitHubToken, IssueBodyText, IssueLocator, IssueManagementPatch,
-    IssueState, IssueTitle, Label, LabelColor, ListLabelsRequest, LockReason, ManagementName,
-    ManagementRequest, ManagementText, Owner, Page, ProjectFieldType, ProjectItemType,
-    ProjectOwner, ProjectOwnerKind, ProjectRef, ProjectStatus, ProjectViewLayout, RepoTarget,
-    SearchIssuesRequest, SetStateRequest, UpdateIssueBodyRequest, UpdateIssueCommentRequest,
+    GitHubComment, GitHubOutcome, GitHubToken, IssueBodyText, IssueFilter, IssueListState,
+    IssueLocator, IssueManagementPatch, IssueState, IssueTitle, Label, LabelColor,
+    ListIssuesRequest, ListLabelsRequest, LockReason, ManagementName, ManagementRequest,
+    ManagementText, Owner, Page, ProjectFieldType, ProjectItemType, ProjectOwner, ProjectOwnerKind,
+    ProjectRef, ProjectStatus, ProjectViewLayout, RepoTarget, SearchIssuesRequest, SetStateRequest,
+    Since, UpdateIssueBodyRequest, UpdateIssueCommentRequest,
 };
 use automonique_protocol::digest::Sha256;
 use serde::Deserialize;
@@ -67,6 +68,8 @@ const MAX_CONFIGURED_REPOSITORIES: usize = 16;
 const MAX_REPOSITORY_ALIAS_BYTES: usize = 32;
 const MAX_ACTION_COMMENTS: u32 = 1_000;
 const PAGE_SIZE: u32 = 100;
+const MAX_REPOSITORY_ISSUE_PAGES: u32 = 10;
+const MAX_REPOSITORY_ISSUE_ROWS: usize = 100;
 const GH_EXECUTABLE: &str = "/usr/bin/gh";
 const GH_CREDENTIAL: &str = "gh-cli-active-account";
 const UTC_DAY_MILLIS: i64 = 86_400_000;
@@ -87,6 +90,52 @@ pub enum RepositoryActivityWindow {
     Yesterday,
     /// The rolling seven days ending at the snapshot instant.
     Last7Days,
+}
+
+/// A bounded issue inventory over the configured repository allowlist.
+///
+/// `Open` and `All` describe current/historical inventory. The remaining
+/// variants describe issue activity by GitHub's canonical `updated_at`, not
+/// repository pushes or local worktree activity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepositoryIssueSelection {
+    /// Every currently open issue.
+    Open,
+    /// Every issue regardless of state, subject to the explicit page cap.
+    All,
+    /// Issues updated since Monday 00:00 UTC.
+    ThisWeek,
+    /// Issues updated during the current UTC day.
+    Today,
+    /// Issues updated during the complete previous UTC day.
+    Yesterday,
+    /// Issues updated during the rolling seven days ending at the snapshot.
+    Last7Days,
+}
+
+impl RepositoryIssueSelection {
+    /// Stable rendering used in bounded facts and tool schemas.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::All => "all",
+            Self::ThisWeek => "this_week",
+            Self::Today => "today",
+            Self::Yesterday => "yesterday",
+            Self::Last7Days => "last_7_days",
+        }
+    }
+
+    const fn activity_window(self) -> Option<RepositoryActivityWindow> {
+        match self {
+            Self::Open | Self::All => None,
+            Self::ThisWeek => Some(RepositoryActivityWindow::ThisWeek),
+            Self::Today => Some(RepositoryActivityWindow::Today),
+            Self::Yesterday => Some(RepositoryActivityWindow::Yesterday),
+            Self::Last7Days => Some(RepositoryActivityWindow::Last7Days),
+        }
+    }
 }
 
 impl RepositoryActivityWindow {
@@ -126,6 +175,19 @@ pub trait GitHubSurface: Send {
     ) -> Result<String, String> {
         Err(String::from(
             "status=unavailable reason=github_repository_activity_unavailable",
+        ))
+    }
+
+    /// Read a bounded issue inventory from every configured repository.
+    ///
+    /// The safe default keeps injected issue-only surfaces issue-only.
+    fn repository_issue_inventory(
+        &mut self,
+        _selection: RepositoryIssueSelection,
+        _now_ms: i64,
+    ) -> Result<String, String> {
+        Err(String::from(
+            "status=unavailable reason=github_repository_issue_inventory_unavailable",
         ))
     }
 
@@ -1000,6 +1062,132 @@ impl GitHubSurface for GitHubWorkspace {
         ))
     }
 
+    fn repository_issue_inventory(
+        &mut self,
+        selection: RepositoryIssueSelection,
+        now_ms: i64,
+    ) -> Result<String, String> {
+        if self.repositories.is_empty() {
+            return Err(String::from(
+                "status=refused reason=github_repository_allowlist_empty",
+            ));
+        }
+        let bounds = selection
+            .activity_window()
+            .map(|window| {
+                RepositoryActivityBounds::new(window, now_ms).ok_or_else(|| {
+                    String::from("status=refused reason=github_issue_inventory_clock_invalid")
+                })
+            })
+            .transpose()?;
+        let state = if selection == RepositoryIssueSelection::Open {
+            IssueListState::Open
+        } else {
+            IssueListState::All
+        };
+        let mut filter = IssueFilter::new(state);
+        if let Some(lower) = bounds
+            .as_ref()
+            .and_then(|bounds| bounds.lower_inclusive.as_deref())
+        {
+            filter = filter.with_since(Since::new(lower).map_err(|_| {
+                String::from("status=refused reason=github_issue_inventory_bounds_invalid")
+            })?);
+        }
+
+        let mut rows = Vec::new();
+        let mut repository_counts = Vec::new();
+        let mut unavailable = Vec::new();
+        let mut invalid_rows = 0_usize;
+        let mut truncated = false;
+        for target in &self.repositories {
+            let mut matched = 0_usize;
+            let mut open = 0_usize;
+            let mut closed = 0_usize;
+            let mut repository_failed = None;
+            for page_number in 1..=MAX_REPOSITORY_ISSUE_PAGES {
+                let request = ListIssuesRequest::new(
+                    target.clone(),
+                    filter.clone(),
+                    Page::new(page_number, PAGE_SIZE).map_err(|_| {
+                        String::from("status=refused reason=github_issue_inventory_page_invalid")
+                    })?,
+                );
+                let reply = match self.client.list_issues(&request) {
+                    Ok(reply) => reply,
+                    Err(failure) => {
+                        repository_failed = Some(failure.category().to_owned());
+                        break;
+                    }
+                };
+                let page = match reply.into_outcome() {
+                    GitHubOutcome::Accepted(page) => page,
+                    GitHubOutcome::Rejected(rejection) => {
+                        repository_failed = Some(rejection.kind().category().to_owned());
+                        break;
+                    }
+                };
+                let has_more = page.has_more;
+                for issue in page.issues {
+                    if issue.target != *target {
+                        invalid_rows = invalid_rows.saturating_add(1);
+                        continue;
+                    }
+                    let Some(updated_key) = utc_timestamp_sort_key(&issue.updated_at) else {
+                        invalid_rows = invalid_rows.saturating_add(1);
+                        continue;
+                    };
+                    if bounds
+                        .as_ref()
+                        .is_some_and(|bounds| !bounds.contains(&updated_key))
+                    {
+                        continue;
+                    }
+                    matched = matched.saturating_add(1);
+                    match issue.state {
+                        IssueState::Open => open = open.saturating_add(1),
+                        IssueState::Closed => closed = closed.saturating_add(1),
+                    }
+                    rows.push(RepositoryIssueRow {
+                        reference: format!("{}#{}", issue.target, issue.number),
+                        url: issue.url,
+                        state: issue.state,
+                        title: issue.title,
+                        updated_at: issue.updated_at,
+                        updated_key,
+                    });
+                }
+                if !has_more {
+                    break;
+                }
+                if page_number == MAX_REPOSITORY_ISSUE_PAGES {
+                    truncated = true;
+                }
+            }
+            if let Some(reason) = repository_failed {
+                truncated = true;
+                unavailable.push(format!("{target}:{reason}"));
+            }
+            repository_counts.push((target.to_string(), matched, open, closed));
+        }
+        rows.sort_by(|left, right| {
+            right
+                .updated_key
+                .cmp(&left.updated_key)
+                .then_with(|| left.reference.cmp(&right.reference))
+        });
+        Ok(render_repository_issue_inventory(
+            selection,
+            bounds.as_ref(),
+            self.repositories.len(),
+            &repository_counts,
+            &rows,
+            &unavailable,
+            invalid_rows,
+            truncated,
+        ))
+    }
+
     fn issue_facts(
         &mut self,
         locator: &IssueLocator,
@@ -1318,6 +1506,90 @@ fn render_repository_push_activity(
     }
     facts.push_str(
         "\nscope_note=This is the configured local allowlist, not an organization-wide inventory. pushed_at proves Git push activity, not issue, project, or local unpushed work.",
+    );
+    facts
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RepositoryIssueRow {
+    reference: String,
+    url: String,
+    state: IssueState,
+    title: String,
+    updated_at: String,
+    updated_key: String,
+}
+
+/// Render counts for the complete bounded read and retain only the newest
+/// issue rows. Titles are explicitly untrusted and individually bounded.
+#[allow(clippy::too_many_arguments)]
+fn render_repository_issue_inventory(
+    selection: RepositoryIssueSelection,
+    bounds: Option<&RepositoryActivityBounds>,
+    checked: usize,
+    repository_counts: &[(String, usize, usize, usize)],
+    rows: &[RepositoryIssueRow],
+    unavailable: &[String],
+    invalid_rows: usize,
+    truncated: bool,
+) -> String {
+    let open = repository_counts
+        .iter()
+        .map(|(_, _, open, _)| *open)
+        .sum::<usize>();
+    let closed = repository_counts
+        .iter()
+        .map(|(_, _, _, closed)| *closed)
+        .sum::<usize>();
+    let matched = open.saturating_add(closed);
+    let included = rows.len().min(MAX_REPOSITORY_ISSUE_ROWS);
+    let omitted = rows.len().saturating_sub(included);
+    let mut facts = format!(
+        "status=available\nscope=configured_repository_allowlist\nissue_basis=github_repository_issues\ntime_basis={}\nselection={}\nlower_inclusive={}\nupper_exclusive={}\nrepositories_checked={checked}\nissues_matched={matched}\nissues_open={open}\nissues_closed={closed}\nissue_rows_included={included}\nissue_rows_omitted={omitted}\ninventory_truncated={}\ninvalid_rows={invalid_rows}",
+        if bounds.is_some() {
+            "github_issue_updated_at"
+        } else {
+            "none"
+        },
+        selection.as_str(),
+        bounds
+            .and_then(|bounds| bounds.lower_inclusive.as_deref())
+            .unwrap_or("unbounded"),
+        bounds
+            .map(|bounds| bounds.upper_exclusive.as_str())
+            .unwrap_or("snapshot"),
+        if truncated { "yes" } else { "no" },
+    );
+    for (repository, matched, open, closed) in repository_counts {
+        facts.push_str("\nrepository=");
+        facts.push_str(repository);
+        facts.push_str(" matched=");
+        facts.push_str(&matched.to_string());
+        facts.push_str(" open=");
+        facts.push_str(&open.to_string());
+        facts.push_str(" closed=");
+        facts.push_str(&closed.to_string());
+    }
+    for row in rows.iter().take(MAX_REPOSITORY_ISSUE_ROWS) {
+        facts.push_str("\nissue=");
+        facts.push_str(&row.reference);
+        facts.push_str(" state=");
+        facts.push_str(row.state.as_str());
+        facts.push_str(" updated_at=");
+        facts.push_str(&single_line(&row.updated_at));
+        facts.push_str(" url=");
+        facts.push_str(&single_line(&row.url));
+        facts.push_str(" title_untrusted=");
+        facts.push_str(&bounded_field(&row.title, 180));
+    }
+    facts.push_str("\nrepositories_unavailable=");
+    facts.push_str(&unavailable.len().to_string());
+    for entry in unavailable {
+        facts.push_str("\nunavailable_repository=");
+        facts.push_str(entry);
+    }
+    facts.push_str(
+        "\nscope_note=This is GitHub issue state for the configured local repository allowlist, not Manage support tickets or an organization-wide inventory. Timed selections use issue updated_at and do not prove code, deployment, or completion by themselves.",
     );
     facts
 }
@@ -2963,6 +3235,55 @@ mod tests {
         assert!(yesterday.contains("2026-08-21T23:59:59.999Z"));
         assert!(!yesterday.contains("2026-08-22T00:00:00.000Z"));
         assert!(RepositoryActivityBounds::new(RepositoryActivityWindow::All, -1).is_none());
+    }
+
+    #[test]
+    fn repository_issue_projection_separates_state_activity_and_support_scope() {
+        let bounds =
+            RepositoryActivityBounds::new(RepositoryActivityWindow::Last7Days, 1_787_423_040_000)
+                .expect("bounds");
+        let rows = vec![
+            RepositoryIssueRow {
+                reference: String::from("example/alpha#12"),
+                url: String::from("https://github.com/example/alpha/issues/12"),
+                state: IssueState::Closed,
+                title: String::from("Shipped\nfix"),
+                updated_at: String::from("2026-08-21T17:04:11Z"),
+                updated_key: String::from("2026-08-21T17:04:11.000Z"),
+            },
+            RepositoryIssueRow {
+                reference: String::from("example/beta#7"),
+                url: String::from("https://github.com/example/beta/issues/7"),
+                state: IssueState::Open,
+                title: String::from("Follow-up"),
+                updated_at: String::from("2026-08-20T09:00:00Z"),
+                updated_key: String::from("2026-08-20T09:00:00.000Z"),
+            },
+        ];
+        let facts = render_repository_issue_inventory(
+            RepositoryIssueSelection::Last7Days,
+            Some(&bounds),
+            2,
+            &[
+                (String::from("example/alpha"), 1, 0, 1),
+                (String::from("example/beta"), 1, 1, 0),
+            ],
+            &rows,
+            &[],
+            0,
+            false,
+        );
+        assert!(facts.contains("issue_basis=github_repository_issues"));
+        assert!(facts.contains("time_basis=github_issue_updated_at"));
+        assert!(facts.contains("selection=last_7_days"));
+        assert!(facts.contains("issues_matched=2"));
+        assert!(facts.contains("issues_open=1"));
+        assert!(facts.contains("issues_closed=1"));
+        assert!(facts.contains("issue=example/alpha#12 state=closed"));
+        assert!(facts.contains("title_untrusted=Shipped fix"));
+        assert!(facts.contains("inventory_truncated=no"));
+        assert!(facts.contains("not Manage support tickets"));
+        assert!(facts.contains("do not prove code, deployment, or completion"));
     }
 
     #[test]

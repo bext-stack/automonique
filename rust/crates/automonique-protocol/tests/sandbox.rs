@@ -1164,6 +1164,40 @@ mod narrowing_only_reuse {
         // Intersection in either order is still within the reviewed set.
         assert!(greedy.narrowed_to(&reviewed).is_within(&reviewed));
     }
+
+    #[test]
+    fn write_and_execute_grants_are_incomparable_siblings() {
+        let writable =
+            PathGrants::declare(&[
+                PathGrant::new("/workspace/tool", PathAccess::ReadWrite).expect("valid")
+            ])
+            .expect("writable grants");
+        let executable =
+            PathGrants::declare(&[
+                PathGrant::new("/workspace/tool", PathAccess::ReadExecute).expect("valid")
+            ])
+            .expect("executable grants");
+        let readable =
+            PathGrants::declare(&[
+                PathGrant::new("/workspace/tool", PathAccess::ReadOnly).expect("valid")
+            ])
+            .expect("readable grants");
+
+        assert!(!writable.is_within(&executable));
+        assert!(!executable.is_within(&writable));
+        assert!(readable.is_within(&writable));
+        assert!(readable.is_within(&executable));
+        assert_eq!(
+            writable.narrowed_to(&executable).as_slice()[0].access(),
+            PathAccess::ReadOnly,
+            "write and execute share only read authority"
+        );
+        assert_eq!(
+            executable.narrowed_to(&writable).as_slice()[0].access(),
+            PathAccess::ReadOnly,
+            "intersection must be commutative"
+        );
+    }
 }
 
 mod approval_cannot_widen {

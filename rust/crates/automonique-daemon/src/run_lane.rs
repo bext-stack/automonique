@@ -897,6 +897,10 @@ impl RunLane for SocketRunLane {
         self.run_with_profile(task, ProviderRunProfile::Standard)
     }
 
+    fn run_agentic_scratchpad(&mut self, task: &str) -> Result<String, RunFailure> {
+        self.run_with_profile(task, ProviderRunProfile::AgenticScratchpad)
+    }
+
     fn cancel_run(
         &mut self,
         run_ref: &str,
@@ -1123,7 +1127,10 @@ impl SocketRunLane {
             ProviderRunProfile::Standard => compose(&task, &inputs),
             ProviderRunProfile::FastConversation
             | ProviderRunProfile::IntelligentQuestion
-            | ProviderRunProfile::WebResearch => compose_with_profile(&task, &inputs, profile),
+            | ProviderRunProfile::WebResearch
+            | ProviderRunProfile::AgenticScratchpad => {
+                compose_with_profile(&task, &inputs, profile)
+            }
         }
         .map_err(RunFailure::from_compose)?;
 

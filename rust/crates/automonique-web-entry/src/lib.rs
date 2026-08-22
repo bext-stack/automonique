@@ -1023,6 +1023,11 @@ struct ChatMessageView {
     created_at_ms: i64,
 }
 
+struct ModelCapabilityAnswer {
+    text: String,
+    catalog_available: bool,
+}
+
 impl WebIntegration {
     pub fn open(
         config: IntegrationConfig,
@@ -1524,13 +1529,19 @@ impl WebIntegration {
 
         let request_time_utc =
             utc_rfc3339_from_unix_millis(now).unwrap_or_else(|| String::from("unavailable"));
-        let direct_answer = is_current_time_question(message).then(|| {
-            if request_time_utc == "unavailable" {
+        let current_time_question = is_current_time_question(message);
+        let model_capability = (!current_time_question
+            && automonique_daemon::telegram_bridge::is_model_capability_question(message))
+        .then(|| model_capability_answer(&self.state_dir));
+        let direct_answer = if current_time_question {
+            Some(if request_time_utc == "unavailable" {
                 String::from("The server clock is unavailable right now.")
             } else {
                 format!("It’s {request_time_utc} (UTC).")
-            }
-        });
+            })
+        } else {
+            model_capability.as_ref().map(|answer| answer.text.clone())
+        };
         let github_tool = if direct_answer.is_some() {
             GitHubToolDecision::None
         } else {
@@ -1608,6 +1619,15 @@ impl WebIntegration {
             live_sources.push(format!("manage:{tool}"));
         }
         live_sources.push(String::from("clock:utc"));
+        if model_capability.is_some() {
+            live_sources.push(String::from("automonique:model-routes"));
+        }
+        if model_capability
+            .as_ref()
+            .is_some_and(|answer| answer.catalog_available)
+        {
+            live_sources.push(String::from("codex:model-catalog"));
+        }
         if direct_answer.is_none() {
             live_sources.push(String::from("automonique:status"));
         }
@@ -2169,6 +2189,64 @@ impl WebIntegration {
         let mut sequence = self.sequence.lock().map_err(|_| "chat_lane_unavailable")?;
         *sequence = sequence.wrapping_add(1);
         Ok(now_ms().wrapping_mul(1_000).wrapping_add(*sequence))
+    }
+}
+
+fn model_capability_answer(state_dir: &Path) -> ModelCapabilityAnswer {
+    use automonique_daemon::model_inventory::configured_codex_catalog;
+
+    let routes = automonique_daemon::model_inventory::configured_model_routes(state_dir);
+    render_model_capability_answer(routes, configured_codex_catalog(state_dir))
+}
+
+fn render_model_capability_answer(
+    routes: automonique_daemon::model_inventory::ConfiguredModelRoutes,
+    catalog: automonique_daemon::model_inventory::ModelCatalogRead,
+) -> ModelCapabilityAnswer {
+    use automonique_daemon::model_inventory::ModelCatalogRead;
+
+    let mut text = format!(
+        "Monique’s configured model routes:\n\
+         - Conversation: `{}`\n\
+         - Conversation fallback: `{}`\n\
+         - Operational work: `{}` (`{}` reasoning)",
+        routes.conversation_primary,
+        routes.conversation_fallback,
+        routes.operational_primary,
+        routes.operational_reasoning,
+    );
+    match catalog {
+        ModelCatalogRead::Available(catalog) => {
+            let models = catalog
+                .models
+                .iter()
+                .map(|model| {
+                    if model.is_default {
+                        format!("`{}` (default)", model.id)
+                    } else {
+                        format!("`{}`", model.id)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            text.push_str(&format!(
+                "\n\nThe connected Codex account currently exposes: {models}.\n\
+                 Account-visible models are not automatically active Monique routes."
+            ));
+            ModelCapabilityAnswer {
+                text,
+                catalog_available: true,
+            }
+        }
+        ModelCatalogRead::Unavailable(_) => {
+            text.push_str(
+                "\n\nThe connected Codex account’s live model catalog is temporarily unavailable. The configured routes above remain authoritative for what Monique will select.",
+            );
+            ModelCapabilityAnswer {
+                text,
+                catalog_available: false,
+            }
+        }
     }
 }
 
@@ -5247,6 +5325,165 @@ mod tests {
         assert_eq!(
             utc_rfc3339_from_unix_millis(1_775_433_480_000).as_deref(),
             Some("2026-04-05T23:58:00.000Z")
+        );
+    }
+
+    #[test]
+    fn dashboard_model_capability_answer_separates_routes_from_account_catalog() {
+        use automonique_daemon::model_inventory::{
+            AvailableModel, CodexModelCatalog, ConfiguredModelRoutes, ModelCatalogRead,
+            ModelCatalogUnavailable,
+        };
+
+        let routes = ConfiguredModelRoutes {
+            conversation_primary: String::from("deepseek-v4-flash"),
+            conversation_fallback: String::from("gpt-5.6-luna"),
+            operational_primary: String::from("gpt-5.6-sol"),
+            operational_reasoning: String::from("high"),
+            operational_harness: String::from("codex-fixture"),
+        };
+        let available = render_model_capability_answer(
+            routes.clone(),
+            ModelCatalogRead::Available(CodexModelCatalog {
+                models: vec![
+                    AvailableModel {
+                        id: String::from("gpt-5.6-sol"),
+                        is_default: true,
+                    },
+                    AvailableModel {
+                        id: String::from("gpt-5.6-terra"),
+                        is_default: false,
+                    },
+                ],
+            }),
+        );
+        assert!(available.catalog_available);
+        assert!(available.text.contains("Conversation: `deepseek-v4-flash`"));
+        assert!(
+            available
+                .text
+                .contains("Conversation fallback: `gpt-5.6-luna`")
+        );
+        assert!(
+            available
+                .text
+                .contains("Operational work: `gpt-5.6-sol` (`high` reasoning)")
+        );
+        assert!(available.text.contains("`gpt-5.6-sol` (default)"));
+        assert!(available.text.contains("`gpt-5.6-terra`"));
+        assert!(
+            available
+                .text
+                .contains("not automatically active Monique routes")
+        );
+        assert!(!available.text.contains("codex-fixture"));
+
+        let unavailable = render_model_capability_answer(
+            routes,
+            ModelCatalogRead::Unavailable(ModelCatalogUnavailable::TimedOut),
+        );
+        assert!(!unavailable.catalog_available);
+        assert!(unavailable.text.contains("configured model routes"));
+        assert!(
+            unavailable
+                .text
+                .contains("live model catalog is temporarily unavailable")
+        );
+        assert!(!unavailable.text.contains("add a provider model-list"));
+    }
+
+    #[test]
+    fn dashboard_model_question_is_answered_without_a_conversational_provider_run() {
+        let state = tempfile::tempdir().expect("state");
+        let runtime = tempfile::tempdir().expect("runtime");
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+        let home = state.path().join("codex-home");
+        std::fs::create_dir(&home).expect("provider home");
+        std::fs::write(
+            home.join("config.toml"),
+            "model = \"gpt-5.6-sol\"\nmodel_reasoning_effort = \"high\"\n",
+        )
+        .expect("model config");
+        let binary = state.path().join("fake-codex");
+        std::fs::write(
+            &binary,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s\\n' '{\"id\":2,\"result\":{\"data\":[{\"id\":\"gpt-5.6-sol\",\"model\":\"gpt-5.6-sol\",\"hidden\":false,\"isDefault\":true},{\"id\":\"gpt-5.6-terra\",\"model\":\"gpt-5.6-terra\",\"hidden\":false,\"isDefault\":false}],\"nextCursor\":null}}'\n",
+            ),
+        )
+        .expect("fixture provider");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+            .expect("executable provider");
+        let primary = state.path().join("provider");
+        std::fs::write(
+            &primary,
+            format!(
+                "binary={}\nhome={}\nversion=codex-fixture\narg={{answer}}\n",
+                binary.display(),
+                home.display(),
+            ),
+        )
+        .expect("primary provider");
+        let conversation = state.path().join("conversation-provider");
+        std::fs::write(
+            &conversation,
+            format!(
+                "binary={}\nhome={}\nversion=deepseek-v4-flash-direct-v1\narg={{answer}}\n",
+                binary.display(),
+                home.display(),
+            ),
+        )
+        .expect("conversation provider");
+        for path in [&primary, &conversation] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("private provider config");
+        }
+        let integration = WebIntegration::open(
+            IntegrationConfig {
+                tenant: String::from("operator"),
+                actor: String::from("operator:fixture"),
+                hosts: fixture_hosts(),
+            },
+            state.path(),
+            runtime.path(),
+        )
+        .expect("web integration");
+
+        let response = integration
+            .chat(
+                ChatRequest {
+                    message: String::from("what models do we have access to ?"),
+                    profile: None,
+                },
+                &fixture_status(),
+            )
+            .expect("model capability answer");
+        assert!(
+            response
+                .answer
+                .contains("Conversation: `deepseek-v4-flash`")
+        );
+        assert!(response.answer.contains("`gpt-5.6-sol` (default)"));
+        assert!(response.answer.contains("`gpt-5.6-terra`"));
+        assert_eq!(response.profile, "conversation");
+        assert!(
+            response
+                .live_sources
+                .contains(&String::from("automonique:model-routes"))
+        );
+        assert!(
+            response
+                .live_sources
+                .contains(&String::from("codex:model-catalog"))
+        );
+        assert!(
+            !response
+                .live_sources
+                .contains(&String::from("automonique:status"))
         );
     }
 

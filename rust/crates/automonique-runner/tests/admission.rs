@@ -418,12 +418,13 @@ fn admitting_the_same_spec_and_context_twice_is_byte_identical() {
 fn declared_path_grants_map_by_access_in_declared_order() {
     let workspace = TempDir::new("grants");
     let mut sandbox = sandbox_parts();
-    // Four grants, declared in an order no sort and no hash reproduces, so a
+    // Five grants, declared in an order no sort and no hash reproduces, so a
     // mapping that collected them through an unordered container or tidied
     // them into sorted order cannot match the frame below.
     sandbox.path_grants = PathGrants::declare(&[
         PathGrant::new("/outputs", PathAccess::ReadWrite).unwrap(),
         PathGrant::new("/inputs", PathAccess::ReadOnly).unwrap(),
+        PathGrant::new("/tools", PathAccess::ReadExecute).unwrap(),
         PathGrant::new("/scratch", PathAccess::ReadWrite).unwrap(),
         PathGrant::new("/cache", PathAccess::ReadOnly).unwrap(),
     ])
@@ -451,6 +452,8 @@ fn declared_path_grants_map_by_access_in_declared_order() {
         .unwrap()
         .filesystem_grant(PathIntent::Read, "/inputs")
         .unwrap()
+        .filesystem_grant(PathIntent::ReadExecute, "/tools")
+        .unwrap()
         .filesystem_grant(PathIntent::ReadWrite, "/scratch")
         .unwrap()
         .filesystem_grant(PathIntent::Read, "/cache")
@@ -462,7 +465,7 @@ fn declared_path_grants_map_by_access_in_declared_order() {
     assert_eq!(
         admitted.plan().encode().unwrap(),
         expected.encode().unwrap(),
-        "read-only and read-write grants must map in the spec's own order"
+        "read, read-execute, and read-write grants must map in the spec's own order"
     );
 }
 
