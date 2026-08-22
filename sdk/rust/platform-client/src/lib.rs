@@ -14,12 +14,19 @@ use automonique_protocol::codec::{
     FrameDecode, LENGTH_PREFIX_BYTES, RequestId, decode_frame, encode_frame,
 };
 use automonique_protocol::platform::{
-    ActionReceipt, Capabilities, PlatformCursor, PlatformRequest, PlatformResponse, ReceiptId,
-    ResourceCoordinate, ResourceRecord, Snapshot, Subscription,
+    ActionReceipt, AttachRequest, Attachment, Capabilities, ClaimControlRequest, ClientId,
+    ControlLease, DetachRequest, ExecuteRequest, GetReceiptRequest, IdempotencyKey,
+    ListSessionsRequest, PlatformCursor, PlatformRequest, PlatformResponse, ReceiptId,
+    ReleaseControlRequest, ResourceAuthority, ResourceCoordinate, ResourceRecord, SessionList,
+    Snapshot, SnapshotRequest, SubscribeRequest, Subscription,
 };
 use automonique_protocol::platform_api::{
     MAX_PLATFORM_CANONICAL_BYTES, PlatformRequestMessage, PlatformResponseMessage,
 };
+use zeroize::Zeroizing;
+
+pub const PLATFORM_CONTENT_TYPE: &str = "application/vnd.automonique.platform.v1+json";
+const MAX_BEARER_BYTES: usize = 4096;
 
 /// Stable client refusal categories. Payload bytes are never retained.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,6 +35,10 @@ pub enum ClientError {
     Protocol,
     Correlation,
     ResponseTooLarge,
+    Endpoint,
+    Unauthorized,
+    UnexpectedStatus,
+    UnexpectedContentType,
 }
 
 impl ClientError {
@@ -38,6 +49,10 @@ impl ClientError {
             Self::Protocol => "protocol",
             Self::Correlation => "correlation",
             Self::ResponseTooLarge => "response_too_large",
+            Self::Endpoint => "endpoint",
+            Self::Unauthorized => "unauthorized",
+            Self::UnexpectedStatus => "unexpected_status",
+            Self::UnexpectedContentType => "unexpected_content_type",
         }
     }
 }
@@ -49,6 +64,35 @@ impl fmt::Display for ClientError {
 }
 
 impl Error for ClientError {}
+
+/// Bounded bearer credential retained only by the HTTPS transport and always
+/// redacted from diagnostics.
+pub struct BearerToken(Zeroizing<String>);
+
+impl BearerToken {
+    pub fn new(value: impl Into<String>) -> Result<Self, ClientError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > MAX_BEARER_BYTES
+            || value
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte == b' ')
+        {
+            return Err(ClientError::Unauthorized);
+        }
+        Ok(Self(Zeroizing::new(value)))
+    }
+
+    fn authorization(&self) -> Zeroizing<String> {
+        Zeroizing::new(format!("Bearer {}", self.0.as_str()))
+    }
+}
+
+impl fmt::Debug for BearerToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BearerToken(<redacted>)")
+    }
+}
 
 /// Semantic request transport. Unix, HTTPS, WebSocket, and fakes implement the
 /// same operation and return the same response vocabulary.
@@ -143,6 +187,128 @@ impl PlatformTransport for UnixTransport {
     }
 }
 
+/// Remote HTTPS transport carrying the exact canonical platform frame used on
+/// the Unix socket. Authentication is outside the frame and no remote wire
+/// types or retry policy are introduced here.
+pub struct HttpsTransport {
+    endpoint: String,
+    token: BearerToken,
+    timeout: Duration,
+    agent: ureq::Agent,
+}
+
+impl HttpsTransport {
+    pub fn new(endpoint: impl Into<String>, token: BearerToken) -> Result<Self, ClientError> {
+        let endpoint = endpoint.into();
+        validate_endpoint(&endpoint)?;
+        Ok(Self {
+            endpoint,
+            token,
+            timeout: Duration::from_secs(10),
+            agent: ureq::Agent::config_builder().build().new_agent(),
+        })
+    }
+
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+}
+
+impl fmt::Debug for HttpsTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpsTransport")
+            .field("endpoint", &self.endpoint)
+            .field("token", &"<redacted>")
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+fn validate_endpoint(endpoint: &str) -> Result<(), ClientError> {
+    let uri: ureq::http::Uri = endpoint.parse().map_err(|_| ClientError::Endpoint)?;
+    let scheme = uri.scheme_str().ok_or(ClientError::Endpoint)?;
+    let host = uri.host().ok_or(ClientError::Endpoint)?;
+    if uri
+        .authority()
+        .is_some_and(|authority| authority.as_str().contains('@'))
+        || uri.query().is_some()
+        || (scheme != "https"
+            && !(scheme == "http" && matches!(host, "localhost" | "127.0.0.1" | "[::1]")))
+    {
+        return Err(ClientError::Endpoint);
+    }
+    Ok(())
+}
+
+impl PlatformTransport for HttpsTransport {
+    fn request(
+        &mut self,
+        request_id: RequestId,
+        request: PlatformRequest,
+    ) -> Result<PlatformResponse, ClientError> {
+        let payload = PlatformRequestMessage::new(request_id.clone(), request)
+            .to_message()
+            .map_err(|_| ClientError::Protocol)?
+            .to_canonical_bytes();
+        let authorization = self.token.authorization();
+        let mut response = self
+            .agent
+            .post(&self.endpoint)
+            .header("authorization", authorization.as_str())
+            .header("content-type", PLATFORM_CONTENT_TYPE)
+            .header("accept", PLATFORM_CONTENT_TYPE)
+            .config()
+            .timeout_global(Some(self.timeout))
+            .build()
+            .send(&payload)
+            .map_err(|error| match error {
+                ureq::Error::BodyExceedsLimit(_) => ClientError::ResponseTooLarge,
+                _ => ClientError::Io,
+            })?;
+        let status = response.status().as_u16();
+        if matches!(status, 401 | 403) {
+            return Err(ClientError::Unauthorized);
+        }
+        if !(200..=299).contains(&status) {
+            return Err(ClientError::UnexpectedStatus);
+        }
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim);
+        if content_type != Some(PLATFORM_CONTENT_TYPE) {
+            return Err(ClientError::UnexpectedContentType);
+        }
+        let mut body = Vec::new();
+        response
+            .body_mut()
+            .with_config()
+            .limit((MAX_PLATFORM_CANONICAL_BYTES + 1) as u64)
+            .reader()
+            .read_to_end(&mut body)
+            .map_err(|_| ClientError::Io)?;
+        if body.len() > MAX_PLATFORM_CANONICAL_BYTES {
+            return Err(ClientError::ResponseTooLarge);
+        }
+        let response = PlatformResponseMessage::from_canonical_bytes(&body)
+            .map_err(|_| ClientError::Protocol)?;
+        if response.request_id() != &request_id {
+            return Err(ClientError::Correlation);
+        }
+        Ok(response.response().clone())
+    }
+}
+
 /// Small typed facade shared by interactive and headless clients.
 pub struct PlatformClient<T> {
     transport: T,
@@ -168,9 +334,135 @@ impl<T: PlatformTransport> PlatformClient<T> {
         self.transport.request(request_id, request)
     }
 
+    /// Send a request with a caller-supplied correlation identifier. Gateways
+    /// use this to preserve the exact request identity across transports.
+    pub fn request_correlated(
+        &mut self,
+        request_id: RequestId,
+        request: PlatformRequest,
+    ) -> Result<PlatformResponse, ClientError> {
+        self.transport.request(request_id, request)
+    }
+
     pub fn capabilities(&mut self) -> Result<Capabilities, ClientError> {
         match self.request(PlatformRequest::Capabilities)? {
             PlatformResponse::Capabilities(value) => Ok(value),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    pub fn snapshot(
+        &mut self,
+        resources: Vec<ResourceCoordinate>,
+    ) -> Result<Snapshot, ClientError> {
+        match self.request(PlatformRequest::Snapshot(
+            SnapshotRequest::new(resources).map_err(|_| ClientError::Protocol)?,
+        ))? {
+            PlatformResponse::Snapshot(value) => Ok(value),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    pub fn subscribe(
+        &mut self,
+        cursor: Option<PlatformCursor>,
+    ) -> Result<Subscription, ClientError> {
+        match self.request(PlatformRequest::Subscribe(SubscribeRequest { cursor }))? {
+            PlatformResponse::Subscription(value) => Ok(value),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    pub fn execute(&mut self, request: ExecuteRequest) -> Result<ActionReceipt, ClientError> {
+        match self.request(PlatformRequest::Execute(request))? {
+            PlatformResponse::Receipt(value) => Ok(value),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    pub fn get_receipt(
+        &mut self,
+        request: GetReceiptRequest,
+    ) -> Result<ActionReceipt, ClientError> {
+        match self.request(PlatformRequest::GetReceipt(request))? {
+            PlatformResponse::Receipt(value) => Ok(value),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    pub fn list_sessions(
+        &mut self,
+        authority: ResourceAuthority,
+        cursor: Option<PlatformCursor>,
+    ) -> Result<SessionList, ClientError> {
+        match self.request(PlatformRequest::ListSessions(ListSessionsRequest {
+            authority,
+            cursor,
+        }))? {
+            PlatformResponse::Sessions(value) => Ok(value),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    pub fn attach(
+        &mut self,
+        session: ResourceCoordinate,
+        client: ClientId,
+    ) -> Result<Attachment, ClientError> {
+        match self.request(PlatformRequest::Attach(AttachRequest { session, client }))? {
+            PlatformResponse::Attached(value) => Ok(value),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    pub fn detach(
+        &mut self,
+        session: ResourceCoordinate,
+        client: ClientId,
+    ) -> Result<(), ClientError> {
+        match self.request(PlatformRequest::Detach(DetachRequest {
+            session: session.clone(),
+            client: client.clone(),
+        }))? {
+            PlatformResponse::Detached {
+                session: response_session,
+                client: response_client,
+            } if response_session == session && response_client == client => Ok(()),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    pub fn claim_control(
+        &mut self,
+        session: ResourceCoordinate,
+        client: ClientId,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<ControlLease, ClientError> {
+        match self.request(PlatformRequest::ClaimControl(ClaimControlRequest {
+            session,
+            client,
+            idempotency_key,
+        }))? {
+            PlatformResponse::ControlClaimed(value) => Ok(value),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    pub fn release_control(&mut self, request: ReleaseControlRequest) -> Result<(), ClientError> {
+        let session = request.session.clone();
+        let client = request.client.clone();
+        let lease = request.lease.clone();
+        match self.request(PlatformRequest::ReleaseControl(request))? {
+            PlatformResponse::ControlReleased {
+                session: response_session,
+                client: response_client,
+                lease: response_lease,
+            } if response_session == session
+                && response_client == client
+                && response_lease == lease =>
+            {
+                Ok(())
+            }
             _ => Err(ClientError::Protocol),
         }
     }

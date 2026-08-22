@@ -163,6 +163,8 @@ name = "automonique-platform-client"
 version = "0.1.0"
 dependencies = [
  "automonique-protocol",
+ "ureq",
+ "zeroize",
 ]
 
 [[package]]
@@ -275,6 +277,7 @@ dependencies = [
  "sha2",
  "subtle",
  "tempfile",
+ "ureq",
  "zeroize",
 ]
 

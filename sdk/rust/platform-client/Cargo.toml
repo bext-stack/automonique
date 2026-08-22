@@ -9,6 +9,8 @@ publish = false
 
 [dependencies]
 automonique-protocol = { path = "../../../rust/crates/automonique-protocol" }
+ureq = { version = "=3.3.0", default-features = false, features = ["rustls"] }
+zeroize = "=1.9.0"
 
 [dev-dependencies]
 tempfile = "=3.24.0"
