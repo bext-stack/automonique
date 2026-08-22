@@ -2706,6 +2706,7 @@ enum ModelQuestionIntent {
 
 const INVALID_MODEL_STEP_REPLY: &str =
     "The provider returned an invalid agent step, so no tool was run. Please retry.";
+const AGENT_STEP_REPAIR_SUFFIX: &str = "\n\nAGENT_STEP_REPAIR\nYour previous response did not satisfy the closed AgentHarness step contract. Re-read the unchanged request and capability catalog above, then return exactly one corrected JSON step with no markdown, commentary, or extra fields. Do not answer from memory and do not omit a safe read that covers the request.\nEND_AGENT_STEP_REPAIR";
 
 enum QuestionStage {
     Intent {
@@ -2877,6 +2878,48 @@ where
                                     QuestionProfile::Operational,
                                 );
                                 lane.set_draft_target(None);
+                            }
+                            Err(_) => outcome = Err(RunFailure::Unavailable),
+                        }
+                    }
+                    let repair_prompt = match (&outcome, &job.stage) {
+                        (
+                            Ok(answer),
+                            QuestionStage::Intent {
+                                question,
+                                slack_channels,
+                                mcp_tools,
+                                github_action_aliases,
+                                forced_profile,
+                                ..
+                            },
+                        ) if invalid_agent_step(&model_question_step(
+                            answer,
+                            *forced_profile,
+                            question,
+                            slack_channels,
+                            mcp_tools,
+                            github_action_aliases,
+                        )) => agent_step_repair_prompt(&job.prompt),
+                        _ => None,
+                    };
+                    if !queue_expired && let Some(repair_prompt) = repair_prompt {
+                        match lane.lock() {
+                            Ok(mut lane) => {
+                                lane.set_draft_target(Some(job.chat_id));
+                                let repaired = run_question_completion_pass(
+                                    &mut *lane,
+                                    &repair_prompt,
+                                    QuestionProfile::Operational,
+                                );
+                                lane.set_draft_target(None);
+                                match repaired {
+                                    Ok((answer, repaired_runtime)) => {
+                                        runtime = repaired_runtime;
+                                        outcome = Ok(answer);
+                                    }
+                                    Err(failure) => outcome = Err(failure),
+                                }
                             }
                             Err(_) => outcome = Err(RunFailure::Unavailable),
                         }
@@ -11333,6 +11376,21 @@ fn run_question_completion_pass(
     Ok((answer, runtime))
 }
 
+fn agent_step_repair_prompt(prompt: &str) -> Option<String> {
+    let repaired_len = prompt.len().checked_add(AGENT_STEP_REPAIR_SUFFIX.len())?;
+    if repaired_len > MAX_QUESTION_PROMPT_BYTES {
+        return None;
+    }
+    let mut repaired = String::with_capacity(repaired_len);
+    repaired.push_str(prompt);
+    repaired.push_str(AGENT_STEP_REPAIR_SUFFIX);
+    Some(repaired)
+}
+
+fn invalid_agent_step(intent: &ModelQuestionIntent) -> bool {
+    matches!(intent, ModelQuestionIntent::Refused(answer) if answer == INVALID_MODEL_STEP_REPLY)
+}
+
 pub(crate) fn run_question_to_completion(
     lane: &mut dyn RunLane,
     prompt: &str,
@@ -11485,20 +11543,39 @@ pub(crate) fn answer_read_only_transport_question(
         );
     };
     let routing_started = Instant::now();
-    let (routed, routing_runtime) =
+    let (routed, mut routing_runtime) =
         match run_question_completion_pass(lane, &intent_prompt, profile) {
             Ok(answer) => answer,
             Err(failure) => return String::from(question_failure_reply(failure)),
         };
-    let first_execution_ms = routing_started.elapsed().as_millis();
-    match model_question_step(
+    let mut intent = model_question_step(
         &routed,
         None,
         question,
         slack_channels,
         mcp_tools,
         github_action_aliases,
-    ) {
+    );
+    if invalid_agent_step(&intent)
+        && let Some(repair_prompt) = agent_step_repair_prompt(&intent_prompt)
+    {
+        match run_question_completion_pass(lane, &repair_prompt, QuestionProfile::Operational) {
+            Ok((repaired, runtime)) => {
+                routing_runtime = runtime;
+                intent = model_question_step(
+                    &repaired,
+                    None,
+                    question,
+                    slack_channels,
+                    mcp_tools,
+                    github_action_aliases,
+                );
+            }
+            Err(failure) => return String::from(question_failure_reply(failure)),
+        }
+    }
+    let first_execution_ms = routing_started.elapsed().as_millis();
+    match intent {
         ModelQuestionIntent::Answer(answer) => timed_question_reply_for(
             &answer,
             routing_runtime,
@@ -13236,6 +13313,16 @@ fn harness_model_question_step(
     )
 }
 
+fn exact_fenced_json_step(answer: &str) -> Option<&str> {
+    let answer = answer.trim();
+    let body = answer
+        .strip_prefix("```json\n")
+        .or_else(|| answer.strip_prefix("```\n"))?
+        .strip_suffix("\n```")?
+        .trim();
+    (!body.is_empty() && !body.contains("```")).then_some(body)
+}
+
 fn model_question_step(
     answer: &str,
     forced_profile: Option<QuestionProfile>,
@@ -13244,6 +13331,7 @@ fn model_question_step(
     mcp_tools: &[McpToolDescriptor],
     github_action_aliases: &[String],
 ) -> ModelQuestionIntent {
+    let answer = exact_fenced_json_step(answer).unwrap_or(answer);
     if let Some(intent) = harness_model_question_step(
         answer,
         forced_profile,
@@ -14438,7 +14526,7 @@ mod clock_tests {
         ));
 
         let read_step = model_question_step(
-            r#"{"kind":"tool_call","call_id":"read-1","tool":"read_context","arguments":{"sources":["tickets","activity"],"slack_channel":null,"github_issues":false,"github_repository_activity":"this_week","depth":"fast"}}"#,
+            "```json\n{\"kind\":\"tool_call\",\"call_id\":\"read-1\",\"tool\":\"read_context\",\"arguments\":{\"sources\":[\"tickets\",\"activity\"],\"slack_channel\":null,\"github_issues\":false,\"github_repository_activity\":\"this_week\",\"depth\":\"fast\"}}\n```",
             None,
             "What tickets were completed yesterday?",
             &[],

@@ -2316,6 +2316,7 @@ fn configured_repository_activity_is_an_automatic_typed_read_with_clocked_synthe
     let github = FakeGitHub::default();
     let outbound = FakeOutbound::default();
     let lane = FakeRunLane::answering_sequence(&[
+        r#"{"kind":"tool_call","call_id":"broken","tool":"read_context","arguments":{"sources":"not-an-array"}}"#,
         r#"{"kind":"read","sources":[],"slack_channel":null,"github_issues":false,"github_repository_activity":"this_week","depth":"fast"}"#,
         "example/active had Git push activity this week in the configured repository allowlist.",
     ]);
@@ -2355,18 +2356,20 @@ fn configured_repository_activity_is_an_automatic_typed_read_with_clocked_synthe
     );
     assert!(github.seen().is_empty(), "no issue read was selected");
     let prompts = lane.tasks();
-    assert_eq!(prompts.len(), 2);
+    assert_eq!(prompts.len(), 3);
     assert!(prompts[0].contains("github_repository_activity (one of all, this_week"));
     assert!(prompts[0].contains("github_repository_activity_read=yes"));
     assert!(prompts[0].contains("Use all for a pure configured-repository inventory"));
     assert!(prompts[0].contains("including windows resolved from recent conversation"));
-    assert!(prompts[1].contains("[live_github_repository_push_activity]"));
-    assert!(prompts[1].contains("selected_window=this_week"));
-    assert!(prompts[1].contains("current_utc="));
-    assert!(prompts[1].contains("active_repository=example/active"));
-    assert!(!prompts[1].contains("2019-06-14"));
-    assert!(!prompts[1].contains("example/legacy"));
-    assert!(prompts[1].contains("not an organization-wide inventory"));
+    assert!(prompts[1].contains("AGENT_STEP_REPAIR"));
+    assert!(prompts[1].contains("AUTOMONIQUE_CONVERSATIONAL_TOOL_ROUTER_V1"));
+    assert!(prompts[2].contains("[live_github_repository_push_activity]"));
+    assert!(prompts[2].contains("selected_window=this_week"));
+    assert!(prompts[2].contains("current_utc="));
+    assert!(prompts[2].contains("active_repository=example/active"));
+    assert!(!prompts[2].contains("2019-06-14"));
+    assert!(!prompts[2].contains("example/legacy"));
+    assert!(prompts[2].contains("not an organization-wide inventory"));
     assert!(outbound.messages()[0].contains("example/active"));
 }
 
