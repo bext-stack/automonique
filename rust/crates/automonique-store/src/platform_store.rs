@@ -48,6 +48,7 @@ CREATE TABLE platform_resources (
 
 CREATE TABLE platform_events (
     sequence INTEGER PRIMARY KEY,
+    topic_sequence INTEGER NOT NULL CHECK (topic_sequence >= 1),
     topic TEXT NOT NULL,
     authority TEXT NOT NULL,
     kind TEXT NOT NULL,
@@ -55,13 +56,14 @@ CREATE TABLE platform_events (
     freshness_state TEXT NOT NULL,
     observed_at_ms INTEGER NOT NULL,
     revision INTEGER NOT NULL CHECK (revision >= 1),
-    summary TEXT NOT NULL
+    summary TEXT NOT NULL,
+    UNIQUE(topic, topic_sequence)
 ) STRICT;
 INSERT INTO platform_events(
-    sequence, topic, authority, kind, resource_id, freshness_state,
+    sequence, topic_sequence, topic, authority, kind, resource_id, freshness_state,
     observed_at_ms, revision, summary
 ) VALUES (
-    1, 'platform', 'client', 'client', 'platform-store', 'fresh',
+    1, 1, 'platform', 'client', 'client', 'platform-store', 'fresh',
     0, 1, 'platform store initialized'
 );
 
@@ -263,6 +265,7 @@ impl PlatformStore {
             .as_ref()
             .map(|(state, _, revision, summary)| (state.clone(), *revision, summary.clone()));
         if semantic_existing.as_ref() != Some(&wanted) {
+            let topic_sequence = next_topic_sequence(&transaction, topic)?;
             transaction.execute(
                 "INSERT INTO platform_resources(authority,kind,resource_id,freshness_state,observed_at_ms,revision,summary)
                  VALUES(?1,?2,?3,?4,?5,?6,?7)
@@ -274,9 +277,9 @@ impl PlatformStore {
                     to_db_revision(record.freshness.revision)?, record.summary.as_str()],
             )?;
             transaction.execute(
-                "INSERT INTO platform_events(topic,authority,kind,resource_id,freshness_state,observed_at_ms,revision,summary)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![topic, record.resource.authority.as_str(), record.resource.kind.as_str(), record.resource.id.as_str(),
+                "INSERT INTO platform_events(topic_sequence,topic,authority,kind,resource_id,freshness_state,observed_at_ms,revision,summary)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![to_db_u64(topic_sequence,"sequence")?, topic, record.resource.authority.as_str(), record.resource.kind.as_str(), record.resource.id.as_str(),
                     record.freshness.state.as_str(), record.freshness.observed_at.as_millis(),
                     to_db_revision(record.freshness.revision)?, record.summary.as_str()],
             )?;
@@ -294,7 +297,7 @@ impl PlatformStore {
                 ],
             )?;
         }
-        let sequence = last_sequence(&transaction)?;
+        let sequence = last_topic_sequence(&transaction, topic)?;
         transaction.commit()?;
         platform_cursor(record.resource.authority, topic, sequence)
     }
@@ -327,7 +330,7 @@ impl PlatformStore {
                 }
             }
         }
-        let sequence = last_sequence(&self.connection)?;
+        let sequence = last_topic_sequence(&self.connection, topic)?;
         Ok((
             records,
             platform_cursor(ResourceAuthority::Automonique, topic, sequence)?,
@@ -340,7 +343,7 @@ impl PlatformStore {
         topic: &str,
     ) -> Stored<Subscription> {
         validate_topic(topic)?;
-        let current = last_sequence(&self.connection)?;
+        let current = last_topic_sequence(&self.connection, topic)?;
         let after = requested.map_or(0, |cursor| cursor.sequence.get());
         if let Some(cursor) = requested
             && (cursor.authority != ResourceAuthority::Automonique
@@ -350,8 +353,8 @@ impl PlatformStore {
             return Err(PlatformStoreError::ResyncRequired);
         }
         let mut statement = self.connection.prepare(
-            "SELECT sequence,authority,kind,resource_id,freshness_state,observed_at_ms,revision,summary
-             FROM platform_events WHERE sequence > ?1 AND topic = ?2 ORDER BY sequence LIMIT ?3")?;
+            "SELECT topic_sequence,authority,kind,resource_id,freshness_state,observed_at_ms,revision,summary
+             FROM platform_events WHERE topic_sequence > ?1 AND topic = ?2 ORDER BY topic_sequence LIMIT ?3")?;
         let rows = statement.query_map(
             params![
                 to_db_u64(after, "sequence")?,
@@ -508,7 +511,7 @@ impl PlatformStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let sequence = last_sequence(&transaction)?;
+        let sequence = last_topic_sequence(&transaction, topic)?;
         transaction.execute(
             "INSERT INTO platform_attachments(session_authority,session_kind,session_id,client_id,cursor_sequence,attached_at_ms)
              VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(session_authority,session_kind,session_id,client_id)
@@ -834,10 +837,11 @@ fn append_receipt_event(connection: &Connection, receipt: &ActionReceipt) -> Sto
         params![resource.authority.as_str(), resource.kind.as_str(), resource.id.as_str(),
             receipt.recorded_at.as_millis(), to_db_revision(receipt.revision)?, summary.as_str()],
     )?;
+    let topic_sequence = next_topic_sequence(connection, "receipts")?;
     connection.execute(
-        "INSERT INTO platform_events(topic,authority,kind,resource_id,freshness_state,observed_at_ms,revision,summary)
-         VALUES('receipts',?1,?2,?3,'fresh',?4,?5,?6)",
-        params![resource.authority.as_str(), resource.kind.as_str(), resource.id.as_str(),
+        "INSERT INTO platform_events(topic_sequence,topic,authority,kind,resource_id,freshness_state,observed_at_ms,revision,summary)
+         VALUES(?1,'receipts',?2,?3,?4,'fresh',?5,?6,?7)",
+        params![to_db_u64(topic_sequence,"sequence")?, resource.authority.as_str(), resource.kind.as_str(), resource.id.as_str(),
             receipt.recorded_at.as_millis(), to_db_revision(receipt.revision)?, summary.as_str()],
     )?;
     Ok(())
@@ -959,13 +963,19 @@ fn next_revision(connection: &Connection) -> Stored<Revision> {
     )?;
     revision(value)
 }
-fn last_sequence(connection: &Connection) -> Stored<u64> {
+fn last_topic_sequence(connection: &Connection, topic: &str) -> Stored<u64> {
     let value: i64 = connection.query_row(
-        "SELECT COALESCE(max(sequence),1) FROM platform_events",
-        [],
+        "SELECT COALESCE(max(topic_sequence),1) FROM platform_events WHERE topic=?1",
+        [topic],
         |row| row.get(0),
     )?;
     from_db_u64(value, "sequence")
+}
+
+fn next_topic_sequence(connection: &Connection, topic: &str) -> Stored<u64> {
+    last_topic_sequence(connection, topic)?
+        .checked_add(1)
+        .ok_or(PlatformStoreError::InvalidField("sequence"))
 }
 fn deterministic_id(prefix: &str, key: &str) -> String {
     let digest = Sha256::digest(key.as_bytes());

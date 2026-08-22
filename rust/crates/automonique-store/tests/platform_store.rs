@@ -198,7 +198,11 @@ fn snapshot_cursor_and_subscription_are_ordered_and_topic_scoped() {
     assert_eq!(page.events.len(), 2);
     assert_eq!(page.events[0].resource.summary.as_str(), "queued");
     assert_eq!(page.events[1].resource.summary.as_str(), "running");
-    assert!(page.events[0].cursor.sequence < page.events[1].cursor.sequence);
+    assert_eq!(
+        page.events[1].cursor.sequence.get(),
+        page.events[0].cursor.sequence.get() + 1,
+        "a topic stream is gap-free even when other topics change"
+    );
 
     let (_, cursor_before_observation_refresh) = store.snapshot(&[], "runs").expect("snapshot");
     store

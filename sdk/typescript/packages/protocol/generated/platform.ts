@@ -11,11 +11,17 @@
 
 import {ValidationError, byteLength} from "./runtime.ts";
 
+/** Lifetime of one exclusive interactive control lease. */
+export const CONTROL_LEASE_TTL_MILLIS = 30000;
+
 /** Maximum methods advertised by one endpoint. */
 export const MAX_CAPABILITY_METHODS = 32;
 
 /** Maximum resources carried by one snapshot. */
 export const MAX_SNAPSHOT_RESOURCES = 512;
+
+/** Maximum ordered events carried by one subscription page. */
+export const MAX_SUBSCRIPTION_EVENTS = 512;
 
 /** Stable platform protocol name. */
 export const PLATFORM_PROTOCOL = "automonique.platform";
@@ -208,6 +214,18 @@ export const ActionReceipt_FIELDS: readonly string[] = [
   "target",
 ];
 
+/** Observation-only session attachment. */
+export interface Attachment {
+  readonly client: ClientId;
+  readonly cursor: PlatformCursor;
+  readonly session: ResourceCoordinate;
+}
+export const Attachment_FIELDS: readonly string[] = [
+  "client",
+  "cursor",
+  "session",
+];
+
 /** Methods and transport projections supported by an endpoint. */
 export interface Capabilities {
   readonly methods: readonly PlatformMethod[];
@@ -220,6 +238,22 @@ export const Capabilities_FIELDS: readonly string[] = [
   "protocol",
   "schema",
   "transports",
+];
+
+/** Short exclusive authority to steer one session. */
+export interface ControlLease {
+  readonly client: ClientId;
+  readonly expires_at: PlatformEpochMillis;
+  readonly id: ControlLeaseId;
+  readonly revision: PlatformRevision;
+  readonly session: ResourceCoordinate;
+}
+export const ControlLease_FIELDS: readonly string[] = [
+  "client",
+  "expires_at",
+  "id",
+  "revision",
+  "session",
 ];
 
 /** The only general mutation request in the public contract. */
@@ -262,6 +296,16 @@ export const PlatformCursor_FIELDS: readonly string[] = [
   "topic",
 ];
 
+/** One ordered resource change after a snapshot cursor. */
+export interface PlatformEvent {
+  readonly cursor: PlatformCursor;
+  readonly resource: ResourceRecord;
+}
+export const PlatformEvent_FIELDS: readonly string[] = [
+  "cursor",
+  "resource",
+];
+
 /** Authority-qualified resource identity. */
 export interface ResourceCoordinate {
   readonly authority: ResourceAuthority;
@@ -286,6 +330,30 @@ export const ResourceRecord_FIELDS: readonly string[] = [
   "summary",
 ];
 
+/** One bounded session page and its resume cursor. */
+export interface SessionList {
+  readonly cursor: PlatformCursor;
+  readonly sessions: readonly SessionRecord[];
+}
+export const SessionList_FIELDS: readonly string[] = [
+  "cursor",
+  "sessions",
+];
+
+/** One attachable session and its optional owning run. */
+export interface SessionRecord {
+  readonly attachable: boolean;
+  readonly controllable: boolean;
+  readonly run: ResourceCoordinate | null;
+  readonly session: ResourceRecord;
+}
+export const SessionRecord_FIELDS: readonly string[] = [
+  "attachable",
+  "controllable",
+  "run",
+  "session",
+];
+
 /** Bounded point-in-time resource collection and resume cursor. */
 export interface Snapshot {
   readonly cursor: PlatformCursor;
@@ -294,4 +362,14 @@ export interface Snapshot {
 export const Snapshot_FIELDS: readonly string[] = [
   "cursor",
   "resources",
+];
+
+/** One bounded, gap-free event page. */
+export interface Subscription {
+  readonly cursor: PlatformCursor;
+  readonly events: readonly PlatformEvent[];
+}
+export const Subscription_FIELDS: readonly string[] = [
+  "cursor",
+  "events",
 ];
