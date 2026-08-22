@@ -2,7 +2,24 @@
 
 # Unified client platform
 
-**Status:** accepted owner-steering plan
+**Status:** phases 1–4 deployed; phases 5–6 gated on ShellDeck publication
+
+## Delivery status
+
+As of 2026-08-22, the contract/fork baseline, shared substrate, production
+vertical slice and client-inventory convergence are deployed. The production
+slice has completed AI Operations release approval and job delivery through a
+registered Automonique node, an installed JCode engine turn and an ordered
+terminal receipt. Exact idempotent replay returns the original completed
+receipt, and JCode, the ShellDeck client-only build and the hosted web surface
+agree on the authority-qualified provider model catalog.
+
+The ShellDeck client-only implementation is complete, tested and packaged in
+its repository worktree, but it is not yet published: that repository requires
+GitHub actor `pedrokarim`, while the available CLI and SSH credentials identify
+as `benfavre`. Until the required actor publishes that branch, the phase-5
+client cutover and phase-6 compatibility removals remain intentionally open.
+The central epic and repository issues are the canonical live checklist.
 
 ## Outcome
 
