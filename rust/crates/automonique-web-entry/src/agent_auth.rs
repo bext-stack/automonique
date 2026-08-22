@@ -23,6 +23,7 @@ const SESSION_RETENTION: Duration = Duration::from_secs(30 * 60);
 const OUTPUT_LIMIT: usize = 32 * 1024;
 const REGISTRY_LIMIT: u64 = 128 * 1024;
 const HEALTH_LIMIT: u64 = 8 * 1024;
+const MAX_ACCOUNTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Provider {
@@ -134,7 +135,7 @@ impl Registry {
     fn validate(&self) -> bool {
         if self.schema != REGISTRY_SCHEMA
             || self.revision > 9_007_199_254_740_991
-            || self.accounts.len() > 64
+            || self.accounts.len() > MAX_ACCOUNTS
             || self
                 .worker_provider
                 .as_deref()
@@ -227,6 +228,7 @@ impl HealthRecord {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct AgentAccountsView {
     schema: &'static str,
+    max_accounts: usize,
     providers: Vec<ProviderView>,
     worker_provider: Option<String>,
     accounts: Vec<AccountView>,
@@ -457,6 +459,7 @@ impl AgentAuthManager {
             .collect();
         Ok(AgentAccountsView {
             schema: VIEW_SCHEMA,
+            max_accounts: MAX_ACCOUNTS,
             providers,
             worker_provider: registry.worker_provider,
             accounts,
@@ -518,7 +521,7 @@ impl AgentAuthManager {
             account.updated_at_ms = now_ms();
             account.id.clone()
         } else {
-            if registry.accounts.len() >= 64 {
+            if registry.accounts.len() >= MAX_ACCOUNTS {
                 return Err("account_limit_reached");
             }
             let id = generate_id("acct")?;
@@ -1342,5 +1345,110 @@ mod tests {
             assert_eq!(0o700, fs::metadata(directory).unwrap().mode() & 0o777);
         }
         assert!(!root.join("accounts.json").exists());
+    }
+
+    #[test]
+    fn registry_projects_n_isolated_accounts_per_native_provider_without_secrets() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let root = temporary.path().join("agent-auth");
+        let config = AgentAuthConfig::new(
+            root.clone(),
+            PathBuf::from("/bin/true"),
+            PathBuf::from("/bin/true"),
+        )
+        .expect("valid fixture config");
+        let manager = AgentAuthManager::open(config).expect("manager");
+        let mut registry = Registry::empty();
+        for (index, provider) in ["codex", "claude"].into_iter().enumerate() {
+            for ordinal in 0..4_u64 {
+                let id = format!("acct-{index:012x}{ordinal:012x}");
+                registry.accounts.push(AccountRecord {
+                    id: id.clone(),
+                    provider: provider.to_owned(),
+                    label: format!("{provider} subscription {}", ordinal + 1),
+                    created_at_ms: ordinal + 1,
+                    updated_at_ms: ordinal + 1,
+                });
+                ensure_private_directory(&root.join("profiles").join(&id)).unwrap();
+                if ordinal == 0 {
+                    registry.selected.insert(provider.to_owned(), id);
+                }
+            }
+        }
+        registry.worker_provider = Some(String::from("codex"));
+        registry.revision = 1;
+        manager
+            .write_registry_unlocked(&registry)
+            .expect("multi-account registry");
+
+        let view = manager.view().expect("multi-account view");
+        assert_eq!(8, view.accounts.len());
+        assert_eq!(4, view.providers[0].account_count);
+        assert_eq!(4, view.providers[1].account_count);
+        assert_eq!(
+            1,
+            view.accounts
+                .iter()
+                .filter(|item| item.worker_selected)
+                .count()
+        );
+        assert_eq!(
+            2,
+            view.accounts.iter().filter(|item| item.selected).count(),
+            "each provider keeps an independent explicit selection"
+        );
+        let projection = serde_json::to_string(&view).expect("serializable view");
+        for forbidden in [
+            "auth.json",
+            ".credentials.json",
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "token",
+        ] {
+            assert!(
+                !projection.contains(forbidden),
+                "secret boundary leaked {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_provider_commands_isolate_profiles_and_strip_api_key_fallbacks() {
+        let profile = Path::new("/private/native-profile");
+        let codex = provider_command(Provider::Codex, Path::new("/bin/codex"), profile);
+        let claude = provider_command(Provider::Claude, Path::new("/bin/claude"), profile);
+        let codex_env: BTreeMap<_, _> = codex
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(ToOwned::to_owned)))
+            .collect();
+        let claude_env: BTreeMap<_, _> = claude
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(ToOwned::to_owned)))
+            .collect();
+        assert_eq!(
+            Some(Some(profile.as_os_str().to_owned())),
+            codex_env.get(std::ffi::OsStr::new("CODEX_HOME")).cloned()
+        );
+        assert_eq!(
+            Some(Some(profile.as_os_str().to_owned())),
+            claude_env
+                .get(std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+                .cloned()
+        );
+        for key in [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CODEX_API_KEY",
+        ] {
+            assert_eq!(
+                Some(None),
+                codex_env.get(std::ffi::OsStr::new(key)).cloned()
+            );
+            assert_eq!(
+                Some(None),
+                claude_env.get(std::ffi::OsStr::new(key)).cloned()
+            );
+        }
     }
 }
