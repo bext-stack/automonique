@@ -37,10 +37,14 @@ use automonique_daemon::{
     mcp_client::{McpCallResult, McpRegistry, McpToolDescriptor},
     site_inventory::{NGINX_SITES_ENABLED, enabled_hosts, manage_profiles, prism_sites},
 };
-use automonique_platform_client::{PlatformClient, UnixTransport};
+use automonique_platform_client::{PLATFORM_CONTENT_TYPE, PlatformClient, UnixTransport};
 use automonique_protocol::platform::{
     Capabilities, ListSessionsRequest, PlatformCursor, PlatformRequest, PlatformResponse,
-    ResourceAuthority, ResourceCoordinate, ResourceRecord, SessionRecord, SnapshotRequest,
+    PlatformTransport, ResourceAuthority, ResourceCoordinate, ResourceRecord, SessionRecord,
+    SnapshotRequest,
+};
+use automonique_protocol::platform_api::{
+    MAX_PLATFORM_REQUEST_CANONICAL_BYTES, PlatformRequestMessage, PlatformResponseMessage,
 };
 use automonique_store::agent_memory::{AgentMemoryStore, MemoryRecord, MessageInput};
 use automonique_transport_runtime::ChannelName;
@@ -73,8 +77,9 @@ const AUTH_CONFIG_LIMIT: u64 = 4 * 1024;
 const INTEGRATION_CONFIG_LIMIT: u64 = 4 * 1024;
 const PROVIDER_AUTH_HEALTH_LIMIT: u64 = 4 * 1024;
 const PROCESS_SNAPSHOT_LIMIT: u64 = 256 * 1024;
-const REQUEST_LIMIT: usize = 48 * 1024;
-const BODY_LIMIT: usize = 24 * 1024;
+const BODY_LIMIT: usize = MAX_PLATFORM_REQUEST_CANONICAL_BYTES;
+const REQUEST_LIMIT: usize = HEADER_LIMIT + BODY_LIMIT;
+const MANAGE_PLATFORM_RESPONSE_LIMIT: u64 = 64 * 1024;
 const MAX_MANAGE_RESULT_CONTEXT_BYTES: usize = 8 * 1024;
 const MAX_PENDING_MANAGE_ACTIONS: usize = 32;
 const MANAGE_ACTION_LIFETIME: Duration = Duration::from_secs(5 * 60);
@@ -103,6 +108,7 @@ pub enum Route {
     ApiAgentAccountsAction,
     ApiOperations,
     ApiPlatform,
+    ApiPlatformRemote,
     ApiProcesses,
     ApiChat,
     ApiChatAction,
@@ -550,6 +556,81 @@ struct ManageIntegration {
     profile_source_configured: bool,
     agent_tools_configured: bool,
     mcp_server: Option<String>,
+}
+
+impl ManageIntegration {
+    fn authorize_platform_bearer(&self, authorization: Option<&str>) -> bool {
+        let Some(authorization) = authorization.filter(|value| {
+            value.len() <= 4096
+                && value
+                    .strip_prefix("Bearer ")
+                    .is_some_and(|token| !token.is_empty() && !token.contains(char::is_whitespace))
+        }) else {
+            return false;
+        };
+        let Some(endpoint) = self
+            .console_url
+            .as_deref()
+            .and_then(manage_platform_endpoint)
+        else {
+            return false;
+        };
+        let response = ureq::Agent::config_builder()
+            .timeout_global(Some(IO_TIMEOUT))
+            .build()
+            .new_agent()
+            .post(endpoint)
+            .header("authorization", authorization)
+            .header("content-type", "application/json")
+            .header("accept", "application/json")
+            .send(r#"{"method":"capabilities"}"#);
+        let Ok(mut response) = response else {
+            return false;
+        };
+        if response.status() != 200 {
+            return false;
+        }
+        let mut body = Vec::new();
+        if response
+            .body_mut()
+            .with_config()
+            .limit(MANAGE_PLATFORM_RESPONSE_LIMIT)
+            .reader()
+            .read_to_end(&mut body)
+            .is_err()
+        {
+            return false;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&body) else {
+            return false;
+        };
+        value.get("ok").and_then(Value::as_bool) == Some(true)
+            && value
+                .pointer("/capabilities/protocol")
+                .and_then(Value::as_str)
+                == Some(automonique_protocol::platform::PLATFORM_PROTOCOL)
+            && value
+                .pointer("/capabilities/schema")
+                .and_then(Value::as_str)
+                == Some(automonique_protocol::platform::PLATFORM_SCHEMA_V1)
+    }
+}
+
+fn manage_platform_endpoint(console_url: &str) -> Option<String> {
+    let uri: ureq::http::Uri = console_url.parse().ok()?;
+    let scheme = uri.scheme_str()?;
+    let authority = uri.authority()?.as_str();
+    if authority.contains('@')
+        || (scheme != "https"
+            && !(cfg!(test)
+                && scheme == "http"
+                && matches!(uri.host()?, "localhost" | "127.0.0.1" | "[::1]")))
+    {
+        return None;
+    }
+    Some(format!(
+        "{scheme}://{authority}/api/manage/automonique/platform"
+    ))
 }
 
 struct PendingManageAction {
@@ -1260,6 +1341,30 @@ impl WebIntegration {
             resources: snapshot.resources.into_iter().map(Into::into).collect(),
             sessions: sessions.sessions.into_iter().map(Into::into).collect(),
         })
+    }
+
+    fn platform_remote(&self, body: &[u8]) -> Result<Vec<u8>, &'static str> {
+        let request = PlatformRequestMessage::from_canonical_bytes(body)
+            .map_err(|_| "platform_request_invalid")?;
+        let request_id = request.request_id().clone();
+        let mut client = self
+            .platform
+            .try_lock()
+            .map_err(|_| "platform_client_busy")?;
+        let mut response = client
+            .request_correlated(request_id.clone(), request.request().clone())
+            .map_err(|_| "platform_unavailable")?;
+        if let PlatformResponse::Capabilities(capabilities) = &mut response
+            && !capabilities
+                .transports
+                .contains(&PlatformTransport::RemoteHttps)
+        {
+            capabilities.transports.push(PlatformTransport::RemoteHttps);
+        }
+        PlatformResponseMessage::new(request_id, response)
+            .to_message()
+            .map(|message| message.to_canonical_bytes())
+            .map_err(|_| "platform_response_invalid")
     }
 
     fn memory(&self, query: Option<&str>) -> Result<MemoryView, &'static str> {
@@ -3500,7 +3605,13 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/api/agent-accounts" => Route::ApiAgentAccounts,
                 "/api/agent-accounts/action" => Route::ApiAgentAccountsAction,
                 "/api/operations" => Route::ApiOperations,
-                "/api/platform" => Route::ApiPlatform,
+                "/api/platform" => {
+                    if request.method == Method::Post {
+                        Route::ApiPlatformRemote
+                    } else {
+                        Route::ApiPlatform
+                    }
+                }
                 "/api/processes" => Route::ApiProcesses,
                 "/api/chat" => Route::ApiChat,
                 "/api/chat/action" => Route::ApiChatAction,
@@ -3513,6 +3624,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 route,
                 Route::ApiMemorySearch
                     | Route::ApiAgentAccountsAction
+                    | Route::ApiPlatformRemote
                     | Route::ApiChat
                     | Route::ApiChatAction
                     | Route::ApiChatNew
@@ -3909,6 +4021,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiAgentAccountsAction
         | Route::ApiOperations
         | Route::ApiPlatform
+        | Route::ApiPlatformRemote
         | Route::ApiProcesses
         | Route::ApiChat
         | Route::ApiChatAction
@@ -3997,6 +4110,20 @@ fn api_response(
         Route::ApiOperations => json_response("200 OK", &integration.operations()),
         Route::ApiPlatform => match integration.platform() {
             Ok(view) => json_response("200 OK", &view),
+            Err(category) => json_error("503 Service Unavailable", category),
+        },
+        Route::ApiPlatformRemote => match integration.platform_remote(body) {
+            Ok(body) => Response {
+                status: "200 OK",
+                content_type: Some(PLATFORM_CONTENT_TYPE),
+                cache_control: "no-store",
+                location: None,
+                retry_after: None,
+                body,
+            },
+            Err("platform_request_invalid") => {
+                json_error("400 Bad Request", "platform_request_invalid")
+            }
             Err(category) => json_error("503 Service Unavailable", category),
         },
         Route::ApiProcesses => json_response("200 OK", &integration.processes()),
@@ -4155,6 +4282,7 @@ fn handle(
                 }
                 let local_health = normalize_host(request.host) == Some("localhost")
                     && requested_route == Route::Health;
+                let remote_platform = requested_route == Route::ApiPlatformRemote;
                 let needs_auth = !local_health
                     && !matches!(
                         requested_route,
@@ -4165,15 +4293,27 @@ fn handle(
                     );
                 let basic_authorized = auth.authorize(request.authorization);
                 let session_authorized = auth.authorize_session(request.cookie);
+                let bearer_authorized = remote_platform
+                    && integration.is_some_and(|integration| {
+                        integration
+                            .manage
+                            .authorize_platform_bearer(request.authorization)
+                    });
                 let route = if !state.admit() {
                     Route::RateLimited
-                } else if needs_auth && !(basic_authorized || session_authorized) {
+                } else if needs_auth
+                    && !(basic_authorized || session_authorized || bearer_authorized)
+                {
                     Route::Unauthorized
                 } else if request.method == Method::Post
                     && (request.content_length == 0
-                        || !request
-                            .content_type
-                            .is_some_and(|value| value.eq_ignore_ascii_case("application/json")))
+                        || !request.content_type.is_some_and(|value| {
+                            value.eq_ignore_ascii_case(if remote_platform {
+                                PLATFORM_CONTENT_TYPE
+                            } else {
+                                "application/json"
+                            })
+                        }))
                 {
                     Route::BadRequest
                 } else {
@@ -4184,7 +4324,8 @@ fn handle(
                 } else {
                     Vec::new()
                 };
-                let issue_session = needs_auth && basic_authorized && !session_authorized;
+                let issue_session =
+                    needs_auth && !remote_platform && basic_authorized && !session_authorized;
                 break Ok((route, request.method == Method::Head, body, issue_session));
             }
             Err(Route::BadRequest) if !bytes.windows(4).any(|part| part == b"\r\n\r\n") => {
@@ -4206,6 +4347,7 @@ fn handle(
             | Route::ApiAgentAccountsAction
             | Route::ApiOperations
             | Route::ApiPlatform
+            | Route::ApiPlatformRemote
             | Route::ApiProcesses
             | Route::ApiChat
             | Route::ApiChatAction
@@ -4474,6 +4616,52 @@ mod tests {
                 route(&parse_request(&bytes).unwrap(), &fixture_hosts())
             );
         }
+        let bytes = request("POST", "/api/platform", CANONICAL_HOST);
+        assert_eq!(
+            Route::ApiPlatformRemote,
+            route(&parse_request(&bytes).unwrap(), &fixture_hosts())
+        );
+    }
+
+    #[test]
+    fn manage_bearer_validation_is_remote_bounded_and_fail_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+            let mut request = [0_u8; 4096];
+            let count = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..count]).to_ascii_lowercase();
+            assert!(request.starts_with("post /api/manage/automonique/platform http/1.1"));
+            assert!(request.contains("authorization: bearer fixture-token"));
+            let body = format!(
+                "{{\"ok\":true,\"capabilities\":{{\"protocol\":\"{}\",\"schema\":\"{}\"}}}}",
+                automonique_protocol::platform::PLATFORM_PROTOCOL,
+                automonique_protocol::platform::PLATFORM_SCHEMA_V1
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let integration = ManageIntegration {
+            console_url: Some(format!("http://{address}/manage")),
+            profile_app: None,
+            profile_source_configured: false,
+            agent_tools_configured: false,
+            mcp_server: None,
+        };
+        assert!(integration.authorize_platform_bearer(Some("Bearer fixture-token")));
+        server.join().unwrap();
+        assert!(!integration.authorize_platform_bearer(Some("Bearer bad token")));
+        assert!(!integration.authorize_platform_bearer(Some("Basic fixture")));
+        assert_eq!(
+            manage_platform_endpoint("https://manage.example.test/anything").as_deref(),
+            Some("https://manage.example.test/api/manage/automonique/platform")
+        );
+        assert!(manage_platform_endpoint("http://manage.example.test/").is_none());
     }
 
     #[test]
