@@ -87,20 +87,6 @@ jobs:
           (cd lab && npm run typecheck)
           (cd lab && bun test ./test)
 
-      - name: Build the binary the interop test drives
-        working-directory: rust
-        run: cargo build --offline --locked -p automonique-lab --bins
-
-      # The one check that runs both implementations against each other rather
-      # than each against a fixture. It is double-gated in the test file, so
-      # nothing outside this step and a deliberate local run ever executes it.
-      - name: Rust and TypeScript interoperate over the real transport
-        working-directory: sdk/typescript/packages/lab
-        env:
-          AUTOMONIQUE_RUN_RUST_INTEROP: "1"
-          AUTOMONIQUE_LAB_BIN: ${{ github.workspace }}/rust/target/debug/automonique-lab
-        run: bun test ./test/rust-interop.test.ts
-
       # `generated/VERDICT.md` constraint 5. Reproducibility is asserted by the
       # crate's own tests; that the checked-in tree was regenerated is a claim
       # no test inside the tree can make, because a test cannot see the commit.

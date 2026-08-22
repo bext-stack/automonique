@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Elastic-2.0
+
 //! `automonique shot`: visual proof for a rendered page.
 //!
 //! A change to a page, a component or a style is not delivered until someone
