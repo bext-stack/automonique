@@ -31,6 +31,7 @@ pub mod memory_api;
 pub mod models;
 pub mod parity;
 pub mod platform;
+pub mod platform_api;
 pub mod primitives;
 pub mod progress_api;
 pub mod protocols;

@@ -974,6 +974,9 @@ kbd { padding: 1px 4px; border: 1px solid var(--line-bright); border-bottom-colo
 .operations-metrics strong, .ticket-metrics strong { display: block; margin-top: 8px; font: var(--font-display-sm) ui-monospace, monospace; }
 .operations-metrics small { display: block; margin-top: 5px; color: var(--muted); font-size: var(--font-xs); }
 .process-monitor { margin-bottom: 14px; }
+.platform-monitor { margin-bottom: 14px; }
+.platform-monitor .platform-metrics { margin: 0; padding: 14px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.platform-monitor .process-semantics { margin: 12px 14px 0; }
 .process-monitor-head { gap: 18px; }
 .process-monitor-actions { display: flex; gap: 9px; align-items: center; }
 .process-monitor-actions small { color: var(--quiet); font: var(--font-xs) ui-monospace, monospace; }

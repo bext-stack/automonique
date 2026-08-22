@@ -100,6 +100,16 @@ use automonique_protocol::execute_api::{
     CancelRunOutcome, ExecuteRefusal, ExecuteRequest, ExecuteResponse,
 };
 use automonique_protocol::journal::{CursorResume, RetainedRange};
+use automonique_protocol::platform::{
+    Capabilities as PlatformCapabilities, Freshness, FreshnessState, PlatformAction,
+    PlatformMethod, PlatformRequest, PlatformResponse, PlatformText, PlatformTransport,
+    ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
+    ResourceRecord, SessionList, SessionRecord, Snapshot,
+};
+use automonique_protocol::platform_api::{
+    MAX_PLATFORM_REQUEST_CANONICAL_BYTES, PlatformRequestMessage, PlatformResponseMessage,
+};
+use automonique_protocol::primitives::Revision;
 use automonique_protocol::provenance::{CausationId, CorrelationId, Provenance, TraceId};
 use automonique_protocol::runs_api::{
     Continuation, LifecycleCoverage, ListRuns, MAX_LIFECYCLE_EVENTS, RunCursor, RunDetailView,
@@ -132,6 +142,7 @@ use automonique_store::generation_audit::{
     GenerationAudit, GenerationAuditError, SelfEndKind, Succession, TenureEnding, TenureOpening,
     TenureRecord,
 };
+use automonique_store::platform_store::{ActionAdmission, PlatformStore, PlatformStoreError};
 use automonique_store::provider_journal::ProviderJournal;
 use automonique_store::run_index::{
     RunIndex, RunIndexEntry, RunIndexError, RunIndexRecord, RunSpoolState,
@@ -235,6 +246,10 @@ pub const RUN_SUBMISSIONS_NAME: &str = concat!("run-submissions", ".sqlite3");
 /// read model are different things: the first is the source of truth, the
 /// second is rebuildable from it.
 pub const RUN_INDEX_NAME: &str = concat!("run-index", ".sqlite3");
+
+/// Durable idempotency receipts, projections, cursors, and controller leases
+/// for the platform-v1 endpoint.
+pub const PLATFORM_STORE_NAME: &str = concat!("platform-v1", ".sqlite3");
 
 /// Durable automation enablement registry, a sibling of [`DATABASE_NAME`].
 ///
@@ -384,7 +399,12 @@ pub const GENERATION_AUDIT_NAME: &str = concat!("generation-audit", ".sqlite3");
 pub const EGRESS_DESTINATIONS_NAME: &str = "egress-destinations";
 
 /// Maximum administration payload accepted by the daemon.
-pub const MAX_ADMIN_PAYLOAD_BYTES: usize = MAX_ADMIN_CANONICAL_BYTES;
+pub const MAX_ADMIN_PAYLOAD_BYTES: usize =
+    if MAX_PLATFORM_REQUEST_CANONICAL_BYTES > MAX_ADMIN_CANONICAL_BYTES {
+        MAX_PLATFORM_REQUEST_CANONICAL_BYTES
+    } else {
+        MAX_ADMIN_CANONICAL_BYTES
+    };
 
 /// Ceiling this daemon re-opens a finished run's spool under, to read its
 /// lifecycle.
@@ -464,7 +484,7 @@ impl DaemonConfig {
 
     /// Live progress endpoint, a sibling of [`DaemonConfig::admin_socket`].
     ///
-    /// A second socket rather than a seventh protocol on the first, and the
+    /// A second socket rather than another request/response protocol on the first, and the
     /// reason is the admin socket's framing: one request, one response, one
     /// connection, served on the serve thread. A subscription is the opposite
     /// shape — one request and an unbounded stream of answers — and folding it
@@ -515,6 +535,12 @@ impl DaemonConfig {
     #[must_use]
     pub fn run_index_path(&self) -> PathBuf {
         self.state_dir().join(RUN_INDEX_NAME)
+    }
+
+    /// Durable platform-v1 kernel path.
+    #[must_use]
+    pub fn platform_store_path(&self) -> PathBuf {
+        self.state_dir().join(PLATFORM_STORE_NAME)
     }
 
     /// Durable automation enablement registry path.
@@ -905,6 +931,8 @@ pub enum DaemonError {
     /// reports a lost document: it reports a read model that could not be
     /// extended or could not be believed.
     RunIndexFailed(&'static str),
+    /// The platform-v1 durable kernel could not be opened or updated.
+    PlatformStoreFailed(&'static str),
     /// The durable audit chain could not be opened. The payload is the stable
     /// category from `automonique_store::audit_chain`.
     ///
@@ -1026,6 +1054,7 @@ impl DaemonError {
             Self::TelegramRefused(category) => category,
             Self::RunSubmissionFailed(category) => category,
             Self::RunIndexFailed(category) => category,
+            Self::PlatformStoreFailed(category) => category,
             Self::AuditChainFailed(category) => category,
             Self::AttemptHostFailed(category) => category,
             Self::AutomationStoreFailed(category) => category,
@@ -1074,6 +1103,9 @@ impl fmt::Display for DaemonError {
             }
             Self::RunIndexFailed(category) => {
                 write!(formatter, "run index failed: {category}")
+            }
+            Self::PlatformStoreFailed(category) => {
+                write!(formatter, "platform store failed: {category}")
             }
             Self::AuditChainFailed(category) => {
                 write!(formatter, "audit chain failed: {category}")
@@ -1168,6 +1200,8 @@ pub struct Daemon {
     /// for the reason custody storage is — a daemon that cannot record what it
     /// accepted must not publish an endpoint that accepts.
     run_index: RunIndex,
+    /// Durable platform-v1 action, cursor, attachment, and control state.
+    platform: PlatformStore,
     /// The hash-chained audit record of what this daemon was asked to do.
     ///
     /// A plain field for the reason [`Daemon::run_index`] is one: it owns no
@@ -1604,6 +1638,9 @@ impl Daemon {
         let run_index = RunIndex::open(config.run_index_path())
             .map_err(|error| DaemonError::RunIndexFailed(error.category()))?;
 
+        let platform = PlatformStore::open(config.platform_store_path())
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+
         // The audit chain opens under the same fence and before the socket
         // guard is disarmed, for the reason every durable sibling does: a
         // daemon that cannot record what it was asked to do must not publish
@@ -1752,6 +1789,7 @@ impl Daemon {
             slack_tickets,
             run_submissions,
             run_index,
+            platform,
             audit_chain,
             automations,
             approvals,
@@ -2254,7 +2292,7 @@ impl Daemon {
     /// Authenticate the peer, read one bounded frame, and hand it to the lane
     /// its envelope names.
     ///
-    /// The socket serves six protocols. Which one a frame belongs to is read
+    /// The socket serves seven protocols. Which one a frame belongs to is read
     /// off its declared protocol name by
     /// [`LocalRequest::from_canonical_bytes`], never guessed and never tried in
     /// sequence, so an administration client, a Runs client, an Automation
@@ -2278,6 +2316,7 @@ impl Daemon {
             LocalRequest::Approval(request) => self.handle_approval(stream, &request),
             LocalRequest::Batch(request) => self.handle_batch(stream, &request),
             LocalRequest::Execute(request) => self.handle_execute(stream, &request),
+            LocalRequest::Platform(request) => self.handle_platform(stream, &request),
         }
     }
 
@@ -2966,6 +3005,415 @@ impl Daemon {
             stop.store(true, Ordering::Release);
         }
         Ok(())
+    }
+
+    /// Serve the transport-independent platform-v1 contract on the local
+    /// authenticated socket.
+    fn handle_platform(
+        &mut self,
+        stream: &mut UnixStream,
+        message: &PlatformRequestMessage,
+    ) -> Result<(), DaemonError> {
+        let now_ms = unix_millis()?;
+        let snapshot = self.store.status_snapshot_at(GENERATION_ID, now_ms)?;
+        let generation = snapshot.generation().ok_or(StoreError::StaleEpoch)?;
+        if generation.holder_id() != self.instance_id.as_str()
+            || generation.lease_epoch() != self.lease_epoch
+            || generation.lease_expires_ms() != self.lease_expires_ms
+            || generation.lease_expires_ms() <= snapshot.lease_observed_boottime_ms()
+        {
+            return Err(DaemonError::Store(StoreError::StaleEpoch));
+        }
+
+        let response = match message.request() {
+            PlatformRequest::Capabilities => PlatformResponse::Capabilities(PlatformCapabilities {
+                protocol: automonique_protocol::platform::PLATFORM_PROTOCOL,
+                schema: automonique_protocol::platform::PLATFORM_SCHEMA_V1,
+                methods: PlatformMethod::ALL.to_vec(),
+                transports: vec![PlatformTransport::LocalUnix],
+            }),
+            PlatformRequest::Snapshot(request) => {
+                self.refresh_platform_resources(&request.resources, now_ms)?;
+                match self.platform.snapshot(&request.resources, "resources") {
+                    Ok((resources, cursor)) => PlatformResponse::Snapshot(
+                        Snapshot::new(resources, cursor)
+                            .map_err(|_| DaemonError::ProtocolRefused("platform_snapshot"))?,
+                    ),
+                    Err(error) => platform_store_response(&error),
+                }
+            }
+            PlatformRequest::Subscribe(request) => {
+                let topic = request
+                    .cursor
+                    .as_ref()
+                    .map_or("resources", |cursor| cursor.topic.as_str());
+                if topic == "sessions" {
+                    self.refresh_platform_sessions(now_ms)?;
+                } else {
+                    self.refresh_platform_resources(&[], now_ms)?;
+                }
+                match self.platform.subscribe(request.cursor.as_ref(), topic) {
+                    Ok(subscription) => PlatformResponse::Subscription(subscription),
+                    Err(error) => platform_store_response(&error),
+                }
+            }
+            PlatformRequest::Execute(request) => {
+                self.platform_execute(request, &snapshot, now_ms)?
+            }
+            PlatformRequest::GetReceipt(request) => match self
+                .platform
+                .receipt(request.id.as_ref(), request.idempotency_key.as_ref())
+            {
+                Ok(receipt) => PlatformResponse::Receipt(receipt),
+                Err(error) => platform_store_response(&error),
+            },
+            PlatformRequest::ListSessions(request) => {
+                if request.authority != ResourceAuthority::Automonique {
+                    platform_refusal(ReceiptOutcome::Rejected, "authority_not_local")?
+                } else {
+                    self.refresh_platform_sessions(now_ms)?;
+                    if let Some(cursor) = request.cursor.as_ref()
+                        && let Err(error) = self.platform.subscribe(Some(cursor), "sessions")
+                    {
+                        platform_store_response(&error)
+                    } else {
+                        let (resources, cursor) = self
+                            .platform
+                            .snapshot(&[], "sessions")
+                            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+                        let sessions = resources
+                            .into_iter()
+                            .filter(|record| record.resource.kind == ResourceKind::Session)
+                            .map(|session| SessionRecord {
+                                attachable: session.summary.as_str() == "open",
+                                controllable: session.summary.as_str() == "open",
+                                run: None,
+                                session,
+                            })
+                            .collect();
+                        PlatformResponse::Sessions(
+                            SessionList::new(sessions, cursor)
+                                .map_err(|_| DaemonError::ProtocolRefused("platform_sessions"))?,
+                        )
+                    }
+                }
+            }
+            PlatformRequest::Attach(request) => {
+                self.refresh_platform_sessions(now_ms)?;
+                if !self.platform_session_is_open(&request.session)? {
+                    platform_refusal(ReceiptOutcome::Rejected, "session_not_attachable")?
+                } else {
+                    match self.platform.attach(
+                        &request.session,
+                        &request.client,
+                        now_ms,
+                        "sessions",
+                    ) {
+                        Ok(attachment) => PlatformResponse::Attached(attachment),
+                        Err(error) => platform_store_response(&error),
+                    }
+                }
+            }
+            PlatformRequest::Detach(request) => {
+                match self.platform.detach(&request.session, &request.client) {
+                    Ok(()) => PlatformResponse::Detached {
+                        session: request.session.clone(),
+                        client: request.client.clone(),
+                    },
+                    Err(error) => platform_store_response(&error),
+                }
+            }
+            PlatformRequest::ClaimControl(request) => {
+                self.refresh_platform_sessions(now_ms)?;
+                if !self.platform_session_is_open(&request.session)? {
+                    platform_refusal(ReceiptOutcome::Rejected, "session_not_controllable")?
+                } else {
+                    match self.platform.claim_control(
+                        &request.session,
+                        &request.client,
+                        &request.idempotency_key,
+                        now_ms,
+                    ) {
+                        Ok(
+                            automonique_store::platform_store::ControlAdmission::New(lease)
+                            | automonique_store::platform_store::ControlAdmission::Replay(lease),
+                        ) => PlatformResponse::ControlClaimed(lease),
+                        Err(error) => platform_store_response(&error),
+                    }
+                }
+            }
+            PlatformRequest::ReleaseControl(request) => match self.platform.release_control(
+                &request.session,
+                &request.client,
+                &request.lease,
+                &request.idempotency_key,
+                now_ms,
+            ) {
+                Ok(()) => PlatformResponse::ControlReleased {
+                    session: request.session.clone(),
+                    client: request.client.clone(),
+                    lease: request.lease.clone(),
+                },
+                Err(error) => platform_store_response(&error),
+            },
+        };
+
+        let payload = PlatformResponseMessage::new(message.request_id().clone(), response)
+            .to_message()
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
+            .to_canonical_bytes();
+        let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
+        encode_frame(&payload, &mut frame)
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
+        stream.write_all(&frame)?;
+        stream.flush()?;
+        Ok(())
+    }
+
+    fn refresh_platform_sessions(&mut self, now_ms: i64) -> Result<(), DaemonError> {
+        let path = self.state_dir.join(PROVIDER_JOURNAL_NAME);
+        if !path.exists() {
+            return Ok(());
+        }
+        let journal = ProviderJournal::open(path)
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        let sessions = journal
+            .sessions(automonique_protocol::platform::MAX_SNAPSHOT_RESOURCES)
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        for session in sessions {
+            let (freshness, summary) = match session.state {
+                automonique_store::provider_journal::SessionState::Open => {
+                    (FreshnessState::Fresh, "open")
+                }
+                automonique_store::provider_journal::SessionState::Closed => {
+                    (FreshnessState::Stale, "closed")
+                }
+                automonique_store::provider_journal::SessionState::Lost => {
+                    (FreshnessState::Unknown, "lost")
+                }
+            };
+            let record = ResourceRecord {
+                resource: ResourceCoordinate::new(
+                    ResourceAuthority::Automonique,
+                    ResourceKind::Session,
+                    ResourceId::new(session.provider_session_key)
+                        .map_err(|_| DaemonError::PlatformStoreFailed("session_id_invalid"))?,
+                ),
+                freshness: Freshness {
+                    state: freshness,
+                    observed_at: automonique_protocol::primitives::EpochMillis::from_millis(
+                        session.closed_ms.unwrap_or(now_ms),
+                    ),
+                    revision: Revision::new(session.revision)
+                        .map_err(|_| DaemonError::PlatformStoreFailed("revision_invalid"))?,
+                },
+                summary: PlatformText::new(summary)
+                    .map_err(|_| DaemonError::PlatformStoreFailed("session_state_invalid"))?,
+            };
+            self.platform
+                .upsert_resource("sessions", &record)
+                .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        }
+        Ok(())
+    }
+
+    fn platform_session_is_open(&self, session: &ResourceCoordinate) -> Result<bool, DaemonError> {
+        if session.authority != ResourceAuthority::Automonique
+            || session.kind != ResourceKind::Session
+        {
+            return Ok(false);
+        }
+        self.platform
+            .resource(session)
+            .map(|record| record.is_some_and(|record| record.summary.as_str() == "open"))
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))
+    }
+
+    fn refresh_platform_resources(
+        &mut self,
+        requested: &[ResourceCoordinate],
+        now_ms: i64,
+    ) -> Result<(), DaemonError> {
+        let wants_all = requested.is_empty();
+        let wants_node = wants_all
+            || requested.iter().any(|resource| {
+                resource.authority == ResourceAuthority::Automonique
+                    && resource.kind == ResourceKind::Node
+                    && resource.id.as_str() == self.instance_id.as_str()
+            });
+        if wants_node {
+            let node = ResourceRecord {
+                resource: ResourceCoordinate::new(
+                    ResourceAuthority::Automonique,
+                    ResourceKind::Node,
+                    ResourceId::new(self.instance_id.as_str())
+                        .map_err(|_| DaemonError::ProtocolRefused("platform_node_id"))?,
+                ),
+                freshness: Freshness {
+                    state: FreshnessState::Fresh,
+                    observed_at: automonique_protocol::primitives::EpochMillis::from_millis(now_ms),
+                    revision: Revision::new(self.lease_epoch.max(1))
+                        .map_err(|_| DaemonError::ProtocolRefused("platform_revision"))?,
+                },
+                summary: PlatformText::new("daemon ready")
+                    .map_err(|_| DaemonError::ProtocolRefused("platform_summary"))?,
+            };
+            self.platform
+                .upsert_resource("resources", &node)
+                .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        }
+
+        let records = if wants_all {
+            self.run_index
+                .page(0, automonique_protocol::platform::MAX_SNAPSHOT_RESOURCES)
+                .map_err(index_failed)?
+                .entries
+        } else {
+            let mut records = Vec::new();
+            for resource in requested.iter().filter(|resource| {
+                resource.authority == ResourceAuthority::Automonique
+                    && resource.kind == ResourceKind::Run
+            }) {
+                if let Some(record) = self
+                    .run_index
+                    .by_run_id(resource.id.as_str())
+                    .map_err(index_failed)?
+                    .into_iter()
+                    .last()
+                {
+                    records.push(record);
+                }
+            }
+            records
+        };
+        for record in records {
+            let resource = platform_run_resource(&record)?;
+            self.platform
+                .upsert_resource("resources", &resource)
+                .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        }
+        Ok(())
+    }
+
+    fn platform_execute(
+        &mut self,
+        request: &automonique_protocol::platform::ExecuteRequest,
+        status: &StatusSnapshot,
+        now_ms: i64,
+    ) -> Result<PlatformResponse, DaemonError> {
+        if request.target.authority != ResourceAuthority::Automonique {
+            return platform_refusal(ReceiptOutcome::Rejected, "authority_not_local");
+        }
+        let authoritative_revision = match request.action {
+            PlatformAction::StartRun | PlatformAction::StopRun => {
+                if request.target.kind != ResourceKind::Run {
+                    return platform_refusal(ReceiptOutcome::Rejected, "target_kind_invalid");
+                }
+                let records = self
+                    .run_index
+                    .by_run_id(request.target.id.as_str())
+                    .map_err(index_failed)?;
+                let Some(record) = records.last() else {
+                    return platform_refusal(ReceiptOutcome::Rejected, "unknown_run");
+                };
+                Revision::new(record.revision)
+                    .map_err(|_| DaemonError::RunIndexFailed("revision_invalid"))?
+            }
+            PlatformAction::DecideApproval => self
+                .platform
+                .revision()
+                .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?,
+            PlatformAction::SubmitJob
+            | PlatformAction::ApproveRelease
+            | PlatformAction::RegisterNode => {
+                return platform_refusal(ReceiptOutcome::Rejected, "authority_not_local");
+            }
+        };
+        let admission = match self
+            .platform
+            .prepare_execute(request, authoritative_revision, now_ms)
+        {
+            Ok(admission) => admission,
+            Err(error) => return Ok(platform_store_response(&error)),
+        };
+        let accepted = match admission {
+            ActionAdmission::New(receipt) => receipt,
+            ActionAdmission::Replay(receipt) => return Ok(PlatformResponse::Receipt(receipt)),
+        };
+
+        let action_result = match request.action {
+            PlatformAction::StartRun => {
+                let run_id = RunId::new(request.target.id.as_str())
+                    .map_err(|_| DaemonError::ProtocolRefused("platform_run_id"))?;
+                let degraded = self.reconciliation_run_id.is_some()
+                    || snapshot_requires_reconciliation(status);
+                let paused = self.store.intake_paused(GENERATION_ID, now_ms)?.is_some();
+                self.start_run(&run_id, degraded, paused, now_ms)
+                    .map(|_| ReceiptOutcome::Accepted)
+                    .map_err(ExecuteRefusal::as_str)
+            }
+            PlatformAction::StopRun => {
+                let run_id = RunId::new(request.target.id.as_str())
+                    .map_err(|_| DaemonError::ProtocolRefused("platform_run_id"))?;
+                let records = self
+                    .run_index
+                    .by_run_id(run_id.as_str())
+                    .map_err(index_failed)?;
+                let observed = records.last().map_or(0, |record| record.last_sequence);
+                self.cancel_run(&run_id, request.idempotency_key.as_str(), observed, now_ms)
+                    .map(|_| ReceiptOutcome::Completed)
+                    .map_err(ExecuteRefusal::as_str)
+            }
+            PlatformAction::DecideApproval => {
+                let decision = match request.parameter.as_ref().map(PlatformText::as_str) {
+                    Some("grant") => ApprovalOutcome::Granted,
+                    Some("deny") => ApprovalOutcome::Denied,
+                    _ => {
+                        return self.finalize_platform_rejection(
+                            request,
+                            "approval_decision_invalid",
+                            now_ms,
+                        );
+                    }
+                };
+                self.record_decision(request.target.id.as_str(), decision, "platform-v1", now_ms)
+                    .map(|_| ReceiptOutcome::Completed)
+                    .map_err(|error| error.category())
+            }
+            PlatformAction::SubmitJob
+            | PlatformAction::ApproveRelease
+            | PlatformAction::RegisterNode => unreachable!(),
+        };
+
+        match action_result {
+            Ok(ReceiptOutcome::Accepted) => Ok(PlatformResponse::Receipt(accepted)),
+            Ok(outcome) => {
+                let receipt = self
+                    .platform
+                    .finalize_execute(&request.idempotency_key, outcome, None, now_ms)
+                    .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+                Ok(PlatformResponse::Receipt(receipt))
+            }
+            Err(category) => self.finalize_platform_rejection(request, category, now_ms),
+        }
+    }
+
+    fn finalize_platform_rejection(
+        &mut self,
+        request: &automonique_protocol::platform::ExecuteRequest,
+        category: &str,
+        now_ms: i64,
+    ) -> Result<PlatformResponse, DaemonError> {
+        let receipt = self
+            .platform
+            .finalize_execute(
+                &request.idempotency_key,
+                ReceiptOutcome::Rejected,
+                Some(category),
+                now_ms,
+            )
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        Ok(PlatformResponse::Receipt(receipt))
     }
 
     /// Answer one read on the native Runs API.
@@ -5632,6 +6080,59 @@ fn refuse_batch(
 
 fn index_failed(error: RunIndexError) -> DaemonError {
     DaemonError::RunIndexFailed(error.category())
+}
+
+fn platform_run_resource(record: &RunIndexRecord) -> Result<ResourceRecord, DaemonError> {
+    Ok(ResourceRecord {
+        resource: ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Run,
+            ResourceId::new(&record.run_id)
+                .map_err(|_| DaemonError::RunIndexFailed("run_id_ungrammatical"))?,
+        ),
+        freshness: Freshness {
+            state: FreshnessState::Fresh,
+            observed_at: automonique_protocol::primitives::EpochMillis::from_millis(
+                record.updated_at_ms,
+            ),
+            revision: Revision::new(record.revision)
+                .map_err(|_| DaemonError::RunIndexFailed("revision_invalid"))?,
+        },
+        summary: PlatformText::new(record.spool_state.as_str())
+            .map_err(|_| DaemonError::RunIndexFailed("state_ungrammatical"))?,
+    })
+}
+
+fn platform_refusal(
+    outcome: ReceiptOutcome,
+    category: &str,
+) -> Result<PlatformResponse, DaemonError> {
+    Ok(PlatformResponse::Refused {
+        outcome,
+        explanation: PlatformText::new(category)
+            .map_err(|_| DaemonError::ProtocolRefused("platform_explanation"))?,
+    })
+}
+
+fn platform_store_response(error: &PlatformStoreError) -> PlatformResponse {
+    let outcome = match error {
+        PlatformStoreError::StaleRevision | PlatformStoreError::Conflict(_) => {
+            ReceiptOutcome::Conflict
+        }
+        PlatformStoreError::ResyncRequired => ReceiptOutcome::ResyncRequired,
+        PlatformStoreError::NotFound
+        | PlatformStoreError::InvalidField(_)
+        | PlatformStoreError::InsecurePath(_)
+        | PlatformStoreError::SchemaVersion { .. }
+        | PlatformStoreError::Corrupt(_)
+        | PlatformStoreError::Io(_)
+        | PlatformStoreError::Sqlite(_) => ReceiptOutcome::Rejected,
+    };
+    PlatformResponse::Refused {
+        outcome,
+        explanation: PlatformText::new(error.category())
+            .expect("closed platform-store categories fit the platform field bound"),
+    }
 }
 
 fn generation_audit_failed(error: GenerationAuditError) -> DaemonError {

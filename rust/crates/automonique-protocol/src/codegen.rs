@@ -5920,6 +5920,19 @@ fn platform_module() -> GeneratedModule {
                 value: ConstantValue::Count(crate::platform::MAX_SNAPSHOT_RESOURCES),
             },
             Constant {
+                name: "MAX_SUBSCRIPTION_EVENTS".to_owned(),
+                doc: "Maximum ordered events carried by one subscription page.".to_owned(),
+                value: ConstantValue::Count(crate::platform::MAX_SUBSCRIPTION_EVENTS),
+            },
+            Constant {
+                name: "CONTROL_LEASE_TTL_MILLIS".to_owned(),
+                doc: "Lifetime of one exclusive interactive control lease.".to_owned(),
+                value: ConstantValue::Count(
+                    usize::try_from(crate::platform::CONTROL_LEASE_TTL_MILLIS)
+                        .expect("positive control lease TTL"),
+                ),
+            },
+            Constant {
                 name: "PLATFORM_PROTOCOL".to_owned(),
                 doc: "Stable platform protocol name.".to_owned(),
                 value: ConstantValue::Text(crate::platform::PLATFORM_PROTOCOL.to_owned()),
@@ -6075,6 +6088,60 @@ fn platform_module() -> GeneratedModule {
                 fields: vec![
                     required("cursor", "PlatformCursor"),
                     required("resources", "readonly ResourceRecord[]"),
+                ],
+            },
+            Interface {
+                name: "PlatformEvent".to_owned(),
+                doc: "One ordered resource change after a snapshot cursor.".to_owned(),
+                fields: vec![
+                    required("cursor", "PlatformCursor"),
+                    required("resource", "ResourceRecord"),
+                ],
+            },
+            Interface {
+                name: "Subscription".to_owned(),
+                doc: "One bounded, gap-free event page.".to_owned(),
+                fields: vec![
+                    required("cursor", "PlatformCursor"),
+                    required("events", "readonly PlatformEvent[]"),
+                ],
+            },
+            Interface {
+                name: "SessionRecord".to_owned(),
+                doc: "One attachable session and its optional owning run.".to_owned(),
+                fields: vec![
+                    required("attachable", "boolean"),
+                    required("controllable", "boolean"),
+                    nullable("run", "ResourceCoordinate"),
+                    required("session", "ResourceRecord"),
+                ],
+            },
+            Interface {
+                name: "SessionList".to_owned(),
+                doc: "One bounded session page and its resume cursor.".to_owned(),
+                fields: vec![
+                    required("cursor", "PlatformCursor"),
+                    required("sessions", "readonly SessionRecord[]"),
+                ],
+            },
+            Interface {
+                name: "Attachment".to_owned(),
+                doc: "Observation-only session attachment.".to_owned(),
+                fields: vec![
+                    required("client", "ClientId"),
+                    required("cursor", "PlatformCursor"),
+                    required("session", "ResourceCoordinate"),
+                ],
+            },
+            Interface {
+                name: "ControlLease".to_owned(),
+                doc: "Short exclusive authority to steer one session.".to_owned(),
+                fields: vec![
+                    required("client", "ClientId"),
+                    required("expires_at", "PlatformEpochMillis"),
+                    required("id", "ControlLeaseId"),
+                    required("revision", "PlatformRevision"),
+                    required("session", "ResourceCoordinate"),
                 ],
             },
         ],

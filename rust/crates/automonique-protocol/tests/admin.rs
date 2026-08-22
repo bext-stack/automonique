@@ -2263,6 +2263,7 @@ mod capability {
         (2, "the authenticated local metrics scrape"),
         (3, "provenance on reconciliation evidence"),
         (4, "execution status reports the wired lane"),
+        (5, "the ten-method platform v1 local endpoint"),
     ];
 
     /// Every endpoint, at the maturity it had when it landed.
@@ -2303,6 +2304,16 @@ mod capability {
         "automonique.batch/batch_detail",
         "automonique.progress.stream/subscribe",
         "automonique.admin/metrics",
+        "automonique.platform/capabilities",
+        "automonique.platform/snapshot",
+        "automonique.platform/subscribe",
+        "automonique.platform/execute",
+        "automonique.platform/get_receipt",
+        "automonique.platform/list_sessions",
+        "automonique.platform/attach",
+        "automonique.platform/detach",
+        "automonique.platform/claim_control",
+        "automonique.platform/release_control",
     ];
 
     #[test]
