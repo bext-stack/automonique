@@ -863,9 +863,16 @@ fn zombie_holder_helper() {
         "claim-sigstop",
         "scope:sigstop",
     );
+    // The process is the lease holder; an idle SQLite connection is not part
+    // of that authority. Close it before publishing readiness so the parent
+    // never races a transient WAL writer lock while proving epoch takeover.
+    // Reopening after SIGCONT also exercises the durable fence rather than an
+    // in-memory connection artifact.
+    drop(store);
     fs::write(&ready, run_id.to_string()).expect("publish ready");
     nix::sys::signal::kill(nix::unistd::getpid(), nix::sys::signal::Signal::SIGSTOP)
         .expect("self stop");
+    let mut store = Store::open(&database).expect("old holder reopens store");
     let category = store
         .finish_run(TerminalRun {
             run_id,
