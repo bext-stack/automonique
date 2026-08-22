@@ -20,6 +20,36 @@ use automonique_protocol::codec::RequestId;
 use automonique_protocol::codegen::{SpikeSchema, emit_typescript, hostile_slice};
 use automonique_protocol::wire::{JsonValue, Message};
 
+mod platform_surface {
+    use super::*;
+
+    #[test]
+    fn the_typescript_fixture_agrees_with_rust_and_fails_closed() {
+        let runtime = javascript_runtime().unwrap_or_else(|| {
+            record_js_gap("the platform cross-language fixture did not run");
+            "bun"
+        });
+        if javascript_runtime().is_none() {
+            return;
+        }
+        let output = Command::new(runtime)
+            .arg(package_root().join("conformance/platform-runtime.ts"))
+            .current_dir(package_root())
+            .output()
+            .expect("the TypeScript runtime starts");
+        assert!(
+            output.status.success(),
+            "platform fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "{\"authority\":\"automonique\",\"id\":\"run-1\",\"kind\":\"run\"}\n\
+             ValidationError\nValidationError\nValidationError\n"
+        );
+    }
+}
+
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
