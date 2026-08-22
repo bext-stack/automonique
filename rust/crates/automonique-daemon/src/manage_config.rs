@@ -45,6 +45,10 @@ const CONFIG_RELATIVE: &str = "manage/manage.conf";
 const CONFIG_HEADER: &str = "schema=automonique.manage/v1";
 /// Exact final line of a complete Manage configuration.
 const CONFIG_TERMINATOR: &str = "end=automonique.manage/v1";
+/// Optional platform authority configuration beneath the same private state.
+const PLATFORM_CONFIG_RELATIVE: &str = "manage/platform.conf";
+const PLATFORM_CONFIG_HEADER: &str = "schema=automonique.manage-platform/v1";
+const PLATFORM_CONFIG_TERMINATOR: &str = "end=automonique.manage-platform/v1";
 /// Upper bound on the configuration file.
 const MAX_CONFIG_BYTES: u64 = 4_096;
 /// Longest console URL admitted.
@@ -272,9 +276,63 @@ impl ManageConfig {
     }
 }
 
+/// Optional AI Operations origin, isolated from `manage.conf` so an older
+/// release can still parse its original strict frame during rollback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagePlatformConfig {
+    url: ManageUrl,
+}
+
+impl ManagePlatformConfig {
+    #[must_use]
+    pub fn path(state_dir: &Path) -> PathBuf {
+        state_dir.join(PLATFORM_CONFIG_RELATIVE)
+    }
+
+    #[must_use]
+    pub const fn url(&self) -> &ManageUrl {
+        &self.url
+    }
+
+    pub fn load(state_dir: &Path) -> Result<Option<Self>, ManageConfigError> {
+        let path = Self::path(state_dir);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(ManageConfigError::Unreadable),
+        };
+        if !metadata.is_file()
+            || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+            || metadata.mode() & 0o077 != 0
+            || metadata.len() > MAX_CONFIG_BYTES
+        {
+            return Err(ManageConfigError::Insecure);
+        }
+        let raw = fs::read(&path).map_err(|_| ManageConfigError::Unreadable)?;
+        let text = std::str::from_utf8(&raw).map_err(|_| ManageConfigError::Malformed)?;
+        Self::parse(text).map(Some)
+    }
+
+    fn parse(text: &str) -> Result<Self, ManageConfigError> {
+        let mut lines = text.lines();
+        if lines.next() != Some(PLATFORM_CONFIG_HEADER) {
+            return Err(ManageConfigError::Malformed);
+        }
+        let line = lines.next().ok_or(ManageConfigError::Malformed)?;
+        let value = line
+            .strip_prefix("url=")
+            .ok_or(ManageConfigError::Malformed)?;
+        let url = ManageUrl::new(value)?;
+        if lines.next() != Some(PLATFORM_CONFIG_TERMINATOR) || lines.next().is_some() {
+            return Err(ManageConfigError::Malformed);
+        }
+        Ok(Self { url })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ManageConfig, ManageProfileApp, ManageUrl};
+    use super::{ManageConfig, ManagePlatformConfig, ManageProfileApp, ManageUrl};
 
     const FRAME: &str = "schema=automonique.manage/v1\n\
                          url=https://manage.example.test/\n\
@@ -455,6 +513,54 @@ mod tests {
                 .expect_err("an insecure file is refused")
                 .category(),
             "manage_config_insecure",
+        );
+    }
+
+    #[test]
+    fn platform_authority_uses_an_independent_rollback_safe_frame() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let config = ManagePlatformConfig::parse(
+            "schema=automonique.manage-platform/v1\n\
+             url=https://ai-operations.example.test/\n\
+             end=automonique.manage-platform/v1\n",
+        )
+        .expect("a platform authority frame");
+        assert_eq!(config.url().as_str(), "https://ai-operations.example.test/");
+        assert!(
+            ManagePlatformConfig::parse(
+                "schema=automonique.manage-platform/v1\n\
+             url=https://ai-operations.example.test/\n\
+             extra=true\n\
+             end=automonique.manage-platform/v1\n"
+            )
+            .is_err()
+        );
+
+        let directory = tempfile::tempdir().expect("a temporary state directory");
+        assert!(
+            ManagePlatformConfig::load(directory.path())
+                .expect("absence is allowed")
+                .is_none()
+        );
+        let path = ManagePlatformConfig::path(directory.path());
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("manage directory");
+        std::fs::write(
+            &path,
+            "schema=automonique.manage-platform/v1\n\
+             url=https://ai-operations.example.test/\n\
+             end=automonique.manage-platform/v1\n",
+        )
+        .expect("platform configuration");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only permissions");
+        assert_eq!(
+            ManagePlatformConfig::load(directory.path())
+                .expect("private frame")
+                .expect("configured")
+                .url()
+                .as_str(),
+            "https://ai-operations.example.test/"
         );
     }
 }

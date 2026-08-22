@@ -127,3 +127,26 @@ fn https_transport_refuses_cleartext_remote_and_embedded_credentials() {
     ));
     assert!(BearerToken::new("contains space").is_err());
 }
+
+#[test]
+fn https_transport_preserves_http_authorization_refusals() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("client connection");
+        let mut bytes = [0_u8; 4096];
+        let _ = stream.read(&mut bytes).expect("request bytes");
+        stream
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .expect("refusal response");
+    });
+
+    let token = BearerToken::new("rejected-token").expect("bounded token");
+    let transport = HttpsTransport::new(format!("http://{address}/platform"), token)
+        .expect("loopback endpoint");
+    let mut client = PlatformClient::new(transport);
+    assert_eq!(client.capabilities(), Err(ClientError::Unauthorized));
+    server.join().expect("server thread");
+}

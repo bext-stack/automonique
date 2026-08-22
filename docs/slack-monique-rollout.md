@@ -48,7 +48,7 @@ Never commit it.
 
 ```text
 schema=automonique.manage/v1
-url=https://manage.example.test/
+url=https://support-console.example.test/
 profile_app=<manage-app-id>
 end=automonique.manage/v1
 ```
@@ -62,6 +62,19 @@ end=automonique.manage/v1
 - An absent file disables both. A present file that is world-readable, is
   malformed, sets an unknown or duplicate key, carries an invalid value, or
   sets neither key refuses daemon startup rather than being ignored.
+
+When the AI Operations authority differs from the support/MCP console, put its
+origin in the separate owner-only `<state>/manage/platform.conf` frame. Keeping
+this additive configuration in a separate file preserves rollback parsing for
+older releases:
+
+```text
+schema=automonique.manage-platform/v1
+url=https://ai-operations.example.test/
+end=automonique.manage-platform/v1
+```
+
+Without that file, platform bearer validation retains the `url=` origin.
 
 ## Slack app settings
 
