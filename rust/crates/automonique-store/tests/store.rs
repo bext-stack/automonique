@@ -14,10 +14,10 @@ use automonique_store::{
     OutboxClaimRequest, OutboxDelivery, OutboxEnqueue, OutboxFailure, OutboxFailureDecision,
     OutboxPayloadRequest, OutboxReconciliationDecision, OutboxReconciliationRequest,
     ReconciliationDecision, ReconciliationInboxState, ReconciliationRequest,
-    ReconciliationRunState, SCHEMA_VERSION, SchedulerClaim, Store, TelegramBatchIngestion,
-    TelegramPollerCommit, TelegramPollerLeaseIdentity, TelegramPollerLeaseRenewal,
-    TelegramPollerLeaseRequest, TelegramStoreDisposition, TelegramStoreUpdate, TerminalRun,
-    TerminalState, TransportPauseRequest, WorkClaim,
+    ReconciliationRunState, SCHEMA_VERSION, SchedulerClaim, Store, StoreError,
+    TelegramBatchIngestion, TelegramPollerCommit, TelegramPollerLeaseIdentity,
+    TelegramPollerLeaseRenewal, TelegramPollerLeaseRequest, TelegramStoreDisposition,
+    TelegramStoreUpdate, TerminalRun, TerminalState, TransportPauseRequest, WorkClaim,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -790,8 +790,13 @@ fn a_sigstopped_old_holder_cannot_commit_after_its_epoch_is_replaced() {
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    let successor = successor_store
-        .acquire_generation_lease_owned(
+    // A loaded CI filesystem can briefly retain SQLite's WAL writer lock after
+    // the helper closes its connection. That lock is not authority and the
+    // production connection already has a bounded busy timeout, so retry only
+    // SQLITE_BUSY/SQLITE_LOCKED while preserving the fencing assertion.
+    let takeover_deadline = Instant::now() + Duration::from_secs(10);
+    let successor = loop {
+        match successor_store.acquire_generation_lease_owned(
             LeaseRequest {
                 generation_id: "generation-a",
                 holder_id: "holder-successor",
@@ -803,8 +808,20 @@ fn a_sigstopped_old_holder_cannot_commit_after_its_epoch_is_replaced() {
                 pid: std::process::id(),
                 starttime: 999,
             },
-        )
-        .expect("successor takes expired epoch");
+        ) {
+            Ok(successor) => break successor,
+            Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(code, _)))
+                if code.extended_code == 5 || code.extended_code == 6 =>
+            {
+                assert!(
+                    Instant::now() < takeover_deadline,
+                    "successor remained blocked by a transient SQLite writer lock"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("successor takes expired epoch: {error}"),
+        }
+    };
     assert!(successor.epoch > 1);
 
     nix::sys::signal::kill(
