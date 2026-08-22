@@ -97,6 +97,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -104,7 +105,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use nix::sys::socket::{getsockopt, sockopt};
+use nix::errno::Errno;
+use nix::sys::socket::{MsgFlags, getsockopt, recv, sockopt};
 use nix::unistd::geteuid;
 
 use automonique_observability::ProgressObservation;
@@ -1085,6 +1087,7 @@ fn pump(stream: &mut UnixStream, feed: &SubscriberFeed, stop: &AtomicBool) {
     let mut delivered_through = 0_u64;
     loop {
         let (frames, end) = feed.take();
+        let idle = frames.is_empty();
         for payload in frames {
             // Decoded and re-encoded rather than spliced: the frame owns its
             // canonical bytes and the message owns its envelope, and a hand-made
@@ -1114,6 +1117,30 @@ fn pump(stream: &mut UnixStream, feed: &SubscriberFeed, stop: &AtomicBool) {
         if stop.load(Ordering::Acquire) {
             return;
         }
+        if idle && peer_disconnected(stream) {
+            return;
+        }
+    }
+}
+
+/// Detect a peer that closed while no new frame was available to write.
+///
+/// A write observes disconnects while the stream is active. Once a subscriber
+/// has drained its queue, however, the writer may otherwise wait forever and
+/// retain its hub slot because this protocol expects no second client request.
+/// Peeking one byte without consuming it distinguishes EOF from a connected
+/// peer with no input and keeps unexpected extra input available for any later
+/// protocol decision.
+fn peer_disconnected(stream: &UnixStream) -> bool {
+    let mut byte = [0_u8; 1];
+    match recv(
+        stream.as_raw_fd(),
+        &mut byte,
+        MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT,
+    ) {
+        Ok(0) => true,
+        Ok(_) | Err(Errno::EAGAIN | Errno::EINTR) => false,
+        Err(_) => true,
     }
 }
 
