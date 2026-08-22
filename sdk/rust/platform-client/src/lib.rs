@@ -271,6 +271,8 @@ impl PlatformTransport for HttpsTransport {
             .send(&payload)
             .map_err(|error| match error {
                 ureq::Error::BodyExceedsLimit(_) => ClientError::ResponseTooLarge,
+                ureq::Error::StatusCode(401 | 403) => ClientError::Unauthorized,
+                ureq::Error::StatusCode(_) => ClientError::UnexpectedStatus,
                 _ => ClientError::Io,
             })?;
         let status = response.status().as_u16();

@@ -13,6 +13,7 @@
 //! ```text
 //! schema=automonique.manage/v1
 //! url=https://manage.example.test/
+//! platform_url=https://ai-operations.example.test/
 //! profile_app=example-manage-app
 //! end=automonique.manage/v1
 //! ```
@@ -185,6 +186,7 @@ impl ManageConfigError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManageConfig {
     url: Option<ManageUrl>,
+    platform_url: Option<ManageUrl>,
     profile_app: Option<ManageProfileApp>,
 }
 
@@ -199,6 +201,13 @@ impl ManageConfig {
     #[must_use]
     pub const fn url(&self) -> Option<&ManageUrl> {
         self.url.as_ref()
+    }
+
+    /// The AI Operations authority used to validate platform bearer tokens.
+    /// When absent, callers may retain the version-one `url` behavior.
+    #[must_use]
+    pub const fn platform_url(&self) -> Option<&ManageUrl> {
+        self.platform_url.as_ref()
     }
 
     /// The app identity the site-profile read model addresses, if configured.
@@ -241,6 +250,7 @@ impl ManageConfig {
             return Err(ManageConfigError::Malformed);
         }
         let mut url: Option<ManageUrl> = None;
+        let mut platform_url: Option<ManageUrl> = None;
         let mut profile_app: Option<ManageProfileApp> = None;
         let mut terminated = false;
         for line in lines {
@@ -256,6 +266,9 @@ impl ManageConfig {
                 "url" if url.is_none() => {
                     url = Some(ManageUrl::new(value)?);
                 }
+                "platform_url" if platform_url.is_none() => {
+                    platform_url = Some(ManageUrl::new(value)?);
+                }
                 "profile_app" if profile_app.is_none() => {
                     profile_app = Some(ManageProfileApp::new(value)?);
                 }
@@ -265,10 +278,14 @@ impl ManageConfig {
         if !terminated {
             return Err(ManageConfigError::Malformed);
         }
-        if url.is_none() && profile_app.is_none() {
+        if url.is_none() && platform_url.is_none() && profile_app.is_none() {
             return Err(ManageConfigError::Empty);
         }
-        Ok(Some(Self { url, profile_app }))
+        Ok(Some(Self {
+            url,
+            platform_url,
+            profile_app,
+        }))
     }
 }
 
@@ -278,6 +295,7 @@ mod tests {
 
     const FRAME: &str = "schema=automonique.manage/v1\n\
                          url=https://manage.example.test/\n\
+                         platform_url=https://ai-operations.example.test/\n\
                          profile_app=example-manage-app\n\
                          end=automonique.manage/v1\n";
 
@@ -297,6 +315,10 @@ mod tests {
             Some("https://manage.example.test/")
         );
         assert_eq!(
+            config.platform_url().map(ManageUrl::as_str),
+            Some("https://ai-operations.example.test/")
+        );
+        assert_eq!(
             config.profile_app().map(ManageProfileApp::as_str),
             Some("example-manage-app")
         );
@@ -312,6 +334,7 @@ mod tests {
         .expect("a url-only frame")
         .expect("a present configuration");
         assert!(url_only.url().is_some());
+        assert!(url_only.platform_url().is_none());
         assert!(url_only.profile_app().is_none());
 
         let app_only = ManageConfig::parse(
@@ -322,7 +345,19 @@ mod tests {
         .expect("an app-only frame")
         .expect("a present configuration");
         assert!(app_only.url().is_none());
+        assert!(app_only.platform_url().is_none());
         assert!(app_only.profile_app().is_some());
+
+        let platform_only = ManageConfig::parse(
+            "schema=automonique.manage/v1\n\
+             platform_url=https://ai-operations.example.test/\n\
+             end=automonique.manage/v1\n",
+        )
+        .expect("a platform-only frame")
+        .expect("a present configuration");
+        assert!(platform_only.url().is_none());
+        assert!(platform_only.platform_url().is_some());
+        assert!(platform_only.profile_app().is_none());
     }
 
     #[test]
@@ -351,6 +386,10 @@ mod tests {
         assert_eq!(
             config.url().map(ManageUrl::as_str),
             Some("https://manage.example.test/")
+        );
+        assert_eq!(
+            config.platform_url().map(ManageUrl::as_str),
+            Some("https://ai-operations.example.test/")
         );
         assert_eq!(
             config.profile_app().map(ManageProfileApp::as_str),

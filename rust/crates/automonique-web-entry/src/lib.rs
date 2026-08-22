@@ -552,6 +552,7 @@ pub struct WebIntegration {
 
 struct ManageIntegration {
     console_url: Option<String>,
+    platform_url: Option<String>,
     profile_app: Option<ManageProfileApp>,
     profile_source_configured: bool,
     agent_tools_configured: bool,
@@ -559,6 +560,10 @@ struct ManageIntegration {
 }
 
 impl ManageIntegration {
+    fn platform_authority_url(&self) -> Option<&str> {
+        self.platform_url.as_deref().or(self.console_url.as_deref())
+    }
+
     fn authorize_platform_bearer(&self, authorization: Option<&str>) -> bool {
         let Some(authorization) = authorization.filter(|value| {
             value.len() <= 4096
@@ -569,8 +574,7 @@ impl ManageIntegration {
             return false;
         };
         let Some(endpoint) = self
-            .console_url
-            .as_deref()
+            .platform_authority_url()
             .and_then(manage_platform_endpoint)
         else {
             return false;
@@ -1275,6 +1279,10 @@ impl WebIntegration {
             .as_ref()
             .and_then(ManageConfig::url)
             .map(|url| url.as_str().to_owned());
+        let platform_url = manage_config
+            .as_ref()
+            .and_then(ManageConfig::platform_url)
+            .map(|url| url.as_str().to_owned());
         let mcp_server = console_url
             .as_deref()
             .and_then(|url| mcp.unique_server_for_https_origin(url));
@@ -1284,6 +1292,7 @@ impl WebIntegration {
             .cloned();
         let manage = ManageIntegration {
             console_url,
+            platform_url,
             profile_source_configured: profile_app.is_some(),
             profile_app,
             agent_tools_configured,
@@ -4648,6 +4657,7 @@ mod tests {
         });
         let integration = ManageIntegration {
             console_url: Some(format!("http://{address}/manage")),
+            platform_url: None,
             profile_app: None,
             profile_source_configured: false,
             agent_tools_configured: false,
@@ -4657,6 +4667,18 @@ mod tests {
         server.join().unwrap();
         assert!(!integration.authorize_platform_bearer(Some("Bearer bad token")));
         assert!(!integration.authorize_platform_bearer(Some("Basic fixture")));
+        let split_authority = ManageIntegration {
+            console_url: Some(String::from("https://support.example.test/")),
+            platform_url: Some(String::from("https://operations.example.test/")),
+            profile_app: None,
+            profile_source_configured: false,
+            agent_tools_configured: false,
+            mcp_server: None,
+        };
+        assert_eq!(
+            split_authority.platform_authority_url(),
+            Some("https://operations.example.test/")
+        );
         assert_eq!(
             manage_platform_endpoint("https://manage.example.test/anything").as_deref(),
             Some("https://manage.example.test/api/manage/automonique/platform")
@@ -5288,6 +5310,7 @@ mod tests {
                 live_processes: None,
                 manage: &ManageIntegration {
                     console_url: None,
+                    platform_url: None,
                     profile_app: None,
                     profile_source_configured: false,
                     agent_tools_configured: false,
@@ -5339,6 +5362,7 @@ mod tests {
                 live_processes: None,
                 manage: &ManageIntegration {
                     console_url: None,
+                    platform_url: None,
                     profile_app: None,
                     profile_source_configured: false,
                     agent_tools_configured: false,
@@ -5486,6 +5510,7 @@ mod tests {
                 live_processes: None,
                 manage: &ManageIntegration {
                     console_url: None,
+                    platform_url: None,
                     profile_app: None,
                     profile_source_configured: false,
                     agent_tools_configured: false,
@@ -5556,6 +5581,7 @@ mod tests {
                 live_processes: None,
                 manage: &ManageIntegration {
                     console_url: Some(String::from("https://manage.example.test/")),
+                    platform_url: None,
                     profile_app: None,
                     profile_source_configured: true,
                     agent_tools_configured: true,
@@ -5595,6 +5621,7 @@ mod tests {
                 live_processes: None,
                 manage: &ManageIntegration {
                     console_url: None,
+                    platform_url: None,
                     profile_app: None,
                     profile_source_configured: false,
                     agent_tools_configured: false,
@@ -5652,6 +5679,7 @@ mod tests {
                 live_processes: Some(&processes),
                 manage: &ManageIntegration {
                     console_url: None,
+                    platform_url: None,
                     profile_app: None,
                     profile_source_configured: true,
                     agent_tools_configured: false,
@@ -5978,6 +6006,7 @@ mod tests {
                 live_processes: None,
                 manage: &ManageIntegration {
                     console_url: None,
+                    platform_url: None,
                     profile_app: None,
                     profile_source_configured: false,
                     agent_tools_configured: false,
