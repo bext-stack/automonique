@@ -4568,11 +4568,14 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("id=\"agent-accounts-manager\""));
         assert!(DASHBOARD_HTML.contains("data-add-agent-provider=\"codex\""));
         assert!(DASHBOARD_HTML.contains("data-add-agent-provider=\"claude\""));
+        assert!(DASHBOARD_HTML.contains("id=\"agent-account-capacity\""));
         assert!(DASHBOARD_JS.contains("Agent authentication"));
         assert!(DASHBOARD_JS.contains("/api/agent-accounts/action"));
         assert!(DASHBOARD_JS.contains("submit_authorization_code"));
         assert!(DASHBOARD_JS.contains("auth.openai.com"));
         assert!(DASHBOARD_JS.contains("claude.com"));
+        assert!(DASHBOARD_JS.contains("view.max_accounts"));
+        assert!(DASHBOARD_JS.contains("provider?.available !== true"));
         assert!(DASHBOARD_JS.contains("configurationValue"));
         assert!(DASHBOARD_CSS.contains("data-state=\"expired\""));
         for control in [

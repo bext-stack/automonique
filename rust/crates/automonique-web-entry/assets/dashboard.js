@@ -2600,6 +2600,7 @@ async function mutateAgentAccounts(payload, successMessage) {
       selected_account_cannot_be_removed: "Select another worker account before removing this one.",
       confirmation_required: "Confirmation is required for this account change.",
       native_login_unavailable: "Native provider sign-in could not be started.",
+      account_limit_reached: "The local native-account limit has been reached.",
     };
     toast(messages[error.message] || `Agent account action failed (${error.message}).`, "error");
     return null;
@@ -2719,6 +2720,15 @@ function renderAgentAccounts(view) {
   const accountsRoot = byId("agent-account-list");
   sessionsRoot.replaceChildren(...(view.login_sessions || []).map(renderAgentLoginSession));
   const accounts = Array.isArray(view.accounts) ? view.accounts : [];
+  const providers = Array.isArray(view.providers) ? view.providers : [];
+  const maximum = Number.isSafeInteger(view.max_accounts) && view.max_accounts > 0 ? view.max_accounts : null;
+  const atCapacity = maximum !== null && accounts.length >= maximum;
+  const capacity = byId("agent-account-capacity");
+  if (capacity) capacity.textContent = maximum === null ? `${accounts.length} accounts` : `${accounts.length} / ${maximum} accounts`;
+  document.querySelectorAll("[data-add-agent-provider]").forEach((button) => {
+    const provider = providers.find((item) => item?.id === button.dataset.addAgentProvider);
+    button.disabled = atCapacity || provider?.available !== true;
+  });
   if (accounts.length) {
     accountsRoot.replaceChildren(...accounts.map(renderAgentAccount));
   } else {

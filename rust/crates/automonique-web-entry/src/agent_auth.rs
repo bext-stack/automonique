@@ -583,10 +583,12 @@ impl AgentAuthManager {
         self.sessions
             .lock()
             .map_err(|_| "agent_auth_busy")?
-            .insert(session_id, session);
+            .insert(session_id.clone(), session);
         let binary = self.binary(provider).to_path_buf();
         let health_path = self.health_path(&account_id)?;
-        thread::Builder::new()
+        let failed_health_path = health_path.clone();
+        let failed_account_id = account_id.clone();
+        let spawned = thread::Builder::new()
             .name(format!("agent-login-{}", provider.id()))
             .spawn(move || {
                 run_login_process(LoginProcess {
@@ -600,21 +602,43 @@ impl AgentAuthManager {
                     cancelled,
                     input,
                 });
-            })
-            .map_err(|_| "native_login_unavailable")?;
+            });
+        if spawned.is_err() {
+            self.sessions
+                .lock()
+                .map_err(|_| "agent_auth_busy")?
+                .remove(&session_id);
+            let _ = write_health_path(
+                &failed_health_path,
+                provider,
+                &failed_account_id,
+                "unavailable",
+                "native_login_failed",
+                None,
+            );
+            return Err("native_login_unavailable");
+        }
         Ok(())
     }
 
     fn select(&self, account_id: &str) -> Result<(), &'static str> {
+        let account = {
+            let _guard = self.registry_lock.lock().map_err(|_| "agent_auth_busy")?;
+            self.read_registry_unlocked()?
+                .accounts
+                .into_iter()
+                .find(|account| account.id == account_id)
+                .ok_or("account_not_found")?
+        };
+        let health = self.probe_account(&account)?;
         let _guard = self.registry_lock.lock().map_err(|_| "agent_auth_busy")?;
         let mut registry = self.read_registry_unlocked()?;
-        let account = registry
+        let current = registry
             .accounts
             .iter()
-            .find(|account| account.id == account_id)
-            .cloned()
+            .find(|current| current.id == account.id && current.provider == account.provider)
             .ok_or("account_not_found")?;
-        let health = self.probe_and_write(&account)?;
+        self.write_health(&health)?;
         if !matches!(
             health.status.as_str(),
             "authenticated" | "configured_unverified"
@@ -623,21 +647,31 @@ impl AgentAuthManager {
         }
         registry
             .selected
-            .insert(account.provider.clone(), account.id.clone());
-        registry.worker_provider = Some(account.provider);
+            .insert(current.provider.clone(), current.id.clone());
+        registry.worker_provider = Some(current.provider.clone());
         registry.revision = registry.revision.saturating_add(1);
         self.write_registry_unlocked(&registry)
     }
 
     fn refresh(&self, account_id: &str) -> Result<(), &'static str> {
+        let account = {
+            let _guard = self.registry_lock.lock().map_err(|_| "agent_auth_busy")?;
+            self.read_registry_unlocked()?
+                .accounts
+                .into_iter()
+                .find(|account| account.id == account_id)
+                .ok_or("account_not_found")?
+        };
+        let health = self.probe_account(&account)?;
         let _guard = self.registry_lock.lock().map_err(|_| "agent_auth_busy")?;
         let registry = self.read_registry_unlocked()?;
-        let account = registry
+        registry
             .accounts
             .iter()
-            .find(|account| account.id == account_id)
+            .any(|current| current.id == account.id && current.provider == account.provider)
+            .then_some(())
             .ok_or("account_not_found")?;
-        self.probe_and_write(account).map(|_| ())
+        self.write_health(&health)
     }
 
     fn cancel_login(&self, session_id: &str) -> Result<(), &'static str> {
@@ -686,13 +720,20 @@ impl AgentAuthManager {
         if !confirm {
             return Err("confirmation_required");
         }
-        let _guard = self.registry_lock.lock().map_err(|_| "agent_auth_busy")?;
-        let registry = self.read_registry_unlocked()?;
-        let account = registry
-            .accounts
-            .iter()
-            .find(|account| account.id == account_id)
-            .ok_or("account_not_found")?;
+        let (account, previous_verified) = {
+            let _guard = self.registry_lock.lock().map_err(|_| "agent_auth_busy")?;
+            let registry = self.read_registry_unlocked()?;
+            let account = registry
+                .accounts
+                .iter()
+                .find(|account| account.id == account_id)
+                .cloned()
+                .ok_or("account_not_found")?;
+            let previous_verified = self
+                .read_health(&account)
+                .and_then(|health| health.last_verified_at_ms);
+            (account, previous_verified)
+        };
         let provider = Provider::parse(&account.provider).ok_or("provider_not_supported")?;
         let profile = self.profile_path(account_id)?;
         let mut command = provider_command(provider, self.binary(provider), &profile);
@@ -713,6 +754,14 @@ impl AgentAuthManager {
         if !status.success() {
             return Err("native_logout_failed");
         }
+        let _guard = self.registry_lock.lock().map_err(|_| "agent_auth_busy")?;
+        let registry = self.read_registry_unlocked()?;
+        registry
+            .accounts
+            .iter()
+            .any(|current| current.id == account.id && current.provider == account.provider)
+            .then_some(())
+            .ok_or("account_not_found")?;
         self.write_health(&HealthRecord {
             schema: String::from(HEALTH_SCHEMA),
             provider: account.provider.clone(),
@@ -721,9 +770,7 @@ impl AgentAuthManager {
             method: String::from(provider.method()),
             reason: String::from("operator_signed_out"),
             observed_at_ms: now_ms(),
-            last_verified_at_ms: self
-                .read_health(account)
-                .and_then(|health| health.last_verified_at_ms),
+            last_verified_at_ms: previous_verified,
         })
     }
 
@@ -760,7 +807,7 @@ impl AgentAuthManager {
         self.write_registry_unlocked(&registry)
     }
 
-    fn probe_and_write(&self, account: &AccountRecord) -> Result<HealthRecord, &'static str> {
+    fn probe_account(&self, account: &AccountRecord) -> Result<HealthRecord, &'static str> {
         let provider = Provider::parse(&account.provider).ok_or("provider_not_supported")?;
         let profile = self.profile_path(&account.id)?;
         let verified = probe_native_subscription(provider, self.binary(provider), &profile);
@@ -796,7 +843,6 @@ impl AgentAuthManager {
             observed_at_ms: now,
             last_verified_at_ms: previous_verified,
         };
-        self.write_health(&health)?;
         Ok(health)
     }
 
@@ -1382,6 +1428,7 @@ mod tests {
             .expect("multi-account registry");
 
         let view = manager.view().expect("multi-account view");
+        assert_eq!(MAX_ACCOUNTS, view.max_accounts);
         assert_eq!(8, view.accounts.len());
         assert_eq!(4, view.providers[0].account_count);
         assert_eq!(4, view.providers[1].account_count);
@@ -1450,5 +1497,62 @@ mod tests {
                 claude_env.get(std::ffi::OsStr::new(key)).cloned()
             );
         }
+    }
+
+    #[test]
+    fn slow_native_probe_does_not_block_secret_safe_account_reads() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let binary = temporary.path().join("slow-provider");
+        fs::write(
+            &binary,
+            "#!/bin/sh\n: > probe-started\nsleep 1\nprintf '%s\\n' 'Logged in using ChatGPT'\n",
+        )
+        .expect("write provider fixture");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+            .expect("provider fixture mode");
+        let root = temporary.path().join("agent-auth");
+        let manager = Arc::new(
+            AgentAuthManager::open(
+                AgentAuthConfig::new(root.clone(), binary.clone(), binary)
+                    .expect("valid fixture config"),
+            )
+            .expect("manager"),
+        );
+        let account_id = String::from("acct-0123456789abcdef01234567");
+        ensure_private_directory(&root.join("profiles").join(&account_id)).unwrap();
+        let mut registry = Registry::empty();
+        registry.accounts.push(AccountRecord {
+            id: account_id.clone(),
+            provider: String::from("codex"),
+            label: String::from("Slow Codex"),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        });
+        manager
+            .write_registry_unlocked(&registry)
+            .expect("account registry");
+
+        let selecting = Arc::clone(&manager);
+        let selected_id = account_id.clone();
+        let task = thread::spawn(move || selecting.select(&selected_id));
+        let marker = root
+            .join("profiles")
+            .join(&account_id)
+            .join("probe-started");
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "native probe did not start");
+        let started = SystemTime::now();
+        let view = manager.view().expect("view remains available during probe");
+        assert_eq!(1, view.accounts.len());
+        assert!(
+            started.elapsed().unwrap_or_default() < Duration::from_millis(300),
+            "account view waited for the native provider process"
+        );
+        task.join().expect("select thread").expect("selection");
     }
 }
