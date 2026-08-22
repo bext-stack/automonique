@@ -13106,9 +13106,9 @@ fn conversational_agent_tools(
             object(
                 serde_json::json!({
                     "sources": {"type":"array", "items":{"type":"string"}},
-                    "slack_channel": {"type":"string"},
+                    "slack_channel": {"anyOf":[{"type":"string"},{"type":"null"}]},
                     "github_issues": {"type":"boolean"},
-                    "github_repository_activity": {"type":"string"},
+                    "github_repository_activity": {"anyOf":[{"type":"string"},{"type":"null"}]},
                     "depth": {"type":"string"}
                 }),
                 serde_json::json!(["sources", "github_issues", "depth"]),
@@ -14438,7 +14438,7 @@ mod clock_tests {
         ));
 
         let read_step = model_question_step(
-            r#"{"kind":"tool_call","call_id":"read-1","tool":"read_context","arguments":{"sources":["tickets","activity"],"github_issues":false,"github_repository_activity":"this_week","depth":"fast"}}"#,
+            r#"{"kind":"tool_call","call_id":"read-1","tool":"read_context","arguments":{"sources":["tickets","activity"],"slack_channel":null,"github_issues":false,"github_repository_activity":"this_week","depth":"fast"}}"#,
             None,
             "What tickets were completed yesterday?",
             &[],

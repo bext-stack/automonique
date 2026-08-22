@@ -23,6 +23,7 @@ const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
 const MAX_BATCH_CALLS: usize = 64;
 const MAX_SCHEMA_DEPTH: usize = 8;
 const MAX_PROPERTIES: usize = 64;
+const MAX_SCHEMA_ALTERNATIVES: usize = 4;
 
 /// How replayed calls to a tool are handled.
 ///
@@ -885,6 +886,18 @@ fn validate_schema(schema: &Value, depth: usize) -> Result<(), ()> {
         return Err(());
     }
     let object = schema.as_object().ok_or(())?;
+    if let Some(alternatives) = object.get("anyOf") {
+        if object.len() != 1 {
+            return Err(());
+        }
+        let alternatives = alternatives.as_array().ok_or(())?;
+        if !(2..=MAX_SCHEMA_ALTERNATIVES).contains(&alternatives.len()) {
+            return Err(());
+        }
+        return alternatives
+            .iter()
+            .try_for_each(|alternative| validate_schema(alternative, depth + 1));
+    }
     let kind = object.get("type").and_then(Value::as_str).ok_or(())?;
     match kind {
         "object" => {
@@ -940,6 +953,14 @@ fn validate_value(schema: &Value, value: &Value, depth: usize) -> Result<(), ()>
         return Err(());
     }
     let schema = schema.as_object().ok_or(())?;
+    if let Some(alternatives) = schema.get("anyOf") {
+        let alternatives = alternatives.as_array().ok_or(())?;
+        return alternatives
+            .iter()
+            .any(|alternative| validate_value(alternative, value, depth + 1).is_ok())
+            .then_some(())
+            .ok_or(());
+    }
     match schema.get("type").and_then(Value::as_str).ok_or(())? {
         "object" => {
             let value = value.as_object().ok_or(())?;
@@ -1229,6 +1250,53 @@ mod tests {
         }
         assert!(calls.lock().unwrap().is_empty());
         assert_eq!(broker.calls_used(), 0);
+    }
+
+    #[test]
+    fn local_schema_accepts_bounded_nullable_optional_fields() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "window": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+            },
+            "required": [],
+            "additionalProperties": false
+        });
+        let descriptor = LocalToolDescriptor::new(
+            "activity.read",
+            "Read one bounded activity window.",
+            schema,
+            SideEffectClass::ReadOnly,
+            ApprovalRequirement::None,
+            ReplayPolicy::ReplaySafe,
+        )
+        .expect("nullable schema");
+        for arguments in [
+            json!({}),
+            json!({"window": "this_week"}),
+            json!({"window": null}),
+        ] {
+            assert!(validate_value(descriptor.input_schema(), &arguments, 0).is_ok());
+        }
+        assert!(validate_value(descriptor.input_schema(), &json!({"window": true}), 0).is_err());
+
+        for invalid in [
+            json!({"anyOf": []}),
+            json!({"anyOf": [{"type": "string"}]}),
+            json!({"anyOf": [
+                {"type": "string"},
+                {"type": "null"},
+                {"type": "boolean"},
+                {"type": "integer"},
+                {"type": "number"}
+            ]}),
+            json!({"anyOf": [{"type": "string"}, {"type": "null"}], "type": "string"}),
+        ] {
+            assert!(
+                validate_schema(&invalid, 0).is_err(),
+                "must reject {invalid}"
+            );
+        }
     }
 
     #[test]
