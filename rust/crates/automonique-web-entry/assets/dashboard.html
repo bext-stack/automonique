@@ -184,6 +184,17 @@
               <article><span>APPROVAL ACTIONS</span><strong id="operations-actions">—</strong><small>staged before execution</small></article>
               <article><span>PENDING</span><strong id="operations-pending">—</strong><small>awaiting your decision</small></article>
             </div>
+            <article class="panel platform-monitor" aria-labelledby="platform-monitor-title">
+              <div class="panel-head process-monitor-head"><div><p class="kicker">AUTOMONIQUE.PLATFORM / V1</p><h2 id="platform-monitor-title">Shared platform projection</h2></div><div class="process-monitor-actions"><small id="platform-cursor">Waiting for a gap-free cursor</small><button class="button secondary" id="platform-refresh" type="button">Refresh</button><span class="tag" id="platform-health">LOADING</span></div></div>
+              <div class="operations-metrics platform-metrics" aria-label="Shared platform counts">
+                <article><span>RESOURCES</span><strong id="platform-resources">—</strong><small>authority-qualified</small></article>
+                <article><span>SESSIONS</span><strong id="platform-sessions">—</strong><small>provider-neutral</small></article>
+                <article><span>METHODS</span><strong id="platform-methods">—</strong><small>advertised by endpoint</small></article>
+                <article><span>TRANSPORTS</span><strong id="platform-transports">—</strong><small>same semantic contract</small></article>
+              </div>
+              <p class="process-semantics">This browser reads the same typed platform contract as JCode. Resources name their owning authority; queued work is never presented as local execution.</p>
+              <div class="tool-grid" id="platform-resource-grid"><div class="integration-empty">Loading the shared projection…</div></div>
+            </article>
             <article class="panel process-monitor" aria-labelledby="process-monitor-title">
               <div class="panel-head process-monitor-head"><div><p class="kicker">EXECUTION MONITOR</p><h2 id="process-monitor-title">Agent processes</h2></div><div class="process-monitor-actions"><small id="process-observed">Waiting for worker snapshot</small><button class="button secondary" id="processes-refresh" type="button">Refresh</button><span class="tag" id="processes-health">LOADING</span></div></div>
               <div class="process-metrics" aria-label="Agent process counts">

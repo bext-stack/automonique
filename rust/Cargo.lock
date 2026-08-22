@@ -159,6 +159,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "automonique-platform-client"
+version = "0.1.0"
+dependencies = [
+ "automonique-protocol",
+]
+
+[[package]]
 name = "automonique-policy"
 version = "0.1.0"
 
@@ -254,6 +261,8 @@ dependencies = [
  "automonique-core",
  "automonique-daemon",
  "automonique-github-connector",
+ "automonique-platform-client",
+ "automonique-protocol",
  "automonique-store",
  "automonique-transport-runtime",
  "base64 0.22.1",

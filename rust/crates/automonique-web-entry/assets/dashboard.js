@@ -1319,7 +1319,10 @@ function showView(name) {
   if (window.location.hash !== `#${name}`) history.replaceState(null, "", `#${name}`);
   if (name === "memory") loadMemory(memoryQuery);
   if (name === "operations" || name === "tickets") loadOperations();
-  if (name === "operations") loadProcesses();
+  if (name === "operations") {
+    loadPlatform();
+    loadProcesses();
+  }
   if (name === "configuration") loadConfiguration();
   if (name === "chat") loadChatHistory();
   if (window.matchMedia("(max-width: 760px)").matches) mobileSidebarOpen(false);
@@ -2016,6 +2019,76 @@ async function loadProcesses({ announce = false } = {}) {
   }
 }
 
+function renderPlatform(view) {
+  const resources = Array.isArray(view.resources) ? view.resources : [];
+  const sessions = Array.isArray(view.sessions) ? view.sessions : [];
+  const methods = Array.isArray(view.capabilities?.methods) ? view.capabilities.methods : [];
+  const transports = Array.isArray(view.capabilities?.transports) ? view.capabilities.transports : [];
+  byId("platform-resources").textContent = count(resources.length);
+  byId("platform-sessions").textContent = count(sessions.length);
+  byId("platform-methods").textContent = count(methods.length);
+  byId("platform-transports").textContent = count(transports.length);
+  byId("platform-health").textContent = words(view.health || "unavailable").toUpperCase();
+  byId("platform-cursor").textContent = view.cursor
+    ? `${words(view.cursor.authority)} / ${view.cursor.topic} / seq ${count(view.cursor.sequence)}`
+    : "No cursor";
+  const sessionById = new Map(sessions.map((session) => [session.session?.resource?.id, session]));
+  const root = byId("platform-resource-grid");
+  root.replaceChildren();
+  if (resources.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "integration-empty";
+    empty.textContent = "The platform endpoint returned no visible resources.";
+    root.append(empty);
+    return;
+  }
+  resources.forEach((record) => {
+    const coordinate = record.resource || {};
+    const session = sessionById.get(coordinate.id);
+    const card = document.createElement("article");
+    card.className = "tool-card";
+    const head = document.createElement("div");
+    const authority = document.createElement("span");
+    authority.textContent = words(coordinate.authority || "unknown");
+    const freshness = document.createElement("i");
+    freshness.className = record.freshness === "fresh" ? "safe" : "approval";
+    freshness.textContent = words(record.freshness || "unknown").toUpperCase();
+    head.append(authority, freshness);
+    const title = document.createElement("strong");
+    title.setAttribute("data-i18n-skip", "");
+    title.textContent = `${words(coordinate.kind || "resource")} · ${coordinate.id || "—"}`;
+    const summary = document.createElement("p");
+    summary.setAttribute("data-i18n-skip", "");
+    summary.textContent = record.summary || "No bounded summary.";
+    const footer = document.createElement("div");
+    const revision = document.createElement("small");
+    revision.textContent = `Revision ${count(record.revision)}`;
+    const detail = document.createElement("small");
+    detail.textContent = session
+      ? `${session.attachable ? "Attachable" : "Observe only"} · ${session.controllable ? "Control available" : "No control"}`
+      : Number.isSafeInteger(record.observed_at_ms)
+        ? ticketDateLabel(new Date(record.observed_at_ms).toISOString())
+        : "Observation time unknown";
+    footer.append(revision, detail);
+    card.append(head, title, summary, footer);
+    root.append(card);
+  });
+}
+
+async function loadPlatform({ announce = false } = {}) {
+  const button = byId("platform-refresh");
+  button.disabled = true;
+  try {
+    renderPlatform(await api("/api/platform"));
+    if (announce) toast("Shared platform projection refreshed.");
+  } catch (_error) {
+    renderPlatform({ health: "unavailable", capabilities: {}, resources: [], sessions: [] });
+    if (announce) toast("The shared platform projection is unavailable.", "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function renderOperationsCatalog(tools) {
   const root = byId("operations-tool-grid");
   root.replaceChildren();
@@ -2365,6 +2438,7 @@ byId("operations-refresh").addEventListener("click", () => {
   loadProcesses({ announce: true });
 });
 byId("processes-refresh").addEventListener("click", () => loadProcesses({ announce: true }));
+byId("platform-refresh").addEventListener("click", () => loadPlatform({ announce: true }));
 byId("attention-toggle").addEventListener("click", () => {
   const button = byId("attention-toggle");
   const expanded = button.getAttribute("aria-expanded") === "true";
@@ -3522,6 +3596,7 @@ document.addEventListener("keydown", (event) => {
 });
 
 refreshStatus();
+loadPlatform();
 loadProcesses();
 loadConfiguration();
 showView(window.location.hash.slice(1) || storedPreference("monique-start-view", startupViews, "chat"));
@@ -3536,6 +3611,9 @@ scheduleStatusRefresh(Number(byId("configuration-refresh-rate").value));
 window.setInterval(updateObservedAge, 1_000);
 window.setInterval(renderPulse, 1_000);
 window.setInterval(() => {
-  if (!document.hidden && document.querySelector('[data-panel="operations"]')?.classList.contains("is-visible")) loadProcesses();
+  if (!document.hidden && document.querySelector('[data-panel="operations"]')?.classList.contains("is-visible")) {
+    loadPlatform();
+    loadProcesses();
+  }
 }, 5_000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshStatus(); });

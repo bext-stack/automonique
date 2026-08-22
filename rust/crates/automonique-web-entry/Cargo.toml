@@ -12,6 +12,8 @@ automonique-cli = { path = "../automonique-cli" }
 automonique-core = { path = "../automonique-core" }
 automonique-daemon = { path = "../automonique-daemon" }
 automonique-github-connector = { path = "../automonique-github-connector" }
+automonique-platform-client = { path = "../../../sdk/rust/platform-client" }
+automonique-protocol = { path = "../automonique-protocol" }
 automonique-store = { path = "../automonique-store" }
 automonique-transport-runtime = { path = "../automonique-transport-runtime" }
 base64.workspace = true

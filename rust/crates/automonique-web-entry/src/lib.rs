@@ -37,6 +37,11 @@ use automonique_daemon::{
     mcp_client::{McpCallResult, McpRegistry, McpToolDescriptor},
     site_inventory::{NGINX_SITES_ENABLED, enabled_hosts, manage_profiles, prism_sites},
 };
+use automonique_platform_client::{PlatformClient, UnixTransport};
+use automonique_protocol::platform::{
+    Capabilities, ListSessionsRequest, PlatformCursor, PlatformRequest, PlatformResponse,
+    ResourceAuthority, ResourceCoordinate, ResourceRecord, SessionRecord, SnapshotRequest,
+};
 use automonique_store::agent_memory::{AgentMemoryStore, MemoryRecord, MessageInput};
 use automonique_transport_runtime::ChannelName;
 use base64::Engine;
@@ -97,6 +102,7 @@ pub enum Route {
     ApiAgentAccounts,
     ApiAgentAccountsAction,
     ApiOperations,
+    ApiPlatform,
     ApiProcesses,
     ApiChat,
     ApiChatAction,
@@ -528,6 +534,7 @@ pub struct WebIntegration {
     state_dir: PathBuf,
     memory_path: PathBuf,
     lane: Mutex<SocketRunLane>,
+    platform: Mutex<PlatformClient<UnixTransport>>,
     slack: Mutex<Option<Box<dyn SlackSurface + Send>>>,
     github: Mutex<Option<Box<dyn GitHubSurface + Send>>>,
     manage: ManageIntegration,
@@ -708,6 +715,118 @@ struct OperationsView {
     pending_actions: usize,
     tools: Vec<OperationsToolView>,
     tickets: TicketSnapshotView,
+}
+
+#[derive(Serialize)]
+struct PlatformProjectionView {
+    schema: &'static str,
+    health: &'static str,
+    capabilities: PlatformCapabilitiesView,
+    cursor: PlatformCursorView,
+    sessions_cursor: PlatformCursorView,
+    resources: Vec<PlatformResourceView>,
+    sessions: Vec<PlatformSessionView>,
+}
+
+#[derive(Serialize)]
+struct PlatformCapabilitiesView {
+    protocol: &'static str,
+    schema: &'static str,
+    methods: Vec<&'static str>,
+    transports: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct PlatformCursorView {
+    authority: &'static str,
+    topic: String,
+    sequence: u64,
+}
+
+#[derive(Serialize)]
+struct PlatformCoordinateView {
+    authority: &'static str,
+    kind: &'static str,
+    id: String,
+}
+
+#[derive(Serialize)]
+struct PlatformResourceView {
+    resource: PlatformCoordinateView,
+    freshness: &'static str,
+    observed_at_ms: i64,
+    revision: u64,
+    summary: String,
+}
+
+#[derive(Serialize)]
+struct PlatformSessionView {
+    session: PlatformResourceView,
+    run: Option<PlatformCoordinateView>,
+    attachable: bool,
+    controllable: bool,
+}
+
+impl From<Capabilities> for PlatformCapabilitiesView {
+    fn from(value: Capabilities) -> Self {
+        Self {
+            protocol: value.protocol,
+            schema: value.schema,
+            methods: value
+                .methods
+                .into_iter()
+                .map(|method| method.as_str())
+                .collect(),
+            transports: value
+                .transports
+                .into_iter()
+                .map(|transport| transport.as_str())
+                .collect(),
+        }
+    }
+}
+
+impl From<PlatformCursor> for PlatformCursorView {
+    fn from(value: PlatformCursor) -> Self {
+        Self {
+            authority: value.authority.as_str(),
+            topic: value.topic.as_str().to_owned(),
+            sequence: value.sequence.get(),
+        }
+    }
+}
+
+impl From<ResourceCoordinate> for PlatformCoordinateView {
+    fn from(value: ResourceCoordinate) -> Self {
+        Self {
+            authority: value.authority.as_str(),
+            kind: value.kind.as_str(),
+            id: value.id.as_str().to_owned(),
+        }
+    }
+}
+
+impl From<ResourceRecord> for PlatformResourceView {
+    fn from(value: ResourceRecord) -> Self {
+        Self {
+            resource: value.resource.into(),
+            freshness: value.freshness.state.as_str(),
+            observed_at_ms: value.freshness.observed_at.as_millis(),
+            revision: value.freshness.revision.get(),
+            summary: value.summary.as_str().to_owned(),
+        }
+    }
+}
+
+impl From<SessionRecord> for PlatformSessionView {
+    fn from(value: SessionRecord) -> Self {
+        Self {
+            session: value.session.into(),
+            run: value.run.map(Into::into),
+            attachable: value.attachable,
+            controllable: value.controllable,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1057,7 +1176,8 @@ impl WebIntegration {
             return Err("integration paths must be absolute");
         }
         let run_index = state_dir.join(automonique_daemon::RUN_INDEX_NAME);
-        let lane = SocketRunLane::open(state_dir, &runtime_dir.join("admin.sock"), &run_index)
+        let admin_socket = runtime_dir.join("admin.sock");
+        let lane = SocketRunLane::open(state_dir, &admin_socket, &run_index)
             .map_err(|_| "dashboard run lane unavailable")?;
         let slack = SlackHost::open(state_dir)
             .map_err(|_| "dashboard Slack integration unavailable")?
@@ -1093,6 +1213,7 @@ impl WebIntegration {
             state_dir: state_dir.to_path_buf(),
             memory_path: state_dir.join("agent-memory.sqlite3"),
             lane: Mutex::new(lane),
+            platform: Mutex::new(PlatformClient::new(UnixTransport::new(admin_socket))),
             slack: Mutex::new(slack),
             github: Mutex::new(github),
             manage,
@@ -1100,6 +1221,44 @@ impl WebIntegration {
             pending_manage_actions: Mutex::new(BTreeMap::new()),
             sequence: Mutex::new(0),
             agent_auth,
+        })
+    }
+
+    fn platform(&self) -> Result<PlatformProjectionView, &'static str> {
+        let mut client = self
+            .platform
+            .try_lock()
+            .map_err(|_| "platform_client_busy")?;
+        let capabilities = client.capabilities().map_err(|_| "platform_unavailable")?;
+        let snapshot = match client
+            .request(PlatformRequest::Snapshot(
+                SnapshotRequest::new(Vec::new()).map_err(|_| "platform_request_invalid")?,
+            ))
+            .map_err(|_| "platform_unavailable")?
+        {
+            PlatformResponse::Snapshot(snapshot) => snapshot,
+            PlatformResponse::Refused { .. } => return Err("platform_snapshot_refused"),
+            _ => return Err("platform_protocol_invalid"),
+        };
+        let sessions = match client
+            .request(PlatformRequest::ListSessions(ListSessionsRequest {
+                authority: ResourceAuthority::Automonique,
+                cursor: None,
+            }))
+            .map_err(|_| "platform_unavailable")?
+        {
+            PlatformResponse::Sessions(sessions) => sessions,
+            PlatformResponse::Refused { .. } => return Err("platform_sessions_refused"),
+            _ => return Err("platform_protocol_invalid"),
+        };
+        Ok(PlatformProjectionView {
+            schema: "automonique.dashboard.platform/v1",
+            health: "operational",
+            capabilities: capabilities.into(),
+            cursor: snapshot.cursor.into(),
+            sessions_cursor: sessions.cursor.into(),
+            resources: snapshot.resources.into_iter().map(Into::into).collect(),
+            sessions: sessions.sessions.into_iter().map(Into::into).collect(),
         })
     }
 
@@ -3341,6 +3500,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/api/agent-accounts" => Route::ApiAgentAccounts,
                 "/api/agent-accounts/action" => Route::ApiAgentAccountsAction,
                 "/api/operations" => Route::ApiOperations,
+                "/api/platform" => Route::ApiPlatform,
                 "/api/processes" => Route::ApiProcesses,
                 "/api/chat" => Route::ApiChat,
                 "/api/chat/action" => Route::ApiChatAction,
@@ -3748,6 +3908,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiAgentAccounts
         | Route::ApiAgentAccountsAction
         | Route::ApiOperations
+        | Route::ApiPlatform
         | Route::ApiProcesses
         | Route::ApiChat
         | Route::ApiChatAction
@@ -3834,6 +3995,10 @@ fn api_response(
             Err(_) => json_error("400 Bad Request", "invalid_json"),
         },
         Route::ApiOperations => json_response("200 OK", &integration.operations()),
+        Route::ApiPlatform => match integration.platform() {
+            Ok(view) => json_response("200 OK", &view),
+            Err(category) => json_error("503 Service Unavailable", category),
+        },
         Route::ApiProcesses => json_response("200 OK", &integration.processes()),
         Route::ApiChat => match serde_json::from_slice::<ChatRequest>(body) {
             Ok(request) => match integration.chat(request, &state.snapshot()) {
@@ -4040,6 +4205,7 @@ fn handle(
             | Route::ApiAgentAccounts
             | Route::ApiAgentAccountsAction
             | Route::ApiOperations
+            | Route::ApiPlatform
             | Route::ApiProcesses
             | Route::ApiChat
             | Route::ApiChatAction
@@ -4296,6 +4462,7 @@ mod tests {
             ("/assets/dashboard.js", Route::Script),
             ("/api/status?fresh=1", Route::ApiStatus),
             ("/api/operations", Route::ApiOperations),
+            ("/api/platform", Route::ApiPlatform),
             ("/api/processes", Route::ApiProcesses),
             ("/api/agent-accounts", Route::ApiAgentAccounts),
             ("/missing", Route::NotFound),
@@ -4604,6 +4771,8 @@ mod tests {
             "sidebar-collapse",
             "appearance-panel",
             "operations-refresh",
+            "platform-refresh",
+            "platform-resource-grid",
             "attention-toggle",
             "processes-refresh",
             "process-list",
@@ -4621,6 +4790,8 @@ mod tests {
         }
         assert!(DASHBOARD_JS.contains("monique-theme"));
         assert!(DASHBOARD_JS.contains("processHierarchy(jobs)"));
+        assert!(DASHBOARD_JS.contains("api(\"/api/platform\")"));
+        assert!(DASHBOARD_JS.contains("renderPlatform"));
         assert!(DASHBOARD_JS.contains("Manage control-plane state"));
         assert!(DASHBOARD_JS.contains("monique-text-scale"));
         assert!(DASHBOARD_JS.contains("monique-sidebar"));
