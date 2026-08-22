@@ -3341,6 +3341,12 @@ impl Daemon {
 
         match model_inventory::configured_codex_catalog(&self.state_dir) {
             model_inventory::ModelCatalogRead::Available(catalog) => {
+                let routes = model_inventory::configured_model_routes(&self.state_dir);
+                let configured_routes = [
+                    routes.conversation_primary.as_str(),
+                    routes.conversation_fallback.as_str(),
+                    routes.operational_primary.as_str(),
+                ];
                 let available: std::collections::BTreeSet<&str> = catalog
                     .models
                     .iter()
@@ -3353,15 +3359,15 @@ impl Daemon {
                         ResourceId::new(&model.id)
                             .map_err(|_| DaemonError::PlatformStoreFailed("model_id_invalid"))?,
                     );
-                    let summary = if model.is_default {
-                        "available; default=true"
-                    } else {
-                        "available; default=false"
-                    };
+                    let configured = configured_routes.contains(&model.id.as_str());
+                    let summary = format!(
+                        "source=codex_model_list; scope=configured_account; available=true; default={}; configured_route={configured}",
+                        model.is_default
+                    );
                     self.upsert_platform_observation(
                         coordinate,
                         FreshnessState::Fresh,
-                        summary,
+                        &summary,
                         now_ms,
                     )?;
                 }
@@ -3372,7 +3378,7 @@ impl Daemon {
                     self.upsert_platform_observation(
                         record.resource.clone(),
                         FreshnessState::Stale,
-                        "absent from current catalog",
+                        "source=codex_model_list; scope=configured_account; available=false",
                         now_ms,
                     )?;
                 }
@@ -3382,7 +3388,7 @@ impl Daemon {
                     self.upsert_platform_observation(
                         record.resource,
                         FreshnessState::Unknown,
-                        "catalog temporarily unavailable",
+                        "source=codex_model_list; scope=configured_account; available=unknown",
                         now_ms,
                     )?;
                 }

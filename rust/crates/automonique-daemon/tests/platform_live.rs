@@ -221,7 +221,10 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
     assert_eq!(model.resource.authority, ResourceAuthority::Provider);
     assert_eq!(model.resource.id.as_str(), "gpt-5.6-sol");
     assert_eq!(model.freshness.state.as_str(), "fresh");
-    assert_eq!(model.summary.as_str(), "available; default=true");
+    assert_eq!(
+        model.summary.as_str(),
+        "source=codex_model_list; scope=configured_account; available=true; default=true; configured_route=false"
+    );
 
     let PlatformResponse::Sessions(sessions) = platform(
         &config,
@@ -287,13 +290,19 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
         .find(|resource| resource.resource.id.as_str() == "gpt-5.6-sol")
         .expect("removed model remains explicit");
     assert_eq!(old_model.freshness.state.as_str(), "stale");
-    assert_eq!(old_model.summary.as_str(), "absent from current catalog");
+    assert_eq!(
+        old_model.summary.as_str(),
+        "source=codex_model_list; scope=configured_account; available=false"
+    );
     let current_model = restarted_snapshot
         .resources
         .iter()
         .find(|resource| resource.resource.id.as_str() == "gpt-5.6-terra")
         .expect("replacement model is projected");
     assert_eq!(current_model.freshness.state.as_str(), "fresh");
-    assert_eq!(current_model.summary.as_str(), "available; default=false");
+    assert_eq!(
+        current_model.summary.as_str(),
+        "source=codex_model_list; scope=configured_account; available=true; default=false; configured_route=false"
+    );
     serving.shutdown(&config);
 }
