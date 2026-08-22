@@ -151,6 +151,10 @@ use nix::sys::socket::{getsockopt, sockopt};
 use nix::unistd::geteuid;
 
 mod agent_activity;
+pub mod agent_harness;
+pub mod agent_profile;
+pub mod agent_runtime;
+pub mod agent_tool_broker;
 pub mod approval_policy;
 pub mod ask;
 pub mod attempt_host;

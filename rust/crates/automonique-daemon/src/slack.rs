@@ -125,8 +125,8 @@ use crate::telegram_bridge::{
     ApprovalDecisionAnswer, ApprovalDecisionFailure, ControlSurface as _, HostFacts,
     QuestionProfile, RunLane as _, SlackSurface, StoreControlSurface, TransportLiveSeams,
     TransportToolPlan, accepted_mcp_input_responses, answer_read_only_transport_question,
-    answer_typed_github_issue_question, deterministic_conversation_answer, mcp_approval_preview,
-    mcp_result_prompt, run_question_to_completion,
+    answer_typed_github_issue_question, mcp_approval_preview, mcp_result_prompt,
+    run_question_to_completion,
 };
 
 /// Configuration path beneath the daemon's private state directory.
@@ -4468,12 +4468,6 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                 || event.channel.as_str().starts_with('D'));
         let mut contextual_work_url = None;
         if conversational {
-            if let Some(answer) = deterministic_conversation_answer(trimmed) {
-                let _ = self
-                    .poster
-                    .post_thread(&event.channel, &event.parent, answer);
-                return;
-            }
             if is_github_capability_question(trimmed) {
                 let text = if self.github_actions.is_some() {
                     "Yes. I can create GitHub issues, reply to them, and check or uncheck checklist items in configured repositories."
@@ -8965,7 +8959,7 @@ mod tests {
     }
 
     #[test]
-    fn slack_greetings_answer_as_monique_without_spending_a_provider_run() {
+    fn slack_greetings_do_not_bypass_the_conversation_surface() {
         let poster = FakeTicketPoster::default();
         let messages = Arc::clone(&poster.messages);
         let mut router = SlackTicketRouter {
@@ -8993,11 +8987,9 @@ mod tests {
         event.app_mention = true;
         router.handle_with_context(event, "");
 
-        assert_eq!(
-            messages.lock().expect("messages").as_slice(),
-            [String::from(crate::telegram_bridge::QUESTION_GREETING)]
-        );
-        assert!(crate::telegram_bridge::QUESTION_GREETING.contains("Monique"));
+        let messages = messages.lock().expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("conversational tool surface is unavailable"));
     }
 
     #[test]

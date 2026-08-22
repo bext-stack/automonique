@@ -29,8 +29,7 @@ use automonique_daemon::telegram_bridge::{
     ApprovalDecisionAnswer, ApprovalDecisionFailure, BridgeParts, ControlSurface, DispatchReport,
     EmailActionSurface, HostFacts, MAX_PENDING_QUESTIONS, MAX_QUESTION_CONTEXT_BYTES,
     MAX_QUESTION_PROMPT_BYTES, MemberChange, MemorySurface, MemoryTenantSource,
-    NO_TICKETS_RECORDED, OperatorRoster, QUESTION_ADMIN_ONLY, QUESTION_FRENCH_GREETING,
-    QUESTION_GREETING, QUESTION_IDENTITY, QUESTION_SMALL_TALK, QUESTION_TICKETS_LISTED, RunFailure,
+    NO_TICKETS_RECORDED, OperatorRoster, QUESTION_ADMIN_ONLY, QUESTION_TICKETS_LISTED, RunFailure,
     RunLane, SlackSurface, StoreControlSurface, StoreMemorySurface, TICKET_ACTION_UNAVAILABLE,
     TICKET_NOT_FOUND, TICKETS_LISTED, TICKETS_NOT_ENABLED, TelegramControlBridge,
     TicketActionSurface,
@@ -1904,97 +1903,68 @@ fn ambiguous_email_recipient_is_refused_without_an_external_effect() {
 // --------------------------------------------------------------------- tests
 
 #[test]
-fn greeting_only_prose_answers_immediately_without_a_provider_run() {
+fn greeting_prose_uses_the_personality_led_conversation_lane() {
     let fixture = Fixture::new(&[]);
     let outbound = FakeOutbound::default();
-    let lane = FakeRunLane::answering("must not be used");
+    let lane = FakeRunLane::answering(
+        r#"{"kind":"answer","answer":"Hey! I'm Monique — what are we working on?"}"#,
+    );
     let mut bridge = bridge_with_lane(
         &fixture,
-        FakeClient::new([updates(&[
-            (1, OPERATOR, "hello"),
-            (2, OPERATOR, " HI "),
-            (3, OPERATOR, "Hey"),
-            (4, OPERATOR, "bonjour"),
-            (5, OPERATOR, "SALUT"),
-            (6, OPERATOR, "yo"),
-        ])]),
+        FakeClient::new([updates(&[(1, OPERATOR, "hello")])]),
         outbound.clone(),
         FakeSink::default(),
         lane.clone(),
     );
 
     let report = poll(&mut bridge).expect("greetings commit");
-    assert_eq!(report.answered, 6);
-    assert_eq!(report.questions_queued, 0);
-    assert!(lane.tasks().is_empty());
-    assert_eq!(outbound.sent().len(), 6);
-    assert!(
-        outbound
-            .messages()
-            .iter()
-            .all(|body| body.contains(QUESTION_GREETING))
-    );
+    assert_eq!(report.questions_queued, 1);
+    assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
+    assert_eq!(lane.tasks().len(), 1);
+    assert!(outbound.messages()[0].contains("what are we working on?"));
 }
 
 #[test]
-fn identity_only_prose_answers_immediately_without_a_provider_run() {
+fn identity_prose_uses_the_personality_led_conversation_lane() {
     let fixture = Fixture::new(&[]);
     let outbound = FakeOutbound::default();
-    let lane = FakeRunLane::answering("must not be used");
+    let lane = FakeRunLane::answering(
+        r#"{"kind":"answer","answer":"I'm Monique, your operational copilot."}"#,
+    );
     let mut bridge = bridge_with_lane(
         &fixture,
-        FakeClient::new([updates(&[
-            (1, OPERATOR, "who are you"),
-            (2, OPERATOR, " What are you? "),
-            (3, OPERATOR, "Qui es-tu !"),
-            (4, OPERATOR, "QUI ES TU..."),
-        ])]),
+        FakeClient::new([updates(&[(1, OPERATOR, "who are you")])]),
         outbound.clone(),
         FakeSink::default(),
         lane.clone(),
     );
 
     let report = poll(&mut bridge).expect("identity questions commit");
-    assert_eq!(report.answered, 4);
-    assert_eq!(report.questions_queued, 0);
-    assert!(lane.tasks().is_empty());
-    assert_eq!(outbound.sent().len(), 4);
-    assert!(
-        outbound
-            .messages()
-            .iter()
-            .all(|body| body.contains(QUESTION_IDENTITY))
-    );
+    assert_eq!(report.questions_queued, 1);
+    assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
+    assert_eq!(lane.tasks().len(), 1);
+    assert!(outbound.messages()[0].contains("operational copilot"));
 }
 
 #[test]
-fn casual_check_ins_answer_immediately_without_a_provider_run() {
+fn casual_check_ins_use_the_personality_led_conversation_lane() {
     let fixture = Fixture::new(&[]);
     let outbound = FakeOutbound::default();
-    let lane = FakeRunLane::answering("must not be used");
+    let lane =
+        FakeRunLane::answering(r#"{"kind":"answer","answer":"Doing well — ready when you are."}"#);
     let mut bridge = bridge_with_lane(
         &fixture,
-        FakeClient::new([updates(&[
-            (1, OPERATOR, "sup"),
-            (2, OPERATOR, "supe monique"),
-            (3, OPERATOR, "How are you ?"),
-            (4, OPERATOR, "Ça va Monique!"),
-        ])]),
+        FakeClient::new([updates(&[(1, OPERATOR, "sup")])]),
         outbound.clone(),
         FakeSink::default(),
         lane.clone(),
     );
 
     let report = poll(&mut bridge).expect("casual check-ins commit");
-    assert_eq!(report.answered, 4);
-    assert_eq!(report.questions_queued, 0);
-    assert!(lane.tasks().is_empty());
-    assert!(
-        outbound
-            .messages()
-            .iter()
-            .all(|body| body.contains(QUESTION_SMALL_TALK))
-    );
+    assert_eq!(report.questions_queued, 1);
+    assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
+    assert_eq!(lane.tasks().len(), 1);
+    assert!(outbound.messages()[0].contains("ready when you are"));
 }
 
 #[test]
@@ -2110,10 +2080,12 @@ fn complex_script_requests_require_an_explicit_admin_scratchpad_boundary() {
 }
 
 #[test]
-fn french_greeting_answers_immediately_without_a_provider_run() {
+fn french_greeting_uses_the_personality_led_conversation_lane() {
     let fixture = Fixture::new(&[]);
     let outbound = FakeOutbound::default();
-    let lane = FakeRunLane::answering("must not be used");
+    let lane = FakeRunLane::answering(
+        r#"{"kind":"answer","answer":"Coucou 👋 Qu'est-ce qu'on fait aujourd'hui ?"}"#,
+    );
     let mut bridge = bridge_with_lane(
         &fixture,
         FakeClient::new([updates(&[(1, OPERATOR, "coucou monique")])]),
@@ -2123,10 +2095,10 @@ fn french_greeting_answers_immediately_without_a_provider_run() {
     );
 
     let report = poll(&mut bridge).expect("French greeting commits");
-    assert_eq!(report.answered, 1);
-    assert_eq!(report.questions_queued, 0);
-    assert!(lane.tasks().is_empty());
-    assert!(outbound.messages()[0].contains(QUESTION_FRENCH_GREETING));
+    assert_eq!(report.questions_queued, 1);
+    assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
+    assert_eq!(lane.tasks().len(), 1);
+    assert!(outbound.messages()[0].contains("aujourd'hui"));
 }
 
 #[test]
@@ -3577,8 +3549,79 @@ fn question_context_is_bounded_and_marks_omitted_ticket_facts() {
     assert!(context.len() <= MAX_QUESTION_CONTEXT_BYTES);
     assert!(context.contains("included=50"));
     assert!(context.contains("total_recorded=51"));
-    assert!(context.contains("older_rows_omitted=1"));
+    assert!(context.contains("rows_omitted=1"));
     assert!(context.contains("snapshot_truncated=yes"));
+}
+
+/// A completion report must not lose every closed row behind a large open
+/// backlog. The bounded read model focuses closed rows when the question asks
+/// what was done, while retaining the aggregate open/closed counts.
+#[test]
+fn completed_ticket_question_lists_closed_rows_before_the_open_backlog() {
+    let fixture = Fixture::new(&[]);
+    let mut store = SupportTicketStore::open(&fixture.support_tickets_path)
+        .expect("support ticket store opens");
+    for number in 1..=QUESTION_TICKETS_LISTED + 1 {
+        let fleet_id = format!("OPEN-{number}");
+        store
+            .record(&FleetTicket {
+                fleet_issue_id: &fleet_id,
+                title: "Open backlog ticket",
+                tenant_name: "Example",
+                site_label: None,
+                fleet_status: "open",
+                priority: "normal",
+                source: "email",
+                requested_by: "operator",
+                comment_count: 0,
+                created_at: "2026-08-20T00:00:00Z",
+                updated_at: "2026-08-20T00:00:00Z",
+                observed_at_ms: TICKET_OBSERVED_MS,
+            })
+            .expect("open ticket recorded");
+    }
+    for number in 1..=2 {
+        let fleet_id = format!("DONE-YESTERDAY-{number}");
+        let receipt = store
+            .record(&FleetTicket {
+                fleet_issue_id: &fleet_id,
+                title: "Completed ticket",
+                tenant_name: "Example",
+                site_label: None,
+                fleet_status: "closed",
+                priority: "normal",
+                source: "email",
+                requested_by: "operator",
+                comment_count: 1,
+                created_at: "2026-08-20T00:00:00Z",
+                updated_at: "2026-08-21T12:00:00Z",
+                observed_at_ms: TICKET_OBSERVED_MS,
+            })
+            .expect("closed ticket recorded");
+        store
+            .transition(TicketTransition {
+                fleet_issue_id: &fleet_id,
+                expected_revision: receipt.revision,
+                lifecycle: TicketLifecycle::Closed,
+                now_ms: TICKET_OBSERVED_MS,
+            })
+            .expect("ticket closed");
+    }
+    drop(store);
+
+    let context = fixture
+        .surface()
+        .question_context(
+            "Sup. What tickets were done yesterday?",
+            &[OPERATOR],
+            &[OPERATOR],
+        )
+        .expect("completion context renders");
+    assert!(context.contains("row_order=closed tickets newest first"));
+    assert!(context.contains("thread_id=DONE-YESTERDAY-1"));
+    assert!(context.contains("thread_id=DONE-YESTERDAY-2"));
+    assert!(context.contains("lifecycle=closed"));
+    assert!(!context.contains("thread_id=OPEN-"));
 }
 
 /// An unreadable selected source prevents synthesis after the model has chosen

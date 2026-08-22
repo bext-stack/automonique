@@ -240,18 +240,6 @@ pub const QUESTION_ADMIN_ONLY: &str = "Natural-language questions are available 
 /// Fixed answer when an administrator's prose is not safe to put in a prompt.
 pub const QUESTION_REJECTED: &str = "That question is empty, too long, or contains unsupported control characters, so no provider run was started.";
 
-/// Deterministic answer for greeting-only administrator prose.
-pub const QUESTION_GREETING: &str = "Hello! I'm Monique. How can I help?";
-
-/// Deterministic identity answer that never needs an operational fact snapshot.
-pub const QUESTION_IDENTITY: &str = "I'm Monique, Automonique's operational assistant. I can answer questions about the daemon and the locally tracked support tickets.";
-
-/// Deterministic casual-chat answer that spends no provider run.
-pub const QUESTION_SMALL_TALK: &str = "Doing well, thanks! What can I help you with?";
-
-/// Deterministic French greeting that spends no provider run.
-pub const QUESTION_FRENCH_GREETING: &str = "Coucou 👋 Que puis-je faire pour toi ?";
-
 /// Fixed answer while the bounded background question queue is occupied.
 pub const QUESTION_BUSY: &str = "My question queue is full. Please try again after an answer arrives; no provider run was started for this message.";
 
@@ -2691,6 +2679,9 @@ enum ModelQuestionIntent {
     Refused(String),
 }
 
+const INVALID_MODEL_STEP_REPLY: &str =
+    "The provider returned an invalid agent step, so no tool was run. Please retry.";
+
 enum QuestionStage {
     Intent {
         question: String,
@@ -2886,7 +2877,7 @@ where
                                 github_action_aliases,
                                 source_key,
                                 forced_profile,
-                            } => match model_question_intent(
+                            } => match model_question_step(
                                 &answer,
                                 *forced_profile,
                                 question,
@@ -2894,8 +2885,8 @@ where
                                 mcp_tools,
                                 github_action_aliases,
                             ) {
-                                Some(ModelQuestionIntent::Answer(answer)) => (true, answer),
-                                Some(ModelQuestionIntent::Read(plan)) => {
+                                ModelQuestionIntent::Answer(answer) => (true, answer),
+                                ModelQuestionIntent::Read(plan) => {
                                     continuation = Some(QuestionContinuation::Read(
                                         QuestionReadContinuation {
                                             question: question.clone(),
@@ -2913,11 +2904,11 @@ where
                                     ));
                                     (false, String::new())
                                 }
-                                Some(ModelQuestionIntent::SlackPost(plan)) => {
+                                ModelQuestionIntent::SlackPost(plan) => {
                                     continuation = Some(QuestionContinuation::SlackPost(plan));
                                     (false, String::new())
                                 }
-                                Some(ModelQuestionIntent::McpCall(plan)) => {
+                                ModelQuestionIntent::McpCall(plan) => {
                                     continuation = Some(QuestionContinuation::McpCall {
                                         question: question.clone(),
                                         plan,
@@ -2932,7 +2923,7 @@ where
                                     });
                                     (false, String::new())
                                 }
-                                Some(ModelQuestionIntent::GitHubAction(request)) => {
+                                ModelQuestionIntent::GitHubAction(request) => {
                                     continuation = Some(QuestionContinuation::GitHubAction {
                                         source_key: source_key.clone(),
                                         question: question.clone(),
@@ -2940,7 +2931,7 @@ where
                                     });
                                     (false, String::new())
                                 }
-                                Some(ModelQuestionIntent::Escalate(plan)) => {
+                                ModelQuestionIntent::Escalate(plan) => {
                                     continuation = Some(QuestionContinuation::Escalate {
                                         escalation: QuestionEscalation {
                                             question: question.clone(),
@@ -2958,8 +2949,7 @@ where
                                     });
                                     (false, String::new())
                                 }
-                                Some(ModelQuestionIntent::Refused(answer)) => (false, answer),
-                                None => (true, answer),
+                                ModelQuestionIntent::Refused(answer) => (false, answer),
                             },
                             QuestionStage::Answer if is_deferred_placeholder_answer(&answer) => (
                                 false,
@@ -7586,13 +7576,6 @@ where
                 preformatted: false,
             };
         }
-        if let Some(answer) = deterministic_conversation_answer(question) {
-            return Answer::Answered {
-                chat_id,
-                text: String::from(answer),
-                preformatted: false,
-            };
-        }
         if is_current_time_question(question) {
             let Some(current_utc) = accepted_unix_ms.and_then(utc_rfc3339_from_unix_millis) else {
                 return Answer::Unavailable {
@@ -7692,6 +7675,9 @@ where
                 })
                 .unwrap_or_default()
         };
+        let resolved_ticket_question =
+            resolved_support_ticket_read_continuation(question, &memory_context);
+        let question = resolved_ticket_question.as_deref().unwrap_or(question);
         let host_load_followup = is_host_load_followup(question, &memory_context);
         if is_support_ticket_inventory_followup(question, &memory_context)
             && !self.mcp.has_server("support")
@@ -10869,6 +10855,113 @@ fn is_support_ticket_inventory_followup(text: &str, memory_context: &str) -> boo
         .any(|term| matches!(term, "ticket" | "tickets"))
 }
 
+/// Resolve an explicit short confirmation against the preceding read-only
+/// support-ticket inventory question.
+///
+/// Both Telegram and Slack persist the current user message at slightly
+/// different points in their ingress flow, so the newest transcript user line
+/// may be the confirmation itself. Skip that line when present and reuse only
+/// the immediately preceding question when it passed the inventory classifier. This
+/// can repeat a read, but can never turn an ambiguous "do it" into a ticket or
+/// GitHub mutation.
+fn resolved_support_ticket_read_continuation(text: &str, memory_context: &str) -> Option<String> {
+    let normalized = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|character: char| !character.is_alphanumeric())
+        .to_lowercase();
+    if !matches!(
+        normalized.as_str(),
+        "do it"
+            | "please do"
+            | "please do it"
+            | "go ahead"
+            | "yes do it"
+            | "yes please"
+            | "fais le"
+            | "fais-le"
+            | "vas y"
+            | "vas-y"
+            | "oui fais le"
+            | "oui fais-le"
+    ) {
+        return None;
+    }
+
+    let recent = memory_context
+        .split_once("[recent_conversation]\n")
+        .and_then(|(_, remainder)| remainder.split_once("\n[/recent_conversation]"))
+        .map(|(recent, _)| recent)
+        .or_else(|| {
+            memory_context
+                .split_once("[recent conversation]\n")
+                .map(|(_, recent)| recent)
+        })
+        .unwrap_or("");
+    let mut messages = recent
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("user | content_untrusted=")
+                .or_else(|| line.strip_prefix("user: "))
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+        })
+        .collect::<Vec<_>>();
+    if messages.last().is_some_and(|message| {
+        message
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim_matches(|character: char| !character.is_alphanumeric())
+            .eq_ignore_ascii_case(&normalized)
+    }) {
+        messages.pop();
+    }
+    messages
+        .last()
+        .filter(|message| is_support_ticket_inventory_question(message))
+        .map(|message| (*message).to_owned())
+}
+
+/// Whether a ticket inventory question is specifically about completed rows.
+///
+/// Open-first remains the default because it answers the common backlog
+/// question correctly. Completion questions reverse that focus so dozens of
+/// open tickets cannot consume the bounded snapshot before any closed row is
+/// rendered.
+fn is_closed_ticket_inventory_question(text: &str) -> bool {
+    if !is_support_ticket_inventory_question(text) {
+        return false;
+    }
+    text.to_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .any(|term| {
+            matches!(
+                term,
+                "closed"
+                    | "completed"
+                    | "complete"
+                    | "done"
+                    | "finished"
+                    | "resolved"
+                    | "traité"
+                    | "traités"
+                    | "traite"
+                    | "traites"
+                    | "fermé"
+                    | "fermés"
+                    | "fermee"
+                    | "fermees"
+                    | "clôturé"
+                    | "clôturés"
+                    | "cloture"
+                    | "clotures"
+            )
+        })
+}
+
 /// Recognize a GitHub repository inventory without swallowing issue/project
 /// mutations that happen to mention one repository.
 fn is_github_repository_inventory_question(text: &str) -> bool {
@@ -11020,46 +11113,6 @@ fn is_identity_question(text: &str) -> bool {
     )
 }
 
-/// Whether prose is one exact casual check-in that needs no operational data.
-fn small_talk_answer(text: &str) -> Option<&'static str> {
-    let normalized = text
-        .trim()
-        .trim_end_matches(['?', '!', '.'])
-        .trim_end()
-        .to_lowercase();
-    if matches!(normalized.as_str(), "coucou" | "coucou monique") {
-        return Some(QUESTION_FRENCH_GREETING);
-    }
-    matches!(
-        normalized.as_str(),
-        "sup"
-            | "how are you"
-            | "how are you monique"
-            | "sup monique"
-            | "supe monique"
-            | "what's up monique"
-            | "whats up monique"
-            | "ça va monique"
-            | "ca va monique"
-    )
-    .then_some(QUESTION_SMALL_TALK)
-}
-
-/// Answer the transport-independent conversational fast paths.
-///
-/// Slack and Telegram both admit these exact, read-only utterances without a
-/// provider run. Keeping the decision here prevents one transport from
-/// silently dropping a greeting that the other transport answers.
-pub(crate) fn deterministic_conversation_answer(text: &str) -> Option<&'static str> {
-    if is_greeting(text) {
-        return Some(QUESTION_GREETING);
-    }
-    if is_identity_question(text) {
-        return Some(QUESTION_IDENTITY);
-    }
-    small_talk_answer(text)
-}
-
 /// The transport facts handed to the conversational router for one Slack
 /// thread reply.
 ///
@@ -11156,9 +11209,9 @@ pub(crate) fn answer_read_only_transport_question(
 ) -> String {
     let accepted_unix_ms = crate::unix_millis().ok();
     let accepted_at = Instant::now();
-    if let Some(answer) = deterministic_conversation_answer(question) {
-        return String::from(answer);
-    }
+    let resolved_ticket_question =
+        resolved_support_ticket_read_continuation(question, memory_context);
+    let question = resolved_ticket_question.as_deref().unwrap_or(question);
     let Some(question) = accepted_question(question) else {
         return String::from(QUESTION_REJECTED);
     };
@@ -11261,7 +11314,7 @@ pub(crate) fn answer_read_only_transport_question(
             Err(failure) => return String::from(question_failure_reply(failure)),
         };
     let first_execution_ms = routing_started.elapsed().as_millis();
-    match model_question_intent(
+    match model_question_step(
         &routed,
         None,
         question,
@@ -11269,7 +11322,7 @@ pub(crate) fn answer_read_only_transport_question(
         mcp_tools,
         github_action_aliases,
     ) {
-        Some(ModelQuestionIntent::Answer(answer)) => timed_question_reply_for(
+        ModelQuestionIntent::Answer(answer) => timed_question_reply_for(
             &answer,
             routing_runtime,
             QuestionTimingBreakdown {
@@ -11283,7 +11336,7 @@ pub(crate) fn answer_read_only_transport_question(
             },
             caller,
         ),
-        Some(ModelQuestionIntent::Read(plan)) => {
+        ModelQuestionIntent::Read(plan) => {
             let selected_started = Instant::now();
             let context = if plan.profile == QuestionProfile::WebResearch {
                 bounded_question_context(memory_context)
@@ -11343,20 +11396,20 @@ pub(crate) fn answer_read_only_transport_question(
                 caller,
             )
         }
-        Some(ModelQuestionIntent::Refused(answer)) => answer,
-        Some(ModelQuestionIntent::SlackPost(plan)) => {
+        ModelQuestionIntent::Refused(answer) => answer,
+        ModelQuestionIntent::SlackPost(plan) => {
             *selected_tool = Some(TransportToolPlan::SlackPost(plan));
             String::new()
         }
-        Some(ModelQuestionIntent::McpCall(plan)) => {
+        ModelQuestionIntent::McpCall(plan) => {
             *selected_tool = Some(TransportToolPlan::McpCall(plan));
             String::new()
         }
-        Some(ModelQuestionIntent::GitHubAction(request)) => {
+        ModelQuestionIntent::GitHubAction(request) => {
             *selected_tool = Some(TransportToolPlan::GitHubAction(request));
             String::new()
         }
-        Some(ModelQuestionIntent::Escalate(plan)) => {
+        ModelQuestionIntent::Escalate(plan) => {
             *selected_tool = Some(TransportToolPlan::Escalate(QuestionEscalation {
                 question: question.to_owned(),
                 memory_context: memory_context.to_owned(),
@@ -11364,20 +11417,6 @@ pub(crate) fn answer_read_only_transport_question(
             }));
             String::new()
         }
-        None => timed_question_reply_for(
-            &routed,
-            routing_runtime,
-            QuestionTimingBreakdown {
-                accepted_unix_ms,
-                lookup_ms: lookup_started.elapsed().as_millis(),
-                ack_ms: 0,
-                queue_ms: 0,
-                routing_ms: 0,
-                execution_ms: first_execution_ms,
-                total_ms: accepted_at.elapsed().as_millis(),
-            },
-            caller,
-        ),
     }
 }
 
@@ -12712,7 +12751,7 @@ fn question_intent_prompt(
     let render = |memory: &str, baseline: &str| {
         format!(
             "AUTOMONIQUE_CONVERSATIONAL_TOOL_ROUTER_V1\n\
-         You are Monique's intent resolver and conversational answerer. Interpret meaning, paraphrases, and references from recent conversation instead of matching literal phrases.\n\
+         You are Monique's intent resolver and conversational answerer. Monique is warm, direct, curious, and operationally precise; preserve that voice in final answers without turning safety or capability policy into personality. Interpret meaning, paraphrases, and references from recent conversation instead of matching literal phrases.\n\
          Return exactly one compact JSON object and no markdown.\n\
          Search relevant attached local sources before concluding that an operational fact is unknown. If no attached source or discovered tool can answer, return an escalation (below) rather than an answer listing what is missing; never imply arbitrary disk access.\n\
          For ordinary conversation or stable general knowledge, return {{\"kind\":\"answer\",\"answer\":\"concise answer in the user's language\"}}.\n\
@@ -12731,7 +12770,7 @@ fn question_intent_prompt(
          When neither the baseline nor any allowed read or tool can satisfy the request because it needs broad cross-source analysis, code or filesystem inspection, a long multi-step investigation, or public-web facts, return {{\"kind\":\"escalate\",\"mode\":\"deep\",\"reason\":\"one short sentence saying what is needed\",\"preface\":\"optional one-sentence partial answer from the facts you do have\"}} with mode deep for local cross-source analysis on the stronger tool-backed model, or mode web for public-web research. An escalation is a permission request shown to the administrator with approve/deny buttons; it runs nothing by itself, so never claim that the deeper work started. Prefer escalate over an answer that merely lists what you cannot see.\n\
          WHAT_YOU_CAN_DO: you reply on the current surface (Telegram chat, Slack thread or dashboard) with every answer; you read the baseline facts, durable memory and recent conversation; you read the listed local sources and configured GitHub issues; with administrator approval you run deep local analysis, public-web research, MCP tools, Slack posts to other configured channels and the listed native GitHub actions. Never deny a capability listed here; when it needs approval, request it.\n\n\
          When an answer establishes an important stable reusable fact, you may end with one short opt-in question asking whether to add that exact fact to durable memory. Make clear that no memory write happened. Never offer to remember credentials, secrets, personal or customer data, process or job state, timestamps, IDs, logs, queue state, health, or other transient observations; a user who wants a fact stored can confirm explicitly with `remember that <fact>`.\n\
-         This router is one-shot. Never return an answer promising to search, check, send, post, act, or respond later: select the matching read/tool plan now, request an escalation, or return a complete honest answer.\n\n\
+         Each model step must finish synchronously. Never return an answer promising to search, check, send, post, act, or respond later: select the matching read/tool plan now, request an escalation, or return a complete honest answer. Tool results may be returned to a later bounded harness step.\n\n\
          TRUSTED_CURRENT_TRANSPORT\n{transport_context}\nEND_TRUSTED_CURRENT_TRANSPORT\n\n\
          TOOL_AVAILABILITY\nslack_channels={channels}\ngithub_issue_reads={}\ngithub_action_aliases={github_action_catalog}\npreferred_depth={preferred_depth}\nmcp_tools={mcp_catalog}\nescalation_modes=deep,web\nEND_TOOL_AVAILABILITY\n\n\
          BEGIN_BASELINE_FACTS\ncurrent_utc={current_utc}\ntimezone=UTC\n{baseline}\nEND_BASELINE_FACTS\n\n\
@@ -12857,6 +12896,45 @@ fn deserves_escalation(question: &str) -> bool {
         && !is_greeting(question)
         && !is_identity_question(question)
         && !is_current_time_question(question)
+}
+
+/// Decode one provider step without ever presenting malformed control output
+/// as a completed answer.
+///
+/// Plain prose remains an explicit final-answer step for compatibility with
+/// provider adapters that do not support structured output. Once a response
+/// contains JSON control delimiters, however, it must satisfy the closed
+/// intent schema below. A half-written or unknown tool plan fails closed.
+fn model_question_step(
+    answer: &str,
+    forced_profile: Option<QuestionProfile>,
+    question: &str,
+    slack_channels: &[String],
+    mcp_tools: &[McpToolDescriptor],
+    github_action_aliases: &[String],
+) -> ModelQuestionIntent {
+    if let Some(intent) = model_question_intent(
+        answer,
+        forced_profile,
+        question,
+        slack_channels,
+        mcp_tools,
+        github_action_aliases,
+    ) {
+        return intent;
+    }
+    let answer = answer.trim();
+    if !answer.is_empty()
+        && !answer.contains('{')
+        && !answer.contains('}')
+        && !answer
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+        && !is_deferred_placeholder_answer(answer)
+    {
+        return ModelQuestionIntent::Answer(bounded_reply(answer));
+    }
+    ModelQuestionIntent::Refused(String::from(INVALID_MODEL_STEP_REPLY))
 }
 
 fn model_question_intent(
@@ -13675,21 +13753,23 @@ const fn cancel_failure_reply(failure: RunFailure) -> &'static str {
 mod clock_tests {
     use super::{
         CapabilityTarget, ESCALATION_APPROVAL_PREFIX, EscalationMode, GitHubActionRequest,
-        HostLoadSnapshot, MAX_BASELINE_BRIEF_BYTES, MAX_QUESTION_PROMPT_BYTES, McpToolDescriptor,
-        ModelQuestionIntent, PendingSlackPost, PendingSlackPostResolution, QuestionEscalationPlan,
-        QuestionIntentCapabilities, QuestionMcpCallPlan, QuestionProfile, QuestionRuntime,
-        QuestionTimingBreakdown, SlackPostApprovalRegistry, compact_input_schema,
-        deepseek_balance_text, escalation_approval_callback_data, escalation_approval_key,
-        github_issue_references, host_load_text, is_current_time_question,
+        HostLoadSnapshot, INVALID_MODEL_STEP_REPLY, MAX_BASELINE_BRIEF_BYTES,
+        MAX_QUESTION_PROMPT_BYTES, McpToolDescriptor, ModelQuestionIntent, PendingSlackPost,
+        PendingSlackPostResolution, QuestionEscalationPlan, QuestionIntentCapabilities,
+        QuestionMcpCallPlan, QuestionProfile, QuestionRuntime, QuestionTimingBreakdown,
+        SlackPostApprovalRegistry, compact_input_schema, deepseek_balance_text,
+        escalation_approval_callback_data, escalation_approval_key, github_issue_references,
+        host_load_text, is_closed_ticket_inventory_question, is_current_time_question,
         is_deepseek_balance_question, is_enabled_site_inventory_question,
         is_github_repository_inventory_question, is_host_load_followup, is_host_load_question,
         is_named_entity_description_question, is_support_ticket_inventory_followup,
         is_support_ticket_inventory_question, local_entity_terms, local_entity_value_matches,
-        mcp_result_prompt, meminfo_kib, model_question_intent, parse_decimal_milli,
-        parse_escalation_approval_callback, parse_mcp_approval_callback, prism_inventory_reply,
-        question_intent_prompt, question_profile, question_prompt, question_sources,
-        requires_scratchpad_review, set_reply_telemetry, system_capability_question,
-        timed_question_reply, utc_rfc3339_from_unix_millis,
+        mcp_result_prompt, meminfo_kib, model_question_intent, model_question_step,
+        parse_decimal_milli, parse_escalation_approval_callback, parse_mcp_approval_callback,
+        prism_inventory_reply, question_intent_prompt, question_profile, question_prompt,
+        question_sources, requires_scratchpad_review, resolved_support_ticket_read_continuation,
+        set_reply_telemetry, system_capability_question, timed_question_reply,
+        utc_rfc3339_from_unix_millis,
     };
 
     fn no_tool_capabilities() -> QuestionIntentCapabilities<'static> {
@@ -13951,6 +14031,23 @@ mod clock_tests {
         let prompt = mcp_result_prompt("how many?", &plan, &small, false).expect("prompt");
         assert!(prompt.contains(r#"{"count":3,"ok":true}"#));
         assert!(!prompt.contains("truncated"));
+    }
+
+    #[test]
+    fn provider_steps_make_prose_explicit_and_fail_closed_on_malformed_control() {
+        let prose = model_question_step("Hey — I can help with that.", None, "hey", &[], &[], &[]);
+        assert!(matches!(prose, ModelQuestionIntent::Answer(_)));
+
+        for malformed in [
+            r#"{"kind":"read","sources":["tickets"]"#,
+            r#"{"kind":"unknown","answer":"looks plausible"}"#,
+            r#"prefix {"kind":"answer"} trailing {"kind":"read"}"#,
+        ] {
+            assert!(matches!(
+                model_question_step(malformed, None, "question", &[], &[], &[]),
+                ModelQuestionIntent::Refused(answer) if answer == INVALID_MODEL_STEP_REPLY
+            ));
+        }
     }
 
     #[test]
@@ -14534,6 +14631,45 @@ mod clock_tests {
     }
 
     #[test]
+    fn short_confirmation_reuses_only_a_prior_read_only_ticket_inventory() {
+        let telegram = "[recent_conversation]\nuser | content_untrusted=Sup. What tickets were done yesterday ?\nassistant | content_untrusted=The visible snapshot is truncated.\n[/recent_conversation]";
+        assert_eq!(
+            resolved_support_ticket_read_continuation("do it", telegram).as_deref(),
+            Some("Sup. What tickets were done yesterday ?")
+        );
+
+        let slack = "[recent conversation]\nuser: what tickets were done yesterday?\nassistant: the snapshot is truncated\nuser: do it";
+        assert_eq!(
+            resolved_support_ticket_read_continuation("do it", slack).as_deref(),
+            Some("what tickets were done yesterday?")
+        );
+
+        let mutation = "[recent_conversation]\nuser | content_untrusted=close ticket 42\nassistant | content_untrusted=confirmation needed\n[/recent_conversation]";
+        assert!(resolved_support_ticket_read_continuation("do it", mutation).is_none());
+        let intervening = "[recent_conversation]\nuser | content_untrusted=what tickets were done yesterday?\nassistant | content_untrusted=the snapshot is truncated\nuser | content_untrusted=what can you do?\nassistant | content_untrusted=I can answer operational questions\n[/recent_conversation]";
+        assert!(resolved_support_ticket_read_continuation("do it", intervening).is_none());
+        assert!(resolved_support_ticket_read_continuation("do it", "").is_none());
+    }
+
+    #[test]
+    fn completed_ticket_questions_select_the_closed_ticket_view() {
+        for question in [
+            "What tickets were done yesterday?",
+            "Which tickets are closed?",
+            "Quels tickets ont été traités hier ?",
+        ] {
+            assert!(
+                is_closed_ticket_inventory_question(question),
+                "{question:?}"
+            );
+        }
+        assert!(!is_closed_ticket_inventory_question(
+            "What tickets are still open?"
+        ));
+        assert!(!is_closed_ticket_inventory_question("close ticket 42"));
+    }
+
+    #[test]
     fn scratchpad_review_intent_is_closed_to_code_or_unbounded_local_reads() {
         for question in [
             "write a Python script to summarize these logs",
@@ -15088,7 +15224,7 @@ impl StoreControlSurface {
         let Some(store) = self.ticket_store()? else {
             return Ok(String::from(TICKETS_NOT_ENABLED));
         };
-        let selection = select_question_tickets(store, BASELINE_TICKETS_LISTED)?;
+        let selection = select_question_tickets(store, BASELINE_TICKETS_LISTED, false)?;
         if selection.tickets.is_empty() {
             return Ok(String::from(NO_TICKETS_RECORDED));
         }
@@ -16202,7 +16338,11 @@ impl ControlSurface for StoreControlSurface {
                 match self.ticket_store()? {
                     None => (false, 0_usize, 0_usize, String::new(), Vec::new()),
                     Some(store) => {
-                        let selection = select_question_tickets(store, QUESTION_TICKETS_LISTED)?;
+                        let selection = select_question_tickets(
+                            store,
+                            QUESTION_TICKETS_LISTED,
+                            is_closed_ticket_inventory_question(question),
+                        )?;
                         (
                             true,
                             selection.total,
@@ -16269,10 +16409,10 @@ impl ControlSurface for StoreControlSurface {
              tracking_enabled={}\n\
              included={}\n\
              total_recorded={}\n\
-             older_rows_omitted={}\n\
+             rows_omitted={}\n\
              open_total={}\n\
              lifecycle_counts={}\n\
-             row_order=open tickets newest first, then closed tickets newest first; an open ticket is any lifecycle other than closed\n",
+             row_order={}\n",
             if sources.status { "yes" } else { "no" },
             if sources.host_load { "yes" } else { "no" },
             if sources.operators { "yes" } else { "no" },
@@ -16321,6 +16461,11 @@ impl ControlSurface for StoreControlSurface {
             total_tickets.saturating_sub(tickets.len()),
             open_total,
             lifecycle_counts,
+            if is_closed_ticket_inventory_question(question) {
+                "closed tickets newest first; open rows excluded by the question's completion focus"
+            } else {
+                "open tickets newest first, then closed tickets newest first; an open ticket is any lifecycle other than closed"
+            },
         );
         for ticket in &tickets {
             context.push_str(&format!(
@@ -16539,8 +16684,9 @@ const OPEN_TICKET_LIFECYCLES: [TicketLifecycle; 4] = [
 fn select_question_tickets(
     store: &SupportTicketStore,
     limit: usize,
+    closed_focus: bool,
 ) -> Result<QuestionTicketSelection, SurfaceRefusal> {
-    const MAX_OPEN_TICKET_SCAN: usize = 4_096;
+    const MAX_TICKET_SCAN: usize = 4_096;
     let total = store
         .ticket_count()
         .map_err(|_| SurfaceRefusal::Unavailable)?;
@@ -16566,7 +16712,7 @@ fn select_question_tickets(
         let count = page.tickets.len();
         open.extend(page.tickets);
         match next_cursor {
-            Some(next) if count > 0 && open.len() < MAX_OPEN_TICKET_SCAN && next > cursor => {
+            Some(next) if count > 0 && open.len() < MAX_TICKET_SCAN && next > cursor => {
                 cursor = next;
             }
             _ => break,
@@ -16587,6 +16733,31 @@ fn select_question_tickets(
         .join(" ");
     let open_total = open.len();
     let lifecycle_counts = format!("{counts} closed={}", total.saturating_sub(open_total));
+    if closed_focus {
+        let mut closed = Vec::new();
+        let mut cursor = range.first.saturating_sub(1);
+        loop {
+            let page = store
+                .page_in_lifecycles(cursor, page_size, &[TicketLifecycle::Closed])
+                .map_err(|_| SurfaceRefusal::Unavailable)?;
+            let next_cursor = page.next_cursor;
+            let count = page.tickets.len();
+            closed.extend(page.tickets);
+            match next_cursor {
+                Some(next) if count > 0 && closed.len() < MAX_TICKET_SCAN && next > cursor => {
+                    cursor = next;
+                }
+                _ => break,
+            }
+        }
+        closed.sort_by(|left, right| right.ticket_id.cmp(&left.ticket_id));
+        return Ok(QuestionTicketSelection {
+            total,
+            open_total,
+            lifecycle_counts,
+            tickets: closed.into_iter().take(limit).collect(),
+        });
+    }
     open.sort_by(|left, right| right.ticket_id.cmp(&left.ticket_id));
     let mut tickets: Vec<TicketRecord> = open.into_iter().take(limit).collect();
     if tickets.len() < limit {
