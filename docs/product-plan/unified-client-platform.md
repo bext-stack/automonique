@@ -175,7 +175,7 @@ architecture and acceptance contract.
 
 <!-- TRACKING_LINKS_START -->
 - Central epic: [bext-stack/automonique#66](https://github.com/bext-stack/automonique/issues/66)
-- Documentation PR: pending GitHub pull request creation
+- Documentation PR: [bext-stack/automonique#74](https://github.com/bext-stack/automonique/pull/74)
 
 | Repository | Milestone | Issues |
 |---|---|---|
