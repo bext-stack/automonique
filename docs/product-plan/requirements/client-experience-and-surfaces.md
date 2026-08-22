@@ -34,6 +34,13 @@ Remote authentication supports OIDC/Entra-compatible providers and scoped servic
 
 The native desktop client is ShellDeck (`github.com/benfavre/shelldeck`), an owner-controlled Rust/GPUI application maintained in its own MIT repository. It consumes the typed admin/SDK protocols through the same shared Rust client crate as the TUI, embeds no daemon policy, and must pass the same semantic conformance suite as every other surface before presenting itself as the Automonique desktop. The core production daemon remains Linux-first. Linux and macOS are the primary desktop targets; until a Windows build passes conformance, Windows users are served by the dashboard/PWA as a clearly weaker named profile, never an equivalent desktop claim.
 
+ShellDeck is a client, not a second fleet execution authority. Its existing
+direct provider job executor remains only for staged compatibility and is
+removed automatically once the shared-client path covers every consumer and
+the cross-repository conformance plus live vertical-slice gates pass. ShellDeck
+may launch a separately installed Automonique node, but cannot replace its
+sandbox, receipt, approval or provider-session authority inside the UI process.
+
 Desktop capabilities include:
 
 - streaming multi-tab/multi-window chat and cross-profile sessions;

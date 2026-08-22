@@ -77,6 +77,22 @@ The Rust domain schema is authoritative. SDKs and integrations are generated or
 implemented under `sdk/` and `integrations/` and therefore use Apache-2.0;
 product code remains Elastic-2.0.
 
+## Federated platform boundary
+
+AI Operations and Automonique retain distinct authority while sharing one
+generated client contract. AI Operations owns global jobs, release approvals,
+node registration and assignment. An Automonique node owns local execution,
+sandbox/credential admission, provider sessions, ordered events, local action
+receipts and controller leases. Cross-authority projections always name their
+source; neither side infers the other's state from transport or presentation.
+
+The maintained JCode fork supplies a dual-mode terminal client and provider
+engine. Managed mode speaks only through the shared Automonique client for
+control. ShellDeck and `monique.1clic.pro` consume the same services and view
+models; ShellDeck does not retain a second provider-job executor. The complete
+migration and repository ownership plan is in
+[`unified-client-platform.md`](unified-client-platform.md).
+
 ## Recovery posture
 
 Correctness wins over availability. Ambiguous effects block and reconcile.
