@@ -47,7 +47,7 @@ jobs:
 
       # node is here for `npx`, which is what resolves the pinned compiler out
       # of the package's own node_modules.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24.19.0
 
