@@ -35,6 +35,7 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use automonique_core::conversation::utc_rfc3339_from_unix_millis;
 use automonique_github_connector::{
     CommentId, CommentRequest, CreateIssueRequest, DatabaseId, GetCommentsRequest,
     GetIssueCommentRequest, GetIssueRequest, GetRepositoryRequest, GitHubBase, GitHubClient,
@@ -68,6 +69,39 @@ const MAX_ACTION_COMMENTS: u32 = 1_000;
 const PAGE_SIZE: u32 = 100;
 const GH_EXECUTABLE: &str = "/usr/bin/gh";
 const GH_CREDENTIAL: &str = "gh-cli-active-account";
+const UTC_DAY_MILLIS: i64 = 86_400_000;
+
+/// Closed push-activity windows accepted by the GitHub read surface.
+///
+/// Conversation text is mapped to one of these before the surface is called;
+/// no model-produced timestamp or date arithmetic reaches the filter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepositoryActivityWindow {
+    /// Every configured repository whose last push predates the snapshot.
+    All,
+    /// Monday 00:00 UTC through the snapshot instant.
+    ThisWeek,
+    /// Current UTC day through the snapshot instant.
+    Today,
+    /// The complete previous UTC calendar day.
+    Yesterday,
+    /// The rolling seven days ending at the snapshot instant.
+    Last7Days,
+}
+
+impl RepositoryActivityWindow {
+    /// Stable rendering used in bounded facts and tool schemas.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::ThisWeek => "this_week",
+            Self::Today => "today",
+            Self::Yesterday => "yesterday",
+            Self::Last7Days => "last_7_days",
+        }
+    }
+}
 
 /// An allowlisted issue source plus explicitly configured typed actions.
 pub trait GitHubSurface: Send {
@@ -78,14 +112,18 @@ pub trait GitHubSurface: Send {
         Vec::new()
     }
 
-    /// Read push activity for the locally allowlisted repositories since one
-    /// exact UTC instant.
+    /// Read push activity for the locally allowlisted repositories in one
+    /// closed host-computed UTC window.
     ///
     /// The safe default keeps injected issue-only surfaces issue-only. The
     /// production workspace implements this with one fixed-origin typed
     /// repository-metadata read per configured repository; it never expands
     /// credential scope into an account- or organization-wide inventory.
-    fn repository_push_activity_since(&mut self, _since: &str) -> Result<String, String> {
+    fn repository_push_activity(
+        &mut self,
+        _window: RepositoryActivityWindow,
+        _now_ms: i64,
+    ) -> Result<String, String> {
         Err(String::from(
             "status=unavailable reason=github_repository_activity_unavailable",
         ))
@@ -908,9 +946,13 @@ impl GitHubSurface for GitHubWorkspace {
         self.repositories.iter().map(ToString::to_string).collect()
     }
 
-    fn repository_push_activity_since(&mut self, since: &str) -> Result<String, String> {
-        let since_key = utc_timestamp_sort_key(since)
-            .ok_or_else(|| String::from("status=refused reason=github_activity_since_invalid"))?;
+    fn repository_push_activity(
+        &mut self,
+        window: RepositoryActivityWindow,
+        now_ms: i64,
+    ) -> Result<String, String> {
+        let bounds = RepositoryActivityBounds::new(window, now_ms)
+            .ok_or_else(|| String::from("status=refused reason=github_activity_clock_invalid"))?;
         if self.repositories.is_empty() {
             return Err(String::from(
                 "status=refused reason=github_repository_allowlist_empty",
@@ -945,13 +987,13 @@ impl GitHubSurface for GitHubWorkspace {
                 unavailable.push(format!("{target}:pushed_at_invalid"));
                 continue;
             };
-            if pushed_key >= since_key {
+            if bounds.contains(&pushed_key) {
                 active.push((target.to_string(), repository.pushed_at));
             }
         }
 
         Ok(render_repository_push_activity(
-            since,
+            &bounds,
             self.repositories.len(),
             &active,
             &unavailable,
@@ -1186,7 +1228,10 @@ fn utc_timestamp_sort_key(value: &str) -> Option<String> {
         String::from("000")
     } else {
         let digits = fraction.strip_prefix('.')?;
-        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        if digits.is_empty()
+            || digits.len() > 3
+            || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        {
             return None;
         }
         format!("{digits:0<3}").chars().take(3).collect()
@@ -1194,16 +1239,69 @@ fn utc_timestamp_sort_key(value: &str) -> Option<String> {
     Some(format!("{base}.{milliseconds}Z"))
 }
 
+/// One exact half-open UTC interval, computed solely from the injected clock.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RepositoryActivityBounds {
+    window: RepositoryActivityWindow,
+    lower_inclusive: Option<String>,
+    upper_exclusive: String,
+}
+
+impl RepositoryActivityBounds {
+    fn new(window: RepositoryActivityWindow, now_ms: i64) -> Option<Self> {
+        if now_ms < 0 {
+            return None;
+        }
+        let today_ms = now_ms.checked_sub(now_ms.rem_euclid(UTC_DAY_MILLIS))?;
+        let lower_ms = match window {
+            RepositoryActivityWindow::All => None,
+            RepositoryActivityWindow::ThisWeek => {
+                let unix_day = today_ms.div_euclid(UTC_DAY_MILLIS);
+                // 1970-01-01 was Thursday: three complete days after Monday.
+                let days_since_monday = (unix_day + 3).rem_euclid(7);
+                Some(today_ms.checked_sub(days_since_monday * UTC_DAY_MILLIS)?)
+            }
+            RepositoryActivityWindow::Today => Some(today_ms),
+            RepositoryActivityWindow::Yesterday => Some(today_ms.checked_sub(UTC_DAY_MILLIS)?),
+            RepositoryActivityWindow::Last7Days => Some(now_ms.checked_sub(7 * UTC_DAY_MILLIS)?),
+        };
+        let upper_ms = if window == RepositoryActivityWindow::Yesterday {
+            today_ms
+        } else {
+            now_ms
+        };
+        let lower_inclusive = match lower_ms {
+            Some(milliseconds) => Some(utc_rfc3339_from_unix_millis(milliseconds)?),
+            None => None,
+        };
+        let upper_exclusive = utc_rfc3339_from_unix_millis(upper_ms)?;
+        Some(Self {
+            window,
+            lower_inclusive,
+            upper_exclusive,
+        })
+    }
+
+    fn contains(&self, pushed_key: &str) -> bool {
+        self.lower_inclusive
+            .as_ref()
+            .is_none_or(|lower| pushed_key >= lower.as_str())
+            && pushed_key < self.upper_exclusive.as_str()
+    }
+}
+
 /// Render a bounded, provenance-explicit projection for conversational use.
 fn render_repository_push_activity(
-    since: &str,
+    bounds: &RepositoryActivityBounds,
     checked: usize,
     active: &[(String, String)],
     unavailable: &[String],
 ) -> String {
     let mut facts = format!(
-        "status=available\nscope=configured_repository_allowlist\nactivity_basis=github_repository_pushed_at\nsince={}\nrepositories_checked={checked}\nrepositories_with_push_activity={}",
-        single_line(since),
+        "status=available\nscope=configured_repository_allowlist\nactivity_basis=github_repository_pushed_at\nwindow={}\nlower_inclusive={}\nupper_exclusive={}\nrepositories_checked={checked}\nrepositories_with_push_activity={}",
+        bounds.window.as_str(),
+        bounds.lower_inclusive.as_deref().unwrap_or("unbounded"),
+        bounds.upper_exclusive,
         active.len(),
     );
     for (repository, pushed_at) in active {
@@ -2788,8 +2886,11 @@ mod tests {
 
     #[test]
     fn repository_activity_projection_names_its_allowlisted_push_scope() {
+        let bounds =
+            RepositoryActivityBounds::new(RepositoryActivityWindow::Last7Days, 1_787_423_040_000)
+                .expect("bounds");
         let facts = render_repository_push_activity(
-            "2026-08-15T18:24:00.000Z",
+            &bounds,
             3,
             &[
                 (
@@ -2805,12 +2906,63 @@ mod tests {
         );
         assert!(facts.contains("scope=configured_repository_allowlist"));
         assert!(facts.contains("activity_basis=github_repository_pushed_at"));
+        assert!(facts.contains("window=last_7_days"));
+        assert!(facts.contains("lower_inclusive=2026-08-15T18:24:00.000Z"));
+        assert!(facts.contains("upper_exclusive=2026-08-22T18:24:00.000Z"));
         assert!(facts.contains("repositories_checked=3"));
         assert!(facts.contains("repositories_with_push_activity=2"));
         assert!(facts.contains("active_repository=example/active pushed_at=2026-08-21T17:04:11Z"));
         assert!(facts.contains("repositories_unavailable=1"));
         assert!(facts.contains("not an organization-wide inventory"));
         assert!(facts.contains("not issue, project, or local unpushed work"));
+    }
+
+    #[test]
+    fn repository_activity_windows_are_host_computed_and_half_open() {
+        let now_ms = 1_787_423_040_000;
+        let cases = [
+            (RepositoryActivityWindow::All, None),
+            (
+                RepositoryActivityWindow::ThisWeek,
+                Some("2026-08-17T00:00:00.000Z"),
+            ),
+            (
+                RepositoryActivityWindow::Today,
+                Some("2026-08-22T00:00:00.000Z"),
+            ),
+            (
+                RepositoryActivityWindow::Yesterday,
+                Some("2026-08-21T00:00:00.000Z"),
+            ),
+            (
+                RepositoryActivityWindow::Last7Days,
+                Some("2026-08-15T18:24:00.000Z"),
+            ),
+        ];
+        for (window, lower) in cases {
+            let bounds = RepositoryActivityBounds::new(window, now_ms).expect("bounds");
+            assert_eq!(bounds.lower_inclusive.as_deref(), lower, "{window:?}");
+            let upper = if window == RepositoryActivityWindow::Yesterday {
+                "2026-08-22T00:00:00.000Z"
+            } else {
+                "2026-08-22T18:24:00.000Z"
+            };
+            assert_eq!(bounds.upper_exclusive, upper, "{window:?}");
+            assert!(!bounds.contains(upper), "upper bound is exclusive");
+        }
+
+        let this_week = RepositoryActivityBounds::new(RepositoryActivityWindow::ThisWeek, now_ms)
+            .expect("this week");
+        assert!(this_week.contains("2026-08-21T17:04:11.000Z"));
+        assert!(!this_week.contains("2019-06-01T12:00:00.000Z"));
+        assert!(!this_week.contains("2026-08-16T23:59:59.999Z"));
+
+        let yesterday = RepositoryActivityBounds::new(RepositoryActivityWindow::Yesterday, now_ms)
+            .expect("yesterday");
+        assert!(yesterday.contains("2026-08-21T00:00:00.000Z"));
+        assert!(yesterday.contains("2026-08-21T23:59:59.999Z"));
+        assert!(!yesterday.contains("2026-08-22T00:00:00.000Z"));
+        assert!(RepositoryActivityBounds::new(RepositoryActivityWindow::All, -1).is_none());
     }
 
     #[test]

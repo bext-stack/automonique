@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use automonique_daemon::github::{
     GitHubActionSurface, GitHubIssueContext, GitHubMutationReceipt, GitHubSurface, IssueFactDetail,
+    RepositoryActivityWindow,
 };
 use automonique_daemon::slack::SLACK_NOT_CONFIGURED;
 use automonique_daemon::telegram_bridge::{
@@ -1155,7 +1156,7 @@ impl SlackSurface for FakeSlack {
 #[derive(Clone, Default)]
 struct FakeGitHub {
     seen: Arc<Mutex<Vec<String>>>,
-    activity_since: Arc<Mutex<Vec<String>>>,
+    activity_reads: Arc<Mutex<Vec<(RepositoryActivityWindow, i64)>>>,
     actions: Arc<Mutex<Vec<(String, String)>>>,
 }
 
@@ -1164,8 +1165,8 @@ impl FakeGitHub {
         self.seen.lock().expect("github seen").clone()
     }
 
-    fn activity_since(&self) -> Vec<String> {
-        self.activity_since.lock().expect("github activity").clone()
+    fn activity_reads(&self) -> Vec<(RepositoryActivityWindow, i64)> {
+        self.activity_reads.lock().expect("github activity").clone()
     }
 }
 
@@ -1174,13 +1175,23 @@ impl GitHubSurface for FakeGitHub {
         vec![String::from("example/read-repo")]
     }
 
-    fn repository_push_activity_since(&mut self, since: &str) -> Result<String, String> {
-        self.activity_since
+    fn repository_push_activity(
+        &mut self,
+        window: RepositoryActivityWindow,
+        now_ms: i64,
+    ) -> Result<String, String> {
+        self.activity_reads
             .lock()
             .expect("github activity")
-            .push(since.to_owned());
+            .push((window, now_ms));
+        let legacy = if window == RepositoryActivityWindow::All {
+            "\nactive_repository=example/legacy pushed_at=2019-06-14T09:00:00Z"
+        } else {
+            ""
+        };
         Ok(format!(
-            "status=available\nscope=configured_repository_allowlist\nactivity_basis=github_repository_pushed_at\nsince={since}\nrepositories_checked=2\nrepositories_with_push_activity=2\nactive_repository=example/active pushed_at=2026-08-21T17:04:11Z\nactive_repository=example/older pushed_at=2026-08-10T09:00:00Z\nrepositories_unavailable=0\nscope_note=This is the configured local allowlist, not an organization-wide inventory. pushed_at proves Git push activity, not issue, project, or local unpushed work."
+            "status=available\nscope=configured_repository_allowlist\nactivity_basis=github_repository_pushed_at\nwindow={}\nrepositories_checked=2\nrepositories_with_push_activity=1\nactive_repository=example/active pushed_at=2026-08-21T17:04:11Z{legacy}\nrepositories_unavailable=0\nscope_note=This is the configured local allowlist, not an organization-wide inventory. pushed_at proves Git push activity, not issue, project, or local unpushed work.",
+            window.as_str()
         ))
     }
 
@@ -2305,7 +2316,7 @@ fn configured_repository_activity_is_an_automatic_typed_read_with_clocked_synthe
     let github = FakeGitHub::default();
     let outbound = FakeOutbound::default();
     let lane = FakeRunLane::answering_sequence(&[
-        r#"{"kind":"read","sources":[],"slack_channel":null,"github_issues":false,"github_repository_activity":true,"depth":"fast"}"#,
+        r#"{"kind":"read","sources":[],"slack_channel":null,"github_issues":false,"github_repository_activity":"this_week","depth":"fast"}"#,
         "example/active had Git push activity this week in the configured repository allowlist.",
     ]);
     let mut bridge = bridge_with_sources(
@@ -2330,21 +2341,31 @@ fn configured_repository_activity_is_an_automatic_typed_read_with_clocked_synthe
     );
     assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
     assert_eq!(
-        github.activity_since(),
-        ["1970-01-01T00:00:00Z"],
-        "the typed surface returns the full bounded allowlist projection so the answer model can apply the relative window"
+        github
+            .activity_reads()
+            .iter()
+            .map(|(window, _)| *window)
+            .collect::<Vec<_>>(),
+        [RepositoryActivityWindow::ThisWeek],
+        "the host receives the closed semantic window selected by the router"
+    );
+    assert!(
+        github.activity_reads()[0].1 > 0,
+        "the accepted host clock is injected"
     );
     assert!(github.seen().is_empty(), "no issue read was selected");
     let prompts = lane.tasks();
     assert_eq!(prompts.len(), 2);
-    assert!(prompts[0].contains("github_repository_activity (boolean)"));
+    assert!(prompts[0].contains("github_repository_activity (one of all, this_week"));
     assert!(prompts[0].contains("github_repository_activity_read=yes"));
-    assert!(prompts[0].contains("configured-repository inventory or activity questions"));
-    assert!(prompts[0].contains("time-window questions resolved from recent conversation"));
+    assert!(prompts[0].contains("Use all for a pure configured-repository inventory"));
+    assert!(prompts[0].contains("including windows resolved from recent conversation"));
     assert!(prompts[1].contains("[live_github_repository_push_activity]"));
+    assert!(prompts[1].contains("selected_window=this_week"));
     assert!(prompts[1].contains("current_utc="));
     assert!(prompts[1].contains("active_repository=example/active"));
-    assert!(prompts[1].contains("active_repository=example/older"));
+    assert!(!prompts[1].contains("2019-06-14"));
+    assert!(!prompts[1].contains("example/legacy"));
     assert!(prompts[1].contains("not an organization-wide inventory"));
     assert!(outbound.messages()[0].contains("example/active"));
 }

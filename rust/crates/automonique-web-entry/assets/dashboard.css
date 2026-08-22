@@ -684,10 +684,21 @@ h2 { margin-bottom: 0; font-size: var(--font-title); font-weight: 580; letter-sp
 .button.primary:hover { border-color: var(--green); filter: brightness(1.08); }
 .button:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
 
-.attention-bar { display: grid; grid-template-columns: minmax(190px, auto) 1fr auto; gap: 20px; align-items: center; min-height: 64px; padding: 0 20px; border: 1px solid var(--success-border); border-radius: var(--radius-md); background: var(--success-surface); }
-.attention-bar > div { display: flex; gap: 10px; align-items: center; }
+.attention-bar { display: grid; grid-template-columns: minmax(190px, auto) 1fr auto; gap: 14px 20px; align-items: center; min-height: 64px; padding: 12px 20px; border: 1px solid var(--success-border); border-radius: var(--radius-md); background: var(--success-surface); }
+.attention-heading, .attention-actions { display: flex; gap: 10px; align-items: center; }
+.attention-actions { justify-content: flex-end; }
+.attention-actions button { min-height: 30px; padding: 0 9px; border: 1px solid var(--success-border); border-radius: 7px; color: var(--success-muted); background: transparent; font-size: var(--font-xs); cursor: pointer; }
+.attention-actions button:hover:not(:disabled) { border-color: var(--green); color: var(--text); }
+.attention-actions button:disabled { opacity: .55; cursor: default; }
 .attention-bar strong { font-size: var(--font-lg); }
 .attention-bar p { margin: 0; color: var(--success-muted); font-size: var(--font-md); }
+.attention-list { display: grid; grid-column: 1 / -1; gap: 1px; margin: 0; padding: 0; overflow: hidden; border: 1px solid var(--success-border); border-radius: 9px; background: var(--success-border); list-style: none; }
+.attention-list[hidden] { display: none; }
+.attention-list li { display: grid; grid-template-columns: minmax(170px, .75fr) minmax(240px, 1.5fr) auto; gap: 12px; align-items: center; padding: 10px 12px; background: var(--panel); }
+.attention-list strong { font-size: var(--font-sm); }
+.attention-list span { color: var(--muted); font-size: var(--font-xs); }
+.attention-list a { color: var(--green); font-size: var(--font-xs); text-decoration: none; white-space: nowrap; }
+.attention-list a:hover { text-decoration: underline; }
 .mono { color: var(--muted); font: var(--font-sm) ui-monospace, monospace; letter-spacing: .1em; }
 .metric-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; margin-top: 14px; }
 .metric-grid article { position: relative; min-height: 126px; padding: 20px; border: 1px solid var(--line); border-radius: var(--radius-md); background: linear-gradient(145deg, var(--metric-start), var(--metric-end)); overflow: hidden; transition: border-color .16s ease, transform .16s ease; }
@@ -1013,6 +1024,11 @@ kbd { padding: 1px 4px; border: 1px solid var(--line-bright); border-bottom-colo
 .process-card.status-running .process-reference > i { background: var(--green); box-shadow: 0 0 0 4px var(--accent-glow); animation: integration-pulse 1.4s ease-in-out infinite; }
 .process-card.status-pending .process-reference > i { background: var(--blue); box-shadow: 0 0 0 3px var(--info-surface); }
 .process-card.status-failed .process-reference > i { background: var(--red); box-shadow: 0 0 0 3px var(--danger-surface); }
+.process-card.is-child .process-reference { padding-inline-start: 16px; }
+.process-card.is-child.depth-2 .process-reference { padding-inline-start: 32px; }
+.process-card.is-child.depth-3 .process-reference { padding-inline-start: 48px; }
+.process-card.is-child.depth-4 .process-reference { padding-inline-start: 64px; }
+.process-card.is-child .process-reference::before { color: var(--quiet); content: "↳"; font: var(--font-sm) ui-monospace, monospace; }
 .process-reference div, .process-execution, .process-timing { min-width: 0; }
 .process-reference strong, .process-reference small, .process-execution strong, .process-timing strong, .process-timing small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .process-reference strong { font: 650 var(--font-md) ui-monospace, monospace; }
@@ -1443,6 +1459,8 @@ html[data-health="unavailable"] .attention-bar { border-color: var(--danger-bord
   .heading-actions .tag { display: inline-flex; }
   .attention-bar { grid-template-columns: 1fr auto; padding: 12px 14px; }
   .attention-bar p { grid-column: 1 / -1; }
+  .attention-list li { grid-template-columns: 1fr auto; }
+  .attention-list li span { grid-column: 1 / -1; grid-row: 2; }
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
   .operations-metrics { grid-template-columns: repeat(2, 1fr); }
   .process-monitor-head { align-items: flex-start; flex-direction: column; padding-top: 14px; padding-bottom: 14px; }
@@ -1546,6 +1564,10 @@ html[data-health="unavailable"] .attention-bar { border-color: var(--danger-bord
   .process-worker-status { justify-self: start; }
   .process-worker-facts, .process-details { grid-template-columns: 1fr; }
   .process-row { grid-template-columns: 1fr; }
+  .process-card.is-child .process-reference { padding-inline-start: 10px; }
+  .process-card.is-child.depth-2 .process-reference { padding-inline-start: 20px; }
+  .process-card.is-child.depth-3 .process-reference { padding-inline-start: 30px; }
+  .process-card.is-child.depth-4 .process-reference { padding-inline-start: 40px; }
   .process-lifecycle { grid-column: 1; }
   .ticket-metrics { grid-template-columns: 1fr 1fr; }
   .ticket-metrics .ticket-metric:last-child { grid-column: 1 / -1; }

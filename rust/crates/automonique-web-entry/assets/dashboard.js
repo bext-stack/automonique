@@ -1128,14 +1128,68 @@ function toast(message, kind = "info") {
 }
 
 function attention(status) {
-  const issues = [];
-  if (status.health !== "operational") issues.push("runtime health");
-  if (status.stale) issues.push("stale snapshot");
-  if ((status.reconciliation_pending || 0) > 0) issues.push("reconciliation");
-  if ((status.outbox_ambiguous || 0) > 0) issues.push("ambiguous effects");
-  if (status.provider_available === false) issues.push("provider lane");
-  if (status.accepting_intake === false) issues.push("intake closed");
-  return [...new Set(issues)];
+  const items = [];
+  const add = (key, title, detail, href = null) => {
+    if (!items.some((item) => item.key === key)) items.push({ key, title, detail, href });
+  };
+  if (status.health !== "operational") add("runtime", "Runtime health", `Daemon status is ${status.health || "unavailable"}.`);
+  if (status.stale) add("stale", "Stale daemon snapshot", "The dashboard has not received a current daemon status snapshot.");
+  if ((status.reconciliation_pending || 0) > 0) add("reconciliation", "Reconciliation required", `${count(status.reconciliation_pending)} daemon run or delivery outcome(s) need reconciliation.`);
+  if ((status.outbox_ambiguous || 0) > 0) add("ambiguous", "Ambiguous deliveries", `${count(status.outbox_ambiguous)} outbox effect(s) have an uncertain delivery outcome.`);
+  if (status.provider_available === false) add("provider", "Provider lane unavailable", "The daemon reports no available provider lane.");
+  if (status.accepting_intake === false) add("intake", "Intake closed", "The daemon is not accepting new work.");
+  if (processesSnapshot?.health === "stale") add("manage-stale", "Stale Manage process snapshot", "Manage process state is older than the dashboard freshness window.");
+  const manageJobs = Array.isArray(processesSnapshot?.jobs) && ["ready", "degraded"].includes(processesSnapshot.health) ? processesSnapshot.jobs : [];
+  manageJobs.filter((job) => job.status === "failed").slice(0, 5).forEach((job) => {
+    add(
+      `manage:${job.id}`,
+      `Manage job ${shortProcessReference(job.id)} failed`,
+      "Manage control-plane state; inspect its issue or process record for authoritative delivery evidence.",
+      safeTicketLink(job.manage_url) || safeTicketLink(job.issue_url),
+    );
+  });
+  return items;
+}
+
+function renderAttention(status) {
+  const items = attention(status);
+  const attentionKey = `${status.health}:${items.map((item) => item.key).join("|")}`;
+  if (lastNotifiedAttentionKey !== null && attentionKey !== lastNotifiedAttentionKey && items.length > 0
+      && storedPreference("monique-notifications", ["on", "off"], "off") === "on"
+      && "Notification" in window && Notification.permission === "granted") {
+    new Notification("Monique · attention required", { body: items.map((item) => item.title).join(" · "), tag: "monique-operational-attention" });
+  }
+  lastNotifiedAttentionKey = attentionKey;
+  byId("attention-title").textContent = items.length === 0 ? "All operational invariants hold" : `${items.length} item${items.length === 1 ? "" : "s"} need attention`;
+  byId("attention-detail").textContent = items.length === 0 ? "Provider, intake, delivery certainty and reconciliation are clear." : items.map((item) => item.title).join(" · ");
+  byId("metric-attention").textContent = count(items.length);
+  const list = byId("attention-list");
+  list.replaceChildren();
+  items.forEach((item) => {
+    const row = document.createElement("li");
+    const title = document.createElement("strong");
+    title.textContent = item.title;
+    const detail = document.createElement("span");
+    detail.textContent = item.detail;
+    row.append(title, detail);
+    if (item.href) {
+      const link = document.createElement("a");
+      link.href = item.href;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = "Inspect ↗";
+      row.append(link);
+    }
+    list.append(row);
+  });
+  const toggle = byId("attention-toggle");
+  toggle.disabled = items.length === 0;
+  if (items.length === 0) {
+    toggle.setAttribute("aria-expanded", "false");
+    toggle.textContent = "Details";
+    list.hidden = true;
+  }
+  return items;
 }
 
 function pipelineState(value, danger = false) {
@@ -1208,25 +1262,15 @@ function renderStatus(status) {
   lastStatusSnapshot = status;
   const health = ["operational", "degraded", "unavailable"].includes(status.health) ? status.health : "unavailable";
   document.documentElement.dataset.health = health;
-  const issues = attention(status);
-  const attentionKey = `${health}:${issues.join("|")}`;
-  if (lastNotifiedAttentionKey !== null && attentionKey !== lastNotifiedAttentionKey && issues.length > 0
-      && storedPreference("monique-notifications", ["on", "off"], "off") === "on"
-      && "Notification" in window && Notification.permission === "granted") {
-    new Notification("Monique · attention required", { body: issues.join(" · "), tag: "monique-operational-attention" });
-  }
-  lastNotifiedAttentionKey = attentionKey;
+  const issues = renderAttention(status);
   byId("global-health").textContent = health;
   byId("generation").textContent = `GEN ${count(status.generation)}`;
   byId("footer-state").textContent = `${health.toUpperCase()} / GEN ${count(status.generation)}`;
-  byId("attention-title").textContent = issues.length === 0 ? "All operational invariants hold" : `${issues.length} invariant${issues.length === 1 ? "" : "s"} need attention`;
-  byId("attention-detail").textContent = issues.length === 0 ? "Provider, intake, delivery certainty and reconciliation are clear." : issues.join(" · ");
   byId("metric-running").textContent = count(status.running);
   byId("metric-inbox").textContent = count(status.inbox_pending);
   byId("metric-outbox").textContent = count(status.outbox_pending);
   byId("metric-reconciliation").textContent = count(status.reconciliation_pending);
   byId("metric-ambiguous").textContent = count(status.outbox_ambiguous);
-  byId("metric-attention").textContent = count(issues.length);
   byId("runtime-daemon").textContent = words(status.state);
   byId("runtime-provider").textContent = status.provider_available === true ? "AVAILABLE" : status.provider_available === false ? "UNAVAILABLE" : "—";
   byId("runtime-intake").textContent = yesNo(status.accepting_intake);
@@ -1738,9 +1782,31 @@ function setProcessFilter(filter) {
   });
 }
 
+function processHierarchy(jobs) {
+  const indexed = new Map(jobs.map((job) => [job.id, job]));
+  const children = new Map();
+  jobs.forEach((job) => {
+    if (!job.parent_id || !indexed.has(job.parent_id) || job.parent_id === job.id) return;
+    if (!children.has(job.parent_id)) children.set(job.parent_id, []);
+    children.get(job.parent_id).push(job);
+  });
+  const ordered = [];
+  const visited = new Set();
+  const visit = (job, depth) => {
+    if (visited.has(job.id)) return;
+    visited.add(job.id);
+    ordered.push({ job, depth: Math.min(depth, 4) });
+    (children.get(job.id) || []).forEach((child) => visit(child, depth + 1));
+  };
+  jobs.filter((job) => !job.parent_id || !indexed.has(job.parent_id) || job.parent_id === job.id).forEach((job) => visit(job, 0));
+  jobs.forEach((job) => visit(job, 0));
+  return ordered;
+}
+
 function renderProcesses(view) {
   processesSnapshot = view;
   const jobs = Array.isArray(view.jobs) ? view.jobs : [];
+  if (lastStatusSnapshot) renderAttention(lastStatusSnapshot);
   const health = String(view.health || "unavailable");
   byId("processes-health").textContent = health.toUpperCase();
   byId("processes-health").dataset.state = health;
@@ -1760,7 +1826,7 @@ function renderProcesses(view) {
     completed: jobs.filter((job) => processMatches(job, "completed")).length,
   };
   Object.entries(filterCounts).forEach(([name, value]) => { byId(`process-filter-${name}`).textContent = count(value); });
-  const visible = jobs.filter((job) => processMatches(job, processFilter));
+  const visible = processHierarchy(jobs).filter(({ job }) => processMatches(job, processFilter));
   byId("process-result-state").textContent = `${visible.length.toLocaleString(localeTag())} of ${jobs.length.toLocaleString(localeTag())} processes`;
   const root = byId("process-list");
   root.replaceChildren();
@@ -1771,9 +1837,12 @@ function renderProcesses(view) {
     root.append(empty);
     return;
   }
-  visible.forEach((job, index) => {
+  visible.forEach(({ job, depth }, index) => {
     const card = document.createElement("article");
     card.className = `process-card status-${job.status}`;
+    if (depth > 0) {
+      card.classList.add("is-child", `depth-${depth}`);
+    }
     const row = document.createElement("div");
     row.className = "process-row";
     const reference = document.createElement("div");
@@ -1805,7 +1874,7 @@ function renderProcesses(view) {
     executionTitle.textContent = executionName || executionState;
     const facts = document.createElement("div");
     facts.className = "process-facts";
-    [operationLabel(job.source), job.assigned_to_worker ? "Assigned to this worker" : "Unassigned from this worker", job.approved ? "Approval recorded" : "No approval recorded", job.status === "running" && job.session_id ? "Live session reported" : job.status === "pending" ? "No active session reported" : null]
+    [job.kind ? operationLabel(job.kind) : null, job.parent_id ? "Observed child process" : null, operationLabel(job.source), job.assigned_to_worker ? "Assigned to this worker" : "Unassigned from this worker", job.approved ? "Approval recorded" : "No approval recorded", job.status === "running" && job.session_id ? "Live session reported" : job.status === "pending" ? "No active session reported" : null]
       .filter(Boolean)
       .forEach((value) => {
         const fact = document.createElement("span");
@@ -1857,6 +1926,8 @@ function renderProcesses(view) {
     details.hidden = true;
     [
       ["Process", job.id],
+      ["Kind", job.kind ? operationLabel(job.kind) : null],
+      ["Parent", job.parent_id],
       ["Issue", job.issue_id],
       ["Session", job.session_id],
       ["Site", job.site_id],
@@ -2294,6 +2365,13 @@ byId("operations-refresh").addEventListener("click", () => {
   loadProcesses({ announce: true });
 });
 byId("processes-refresh").addEventListener("click", () => loadProcesses({ announce: true }));
+byId("attention-toggle").addEventListener("click", () => {
+  const button = byId("attention-toggle");
+  const expanded = button.getAttribute("aria-expanded") === "true";
+  button.setAttribute("aria-expanded", String(!expanded));
+  button.textContent = expanded ? "Details" : "Hide details";
+  byId("attention-list").hidden = expanded;
+});
 document.querySelectorAll("[data-process-filter]").forEach((button) => button.addEventListener("click", () => {
   setProcessFilter(button.dataset.processFilter);
   if (processesSnapshot) renderProcesses(processesSnapshot);
@@ -3434,6 +3512,7 @@ document.addEventListener("keydown", (event) => {
 });
 
 refreshStatus();
+loadProcesses();
 loadConfiguration();
 showView(window.location.hash.slice(1) || storedPreference("monique-start-view", startupViews, "chat"));
 function scheduleStatusRefresh(delay = 10000) {

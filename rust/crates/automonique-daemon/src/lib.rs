@@ -200,6 +200,7 @@ mod systemd;
 mod telegram;
 pub mod telegram_bridge;
 pub mod ticket_intake;
+mod ticket_presentation;
 pub mod ticket_work;
 pub mod work_brief;
 pub mod work_method;

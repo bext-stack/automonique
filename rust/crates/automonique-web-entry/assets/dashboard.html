@@ -8,8 +8,8 @@
     <meta name="theme-color" id="theme-color" content="#0b0d10">
     <title>Monique</title>
     <link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=12">
-    <script src="/assets/dashboard.js?v=12" defer></script>
+    <link rel="stylesheet" href="/assets/dashboard.css?v=13">
+    <script src="/assets/dashboard.js?v=13" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -65,9 +65,10 @@
             </div>
 
             <div class="attention-bar" id="attention-bar">
-              <div><span class="status-dot"></span><strong id="attention-title">Establishing snapshot</strong></div>
+              <div class="attention-heading"><span class="status-dot"></span><strong id="attention-title">Establishing snapshot</strong></div>
               <p id="attention-detail">Waiting for the daemon’s sanitized operational projection.</p>
-              <span class="mono" id="generation">GEN —</span>
+              <div class="attention-actions"><span class="mono" id="generation">GEN —</span><button id="attention-toggle" type="button" aria-controls="attention-list" aria-expanded="false" disabled>Details</button></div>
+              <ul class="attention-list" id="attention-list" aria-label="Items requiring attention" hidden></ul>
             </div>
 
             <div class="metric-grid" aria-label="Operational counters">

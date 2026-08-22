@@ -129,6 +129,7 @@ use crate::telegram_bridge::{
     answer_typed_github_issue_question, mcp_approval_preview, mcp_result_prompt,
     run_question_to_completion,
 };
+use crate::ticket_presentation::ticket_heading;
 
 /// Configuration path beneath the daemon's private state directory.
 const CONFIG_RELATIVE: &str = "slack/slack.conf";
@@ -3127,7 +3128,8 @@ fn channel_ticket_audit_text(
 fn slack_ticket_status_text(status: &automonique_support_connector::TicketStatus) -> String {
     let short = status.job_id.get(..12).unwrap_or(&status.job_id);
     let mut text = format!(
-        "Monique job `{short}` is {}.\nLast updated: {}",
+        "{}\nMonique job `{short}` is {}.\nLast updated: {}",
+        ticket_heading(status.job_status),
         status.job_status.as_str(),
         status.updated_at
     );
@@ -3171,15 +3173,18 @@ fn slack_ticket_terminal_text(
                     |url| format!("<{url}|View the completion summary on GitHub>"),
                 );
             Some(format!(
-                "✅ <@{requester}> Monique completed the ticket work.\n{destination}\nMonique job `{short}` is done."
+                "{}\n<@{requester}> Monique completed the ticket work.\n{destination}\nMonique job `{short}` is done.",
+                ticket_heading(status.job_status)
             ))
         }
         TicketJobStatus::Failed => Some(format!(
-            "❌ <@{requester}> Monique's ticket work failed.\n<{}|Open the GitHub issue>\nMonique job `{short}` is failed.",
+            "{}\n<@{requester}> Monique's ticket work failed.\n<{}|Open the GitHub issue>\nMonique job `{short}` is failed.",
+            ticket_heading(status.job_status),
             status.issue_url
         )),
         TicketJobStatus::Cancelled => Some(format!(
-            "⛔ <@{requester}> Monique's ticket work was cancelled.\n<{}|Open the GitHub issue>\nMonique job `{short}` is cancelled.",
+            "{}\n<@{requester}> Monique's ticket work was cancelled.\n<{}|Open the GitHub issue>\nMonique job `{short}` is cancelled.",
+            ticket_heading(status.job_status),
             status.issue_url
         )),
         TicketJobStatus::PendingApproval
@@ -8648,6 +8653,7 @@ mod tests {
         );
         let messages = messages.lock().expect("messages");
         let progress = messages.last().expect("progress reply");
+        assert!(progress.starts_with("🔄 Running\n"));
         assert!(progress.contains("Monique job `job-fixture-` is running."));
         assert!(progress.contains("Last updated: 2026-08-17T20:54:00Z"));
         assert!(progress.contains("Implementing the requested change."));
@@ -8707,6 +8713,7 @@ mod tests {
             .collect();
         assert_eq!(completions.len(), 1, "one completion reply: {messages:?}");
         let completion = completions[0];
+        assert!(completion.starts_with("✅ Completed\n"));
         assert!(completion.contains("<@U0REQUEST01>"));
         assert!(completion.contains(
             "<https://github.com/example/project/issues/42#issuecomment-9001|View the completion summary on GitHub>"

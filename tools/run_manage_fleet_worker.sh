@@ -419,6 +419,9 @@ publish_process_snapshot() {
                     else null end),
                 site_id: (.site_id | safe_id),
                 session_id: (.session_id | safe_id),
+                parent_id: (.parent_id | safe_id),
+                kind: (if (.kind | type) == "string" and (.kind | length) > 0 and (.kind | length) <= 64
+                    and (.kind | test("^[A-Za-z0-9._-]+$")) then (.kind | ascii_downcase) else null end),
                 provider: (.claimed_agent | safe_state),
                 runtime: (.claimed_runtime | safe_state),
                 assigned_to_worker: (.instance_id == $instance),
