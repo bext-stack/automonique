@@ -518,6 +518,36 @@ impl AgentToolBroker {
         self.calls_used
     }
 
+    /// Derive the exact downstream idempotency key before an executor can run.
+    ///
+    /// Durable runtime adapters persist this value alongside effect intent.
+    /// The same helper is used by [`Self::invoke`], preventing a preview from
+    /// drifting from the key delivered to the executor.
+    pub(crate) fn planned_idempotency_key(
+        &self,
+        catalog: &GrantedToolCatalog,
+        invocation: &ToolInvocation,
+    ) -> Result<String, ToolDenial> {
+        if catalog.revision != self.revision {
+            return Err(ToolDenial::CatalogStale);
+        }
+        let granted = catalog
+            .descriptors
+            .get(&invocation.tool_name)
+            .ok_or(ToolDenial::NotGranted)?;
+        let registered = self
+            .tools
+            .get(&invocation.tool_name)
+            .ok_or(ToolDenial::Unavailable)?;
+        if registered.descriptor != *granted {
+            return Err(ToolDenial::CatalogStale);
+        }
+        if validate_value(&granted.input_schema, &invocation.arguments, 0).is_err() {
+            return Err(ToolDenial::InvalidArguments);
+        }
+        Ok(downstream_idempotency_key(invocation, granted))
+    }
+
     /// Validate, fence, and either execute or freeze one invocation.
     pub fn invoke(
         &mut self,
@@ -571,7 +601,7 @@ impl AgentToolBroker {
         );
 
         let digest = effect_digest(&invocation, granted);
-        let idempotency_key = format!("atk-{digest}");
+        let idempotency_key = downstream_idempotency_key(&invocation, granted);
         let auto_run = granted.side_effect == SideEffectClass::ReadOnly
             && granted.approval == ApprovalRequirement::None;
         if auto_run {
@@ -912,6 +942,13 @@ fn effect_digest(invocation: &ToolInvocation, descriptor: &LocalToolDescriptor) 
         &canonical_json_text(&invocation.arguments),
         &descriptor.digest(),
     ])
+}
+
+fn downstream_idempotency_key(
+    invocation: &ToolInvocation,
+    descriptor: &LocalToolDescriptor,
+) -> String {
+    format!("atk-{}", effect_digest(invocation, descriptor))
 }
 
 fn digest_fields(fields: &[&str]) -> String {

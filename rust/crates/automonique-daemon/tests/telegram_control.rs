@@ -2017,6 +2017,43 @@ fn host_load_questions_measure_cpu_and_ram_without_a_provider_run() {
 }
 
 #[test]
+fn terse_non_ticket_read_replays_the_prior_host_measurement() {
+    let fixture = Fixture::new(&[]);
+    let root = tempfile::tempdir().expect("memory root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private memory root");
+    let memory =
+        StoreMemorySurface::open(&root.path().join("agent-memory.sqlite3"), BOT_ID, "primary")
+            .expect("memory surface");
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering("must not be used");
+    let mut bridge = bridge_with_memory_and_lane(
+        &fixture,
+        FakeClient::new([
+            updates(&[(1, OPERATOR, "cpu load and ram")]),
+            updates(&[(2, OPERATOR, "do it")]),
+        ]),
+        outbound.clone(),
+        FakeSink::default(),
+        single_tier_roster(),
+        memory,
+        lane.clone(),
+    );
+
+    for _ in 0..2 {
+        let report = poll(&mut bridge).expect("host read commits");
+        assert_eq!(report.answered, 1);
+        assert_eq!(report.questions_queued, 0);
+    }
+    assert!(lane.tasks().is_empty());
+    assert_eq!(outbound.messages().len(), 2);
+    for message in outbound.messages() {
+        assert!(message.contains("CPU load averages: 1m"));
+        assert!(message.contains("RAM:"));
+    }
+}
+
+#[test]
 fn composite_operational_questions_use_typed_reads_then_answer_in_general_language() {
     let fixture = Fixture::new(&[]);
     let outbound = FakeOutbound::default();
@@ -3633,6 +3670,138 @@ fn completed_ticket_question_lists_closed_rows_before_the_open_backlog() {
     assert!(!context.contains("thread_id=OPEN-"));
 }
 
+/// The exact live phrasing must select the closed scan rather than the first
+/// open-first window. Closed rows beyond row 50 are read by lifecycle from the
+/// whole bounded store scan; their identities come only from those real rows.
+#[test]
+fn handled_yesterday_scans_closed_rows_beyond_the_first_fifty() {
+    let fixture = Fixture::new(&[]);
+    let mut store = SupportTicketStore::open(&fixture.support_tickets_path)
+        .expect("support ticket store opens");
+    for number in 1..=71 {
+        let closed = matches!(number, 67 | 69 | 71);
+        let fleet_id = format!("LIVE-{number}");
+        let receipt = store
+            .record(&FleetTicket {
+                fleet_issue_id: &fleet_id,
+                title: if closed {
+                    "Ticket handled on the target day"
+                } else {
+                    "Open backlog ticket"
+                },
+                tenant_name: "Example",
+                site_label: None,
+                fleet_status: if closed { "closed" } else { "open" },
+                priority: "normal",
+                source: "email",
+                requested_by: "operator",
+                comment_count: 0,
+                created_at: "2026-08-20T00:00:00Z",
+                updated_at: if closed {
+                    "2026-08-21T12:00:00Z"
+                } else {
+                    "2026-08-22T12:00:00Z"
+                },
+                observed_at_ms: TICKET_OBSERVED_MS,
+            })
+            .expect("ticket recorded");
+        if closed {
+            store
+                .transition(TicketTransition {
+                    fleet_issue_id: &fleet_id,
+                    expected_revision: receipt.revision,
+                    lifecycle: TicketLifecycle::Closed,
+                    now_ms: TICKET_OBSERVED_MS,
+                })
+                .expect("ticket closed");
+        }
+    }
+    drop(store);
+
+    let context = fixture
+        .surface()
+        .question_context(
+            "what tickets were handled yesterday?",
+            &[OPERATOR],
+            &[OPERATOR],
+        )
+        .expect("completion context renders");
+    assert!(context.contains("included=3"));
+    assert!(context.contains("total_recorded=71"));
+    assert!(context.contains("row_order=closed tickets newest first"));
+    for number in [71, 69, 67] {
+        assert!(
+            context.contains(&format!("ticket #{number} | thread_id=LIVE-{number}")),
+            "missing closed row #{number}: {context}"
+        );
+    }
+    assert!(!context.contains("thread_id=LIVE-66"));
+}
+
+#[test]
+fn handled_yesterday_filters_the_day_before_applying_the_fifty_row_limit() {
+    let fixture = Fixture::new(&[]);
+    let mut store = SupportTicketStore::open(&fixture.support_tickets_path)
+        .expect("support ticket store opens");
+    for number in 1..=63 {
+        let target_day = matches!(number, 1 | 3 | 5);
+        let fleet_id = format!("DATE-FIRST-{number}");
+        let receipt = store
+            .record(&FleetTicket {
+                fleet_issue_id: &fleet_id,
+                title: if target_day {
+                    "Handled on the target day"
+                } else {
+                    "Handled after the target day"
+                },
+                tenant_name: "Example",
+                site_label: None,
+                fleet_status: "closed",
+                priority: "normal",
+                source: "email",
+                requested_by: "operator",
+                comment_count: 0,
+                created_at: "2026-08-20T00:00:00Z",
+                updated_at: if target_day {
+                    "2026-08-21T12:00:00Z"
+                } else {
+                    "2026-08-22T12:00:00Z"
+                },
+                observed_at_ms: TICKET_OBSERVED_MS,
+            })
+            .expect("ticket recorded");
+        store
+            .transition(TicketTransition {
+                fleet_issue_id: &fleet_id,
+                expected_revision: receipt.revision,
+                lifecycle: TicketLifecycle::Closed,
+                now_ms: TICKET_OBSERVED_MS,
+            })
+            .expect("ticket closed");
+    }
+    drop(store);
+
+    let context = fixture
+        .surface()
+        .question_context(
+            "what tickets were handled yesterday?",
+            &[OPERATOR],
+            &[OPERATOR],
+        )
+        .expect("completion context renders");
+    assert!(context.contains("completion_utc_date=2026-08-21"));
+    assert!(context.contains("matching_total=3"));
+    assert!(context.contains("matching_rows_omitted=0"));
+    assert!(context.contains("included=3"));
+    for number in [1, 3, 5] {
+        assert!(
+            context.contains(&format!("ticket #{number} | thread_id=DATE-FIRST-{number}")),
+            "missing target-day closed row #{number}: {context}"
+        );
+    }
+    assert!(!context.contains("thread_id=DATE-FIRST-63"));
+}
+
 /// An unreadable selected source prevents synthesis after the model has chosen
 /// the narrow read plan.
 #[test]
@@ -4292,6 +4461,117 @@ fn natural_support_ticket_inventory_and_its_followup_use_the_local_store() {
         assert!(!message.contains("Refused before provider execution"));
         assert!(!message.contains("route="));
     }
+}
+
+#[test]
+fn terse_ticket_followup_replays_the_prior_read_through_the_shared_lane_resolver() {
+    let fixture = Fixture::new(&[]);
+    fixture.seed_tickets(&[
+        SeedTicket::new("SUP-TERSE-1001", "Printer offline in the back room"),
+        SeedTicket::new("SUP-TERSE-1002", "Mail relay rejects attachments"),
+    ]);
+    let root = tempfile::tempdir().expect("memory root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private memory root");
+    let memory =
+        StoreMemorySurface::open(&root.path().join("agent-memory.sqlite3"), BOT_ID, "primary")
+            .expect("memory surface");
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering("must not run");
+    let mut bridge = bridge_with_memory_and_lane(
+        &fixture,
+        FakeClient::new([
+            updates(&[(1, OPERATOR, "what support tickets do we have?")]),
+            updates(&[(2, OPERATOR, "do it")]),
+        ]),
+        outbound.clone(),
+        FakeSink::default(),
+        single_tier_roster(),
+        memory,
+        lane.clone(),
+    );
+
+    assert_eq!(poll(&mut bridge).expect("inventory answer").answered, 1);
+    assert_eq!(poll(&mut bridge).expect("terse replay answer").answered, 1);
+    assert!(
+        lane.tasks().is_empty(),
+        "read replay must spend no provider run"
+    );
+    assert_eq!(outbound.messages().len(), 2);
+    for message in outbound.messages() {
+        assert!(message.contains("🎫 Recent tickets · 2 of 2"));
+        assert!(message.contains("Mail relay rejects attachments"));
+    }
+}
+
+#[test]
+fn completed_ticket_question_and_terse_replay_use_question_aware_reads_without_support_mcp() {
+    let fixture = Fixture::new(&[]);
+    let mut store = SupportTicketStore::open(&fixture.support_tickets_path)
+        .expect("support ticket store opens");
+    let receipt = store
+        .record(&FleetTicket {
+            fleet_issue_id: "NO-MCP-DONE-1",
+            title: "Handled on the target day",
+            tenant_name: "Example",
+            site_label: None,
+            fleet_status: "closed",
+            priority: "normal",
+            source: "email",
+            requested_by: "operator",
+            comment_count: 0,
+            created_at: "2026-08-20T00:00:00Z",
+            updated_at: "2026-08-21T12:00:00Z",
+            observed_at_ms: TICKET_OBSERVED_MS,
+        })
+        .expect("ticket recorded");
+    store
+        .transition(TicketTransition {
+            fleet_issue_id: "NO-MCP-DONE-1",
+            expected_revision: receipt.revision,
+            lifecycle: TicketLifecycle::Closed,
+            now_ms: TICKET_OBSERVED_MS,
+        })
+        .expect("ticket closed");
+    drop(store);
+
+    let root = tempfile::tempdir().expect("memory root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private memory root");
+    let memory =
+        StoreMemorySurface::open(&root.path().join("agent-memory.sqlite3"), BOT_ID, "primary")
+            .expect("memory surface");
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering_sequence(&[
+        r#"{"kind":"read","sources":["tickets"],"slack_channel":null,"github_issues":false,"depth":"fast"}"#,
+        "Ticket NO-MCP-DONE-1 was closed and last updated yesterday.",
+        r#"{"kind":"read","sources":["tickets"],"slack_channel":null,"github_issues":false,"depth":"fast"}"#,
+        "Ticket NO-MCP-DONE-1 was closed and last updated yesterday.",
+    ]);
+    let mut bridge = bridge_with_memory_and_lane(
+        &fixture,
+        FakeClient::new([
+            updates(&[(1, OPERATOR, "what tickets were handled yesterday?")]),
+            updates(&[(2, OPERATOR, "do it")]),
+        ]),
+        outbound.clone(),
+        FakeSink::default(),
+        single_tier_roster(),
+        memory,
+        lane.clone(),
+    );
+
+    for label in ["initial question", "terse replay"] {
+        assert_eq!(poll(&mut bridge).expect(label).questions_queued, 1);
+        assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
+    }
+    let prompts = lane.tasks();
+    assert_eq!(prompts.len(), 4);
+    for prompt in [&prompts[1], &prompts[3]] {
+        assert!(prompt.contains("completion_utc_date=2026-08-21"));
+        assert!(prompt.contains("thread_id=NO-MCP-DONE-1"));
+    }
+    assert_eq!(outbound.messages().len(), 2);
 }
 
 #[test]

@@ -163,6 +163,10 @@ use automonique_transports::{
     TelegramPrincipal, parse_telegram_updates,
 };
 
+use crate::agent_followup::{
+    ConservativeTerseInterpreter, ConversationLane, FollowUpInput, FollowUpResolution,
+    LaneActivity, LaneTurn, PriorRequestKind, resolve_follow_up,
+};
 use crate::agent_harness::{ToolDefinition, TranscriptInput, TranscriptRole};
 use crate::agent_runtime::{AgentRuntimeStep, validate_provider_step};
 use crate::github::IssueFactDetail;
@@ -7529,7 +7533,10 @@ where
         ) {
             return answer;
         }
-        if is_support_ticket_inventory_question(question) && !self.mcp.has_server("support") {
+        if is_support_ticket_inventory_question(question)
+            && !is_closed_ticket_inventory_question(question)
+            && !self.mcp.has_server("support")
+        {
             return self.support_ticket_inventory_answer(chat_id);
         }
         if is_github_repository_inventory_question(question) {
@@ -7663,9 +7670,8 @@ where
                 };
             }
         }
-        let explicit_host_load = is_host_load_question(question);
-        let deterministic_sources = question_sources(question);
-        let memory_context = if explicit_host_load {
+        let initial_host_load = is_host_load_question(question);
+        let memory_context = if initial_host_load {
             String::new()
         } else {
             self.memory
@@ -7677,11 +7683,29 @@ where
                 })
                 .unwrap_or_default()
         };
-        let resolved_ticket_question =
-            resolved_support_ticket_read_continuation(question, &memory_context);
-        let question = resolved_ticket_question.as_deref().unwrap_or(question);
+        let follow_up_lane_key = format!(
+            "telegram:{chat_id}:{}",
+            topic_id.map_or_else(|| String::from("main"), |topic| topic.to_string())
+        );
+        let follow_up_actor_key = format!("telegram:{actor_id}");
+        let resolved_read_question = resolved_read_only_continuation(
+            question,
+            &memory_context,
+            TransportConversationIdentity {
+                lane_key: &follow_up_lane_key,
+                actor_key: &follow_up_actor_key,
+                source_key,
+            },
+        );
+        let question = resolved_read_question.as_deref().unwrap_or(question);
+        let explicit_host_load = is_host_load_question(question);
+        let deterministic_sources = question_sources(question);
         let host_load_followup = is_host_load_followup(question, &memory_context);
-        if is_support_ticket_inventory_followup(question, &memory_context)
+        if (resolved_read_question
+            .as_deref()
+            .is_some_and(is_support_ticket_inventory_question)
+            || is_support_ticket_inventory_followup(question, &memory_context))
+            && !is_closed_ticket_inventory_question(question)
             && !self.mcp.has_server("support")
         {
             return self.support_ticket_inventory_answer(chat_id);
@@ -10875,73 +10899,119 @@ fn is_support_ticket_inventory_followup(text: &str, memory_context: &str) -> boo
         .any(|term| matches!(term, "ticket" | "tickets"))
 }
 
-/// Resolve an explicit short confirmation against the preceding read-only
-/// support-ticket inventory question.
+/// Resolve an explicit short confirmation against the preceding typed
+/// read-only transport question.
 ///
 /// Both Telegram and Slack persist the current user message at slightly
 /// different points in their ingress flow, so the newest transcript user line
 /// may be the confirmation itself. Skip that line when present and reuse only
-/// the immediately preceding question when it passed the inventory classifier. This
-/// can repeat a read, but can never turn an ambiguous "do it" into a ticket or
-/// GitHub mutation.
-fn resolved_support_ticket_read_continuation(text: &str, memory_context: &str) -> Option<String> {
-    let normalized = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim_matches(|character: char| !character.is_alphanumeric())
-        .to_lowercase();
-    if !matches!(
-        normalized.as_str(),
-        "do it"
-            | "please do"
-            | "please do it"
-            | "go ahead"
-            | "yes do it"
-            | "yes please"
-            | "fais le"
-            | "fais-le"
-            | "vas y"
-            | "vas-y"
-            | "oui fais le"
-            | "oui fais-le"
-    ) {
-        return None;
-    }
-
-    let recent = memory_context
-        .split_once("[recent_conversation]\n")
-        .and_then(|(_, remainder)| remainder.split_once("\n[/recent_conversation]"))
-        .map(|(recent, _)| recent)
-        .or_else(|| {
-            memory_context
-                .split_once("[recent conversation]\n")
-                .map(|(_, recent)| recent)
-        })
-        .unwrap_or("");
-    let mut messages = recent
+/// the immediately preceding question when an existing typed classifier proves
+/// it is side-effect-free. This can repeat a read, but can never turn an
+/// ambiguous "do it" into a mutation.
+fn resolved_read_only_continuation(
+    text: &str,
+    memory_context: &str,
+    identity: TransportConversationIdentity<'_>,
+) -> Option<String> {
+    let recent = recent_conversation_projection(memory_context);
+    let parsed = recent
         .lines()
-        .filter_map(|line| {
-            line.strip_prefix("user | content_untrusted=")
-                .or_else(|| line.strip_prefix("user: "))
-                .map(str::trim)
-                .filter(|message| !message.is_empty())
-        })
+        .filter_map(parse_projected_conversation_line)
         .collect::<Vec<_>>();
-    if messages.last().is_some_and(|message| {
-        message
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .trim_matches(|character: char| !character.is_alphanumeric())
-            .eq_ignore_ascii_case(&normalized)
-    }) {
-        messages.pop();
+    let current_index = parsed
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, (role, content))| *role == "user" && content.trim() == text.trim())
+        .map(|(index, _)| index);
+    let turns = parsed
+        .into_iter()
+        .enumerate()
+        .map(|(index, (role, content))| {
+            let source_key = if Some(index) == current_index {
+                identity.source_key.to_owned()
+            } else {
+                format!("context-{index}")
+            };
+            if role == "user" {
+                let request_kind = if is_replayable_read_only_transport_question(content) {
+                    PriorRequestKind::ReplayableReadOnly
+                } else {
+                    PriorRequestKind::Conversation
+                };
+                LaneTurn::user(source_key, identity.actor_key, content, request_kind)
+            } else {
+                LaneTurn::assistant(source_key, content)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let lane = ConversationLane::new(identity.lane_key, LaneActivity::Idle, turns).ok()?;
+    let input = FollowUpInput::new(identity.source_key, identity.actor_key, text).ok()?;
+    match resolve_follow_up(&lane, &input, &mut ConservativeTerseInterpreter) {
+        FollowUpResolution::ReplayReadOnly { request, .. } => Some(request),
+        FollowUpResolution::NewTurn
+        | FollowUpResolution::Steer { .. }
+        | FollowUpResolution::QueueFollowUp { .. }
+        | FollowUpResolution::RequiresExplicitApproval { .. }
+        | FollowUpResolution::Unresolved(_) => None,
     }
-    messages
-        .last()
-        .filter(|message| is_support_ticket_inventory_question(message))
-        .map(|message| (*message).to_owned())
+}
+
+/// Closed set of existing typed read routes that may be replayed from the same
+/// actor's immediately preceding lane turn. Generic router prose is excluded:
+/// if no existing classifier proves a read, the request is not replayable.
+fn is_replayable_read_only_transport_question(text: &str) -> bool {
+    is_support_ticket_inventory_question(text)
+        || is_github_repository_inventory_question(text)
+        || is_memory_summary_question(text)
+        || is_current_time_question(text)
+        || is_host_load_question(text)
+        || is_enabled_site_inventory_question(text)
+        || is_site_inventory_question(text)
+        || is_site_profile_question(text)
+        || is_pm2_process_question(text)
+        || is_named_entity_description_question(text)
+        || is_codex_usage_question(text)
+        || is_deepseek_balance_question(text)
+        || is_identity_question(text)
+        || system_capability_question(text).is_some()
+        || matches!(
+            natural_issue_request(text),
+            Ok(Some(GitHubIssueRequestIntent::Read { .. }))
+        )
+}
+
+fn recent_conversation_projection(memory_context: &str) -> &str {
+    if let Some((_, remainder)) = memory_context.split_once("[recent_conversation]\n") {
+        return remainder
+            .split_once("\n[/recent_conversation]")
+            .map_or("", |(recent, _)| recent);
+    }
+    if let Some((_, recent)) = memory_context.split_once("[recent conversation]\n") {
+        return recent;
+    }
+    if memory_context.contains("[reviewed memory]") || memory_context.contains("[durable_memory]") {
+        ""
+    } else {
+        memory_context
+    }
+}
+
+fn parse_projected_conversation_line(line: &str) -> Option<(&'static str, &str)> {
+    if let Some(content) = line
+        .strip_prefix("user | content_untrusted=")
+        .or_else(|| line.strip_prefix("user: "))
+        .map(str::trim)
+        .filter(|content| !content.is_empty())
+    {
+        return Some(("user", content));
+    }
+    line.strip_prefix("assistant | content_untrusted=")
+        .or_else(|| line.strip_prefix("assistant: "))
+        .map(str::trim)
+        .filter(|content| !content.is_empty())
+        .map(|content| ("assistant", content))
 }
 
 /// Whether a ticket inventory question is specifically about completed rows.
@@ -10954,32 +11024,121 @@ fn is_closed_ticket_inventory_question(text: &str) -> bool {
     if !is_support_ticket_inventory_question(text) {
         return false;
     }
-    text.to_lowercase()
+    let normalized = text.to_lowercase();
+    let terms = normalized
         .split(|character: char| !character.is_alphanumeric())
         .filter(|term| !term.is_empty())
-        .any(|term| {
-            matches!(
-                term,
-                "closed"
-                    | "completed"
-                    | "complete"
-                    | "done"
-                    | "finished"
-                    | "resolved"
-                    | "traité"
-                    | "traités"
-                    | "traite"
-                    | "traites"
-                    | "fermé"
-                    | "fermés"
-                    | "fermee"
-                    | "fermees"
-                    | "clôturé"
-                    | "clôturés"
-                    | "cloture"
-                    | "clotures"
-            )
-        })
+        .collect::<Vec<_>>();
+    let completion_positions = terms
+        .iter()
+        .enumerate()
+        .filter_map(|(index, term)| completion_ticket_term(term).then_some(index))
+        .collect::<Vec<_>>();
+    if completion_positions.is_empty() {
+        return false;
+    }
+    let negated = completion_positions.iter().any(|position| {
+        terms[position.saturating_sub(2)..*position]
+            .iter()
+            .any(|term| matches!(*term, "not" | "never" | "pas" | "non"))
+    });
+    let mixed_open_focus = terms.iter().any(|term| {
+        matches!(
+            *term,
+            "pending"
+                | "outstanding"
+                | "remaining"
+                | "unresolved"
+                | "unfinished"
+                | "active"
+                | "working"
+                | "nouveaux"
+                | "nouvelles"
+                | "ouverts"
+                | "ouvertes"
+                | "restants"
+                | "restantes"
+                | "encours"
+        )
+    });
+    !negated && !mixed_open_focus
+}
+
+fn completion_ticket_term(term: &str) -> bool {
+    matches!(
+        term,
+        "closed"
+            | "completed"
+            | "complete"
+            | "done"
+            | "finished"
+            | "resolved"
+            | "handled"
+            | "processed"
+            | "dealt"
+            | "traité"
+            | "traités"
+            | "traite"
+            | "traites"
+            | "fermé"
+            | "fermés"
+            | "fermee"
+            | "fermees"
+            | "clôturé"
+            | "clôturés"
+            | "cloture"
+            | "clotures"
+    )
+}
+
+/// One exact UTC date a completion-focused ticket question asks about.
+///
+/// The store exposes an RFC 3339 `updated_at`, not a closure instant. Keeping
+/// this as a date string lets selection discard out-of-scope closed rows before
+/// the bounded answer window is applied.
+fn completion_ticket_target_utc_date(text: &str, snapshot_unix_ms: Option<i64>) -> Option<String> {
+    if let Some(date) = explicit_utc_date(text) {
+        return Some(date.to_owned());
+    }
+    let normalized = text.to_lowercase();
+    let terms = normalized
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
+    let day_offset = if terms
+        .iter()
+        .any(|term| matches!(*term, "yesterday" | "hier"))
+    {
+        -86_400_000_i64
+    } else if terms.contains(&"today") || (terms.contains(&"aujourd") && terms.contains(&"hui")) {
+        0
+    } else {
+        return None;
+    };
+    let target_ms = snapshot_unix_ms?.checked_add(day_offset)?;
+    utc_rfc3339_from_unix_millis(target_ms)
+        .and_then(|timestamp| timestamp.get(..10).map(str::to_owned))
+}
+
+fn explicit_utc_date(text: &str) -> Option<&str> {
+    text.char_indices().find_map(|(start, _)| {
+        let end = start.checked_add(10)?;
+        let candidate = text.get(start..end)?;
+        let bytes = candidate.as_bytes();
+        let shaped = bytes.len() == 10
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit());
+        if !shaped {
+            return None;
+        }
+        let month = candidate.get(5..7)?.parse::<u8>().ok()?;
+        let day = candidate.get(8..10)?.parse::<u8>().ok()?;
+        ((1..=12).contains(&month) && (1..=31).contains(&day)).then_some(candidate)
+    })
 }
 
 /// Recognize a GitHub repository inventory without swallowing issue/project
@@ -11210,6 +11369,15 @@ pub(crate) struct TransportLiveSeams<'a> {
     pub(crate) github: Option<&'a mut dyn crate::github::GitHubSurface>,
 }
 
+/// Trusted identity of the exact transport lane whose bounded conversation
+/// projection accompanies one question.
+#[derive(Clone, Copy)]
+pub(crate) struct TransportConversationIdentity<'a> {
+    pub(crate) lane_key: &'a str,
+    pub(crate) actor_key: &'a str,
+    pub(crate) source_key: &'a str,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn answer_read_only_transport_question(
     surface: &mut dyn ControlSurface,
@@ -11217,6 +11385,7 @@ pub(crate) fn answer_read_only_transport_question(
     mut seams: TransportLiveSeams<'_>,
     question: &str,
     memory_context: &str,
+    conversation: TransportConversationIdentity<'_>,
     administrators: &[i64],
     configured: &[i64],
     roster: Option<&str>,
@@ -11229,9 +11398,9 @@ pub(crate) fn answer_read_only_transport_question(
 ) -> String {
     let accepted_unix_ms = crate::unix_millis().ok();
     let accepted_at = Instant::now();
-    let resolved_ticket_question =
-        resolved_support_ticket_read_continuation(question, memory_context);
-    let question = resolved_ticket_question.as_deref().unwrap_or(question);
+    let resolved_read_question =
+        resolved_read_only_continuation(question, memory_context, conversation);
+    let question = resolved_read_question.as_deref().unwrap_or(question);
     let Some(question) = accepted_question(question) else {
         return String::from(QUESTION_REJECTED);
     };
@@ -13936,10 +14105,10 @@ mod clock_tests {
         MAX_QUESTION_CONTEXT_BYTES, MAX_QUESTION_PROMPT_BYTES, McpToolDescriptor,
         ModelQuestionIntent, PendingSlackPost, PendingSlackPostResolution, QuestionEscalationPlan,
         QuestionIntentCapabilities, QuestionMcpCallPlan, QuestionProfile, QuestionRuntime,
-        QuestionTimingBreakdown, SlackPostApprovalRegistry, bounded_question_context,
-        compact_input_schema, deepseek_balance_text, escalation_approval_callback_data,
-        escalation_approval_key, github_issue_references, host_load_text,
-        is_closed_ticket_inventory_question, is_current_time_question,
+        QuestionTimingBreakdown, SlackPostApprovalRegistry, TransportConversationIdentity,
+        bounded_question_context, compact_input_schema, deepseek_balance_text,
+        escalation_approval_callback_data, escalation_approval_key, github_issue_references,
+        host_load_text, is_closed_ticket_inventory_question, is_current_time_question,
         is_deepseek_balance_question, is_enabled_site_inventory_question,
         is_github_repository_inventory_question, is_host_load_followup, is_host_load_question,
         is_named_entity_description_question, is_support_ticket_inventory_followup,
@@ -13947,7 +14116,7 @@ mod clock_tests {
         mcp_result_prompt, meminfo_kib, model_question_intent, model_question_step,
         parse_decimal_milli, parse_escalation_approval_callback, parse_mcp_approval_callback,
         prism_inventory_reply, question_intent_prompt, question_profile, question_prompt,
-        question_sources, requires_scratchpad_review, resolved_support_ticket_read_continuation,
+        question_sources, requires_scratchpad_review, resolved_read_only_continuation,
         set_reply_telemetry, system_capability_question, timed_question_reply,
         utc_rfc3339_from_unix_millis,
     };
@@ -14944,30 +15113,58 @@ mod clock_tests {
     }
 
     #[test]
-    fn short_confirmation_reuses_only_a_prior_read_only_ticket_inventory() {
+    fn short_confirmation_reuses_only_a_prior_typed_read() {
+        let identity = TransportConversationIdentity {
+            lane_key: "test:lane",
+            actor_key: "test:actor",
+            source_key: "test:current",
+        };
         let telegram = "[recent_conversation]\nuser | content_untrusted=Sup. What tickets were done yesterday ?\nassistant | content_untrusted=The visible snapshot is truncated.\n[/recent_conversation]";
         assert_eq!(
-            resolved_support_ticket_read_continuation("do it", telegram).as_deref(),
+            resolved_read_only_continuation("do it", telegram, identity).as_deref(),
             Some("Sup. What tickets were done yesterday ?")
         );
 
         let slack = "[recent conversation]\nuser: what tickets were done yesterday?\nassistant: the snapshot is truncated\nuser: do it";
         assert_eq!(
-            resolved_support_ticket_read_continuation("do it", slack).as_deref(),
+            resolved_read_only_continuation("do it", slack, identity).as_deref(),
+            Some("what tickets were done yesterday?")
+        );
+
+        let slack_without_header = "user: what tickets were done yesterday?\nassistant: the snapshot is truncated\nuser: yes please";
+        assert_eq!(
+            resolved_read_only_continuation("yes please", slack_without_header, identity)
+                .as_deref(),
             Some("what tickets were done yesterday?")
         );
 
         let mutation = "[recent_conversation]\nuser | content_untrusted=close ticket 42\nassistant | content_untrusted=confirmation needed\n[/recent_conversation]";
-        assert!(resolved_support_ticket_read_continuation("do it", mutation).is_none());
+        assert!(resolved_read_only_continuation("do it", mutation, identity).is_none());
         let intervening = "[recent_conversation]\nuser | content_untrusted=what tickets were done yesterday?\nassistant | content_untrusted=the snapshot is truncated\nuser | content_untrusted=what can you do?\nassistant | content_untrusted=I can answer operational questions\n[/recent_conversation]";
-        assert!(resolved_support_ticket_read_continuation("do it", intervening).is_none());
-        assert!(resolved_support_ticket_read_continuation("do it", "").is_none());
+        assert_eq!(
+            resolved_read_only_continuation("do it", intervening, identity).as_deref(),
+            Some("what can you do?")
+        );
+        assert!(resolved_read_only_continuation("do it", "", identity).is_none());
+        assert!(resolved_read_only_continuation("fix it", telegram, identity).is_none());
+
+        let host_load = "[recent_conversation]\nuser | content_untrusted=what is the server load and RAM?\nassistant | content_untrusted=CPU load and RAM snapshot\n[/recent_conversation]";
+        assert_eq!(
+            resolved_read_only_continuation("do it", host_load, identity).as_deref(),
+            Some("what is the server load and RAM?")
+        );
+
+        let effect = "[recent_conversation]\nuser | content_untrusted=deploy the site\nassistant | content_untrusted=deployment needs approval\n[/recent_conversation]";
+        assert!(resolved_read_only_continuation("do it", effect, identity).is_none());
     }
 
     #[test]
     fn completed_ticket_questions_select_the_closed_ticket_view() {
         for question in [
             "What tickets were done yesterday?",
+            "What tickets were handled yesterday?",
+            "Which tickets were processed yesterday?",
+            "Which tickets were dealt with yesterday?",
             "Which tickets are closed?",
             "Quels tickets ont été traités hier ?",
         ] {
@@ -14978,6 +15175,15 @@ mod clock_tests {
         }
         assert!(!is_closed_ticket_inventory_question(
             "What tickets are still open?"
+        ));
+        assert!(!is_closed_ticket_inventory_question(
+            "Which tickets are not done?"
+        ));
+        assert!(!is_closed_ticket_inventory_question(
+            "Which tickets are done or still pending?"
+        ));
+        assert!(!is_closed_ticket_inventory_question(
+            "Quels tickets ne sont pas encore traités ?"
         ));
         assert!(!is_closed_ticket_inventory_question("close ticket 42"));
     }
@@ -15537,7 +15743,7 @@ impl StoreControlSurface {
         let Some(store) = self.ticket_store()? else {
             return Ok(String::from(TICKETS_NOT_ENABLED));
         };
-        let selection = select_question_tickets(store, BASELINE_TICKETS_LISTED, false)?;
+        let selection = select_question_tickets(store, BASELINE_TICKETS_LISTED, false, None)?;
         if selection.tickets.is_empty() {
             return Ok(String::from(NO_TICKETS_RECORDED));
         }
@@ -16435,6 +16641,14 @@ impl ControlSurface for StoreControlSurface {
             .take()
             .filter(|(pending_question, _)| pending_question == question)
             .map_or_else(|| question_sources(question), |(_, sources)| sources);
+        let snapshot_unix_ms = crate::unix_millis().ok();
+        let snapshot_current_utc = snapshot_unix_ms
+            .and_then(utc_rfc3339_from_unix_millis)
+            .unwrap_or_else(|| String::from("unavailable"));
+        let closed_ticket_focus = is_closed_ticket_inventory_question(question);
+        let completion_utc_date = closed_ticket_focus
+            .then(|| completion_ticket_target_utc_date(question, snapshot_unix_ms))
+            .flatten();
         let cached_prism_inventory = self
             .pending_prism_inventory
             .take()
@@ -16644,28 +16858,36 @@ impl ControlSurface for StoreControlSurface {
         } else {
             String::from("status=not_requested")
         };
-        let (ticket_tracking, total_tickets, open_total, lifecycle_counts, tickets) =
-            if !sources.tickets {
-                (false, 0_usize, 0_usize, String::new(), Vec::new())
-            } else {
-                match self.ticket_store()? {
-                    None => (false, 0_usize, 0_usize, String::new(), Vec::new()),
-                    Some(store) => {
-                        let selection = select_question_tickets(
-                            store,
-                            QUESTION_TICKETS_LISTED,
-                            is_closed_ticket_inventory_question(question),
-                        )?;
-                        (
-                            true,
-                            selection.total,
-                            selection.open_total,
-                            selection.lifecycle_counts,
-                            selection.tickets,
-                        )
-                    }
+        let (
+            ticket_tracking,
+            total_tickets,
+            open_total,
+            matching_tickets,
+            lifecycle_counts,
+            tickets,
+        ) = if !sources.tickets {
+            (false, 0_usize, 0_usize, 0_usize, String::new(), Vec::new())
+        } else {
+            match self.ticket_store()? {
+                None => (false, 0_usize, 0_usize, 0_usize, String::new(), Vec::new()),
+                Some(store) => {
+                    let selection = select_question_tickets(
+                        store,
+                        QUESTION_TICKETS_LISTED,
+                        closed_ticket_focus,
+                        completion_utc_date.as_deref(),
+                    )?;
+                    (
+                        true,
+                        selection.total,
+                        selection.open_total,
+                        selection.matching_total,
+                        selection.lifecycle_counts,
+                        selection.tickets,
+                    )
                 }
-            };
+            }
+        };
 
         let observed_tenants: BTreeSet<String> = tickets
             .iter()
@@ -16725,14 +16947,14 @@ impl ControlSurface for StoreControlSurface {
              included={}\n\
              total_recorded={}\n\
              rows_omitted={}\n\
+             completion_utc_date={}\n\
+             matching_total={}\n\
+             matching_rows_omitted={}\n\
              open_total={}\n\
              lifecycle_counts={}\n\
              completion_time_basis=lifecycle=closed proves Automonique currently treats the row as complete; the fleet exposes updated_at but no exact closed_at, so for a day-specific completion question list only included complete rows whose updated date exactly matches that day and label them as closed tickets last updated that day rather than claiming an exact close instant; never infer a matching ticket, identifier, or count from rows_omitted or a truncation marker\n\
              row_order={}\n",
-            crate::unix_millis()
-                .ok()
-                .and_then(utc_rfc3339_from_unix_millis)
-                .unwrap_or_else(|| String::from("unavailable")),
+            snapshot_current_utc,
             if sources.status { "yes" } else { "no" },
             if sources.host_load { "yes" } else { "no" },
             if sources.operators { "yes" } else { "no" },
@@ -16779,9 +17001,12 @@ impl ControlSurface for StoreControlSurface {
             tickets.len(),
             total_tickets,
             total_tickets.saturating_sub(tickets.len()),
+            completion_utc_date.as_deref().unwrap_or("not_requested"),
+            matching_tickets,
+            matching_tickets.saturating_sub(tickets.len()),
             open_total,
             lifecycle_counts,
-            if is_closed_ticket_inventory_question(question) {
+            if closed_ticket_focus {
                 "closed tickets newest first; open rows excluded by the question's completion focus"
             } else {
                 "open tickets newest first, then closed tickets newest first; an open ticket is any lifecycle other than closed"
@@ -16978,6 +17203,8 @@ const EMPTY_FIELD: &str = "-";
 struct QuestionTicketSelection {
     total: usize,
     open_total: usize,
+    /// Rows in the question's lifecycle/date scope before the answer limit.
+    matching_total: usize,
     /// `new=3 acknowledged=0 working=1 answered=0 closed=26`.
     lifecycle_counts: String,
     /// Open tickets newest first, then closed tickets newest first, at most
@@ -16999,14 +17226,15 @@ const OPEN_TICKET_LIFECYCLES: [TicketLifecycle; 4] = [
 /// answers it wrong whenever the newest N happen to be closed: the model then
 /// reports nothing open while dozens of older tickets wait. Open tickets are
 /// therefore listed first, newest first, and closed ones only fill what is
-/// left, so truncation drops the least useful rows. Paging through every open
-/// ticket is bounded by [`MAX_OPEN_TICKET_SCAN`] rows.
+/// left, so truncation drops the least useful rows. The store has a fixed
+/// capacity; paging scans that bounded read model while retaining only the
+/// newest answer window in memory.
 fn select_question_tickets(
     store: &SupportTicketStore,
     limit: usize,
     closed_focus: bool,
+    completion_utc_date: Option<&str>,
 ) -> Result<QuestionTicketSelection, SurfaceRefusal> {
-    const MAX_TICKET_SCAN: usize = 4_096;
     let total = store
         .ticket_count()
         .map_err(|_| SurfaceRefusal::Unavailable)?;
@@ -17017,12 +17245,15 @@ fn select_question_tickets(
         return Ok(QuestionTicketSelection {
             total,
             open_total: 0,
+            matching_total: 0,
             lifecycle_counts: String::from("none"),
             tickets: Vec::new(),
         });
     };
     let page_size = automonique_store::support_tickets::MAX_TICKET_PAGE;
     let mut open = Vec::new();
+    let mut open_counts = [0_usize; OPEN_TICKET_LIFECYCLES.len()];
+    let mut open_total = 0_usize;
     let mut cursor = range.first.saturating_sub(1);
     loop {
         let page = store
@@ -17030,9 +17261,21 @@ fn select_question_tickets(
             .map_err(|_| SurfaceRefusal::Unavailable)?;
         let next_cursor = page.next_cursor;
         let count = page.tickets.len();
-        open.extend(page.tickets);
+        for ticket in page.tickets {
+            if let Some(index) = OPEN_TICKET_LIFECYCLES
+                .iter()
+                .position(|lifecycle| *lifecycle == ticket.lifecycle)
+            {
+                open_counts[index] = open_counts[index].saturating_add(1);
+            }
+            open_total = open_total.saturating_add(1);
+            open.push(ticket);
+        }
+        if open.len() > limit {
+            open.drain(..open.len() - limit);
+        }
         match next_cursor {
-            Some(next) if count > 0 && open.len() < MAX_TICKET_SCAN && next > cursor => {
+            Some(next) if count > 0 && next > cursor => {
                 cursor = next;
             }
             _ => break,
@@ -17040,21 +17283,14 @@ fn select_question_tickets(
     }
     let counts = OPEN_TICKET_LIFECYCLES
         .iter()
-        .map(|lifecycle| {
-            format!(
-                "{}={}",
-                lifecycle.as_str(),
-                open.iter()
-                    .filter(|ticket| ticket.lifecycle == *lifecycle)
-                    .count()
-            )
-        })
+        .zip(open_counts)
+        .map(|(lifecycle, count)| format!("{}={count}", lifecycle.as_str()))
         .collect::<Vec<_>>()
         .join(" ");
-    let open_total = open.len();
     let lifecycle_counts = format!("{counts} closed={}", total.saturating_sub(open_total));
     if closed_focus {
         let mut closed = Vec::new();
+        let mut matching_total = 0_usize;
         let mut cursor = range.first.saturating_sub(1);
         loop {
             let page = store
@@ -17062,9 +17298,19 @@ fn select_question_tickets(
                 .map_err(|_| SurfaceRefusal::Unavailable)?;
             let next_cursor = page.next_cursor;
             let count = page.tickets.len();
-            closed.extend(page.tickets);
+            for ticket in page.tickets {
+                let date_matches = completion_utc_date
+                    .is_none_or(|date| ticket.updated_at.get(..10) == Some(date));
+                if date_matches {
+                    matching_total = matching_total.saturating_add(1);
+                    closed.push(ticket);
+                }
+            }
+            if closed.len() > limit {
+                closed.drain(..closed.len() - limit);
+            }
             match next_cursor {
-                Some(next) if count > 0 && closed.len() < MAX_TICKET_SCAN && next > cursor => {
+                Some(next) if count > 0 && next > cursor => {
                     cursor = next;
                 }
                 _ => break,
@@ -17074,6 +17320,7 @@ fn select_question_tickets(
         return Ok(QuestionTicketSelection {
             total,
             open_total,
+            matching_total,
             lifecycle_counts,
             tickets: closed.into_iter().take(limit).collect(),
         });
@@ -17098,6 +17345,7 @@ fn select_question_tickets(
     Ok(QuestionTicketSelection {
         total,
         open_total,
+        matching_total: total,
         lifecycle_counts,
         tickets,
     })

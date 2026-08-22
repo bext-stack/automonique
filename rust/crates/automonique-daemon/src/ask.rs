@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Elastic-2.0
+
 //! `automonique ask`: the conversational question path, from a terminal.
 //!
 //! The same router, baseline brief, read plans and answer lanes the Telegram
@@ -18,8 +20,9 @@ use std::sync::Arc;
 
 use crate::run_lane::SocketRunLane;
 use crate::telegram_bridge::{
-    HostFacts, QuestionEscalation, SlackSurface, StoreControlSurface, TransportLiveSeams,
-    TransportToolPlan, answer_approved_escalation, answer_read_only_transport_question,
+    HostFacts, QuestionEscalation, SlackSurface, StoreControlSurface,
+    TransportConversationIdentity, TransportLiveSeams, TransportToolPlan,
+    answer_approved_escalation, answer_read_only_transport_question,
 };
 
 /// What one question produced.
@@ -164,6 +167,11 @@ impl AskHost {
             },
             question,
             memory_context,
+            TransportConversationIdentity {
+                lane_key: "cli:ask",
+                actor_key: "cli:operator",
+                source_key: "cli:ask:current",
+            },
             &self.administrators,
             &self.configured,
             None,

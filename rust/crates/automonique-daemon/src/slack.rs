@@ -123,8 +123,9 @@ use crate::progress_hub::ProgressHub;
 use crate::run_lane::{SlackProgressSink, SlackProgressTarget, SocketRunLane};
 use crate::telegram_bridge::{
     ApprovalDecisionAnswer, ApprovalDecisionFailure, ControlSurface as _, HostFacts,
-    QuestionProfile, RunLane as _, SlackSurface, StoreControlSurface, TransportLiveSeams,
-    TransportToolPlan, accepted_mcp_input_responses, answer_read_only_transport_question,
+    QuestionProfile, RunLane as _, SlackSurface, StoreControlSurface,
+    TransportConversationIdentity, TransportLiveSeams, TransportToolPlan,
+    accepted_mcp_input_responses, answer_read_only_transport_question,
     answer_typed_github_issue_question, mcp_approval_preview, mcp_result_prompt,
     run_question_to_completion,
 };
@@ -2389,6 +2390,7 @@ trait SlackQuestionAnswerer: Send {
         question: &str,
         context: &str,
         source_key: &str,
+        actor: &UserId,
         channel: &ChannelId,
         approvals_enabled: bool,
     ) -> SlackQuestionReply;
@@ -2700,6 +2702,7 @@ impl SlackQuestionAnswerer for LiveSlackQuestionAnswerer {
         question: &str,
         context: &str,
         source_key: &str,
+        actor: &UserId,
         channel: &ChannelId,
         approvals_enabled: bool,
     ) -> SlackQuestionReply {
@@ -2734,6 +2737,11 @@ impl SlackQuestionAnswerer for LiveSlackQuestionAnswerer {
             },
             question,
             context,
+            TransportConversationIdentity {
+                lane_key: channel.as_str(),
+                actor_key: actor.as_str(),
+                source_key,
+            },
             &self.administrators,
             &self.configured,
             roster.as_deref(),
@@ -4626,6 +4634,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                                 trimmed,
                                 context,
                                 &event.source_key,
+                                &event.user,
                                 &event.channel,
                                 self.interactive_decisions
                                     && self.features.contains(&SlackFeature::Approvals)
@@ -7110,7 +7119,7 @@ mod tests {
     }
 
     struct FakeQuestionAnswerer {
-        seen: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        seen: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
     }
 
     struct DeferredRunLane {
@@ -7171,13 +7180,15 @@ mod tests {
             question: &str,
             context: &str,
             _source_key: &str,
+            actor: &UserId,
             _channel: &ChannelId,
             _approvals_enabled: bool,
         ) -> SlackQuestionReply {
-            self.seen
-                .lock()
-                .expect("questions")
-                .push((question.to_owned(), context.to_owned()));
+            self.seen.lock().expect("questions").push((
+                question.to_owned(),
+                context.to_owned(),
+                actor.as_str().to_owned(),
+            ));
             SlackQuestionReply::Text(String::from("Monique intelligent answer"))
         }
     }
@@ -7194,6 +7205,7 @@ mod tests {
             _question: &str,
             _context: &str,
             _source_key: &str,
+            _actor: &UserId,
             _channel: &ChannelId,
             _approvals_enabled: bool,
         ) -> SlackQuestionReply {
@@ -7211,6 +7223,7 @@ mod tests {
             _question: &str,
             _context: &str,
             _source_key: &str,
+            _actor: &UserId,
             _channel: &ChannelId,
             _approvals_enabled: bool,
         ) -> SlackQuestionReply {
@@ -7236,6 +7249,7 @@ mod tests {
             _question: &str,
             _context: &str,
             _source_key: &str,
+            _actor: &UserId,
             _channel: &ChannelId,
             _approvals_enabled: bool,
         ) -> SlackQuestionReply {
@@ -7268,6 +7282,7 @@ mod tests {
             _question: &str,
             _context: &str,
             _source_key: &str,
+            _actor: &UserId,
             _channel: &ChannelId,
             approvals_enabled: bool,
         ) -> SlackQuestionReply {
@@ -8353,7 +8368,10 @@ mod tests {
                 ChannelId::new("C0RESERVED01").expect("channel"),
             )]),
             admins: vec![UserId::new("U0ADMIN001").expect("admin")],
-            members: vec![UserId::new("U0ADMIN001").expect("member")],
+            members: vec![
+                UserId::new("U0ADMIN001").expect("member"),
+                UserId::new("U0MEMBER002").expect("member"),
+            ],
             features: vec![SlackFeature::Approvals, SlackFeature::Conversation],
             interactive_decisions: false,
             gates: Arc::new(std::sync::Mutex::new(
@@ -8373,17 +8391,35 @@ mod tests {
         );
         event.app_mention = true;
         router.handle_with_context(event, "remembered context");
+        let mut second = ticket_event(
+            "U0MEMBER002",
+            "<@B0APP> what do you know about activ?",
+            "EvSecondActor",
+        );
+        second.app_mention = true;
+        router.handle_with_context(second, "second remembered context");
 
         assert_eq!(
             seen.lock().expect("questions").as_slice(),
-            [(
-                String::from("what do you know about webdesign29 and activ"),
-                String::from("remembered context")
-            )]
+            [
+                (
+                    String::from("what do you know about webdesign29 and activ"),
+                    String::from("remembered context"),
+                    String::from("U0ADMIN001"),
+                ),
+                (
+                    String::from("what do you know about activ"),
+                    String::from("second remembered context"),
+                    String::from("U0MEMBER002"),
+                ),
+            ]
         );
         assert_eq!(
             messages.lock().expect("messages").as_slice(),
-            [String::from("Monique intelligent answer")]
+            [
+                String::from("Monique intelligent answer"),
+                String::from("Monique intelligent answer"),
+            ]
         );
     }
 
@@ -8891,6 +8927,7 @@ mod tests {
         assert_eq!(seen[0].0, "and webdesign29?");
         assert!(seen[0].1.contains("tell me about activ"));
         assert!(seen[0].1.contains("and webdesign29?"));
+        assert_eq!(seen[0].2, "U0ADMIN001");
         assert_eq!(
             messages.lock().expect("messages").as_slice(),
             [String::from("Monique intelligent answer")]

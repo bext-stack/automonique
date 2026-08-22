@@ -24,7 +24,7 @@ use nix::unistd::geteuid;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 
-pub const AGENT_LANE_JOURNAL_SCHEMA_VERSION: u32 = 1;
+pub const AGENT_LANE_JOURNAL_SCHEMA_VERSION: u32 = 2;
 pub const AGENT_LANE_JOURNAL_NAME: &str = "agent-lanes.sqlite3";
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(2_000);
@@ -33,7 +33,7 @@ const MAX_TOOL_NAME_BYTES: usize = 128;
 const MAX_APPROVAL_SUMMARY_BYTES: usize = 16 * 1024;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
 
-const SCHEMA_V1: &str = r#"
+const SCHEMA_V2: &str = r#"
 CREATE TABLE agent_lane_runs (
     run_id INTEGER PRIMARY KEY,
     lane_key TEXT NOT NULL,
@@ -84,7 +84,7 @@ CREATE TABLE agent_lane_events (
     run_id INTEGER NOT NULL REFERENCES agent_lane_runs(run_id),
     sequence INTEGER NOT NULL CHECK (sequence >= 1),
     kind TEXT NOT NULL CHECK (kind IN (
-        'run_intent', 'provider_intent', 'transcript', 'tool_intent',
+        'run_intent', 'provider_intent', 'provider_outcome', 'transcript', 'tool_intent',
         'tool_outcome', 'approval_pending', 'approval_decision', 'terminal'
     )),
     payload_json BLOB NOT NULL CHECK (typeof(payload_json) = 'blob'),
@@ -111,6 +111,33 @@ CREATE TABLE agent_lane_approvals (
 
 CREATE UNIQUE INDEX agent_lane_one_pending_approval
     ON agent_lane_approvals(run_id) WHERE status = 'pending';
+"#;
+
+/// Schema v1's event vocabulary did not admit `provider_outcome`. Rebuilding
+/// the table is required because SQLite cannot alter a table-level CHECK.
+const MIGRATE_V1_TO_V2: &str = r#"
+ALTER TABLE agent_lane_events RENAME TO agent_lane_events_v1;
+
+CREATE TABLE agent_lane_events (
+    event_id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES agent_lane_runs(run_id),
+    sequence INTEGER NOT NULL CHECK (sequence >= 1),
+    kind TEXT NOT NULL CHECK (kind IN (
+        'run_intent', 'provider_intent', 'provider_outcome', 'transcript', 'tool_intent',
+        'tool_outcome', 'approval_pending', 'approval_decision', 'terminal'
+    )),
+    payload_json BLOB NOT NULL CHECK (typeof(payload_json) = 'blob'),
+    recorded_ms INTEGER NOT NULL CHECK (recorded_ms >= 0),
+    UNIQUE (run_id, sequence)
+) STRICT;
+
+INSERT INTO agent_lane_events
+    (event_id, run_id, sequence, kind, payload_json, recorded_ms)
+SELECT event_id, run_id, sequence, kind, payload_json, recorded_ms
+FROM agent_lane_events_v1
+ORDER BY event_id;
+
+DROP TABLE agent_lane_events_v1;
 "#;
 
 #[derive(Debug)]
@@ -214,10 +241,6 @@ impl TranscriptKind {
             Self::ToolResult => "tool_result",
         }
     }
-
-    const fn settles_provider(self) -> bool {
-        matches!(self, Self::Assistant | Self::ToolCall)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -274,6 +297,13 @@ pub struct ProviderIntent<'a> {
     pub cursor: &'a RunCursor,
     pub round: u32,
     pub request: &'a Value,
+    pub recorded_ms: i64,
+}
+
+pub struct ProviderOutcome<'a> {
+    pub cursor: &'a RunCursor,
+    pub round: u32,
+    pub outcome: &'a Value,
     pub recorded_ms: i64,
 }
 
@@ -529,8 +559,13 @@ impl AgentLaneJournal {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let run = require_cursor(&transaction, append.cursor)?;
         require_running(&run)?;
-        if append.kind.settles_provider() && run.pending_provider_round.is_none() {
-            return Err(AgentLaneJournalError::Conflict("provider_result"));
+        if run.pending_provider_round.is_some()
+            && matches!(
+                append.kind,
+                TranscriptKind::Assistant | TranscriptKind::ToolCall
+            )
+        {
+            return Err(AgentLaneJournalError::PendingProvider);
         }
         insert_event(
             &transaction,
@@ -540,15 +575,58 @@ impl AgentLaneJournal {
             &payload,
             append.recorded_ms,
         )?;
-        let clear_provider = i64::from(append.kind.settles_provider());
         advance_run(
             &transaction,
             &run,
             "UPDATE agent_lane_runs
-             SET pending_provider_round = CASE WHEN ?1 = 1 THEN NULL ELSE pending_provider_round END,
+             SET next_sequence = next_sequence + 1, revision = revision + 1
+             WHERE run_id = ?1 AND revision = ?2",
+            params![run.run_id, to_i64(run.revision)?],
+        )?;
+        transaction.commit()?;
+        Ok(run.advanced())
+    }
+
+    /// Persist the typed provider result (or refusal) after the provider call.
+    /// A matching pending round is required, so a restart never mistakes an
+    /// old response for the result of a newer request.
+    pub fn record_provider_outcome(
+        &mut self,
+        outcome: ProviderOutcome<'_>,
+    ) -> Journalled<RunCursor> {
+        validate_time(outcome.recorded_ms, "recorded_ms")?;
+        validate_provider_outcome(outcome.outcome)?;
+        if outcome.round == 0 {
+            return Err(AgentLaneJournalError::InvalidField("round"));
+        }
+        let payload = encode_json(
+            &json!({"round": outcome.round, "outcome": outcome.outcome}),
+            "provider_outcome",
+        )?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run = require_cursor(&transaction, outcome.cursor)?;
+        require_running(&run)?;
+        if run.pending_provider_round != Some(outcome.round) {
+            return Err(AgentLaneJournalError::Conflict("provider_round"));
+        }
+        insert_event(
+            &transaction,
+            run.run_id,
+            run.next_sequence,
+            "provider_outcome",
+            &payload,
+            outcome.recorded_ms,
+        )?;
+        advance_run(
+            &transaction,
+            &run,
+            "UPDATE agent_lane_runs
+             SET pending_provider_round = NULL,
                  next_sequence = next_sequence + 1, revision = revision + 1
-             WHERE run_id = ?2 AND revision = ?3",
-            params![clear_provider, run.run_id, to_i64(run.revision)?],
+             WHERE run_id = ?1 AND revision = ?2",
+            params![run.run_id, to_i64(run.revision)?],
         )?;
         transaction.commit()?;
         Ok(run.advanced())
@@ -560,6 +638,9 @@ impl AgentLaneJournal {
         validate_tool_name(intent.tool_name)?;
         validate_key(intent.idempotency_key, "idempotency_key")?;
         validate_time(intent.recorded_ms, "recorded_ms")?;
+        if !intent.arguments.is_object() {
+            return Err(AgentLaneJournalError::InvalidField("arguments"));
+        }
         let arguments = encode_json(intent.arguments, "arguments")?;
         let payload = encode_json(
             &json!({
@@ -575,11 +656,28 @@ impl AgentLaneJournal {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let run = require_cursor(&transaction, intent.cursor)?;
         require_running(&run)?;
-        if run.pending_provider_round.is_none() {
-            return Err(AgentLaneJournalError::Conflict("provider_result"));
+        if run.pending_provider_round.is_some() {
+            return Err(AgentLaneJournalError::PendingProvider);
         }
         if run.pending_tool.is_some() {
             return Err(AgentLaneJournalError::PendingTool);
+        }
+        let previous = read_event(
+            &transaction,
+            run.run_id,
+            run.next_sequence.saturating_sub(1),
+        )?
+        .ok_or(AgentLaneJournalError::Conflict("tool_intent_order"))?;
+        if previous.kind != "provider_outcome"
+            || !provider_outcome_matches_tool(
+                &previous.payload,
+                run.provider_round,
+                intent.call_id,
+                intent.tool_name,
+                intent.arguments,
+            )?
+        {
+            return Err(AgentLaneJournalError::Conflict("tool_intent_order"));
         }
         insert_event(
             &transaction,
@@ -891,6 +989,7 @@ impl AgentLaneJournal {
                 kind.as_str(),
                 "run_intent"
                     | "provider_intent"
+                    | "provider_outcome"
                     | "transcript"
                     | "tool_intent"
                     | "tool_outcome"
@@ -914,6 +1013,7 @@ impl AgentLaneJournal {
         if u64::try_from(events.len()).unwrap_or(u64::MAX) + 1 != run.next_sequence {
             return Err(AgentLaneJournalError::Conflict("next_sequence"));
         }
+        validate_event_invariants(&run, &events)?;
         Ok(RunRecovery {
             cursor: run.cursor(),
             lane_key: run.lane_key,
@@ -1171,6 +1271,253 @@ fn insert_event(
     Ok(())
 }
 
+fn read_event(
+    connection: &Connection,
+    run_id: i64,
+    sequence: u64,
+) -> Journalled<Option<JournalEvent>> {
+    let row = connection
+        .query_row(
+            "SELECT kind, payload_json, recorded_ms
+             FROM agent_lane_events WHERE run_id = ?1 AND sequence = ?2",
+            params![run_id, to_i64(sequence)?],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|(kind, payload, recorded_ms)| {
+        Ok(JournalEvent {
+            sequence,
+            kind,
+            payload: decode_json(&payload, "event_payload")?,
+            recorded_ms,
+        })
+    })
+    .transpose()
+}
+
+fn validate_provider_outcome(value: &Value) -> Journalled<()> {
+    let object = value
+        .as_object()
+        .ok_or(AgentLaneJournalError::InvalidField("provider_outcome"))?;
+    let kind = object
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or(AgentLaneJournalError::InvalidField("provider_outcome"))?;
+    match kind {
+        "final" => {
+            if object.len() != 2
+                || object
+                    .get("answer")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+            {
+                return Err(AgentLaneJournalError::InvalidField("provider_outcome"));
+            }
+        }
+        "failure" => {
+            if object.len() != 2
+                || object
+                    .get("failure")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+            {
+                return Err(AgentLaneJournalError::InvalidField("provider_outcome"));
+            }
+        }
+        "tool_call" => {
+            if object.len() != 4 {
+                return Err(AgentLaneJournalError::InvalidField("provider_outcome"));
+            }
+            let call_id = object
+                .get("call_id")
+                .and_then(Value::as_str)
+                .ok_or(AgentLaneJournalError::InvalidField("provider_outcome"))?;
+            let tool = object
+                .get("tool")
+                .and_then(Value::as_str)
+                .ok_or(AgentLaneJournalError::InvalidField("provider_outcome"))?;
+            let arguments = object
+                .get("arguments")
+                .ok_or(AgentLaneJournalError::InvalidField("provider_outcome"))?;
+            validate_key(call_id, "provider_call_id")?;
+            validate_tool_name(tool)?;
+            if !arguments.is_object() {
+                return Err(AgentLaneJournalError::InvalidField("provider_arguments"));
+            }
+            encode_json(arguments, "provider_arguments")?;
+        }
+        _ => return Err(AgentLaneJournalError::InvalidField("provider_outcome")),
+    }
+    Ok(())
+}
+
+fn provider_outcome_matches_tool(
+    event_payload: &Value,
+    expected_round: u32,
+    call_id: &str,
+    tool_name: &str,
+    arguments: &Value,
+) -> Journalled<bool> {
+    let payload = event_payload
+        .as_object()
+        .ok_or(AgentLaneJournalError::Conflict("provider_outcome"))?;
+    if payload.len() != 2
+        || payload.get("round").and_then(Value::as_u64) != Some(u64::from(expected_round))
+    {
+        return Err(AgentLaneJournalError::Conflict("provider_outcome"));
+    }
+    let outcome = payload
+        .get("outcome")
+        .ok_or(AgentLaneJournalError::Conflict("provider_outcome"))?;
+    validate_provider_outcome(outcome)
+        .map_err(|_| AgentLaneJournalError::Conflict("provider_outcome"))?;
+    let object = outcome
+        .as_object()
+        .ok_or(AgentLaneJournalError::Conflict("provider_outcome"))?;
+    Ok(
+        object.get("kind").and_then(Value::as_str) == Some("tool_call")
+            && object.get("call_id").and_then(Value::as_str) == Some(call_id)
+            && object.get("tool").and_then(Value::as_str) == Some(tool_name)
+            && object.get("arguments") == Some(arguments),
+    )
+}
+
+fn validate_event_invariants(run: &StoredRun, events: &[JournalEvent]) -> Journalled<()> {
+    if events.first().map(|event| event.kind.as_str()) != Some("run_intent")
+        || events
+            .iter()
+            .skip(1)
+            .any(|event| event.kind == "run_intent")
+    {
+        return Err(AgentLaneJournalError::Conflict("run_intent_order"));
+    }
+
+    let mut pending_provider = None;
+    let mut latest_round = 0_u32;
+    let mut pending_tool: Option<(u64, String, String, String, Value)> = None;
+    for (index, event) in events.iter().enumerate() {
+        match event.kind.as_str() {
+            "provider_intent" => {
+                if pending_provider.is_some() {
+                    return Err(AgentLaneJournalError::Conflict("provider_order"));
+                }
+                let round = event
+                    .payload
+                    .get("round")
+                    .and_then(Value::as_u64)
+                    .and_then(|round| u32::try_from(round).ok())
+                    .ok_or(AgentLaneJournalError::Conflict("provider_round"))?;
+                if round != latest_round.saturating_add(1) {
+                    return Err(AgentLaneJournalError::Conflict("provider_round"));
+                }
+                latest_round = round;
+                pending_provider = Some(round);
+            }
+            "provider_outcome" => {
+                let round = event
+                    .payload
+                    .get("round")
+                    .and_then(Value::as_u64)
+                    .and_then(|round| u32::try_from(round).ok())
+                    .ok_or(AgentLaneJournalError::Conflict("provider_round"))?;
+                if pending_provider != Some(round) {
+                    return Err(AgentLaneJournalError::Conflict("provider_order"));
+                }
+                let outcome = event
+                    .payload
+                    .get("outcome")
+                    .ok_or(AgentLaneJournalError::Conflict("provider_outcome"))?;
+                validate_provider_outcome(outcome)
+                    .map_err(|_| AgentLaneJournalError::Conflict("provider_outcome"))?;
+                pending_provider = None;
+            }
+            "tool_intent" => {
+                if pending_tool.is_some() || index == 0 {
+                    return Err(AgentLaneJournalError::Conflict("tool_intent_order"));
+                }
+                let call_id = event
+                    .payload
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .ok_or(AgentLaneJournalError::Conflict("tool_intent"))?;
+                let tool = event
+                    .payload
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .ok_or(AgentLaneJournalError::Conflict("tool_intent"))?;
+                let idempotency_key = event
+                    .payload
+                    .get("idempotency_key")
+                    .and_then(Value::as_str)
+                    .ok_or(AgentLaneJournalError::Conflict("tool_intent"))?;
+                let arguments = event
+                    .payload
+                    .get("arguments")
+                    .ok_or(AgentLaneJournalError::Conflict("tool_intent"))?;
+                if event.payload.as_object().map(serde_json::Map::len) != Some(4)
+                    || !arguments.is_object()
+                {
+                    return Err(AgentLaneJournalError::Conflict("tool_intent"));
+                }
+                let previous = &events[index - 1];
+                if previous.kind != "provider_outcome"
+                    || !provider_outcome_matches_tool(
+                        &previous.payload,
+                        latest_round,
+                        call_id,
+                        tool,
+                        arguments,
+                    )?
+                {
+                    return Err(AgentLaneJournalError::Conflict("tool_intent_order"));
+                }
+                validate_key(call_id, "stored_call_id")?;
+                validate_tool_name(tool)?;
+                validate_key(idempotency_key, "stored_idempotency_key")?;
+                pending_tool = Some((
+                    event.sequence,
+                    call_id.to_owned(),
+                    tool.to_owned(),
+                    idempotency_key.to_owned(),
+                    arguments.clone(),
+                ));
+            }
+            "tool_outcome" => {
+                let call_id = event
+                    .payload
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .ok_or(AgentLaneJournalError::Conflict("tool_outcome"))?;
+                if pending_tool.as_ref().map(|tool| tool.1.as_str()) != Some(call_id) {
+                    return Err(AgentLaneJournalError::Conflict("tool_outcome"));
+                }
+                pending_tool = None;
+            }
+            _ => {}
+        }
+    }
+    if latest_round != run.provider_round || pending_provider != run.pending_provider_round {
+        return Err(AgentLaneJournalError::Conflict("provider_coordinate"));
+    }
+    match (&run.pending_tool, pending_tool) {
+        (None, None) => {}
+        (Some(stored), Some((sequence, call_id, tool, key, arguments)))
+            if stored.intent_sequence == sequence
+                && stored.call_id == call_id
+                && stored.tool_name == tool
+                && stored.idempotency_key == key
+                && stored.arguments == arguments => {}
+        _ => return Err(AgentLaneJournalError::Conflict("pending_tool_coordinate")),
+    }
+    Ok(())
+}
+
 fn advance_run<P: rusqlite::Params>(
     connection: &Connection,
     run: &StoredRun,
@@ -1191,6 +1538,24 @@ fn initialize(connection: &mut Connection) -> Journalled<()> {
     if version == AGENT_LANE_JOURNAL_SCHEMA_VERSION {
         return Ok(());
     }
+    if version == 1 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let before: u64 =
+            transaction.query_row("SELECT count(*) FROM agent_lane_events", [], |row| {
+                row.get(0)
+            })?;
+        transaction.execute_batch(MIGRATE_V1_TO_V2)?;
+        let after: u64 =
+            transaction.query_row("SELECT count(*) FROM agent_lane_events", [], |row| {
+                row.get(0)
+            })?;
+        if before != after {
+            return Err(AgentLaneJournalError::Conflict("migration_event_count"));
+        }
+        transaction.pragma_update(None, "user_version", AGENT_LANE_JOURNAL_SCHEMA_VERSION)?;
+        transaction.commit()?;
+        return Ok(());
+    }
     if version != 0 {
         return Err(AgentLaneJournalError::SchemaVersion {
             found: version,
@@ -1209,7 +1574,7 @@ fn initialize(connection: &mut Connection) -> Journalled<()> {
         });
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(SCHEMA_V1)?;
+    transaction.execute_batch(SCHEMA_V2)?;
     transaction.pragma_update(None, "user_version", AGENT_LANE_JOURNAL_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -1372,13 +1737,27 @@ mod tests {
             .expect("provider intent");
         cursor = fixture
             .journal
+            .record_provider_outcome(ProviderOutcome {
+                cursor: &cursor,
+                round: 1,
+                outcome: &json!({
+                    "kind": "tool_call",
+                    "call_id": "call-1",
+                    "tool": "tickets.list",
+                    "arguments": {"state": "closed"}
+                }),
+                recorded_ms: 12,
+            })
+            .expect("provider tool outcome");
+        cursor = fixture
+            .journal
             .record_tool_intent(ToolIntent {
                 cursor: &cursor,
                 call_id: "call-1",
                 tool_name: "tickets.list",
                 idempotency_key: "lane:event-11:call-1",
                 arguments: &json!({"state": "closed"}),
-                recorded_ms: 12,
+                recorded_ms: 13,
             })
             .expect("tool intent");
 
@@ -1395,7 +1774,12 @@ mod tests {
                 .iter()
                 .map(|event| event.kind.as_str())
                 .collect::<Vec<_>>(),
-            vec!["run_intent", "provider_intent", "tool_intent"]
+            vec![
+                "run_intent",
+                "provider_intent",
+                "provider_outcome",
+                "tool_intent"
+            ]
         );
 
         let mut cursor = journal
@@ -1403,7 +1787,7 @@ mod tests {
                 cursor: &recovery.cursor,
                 call_id: "call-1",
                 outcome: &json!({"tickets": ["T-7"]}),
-                recorded_ms: 13,
+                recorded_ms: 14,
             })
             .expect("tool outcome");
         cursor = journal
@@ -1411,15 +1795,26 @@ mod tests {
                 cursor: &cursor,
                 round: 2,
                 request: &json!({"transcript_entries": 3}),
-                recorded_ms: 14,
+                recorded_ms: 15,
             })
             .expect("second provider intent");
+        cursor = journal
+            .record_provider_outcome(ProviderOutcome {
+                cursor: &cursor,
+                round: 2,
+                outcome: &json!({
+                    "kind": "final",
+                    "answer": "T-7 was completed yesterday."
+                }),
+                recorded_ms: 16,
+            })
+            .expect("final provider outcome");
         cursor = journal
             .record_transcript(TranscriptAppend {
                 cursor: &cursor,
                 kind: TranscriptKind::Assistant,
                 content: &json!({"text": "T-7 was completed yesterday."}),
-                recorded_ms: 15,
+                recorded_ms: 17,
             })
             .expect("assistant transcript");
         journal
@@ -1427,14 +1822,14 @@ mod tests {
                 cursor: &cursor,
                 status: TerminalStatus::Completed,
                 detail: &json!({"answer": "T-7 was completed yesterday."}),
-                finished_ms: 16,
+                finished_ms: 18,
             })
             .expect("finish");
         let recovered = journal.recover("event-11").unwrap().unwrap();
         assert_eq!(recovered.status, RunStatus::Completed);
         assert_eq!(recovered.completed_tool_calls, 1);
         assert!(recovered.pending_tool.is_none());
-        assert_eq!(recovered.events.len(), 7);
+        assert_eq!(recovered.events.len(), 9);
     }
 
     #[test]
@@ -1464,6 +1859,215 @@ mod tests {
     }
 
     #[test]
+    fn existing_v1_database_migrates_and_accepts_provider_outcomes_idempotently() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join(AGENT_LANE_JOURNAL_NAME);
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let legacy = Connection::open(&path).unwrap();
+        let legacy_schema = SCHEMA_V2.replace("'provider_outcome', ", "");
+        legacy.execute_batch(&legacy_schema).unwrap();
+        legacy.pragma_update(None, "user_version", 1).unwrap();
+        let intent = serde_json::to_vec(&json!({"message": "legacy run"})).unwrap();
+        legacy
+            .execute(
+                "INSERT INTO agent_lane_runs
+                 (lane_key, run_key, intent_json, status, opened_ms, next_sequence, revision)
+                 VALUES ('legacy-lane', 'legacy-run', ?1, 'running', 10, 2, 1)",
+                [&intent],
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO agent_lane_events
+                 (run_id, sequence, kind, payload_json, recorded_ms)
+                 VALUES (1, 1, 'run_intent', ?1, 10)",
+                [&intent],
+            )
+            .unwrap();
+        drop(legacy);
+
+        let mut journal = AgentLaneJournal::open(&path).expect("migrate v1");
+        let version: u32 = journal
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, AGENT_LANE_JOURNAL_SCHEMA_VERSION);
+        let mut cursor = journal.recover("legacy-run").unwrap().unwrap().cursor;
+        cursor = journal
+            .record_provider_intent(ProviderIntent {
+                cursor: &cursor,
+                round: 1,
+                request: &json!({"transcript_entries": 1}),
+                recorded_ms: 11,
+            })
+            .unwrap();
+        journal
+            .record_provider_outcome(ProviderOutcome {
+                cursor: &cursor,
+                round: 1,
+                outcome: &json!({"kind": "final", "answer": "migrated"}),
+                recorded_ms: 12,
+            })
+            .unwrap();
+        drop(journal);
+
+        let reopened = AgentLaneJournal::open(&path).expect("idempotent v2 reopen");
+        let recovered = reopened.recover("legacy-run").unwrap().unwrap();
+        assert_eq!(recovered.pending_provider_round, None);
+        assert_eq!(
+            recovered.events.last().map(|event| event.kind.as_str()),
+            Some("provider_outcome")
+        );
+    }
+
+    #[test]
+    fn tool_intent_requires_immediately_preceding_matching_provider_outcome() {
+        let mut fixture = Fixture::new();
+        let cursor = fixture.begin();
+        assert!(matches!(
+            fixture.journal.record_tool_intent(ToolIntent {
+                cursor: &cursor,
+                call_id: "call-1",
+                tool_name: "tickets.read",
+                idempotency_key: "effect-1",
+                arguments: &json!({"number": 7}),
+                recorded_ms: 11,
+            }),
+            Err(AgentLaneJournalError::Conflict("tool_intent_order"))
+        ));
+        let mut cursor = fixture
+            .journal
+            .record_provider_intent(ProviderIntent {
+                cursor: &cursor,
+                round: 1,
+                request: &json!({}),
+                recorded_ms: 11,
+            })
+            .unwrap();
+        assert!(matches!(
+            fixture.journal.record_tool_intent(ToolIntent {
+                cursor: &cursor,
+                call_id: "call-1",
+                tool_name: "tickets.read",
+                idempotency_key: "effect-1",
+                arguments: &json!({"number": 7}),
+                recorded_ms: 12,
+            }),
+            Err(AgentLaneJournalError::PendingProvider)
+        ));
+        cursor = fixture
+            .journal
+            .record_provider_outcome(ProviderOutcome {
+                cursor: &cursor,
+                round: 1,
+                outcome: &json!({
+                    "kind": "tool_call",
+                    "call_id": "call-1",
+                    "tool": "tickets.read",
+                    "arguments": {"number": 7}
+                }),
+                recorded_ms: 12,
+            })
+            .unwrap();
+        assert!(matches!(
+            fixture.journal.record_tool_intent(ToolIntent {
+                cursor: &cursor,
+                call_id: "call-1",
+                tool_name: "tickets.read",
+                idempotency_key: "effect-1",
+                arguments: &json!({"number": 8}),
+                recorded_ms: 13,
+            }),
+            Err(AgentLaneJournalError::Conflict("tool_intent_order"))
+        ));
+        cursor = fixture
+            .journal
+            .record_transcript(TranscriptAppend {
+                cursor: &cursor,
+                kind: TranscriptKind::User,
+                content: &json!({"text": "unrelated steering"}),
+                recorded_ms: 13,
+            })
+            .unwrap();
+        assert!(matches!(
+            fixture.journal.record_tool_intent(ToolIntent {
+                cursor: &cursor,
+                call_id: "call-1",
+                tool_name: "tickets.read",
+                idempotency_key: "effect-1",
+                arguments: &json!({"number": 7}),
+                recorded_ms: 14,
+            }),
+            Err(AgentLaneJournalError::Conflict("tool_intent_order"))
+        ));
+    }
+
+    #[test]
+    fn recovery_refuses_tool_intent_whose_provider_binding_was_tampered() {
+        let mut fixture = Fixture::new();
+        let mut cursor = fixture.begin();
+        cursor = fixture
+            .journal
+            .record_provider_intent(ProviderIntent {
+                cursor: &cursor,
+                round: 1,
+                request: &json!({}),
+                recorded_ms: 11,
+            })
+            .unwrap();
+        cursor = fixture
+            .journal
+            .record_provider_outcome(ProviderOutcome {
+                cursor: &cursor,
+                round: 1,
+                outcome: &json!({
+                    "kind": "tool_call",
+                    "call_id": "call-1",
+                    "tool": "tickets.read",
+                    "arguments": {"number": 7}
+                }),
+                recorded_ms: 12,
+            })
+            .unwrap();
+        fixture
+            .journal
+            .record_tool_intent(ToolIntent {
+                cursor: &cursor,
+                call_id: "call-1",
+                tool_name: "tickets.read",
+                idempotency_key: "effect-1",
+                arguments: &json!({"number": 7}),
+                recorded_ms: 13,
+            })
+            .unwrap();
+        let replacement = serde_json::to_vec(&json!({
+            "round": 1,
+            "outcome": {"kind": "final", "answer": "tampered"}
+        }))
+        .unwrap();
+        fixture
+            .journal
+            .connection
+            .execute(
+                "UPDATE agent_lane_events SET payload_json = ?1
+                 WHERE run_id = ?2 AND kind = 'provider_outcome'",
+                params![replacement, cursor.run_id],
+            )
+            .unwrap();
+        assert!(matches!(
+            fixture.journal.recover("event-11"),
+            Err(AgentLaneJournalError::Conflict("tool_intent_order"))
+        ));
+    }
+
+    #[test]
     fn approval_and_exact_tool_intent_survive_restart() {
         let mut fixture = Fixture::new();
         let mut cursor = fixture.begin();
@@ -1478,13 +2082,27 @@ mod tests {
             .unwrap();
         cursor = fixture
             .journal
+            .record_provider_outcome(ProviderOutcome {
+                cursor: &cursor,
+                round: 1,
+                outcome: &json!({
+                    "kind": "tool_call",
+                    "call_id": "call-approve",
+                    "tool": "tickets.comment",
+                    "arguments": {"ticket": 7, "body": "done"}
+                }),
+                recorded_ms: 12,
+            })
+            .unwrap();
+        cursor = fixture
+            .journal
             .record_tool_intent(ToolIntent {
                 cursor: &cursor,
                 call_id: "call-approve",
                 tool_name: "tickets.comment",
                 idempotency_key: "stable-effect-key",
                 arguments: &json!({"ticket": 7, "body": "done"}),
-                recorded_ms: 12,
+                recorded_ms: 13,
             })
             .unwrap();
         fixture
@@ -1494,7 +2112,7 @@ mod tests {
                 approval_key: "approval-7",
                 call_id: "call-approve",
                 summary: "Post the exact ticket comment",
-                requested_ms: 13,
+                requested_ms: 14,
             })
             .unwrap();
 
@@ -1520,7 +2138,7 @@ mod tests {
                 approval_key: "approval-7",
                 decision: ApprovalDecision::Approved,
                 decision_ref: "operator-decision-9",
-                decided_ms: 14,
+                decided_ms: 15,
             })
             .unwrap();
         let recovery = fixture.journal.recover("event-11").unwrap().unwrap();
@@ -1554,13 +2172,27 @@ mod tests {
         ));
         let cursor = fixture
             .journal
+            .record_provider_outcome(ProviderOutcome {
+                cursor: &cursor,
+                round: 1,
+                outcome: &json!({
+                    "kind": "tool_call",
+                    "call_id": "expected",
+                    "tool": "tickets.read",
+                    "arguments": {}
+                }),
+                recorded_ms: 12,
+            })
+            .unwrap();
+        let cursor = fixture
+            .journal
             .record_tool_intent(ToolIntent {
                 cursor: &cursor,
                 call_id: "expected",
                 tool_name: "tickets.read",
                 idempotency_key: "read-1",
                 arguments: &json!({}),
-                recorded_ms: 12,
+                recorded_ms: 13,
             })
             .unwrap();
         assert!(matches!(
@@ -1568,7 +2200,7 @@ mod tests {
                 cursor: &cursor,
                 call_id: "different",
                 outcome: &json!({}),
-                recorded_ms: 13,
+                recorded_ms: 14,
             }),
             Err(AgentLaneJournalError::Conflict("call_id"))
         ));
