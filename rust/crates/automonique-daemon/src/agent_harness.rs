@@ -5,14 +5,15 @@
 //! The harness owns only the model/tool loop. It does not authenticate an
 //! actor, decide an approval, open a provider connection, or execute a tool.
 //! Those authorities stay behind [`AgentProvider`] and [`ToolBroker`]. A model
-//! may select one tool from the catalog it is shown; the broker remains the
-//! component that validates arguments and either returns a bounded result or
-//! pauses the loop for approval.
+//! may select an ordered, bounded batch of tools from the catalog it is shown;
+//! the broker remains the component that validates each call and either
+//! returns a bounded result or pauses the loop for approval. Batches execute
+//! sequentially so every result is returned before the next provider round.
 //!
 //! Persona and policy are separate inputs. Persona may shape Monique's voice,
 //! but it cannot alter the catalog, budgets, approval custody, or broker.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use serde::Deserialize;
@@ -31,12 +32,14 @@ pub const MAX_TOOL_DESCRIPTION_BYTES: usize = 2 * 1024;
 pub const MAX_TOOL_SCHEMA_BYTES: usize = 64 * 1024;
 pub const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
 pub const MAX_PROVIDER_DECISION_BYTES: usize = 128 * 1024;
+pub const MAX_PROVIDER_TOOL_CALLS_PER_BATCH: usize = MAX_TOOL_CALLS_CEILING as usize;
 
 pub const MAX_ROUNDS_CEILING: u16 = 32;
 pub const MAX_TOOL_CALLS_CEILING: u16 = 64;
 pub const MAX_CALLS_PER_TOOL_CEILING: u16 = 16;
 pub const MAX_IDENTICAL_CALLS_CEILING: u16 = 4;
-pub const MAX_TOOL_RESULT_BYTES_CEILING: usize = 1024 * 1024;
+/// Leaves room for the durable journal's tool-outcome envelope below 1 MiB.
+pub const MAX_TOOL_RESULT_BYTES_CEILING: usize = 1024 * 1024 - 4 * 1024;
 
 /// All loop ceilings. Zero is never a useful bound and is refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -352,16 +355,65 @@ impl ToolCall {
     }
 }
 
+/// A non-empty provider-ordered batch of tool calls.
+///
+/// Construction applies a hard process ceiling. A harness applies its smaller
+/// per-turn budgets atomically before any call in the batch reaches a broker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolCallBatch(Vec<ToolCall>);
+
+impl ToolCallBatch {
+    pub fn new(calls: Vec<ToolCall>) -> Result<Self, DecisionError> {
+        if calls.is_empty()
+            || calls.len() > MAX_PROVIDER_TOOL_CALLS_PER_BATCH
+            || encoded_tool_call_batch_size(&calls) > MAX_PROVIDER_DECISION_BYTES
+        {
+            return Err(DecisionError::InvalidBatch);
+        }
+        Ok(Self(calls))
+    }
+
+    #[must_use]
+    pub fn calls(&self) -> &[ToolCall] {
+        &self.0
+    }
+
+    fn into_calls(self) -> Vec<ToolCall> {
+        self.0
+    }
+}
+
+fn encoded_tool_call_batch_size(calls: &[ToolCall]) -> usize {
+    let calls = calls
+        .iter()
+        .map(|call| {
+            serde_json::json!({
+                "call_id": call.call_id(),
+                "tool": call.tool(),
+                "arguments": call.arguments()
+            })
+        })
+        .collect::<Vec<_>>();
+    canonical_json_bytes(&serde_json::json!({
+        "kind": "tool_calls",
+        "calls": calls
+    }))
+    .len()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderDecision {
     Final(FinalAnswer),
+    /// Compatibility form for providers that select exactly one tool.
     ToolCall(ToolCall),
+    ToolCalls(ToolCallBatch),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecisionError {
     InvalidIdentifier,
     InvalidArguments,
+    InvalidBatch,
     InvalidText,
 }
 
@@ -387,7 +439,22 @@ pub fn decode_provider_decision(bytes: &[u8]) -> Result<ProviderDecision, Provid
         } => ToolCall::new(call_id, tool, arguments)
             .map(ProviderDecision::ToolCall)
             .map_err(|_| ProviderFailure::MalformedOutput),
+        ProviderDecisionWire::ToolCalls { calls } => calls
+            .into_iter()
+            .map(|call| ToolCall::new(call.call_id, call.tool, call.arguments))
+            .collect::<Result<Vec<_>, _>>()
+            .and_then(ToolCallBatch::new)
+            .map(ProviderDecision::ToolCalls)
+            .map_err(|_| ProviderFailure::MalformedOutput),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolCallWire {
+    call_id: String,
+    tool: String,
+    arguments: Value,
 }
 
 #[derive(Deserialize)]
@@ -400,6 +467,9 @@ enum ProviderDecisionWire {
         call_id: String,
         tool: String,
         arguments: Value,
+    },
+    ToolCalls {
+        calls: Vec<ToolCallWire>,
     },
 }
 
@@ -503,6 +573,20 @@ pub enum ToolBrokerOutcome {
 /// Execution and argument validation live here, outside model custody.
 pub trait ToolBroker {
     fn catalog(&mut self) -> Result<Vec<ToolDefinition>, CatalogError>;
+
+    /// Atomically validate and reserve an ordered batch against the pinned
+    /// broker catalog without executing, freezing, or journaling.
+    ///
+    /// Failure must commit no reservation or replay/invocation state. Success
+    /// reserves capacity and conflict coordinates for the whole batch;
+    /// [`Self::invoke`] then consumes that reservation in provider order while
+    /// repeating authority-sensitive validation.
+    fn admit_batch(&mut self, calls: &[ToolCall]) -> Result<(), ToolBrokerFailure>;
+
+    /// Release only the unconsumed tail of the current admitted batch.
+    /// Completed calls and their legitimate replay receipts remain intact.
+    fn abort_batch(&mut self);
+
     fn invoke(&mut self, call: &ToolCall) -> Result<ToolBrokerOutcome, ToolBrokerFailure>;
 }
 
@@ -608,6 +692,7 @@ pub struct AgentHarness {
     calls_per_tool: BTreeMap<String, u16>,
     identical_calls: BTreeMap<[u8; 32], u16>,
     call_ids: BTreeSet<String>,
+    pending_calls: VecDeque<ToolCall>,
     state: HarnessState,
 }
 
@@ -652,6 +737,7 @@ impl AgentHarness {
             calls_per_tool: BTreeMap::new(),
             identical_calls: BTreeMap::new(),
             call_ids: BTreeSet::new(),
+            pending_calls: VecDeque::new(),
             state: HarnessState::Ready,
         })
     }
@@ -697,6 +783,31 @@ impl AgentHarness {
         }
 
         loop {
+            // A provider batch is drained completely, in provider order,
+            // before another provider round is allowed to observe results.
+            if let Some(call) = self.pending_calls.pop_front() {
+                self.transcript
+                    .push(TranscriptInput::ToolCall(call.clone()));
+                match broker.invoke(&call) {
+                    Ok(ToolBrokerOutcome::Complete(payload)) => {
+                        if let Err(error) = self.append_tool_result(&call, payload) {
+                            broker.abort_batch();
+                            return self.fail(error);
+                        }
+                    }
+                    Ok(ToolBrokerOutcome::ApprovalRequired(approval)) => {
+                        let pause = ApprovalPause { approval, call };
+                        self.state = HarnessState::AwaitingApproval(pause.clone());
+                        return Ok(HarnessOutcome::AwaitingApproval(pause));
+                    }
+                    Err(error) => {
+                        broker.abort_batch();
+                        return self.fail(HarnessFailure::Tool(error));
+                    }
+                }
+                continue;
+            }
+
             if self.rounds >= self.limits.max_rounds {
                 return self.fail(HarnessFailure::BudgetExceeded(BudgetKind::Rounds));
             }
@@ -732,58 +843,13 @@ impl AgentHarness {
                     return Ok(HarnessOutcome::Complete(answer));
                 }
                 ProviderDecision::ToolCall(call) => {
-                    // Reserve both the call and its eventual result before the
-                    // broker is reached. A tool must not execute if its result
-                    // cannot be represented in the bounded transcript.
-                    if self.transcript.len().saturating_add(2) > MAX_TRANSCRIPT_ENTRIES {
-                        return self.fail(HarnessFailure::TranscriptFull);
+                    if let Err(error) = self.admit_tool_calls(broker, vec![call]) {
+                        return self.fail(error);
                     }
-                    if !self
-                        .catalog
-                        .as_deref()
-                        .unwrap_or(&[])
-                        .iter()
-                        .any(|tool| tool.id == call.tool)
-                    {
-                        return self.fail(HarnessFailure::UnknownTool);
-                    }
-                    if !self.call_ids.insert(call.call_id.clone()) {
-                        return self.fail(HarnessFailure::DuplicateCallId);
-                    }
-                    if self.tool_calls >= self.limits.max_tool_calls {
-                        return self.fail(HarnessFailure::BudgetExceeded(BudgetKind::ToolCalls));
-                    }
-                    let per_tool = self.calls_per_tool.get(&call.tool).copied().unwrap_or(0);
-                    if per_tool >= self.limits.max_calls_per_tool {
-                        return self.fail(HarnessFailure::BudgetExceeded(BudgetKind::CallsPerTool));
-                    }
-                    let digest = call.digest();
-                    let identical = self.identical_calls.get(&digest).copied().unwrap_or(0);
-                    if identical >= self.limits.max_identical_calls {
-                        return self
-                            .fail(HarnessFailure::BudgetExceeded(BudgetKind::IdenticalCall));
-                    }
-
-                    self.tool_calls = self.tool_calls.saturating_add(1);
-                    self.calls_per_tool
-                        .insert(call.tool.clone(), per_tool.saturating_add(1));
-                    self.identical_calls
-                        .insert(digest, identical.saturating_add(1));
-                    self.transcript
-                        .push(TranscriptInput::ToolCall(call.clone()));
-
-                    match broker.invoke(&call) {
-                        Ok(ToolBrokerOutcome::Complete(payload)) => {
-                            if let Err(error) = self.append_tool_result(&call, payload) {
-                                return self.fail(error);
-                            }
-                        }
-                        Ok(ToolBrokerOutcome::ApprovalRequired(approval)) => {
-                            let pause = ApprovalPause { approval, call };
-                            self.state = HarnessState::AwaitingApproval(pause.clone());
-                            return Ok(HarnessOutcome::AwaitingApproval(pause));
-                        }
-                        Err(error) => return self.fail(HarnessFailure::Tool(error)),
+                }
+                ProviderDecision::ToolCalls(batch) => {
+                    if let Err(error) = self.admit_tool_calls(broker, batch.into_calls()) {
+                        return self.fail(error);
                     }
                 }
             }
@@ -792,9 +858,12 @@ impl AgentHarness {
 
     /// Continue after the external approval custodian settled and executed the
     /// exact paused call. This method validates binding and result size; it does
-    /// not interpret approval evidence or execute the tool itself.
+    /// not interpret approval evidence or execute the tool itself. The broker
+    /// handle is used only to release the remaining batch if result admission
+    /// fails.
     pub fn resume_with_tool_result(
         &mut self,
+        broker: &mut dyn ToolBroker,
         call_id: &str,
         payload: ToolResultPayload,
     ) -> Result<(), HarnessFailure> {
@@ -806,10 +875,73 @@ impl AgentHarness {
         }
         let call = pause.call.clone();
         if let Err(error) = self.append_tool_result(&call, payload) {
+            broker.abort_batch();
             self.state = HarnessState::Failed;
             return Err(error);
         }
         self.state = HarnessState::Ready;
+        Ok(())
+    }
+
+    /// Validate and reserve an entire provider batch before any member can
+    /// execute. This prevents a bad later call from leaving partial effects.
+    fn admit_tool_calls(
+        &mut self,
+        broker: &mut dyn ToolBroker,
+        calls: Vec<ToolCall>,
+    ) -> Result<(), HarnessFailure> {
+        debug_assert!(!calls.is_empty());
+        debug_assert!(self.pending_calls.is_empty());
+
+        if self
+            .transcript
+            .len()
+            .saturating_add(calls.len().saturating_mul(2))
+            > MAX_TRANSCRIPT_ENTRIES
+        {
+            return Err(HarnessFailure::TranscriptFull);
+        }
+        let batch_count = u16::try_from(calls.len())
+            .map_err(|_| HarnessFailure::BudgetExceeded(BudgetKind::ToolCalls))?;
+        if self.tool_calls.saturating_add(batch_count) > self.limits.max_tool_calls {
+            return Err(HarnessFailure::BudgetExceeded(BudgetKind::ToolCalls));
+        }
+
+        let catalog = self.catalog.as_deref().unwrap_or(&[]);
+        let mut call_ids = self.call_ids.clone();
+        let mut calls_per_tool = self.calls_per_tool.clone();
+        let mut identical_calls = self.identical_calls.clone();
+        for call in &calls {
+            if !catalog.iter().any(|tool| tool.id == call.tool) {
+                return Err(HarnessFailure::UnknownTool);
+            }
+            if !call_ids.insert(call.call_id.clone()) {
+                return Err(HarnessFailure::DuplicateCallId);
+            }
+
+            let per_tool = calls_per_tool.entry(call.tool.clone()).or_default();
+            *per_tool = per_tool.saturating_add(1);
+            if *per_tool > self.limits.max_calls_per_tool {
+                return Err(HarnessFailure::BudgetExceeded(BudgetKind::CallsPerTool));
+            }
+
+            let identical = identical_calls.entry(call.digest()).or_default();
+            *identical = identical.saturating_add(1);
+            if *identical > self.limits.max_identical_calls {
+                return Err(HarnessFailure::BudgetExceeded(BudgetKind::IdenticalCall));
+            }
+        }
+
+        // Broker schemas, capacity, replay and invocation fences are
+        // authoritative. Reserve the whole batch atomically before any member
+        // reaches `invoke`.
+        broker.admit_batch(&calls).map_err(HarnessFailure::Tool)?;
+
+        self.tool_calls = self.tool_calls.saturating_add(batch_count);
+        self.call_ids = call_ids;
+        self.calls_per_tool = calls_per_tool;
+        self.identical_calls = identical_calls;
+        self.pending_calls.extend(calls);
         Ok(())
     }
 
@@ -954,15 +1086,27 @@ mod tests {
     #[derive(Default)]
     struct FixtureBroker {
         catalog: Vec<ToolDefinition>,
+        admission_outcomes: VecDeque<Result<(), ToolBrokerFailure>>,
+        admitted_batches: Vec<Vec<ToolCall>>,
         outcomes: VecDeque<Result<ToolBrokerOutcome, ToolBrokerFailure>>,
         calls: Vec<ToolCall>,
         catalog_reads: usize,
+        aborts: usize,
     }
 
     impl ToolBroker for FixtureBroker {
         fn catalog(&mut self) -> Result<Vec<ToolDefinition>, CatalogError> {
             self.catalog_reads += 1;
             Ok(self.catalog.clone())
+        }
+
+        fn admit_batch(&mut self, calls: &[ToolCall]) -> Result<(), ToolBrokerFailure> {
+            self.admitted_batches.push(calls.to_vec());
+            self.admission_outcomes.pop_front().unwrap_or(Ok(()))
+        }
+
+        fn abort_batch(&mut self) {
+            self.aborts += 1;
         }
 
         fn invoke(&mut self, call: &ToolCall) -> Result<ToolBrokerOutcome, ToolBrokerFailure> {
@@ -984,6 +1128,14 @@ mod tests {
 
     fn call(id: &str, tool: &str, arguments: Value) -> ProviderDecision {
         ProviderDecision::ToolCall(ToolCall::new(id, tool, arguments).unwrap())
+    }
+
+    fn raw_call(id: &str, tool: &str, arguments: Value) -> ToolCall {
+        ToolCall::new(id, tool, arguments).unwrap()
+    }
+
+    fn batch(calls: Vec<ToolCall>) -> ProviderDecision {
+        ProviderDecision::ToolCalls(ToolCallBatch::new(calls).unwrap())
     }
 
     fn final_answer(text: &str) -> ProviderDecision {
@@ -1076,6 +1228,246 @@ mod tests {
         assert_eq!(provider.observed_transcript_lengths, [1, 3, 5]);
         assert_eq!(broker.catalog_reads, 1);
         assert_eq!(broker.calls.len(), 2);
+    }
+
+    #[test]
+    fn provider_batch_decodes_and_preserves_order() {
+        let decision = decode_provider_decision(
+            br#"{"kind":"tool_calls","calls":[{"call_id":"call-1","tool":"tickets.read","arguments":{"page":1}},{"call_id":"call-2","tool":"issues.read","arguments":{"number":7}}]}"#,
+        )
+        .unwrap();
+        let ProviderDecision::ToolCalls(batch) = decision else {
+            panic!("expected a tool batch");
+        };
+        assert_eq!(
+            batch
+                .calls()
+                .iter()
+                .map(ToolCall::call_id)
+                .collect::<Vec<_>>(),
+            ["call-1", "call-2"]
+        );
+        assert_eq!(
+            decode_provider_decision(br#"{"kind":"tool_calls","calls":[]}"#),
+            Err(ProviderFailure::MalformedOutput)
+        );
+        assert_eq!(
+            decode_provider_decision(
+                br#"{"kind":"tool_calls","calls":[{"call_id":"call-1","tool":"tickets.read","arguments":{},"unexpected":true}]}"#
+            ),
+            Err(ProviderFailure::MalformedOutput)
+        );
+
+        let over_ceiling = (0..=MAX_PROVIDER_TOOL_CALLS_PER_BATCH)
+            .map(|index| {
+                raw_call(
+                    &format!("call-{index}"),
+                    "tickets.read",
+                    json!({"index":index}),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ToolCallBatch::new(over_ceiling),
+            Err(DecisionError::InvalidBatch)
+        );
+
+        let large_payload = "x".repeat(MAX_TOOL_ARGUMENT_BYTES - 32);
+        let aggregate_too_large = vec![
+            raw_call(
+                "call-large-1",
+                "tickets.read",
+                json!({"payload":large_payload}),
+            ),
+            raw_call(
+                "call-large-2",
+                "tickets.read",
+                json!({"payload":large_payload}),
+            ),
+        ];
+        assert_eq!(
+            ToolCallBatch::new(aggregate_too_large),
+            Err(DecisionError::InvalidBatch)
+        );
+        assert_eq!(
+            HarnessLimits::new(1, 1, 1, 1, MAX_TOOL_RESULT_BYTES_CEILING + 1),
+            Err(HarnessBuildError::InvalidLimit("max_tool_result_bytes"))
+        );
+    }
+
+    #[test]
+    fn ordered_batch_runs_sequentially_before_next_provider_round() {
+        let mut provider = ScriptedProvider::new(vec![
+            Ok(batch(vec![
+                raw_call("call-1", "tickets.read", json!({"page":1})),
+                raw_call("call-2", "issues.read", json!({"number":7})),
+                raw_call("call-3", "deployments.read", json!({"name":"web"})),
+            ])),
+            Ok(final_answer("All three reads completed.")),
+        ]);
+        let mut broker = FixtureBroker {
+            catalog: vec![
+                tool("tickets.read"),
+                tool("issues.read"),
+                tool("deployments.read"),
+            ],
+            outcomes: vec![
+                Ok(ToolBrokerOutcome::Complete(ToolResultPayload::complete(
+                    json!({"page":1}),
+                ))),
+                Ok(ToolBrokerOutcome::Complete(ToolResultPayload::complete(
+                    json!({"number":7}),
+                ))),
+                Ok(ToolBrokerOutcome::Complete(ToolResultPayload::complete(
+                    json!({"online":true}),
+                ))),
+            ]
+            .into(),
+            ..FixtureBroker::default()
+        };
+        let mut harness = harness(HarnessLimits::conversational());
+
+        assert!(matches!(
+            harness.drive(&mut provider, &mut broker),
+            Ok(HarnessOutcome::Complete(_))
+        ));
+        assert_eq!(provider.observed_rounds, [1, 2]);
+        assert_eq!(provider.observed_transcript_lengths, [1, 7]);
+        assert_eq!(
+            broker
+                .calls
+                .iter()
+                .map(ToolCall::call_id)
+                .collect::<Vec<_>>(),
+            ["call-1", "call-2", "call-3"]
+        );
+        for (offset, call_id) in ["call-1", "call-2", "call-3"].iter().enumerate() {
+            let call_index = 1 + offset * 2;
+            assert!(matches!(
+                harness.transcript().get(call_index),
+                Some(TranscriptInput::ToolCall(call)) if call.call_id() == *call_id
+            ));
+            assert!(matches!(
+                harness.transcript().get(call_index + 1),
+                Some(TranscriptInput::ToolResult(result)) if result.call_id() == *call_id
+            ));
+        }
+    }
+
+    #[test]
+    fn whole_batch_is_refused_before_execution_when_a_later_call_is_invalid() {
+        let mut provider = ScriptedProvider::new(vec![Ok(batch(vec![
+            raw_call("call-1", "tickets.read", json!({"page":1})),
+            raw_call("call-2", "shell.exec", json!({"command":"no"})),
+        ]))]);
+        let mut broker = FixtureBroker {
+            catalog: vec![tool("tickets.read")],
+            ..FixtureBroker::default()
+        };
+        let mut invalid_harness = harness(HarnessLimits::conversational());
+
+        assert_eq!(
+            invalid_harness.drive(&mut provider, &mut broker),
+            Err(HarnessFailure::UnknownTool)
+        );
+        assert!(broker.calls.is_empty());
+        assert_eq!(invalid_harness.tool_calls(), 0);
+        assert_eq!(invalid_harness.transcript().len(), 1);
+
+        let limits = HarnessLimits::new(4, 1, 1, 1, 1024).unwrap();
+        let mut provider = ScriptedProvider::new(vec![Ok(batch(vec![
+            raw_call("call-1", "tickets.read", json!({"page":1})),
+            raw_call("call-2", "issues.read", json!({"number":7})),
+        ]))]);
+        let mut broker = FixtureBroker {
+            catalog: vec![tool("tickets.read"), tool("issues.read")],
+            ..FixtureBroker::default()
+        };
+        let mut harness = harness(limits);
+        assert_eq!(
+            harness.drive(&mut provider, &mut broker),
+            Err(HarnessFailure::BudgetExceeded(BudgetKind::ToolCalls))
+        );
+        assert!(broker.calls.is_empty());
+        assert_eq!(harness.tool_calls(), 0);
+    }
+
+    #[test]
+    fn schema_invalid_later_batch_member_prevents_every_execution() {
+        let mut provider = ScriptedProvider::new(vec![Ok(batch(vec![
+            raw_call("call-valid", "tickets.read", json!({"number":7})),
+            raw_call("call-invalid", "tickets.read", json!({"number":"eight"})),
+        ]))]);
+        let mut broker = FixtureBroker {
+            catalog: vec![tool("tickets.read")],
+            admission_outcomes: vec![Err(ToolBrokerFailure::InvalidArguments)].into(),
+            ..FixtureBroker::default()
+        };
+        let mut harness = harness(HarnessLimits::conversational());
+
+        assert_eq!(
+            harness.drive(&mut provider, &mut broker),
+            Err(HarnessFailure::Tool(ToolBrokerFailure::InvalidArguments))
+        );
+        assert_eq!(
+            broker
+                .admitted_batches
+                .first()
+                .unwrap()
+                .iter()
+                .map(ToolCall::call_id)
+                .collect::<Vec<_>>(),
+            ["call-valid", "call-invalid"]
+        );
+        assert!(broker.calls.is_empty());
+        assert_eq!(harness.tool_calls(), 0);
+        assert_eq!(harness.transcript().len(), 1);
+    }
+
+    #[test]
+    fn invoke_failure_aborts_batch_tail_and_same_broker_accepts_fresh_run() {
+        let mut failed_provider = ScriptedProvider::new(vec![Ok(batch(vec![
+            raw_call("call-fails", "tickets.read", json!({"number":7})),
+            raw_call("call-tail", "tickets.read", json!({"number":8})),
+        ]))]);
+        let mut broker = FixtureBroker {
+            catalog: vec![tool("tickets.read")],
+            outcomes: vec![
+                Err(ToolBrokerFailure::Failed),
+                Ok(ToolBrokerOutcome::Complete(ToolResultPayload::complete(
+                    json!({"number":9}),
+                ))),
+            ]
+            .into(),
+            ..FixtureBroker::default()
+        };
+        let mut failed_harness = harness(HarnessLimits::conversational());
+
+        assert_eq!(
+            failed_harness.drive(&mut failed_provider, &mut broker),
+            Err(HarnessFailure::Tool(ToolBrokerFailure::Failed))
+        );
+        assert_eq!(broker.aborts, 1);
+        assert_eq!(broker.calls.len(), 1);
+
+        let mut fresh_provider = ScriptedProvider::new(vec![
+            Ok(call("call-fresh", "tickets.read", json!({"number":9}))),
+            Ok(final_answer("Fresh call completed.")),
+        ]);
+        let mut fresh_harness = harness(HarnessLimits::conversational());
+        assert!(matches!(
+            fresh_harness.drive(&mut fresh_provider, &mut broker),
+            Ok(HarnessOutcome::Complete(_))
+        ));
+        assert_eq!(broker.aborts, 1);
+        assert_eq!(
+            broker
+                .calls
+                .iter()
+                .map(ToolCall::call_id)
+                .collect::<Vec<_>>(),
+            ["call-fails", "call-fresh"]
+        );
     }
 
     #[test]
@@ -1212,13 +1604,15 @@ mod tests {
             .into(),
             ..FixtureBroker::default()
         };
+        let mut result_harness = harness(result);
         assert!(matches!(
-            harness(result).drive(&mut provider, &mut broker),
+            result_harness.drive(&mut provider, &mut broker),
             Err(HarnessFailure::ToolResultTooLarge {
                 maximum: 8,
                 actual: _
             })
         ));
+        assert_eq!(broker.aborts, 1);
     }
 
     #[test]
@@ -1249,11 +1643,16 @@ mod tests {
         ));
         assert_eq!(broker.calls.len(), 1);
         assert_eq!(
-            harness.resume_with_tool_result("wrong-call", ToolResultPayload::complete(json!({}))),
+            harness.resume_with_tool_result(
+                &mut broker,
+                "wrong-call",
+                ToolResultPayload::complete(json!({}))
+            ),
             Err(HarnessFailure::ApprovalResultMismatch)
         );
         harness
             .resume_with_tool_result(
+                &mut broker,
                 "call-1",
                 ToolResultPayload::complete(json!({"posted":true})),
             )
@@ -1262,6 +1661,116 @@ mod tests {
             harness.drive(&mut provider, &mut broker),
             Ok(HarnessOutcome::Complete(_))
         ));
+    }
+
+    #[test]
+    fn oversized_resumed_result_aborts_the_retained_batch_tail() {
+        let limits = HarnessLimits::new(4, 4, 4, 2, 8).unwrap();
+        let mut provider = ScriptedProvider::new(vec![Ok(batch(vec![
+            raw_call("call-effect", "slack.post", json!({"text":"hello"})),
+            raw_call("call-tail", "tickets.read", json!({"number":7})),
+        ]))]);
+        let mut broker = FixtureBroker {
+            catalog: vec![tool("slack.post"), tool("tickets.read")],
+            outcomes: vec![Ok(ToolBrokerOutcome::ApprovalRequired(
+                ToolApproval::new("approval-1", "Post hello").unwrap(),
+            ))]
+            .into(),
+            ..FixtureBroker::default()
+        };
+        let mut harness = harness(limits);
+        assert!(matches!(
+            harness.drive(&mut provider, &mut broker),
+            Ok(HarnessOutcome::AwaitingApproval(_))
+        ));
+        assert_eq!(broker.aborts, 0);
+
+        assert!(matches!(
+            harness.resume_with_tool_result(
+                &mut broker,
+                "call-effect",
+                ToolResultPayload::complete(json!({"long":"0123456789"}))
+            ),
+            Err(HarnessFailure::ToolResultTooLarge {
+                maximum: 8,
+                actual: _
+            })
+        ));
+        assert_eq!(broker.aborts, 1);
+    }
+
+    #[test]
+    fn approval_in_a_batch_gates_later_calls_and_the_next_provider_round() {
+        let mut provider = ScriptedProvider::new(vec![
+            Ok(batch(vec![
+                raw_call("call-read-1", "tickets.read", json!({"page":1})),
+                raw_call("call-effect", "slack.post", json!({"text":"hello"})),
+                raw_call("call-read-2", "issues.read", json!({"number":7})),
+            ])),
+            Ok(final_answer("Read, posted, and verified.")),
+        ]);
+        let mut broker = FixtureBroker {
+            catalog: vec![
+                tool("tickets.read"),
+                tool("slack.post"),
+                tool("issues.read"),
+            ],
+            outcomes: vec![
+                Ok(ToolBrokerOutcome::Complete(ToolResultPayload::complete(
+                    json!({"tickets":[]}),
+                ))),
+                Ok(ToolBrokerOutcome::ApprovalRequired(
+                    ToolApproval::new("approval-1", "Post hello to the configured channel")
+                        .unwrap(),
+                )),
+                Ok(ToolBrokerOutcome::Complete(ToolResultPayload::complete(
+                    json!({"number":7}),
+                ))),
+            ]
+            .into(),
+            ..FixtureBroker::default()
+        };
+        let mut harness = harness(HarnessLimits::conversational());
+
+        let HarnessOutcome::AwaitingApproval(pause) =
+            harness.drive(&mut provider, &mut broker).unwrap()
+        else {
+            panic!("expected effect call to pause the batch");
+        };
+        assert_eq!(pause.call().call_id(), "call-effect");
+        assert_eq!(harness.tool_calls(), 3);
+        assert_eq!(provider.observed_rounds, [1]);
+        assert_eq!(
+            broker
+                .calls
+                .iter()
+                .map(ToolCall::call_id)
+                .collect::<Vec<_>>(),
+            ["call-read-1", "call-effect"]
+        );
+        assert_eq!(harness.transcript().len(), 4);
+
+        harness
+            .resume_with_tool_result(
+                &mut broker,
+                "call-effect",
+                ToolResultPayload::complete(json!({"posted":true})),
+            )
+            .unwrap();
+        assert!(matches!(
+            harness.drive(&mut provider, &mut broker),
+            Ok(HarnessOutcome::Complete(_))
+        ));
+        assert_eq!(provider.observed_rounds, [1, 2]);
+        assert_eq!(provider.observed_transcript_lengths, [1, 7]);
+        assert_eq!(
+            broker
+                .calls
+                .iter()
+                .map(ToolCall::call_id)
+                .collect::<Vec<_>>(),
+            ["call-read-1", "call-effect", "call-read-2"]
+        );
     }
 
     #[test]

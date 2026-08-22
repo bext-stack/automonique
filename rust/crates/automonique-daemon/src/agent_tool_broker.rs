@@ -9,7 +9,7 @@
 //! local descriptor requires no approval can execute immediately. Every other
 //! invocation is frozen behind an opaque approval reference.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use automonique_protocol::tools::{ApprovalRequirement, SideEffectClass};
 use serde_json::Value;
@@ -20,6 +20,7 @@ const MAX_DESCRIPTION_BYTES: usize = 500;
 const MAX_INVOCATION_FIELD_BYTES: usize = 256;
 const MAX_SCHEMA_BYTES: usize = 16 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
+const MAX_BATCH_CALLS: usize = 64;
 const MAX_SCHEMA_DEPTH: usize = 8;
 const MAX_PROPERTIES: usize = 64;
 
@@ -450,6 +451,7 @@ pub struct AgentToolBroker {
     replays: BTreeMap<String, ReplayRecord>,
     pending: BTreeMap<String, PendingApproval>,
     decisions: BTreeMap<String, BrokerOutcome>,
+    admitted: VecDeque<ToolInvocation>,
 }
 
 impl AgentToolBroker {
@@ -465,6 +467,7 @@ impl AgentToolBroker {
             replays: BTreeMap::new(),
             pending: BTreeMap::new(),
             decisions: BTreeMap::new(),
+            admitted: VecDeque::new(),
         }
     }
 
@@ -518,6 +521,11 @@ impl AgentToolBroker {
         self.calls_used
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_pending_or_admitted(&self) -> bool {
+        !self.pending.is_empty() || !self.admitted.is_empty()
+    }
+
     /// Derive the exact downstream idempotency key before an executor can run.
     ///
     /// Durable runtime adapters persist this value alongside effect intent.
@@ -548,6 +556,77 @@ impl AgentToolBroker {
         Ok(downstream_idempotency_key(invocation, granted))
     }
 
+    /// Atomically validate and reserve one ordered provider batch.
+    ///
+    /// Admission simulates invocation-id, replay-key, schema, catalog and
+    /// unique-call capacity changes in temporary state. Failure commits
+    /// nothing. Success fences the broker to the exact ordered invocations;
+    /// [`Self::invoke`] consumes one matching reservation at a time.
+    pub(crate) fn admit_batch(
+        &mut self,
+        catalog: &GrantedToolCatalog,
+        invocations: &[ToolInvocation],
+    ) -> Result<(), ToolDenial> {
+        if invocations.is_empty() || !self.admitted.is_empty() {
+            return Err(ToolDenial::InvocationConflict);
+        }
+        if invocations.len() > MAX_BATCH_CALLS {
+            return Err(ToolDenial::CallLimit);
+        }
+
+        let mut invocation_ids = self.invocation_ids.clone();
+        let mut replay_fingerprints = self
+            .replays
+            .iter()
+            .map(|(key, replay)| (key.clone(), replay.fingerprint.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut unique_calls = 0_usize;
+
+        for invocation in invocations {
+            self.planned_idempotency_key(catalog, invocation)?;
+            let granted = catalog
+                .descriptors
+                .get(&invocation.tool_name)
+                .ok_or(ToolDenial::NotGranted)?;
+            let fingerprint = invocation_fingerprint(invocation, granted);
+
+            if let Some(existing_key) = invocation_ids.get(&invocation.invocation_id)
+                && existing_key != &invocation.replay_key
+            {
+                return Err(ToolDenial::InvocationConflict);
+            }
+            invocation_ids.insert(
+                invocation.invocation_id.clone(),
+                invocation.replay_key.clone(),
+            );
+
+            match replay_fingerprints.get(&invocation.replay_key) {
+                Some(existing) if existing != &fingerprint => {
+                    return Err(ToolDenial::ReplayConflict);
+                }
+                Some(_) => {}
+                None => {
+                    replay_fingerprints.insert(invocation.replay_key.clone(), fingerprint);
+                    unique_calls = unique_calls.saturating_add(1);
+                }
+            }
+        }
+
+        if self.calls_used.saturating_add(unique_calls) > self.max_calls {
+            return Err(ToolDenial::CallLimit);
+        }
+
+        self.admitted.extend(invocations.iter().cloned());
+        Ok(())
+    }
+
+    /// Release unconsumed provider-batch reservations after a terminal
+    /// harness failure. Completed invocations and replay receipts are not
+    /// rolled back.
+    pub(crate) fn abort_batch(&mut self) {
+        self.admitted.clear();
+    }
+
     /// Validate, fence, and either execute or freeze one invocation.
     pub fn invoke(
         &mut self,
@@ -572,6 +651,13 @@ impl AgentToolBroker {
         }
         if validate_value(&granted.input_schema, &invocation.arguments, 0).is_err() {
             return denied(ToolDenial::InvalidArguments);
+        }
+
+        if let Some(expected) = self.admitted.front() {
+            if expected != &invocation {
+                return denied(ToolDenial::InvocationConflict);
+            }
+            self.admitted.pop_front();
         }
 
         let fingerprint = invocation_fingerprint(&invocation, granted);
@@ -985,6 +1071,26 @@ mod tests {
         }
     }
 
+    struct FailOnceExecutor {
+        calls: Arc<Mutex<Vec<(String, Value, String)>>>,
+        fail_next: bool,
+    }
+
+    impl AgentToolExecutor for FailOnceExecutor {
+        fn execute(&mut self, request: ToolExecutionRequest<'_>) -> Result<Value, &'static str> {
+            self.calls.lock().unwrap().push((
+                request.tool_name().to_owned(),
+                request.arguments().clone(),
+                request.idempotency_key().to_owned(),
+            ));
+            if std::mem::take(&mut self.fail_next) {
+                Err("first execution failed")
+            } else {
+                Ok(json!({"observed": request.arguments()}))
+            }
+        }
+    }
+
     fn schema() -> Value {
         json!({
             "type": "object",
@@ -1123,6 +1229,178 @@ mod tests {
         }
         assert!(calls.lock().unwrap().is_empty());
         assert_eq!(broker.calls_used(), 0);
+    }
+
+    #[test]
+    fn batch_admission_reserves_atomically_without_leaking_failed_capacity() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut broker = AgentToolBroker::new(1);
+        broker
+            .register(
+                descriptor(
+                    "tickets.read",
+                    SideEffectClass::ReadOnly,
+                    ApprovalRequirement::None,
+                ),
+                Box::new(RecordingExecutor {
+                    calls: calls.clone(),
+                }),
+            )
+            .unwrap();
+        let catalog = broker.granted_catalog(&["tickets.read"]).unwrap();
+        let first = invocation(
+            "call-1",
+            "event:call-1",
+            "tickets.read",
+            json!({"ticket": 7}),
+        );
+        let second = invocation(
+            "call-2",
+            "event:call-2",
+            "tickets.read",
+            json!({"ticket": 8}),
+        );
+
+        assert_eq!(
+            broker.admit_batch(&catalog, &[first.clone(), second]),
+            Err(ToolDenial::CallLimit)
+        );
+        assert!(broker.admitted.is_empty());
+        assert!(broker.invocation_ids.is_empty());
+        assert!(broker.replays.is_empty());
+        assert_eq!(broker.calls_used(), 0);
+        assert!(calls.lock().unwrap().is_empty());
+
+        broker
+            .admit_batch(&catalog, std::slice::from_ref(&first))
+            .unwrap();
+        assert!(matches!(
+            broker.invoke(&catalog, first),
+            BrokerOutcome::Complete { .. }
+        ));
+        assert!(broker.admitted.is_empty());
+        assert_eq!(broker.calls_used(), 1);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn batch_admission_refuses_internal_replay_and_invocation_collisions_atomically() {
+        let mut broker = AgentToolBroker::new(4);
+        broker
+            .register(
+                descriptor(
+                    "tickets.read",
+                    SideEffectClass::ReadOnly,
+                    ApprovalRequirement::None,
+                ),
+                Box::new(RecordingExecutor {
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }),
+            )
+            .unwrap();
+        let catalog = broker.granted_catalog(&["tickets.read"]).unwrap();
+
+        let replay_collision = [
+            invocation("call-1", "event:same", "tickets.read", json!({"ticket": 7})),
+            invocation("call-2", "event:same", "tickets.read", json!({"ticket": 8})),
+        ];
+        assert_eq!(
+            broker.admit_batch(&catalog, &replay_collision),
+            Err(ToolDenial::ReplayConflict)
+        );
+
+        let invocation_collision = [
+            invocation(
+                "call-same",
+                "event:one",
+                "tickets.read",
+                json!({"ticket": 7}),
+            ),
+            invocation(
+                "call-same",
+                "event:two",
+                "tickets.read",
+                json!({"ticket": 7}),
+            ),
+        ];
+        assert_eq!(
+            broker.admit_batch(&catalog, &invocation_collision),
+            Err(ToolDenial::InvocationConflict)
+        );
+        assert!(broker.admitted.is_empty());
+        assert!(broker.invocation_ids.is_empty());
+        assert!(broker.replays.is_empty());
+        assert_eq!(broker.calls_used(), 0);
+    }
+
+    #[test]
+    fn abort_releases_failed_batch_tail_without_erasing_legitimate_receipt() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut broker = AgentToolBroker::new(4);
+        broker
+            .register(
+                descriptor(
+                    "tickets.read",
+                    SideEffectClass::ReadOnly,
+                    ApprovalRequirement::None,
+                ),
+                Box::new(FailOnceExecutor {
+                    calls: calls.clone(),
+                    fail_next: true,
+                }),
+            )
+            .unwrap();
+        let catalog = broker.granted_catalog(&["tickets.read"]).unwrap();
+        let failed = invocation(
+            "call-fails",
+            "event:fails",
+            "tickets.read",
+            json!({"ticket": 7}),
+        );
+        let tail = invocation(
+            "call-tail",
+            "event:tail",
+            "tickets.read",
+            json!({"ticket": 8}),
+        );
+        broker
+            .admit_batch(&catalog, &[failed.clone(), tail])
+            .unwrap();
+        assert!(matches!(
+            broker.invoke(&catalog, failed),
+            BrokerOutcome::Denied {
+                reason: ToolDenial::ExecutionFailed,
+                ..
+            }
+        ));
+        assert_eq!(broker.admitted.len(), 1);
+
+        broker.abort_batch();
+        assert!(broker.admitted.is_empty());
+        assert_eq!(broker.calls_used(), 1);
+        assert_eq!(broker.invocation_ids.len(), 1);
+        assert_eq!(broker.replays.len(), 1);
+        assert!(!broker.invocation_ids.contains_key("call-tail"));
+        assert!(!broker.replays.contains_key("event:tail"));
+
+        let fresh = invocation(
+            "call-fresh",
+            "event:fresh",
+            "tickets.read",
+            json!({"ticket": 9}),
+        );
+        broker
+            .admit_batch(&catalog, std::slice::from_ref(&fresh))
+            .unwrap();
+        assert!(matches!(
+            broker.invoke(&catalog, fresh),
+            BrokerOutcome::Complete { .. }
+        ));
+        assert!(broker.admitted.is_empty());
+        assert_eq!(broker.calls_used(), 2);
+        assert_eq!(broker.invocation_ids.len(), 2);
+        assert_eq!(broker.replays.len(), 2);
+        assert_eq!(calls.lock().unwrap().len(), 2);
     }
 
     #[test]

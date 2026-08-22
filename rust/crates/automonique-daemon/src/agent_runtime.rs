@@ -23,9 +23,9 @@ use crate::agent_harness::{
     TranscriptInput, TranscriptRole,
 };
 use crate::agent_lane_journal::{
-    AgentLaneJournal, AgentLaneJournalError, ApprovalPending, ProviderIntent, ProviderOutcome,
-    RunCursor, RunIntent, RunRecovery, TerminalRecord, TerminalStatus, ToolIntent, ToolOutcome,
-    TranscriptAppend, TranscriptKind,
+    AbandonRecord, AgentLaneJournal, AgentLaneJournalError, ApprovalPending, ProviderIntent,
+    ProviderOutcome, RunCursor, RunIntent, RunRecovery, RunStatus, TerminalRecord, TerminalStatus,
+    ToolIntent, ToolOutcome, TranscriptAppend, TranscriptKind,
 };
 use crate::agent_tool_broker::{
     AgentToolBroker, AgentToolExecutor, BrokerOutcome, GrantedToolCatalog, LocalToolDescriptor,
@@ -46,7 +46,9 @@ pub enum AgentRuntimeError {
 /// Live transports use this while tool execution still belongs to their
 /// existing continuation workers. A selected tool is therefore returned as a
 /// typed, schema-checked call; no executor runs in this adapter. This is a
-/// migration seam, not a second authority path.
+/// migration seam, not a second authority path. It rejects provider batches
+/// because returning only their first paused call would discard continuation
+/// custody for the remaining calls.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentRuntimeStep {
     Final(String),
@@ -86,6 +88,7 @@ pub enum DurableAgentRunOutcome {
 pub enum DurableAgentRuntimeError {
     Journal(AgentLaneJournalError),
     Harness(HarnessFailure),
+    RecoveryUnsafe,
 }
 
 impl fmt::Display for DurableAgentRuntimeError {
@@ -93,8 +96,116 @@ impl fmt::Display for DurableAgentRuntimeError {
         match self {
             Self::Journal(error) => write!(formatter, "durable agent journal: {error}"),
             Self::Harness(error) => write!(formatter, "durable agent harness: {error}"),
+            Self::RecoveryUnsafe => {
+                formatter.write_str("durable agent run requires operator reconciliation")
+            }
         }
     }
+}
+
+/// Run one opaque, no-tool provider callback durably.
+///
+/// The returned string may be a transport router document; this adapter does
+/// not interpret it. Existing typed routing continues after the durable
+/// boundary. Duplicate run keys return the terminal string without calling the
+/// provider. A crash with an in-flight provider callback is terminalized as an
+/// ambiguous failure and is never replayed.
+pub fn drive_durable_opaque_provider_call(
+    journal: &mut AgentLaneJournal,
+    request: DurableAgentRunRequest<'_>,
+    provider: &mut dyn AgentProvider,
+    clock: &mut dyn AgentJournalClock,
+) -> Result<String, DurableAgentRuntimeError> {
+    let mut local = AgentToolBroker::new(1);
+    let granted = local.granted_catalog(&[]).map_err(|_| {
+        DurableAgentRuntimeError::Harness(HarnessFailure::Catalog(CatalogError::InvalidTool))
+    })?;
+    let mut runtime =
+        AgentRuntimeBroker::new(&mut local, granted, "opaque:provider").map_err(|_| {
+            DurableAgentRuntimeError::Harness(HarnessFailure::Catalog(CatalogError::InvalidTool))
+        })?;
+    match drive_durable_agent_run(journal, request, provider, &mut runtime, clock)? {
+        DurableAgentRunOutcome::Complete(answer) => Ok(answer),
+        DurableAgentRunOutcome::AwaitingApproval(_) => {
+            Err(DurableAgentRuntimeError::RecoveryUnsafe)
+        }
+        DurableAgentRunOutcome::Recovered(recovery) => {
+            recover_opaque_provider_call(journal, *recovery, clock)
+        }
+    }
+}
+
+fn recover_opaque_provider_call(
+    journal: &mut AgentLaneJournal,
+    recovery: RunRecovery,
+    clock: &mut dyn AgentJournalClock,
+) -> Result<String, DurableAgentRuntimeError> {
+    match recovery.status {
+        RunStatus::Completed => recovery
+            .terminal_detail
+            .as_ref()
+            .and_then(|detail| detail.get("answer"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or(DurableAgentRuntimeError::RecoveryUnsafe),
+        RunStatus::Running if recovery.pending_provider_round.is_none() => {
+            let outcome = recovery
+                .events
+                .iter()
+                .rev()
+                .find(|event| event.kind == "provider_outcome")
+                .and_then(|event| event.payload.get("outcome"))
+                .filter(|outcome| {
+                    outcome.get("kind").and_then(serde_json::Value::as_str) == Some("final")
+                })
+                .and_then(|outcome| outcome.get("answer"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let last_kind = recovery.events.last().map(|event| event.kind.as_str());
+            if let (Some(outcome), Some("provider_outcome" | "transcript")) = (outcome, last_kind) {
+                let mut cursor = recovery.cursor;
+                if last_kind == Some("provider_outcome") {
+                    let recorded_ms = clock.now_ms();
+                    cursor = journal.record_transcript(TranscriptAppend {
+                        cursor: &cursor,
+                        kind: TranscriptKind::Assistant,
+                        content: &serde_json::json!({"text": outcome}),
+                        recorded_ms,
+                    })?;
+                }
+                let finished_ms = clock.now_ms();
+                journal.finish(TerminalRecord {
+                    cursor: &cursor,
+                    status: TerminalStatus::Completed,
+                    detail: &serde_json::json!({"answer": outcome}),
+                    finished_ms,
+                })?;
+                return Ok(outcome);
+            }
+            abandon_recovery(journal, &recovery, "restart_non_resumable", clock)?;
+            Err(DurableAgentRuntimeError::RecoveryUnsafe)
+        }
+        RunStatus::Running | RunStatus::AwaitingApproval => {
+            abandon_recovery(journal, &recovery, "restart_ambiguous", clock)?;
+            Err(DurableAgentRuntimeError::RecoveryUnsafe)
+        }
+        RunStatus::Failed => Err(DurableAgentRuntimeError::RecoveryUnsafe),
+    }
+}
+
+fn abandon_recovery(
+    journal: &mut AgentLaneJournal,
+    recovery: &RunRecovery,
+    reason: &str,
+    clock: &mut dyn AgentJournalClock,
+) -> Result<(), DurableAgentRuntimeError> {
+    let abandoned_ms = clock.now_ms();
+    journal.abandon(AbandonRecord {
+        cursor: &recovery.cursor,
+        reason,
+        abandoned_ms,
+    })?;
+    Ok(())
 }
 
 impl std::error::Error for DurableAgentRuntimeError {}
@@ -166,6 +277,15 @@ pub fn drive_durable_agent_run(
 
     let mut context = state.borrow_mut();
     if let Some(error) = context.failure.take() {
+        if matches!(error, AgentLaneJournalError::InvalidField(_)) {
+            let abandoned_ms = context.now_ms();
+            let cursor = context.cursor.clone();
+            context.cursor = context.journal.abandon(AbandonRecord {
+                cursor: &cursor,
+                reason: "journal_record_too_large",
+                abandoned_ms,
+            })?;
+        }
         return Err(DurableAgentRuntimeError::Journal(error));
     }
     match outcome {
@@ -180,8 +300,15 @@ pub fn drive_durable_agent_run(
             )?;
             Ok(DurableAgentRunOutcome::Complete(answer.as_str().to_owned()))
         }
-        Ok(HarnessOutcome::AwaitingApproval(pause)) => {
-            Ok(DurableAgentRunOutcome::AwaitingApproval(pause))
+        Ok(HarnessOutcome::AwaitingApproval(_)) => {
+            let abandoned_ms = context.now_ms();
+            let cursor = context.cursor.clone();
+            context.cursor = context.journal.abandon(AbandonRecord {
+                cursor: &cursor,
+                reason: "approval_continuation_unsupported",
+                abandoned_ms,
+            })?;
+            Err(DurableAgentRuntimeError::RecoveryUnsafe)
         }
         Err(failure) => {
             context.finish(
@@ -280,6 +407,14 @@ impl AgentProvider for JournaledProvider<'_, '_> {
                 "tool": call.tool(),
                 "arguments": call.arguments()
             }),
+            Ok(ProviderDecision::ToolCalls(batch)) => serde_json::json!({
+                "kind": "tool_calls",
+                "calls": batch.calls().iter().map(|call| serde_json::json!({
+                    "call_id": call.call_id(),
+                    "tool": call.tool(),
+                    "arguments": call.arguments()
+                })).collect::<Vec<_>>()
+            }),
             Err(failure) => serde_json::json!({
                 "kind": "failure",
                 "failure": provider_failure_code(*failure)
@@ -314,6 +449,24 @@ impl ToolBroker for JournaledRuntimeBroker<'_, '_, '_> {
         self.inner.catalog()
     }
 
+    fn admit_batch(&mut self, calls: &[ToolCall]) -> Result<(), ToolBrokerFailure> {
+        let descriptors = self.inner.granted.descriptors();
+        if calls.iter().any(|call| {
+            descriptors.iter().any(|descriptor| {
+                descriptor.name() == call.tool()
+                    && (descriptor.side_effect() != SideEffectClass::ReadOnly
+                        || descriptor.approval() != ApprovalRequirement::None)
+            })
+        }) {
+            return Err(ToolBrokerFailure::Unauthorized);
+        }
+        self.inner.admit_batch(calls)
+    }
+
+    fn abort_batch(&mut self) {
+        self.inner.abort_batch();
+    }
+
     fn invoke(&mut self, call: &ToolCall) -> Result<ToolBrokerOutcome, ToolBrokerFailure> {
         let idempotency_key = self.inner.planned_idempotency_key(call)?;
         {
@@ -336,7 +489,17 @@ impl ToolBroker for JournaledRuntimeBroker<'_, '_, '_> {
             }
         }
 
-        let result = self.inner.invoke(call);
+        let mut result = self.inner.invoke(call);
+        if let Ok(ToolBrokerOutcome::Complete(payload)) = &result {
+            let outcome = serde_json::json!({
+                "kind": "complete",
+                "is_error": payload.is_error(),
+                "value": payload.value()
+            });
+            if !crate::agent_lane_journal::tool_outcome_record_fits(call.call_id(), &outcome) {
+                result = Err(ToolBrokerFailure::Failed);
+            }
+        }
         let mut context = self.state.borrow_mut();
         let now_ms = context.now_ms();
         let cursor = context.cursor.clone();
@@ -543,7 +706,10 @@ struct OneStepProvider<'a> {
 impl AgentProvider for OneStepProvider<'_> {
     fn decide(&mut self, _turn: ProviderTurn<'_>) -> Result<ProviderDecision, ProviderFailure> {
         let bytes = self.bytes.take().ok_or(ProviderFailure::Refused)?;
-        crate::agent_harness::decode_provider_decision(bytes)
+        match crate::agent_harness::decode_provider_decision(bytes)? {
+            ProviderDecision::ToolCalls(_) => Err(ProviderFailure::Refused),
+            decision => Ok(decision),
+        }
     }
 }
 
@@ -633,6 +799,20 @@ impl<'a> AgentRuntimeBroker<'a> {
 impl ToolBroker for AgentRuntimeBroker<'_> {
     fn catalog(&mut self) -> Result<Vec<ToolDefinition>, CatalogError> {
         Ok(self.definitions.clone())
+    }
+
+    fn admit_batch(&mut self, calls: &[ToolCall]) -> Result<(), ToolBrokerFailure> {
+        let invocations = calls
+            .iter()
+            .map(|call| self.invocation(call))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.broker
+            .admit_batch(&self.granted, &invocations)
+            .map_err(map_denial)
+    }
+
+    fn abort_batch(&mut self) {
+        self.broker.abort_batch();
     }
 
     fn invoke(&mut self, call: &ToolCall) -> Result<ToolBrokerOutcome, ToolBrokerFailure> {
@@ -926,6 +1106,23 @@ mod tests {
     }
 
     #[test]
+    fn live_step_adapter_rejects_batches_instead_of_discarding_the_tail() {
+        let result = validate_provider_step(
+            br#"{"kind":"tool_calls","calls":[{"call_id":"call-1","tool":"tickets.read","arguments":{"number":7}},{"call_id":"call-2","tool":"tickets.read","arguments":{"number":8}}]}"#,
+            "Monique",
+            "Use tools for current facts.",
+            transcript(),
+            &[definition()],
+            "slack:turn-batch",
+        );
+
+        assert_eq!(
+            result,
+            Err(HarnessFailure::Provider(ProviderFailure::Refused))
+        );
+    }
+
+    #[test]
     fn live_step_adapter_fails_closed_on_unknown_tools_and_bad_arguments() {
         for bytes in [
             br#"{"kind":"tool_call","call_id":"call-1","tool":"shell.run","arguments":{"number":7}}"#.as_slice(),
@@ -1067,6 +1264,279 @@ mod tests {
     }
 
     #[test]
+    fn opaque_provider_call_commits_intent_before_callback_and_recovers_without_replay() {
+        let (_root, mut journal, path) = journal_fixture();
+        let raw = r#"{"kind":"tool_call","call_id":"call-1","tool":"tickets.read","arguments":{"number":7}}"#;
+        let mut provider = InspectingProvider {
+            journal_path: path,
+            run_key: String::from("event-opaque"),
+            decisions: vec![Ok(ProviderDecision::Final(
+                crate::agent_harness::FinalAnswer::new(raw).unwrap(),
+            ))]
+            .into(),
+        };
+        let mut clock = StepClock(150);
+        let answer = drive_durable_opaque_provider_call(
+            &mut journal,
+            DurableAgentRunRequest {
+                identity: DurableAgentRunIdentity {
+                    lane_key: "slack:thread-opaque",
+                    run_key: "event-opaque",
+                    opened_ms: 150,
+                },
+                persona: "Monique router",
+                policy: "Return an opaque transport decision.",
+                transcript: transcript(),
+                limits: HarnessLimits::conversational(),
+            },
+            &mut provider,
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(answer, raw);
+        assert!(provider.decisions.is_empty());
+
+        let mut provider_must_not_run = InspectingProvider {
+            journal_path: journal.path().to_path_buf(),
+            run_key: String::from("event-opaque"),
+            decisions: vec![Err(ProviderFailure::Refused)].into(),
+        };
+        let recovered = drive_durable_opaque_provider_call(
+            &mut journal,
+            DurableAgentRunRequest {
+                identity: DurableAgentRunIdentity {
+                    lane_key: "slack:thread-opaque",
+                    run_key: "event-opaque",
+                    opened_ms: 150,
+                },
+                persona: "Monique router",
+                policy: "Return an opaque transport decision.",
+                transcript: transcript(),
+                limits: HarnessLimits::conversational(),
+            },
+            &mut provider_must_not_run,
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(recovered, raw);
+        assert_eq!(provider_must_not_run.decisions.len(), 1);
+    }
+
+    #[test]
+    fn opaque_provider_recovery_terminalizes_ambiguous_callback_without_replay() {
+        let (_root, mut journal, path) = journal_fixture();
+        let persona = "Monique router";
+        let policy = "Return an opaque transport decision.";
+        let limits = HarnessLimits::conversational();
+        let intent = run_intent_value(persona, policy, &transcript(), limits);
+        let receipt = journal
+            .begin_run(RunIntent {
+                lane_key: "slack:thread-ambiguous",
+                run_key: "event-ambiguous",
+                intent: &intent,
+                opened_ms: 200,
+            })
+            .unwrap();
+        journal
+            .record_provider_intent(ProviderIntent {
+                cursor: &receipt.cursor,
+                round: 1,
+                request: &json!({"prompt": "route this"}),
+                recorded_ms: 201,
+            })
+            .unwrap();
+        let mut provider_must_not_run = InspectingProvider {
+            journal_path: path,
+            run_key: String::from("event-ambiguous"),
+            decisions: vec![Err(ProviderFailure::Refused)].into(),
+        };
+        let mut clock = StepClock(210);
+
+        assert!(matches!(
+            drive_durable_opaque_provider_call(
+                &mut journal,
+                DurableAgentRunRequest {
+                    identity: DurableAgentRunIdentity {
+                        lane_key: "slack:thread-ambiguous",
+                        run_key: "event-ambiguous",
+                        opened_ms: 200,
+                    },
+                    persona,
+                    policy,
+                    transcript: transcript(),
+                    limits,
+                },
+                &mut provider_must_not_run,
+                &mut clock,
+            ),
+            Err(DurableAgentRuntimeError::RecoveryUnsafe)
+        ));
+        assert_eq!(provider_must_not_run.decisions.len(), 1);
+        let recovery = journal.recover("event-ambiguous").unwrap().unwrap();
+        assert_eq!(recovery.status, RunStatus::Failed);
+        assert_eq!(recovery.pending_provider_round, None);
+        journal
+            .begin_run(RunIntent {
+                lane_key: "slack:thread-ambiguous",
+                run_key: "event-after-ambiguous",
+                intent: &json!({"phase": "router"}),
+                opened_ms: 220,
+            })
+            .expect("ambiguous run must not deadlock the lane");
+    }
+
+    #[test]
+    fn opaque_provider_recovery_completes_a_recorded_final_outcome() {
+        let (_root, mut journal, path) = journal_fixture();
+        let persona = "Monique router";
+        let policy = "Return an opaque transport decision.";
+        let limits = HarnessLimits::conversational();
+        let intent = run_intent_value(persona, policy, &transcript(), limits);
+        let receipt = journal
+            .begin_run(RunIntent {
+                lane_key: "slack:thread-settled",
+                run_key: "event-settled",
+                intent: &intent,
+                opened_ms: 300,
+            })
+            .unwrap();
+        let cursor = journal
+            .record_provider_intent(ProviderIntent {
+                cursor: &receipt.cursor,
+                round: 1,
+                request: &json!({"prompt": "route this"}),
+                recorded_ms: 301,
+            })
+            .unwrap();
+        journal
+            .record_provider_outcome(ProviderOutcome {
+                cursor: &cursor,
+                round: 1,
+                outcome: &json!({"kind": "final", "answer": "stored router output"}),
+                recorded_ms: 302,
+            })
+            .unwrap();
+        let mut provider_must_not_run = InspectingProvider {
+            journal_path: path,
+            run_key: String::from("event-settled"),
+            decisions: vec![Err(ProviderFailure::Refused)].into(),
+        };
+        let mut clock = StepClock(310);
+
+        let answer = drive_durable_opaque_provider_call(
+            &mut journal,
+            DurableAgentRunRequest {
+                identity: DurableAgentRunIdentity {
+                    lane_key: "slack:thread-settled",
+                    run_key: "event-settled",
+                    opened_ms: 300,
+                },
+                persona,
+                policy,
+                transcript: transcript(),
+                limits,
+            },
+            &mut provider_must_not_run,
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(answer, "stored router output");
+        assert_eq!(provider_must_not_run.decisions.len(), 1);
+        assert_eq!(
+            journal.recover("event-settled").unwrap().unwrap().status,
+            RunStatus::Completed
+        );
+    }
+
+    #[test]
+    fn opaque_recovery_abandons_pending_tool_and_approval_coordinates() {
+        let (_root, mut journal, path) = journal_fixture();
+        let persona = "Monique router";
+        let policy = "Return an opaque transport decision.";
+        let limits = HarnessLimits::conversational();
+        let intent = run_intent_value(persona, policy, &transcript(), limits);
+        let receipt = journal
+            .begin_run(RunIntent {
+                lane_key: "slack:thread-pending-tool",
+                run_key: "event-pending-tool",
+                intent: &intent,
+                opened_ms: 350,
+            })
+            .unwrap();
+        let mut cursor = journal
+            .record_provider_intent(ProviderIntent {
+                cursor: &receipt.cursor,
+                round: 1,
+                request: &json!({"prompt": "route this"}),
+                recorded_ms: 351,
+            })
+            .unwrap();
+        cursor = journal
+            .record_provider_outcome(ProviderOutcome {
+                cursor: &cursor,
+                round: 1,
+                outcome: &json!({
+                    "kind": "tool_call",
+                    "call_id": "call-pending",
+                    "tool": "tickets.read",
+                    "arguments": {"number": 7}
+                }),
+                recorded_ms: 352,
+            })
+            .unwrap();
+        cursor = journal
+            .record_tool_intent(ToolIntent {
+                cursor: &cursor,
+                call_id: "call-pending",
+                tool_name: "tickets.read",
+                idempotency_key: "effect-pending",
+                arguments: &json!({"number": 7}),
+                recorded_ms: 353,
+            })
+            .unwrap();
+        journal
+            .request_approval(ApprovalPending {
+                cursor: &cursor,
+                approval_key: "approval-pending",
+                call_id: "call-pending",
+                summary: "Pending approval that cannot be resumed",
+                requested_ms: 354,
+            })
+            .unwrap();
+        let mut provider_must_not_run = InspectingProvider {
+            journal_path: path,
+            run_key: String::from("event-pending-tool"),
+            decisions: vec![Err(ProviderFailure::Refused)].into(),
+        };
+        let mut clock = StepClock(360);
+
+        assert!(matches!(
+            drive_durable_opaque_provider_call(
+                &mut journal,
+                DurableAgentRunRequest {
+                    identity: DurableAgentRunIdentity {
+                        lane_key: "slack:thread-pending-tool",
+                        run_key: "event-pending-tool",
+                        opened_ms: 350,
+                    },
+                    persona,
+                    policy,
+                    transcript: transcript(),
+                    limits,
+                },
+                &mut provider_must_not_run,
+                &mut clock,
+            ),
+            Err(DurableAgentRuntimeError::RecoveryUnsafe)
+        ));
+        assert_eq!(provider_must_not_run.decisions.len(), 1);
+        let recovery = journal.recover("event-pending-tool").unwrap().unwrap();
+        assert_eq!(recovery.status, RunStatus::Failed);
+        assert!(recovery.pending_tool.is_none());
+        assert!(recovery.pending_approval.is_none());
+    }
+
+    #[test]
     fn durable_runtime_persists_exact_tool_key_before_effect_and_never_auto_replays() {
         let (_root, mut journal, path) = journal_fixture();
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -1176,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_runtime_keeps_approval_and_tool_intent_recoverable() {
+    fn durable_runtime_fails_closed_when_approval_continuation_is_not_resumable() {
         let (_root, mut journal, path) = journal_fixture();
         let mut provider = InspectingProvider {
             journal_path: path,
@@ -1211,19 +1681,379 @@ mod tests {
             &mut provider,
             &mut runtime,
             &mut clock,
-        )
-        .unwrap();
+        );
         assert!(matches!(
             outcome,
-            DurableAgentRunOutcome::AwaitingApproval(_)
+            Err(DurableAgentRuntimeError::Harness(HarnessFailure::Tool(
+                ToolBrokerFailure::Unauthorized
+            )))
         ));
         assert!(calls.lock().unwrap().is_empty());
+        drop(runtime);
+        assert!(!broker.has_pending_or_admitted());
         let recovery = journal.recover("event-approval").unwrap().unwrap();
         assert_eq!(
             recovery.status,
-            crate::agent_lane_journal::RunStatus::AwaitingApproval
+            crate::agent_lane_journal::RunStatus::Failed
         );
-        assert!(recovery.pending_tool.is_some());
-        assert!(recovery.pending_approval.is_some());
+        assert!(recovery.pending_tool.is_none());
+        assert!(recovery.pending_approval.is_none());
+        assert_eq!(
+            recovery
+                .terminal_detail
+                .as_ref()
+                .and_then(|value| value.get("failure"))
+                .and_then(Value::as_str),
+            Some("tool")
+        );
+        assert!(
+            !recovery
+                .events
+                .iter()
+                .any(|event| matches!(event.kind.as_str(), "tool_intent" | "approval_pending"))
+        );
+    }
+
+    #[test]
+    fn durable_runtime_binds_and_executes_provider_batch_in_order() {
+        let (_root, mut journal, path) = journal_fixture();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut broker = AgentToolBroker::new(8);
+        broker
+            .register(
+                LocalToolDescriptor::new(
+                    "tickets.read",
+                    "Read one support ticket",
+                    schema(),
+                    SideEffectClass::ReadOnly,
+                    ApprovalRequirement::None,
+                    ReplayPolicy::ReplaySafe,
+                )
+                .unwrap(),
+                Box::new(InspectingExecutor {
+                    journal_path: path.clone(),
+                    run_key: String::from("event-batch"),
+                    calls: Arc::clone(&calls),
+                }),
+            )
+            .unwrap();
+        let granted = broker.granted_catalog(&["tickets.read"]).unwrap();
+        let mut runtime =
+            AgentRuntimeBroker::new(&mut broker, granted, "slack:event-batch").unwrap();
+        let batch = crate::agent_harness::ToolCallBatch::new(vec![
+            ToolCall::new("call-1", "tickets.read", json!({"number": 7})).unwrap(),
+            ToolCall::new("call-2", "tickets.read", json!({"number": 8})).unwrap(),
+        ])
+        .unwrap();
+        let mut provider = InspectingProvider {
+            journal_path: path,
+            run_key: String::from("event-batch"),
+            decisions: vec![
+                Ok(ProviderDecision::ToolCalls(batch)),
+                Ok(ProviderDecision::Final(
+                    crate::agent_harness::FinalAnswer::new("Tickets 7 and 8 were completed.")
+                        .unwrap(),
+                )),
+            ]
+            .into(),
+        };
+        let mut clock = StepClock(400);
+
+        let outcome = drive_durable_agent_run(
+            &mut journal,
+            DurableAgentRunRequest {
+                identity: DurableAgentRunIdentity {
+                    lane_key: "slack:thread-batch",
+                    run_key: "event-batch",
+                    opened_ms: 400,
+                },
+                persona: "Monique",
+                policy: "Use tools for current facts.",
+                transcript: transcript(),
+                limits: HarnessLimits::conversational(),
+            },
+            &mut provider,
+            &mut runtime,
+            &mut clock,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, DurableAgentRunOutcome::Complete(_)));
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        let recovery = journal.recover("event-batch").unwrap().unwrap();
+        let ordered_effect_events = recovery
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind.as_str(), "tool_intent" | "tool_outcome"))
+            .map(|event| {
+                (
+                    event.kind.as_str(),
+                    event.payload["call_id"].as_str().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_effect_events,
+            vec![
+                ("tool_intent", "call-1"),
+                ("tool_outcome", "call-1"),
+                ("tool_intent", "call-2"),
+                ("tool_outcome", "call-2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn real_schema_batch_preflight_rejects_late_bad_call_before_any_executor() {
+        let (_root, mut journal, path) = journal_fixture();
+        let (mut broker, calls) =
+            registered_broker(SideEffectClass::ReadOnly, ApprovalRequirement::None);
+        let granted = broker.granted_catalog(&["tickets.read"]).unwrap();
+        let mut runtime =
+            AgentRuntimeBroker::new(&mut broker, granted, "slack:event-preflight").unwrap();
+        let batch = crate::agent_harness::ToolCallBatch::new(vec![
+            ToolCall::new("call-valid", "tickets.read", json!({"number": 7})).unwrap(),
+            ToolCall::new("call-invalid", "tickets.read", json!({"number": "eight"})).unwrap(),
+        ])
+        .unwrap();
+        let mut provider = InspectingProvider {
+            journal_path: path,
+            run_key: String::from("event-preflight"),
+            decisions: vec![Ok(ProviderDecision::ToolCalls(batch))].into(),
+        };
+        let mut clock = StepClock(450);
+
+        let outcome = drive_durable_agent_run(
+            &mut journal,
+            DurableAgentRunRequest {
+                identity: DurableAgentRunIdentity {
+                    lane_key: "slack:thread-preflight",
+                    run_key: "event-preflight",
+                    opened_ms: 450,
+                },
+                persona: "Monique",
+                policy: "Use tools for current facts.",
+                transcript: transcript(),
+                limits: HarnessLimits::conversational(),
+            },
+            &mut provider,
+            &mut runtime,
+            &mut clock,
+        );
+        assert!(matches!(
+            outcome,
+            Err(DurableAgentRuntimeError::Harness(HarnessFailure::Tool(
+                ToolBrokerFailure::InvalidArguments
+            )))
+        ));
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(
+            journal.recover("event-preflight").unwrap().unwrap().status,
+            RunStatus::Failed
+        );
+    }
+
+    #[test]
+    fn oversized_executor_result_records_small_failure_after_single_effect() {
+        let (_root, mut journal, path) = journal_fixture();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut broker = AgentToolBroker::new(8);
+        broker
+            .register(
+                LocalToolDescriptor::new(
+                    "tickets.read",
+                    "Read one support ticket",
+                    schema(),
+                    SideEffectClass::ReadOnly,
+                    ApprovalRequirement::None,
+                    ReplayPolicy::ReplaySafe,
+                )
+                .unwrap(),
+                Box::new(FixtureExecutor {
+                    calls: Arc::clone(&calls),
+                    value: json!({"blob": "x".repeat(1024 * 1024)}),
+                }),
+            )
+            .unwrap();
+        let granted = broker.granted_catalog(&["tickets.read"]).unwrap();
+        let mut runtime =
+            AgentRuntimeBroker::new(&mut broker, granted, "slack:event-oversized").unwrap();
+        let mut provider = InspectingProvider {
+            journal_path: path,
+            run_key: String::from("event-oversized"),
+            decisions: vec![Ok(ProviderDecision::ToolCall(
+                ToolCall::new("call-oversized", "tickets.read", json!({"number": 7})).unwrap(),
+            ))]
+            .into(),
+        };
+        let mut clock = StepClock(500);
+
+        let outcome = drive_durable_agent_run(
+            &mut journal,
+            DurableAgentRunRequest {
+                identity: DurableAgentRunIdentity {
+                    lane_key: "slack:thread-oversized",
+                    run_key: "event-oversized",
+                    opened_ms: 500,
+                },
+                persona: "Monique",
+                policy: "Use tools for current facts.",
+                transcript: transcript(),
+                limits: HarnessLimits::conversational(),
+            },
+            &mut provider,
+            &mut runtime,
+            &mut clock,
+        );
+        assert!(matches!(
+            outcome,
+            Err(DurableAgentRuntimeError::Harness(HarnessFailure::Tool(
+                ToolBrokerFailure::Failed
+            )))
+        ));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        let recovery = journal.recover("event-oversized").unwrap().unwrap();
+        assert_eq!(recovery.status, RunStatus::Failed);
+        let tool_outcome = recovery
+            .events
+            .iter()
+            .find(|event| event.kind == "tool_outcome")
+            .unwrap();
+        assert_eq!(tool_outcome.payload["outcome"]["kind"], "failure");
+        assert_eq!(tool_outcome.payload["outcome"]["failure"], "failed");
+    }
+
+    #[test]
+    fn oversized_initial_run_intent_is_rejected_before_opening_a_lane_or_calling_provider() {
+        let (_root, mut journal, path) = journal_fixture();
+        let large_transcript = (0..17)
+            .map(|_| {
+                TranscriptInput::message(
+                    TranscriptRole::User,
+                    "x".repeat(crate::agent_harness::MAX_TRANSCRIPT_TEXT_BYTES),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut provider_must_not_run = InspectingProvider {
+            journal_path: path,
+            run_key: String::from("event-large-intent"),
+            decisions: vec![Err(ProviderFailure::Refused)].into(),
+        };
+        let mut clock = StepClock(600);
+
+        let outcome = drive_durable_opaque_provider_call(
+            &mut journal,
+            DurableAgentRunRequest {
+                identity: DurableAgentRunIdentity {
+                    lane_key: "slack:thread-large-intent",
+                    run_key: "event-large-intent",
+                    opened_ms: 600,
+                },
+                persona: "Monique",
+                policy: "Return one answer.",
+                transcript: large_transcript,
+                limits: HarnessLimits::conversational(),
+            },
+            &mut provider_must_not_run,
+            &mut clock,
+        );
+        assert!(matches!(
+            outcome,
+            Err(DurableAgentRuntimeError::Journal(
+                AgentLaneJournalError::InvalidField("intent")
+            ))
+        ));
+        assert_eq!(provider_must_not_run.decisions.len(), 1);
+        assert!(journal.recover("event-large-intent").unwrap().is_none());
+    }
+
+    #[test]
+    fn near_ceiling_tool_result_growth_abandons_lane_before_next_provider_effect() {
+        let (_root, mut journal, path) = journal_fixture();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut broker = AgentToolBroker::new(8);
+        broker
+            .register(
+                LocalToolDescriptor::new(
+                    "tickets.read",
+                    "Read one support ticket",
+                    schema(),
+                    SideEffectClass::ReadOnly,
+                    ApprovalRequirement::None,
+                    ReplayPolicy::ReplaySafe,
+                )
+                .unwrap(),
+                Box::new(FixtureExecutor {
+                    calls: Arc::clone(&calls),
+                    value: json!(
+                        "x".repeat(crate::agent_harness::MAX_TOOL_RESULT_BYTES_CEILING - 2)
+                    ),
+                }),
+            )
+            .unwrap();
+        let granted = broker.granted_catalog(&["tickets.read"]).unwrap();
+        let mut runtime =
+            AgentRuntimeBroker::new(&mut broker, granted, "slack:event-growth").unwrap();
+        let mut provider = InspectingProvider {
+            journal_path: path,
+            run_key: String::from("event-growth"),
+            decisions: vec![
+                Ok(ProviderDecision::ToolCall(
+                    ToolCall::new("call-growth", "tickets.read", json!({"number": 7})).unwrap(),
+                )),
+                Ok(ProviderDecision::Final(
+                    crate::agent_harness::FinalAnswer::new("must not run").unwrap(),
+                )),
+            ]
+            .into(),
+        };
+        let mut clock = StepClock(650);
+        let limits = HarnessLimits::new(
+            4,
+            6,
+            2,
+            1,
+            crate::agent_harness::MAX_TOOL_RESULT_BYTES_CEILING,
+        )
+        .unwrap();
+        let transcript =
+            vec![TranscriptInput::message(TranscriptRole::User, "q".repeat(16 * 1024)).unwrap()];
+
+        let outcome = drive_durable_agent_run(
+            &mut journal,
+            DurableAgentRunRequest {
+                identity: DurableAgentRunIdentity {
+                    lane_key: "slack:thread-growth",
+                    run_key: "event-growth",
+                    opened_ms: 650,
+                },
+                persona: "Monique",
+                policy: "Use tools for current facts.",
+                transcript,
+                limits,
+            },
+            &mut provider,
+            &mut runtime,
+            &mut clock,
+        );
+        assert!(matches!(
+            outcome,
+            Err(DurableAgentRuntimeError::Journal(
+                AgentLaneJournalError::InvalidField("provider_request")
+            ))
+        ));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(provider.decisions.len(), 1);
+        let recovery = journal.recover("event-growth").unwrap().unwrap();
+        assert_eq!(recovery.status, RunStatus::Failed);
+        assert_eq!(
+            recovery
+                .terminal_detail
+                .as_ref()
+                .and_then(|detail| detail.get("failure"))
+                .and_then(Value::as_str),
+            Some("journal_record_too_large")
+        );
     }
 }
