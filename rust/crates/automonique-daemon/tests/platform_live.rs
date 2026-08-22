@@ -13,10 +13,12 @@ use automonique_daemon::{Daemon, DaemonConfig};
 use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_protocol::platform::{
-    ClaimControlRequest, ClientId, IdempotencyKey, PlatformRequest, PlatformResponse,
-    ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind, SnapshotRequest,
+    ClaimControlRequest, ClientId, IdempotencyKey, ListSessionsRequest, PlatformRequest,
+    PlatformResponse, ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
+    SnapshotRequest,
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
+use automonique_store::provider_journal::{ProcessSpawn, ProviderJournal, SessionOpening};
 
 fn fixture() -> (tempfile::TempDir, DaemonConfig) {
     let root = tempfile::tempdir().expect("temporary root");
@@ -133,6 +135,27 @@ fn session() -> ResourceCoordinate {
 #[test]
 fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
     let (_root, config) = fixture();
+    std::fs::create_dir(config.state_dir()).expect("product state");
+    std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
+        .expect("private product state");
+    let mut journal = ProviderJournal::open(config.provider_journal_path()).expect("journal");
+    let process = journal
+        .record_process(ProcessSpawn {
+            spawn_key: "platform-live-spawn",
+            attempt_id: "platform-live-attempt",
+            provider_kind: "fake",
+            executable_digest: "abababababababababababababababababababababababababababababababab",
+            spawned_ms: 10,
+        })
+        .expect("process");
+    journal
+        .open_session(SessionOpening {
+            process_id: process.process_id,
+            provider_session_key: "platform-live-session",
+            opened_ms: 20,
+        })
+        .expect("session");
+    drop(journal);
     let serving = serve(&config);
 
     let PlatformResponse::Capabilities(capabilities) =
@@ -154,6 +177,23 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
         resource.resource.authority == ResourceAuthority::Automonique
             && resource.resource.kind == ResourceKind::Node
     }));
+
+    let PlatformResponse::Sessions(sessions) = platform(
+        &config,
+        "sessions",
+        PlatformRequest::ListSessions(ListSessionsRequest {
+            authority: ResourceAuthority::Automonique,
+            cursor: None,
+        }),
+    ) else {
+        panic!("sessions response")
+    };
+    assert_eq!(sessions.sessions.len(), 1);
+    assert_eq!(
+        sessions.sessions[0].session.resource.id.as_str(),
+        "platform-live-session"
+    );
+    assert!(sessions.sessions[0].attachable);
 
     let request = ClaimControlRequest {
         session: session(),

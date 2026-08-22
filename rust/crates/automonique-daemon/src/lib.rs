@@ -3043,10 +3043,16 @@ impl Daemon {
                 }
             }
             PlatformRequest::Subscribe(request) => {
-                match self
-                    .platform
-                    .subscribe(request.cursor.as_ref(), "resources")
-                {
+                let topic = request
+                    .cursor
+                    .as_ref()
+                    .map_or("resources", |cursor| cursor.topic.as_str());
+                if topic == "sessions" {
+                    self.refresh_platform_sessions()?;
+                } else {
+                    self.refresh_platform_resources(&[], now_ms)?;
+                }
+                match self.platform.subscribe(request.cursor.as_ref(), topic) {
                     Ok(subscription) => PlatformResponse::Subscription(subscription),
                     Err(error) => platform_store_response(&error),
                 }
@@ -3064,29 +3070,32 @@ impl Daemon {
             PlatformRequest::ListSessions(request) => {
                 if request.authority != ResourceAuthority::Automonique {
                     platform_refusal(ReceiptOutcome::Rejected, "authority_not_local")?
-                } else if let Some(cursor) = request.cursor.as_ref()
-                    && let Err(error) = self.platform.subscribe(Some(cursor), "sessions")
-                {
-                    platform_store_response(&error)
                 } else {
-                    let (resources, cursor) = self
-                        .platform
-                        .snapshot(&[], "sessions")
-                        .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
-                    let sessions = resources
-                        .into_iter()
-                        .filter(|record| record.resource.kind == ResourceKind::Session)
-                        .map(|session| SessionRecord {
-                            session,
-                            run: None,
-                            attachable: true,
-                            controllable: true,
-                        })
-                        .collect();
-                    PlatformResponse::Sessions(
-                        SessionList::new(sessions, cursor)
-                            .map_err(|_| DaemonError::ProtocolRefused("platform_sessions"))?,
-                    )
+                    self.refresh_platform_sessions()?;
+                    if let Some(cursor) = request.cursor.as_ref()
+                        && let Err(error) = self.platform.subscribe(Some(cursor), "sessions")
+                    {
+                        platform_store_response(&error)
+                    } else {
+                        let (resources, cursor) = self
+                            .platform
+                            .snapshot(&[], "sessions")
+                            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+                        let sessions = resources
+                            .into_iter()
+                            .filter(|record| record.resource.kind == ResourceKind::Session)
+                            .map(|session| SessionRecord {
+                                session,
+                                run: None,
+                                attachable: true,
+                                controllable: true,
+                            })
+                            .collect();
+                        PlatformResponse::Sessions(
+                            SessionList::new(sessions, cursor)
+                                .map_err(|_| DaemonError::ProtocolRefused("platform_sessions"))?,
+                        )
+                    }
                 }
             }
             PlatformRequest::Attach(request) => {
@@ -3144,6 +3153,53 @@ impl Daemon {
             .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
         stream.write_all(&frame)?;
         stream.flush()?;
+        Ok(())
+    }
+
+    fn refresh_platform_sessions(&mut self) -> Result<(), DaemonError> {
+        let path = self.state_dir.join(PROVIDER_JOURNAL_NAME);
+        if !path.exists() {
+            return Ok(());
+        }
+        let journal = ProviderJournal::open(path)
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        let sessions = journal
+            .sessions(automonique_protocol::platform::MAX_SNAPSHOT_RESOURCES)
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        for session in sessions {
+            let (freshness, summary) = match session.state {
+                automonique_store::provider_journal::SessionState::Open => {
+                    (FreshnessState::Fresh, "open")
+                }
+                automonique_store::provider_journal::SessionState::Closed => {
+                    (FreshnessState::Stale, "closed")
+                }
+                automonique_store::provider_journal::SessionState::Lost => {
+                    (FreshnessState::Unknown, "lost")
+                }
+            };
+            let record = ResourceRecord {
+                resource: ResourceCoordinate::new(
+                    ResourceAuthority::Automonique,
+                    ResourceKind::Session,
+                    ResourceId::new(session.provider_session_key)
+                        .map_err(|_| DaemonError::PlatformStoreFailed("session_id_invalid"))?,
+                ),
+                freshness: Freshness {
+                    state: freshness,
+                    observed_at: automonique_protocol::primitives::EpochMillis::from_millis(
+                        session.closed_ms.unwrap_or(session.opened_ms),
+                    ),
+                    revision: Revision::new(session.revision)
+                        .map_err(|_| DaemonError::PlatformStoreFailed("revision_invalid"))?,
+                },
+                summary: PlatformText::new(summary)
+                    .map_err(|_| DaemonError::PlatformStoreFailed("session_state_invalid"))?,
+            };
+            self.platform
+                .upsert_resource("sessions", &record)
+                .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        }
         Ok(())
     }
 
