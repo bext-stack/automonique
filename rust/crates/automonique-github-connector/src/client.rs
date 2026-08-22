@@ -2,7 +2,7 @@
 
 //! The synchronous GitHub client.
 //!
-//! One origin, thirteen operations. The client is the composition of
+//! One origin, fourteen operations. The client is the composition of
 //! [`GitHubOperation`]'s rendering and the `decode_*` functions around a single
 //! bounded HTTP call — it adds no field to a request and repairs no field in a
 //! response, so everything it can send or accept is already provable without a
@@ -28,15 +28,15 @@ use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::request::HttpMethod;
 use crate::response::{
-    CommentRef, GitHubComment, GitHubIssue, GitHubReply, IssueListPage, IssueSearchPage, Viewer,
-    decode_comment, decode_comment_ref, decode_comments, decode_error_message, decode_issue,
-    decode_issue_list, decode_issue_ref, decode_labels, decode_repository_labels, decode_search,
-    decode_viewer,
+    CommentRef, GitHubComment, GitHubIssue, GitHubReply, GitHubRepository, IssueListPage,
+    IssueSearchPage, Viewer, decode_comment, decode_comment_ref, decode_comments,
+    decode_error_message, decode_issue, decode_issue_list, decode_issue_ref, decode_labels,
+    decode_repository, decode_repository_labels, decode_search, decode_viewer,
 };
 use crate::{
     CommentRequest, CreateIssueRequest, EntityTag, GITHUB_REQUEST_TIMEOUT_SECONDS,
-    GetCommentsRequest, GetIssueCommentRequest, GetIssueRequest, GitHubBase, GitHubFailure,
-    GitHubOperation, GitHubOutcome, GitHubRejection, GitHubToken, ListIssuesRequest,
+    GetCommentsRequest, GetIssueCommentRequest, GetIssueRequest, GetRepositoryRequest, GitHubBase,
+    GitHubFailure, GitHubOperation, GitHubOutcome, GitHubRejection, GitHubToken, ListIssuesRequest,
     ListLabelsRequest, MAX_GITHUB_RESPONSE_BYTES, ManagementReceipt, ManagementRequest, RateLimit,
     ReplaceLabelsRequest, SearchIssuesRequest, SetStateRequest, UpdateIssueBodyRequest,
     UpdateIssueCommentRequest, Versioned,
@@ -318,6 +318,21 @@ impl GitHubClient {
         self.call(&GitHubOperation::ListIssues(request.clone()), |bytes| {
             decode_issue_list(bytes, per_page)
         })
+    }
+
+    /// Read canonical push-activity metadata for one repository.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::create_issue`], for this operation's contract.
+    pub fn get_repository(
+        &self,
+        request: &GetRepositoryRequest,
+    ) -> Result<GitHubReply<GitHubRepository>, GitHubFailure> {
+        self.call(
+            &GitHubOperation::GetRepository(request.clone()),
+            decode_repository,
+        )
     }
 
     /// Search issues across repositories.

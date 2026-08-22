@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! The thirteen operations, and the exact method, path and body each renders.
+//! The fourteen operations, and the exact method, path and body each renders.
 //!
 //! [`GitHubOperation`] is the second half of the target lock (the first is the
 //! origin in `target`). A path is never a caller string: it is assembled here
@@ -640,6 +640,31 @@ pub struct ListIssuesRequest {
     page: Page,
 }
 
+/// Read one repository's bounded metadata.
+///
+/// This deliberately names one validated repository rather than exposing an
+/// account- or organization-wide listing. The caller remains bound to its
+/// local repository allowlist while still being able to answer push-activity
+/// questions from GitHub's canonical `pushed_at` field.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GetRepositoryRequest {
+    target: RepoTarget,
+}
+
+impl GetRepositoryRequest {
+    /// Name the exact repository to read.
+    #[must_use]
+    pub const fn new(target: RepoTarget) -> Self {
+        Self { target }
+    }
+
+    /// The repository.
+    #[must_use]
+    pub const fn target(&self) -> &RepoTarget {
+        &self.target
+    }
+}
+
 impl ListIssuesRequest {
     /// Name one repository, one filter and one page.
     #[must_use]
@@ -744,6 +769,8 @@ pub enum GitHubOperation {
     ListLabels(ListLabelsRequest),
     /// `GET /repos/{owner}/{repo}/issues`
     ListIssues(ListIssuesRequest),
+    /// `GET /repos/{owner}/{repo}`
+    GetRepository(GetRepositoryRequest),
     /// `GET /search/issues`
     SearchIssues(SearchIssuesRequest),
     /// `GET /user`
@@ -765,6 +792,7 @@ impl GitHubOperation {
             | Self::GetIssueComment(_)
             | Self::ListLabels(_)
             | Self::ListIssues(_)
+            | Self::GetRepository(_)
             | Self::SearchIssues(_)
             | Self::Whoami => HttpMethod::Get,
         }
@@ -867,6 +895,7 @@ impl GitHubOperation {
                 }
                 path
             }
+            Self::GetRepository(request) => repository_path(request.target()),
             Self::SearchIssues(request) => {
                 let page = request.page();
                 let mut path = String::from("/search/issues?q=");
@@ -928,6 +957,7 @@ impl GitHubOperation {
             | Self::GetIssueComment(_)
             | Self::ListLabels(_)
             | Self::ListIssues(_)
+            | Self::GetRepository(_)
             | Self::SearchIssues(_)
             | Self::Whoami => None,
         }
@@ -946,8 +976,13 @@ impl GitHubOperation {
 
 /// `/repos/{owner}/{repo}/issues`, the prefix every repository path shares.
 fn issues_path(target: &RepoTarget) -> String {
+    format!("{}/issues", repository_path(target))
+}
+
+/// `/repos/{owner}/{repo}`, the fixed repository metadata endpoint.
+fn repository_path(target: &RepoTarget) -> String {
     format!(
-        "/repos/{}/{}/issues",
+        "/repos/{}/{}",
         target.owner().as_str(),
         target.repo().as_str()
     )
@@ -1113,6 +1148,11 @@ mod tests {
             repo_labels.path(),
             "/repos/example-org/example-repo/labels?per_page=100&page=3"
         );
+
+        let repository = GitHubOperation::GetRepository(GetRepositoryRequest::new(target()));
+        assert_eq!(repository.path(), "/repos/example-org/example-repo");
+        assert_eq!(repository.method(), HttpMethod::Get);
+        assert!(!repository.is_external_effect());
 
         let list = GitHubOperation::ListIssues(ListIssuesRequest::new(
             target(),

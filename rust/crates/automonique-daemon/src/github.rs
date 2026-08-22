@@ -37,9 +37,9 @@ use std::process::Command;
 
 use automonique_github_connector::{
     CommentId, CommentRequest, CreateIssueRequest, DatabaseId, GetCommentsRequest,
-    GetIssueCommentRequest, GetIssueRequest, GitHubBase, GitHubClient, GitHubComment,
-    GitHubOutcome, GitHubToken, IssueBodyText, IssueLocator, IssueManagementPatch, IssueState,
-    IssueTitle, Label, LabelColor, ListLabelsRequest, LockReason, ManagementName,
+    GetIssueCommentRequest, GetIssueRequest, GetRepositoryRequest, GitHubBase, GitHubClient,
+    GitHubComment, GitHubOutcome, GitHubToken, IssueBodyText, IssueLocator, IssueManagementPatch,
+    IssueState, IssueTitle, Label, LabelColor, ListLabelsRequest, LockReason, ManagementName,
     ManagementRequest, ManagementText, Owner, Page, ProjectFieldType, ProjectItemType,
     ProjectOwner, ProjectOwnerKind, ProjectRef, ProjectStatus, ProjectViewLayout, RepoTarget,
     SearchIssuesRequest, SetStateRequest, UpdateIssueBodyRequest, UpdateIssueCommentRequest,
@@ -76,6 +76,19 @@ pub trait GitHubSurface: Send {
     /// These are configuration entries, not a live organization inventory.
     fn configured_repositories(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Read push activity for the locally allowlisted repositories since one
+    /// exact UTC instant.
+    ///
+    /// The safe default keeps injected issue-only surfaces issue-only. The
+    /// production workspace implements this with one fixed-origin typed
+    /// repository-metadata read per configured repository; it never expands
+    /// credential scope into an account- or organization-wide inventory.
+    fn repository_push_activity_since(&mut self, _since: &str) -> Result<String, String> {
+        Err(String::from(
+            "status=unavailable reason=github_repository_activity_unavailable",
+        ))
     }
 
     /// Read one exact issue and render bounded, untrusted facts.
@@ -895,6 +908,56 @@ impl GitHubSurface for GitHubWorkspace {
         self.repositories.iter().map(ToString::to_string).collect()
     }
 
+    fn repository_push_activity_since(&mut self, since: &str) -> Result<String, String> {
+        let since_key = utc_timestamp_sort_key(since)
+            .ok_or_else(|| String::from("status=refused reason=github_activity_since_invalid"))?;
+        if self.repositories.is_empty() {
+            return Err(String::from(
+                "status=refused reason=github_repository_allowlist_empty",
+            ));
+        }
+
+        let mut active = Vec::new();
+        let mut unavailable = Vec::new();
+        for target in &self.repositories {
+            let reply = match self
+                .client
+                .get_repository(&GetRepositoryRequest::new(target.clone()))
+            {
+                Ok(reply) => reply,
+                Err(failure) => {
+                    unavailable.push(format!("{target}:{}", failure.category()));
+                    continue;
+                }
+            };
+            let repository = match reply.into_outcome() {
+                GitHubOutcome::Accepted(repository) => repository,
+                GitHubOutcome::Rejected(rejection) => {
+                    unavailable.push(format!("{target}:{}", rejection.kind().category()));
+                    continue;
+                }
+            };
+            if repository.target != *target {
+                unavailable.push(format!("{target}:repository_identity_mismatch"));
+                continue;
+            }
+            let Some(pushed_key) = utc_timestamp_sort_key(&repository.pushed_at) else {
+                unavailable.push(format!("{target}:pushed_at_invalid"));
+                continue;
+            };
+            if pushed_key >= since_key {
+                active.push((target.to_string(), repository.pushed_at));
+            }
+        }
+
+        Ok(render_repository_push_activity(
+            since,
+            self.repositories.len(),
+            &active,
+            &unavailable,
+        ))
+    }
+
     fn issue_facts(
         &mut self,
         locator: &IssueLocator,
@@ -1079,6 +1142,86 @@ impl GitHubSurface for GitHubWorkspace {
             comment_url
         ))
     }
+}
+
+/// Normalize GitHub's UTC RFC 3339 timestamps to a lexically sortable
+/// millisecond key. GitHub currently answers with whole seconds while the
+/// daemon clock includes milliseconds; accepting both avoids a false boundary
+/// match without introducing a general date parser into the connector.
+fn utc_timestamp_sort_key(value: &str) -> Option<String> {
+    let value = value.trim();
+    if !value.ends_with('Z') || !(20..=32).contains(&value.len()) {
+        return None;
+    }
+    let base = value.get(..19)?;
+    let bytes = base.as_bytes();
+    let shaped = bytes.len() == 19
+        && matches!(bytes[4], b'-')
+        && matches!(bytes[7], b'-')
+        && matches!(bytes[10], b'T')
+        && matches!(bytes[13], b':')
+        && matches!(bytes[16], b':')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16) || byte.is_ascii_digit());
+    if !shaped {
+        return None;
+    }
+    let month = base.get(5..7)?.parse::<u8>().ok()?;
+    let day = base.get(8..10)?.parse::<u8>().ok()?;
+    let hour = base.get(11..13)?.parse::<u8>().ok()?;
+    let minute = base.get(14..16)?.parse::<u8>().ok()?;
+    let second = base.get(17..19)?.parse::<u8>().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let fraction = value.get(19..value.len() - 1)?;
+    let milliseconds = if fraction.is_empty() {
+        String::from("000")
+    } else {
+        let digits = fraction.strip_prefix('.')?;
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        format!("{digits:0<3}").chars().take(3).collect()
+    };
+    Some(format!("{base}.{milliseconds}Z"))
+}
+
+/// Render a bounded, provenance-explicit projection for conversational use.
+fn render_repository_push_activity(
+    since: &str,
+    checked: usize,
+    active: &[(String, String)],
+    unavailable: &[String],
+) -> String {
+    let mut facts = format!(
+        "status=available\nscope=configured_repository_allowlist\nactivity_basis=github_repository_pushed_at\nsince={}\nrepositories_checked={checked}\nrepositories_with_push_activity={}",
+        single_line(since),
+        active.len(),
+    );
+    for (repository, pushed_at) in active {
+        facts.push_str("\nactive_repository=");
+        facts.push_str(repository);
+        facts.push_str(" pushed_at=");
+        facts.push_str(&single_line(pushed_at));
+    }
+    facts.push_str("\nrepositories_unavailable=");
+    facts.push_str(&unavailable.len().to_string());
+    for entry in unavailable {
+        facts.push_str("\nunavailable_repository=");
+        facts.push_str(entry);
+    }
+    facts.push_str(
+        "\nscope_note=This is the configured local allowlist, not an organization-wide inventory. pushed_at proves Git push activity, not issue, project, or local unpushed work.",
+    );
+    facts
 }
 
 impl GitHubActionSurface for GitHubWorkspace {
@@ -2626,6 +2769,48 @@ mod tests {
         assert_eq!(recent_comment_pages(150, 20), Some((2, 2)));
         assert_eq!(recent_comment_pages(0, 20), None);
         assert_eq!(recent_comment_pages(10, 0), None);
+    }
+
+    #[test]
+    fn repository_activity_timestamps_compare_at_millisecond_precision() {
+        assert_eq!(
+            utc_timestamp_sort_key("2026-08-15T18:24:00Z").as_deref(),
+            Some("2026-08-15T18:24:00.000Z")
+        );
+        assert_eq!(
+            utc_timestamp_sort_key("2026-08-15T18:24:00.125Z").as_deref(),
+            Some("2026-08-15T18:24:00.125Z")
+        );
+        assert!(utc_timestamp_sort_key("2026-13-15T18:24:00Z").is_none());
+        assert!(utc_timestamp_sort_key("not-a-timestamp").is_none());
+        assert!(utc_timestamp_sort_key("2026-08-15T18:24:00.12345678901234567890Z").is_none());
+    }
+
+    #[test]
+    fn repository_activity_projection_names_its_allowlisted_push_scope() {
+        let facts = render_repository_push_activity(
+            "2026-08-15T18:24:00.000Z",
+            3,
+            &[
+                (
+                    String::from("example/active"),
+                    String::from("2026-08-21T17:04:11Z"),
+                ),
+                (
+                    String::from("example/also-active"),
+                    String::from("2026-08-20T09:00:00Z"),
+                ),
+            ],
+            &[String::from("example/unavailable:rate_limited")],
+        );
+        assert!(facts.contains("scope=configured_repository_allowlist"));
+        assert!(facts.contains("activity_basis=github_repository_pushed_at"));
+        assert!(facts.contains("repositories_checked=3"));
+        assert!(facts.contains("repositories_with_push_activity=2"));
+        assert!(facts.contains("active_repository=example/active pushed_at=2026-08-21T17:04:11Z"));
+        assert!(facts.contains("repositories_unavailable=1"));
+        assert!(facts.contains("not an organization-wide inventory"));
+        assert!(facts.contains("not issue, project, or local unpushed work"));
     }
 
     #[test]

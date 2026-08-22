@@ -1155,6 +1155,7 @@ impl SlackSurface for FakeSlack {
 #[derive(Clone, Default)]
 struct FakeGitHub {
     seen: Arc<Mutex<Vec<String>>>,
+    activity_since: Arc<Mutex<Vec<String>>>,
     actions: Arc<Mutex<Vec<(String, String)>>>,
 }
 
@@ -1162,11 +1163,25 @@ impl FakeGitHub {
     fn seen(&self) -> Vec<String> {
         self.seen.lock().expect("github seen").clone()
     }
+
+    fn activity_since(&self) -> Vec<String> {
+        self.activity_since.lock().expect("github activity").clone()
+    }
 }
 
 impl GitHubSurface for FakeGitHub {
     fn configured_repositories(&self) -> Vec<String> {
         vec![String::from("example/read-repo")]
+    }
+
+    fn repository_push_activity_since(&mut self, since: &str) -> Result<String, String> {
+        self.activity_since
+            .lock()
+            .expect("github activity")
+            .push(since.to_owned());
+        Ok(format!(
+            "status=available\nscope=configured_repository_allowlist\nactivity_basis=github_repository_pushed_at\nsince={since}\nrepositories_checked=2\nrepositories_with_push_activity=2\nactive_repository=example/active pushed_at=2026-08-21T17:04:11Z\nactive_repository=example/older pushed_at=2026-08-10T09:00:00Z\nrepositories_unavailable=0\nscope_note=This is the configured local allowlist, not an organization-wide inventory. pushed_at proves Git push activity, not issue, project, or local unpushed work."
+        ))
     }
 
     fn issue_facts(
@@ -2282,6 +2297,56 @@ fn named_slack_and_github_facts_are_read_live_before_fast_operational_answer() {
         outbound.messages()[0].contains("route=operational_lookup_luna_none"),
         "the injected lane uses the fast fallback profile"
     );
+}
+
+#[test]
+fn configured_repository_activity_is_an_automatic_typed_read_with_clocked_synthesis() {
+    let fixture = Fixture::new(&[]);
+    let github = FakeGitHub::default();
+    let outbound = FakeOutbound::default();
+    let lane = FakeRunLane::answering_sequence(&[
+        r#"{"kind":"read","sources":[],"slack_channel":null,"github_issues":false,"github_repository_activity":true,"depth":"fast"}"#,
+        "example/active had Git push activity this week in the configured repository allowlist.",
+    ]);
+    let mut bridge = bridge_with_sources(
+        &fixture,
+        FakeClient::new([updates(&[(
+            1,
+            OPERATOR,
+            "which of all our git repos had activity this week?",
+        )])]),
+        outbound.clone(),
+        FakeSink::default(),
+        lane.clone(),
+        single_tier_roster(),
+        (None, Some(github.clone())),
+    );
+
+    assert_eq!(
+        poll(&mut bridge)
+            .expect("repository activity read queues")
+            .questions_queued,
+        1
+    );
+    assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
+    assert_eq!(
+        github.activity_since(),
+        ["1970-01-01T00:00:00Z"],
+        "the typed surface returns the full bounded allowlist projection so the answer model can apply the relative window"
+    );
+    assert!(github.seen().is_empty(), "no issue read was selected");
+    let prompts = lane.tasks();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("github_repository_activity (boolean)"));
+    assert!(prompts[0].contains("github_repository_activity_read=yes"));
+    assert!(prompts[0].contains("configured-repository inventory or activity questions"));
+    assert!(prompts[0].contains("time-window questions resolved from recent conversation"));
+    assert!(prompts[1].contains("[live_github_repository_push_activity]"));
+    assert!(prompts[1].contains("current_utc="));
+    assert!(prompts[1].contains("active_repository=example/active"));
+    assert!(prompts[1].contains("active_repository=example/older"));
+    assert!(prompts[1].contains("not an organization-wide inventory"));
+    assert!(outbound.messages()[0].contains("example/active"));
 }
 
 #[test]
@@ -4618,59 +4683,6 @@ fn semantic_followup_uses_recent_conversation_to_select_ticket_reads() {
     assert!(prompts[1].contains("selected_sources.tickets=yes"));
     assert!(prompts[1].contains("Attachments are rejected by mail relay"));
     assert!(outbound.messages()[1].contains("two tracked requests"));
-}
-
-#[test]
-fn github_repository_inventory_answers_from_the_local_allowlist_without_a_run() {
-    let fixture = Fixture::new(&[]);
-    let outbound = FakeOutbound::default();
-    let lane = FakeRunLane::answering("must not run");
-    let actions = FakeGitHubActions::default();
-    let created = Arc::clone(&actions.created);
-    let mut bridge = bridge_with_github_actions(
-        &fixture,
-        FakeClient::new([updates(&[
-            (1, OPERATOR, "what github repos do we manage"),
-            (2, OPERATOR, "which GitHub repositories can you access?"),
-            (3, OPERATOR, "list the configured GitHub codebases"),
-        ])]),
-        outbound.clone(),
-        lane.clone(),
-        actions,
-    );
-
-    let report = poll(&mut bridge).expect("repository inventories answer");
-    assert_eq!(report.answered, 3);
-    assert_eq!(report.questions_queued, 0);
-    assert!(lane.tasks().is_empty());
-    assert!(created.lock().expect("created issues").is_empty());
-    for message in outbound.messages() {
-        assert!(message.contains("Configured GitHub repository aliases (1)"));
-        assert!(message.contains("`automonique`"));
-        assert!(message.contains("not a live organization-wide inventory"));
-        assert!(!message.contains("route="));
-    }
-
-    let read_outbound = FakeOutbound::default();
-    let read_lane = FakeRunLane::answering("must not run");
-    let github = FakeGitHub::default();
-    let mut read_bridge = bridge_with_sources(
-        &fixture,
-        FakeClient::new([updates(&[(4, OPERATOR, "what github repos do we manage")])]),
-        read_outbound.clone(),
-        FakeSink::default(),
-        read_lane.clone(),
-        single_tier_roster(),
-        (None, Some(github.clone())),
-    );
-    let report = poll(&mut read_bridge).expect("read allowlist answers");
-    assert_eq!(report.answered, 1);
-    assert_eq!(report.questions_queued, 0);
-    assert!(read_lane.tasks().is_empty());
-    assert!(github.seen().is_empty());
-    let message = &read_outbound.messages()[0];
-    assert!(message.contains("Configured GitHub repositories (1)"));
-    assert!(message.contains("`example/read-repo`"));
 }
 
 /// THE TIER LINE, ON THE ONE COMMAND THAT LEAVES THIS SYSTEM. A member may read

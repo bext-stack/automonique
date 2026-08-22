@@ -4,11 +4,12 @@
 //!
 //! Two request vocabularies are spelled, and nothing outside them can be.
 //!
-//! The **issue surface** is thirteen operations, one per [`GitHubOperation`]
+//! The **issue surface** is fourteen operations, one per [`GitHubOperation`]
 //! variant: create an issue, comment on one, open or close one, replace its
 //! labels, read one back, read its comments, read or edit one comment,
-//! conditionally replace an issue body, list repository labels or issues,
-//! search issues, and identify the credential. Six of them are writes, which
+//! conditionally replace an issue body, list repository labels or issues, read
+//! repository push metadata, search issues, and identify the credential. Six
+//! of them are writes, which
 //! [`GitHubOperation::is_external_effect`] answers for directly.
 //!
 //! The **work-management surface** is thirty-seven typed mutations, one per
@@ -128,15 +129,17 @@ pub use repo_map::{
 };
 pub use request::{
     CommentRequest, CreateIssueRequest, GetCommentsRequest, GetIssueCommentRequest,
-    GetIssueRequest, GitHubOperation, HttpMethod, IssueFilter, IssueListState, ListIssuesRequest,
-    ListLabelsRequest, MAX_LIST_PAGE, MAX_SEARCH_PAGE, Page, ReplaceLabelsRequest,
-    SearchIssuesRequest, SetStateRequest, Since, UpdateIssueBodyRequest, UpdateIssueCommentRequest,
+    GetIssueRequest, GetRepositoryRequest, GitHubOperation, HttpMethod, IssueFilter,
+    IssueListState, ListIssuesRequest, ListLabelsRequest, MAX_LIST_PAGE, MAX_SEARCH_PAGE, Page,
+    ReplaceLabelsRequest, SearchIssuesRequest, SetStateRequest, Since, UpdateIssueBodyRequest,
+    UpdateIssueCommentRequest,
 };
 pub use response::{
-    CommentRef, GitHubComment, GitHubIssue, GitHubReply, IssueListPage, IssueSearchPage,
-    MAX_COMMENT_COUNT, MAX_SEARCH_TOTAL, Viewer, decode_comment, decode_comment_ref,
-    decode_comments, decode_error_message, decode_issue, decode_issue_list, decode_issue_ref,
-    decode_labels, decode_repository_labels, decode_search, decode_viewer,
+    CommentRef, GitHubComment, GitHubIssue, GitHubReply, GitHubRepository, IssueListPage,
+    IssueSearchPage, MAX_COMMENT_COUNT, MAX_SEARCH_TOTAL, Viewer, decode_comment,
+    decode_comment_ref, decode_comments, decode_error_message, decode_issue, decode_issue_list,
+    decode_issue_ref, decode_labels, decode_repository, decode_repository_labels, decode_search,
+    decode_viewer,
 };
 pub use target::{
     CommentId, GITHUB_API_ORIGIN, GitHubBase, IssueLocator, IssueNumber, IssueState, Label,

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Bounded, refusing decoders for the thirteen operations.
+//! Bounded, refusing decoders for the fourteen operations.
 //!
 //! Each decoder takes the accepted response bytes and returns either the
 //! operation's typed payload or a [`GitHubFailure`]. Nothing panics on hostile
@@ -159,6 +159,23 @@ pub struct IssueSearchPage {
     pub total: u64,
     /// How many items on the page were pull requests.
     pub pull_requests_skipped: usize,
+}
+
+/// Canonical push-activity metadata for one repository.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitHubRepository {
+    /// The repository named by GitHub's own `full_name` field.
+    pub target: RepoTarget,
+    /// The web URL.
+    pub url: String,
+    /// Last push timestamp, verbatim.
+    pub pushed_at: String,
+    /// Last repository-metadata update timestamp, verbatim.
+    pub updated_at: String,
+    /// Whether GitHub marks the repository archived.
+    pub archived: bool,
+    /// Whether GitHub marks the repository disabled.
+    pub disabled: bool,
 }
 
 /// One comment on an issue.
@@ -349,6 +366,37 @@ pub fn decode_viewer(bytes: &[u8]) -> Result<Viewer, GitHubFailure> {
     })
 }
 
+/// Decode one repository metadata document.
+///
+/// # Errors
+///
+/// As [`decode_issue`]. The repository coordinate is recovered from
+/// `full_name`, so a mismatched or unaddressable response cannot be mistaken
+/// for the requested repository by a caller.
+pub fn decode_repository(bytes: &[u8]) -> Result<GitHubRepository, GitHubFailure> {
+    let object = envelope(bytes)?;
+    let full_name = nonempty(
+        &object,
+        "full_name",
+        crate::MAX_OWNER_BYTES + crate::MAX_REPO_BYTES + 1,
+    )?;
+    let (owner, repo) = full_name
+        .split_once('/')
+        .ok_or(GitHubFailure::FieldOutOfBounds)?;
+    if repo.contains('/') {
+        return Err(GitHubFailure::FieldOutOfBounds);
+    }
+    let target = RepoTarget::parse(owner, repo).map_err(|_| GitHubFailure::FieldOutOfBounds)?;
+    Ok(GitHubRepository {
+        target,
+        url: nonempty(&object, "html_url", MAX_URL_BYTES)?,
+        pushed_at: timestamp(&object, "pushed_at")?,
+        updated_at: timestamp(&object, "updated_at")?,
+        archived: boolean(&object, "archived")?,
+        disabled: boolean(&object, "disabled")?,
+    })
+}
+
 /// Read GitHub's own message off a refusal document.
 ///
 /// Never an error: a refusal that is HTML, empty, or missing its `message` is
@@ -523,6 +571,15 @@ fn identifier(object: &Map<String, Value>, key: &str) -> Result<u64, GitHubFailu
         .ok_or(GitHubFailure::FieldOutOfBounds)
 }
 
+/// A required boolean field.
+fn boolean(object: &Map<String, Value>, key: &str) -> Result<bool, GitHubFailure> {
+    object
+        .get(key)
+        .ok_or(GitHubFailure::MissingField)?
+        .as_bool()
+        .ok_or(GitHubFailure::FieldOutOfBounds)
+}
+
 /// A required string field, present and a string.
 fn required_str<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a str, GitHubFailure> {
     object
@@ -637,6 +694,59 @@ mod tests {
             r#"{"id":9001,"user":{"login":"octocat"},"body":"merci",
                "created_at":"2026-08-13T17:04:11Z","updated_at":"2026-08-13T17:05:11Z"}"#,
         )
+    }
+
+    fn repository_json() -> String {
+        String::from(
+            r#"{"full_name":"example-org/example-repo",
+               "html_url":"https://github.com/example-org/example-repo",
+               "pushed_at":"2026-08-21T17:04:11Z",
+               "updated_at":"2026-08-21T18:04:11Z",
+               "archived":false,"disabled":false}"#,
+        )
+    }
+
+    #[test]
+    fn repository_metadata_decodes_canonical_push_activity() {
+        let repository = decode_repository(repository_json().as_bytes()).expect("decode");
+        assert_eq!(repository.target.to_string(), "example-org/example-repo");
+        assert_eq!(
+            repository.url,
+            "https://github.com/example-org/example-repo"
+        );
+        assert_eq!(repository.pushed_at, "2026-08-21T17:04:11Z");
+        assert_eq!(repository.updated_at, "2026-08-21T18:04:11Z");
+        assert!(!repository.archived);
+        assert!(!repository.disabled);
+    }
+
+    #[test]
+    fn repository_metadata_refuses_missing_or_malformed_contract_fields() {
+        for key in [
+            "full_name",
+            "html_url",
+            "pushed_at",
+            "updated_at",
+            "archived",
+            "disabled",
+        ] {
+            let mut row: Value = serde_json::from_str(&repository_json()).expect("row");
+            row.as_object_mut().expect("object").remove(key);
+            assert_eq!(
+                decode_repository(row.to_string().as_bytes()),
+                Err(GitHubFailure::MissingField),
+                "dropping {key} must be refused"
+            );
+        }
+        let mut row: Value = serde_json::from_str(&repository_json()).expect("row");
+        row.as_object_mut().expect("object").insert(
+            "full_name".to_owned(),
+            Value::String("example-org/example-repo/escape".to_owned()),
+        );
+        assert_eq!(
+            decode_repository(row.to_string().as_bytes()),
+            Err(GitHubFailure::FieldOutOfBounds)
+        );
     }
 
     #[test]

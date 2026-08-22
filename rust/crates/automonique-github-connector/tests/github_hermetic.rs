@@ -27,10 +27,10 @@ use std::time::{Duration, Instant};
 use automonique_github_connector::{
     Attribution, ChecklistItem, CommentId, CommentRequest, CreateIssueRequest, EntityTag,
     GITHUB_ACCEPT, GITHUB_API_VERSION, GITHUB_USER_AGENT, GetCommentsRequest,
-    GetIssueCommentRequest, GetIssueRequest, GitHubBase, GitHubClient, GitHubFailure,
-    GitHubOperation, GitHubToken, IssueBodyText, IssueFilter, IssueListState, IssueNumber,
-    IssuePriority, IssueSource, IssueState, IssueStatus, IssueTitle, Label, LabelColor,
-    ListIssuesRequest, ListLabelsRequest, MAX_GITHUB_RESPONSE_BYTES, ManagementName,
+    GetIssueCommentRequest, GetIssueRequest, GetRepositoryRequest, GitHubBase, GitHubClient,
+    GitHubFailure, GitHubOperation, GitHubToken, IssueBodyText, IssueFilter, IssueListState,
+    IssueNumber, IssuePriority, IssueSource, IssueState, IssueStatus, IssueTitle, Label,
+    LabelColor, ListIssuesRequest, ListLabelsRequest, MAX_GITHUB_RESPONSE_BYTES, ManagementName,
     ManagementRequest, Page, RejectionKind, ReplaceLabelsRequest, RepoMap, RepoRule, RepoTarget,
     SearchIssuesRequest, SetStateRequest, Since, SiteId, TenantId, TenantIssue, ThreadId,
     TicketDraft, TicketExchange, UpdateIssueBodyRequest, UpdateIssueCommentRequest,
@@ -301,6 +301,14 @@ fn issue_json() -> String {
          \"user\":{{\"login\":\"octocat\"}},\"comments\":2,\
          \"created_at\":\"2026-08-10T09:12:00Z\",\"updated_at\":\"2026-08-13T17:04:11Z\",\
          \"closed_at\":null,\"body\":\"corps\"}}"
+    )
+}
+
+fn repository_json() -> String {
+    format!(
+        "{{\"full_name\":\"{OWNER}/{REPO}\",\"html_url\":\"https://github.com/{OWNER}/{REPO}\",\
+         \"pushed_at\":\"2026-08-21T17:04:11Z\",\"updated_at\":\"2026-08-21T18:04:11Z\",\
+         \"archived\":false,\"disabled\":false}}"
     )
 }
 
@@ -801,6 +809,27 @@ fn the_search_operation_appends_the_issue_qualifier_and_recovers_each_repository
         "example-org/example-repo",
         "a search item names its repository only in its URL"
     );
+}
+
+#[test]
+fn repository_push_activity_uses_one_fixed_allowlist_target() {
+    let fake = FakeGitHub::spawn(vec![Canned::json(&repository_json())]);
+    let client = github_client(&fake);
+    let reply = client
+        .get_repository(&GetRepositoryRequest::new(target()))
+        .expect("call");
+
+    assert_wire_shape(
+        &fake.only_request(),
+        "GET",
+        "/repos/example-org/example-repo",
+    );
+    let repository = reply.accepted().expect("accepted repository");
+    assert_eq!(repository.target, target());
+    assert_eq!(repository.pushed_at, "2026-08-21T17:04:11Z");
+    assert_eq!(repository.updated_at, "2026-08-21T18:04:11Z");
+    assert!(!repository.archived);
+    assert!(!repository.disabled);
 }
 
 #[test]
