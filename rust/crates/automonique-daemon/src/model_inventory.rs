@@ -477,6 +477,9 @@ mod tests {
             concat!(
                 "#!/bin/sh\n",
                 "printf '%s %s' \"$1\" \"$2\" > \"$CODEX_HOME/invocation\"\n",
+                "IFS= read -r initialize\n",
+                "IFS= read -r initialized\n",
+                "IFS= read -r model_list\n",
                 "printf '%s\\n' '{\"id\":2,\"result\":{\"data\":[{\"id\":\"gpt-5.6-sol\",\"model\":\"gpt-5.6-sol\",\"hidden\":false,\"isDefault\":true}],\"nextCursor\":null}}'\n",
             ),
         )
