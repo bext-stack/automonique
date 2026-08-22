@@ -19,8 +19,12 @@ pub const PLATFORM_SCHEMA_V1: &str = "automonique.platform/v1";
 pub const MAX_PLATFORM_FIELD_BYTES: usize = 256;
 /// Largest number of resources in a snapshot request or response.
 pub const MAX_SNAPSHOT_RESOURCES: usize = 512;
+/// Largest number of ordered events returned in one subscription page.
+pub const MAX_SUBSCRIPTION_EVENTS: usize = 512;
 /// Largest number of service methods advertised by one endpoint.
 pub const MAX_CAPABILITY_METHODS: usize = 32;
+/// Default and maximum lifetime of one interactive controller lease.
+pub const CONTROL_LEASE_TTL_MILLIS: i64 = 30_000;
 
 /// One temporary projection retained while existing clients move to platform
 /// v1. The removal test is a stable executable-test name, not a calendar date.
@@ -465,6 +469,30 @@ pub struct Snapshot {
     pub cursor: PlatformCursor,
 }
 
+/// One ordered change after a snapshot cursor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformEvent {
+    pub cursor: PlatformCursor,
+    pub resource: ResourceRecord,
+}
+
+/// A bounded, gap-free event page. A caller whose cursor is no longer
+/// retained receives `resync_required` rather than a partial page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Subscription {
+    pub events: Vec<PlatformEvent>,
+    pub cursor: PlatformCursor,
+}
+
+impl Subscription {
+    pub fn new(events: Vec<PlatformEvent>, cursor: PlatformCursor) -> Result<Self, PlatformError> {
+        if events.len() > MAX_SUBSCRIPTION_EVENTS {
+            return Err(PlatformError::TooManyEvents);
+        }
+        Ok(Self { events, cursor })
+    }
+}
+
 impl Snapshot {
     pub fn new(
         resources: Vec<ResourceRecord>,
@@ -527,13 +555,60 @@ pub struct ActionReceipt {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GetReceiptRequest {
-    pub id: ReceiptId,
+    pub id: Option<ReceiptId>,
+    pub idempotency_key: Option<IdempotencyKey>,
+}
+
+impl GetReceiptRequest {
+    #[must_use]
+    pub const fn by_id(id: ReceiptId) -> Self {
+        Self {
+            id: Some(id),
+            idempotency_key: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn by_idempotency_key(idempotency_key: IdempotencyKey) -> Self {
+        Self {
+            id: None,
+            idempotency_key: Some(idempotency_key),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListSessionsRequest {
     pub authority: ResourceAuthority,
     pub cursor: Option<PlatformCursor>,
+}
+
+/// One attachable provider session projected without provider credentials.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionRecord {
+    pub session: ResourceRecord,
+    pub run: Option<ResourceCoordinate>,
+    pub attachable: bool,
+    pub controllable: bool,
+}
+
+/// A bounded page of sessions and its resume cursor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionList {
+    pub sessions: Vec<SessionRecord>,
+    pub cursor: PlatformCursor,
+}
+
+impl SessionList {
+    pub fn new(
+        sessions: Vec<SessionRecord>,
+        cursor: PlatformCursor,
+    ) -> Result<Self, PlatformError> {
+        if sessions.len() > MAX_SNAPSHOT_RESOURCES {
+            return Err(PlatformError::TooManyResources);
+        }
+        Ok(Self { sessions, cursor })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -563,6 +638,26 @@ pub struct ReleaseControlRequest {
     pub idempotency_key: IdempotencyKey,
 }
 
+/// Observation attachment. It carries an independent resume cursor and no
+/// provider/control authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Attachment {
+    pub session: ResourceCoordinate,
+    pub client: ClientId,
+    pub cursor: PlatformCursor,
+}
+
+/// Short exclusive authority to steer one session. Observation never creates
+/// one of these; only `claim_control` does.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlLease {
+    pub id: ControlLeaseId,
+    pub session: ResourceCoordinate,
+    pub client: ClientId,
+    pub expires_at: EpochMillis,
+    pub revision: Revision,
+}
+
 /// Complete request vocabulary. Adding a mutation requires adding an explicit
 /// arm here and updating conformance fixtures.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -579,10 +674,36 @@ pub enum PlatformRequest {
     ReleaseControl(ReleaseControlRequest),
 }
 
+/// Complete response vocabulary shared by local and remote transports.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlatformResponse {
+    Capabilities(Capabilities),
+    Snapshot(Snapshot),
+    Subscription(Subscription),
+    Receipt(ActionReceipt),
+    Sessions(SessionList),
+    Attached(Attachment),
+    Detached {
+        session: ResourceCoordinate,
+        client: ClientId,
+    },
+    ControlClaimed(ControlLease),
+    ControlReleased {
+        session: ResourceCoordinate,
+        client: ClientId,
+        lease: ControlLeaseId,
+    },
+    Refused {
+        outcome: ReceiptOutcome,
+        explanation: PlatformText,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlatformError {
     Field(ValueError),
     TooManyResources,
+    TooManyEvents,
     AuthorityMismatch,
     UnknownEnum { field: &'static str },
 }

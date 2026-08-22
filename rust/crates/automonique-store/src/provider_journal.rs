@@ -1682,6 +1682,24 @@ impl ProviderJournal {
             .ok_or(ProviderJournalError::NotFound("provider_session"))
     }
 
+    /// Read a bounded page of sessions, newest first.
+    pub fn sessions(&self, limit: usize) -> Journalled<Vec<SessionRow>> {
+        if limit == 0 || limit > MAX_SETTLEMENTS {
+            return Err(ProviderJournalError::InvalidField("limit"));
+        }
+        let limit =
+            i64::try_from(limit).map_err(|_| ProviderJournalError::InvalidField("limit"))?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM provider_sessions ORDER BY session_id DESC LIMIT ?1"
+        ))?;
+        let rows = statement.query_map([limit], raw_session)?;
+        let mut sessions = Vec::new();
+        for raw in rows {
+            sessions.push(validated_session(raw?)?);
+        }
+        Ok(sessions)
+    }
+
     /// Read one validated turn row.
     pub fn turn(&self, turn_id: i64) -> Journalled<TurnRow> {
         read_turn(&self.connection, turn_id)?.ok_or(ProviderJournalError::NotFound("provider_turn"))
