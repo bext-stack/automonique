@@ -49,7 +49,6 @@ Never commit it.
 ```text
 schema=automonique.manage/v1
 url=https://support-console.example.test/
-platform_url=https://ai-operations.example.test/
 profile_app=<manage-app-id>
 end=automonique.manage/v1
 ```
@@ -57,15 +56,25 @@ end=automonique.manage/v1
 - `url=` must be an `https://` URL. It is the "Open Manage" button on the
   interactive approval card. With no file, or no `url=`, the card is posted
   without that button; both decisions remain on the card itself.
-- `platform_url=` is the HTTPS AI Operations authority that validates desktop
-  platform bearer tokens. It may differ from the support/MCP console origin;
-  when omitted, version-one deployments retain the `url=` origin.
 - `profile_app=` is the app identity the site-profile read model addresses.
   With no file, or no `profile_app=`, that source is never attached and
   site-profile questions answer `source=not_attached`.
-- An absent file disables every integration. A present file that is world-readable, is
+- An absent file disables both. A present file that is world-readable, is
   malformed, sets an unknown or duplicate key, carries an invalid value, or
-  sets no key refuses daemon startup rather than being ignored.
+  sets neither key refuses daemon startup rather than being ignored.
+
+When the AI Operations authority differs from the support/MCP console, put its
+origin in the separate owner-only `<state>/manage/platform.conf` frame. Keeping
+this additive configuration in a separate file preserves rollback parsing for
+older releases:
+
+```text
+schema=automonique.manage-platform/v1
+url=https://ai-operations.example.test/
+end=automonique.manage-platform/v1
+```
+
+Without that file, platform bearer validation retains the `url=` origin.
 
 ## Slack app settings
 

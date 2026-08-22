@@ -77,8 +77,8 @@ the canonical memory database, rather than a dashboard-specific provider path.
 The dashboard reuses the deployment's private Manage URL and MCP credentials;
 it never embeds a production address, token, app identity or header in source.
 When AI Operations is served from a different origin than the support/MCP
-console, `manage/manage.conf` names that authority explicitly with
-`platform_url=`; platform bearer validation never guesses or rewrites a host.
+console, the rollback-safe `manage/platform.conf` frame names that authority
+explicitly; platform bearer validation never guesses or rewrites a host.
 The configuration API exposes capability booleans and the validated console
 link, but keeps all authentication material concealed. If Manage or its exact
 same-origin MCP server is absent, Manage actions are simply unavailable rather

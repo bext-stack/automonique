@@ -33,7 +33,7 @@ use automonique_daemon::run_lane::SocketRunLane;
 use automonique_daemon::slack::SlackHost;
 use automonique_daemon::telegram_bridge::{QuestionProfile, RunFailure, RunLane, SlackSurface};
 use automonique_daemon::{
-    manage_config::{ManageConfig, ManageProfileApp},
+    manage_config::{ManageConfig, ManagePlatformConfig, ManageProfileApp},
     mcp_client::{McpCallResult, McpRegistry, McpToolDescriptor},
     site_inventory::{NGINX_SITES_ENABLED, enabled_hosts, manage_profiles, prism_sites},
 };
@@ -1279,10 +1279,9 @@ impl WebIntegration {
             .as_ref()
             .and_then(ManageConfig::url)
             .map(|url| url.as_str().to_owned());
-        let platform_url = manage_config
-            .as_ref()
-            .and_then(ManageConfig::platform_url)
-            .map(|url| url.as_str().to_owned());
+        let platform_url = ManagePlatformConfig::load(state_dir)
+            .map_err(|_| "dashboard platform authority configuration unavailable")?
+            .map(|config| config.url().as_str().to_owned());
         let mcp_server = console_url
             .as_deref()
             .and_then(|url| mcp.unique_server_for_https_origin(url));
