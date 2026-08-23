@@ -17,8 +17,8 @@ use automonique_protocol::platform::{
     ActionReceipt, AttachRequest, Attachment, Capabilities, ClaimControlRequest, ClientId,
     ControlLease, DetachRequest, ExecuteRequest, GetReceiptRequest, IdempotencyKey,
     ListSessionsRequest, PlatformCursor, PlatformRequest, PlatformResponse, PlatformText,
-    ReceiptId, ReleaseControlRequest, ResourceAuthority, ResourceCoordinate, ResourceRecord,
-    SessionList, Snapshot, SnapshotRequest, SubscribeRequest, Subscription,
+    ReceiptId, ReceiptOutcome, ReleaseControlRequest, ResourceAuthority, ResourceCoordinate,
+    ResourceRecord, SessionList, Snapshot, SnapshotRequest, SubscribeRequest, Subscription,
 };
 use automonique_protocol::platform_api::{
     MAX_PLATFORM_CANONICAL_BYTES, PlatformRequestMessage, PlatformResponseMessage,
@@ -328,6 +328,23 @@ pub enum SubscriptionResult {
     ResyncRequired { explanation: PlatformText },
 }
 
+/// Recoverable result of refreshing the attachable-session directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionListResult {
+    Sessions(SessionList),
+    ResyncRequired { explanation: PlatformText },
+}
+
+/// Typed result of an explicit platform mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActionResult {
+    Receipt(ActionReceipt),
+    Refused {
+        outcome: ReceiptOutcome,
+        explanation: PlatformText,
+    },
+}
+
 impl<T: PlatformTransport> PlatformClient<T> {
     #[must_use]
     pub const fn new(transport: T) -> Self {
@@ -396,7 +413,7 @@ impl<T: PlatformTransport> PlatformClient<T> {
         match self.request(PlatformRequest::Subscribe(SubscribeRequest { cursor }))? {
             PlatformResponse::Subscription(value) => Ok(SubscriptionResult::Page(value)),
             PlatformResponse::Refused {
-                outcome: automonique_protocol::platform::ReceiptOutcome::ResyncRequired,
+                outcome: ReceiptOutcome::ResyncRequired,
                 explanation,
             } => Ok(SubscriptionResult::ResyncRequired { explanation }),
             _ => Err(ClientError::Protocol),
@@ -404,8 +421,27 @@ impl<T: PlatformTransport> PlatformClient<T> {
     }
 
     pub fn execute(&mut self, request: ExecuteRequest) -> Result<ActionReceipt, ClientError> {
+        match self.execute_outcome(request)? {
+            ActionResult::Receipt(value) => Ok(value),
+            ActionResult::Refused { .. } => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Execute without collapsing a typed authorization, conflict, or stale
+    /// revision refusal into a generic protocol error.
+    pub fn execute_outcome(
+        &mut self,
+        request: ExecuteRequest,
+    ) -> Result<ActionResult, ClientError> {
         match self.request(PlatformRequest::Execute(request))? {
-            PlatformResponse::Receipt(value) => Ok(value),
+            PlatformResponse::Receipt(value) => Ok(ActionResult::Receipt(value)),
+            PlatformResponse::Refused {
+                outcome,
+                explanation,
+            } => Ok(ActionResult::Refused {
+                outcome,
+                explanation,
+            }),
             _ => Err(ClientError::Protocol),
         }
     }
@@ -425,11 +461,28 @@ impl<T: PlatformTransport> PlatformClient<T> {
         authority: ResourceAuthority,
         cursor: Option<PlatformCursor>,
     ) -> Result<SessionList, ClientError> {
+        match self.list_sessions_recoverable(authority, cursor)? {
+            SessionListResult::Sessions(value) => Ok(value),
+            SessionListResult::ResyncRequired { .. } => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Refresh session discovery while preserving an expired-directory cursor
+    /// as a recoverable resnapshot signal.
+    pub fn list_sessions_recoverable(
+        &mut self,
+        authority: ResourceAuthority,
+        cursor: Option<PlatformCursor>,
+    ) -> Result<SessionListResult, ClientError> {
         match self.request(PlatformRequest::ListSessions(ListSessionsRequest {
             authority,
             cursor,
         }))? {
-            PlatformResponse::Sessions(value) => Ok(value),
+            PlatformResponse::Sessions(value) => Ok(SessionListResult::Sessions(value)),
+            PlatformResponse::Refused {
+                outcome: ReceiptOutcome::ResyncRequired,
+                explanation,
+            } => Ok(SessionListResult::ResyncRequired { explanation }),
             _ => Err(ClientError::Protocol),
         }
     }

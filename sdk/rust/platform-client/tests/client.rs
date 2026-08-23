@@ -5,15 +5,15 @@ use std::net::TcpListener;
 use std::thread;
 
 use automonique_platform_client::{
-    BearerToken, ClientError, HttpsTransport, PLATFORM_CONTENT_TYPE, PlatformClient,
-    PlatformTransport, PlatformView, SubscriptionApply, SubscriptionResult,
+    ActionResult, BearerToken, ClientError, HttpsTransport, PLATFORM_CONTENT_TYPE, PlatformClient,
+    PlatformTransport, PlatformView, SessionListResult, SubscriptionApply, SubscriptionResult,
 };
 use automonique_protocol::codec::RequestId;
 use automonique_protocol::platform::{
-    ActionReceipt, Attachment, Capabilities, ClientId, CursorTopic, PlatformAction, PlatformCursor,
-    PlatformEvent, PlatformRequest, PlatformResponse, PlatformText, ReceiptId, ReceiptOutcome,
-    ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind, ResourceRecord, Snapshot,
-    Subscription,
+    ActionReceipt, Attachment, Capabilities, ClientId, CursorTopic, ExecuteRequest, IdempotencyKey,
+    PlatformAction, PlatformCursor, PlatformEvent, PlatformRequest, PlatformResponse, PlatformText,
+    ReceiptId, ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
+    ResourceRecord, Snapshot, Subscription,
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
 use automonique_protocol::primitives::{EpochMillis, Revision};
@@ -182,6 +182,63 @@ fn recoverable_subscription_preserves_resnapshot_outcome() {
             .expect("typed response"),
         SubscriptionResult::ResyncRequired {
             explanation: text("cursor expired")
+        }
+    );
+}
+
+struct TypedRefusalTransport;
+
+impl PlatformTransport for TypedRefusalTransport {
+    fn request(
+        &mut self,
+        _request_id: RequestId,
+        request: PlatformRequest,
+    ) -> Result<PlatformResponse, ClientError> {
+        match request {
+            PlatformRequest::ListSessions(_) => Ok(PlatformResponse::Refused {
+                outcome: ReceiptOutcome::ResyncRequired,
+                explanation: text("directory cursor expired"),
+            }),
+            PlatformRequest::Execute(_) => Ok(PlatformResponse::Refused {
+                outcome: ReceiptOutcome::Conflict,
+                explanation: text("revision changed"),
+            }),
+            _ => panic!("unexpected request"),
+        }
+    }
+}
+
+#[test]
+fn session_refresh_and_mutation_keep_typed_refusals() {
+    let mut client = PlatformClient::new(TypedRefusalTransport);
+    assert_eq!(
+        client
+            .list_sessions_recoverable(ResourceAuthority::Automonique, Some(cursor("sessions", 9)),)
+            .expect("typed session response"),
+        SessionListResult::ResyncRequired {
+            explanation: text("directory cursor expired")
+        }
+    );
+    let run = ResourceCoordinate::new(
+        ResourceAuthority::Automonique,
+        ResourceKind::Run,
+        ResourceId::new("run-1").expect("run id"),
+    );
+    let request = ExecuteRequest::new(
+        PlatformAction::StopRun,
+        run,
+        IdempotencyKey::new("stop-run-1").expect("idempotency key"),
+        Some(revision(4)),
+        None,
+    )
+    .expect("execute request");
+    assert_eq!(
+        client
+            .execute_outcome(request)
+            .expect("typed action response"),
+        ActionResult::Refused {
+            outcome: ReceiptOutcome::Conflict,
+            explanation: text("revision changed")
         }
     );
 }
