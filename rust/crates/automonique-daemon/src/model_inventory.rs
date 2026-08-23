@@ -77,6 +77,17 @@ pub enum ModelCatalogRead {
     Unavailable(ModelCatalogUnavailable),
 }
 
+/// One transport-neutral answer to a model-capability question.
+///
+/// The configured routes remain authoritative even when the bounded provider
+/// catalog read is unavailable. `catalog_available` lets presentation layers
+/// record which source contributed without parsing the rendered text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelCapabilityAnswer {
+    pub text: String,
+    pub catalog_available: bool,
+}
+
 impl ConfiguredModelRoutes {
     #[must_use]
     pub fn render(&self) -> String {
@@ -170,6 +181,70 @@ pub fn configured_provider_catalog(state_dir: &Path) -> ModelCatalogRead {
     match provider.engine() {
         ProviderEngine::Codex => read_codex_catalog(&provider),
         ProviderEngine::Jcode => read_jcode_catalog(&provider),
+    }
+}
+
+/// Render the same model inventory for every conversational surface.
+#[must_use]
+pub fn model_capability_answer(state_dir: &Path) -> ModelCapabilityAnswer {
+    render_model_capability_answer(
+        configured_model_routes(state_dir),
+        configured_provider_catalog(state_dir),
+    )
+}
+
+/// Combine configured routes with the bounded account-visible catalog.
+#[must_use]
+pub fn render_model_capability_answer(
+    routes: ConfiguredModelRoutes,
+    catalog: ModelCatalogRead,
+) -> ModelCapabilityAnswer {
+    let mut text = format!(
+        "Monique’s configured model routes:\n\
+         - Conversation: `{}`\n\
+         - Conversation fallback: `{}`\n\
+         - Operational work: `{}` (`{}` reasoning)",
+        routes.conversation_primary,
+        routes.conversation_fallback,
+        routes.operational_primary,
+        routes.operational_reasoning,
+    );
+    match catalog {
+        ModelCatalogRead::Available(catalog) => {
+            let source = match catalog.source {
+                ModelCatalogSource::CodexAppServer => "Codex App Server",
+                ModelCatalogSource::JcodeCli => "JCode",
+            };
+            let models = catalog
+                .models
+                .iter()
+                .map(|model| {
+                    if model.is_default {
+                        format!("`{}` (default)", model.id)
+                    } else {
+                        format!("`{}`", model.id)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            text.push_str(&format!(
+                "\n\nThe connected provider account currently exposes: {models}.\n\
+                 Catalog source: {source}. Account-visible models are not automatically active Monique routes."
+            ));
+            ModelCapabilityAnswer {
+                text,
+                catalog_available: true,
+            }
+        }
+        ModelCatalogRead::Unavailable(_) => {
+            text.push_str(
+                "\n\nThe connected provider account’s live model catalog is temporarily unavailable. The configured routes above remain authoritative for what Monique will select.",
+            );
+            ModelCapabilityAnswer {
+                text,
+                catalog_available: false,
+            }
+        }
     }
 }
 

@@ -2979,7 +2979,7 @@ fn site_and_model_capability_inventories_answer_locally_without_provider_runs() 
     assert_eq!(messages.len(), 2);
     assert!(messages[0].contains("Active Prism inventory"));
     assert!(messages[0].contains("alpha-prism.example"));
-    assert!(messages[1].contains("Models: configured routes include"));
+    assert!(messages[1].contains("Monique’s configured model routes"));
     assert!(messages[1].contains("deepseek-v4-flash"));
     assert!(messages[1].contains("gpt-5.6-luna"));
     assert!(messages[1].contains("gpt-5.6-sol"));
@@ -4628,7 +4628,7 @@ fn natural_system_access_questions_answer_from_typed_configuration_without_provi
     assert!(messages[3].contains("Slack is configured"));
     assert!(messages[3].contains("GitHub:"));
     assert!(messages[3].contains("Memory:"));
-    assert!(messages[3].contains("Models:"));
+    assert!(messages[3].contains("Monique’s configured model routes:"));
     assert!(messages[3].contains("Public web research:"));
 
     let unavailable_outbound = FakeOutbound::default();
