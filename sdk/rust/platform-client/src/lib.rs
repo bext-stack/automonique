@@ -16,9 +16,9 @@ use automonique_protocol::codec::{
 use automonique_protocol::platform::{
     ActionReceipt, AttachRequest, Attachment, Capabilities, ClaimControlRequest, ClientId,
     ControlLease, DetachRequest, ExecuteRequest, GetReceiptRequest, IdempotencyKey,
-    ListSessionsRequest, PlatformCursor, PlatformRequest, PlatformResponse, ReceiptId,
-    ReleaseControlRequest, ResourceAuthority, ResourceCoordinate, ResourceRecord, SessionList,
-    Snapshot, SnapshotRequest, SubscribeRequest, Subscription,
+    ListSessionsRequest, PlatformCursor, PlatformRequest, PlatformResponse, PlatformText,
+    ReceiptId, ReleaseControlRequest, ResourceAuthority, ResourceCoordinate, ResourceRecord,
+    SessionList, Snapshot, SnapshotRequest, SubscribeRequest, Subscription,
 };
 use automonique_protocol::platform_api::{
     MAX_PLATFORM_CANONICAL_BYTES, PlatformRequestMessage, PlatformResponseMessage,
@@ -317,6 +317,17 @@ pub struct PlatformClient<T> {
     next_request: u64,
 }
 
+/// Recoverable result of a cursor subscription.
+///
+/// A retained cursor yields a page. An expired cursor is not a transport or
+/// protocol failure: the server explicitly asks the client to replace that
+/// stream with a fresh snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SubscriptionResult {
+    Page(Subscription),
+    ResyncRequired { explanation: PlatformText },
+}
+
 impl<T: PlatformTransport> PlatformClient<T> {
     #[must_use]
     pub const fn new(transport: T) -> Self {
@@ -369,8 +380,25 @@ impl<T: PlatformTransport> PlatformClient<T> {
         &mut self,
         cursor: Option<PlatformCursor>,
     ) -> Result<Subscription, ClientError> {
+        match self.subscribe_recoverable(cursor)? {
+            SubscriptionResult::Page(value) => Ok(value),
+            SubscriptionResult::ResyncRequired { .. } => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Subscribe while preserving the protocol's explicit cursor-expiry
+    /// outcome so interactive clients can resnapshot instead of treating it
+    /// as an opaque failure.
+    pub fn subscribe_recoverable(
+        &mut self,
+        cursor: Option<PlatformCursor>,
+    ) -> Result<SubscriptionResult, ClientError> {
         match self.request(PlatformRequest::Subscribe(SubscribeRequest { cursor }))? {
-            PlatformResponse::Subscription(value) => Ok(value),
+            PlatformResponse::Subscription(value) => Ok(SubscriptionResult::Page(value)),
+            PlatformResponse::Refused {
+                outcome: automonique_protocol::platform::ReceiptOutcome::ResyncRequired,
+                explanation,
+            } => Ok(SubscriptionResult::ResyncRequired { explanation }),
             _ => Err(ClientError::Protocol),
         }
     }
@@ -481,6 +509,21 @@ struct CursorKey {
     topic: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct AttachmentKey {
+    session: String,
+    client: String,
+}
+
+impl AttachmentKey {
+    fn of(attachment: &Attachment) -> Self {
+        Self {
+            session: resource_key(&attachment.session),
+            client: attachment.client.as_str().to_owned(),
+        }
+    }
+}
+
 impl CursorKey {
     fn of(cursor: &PlatformCursor) -> Self {
         Self {
@@ -504,8 +547,17 @@ fn resource_key(value: &ResourceCoordinate) -> String {
 pub struct PlatformView {
     resources: BTreeMap<String, ResourceRecord>,
     cursors: BTreeMap<CursorKey, PlatformCursor>,
+    attachment_cursors: BTreeMap<AttachmentKey, PlatformCursor>,
     receipts: BTreeMap<String, ActionReceipt>,
     resync_required: BTreeSet<CursorKey>,
+    attachment_resync_required: BTreeSet<AttachmentKey>,
+}
+
+/// Result of applying one subscription page to a [`PlatformView`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubscriptionApply {
+    Applied { events: usize },
+    ResyncRequired,
 }
 
 impl PlatformView {
@@ -519,53 +571,52 @@ impl PlatformView {
         self.resync_required.remove(&key);
     }
 
-    pub fn apply_subscription(&mut self, page: Subscription) {
+    #[must_use]
+    pub fn apply_subscription(&mut self, page: Subscription) -> SubscriptionApply {
         let key = CursorKey::of(&page.cursor);
-        let Some(prior) = self.cursors.get(&key) else {
+        let Some(prior) = self.cursors.get(&key).cloned() else {
             self.resync_required.insert(key);
-            return;
+            return SubscriptionApply::ResyncRequired;
         };
-        let mut sequence = prior.sequence.get();
-        let mut staged = self.resources.clone();
-        for event in page.events {
-            if CursorKey::of(&event.cursor) != key {
-                self.resync_required.insert(key);
-                return;
+        match stage_subscription(&self.resources, &prior, page) {
+            Ok((resources, cursor, applied)) => {
+                self.resources = resources;
+                self.cursors.insert(key.clone(), cursor);
+                self.resync_required.remove(&key);
+                SubscriptionApply::Applied { events: applied }
             }
-            let event_sequence = event.cursor.sequence.get();
-            if event_sequence <= sequence {
-                if staged
-                    .get(&resource_key(&event.resource.resource))
-                    .is_some_and(|existing| existing == &event.resource)
-                {
-                    continue;
-                }
+            Err(()) => {
                 self.resync_required.insert(key);
-                return;
+                SubscriptionApply::ResyncRequired
             }
-            if event_sequence != sequence.saturating_add(1) {
-                self.resync_required.insert(key);
-                return;
-            }
-            if staged
-                .get(&resource_key(&event.resource.resource))
-                .is_some_and(|existing| {
-                    event.resource.freshness.revision < existing.freshness.revision
-                })
-            {
-                self.resync_required.insert(key);
-                return;
-            }
-            staged.insert(resource_key(&event.resource.resource), event.resource);
-            sequence = event_sequence;
         }
-        if page.cursor.sequence.get() != sequence {
-            self.resync_required.insert(key);
-            return;
+    }
+
+    /// Apply a page to one attachment without advancing any other attachment
+    /// that happens to observe the same authority/topic.
+    #[must_use]
+    pub fn apply_attachment_subscription(
+        &mut self,
+        attachment: &Attachment,
+        page: Subscription,
+    ) -> SubscriptionApply {
+        let key = AttachmentKey::of(attachment);
+        let Some(prior) = self.attachment_cursors.get(&key).cloned() else {
+            self.attachment_resync_required.insert(key);
+            return SubscriptionApply::ResyncRequired;
+        };
+        match stage_subscription(&self.resources, &prior, page) {
+            Ok((resources, cursor, applied)) => {
+                self.resources = resources;
+                self.attachment_cursors.insert(key.clone(), cursor);
+                self.attachment_resync_required.remove(&key);
+                SubscriptionApply::Applied { events: applied }
+            }
+            Err(()) => {
+                self.attachment_resync_required.insert(key);
+                SubscriptionApply::ResyncRequired
+            }
         }
-        self.resources = staged;
-        self.cursors.insert(key.clone(), page.cursor);
-        self.resync_required.remove(&key);
     }
 
     pub fn apply_receipt(&mut self, receipt: ActionReceipt) {
@@ -580,9 +631,29 @@ impl PlatformView {
         self.receipts.insert(key, receipt);
     }
 
+    /// Start or resume the independent stream represented by an attachment.
+    pub fn track_attachment(&mut self, attachment: &Attachment) {
+        let key = AttachmentKey::of(attachment);
+        self.attachment_cursors
+            .insert(key.clone(), attachment.cursor.clone());
+        self.attachment_resync_required.remove(&key);
+    }
+
+    /// Forget the independent stream represented by a detached attachment.
+    pub fn forget_attachment(&mut self, attachment: &Attachment) {
+        let key = AttachmentKey::of(attachment);
+        self.attachment_cursors.remove(&key);
+        self.attachment_resync_required.remove(&key);
+    }
+
     #[must_use]
     pub fn resource(&self, coordinate: &ResourceCoordinate) -> Option<&ResourceRecord> {
         self.resources.get(&resource_key(coordinate))
+    }
+
+    /// Iterate the current projection in stable resource-coordinate order.
+    pub fn resources(&self) -> impl ExactSizeIterator<Item = &ResourceRecord> {
+        self.resources.values()
     }
 
     #[must_use]
@@ -590,8 +661,78 @@ impl PlatformView {
         self.receipts.get(id.as_str())
     }
 
+    /// Iterate reconciled receipts in stable receipt-id order.
+    pub fn receipts(&self) -> impl ExactSizeIterator<Item = &ActionReceipt> {
+        self.receipts.values()
+    }
+
+    /// Return the latest cursor for the same authority/topic as `cursor`.
+    #[must_use]
+    pub fn cursor(&self, cursor: &PlatformCursor) -> Option<&PlatformCursor> {
+        self.cursors.get(&CursorKey::of(cursor))
+    }
+
+    /// Return the latest cursor for one exact session/client attachment.
+    #[must_use]
+    pub fn attachment_cursor(&self, attachment: &Attachment) -> Option<&PlatformCursor> {
+        self.attachment_cursors.get(&AttachmentKey::of(attachment))
+    }
+
     #[must_use]
     pub fn needs_resync(&self, cursor: &PlatformCursor) -> bool {
         self.resync_required.contains(&CursorKey::of(cursor))
     }
+
+    /// Whether one exact attachment must be detached and reattached before it
+    /// can resume safely.
+    #[must_use]
+    pub fn attachment_needs_resync(&self, attachment: &Attachment) -> bool {
+        self.attachment_resync_required
+            .contains(&AttachmentKey::of(attachment))
+    }
+}
+
+fn stage_subscription(
+    resources: &BTreeMap<String, ResourceRecord>,
+    prior: &PlatformCursor,
+    page: Subscription,
+) -> Result<(BTreeMap<String, ResourceRecord>, PlatformCursor, usize), ()> {
+    let key = CursorKey::of(&page.cursor);
+    if CursorKey::of(prior) != key {
+        return Err(());
+    }
+    let mut sequence = prior.sequence.get();
+    let mut staged = resources.clone();
+    let mut applied = 0;
+    for event in page.events {
+        if CursorKey::of(&event.cursor) != key {
+            return Err(());
+        }
+        let event_sequence = event.cursor.sequence.get();
+        if event_sequence <= sequence {
+            if staged
+                .get(&resource_key(&event.resource.resource))
+                .is_some_and(|existing| existing == &event.resource)
+            {
+                continue;
+            }
+            return Err(());
+        }
+        if event_sequence != sequence.saturating_add(1) {
+            return Err(());
+        }
+        if staged
+            .get(&resource_key(&event.resource.resource))
+            .is_some_and(|existing| event.resource.freshness.revision < existing.freshness.revision)
+        {
+            return Err(());
+        }
+        staged.insert(resource_key(&event.resource.resource), event.resource);
+        sequence = event_sequence;
+        applied += 1;
+    }
+    if page.cursor.sequence.get() != sequence {
+        return Err(());
+    }
+    Ok((staged, page.cursor, applied))
 }

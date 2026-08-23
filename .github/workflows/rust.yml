@@ -73,6 +73,15 @@ jobs:
           cargo test --workspace --all-targets --offline --locked
           cargo clippy --workspace --all-targets --offline --locked -- -D warnings
 
+      - name: Locked shared platform client checks
+        working-directory: sdk/rust/platform-client
+        run: |
+          cargo fetch --locked
+          cargo fmt -- --check
+          cargo check --all-targets --offline --locked
+          cargo test --all-targets --offline --locked
+          cargo clippy --all-targets --offline --locked -- -D warnings
+
       - name: Lockfile is reproducible offline
         working-directory: rust
         run: |
