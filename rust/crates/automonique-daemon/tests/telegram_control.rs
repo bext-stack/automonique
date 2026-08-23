@@ -973,6 +973,12 @@ impl FakeRunLane {
         lane
     }
 
+    fn blocking_sequence(answers: &[&str]) -> Self {
+        let lane = Self::answering_sequence(answers);
+        lane.state.lock().expect("lane state").gate = Some(Arc::new(RunGate::default()));
+        lane
+    }
+
     fn wait_until_started(&self) {
         let gate = self
             .state
@@ -2153,7 +2159,7 @@ fn complex_script_requests_stage_an_admin_approved_agentic_scratchpad() {
         OPERATOR,
         "write a Python script to scan all logs",
     )])]);
-    let lane = FakeRunLane::answering_sequence(&[
+    let lane = FakeRunLane::blocking_sequence(&[
         "plain model prose cannot bypass the host gate",
         "Created analyzer.py, ran its fixture checks, and summarized the available inputs.",
     ]);
@@ -2168,7 +2174,13 @@ fn complex_script_requests_stage_an_admin_approved_agentic_scratchpad() {
     let report = poll(&mut bridge).expect("scratchpad request queues routing");
     assert_eq!(report.answered, 0);
     assert_eq!(report.questions_queued, 1);
-    assert!(lane.tasks().is_empty(), "the queued router has not run yet");
+    lane.wait_until_started();
+    assert_eq!(lane.tasks().len(), 1, "only the queued router has started");
+    assert!(
+        outbound.messages().is_empty(),
+        "the blocked router has no effect"
+    );
+    lane.release();
     assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
     assert_eq!(lane.tasks().len(), 1, "only the read-only router ran");
 

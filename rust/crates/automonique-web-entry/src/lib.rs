@@ -1480,7 +1480,10 @@ impl WebIntegration {
         provider_configured: bool,
         worker_configured: bool,
     ) -> AgentAuthenticationView {
-        if let Some(manager) = &self.agent_auth
+        let (configured_provider_name, configured_provider) =
+            configured_provider_identity(&self.state_dir);
+        if configured_provider != "jcode"
+            && let Some(manager) = &self.agent_auth
             && let Ok(view) = manager.view()
         {
             let authenticated_accounts = view
@@ -1528,14 +1531,14 @@ impl WebIntegration {
             };
         }
         let fallback = |status: &str, evidence: &str| AgentAuthenticationView {
-            provider: "Codex",
+            provider: configured_provider_name,
             surface: "AI Operations ticket worker",
             provider_configured,
             worker_configured,
             account_count: 0,
             authenticated_accounts: 0,
-            worker_provider: String::from("codex"),
-            selected_account: String::from("legacy"),
+            worker_provider: configured_provider.to_owned(),
+            selected_account: String::from("configured"),
             status: status.to_owned(),
             method: String::from("unknown"),
             evidence: evidence.to_owned(),
@@ -1559,15 +1562,18 @@ impl WebIntegration {
         let Some(record) = provider_auth_health_record(&bytes) else {
             return fallback("unavailable", "health_record_invalid");
         };
+        let Some((provider_name, _)) = provider_identity(&record.provider) else {
+            return fallback("unavailable", "health_record_invalid");
+        };
         AgentAuthenticationView {
-            provider: "Codex",
+            provider: provider_name,
             surface: "AI Operations ticket worker",
             provider_configured,
             worker_configured,
             account_count: 0,
             authenticated_accounts: 0,
-            worker_provider: String::from("codex"),
-            selected_account: String::from("legacy"),
+            worker_provider: record.provider.clone(),
+            selected_account: String::from("configured"),
             remediation: authentication_remediation(&record.status),
             status: record.status,
             method: record.method,
@@ -3713,24 +3719,55 @@ pub fn dashboard_status(admin_json: &[u8], observed_ms: u64) -> Option<Dashboard
     })
 }
 
+fn provider_identity(provider: &str) -> Option<(&'static str, &'static str)> {
+    match provider {
+        "codex" => Some(("Codex CLI", "codex")),
+        "jcode" => Some(("JCode", "jcode")),
+        "claude" => Some(("Claude Code", "claude")),
+        _ => None,
+    }
+}
+
+fn configured_provider_identity(state_dir: &Path) -> (&'static str, &'static str) {
+    let path = state_dir.join("provider");
+    let Ok(bytes) = read_private_config(&path, INTEGRATION_CONFIG_LIMIT) else {
+        return ("Configured provider", "unknown");
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return ("Configured provider", "unknown");
+    };
+    let engines = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("engine="))
+        .collect::<Vec<_>>();
+    match engines.as_slice() {
+        [] | ["codex"] => ("Codex CLI", "codex"),
+        ["jcode"] => ("JCode", "jcode"),
+        _ => ("Configured provider", "unknown"),
+    }
+}
+
 fn provider_auth_health_record(bytes: &[u8]) -> Option<ProviderAuthHealthRecord> {
     let record: ProviderAuthHealthRecord = serde_json::from_slice(bytes).ok()?;
     let valid_status = matches!(
         record.status.as_str(),
         "authenticated" | "configured_unverified" | "expired" | "signed_out" | "unavailable"
     );
-    let valid_method = matches!(
-        record.method.as_str(),
-        "chatgpt" | "api_key" | "access_token" | "unknown"
+    let valid_identity = matches!(
+        (record.provider.as_str(), record.method.as_str()),
+        ("codex", "chatgpt" | "api_key" | "access_token" | "unknown")
+            | ("jcode", "jcode_native" | "unknown")
+            | ("claude", "claude_ai" | "unknown")
     );
     let valid_evidence = matches!(
         (record.status.as_str(), record.reason.as_str()),
-        ("authenticated", "execution_succeeded")
-            | (
-                "configured_unverified",
-                "credentials_changed" | "local_session_present"
-            )
-            | ("expired", "refresh_token_rejected")
+        (
+            "authenticated",
+            "execution_succeeded" | "platform_execution_succeeded"
+        ) | (
+            "configured_unverified",
+            "credentials_changed" | "local_session_present"
+        ) | ("expired", "refresh_token_rejected")
             | ("signed_out", "local_session_missing")
             | ("unavailable", "provider_unavailable")
     );
@@ -3739,10 +3776,9 @@ fn provider_auth_health_record(bytes: &[u8]) -> Option<ProviderAuthHealthRecord>
         verified > 0 && verified <= record.observed_at_ms && verified <= MAX_SAFE_INTEGER
     });
     if record.schema != "automonique.provider-auth-health/v1"
-        || record.provider != "codex"
+        || !valid_identity
         || record.surface != "manage-fleet-worker"
         || !valid_status
-        || !valid_method
         || !valid_evidence
         || record.observed_at_ms == 0
         || record.observed_at_ms > MAX_SAFE_INTEGER
@@ -4719,6 +4755,25 @@ mod tests {
         assert_eq!("chatgpt", record.method);
         assert_eq!("refresh_token_rejected", record.reason);
 
+        let jcode = r#"{
+          "schema":"automonique.provider-auth-health/v1",
+          "provider":"jcode",
+          "surface":"manage-fleet-worker",
+          "status":"authenticated",
+          "method":"jcode_native",
+          "reason":"platform_execution_succeeded",
+          "observed_at_ms":1787057640000,
+          "last_verified_at_ms":1787057640000
+        }"#;
+        let record = provider_auth_health_record(jcode.as_bytes()).expect("valid JCode health");
+        assert_eq!("jcode", record.provider);
+        assert_eq!("jcode_native", record.method);
+        assert_eq!("platform_execution_succeeded", record.reason);
+        assert!(
+            provider_auth_health_record(jcode.replace("jcode_native", "chatgpt").as_bytes())
+                .is_none()
+        );
+
         let unknown = valid.replace(
             "\n        }",
             ",\n          \"token\":\"secret\"\n        }",
@@ -4730,6 +4785,23 @@ mod tests {
         assert!(
             provider_auth_health_record(valid.replace("1787057000000", "1787058000000").as_bytes())
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn configured_provider_identity_reports_jcode() {
+        let root = tempfile::tempdir().expect("state root");
+        let provider = root.path().join("provider");
+        std::fs::write(
+            &provider,
+            "engine=jcode\nbinary=/opt/jcode/bin/jcode\nhome=/private/jcode\n",
+        )
+        .expect("provider config");
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o600))
+            .expect("private provider config");
+        assert_eq!(
+            configured_provider_identity(root.path()),
+            ("JCode", "jcode")
         );
     }
 
@@ -4858,6 +4930,7 @@ mod tests {
         assert!(MANAGE_WORKER.contains("platform-job"));
         assert!(MANAGE_WORKER.contains("--idempotency-key \"$command_id\""));
         assert!(MANAGE_WORKER.contains("local_platform_receipts"));
+        assert!(MANAGE_WORKER.contains("platform_execution_succeeded"));
         assert!(MANAGE_WORKER.contains("CLAUDE_CONFIG_DIR=\"$selected_home\""));
         assert!(MANAGE_WORKER.contains("--output-format stream-json"));
         assert!(MANAGE_WORKER.contains("unset OPENAI_API_KEY ANTHROPIC_API_KEY"));
