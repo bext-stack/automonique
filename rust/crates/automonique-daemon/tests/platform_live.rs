@@ -232,16 +232,6 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
         panic!("capabilities response")
     };
     assert_eq!(capabilities.methods.len(), 10);
-    assert_eq!(
-        capabilities.actions,
-        [
-            PlatformAction::StartRun,
-            PlatformAction::StopRun,
-            PlatformAction::DecideApproval,
-            PlatformAction::SubmitRequest,
-            PlatformAction::FollowUp,
-        ]
-    );
     assert_eq!(capabilities.transports.len(), 1);
 
     let PlatformResponse::Snapshot(snapshot) = platform(
@@ -255,6 +245,31 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
         resource.resource.authority == ResourceAuthority::Automonique
             && resource.resource.kind == ResourceKind::Node
     }));
+    let mut actions = snapshot
+        .resources
+        .iter()
+        .filter(|resource| {
+            resource.resource.authority == ResourceAuthority::Automonique
+                && resource.resource.kind == ResourceKind::Client
+                && resource
+                    .resource
+                    .id
+                    .as_str()
+                    .starts_with("platform-action-")
+        })
+        .map(|resource| resource.resource.id.as_str())
+        .collect::<Vec<_>>();
+    actions.sort_unstable();
+    assert_eq!(
+        actions,
+        [
+            "platform-action-decide_approval",
+            "platform-action-follow_up",
+            "platform-action-start_run",
+            "platform-action-stop_run",
+            "platform-action-submit_request",
+        ]
+    );
     let model = snapshot
         .resources
         .iter()

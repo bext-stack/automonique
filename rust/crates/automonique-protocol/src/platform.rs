@@ -440,10 +440,6 @@ pub struct Capabilities {
     pub protocol: &'static str,
     pub schema: &'static str,
     pub methods: Vec<PlatformMethod>,
-    /// Exact typed mutations this endpoint is authorized and implemented to
-    /// accept. Advertising `execute` alone never implies every vocabulary
-    /// member is available on this authority.
-    pub actions: Vec<PlatformAction>,
     pub transports: Vec<PlatformTransport>,
 }
 
@@ -455,7 +451,6 @@ impl Capabilities {
             protocol: PLATFORM_PROTOCOL,
             schema: PLATFORM_SCHEMA_V1,
             methods: PlatformMethod::ALL.to_vec(),
-            actions: PlatformAction::ALL.to_vec(),
             transports: PlatformTransport::ALL.to_vec(),
         }
     }

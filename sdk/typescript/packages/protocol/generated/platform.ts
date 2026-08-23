@@ -226,16 +226,14 @@ export const Attachment_FIELDS: readonly string[] = [
   "session",
 ];
 
-/** Methods, exact typed actions, and transport projections supported by an endpoint. */
+/** Methods and transport projections supported by an endpoint. */
 export interface Capabilities {
-  readonly actions: readonly PlatformAction[];
   readonly methods: readonly PlatformMethod[];
   readonly protocol: typeof PLATFORM_PROTOCOL;
   readonly schema: typeof PLATFORM_SCHEMA_V1;
   readonly transports: readonly PlatformTransport[];
 }
 export const Capabilities_FIELDS: readonly string[] = [
-  "actions",
   "methods",
   "protocol",
   "schema",
