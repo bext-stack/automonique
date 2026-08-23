@@ -29,6 +29,7 @@ use automonique_daemon::github::{
     GitHubHost, GitHubSurface, IssueFactDetail, RepositoryActivityWindow, issue_facts_from_url,
 };
 use automonique_daemon::github_actions::{GitHubIssueRequestIntent, natural_issue_request};
+use automonique_daemon::model_inventory::model_capability_answer;
 use automonique_daemon::run_lane::SocketRunLane;
 use automonique_daemon::slack::SlackHost;
 use automonique_daemon::telegram_bridge::{QuestionProfile, RunFailure, RunLane, SlackSurface};
@@ -1225,11 +1226,6 @@ struct ChatMessageView {
     role: String,
     content: String,
     created_at_ms: i64,
-}
-
-struct ModelCapabilityAnswer {
-    text: String,
-    catalog_available: bool,
 }
 
 impl WebIntegration {
@@ -2467,70 +2463,6 @@ impl WebIntegration {
         let mut sequence = self.sequence.lock().map_err(|_| "chat_lane_unavailable")?;
         *sequence = sequence.wrapping_add(1);
         Ok(now_ms().wrapping_mul(1_000).wrapping_add(*sequence))
-    }
-}
-
-fn model_capability_answer(state_dir: &Path) -> ModelCapabilityAnswer {
-    use automonique_daemon::model_inventory::configured_provider_catalog;
-
-    let routes = automonique_daemon::model_inventory::configured_model_routes(state_dir);
-    render_model_capability_answer(routes, configured_provider_catalog(state_dir))
-}
-
-fn render_model_capability_answer(
-    routes: automonique_daemon::model_inventory::ConfiguredModelRoutes,
-    catalog: automonique_daemon::model_inventory::ModelCatalogRead,
-) -> ModelCapabilityAnswer {
-    use automonique_daemon::model_inventory::ModelCatalogRead;
-
-    let mut text = format!(
-        "Monique’s configured model routes:\n\
-         - Conversation: `{}`\n\
-         - Conversation fallback: `{}`\n\
-         - Operational work: `{}` (`{}` reasoning)",
-        routes.conversation_primary,
-        routes.conversation_fallback,
-        routes.operational_primary,
-        routes.operational_reasoning,
-    );
-    match catalog {
-        ModelCatalogRead::Available(catalog) => {
-            let source = match catalog.source {
-                automonique_daemon::model_inventory::ModelCatalogSource::CodexAppServer => {
-                    "Codex App Server"
-                }
-                automonique_daemon::model_inventory::ModelCatalogSource::JcodeCli => "JCode",
-            };
-            let models = catalog
-                .models
-                .iter()
-                .map(|model| {
-                    if model.is_default {
-                        format!("`{}` (default)", model.id)
-                    } else {
-                        format!("`{}`", model.id)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            text.push_str(&format!(
-                "\n\nThe connected provider account currently exposes: {models}.\n\
-                 Catalog source: {source}. Account-visible models are not automatically active Monique routes."
-            ));
-            ModelCapabilityAnswer {
-                text,
-                catalog_available: true,
-            }
-        }
-        ModelCatalogRead::Unavailable(_) => {
-            text.push_str(
-                "\n\nThe connected provider account’s live model catalog is temporarily unavailable. The configured routes above remain authoritative for what Monique will select.",
-            );
-            ModelCapabilityAnswer {
-                text,
-                catalog_available: false,
-            }
-        }
     }
 }
 
@@ -5824,7 +5756,7 @@ mod tests {
     fn dashboard_model_capability_answer_separates_routes_from_account_catalog() {
         use automonique_daemon::model_inventory::{
             AvailableModel, ConfiguredModelRoutes, ModelCatalogRead, ModelCatalogSource,
-            ModelCatalogUnavailable, ProviderModelCatalog,
+            ModelCatalogUnavailable, ProviderModelCatalog, render_model_capability_answer,
         };
 
         let routes = ConfiguredModelRoutes {

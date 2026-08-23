@@ -798,6 +798,12 @@ pub trait ControlSurface {
         LocalSystemCapabilities::default()
     }
 
+    /// Transport-neutral model inventory rendered from this daemon's pinned
+    /// provider configuration and bounded read-only catalog surface.
+    fn model_capability_text(&mut self) -> Option<String> {
+        None
+    }
+
     /// Current host load from fixed, read-only kernel projections.
     ///
     /// This typed read accepts no path or command from the message. A surface
@@ -7436,6 +7442,11 @@ where
 
     fn system_capability_answer(&mut self, query: &SystemCapabilityQuery) -> String {
         let local = self.surface.local_system_capabilities();
+        let model_capability = query
+            .targets
+            .contains(&CapabilityTarget::Models)
+            .then(|| self.surface.model_capability_text())
+            .flatten();
         let lines = query
             .targets
             .iter()
@@ -7516,7 +7527,9 @@ where
                     "Telegram: active as this authenticated control conversation; read-only questions and typed commands remain separately authorized.",
                 ),
                 CapabilityTarget::Models => {
-                    if local.configured_models.is_empty() {
+                    if let Some(answer) = model_capability.as_ref() {
+                        answer.clone()
+                    } else if local.configured_models.is_empty() {
                         String::from("Models: no usable provider route is configured.")
                     } else {
                         format!(
@@ -11007,7 +11020,80 @@ pub fn is_model_capability_question(text: &str) -> bool {
 
 #[cfg(test)]
 mod model_capability_question_tests {
-    use super::is_model_capability_question;
+    use super::{
+        ControlSurface, DraftOutcome, MemberChange, RunFailure, RunLane, SurfaceRefusal,
+        TransportConversationIdentity, TransportLiveSeams, WorkLookup,
+        answer_read_only_transport_question, is_model_capability_question,
+    };
+
+    struct ModelSurface;
+
+    impl ControlSurface for ModelSurface {
+        fn status_text(&mut self) -> Result<String, SurfaceRefusal> {
+            Err(SurfaceRefusal::Unavailable)
+        }
+
+        fn runs_text(&mut self) -> Result<String, SurfaceRefusal> {
+            Err(SurfaceRefusal::Unavailable)
+        }
+
+        fn tickets_text(&mut self) -> Result<String, SurfaceRefusal> {
+            Err(SurfaceRefusal::Unavailable)
+        }
+
+        fn ticket_text(&mut self, _ticket_ref: &str) -> Result<String, SurfaceRefusal> {
+            Err(SurfaceRefusal::Unavailable)
+        }
+
+        fn question_context(
+            &mut self,
+            _question: &str,
+            _administrators: &[i64],
+            _configured: &[i64],
+        ) -> Result<String, SurfaceRefusal> {
+            Err(SurfaceRefusal::Unavailable)
+        }
+
+        fn ticket_work_order(&mut self, _ticket_ref: &str) -> Result<WorkLookup, SurfaceRefusal> {
+            Err(SurfaceRefusal::Unavailable)
+        }
+
+        fn record_ticket_draft(
+            &mut self,
+            _ticket_ref: &str,
+            _draft: &str,
+        ) -> Result<DraftOutcome, SurfaceRefusal> {
+            Err(SurfaceRefusal::Unavailable)
+        }
+
+        fn member_ids(&mut self) -> Result<Vec<i64>, SurfaceRefusal> {
+            Ok(Vec::new())
+        }
+
+        fn add_member(&mut self, _user_id: i64) -> Result<MemberChange, SurfaceRefusal> {
+            Err(SurfaceRefusal::Unavailable)
+        }
+
+        fn remove_member(&mut self, _user_id: i64) -> Result<MemberChange, SurfaceRefusal> {
+            Err(SurfaceRefusal::Unavailable)
+        }
+
+        fn model_capability_text(&mut self) -> Option<String> {
+            Some(String::from("canonical model inventory"))
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingLane {
+        calls: usize,
+    }
+
+    impl RunLane for CountingLane {
+        fn run(&mut self, _task: &str) -> Result<String, RunFailure> {
+            self.calls += 1;
+            Err(RunFailure::Failed)
+        }
+    }
 
     #[test]
     fn model_inventory_questions_share_one_deterministic_route() {
@@ -11025,6 +11111,37 @@ mod model_capability_question_tests {
         ] {
             assert!(!is_model_capability_question(question), "{question:?}");
         }
+    }
+
+    #[test]
+    fn non_telegram_transports_use_the_same_inventory_without_a_provider_run() {
+        let mut surface = ModelSurface;
+        let mut lane = CountingLane::default();
+        let mut selected = None;
+        let answer = answer_read_only_transport_question(
+            &mut surface,
+            &mut lane,
+            TransportLiveSeams::default(),
+            "what models do you have access to?",
+            "",
+            TransportConversationIdentity {
+                lane_key: "slack:fixture",
+                actor_key: "operator",
+                source_key: "event",
+            },
+            &[],
+            &[],
+            None,
+            &[],
+            false,
+            &[],
+            &[],
+            &mut selected,
+            "test",
+        );
+        assert_eq!(answer, "canonical model inventory");
+        assert_eq!(lane.calls, 0);
+        assert!(selected.is_none());
     }
 }
 
@@ -11711,6 +11828,19 @@ pub(crate) fn answer_read_only_transport_question(
     }
     if is_codex_usage_question(question) {
         return codex_usage_text(surface.codex_usage());
+    }
+    if is_model_capability_question(question) {
+        return surface.model_capability_text().unwrap_or_else(|| {
+            let local = surface.local_system_capabilities();
+            if local.configured_models.is_empty() {
+                String::from("Models: no usable provider route is configured.")
+            } else {
+                format!(
+                    "Models: configured routes include {}. The account-visible catalog is unavailable on this surface.",
+                    local.configured_models.join(", ")
+                )
+            }
+        });
     }
 
     let lookup_started = Instant::now();
@@ -16618,6 +16748,12 @@ impl ControlSurface for StoreControlSurface {
             configured_models,
             ticket_reads,
         }
+    }
+
+    fn model_capability_text(&mut self) -> Option<String> {
+        self.provider_state_dir
+            .as_deref()
+            .map(|state_dir| crate::model_inventory::model_capability_answer(state_dir).text)
     }
 
     fn host_load(&mut self) -> Result<HostLoadSnapshot, SurfaceRefusal> {
