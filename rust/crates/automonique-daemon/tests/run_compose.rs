@@ -94,7 +94,9 @@ use automonique_daemon::execute::{
     DAEMON_BACKEND_ID, DAEMON_WORKSPACE_REGISTRY, JCODE_INTEGRATION_MODE, JCODE_RESUME_ENV,
     locate_launch_helper, offered_host_features, run_workspace,
 };
-use automonique_daemon::run_lane::{CONVERSATION_PROVIDER_CONFIG_NAME, SocketRunLane};
+use automonique_daemon::run_lane::{
+    CONVERSATION_PROVIDER_CONFIG_NAME, PROVIDER_DEPLOYMENTS_NAME, SocketRunLane,
+};
 use automonique_daemon::telegram_bridge::{QuestionProfile, QuestionRuntime, RunFailure, RunLane};
 use automonique_daemon::{Daemon, DaemonConfig, RUN_INDEX_NAME};
 use automonique_egress_broker::{BrokerConfig, EgressBroker};
@@ -124,6 +126,7 @@ use automonique_runner::{
     WorkspaceRegistryId,
 };
 use automonique_store::approval_requests::{ApprovalRequests, ApprovalState};
+use automonique_store::provider_deployments::{DeploymentRegistration, ProviderDeployments};
 
 const BUSYBOX: &str = "/usr/bin/busybox";
 const REQUIRE_ENFORCED_ENV: &str = "AUTOMONIQUE_REQUIRE_ENFORCED_CONTAINMENT";
@@ -1806,6 +1809,57 @@ fn a_dedicated_conversation_provider_is_selected_for_bounded_fast_profiles() {
         QuestionRuntime::codex(QuestionProfile::Operational),
         "operational questions must retain the primary intelligent provider"
     );
+}
+
+#[test]
+fn a_primary_provider_cutover_rolls_the_stable_deployment_slot_forward() {
+    let fixture = Fixture::new(None, Some("127.0.0.1 1 loopback\n"));
+    let primary_home = fixture.provider_home();
+    write_private(
+        &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
+        &format!(
+            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode-cutover-fixture\n\
+             arg=--quiet\narg=api-stdio\n",
+            primary_home.display()
+        ),
+    );
+    let conversation_home = fixture.state_dir().join("conversation-home");
+    std::fs::create_dir(&conversation_home).expect("conversation home");
+    std::fs::set_permissions(&conversation_home, std::fs::Permissions::from_mode(0o700))
+        .expect("private conversation home");
+    write_private(
+        &fixture.state_dir().join(CONVERSATION_PROVIDER_CONFIG_NAME),
+        &busybox_provider(&conversation_home, &["sh", "-c", "true > {answer}"]),
+    );
+
+    let deployments_path = fixture.state_dir().join(PROVIDER_DEPLOYMENTS_NAME);
+    let mut deployments = ProviderDeployments::open(&deployments_path).expect("deployment store");
+    deployments
+        .register(DeploymentRegistration {
+            deployment_id: "primary",
+            provider_kind: "codex",
+            primary_rank: Some(1),
+            context_window_rank: Some(0),
+        })
+        .expect("old primary deployment");
+    deployments
+        .register(DeploymentRegistration {
+            deployment_id: "conversation",
+            provider_kind: "conversation",
+            primary_rank: Some(0),
+            context_window_rank: Some(1),
+        })
+        .expect("conversation deployment");
+    drop(deployments);
+
+    let lane = open_lane(&fixture);
+    assert_eq!(
+        lane.question_runtime(QuestionProfile::Conversation),
+        QuestionRuntime::deepseek_flash(QuestionProfile::Conversation),
+        "a primary-engine cutover must not disable the conversation router"
+    );
+    let deployments = ProviderDeployments::open(deployments_path).expect("reopen deployment store");
+    assert_eq!(deployments.get("primary").unwrap().provider_kind, "jcode");
 }
 
 #[test]
