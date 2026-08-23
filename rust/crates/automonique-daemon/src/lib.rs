@@ -3094,16 +3094,19 @@ impl Daemon {
                             .platform
                             .snapshot(&[], "sessions")
                             .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
-                        let sessions = resources
+                        let mut sessions = Vec::new();
+                        for session in resources
                             .into_iter()
                             .filter(|record| record.resource.kind == ResourceKind::Session)
-                            .map(|session| SessionRecord {
+                        {
+                            let run = self.platform_run_for_session(&session.resource)?;
+                            sessions.push(SessionRecord {
                                 attachable: session.summary.as_str() == "open",
                                 controllable: session.summary.as_str() == "open",
-                                run: None,
+                                run,
                                 session,
-                            })
-                            .collect();
+                            });
+                        }
                         PlatformResponse::Sessions(
                             SessionList::new(sessions, cursor)
                                 .map_err(|_| DaemonError::ProtocolRefused("platform_sessions"))?,
@@ -3240,6 +3243,31 @@ impl Daemon {
             .resource(session)
             .map(|record| record.is_some_and(|record| record.summary.as_str() == "open"))
             .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))
+    }
+
+    fn platform_run_for_session(
+        &self,
+        session: &ResourceCoordinate,
+    ) -> Result<Option<ResourceCoordinate>, DaemonError> {
+        if session.authority != ResourceAuthority::Automonique
+            || session.kind != ResourceKind::Session
+        {
+            return Ok(None);
+        }
+        let records = self
+            .run_index
+            .by_run_id(session.id.as_str())
+            .map_err(index_failed)?;
+        let Some(record) = records.last() else {
+            return Ok(None);
+        };
+        let id = ResourceId::new(record.run_id.clone())
+            .map_err(|_| DaemonError::PlatformStoreFailed("run_id_invalid"))?;
+        Ok(Some(ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Run,
+            id,
+        )))
     }
 
     fn refresh_platform_resources(

@@ -20,6 +20,7 @@ use automonique_protocol::platform::{
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
 use automonique_store::provider_journal::{ProcessSpawn, ProviderJournal, SessionOpening};
+use automonique_store::run_index::{RunIndex, RunIndexEntry};
 
 fn fixture() -> (tempfile::TempDir, DaemonConfig) {
     let root = tempfile::tempdir().expect("temporary root");
@@ -174,6 +175,15 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
     std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
         .expect("private product state");
     let catalog_provider = write_catalog_provider(&config, "gpt-5.6-sol", true);
+    let mut run_index = RunIndex::open(config.run_index_path()).expect("run index");
+    run_index
+        .register(RunIndexEntry {
+            submission_id: 1,
+            run_id: "platform-live-session",
+            registered_at_ms: 9,
+        })
+        .expect("session run");
+    drop(run_index);
     let mut journal = ProviderJournal::open(config.provider_journal_path()).expect("journal");
     let process = journal
         .record_process(ProcessSpawn {
@@ -242,6 +252,15 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
         "platform-live-session"
     );
     assert!(sessions.sessions[0].attachable);
+    assert_eq!(
+        sessions.sessions[0]
+            .run
+            .as_ref()
+            .expect("matching run")
+            .id
+            .as_str(),
+        "platform-live-session"
+    );
 
     let request = ClaimControlRequest {
         session: session(),
