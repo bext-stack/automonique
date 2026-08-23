@@ -14,11 +14,12 @@ use automonique_daemon::{Daemon, DaemonConfig};
 use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_protocol::platform::{
-    ClaimControlRequest, ClientId, IdempotencyKey, ListSessionsRequest, PlatformRequest,
-    PlatformResponse, ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
-    SnapshotRequest,
+    ClaimControlRequest, ClientId, ExecuteRequest, IdempotencyKey, ListSessionsRequest,
+    PlatformAction, PlatformRequest, PlatformResponse, PlatformText, ReceiptOutcome,
+    ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind, SnapshotRequest,
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
+use automonique_store::approval_requests::{ApprovalContext, ApprovalProposal, ApprovalRequests};
 use automonique_store::provider_journal::{ProcessSpawn, ProviderJournal, SessionOpening};
 use automonique_store::run_index::{RunIndex, RunIndexEntry};
 
@@ -184,6 +185,26 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
         })
         .expect("session run");
     drop(run_index);
+    let mut approval_requests =
+        ApprovalRequests::open(config.approval_requests_path()).expect("approval requests");
+    approval_requests
+        .propose(ApprovalProposal {
+            request_key: "apr-000102030405060708090a0b0c0d0e0f",
+            subject: "runspec:platform-live",
+            run_id: "platform-live-session",
+            context: ApprovalContext {
+                spec_digest: "1111111111111111111111111111111111111111111111111111111111111111",
+                program_path: "/usr/bin/platform-live",
+                program_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
+                prompt_sha256: "3333333333333333333333333333333333333333333333333333333333333333",
+                cwd_token: "platform-live-cwd",
+            },
+            requested_by: "platform-live",
+            requested_at_ms: 1,
+            expires_at_ms: 9_000_000_000_000,
+        })
+        .expect("pending approval");
+    drop(approval_requests);
     let mut journal = ProviderJournal::open(config.provider_journal_path()).expect("journal");
     let process = journal
         .record_process(ProcessSpawn {
@@ -235,6 +256,50 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
         model.summary.as_str(),
         "source=codex_model_list; scope=configured_account; available=true; default=true; configured_route=false"
     );
+    let approval = snapshot
+        .resources
+        .iter()
+        .find(|resource| resource.resource.kind == ResourceKind::Approval)
+        .expect("pending approval is projected");
+    assert_eq!(
+        approval.resource.id.as_str(),
+        "apr-000102030405060708090a0b0c0d0e0f"
+    );
+    assert_eq!(approval.freshness.state.as_str(), "fresh");
+    assert!(approval.summary.as_str().starts_with("state=pending;"));
+
+    let PlatformResponse::Receipt(approval_receipt) = platform(
+        &config,
+        "approve",
+        PlatformRequest::Execute(
+            ExecuteRequest::new(
+                PlatformAction::DecideApproval,
+                approval.resource.clone(),
+                IdempotencyKey::new("approval-live-decision").expect("key"),
+                Some(approval.freshness.revision),
+                Some(PlatformText::new("grant").expect("decision")),
+            )
+            .expect("approval action"),
+        ),
+    ) else {
+        panic!("approval receipt")
+    };
+    assert_eq!(approval_receipt.outcome, ReceiptOutcome::Completed);
+
+    let PlatformResponse::Snapshot(after_approval) = platform(
+        &config,
+        "snapshot-after-approval",
+        PlatformRequest::Snapshot(SnapshotRequest::new(Vec::new()).expect("snapshot request")),
+    ) else {
+        panic!("snapshot after approval")
+    };
+    let resolved = after_approval
+        .resources
+        .iter()
+        .find(|resource| resource.resource.id.as_str() == "apr-000102030405060708090a0b0c0d0e0f")
+        .expect("resolved approval remains explicit");
+    assert_eq!(resolved.freshness.state.as_str(), "stale");
+    assert_eq!(resolved.summary.as_str(), "state=granted");
 
     let PlatformResponse::Sessions(sessions) = platform(
         &config,

@@ -184,8 +184,8 @@ export function decodeResourceAuthority(value: string): ResourceAuthority {
   return value as ResourceAuthority;
 }
 
-export type ResourceKind = "client" | "control_lease" | "credential" | "issue" | "job" | "model" | "node" | "provider_account" | "pull_request" | "receipt" | "release" | "repository" | "run" | "sandbox" | "session" | "workflow";
-export const ResourceKind_VALUES: readonly ResourceKind[] = ["client", "control_lease", "credential", "issue", "job", "model", "node", "provider_account", "pull_request", "receipt", "release", "repository", "run", "sandbox", "session", "workflow"];
+export type ResourceKind = "approval" | "client" | "control_lease" | "credential" | "issue" | "job" | "model" | "node" | "provider_account" | "pull_request" | "receipt" | "release" | "repository" | "run" | "sandbox" | "session" | "workflow";
+export const ResourceKind_VALUES: readonly ResourceKind[] = ["approval", "client", "control_lease", "credential", "issue", "job", "model", "node", "provider_account", "pull_request", "receipt", "release", "repository", "run", "sandbox", "session", "workflow"];
 /** Security-sensitive: an undefined value is refused. */
 export function decodeResourceKind(value: string): ResourceKind {
   if (!(ResourceKind_VALUES as readonly string[]).includes(value)) {

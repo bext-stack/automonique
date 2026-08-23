@@ -141,6 +141,7 @@ pub enum ResourceKind {
     Node,
     Run,
     Session,
+    Approval,
     Sandbox,
     Credential,
     Repository,
@@ -156,12 +157,13 @@ pub enum ResourceKind {
 
 impl ResourceKind {
     /// Every version-one spelling in declaration order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Job,
         Self::Release,
         Self::Node,
         Self::Run,
         Self::Session,
+        Self::Approval,
         Self::Sandbox,
         Self::Credential,
         Self::Repository,
@@ -183,6 +185,7 @@ impl ResourceKind {
             Self::Node => "node",
             Self::Run => "run",
             Self::Session => "session",
+            Self::Approval => "approval",
             Self::Sandbox => "sandbox",
             Self::Credential => "credential",
             Self::Repository => "repository",

@@ -126,7 +126,8 @@ use automonique_store::approval_ledger::{
 };
 use automonique_store::approval_requests::{
     ApprovalContext, ApprovalOutcome, ApprovalProposal, ApprovalRequestError,
-    ApprovalRequestRecord, ApprovalRequests, ApprovalState, StoredApprovalContext,
+    ApprovalRequestRecord, ApprovalRequests, ApprovalState, MAX_APPROVAL_REQUEST_PAGE,
+    StoredApprovalContext,
 };
 use automonique_store::audit_chain::{AuditAppend, AuditChain, GENESIS_PREV_HASH};
 use automonique_store::automation_store::{
@@ -3312,6 +3313,15 @@ impl Daemon {
                 .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
         }
 
+        let wants_approvals = wants_all
+            || requested.iter().any(|resource| {
+                resource.authority == ResourceAuthority::Automonique
+                    && resource.kind == ResourceKind::Approval
+            });
+        if wants_approvals {
+            self.refresh_platform_approvals(now_ms)?;
+        }
+
         let records = if wants_all {
             self.run_index
                 .page(0, automonique_protocol::platform::MAX_SNAPSHOT_RESOURCES)
@@ -3340,6 +3350,60 @@ impl Daemon {
             self.platform
                 .upsert_resource("resources", &resource)
                 .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        }
+        Ok(())
+    }
+
+    fn refresh_platform_approvals(&mut self, now_ms: i64) -> Result<(), DaemonError> {
+        let pending = self
+            .approval_requests
+            .pending(MAX_APPROVAL_REQUEST_PAGE)
+            .map_err(|error| DaemonError::ApprovalRequestsFailed(error.category()))?;
+        let pending_ids = pending
+            .iter()
+            .map(|record| record.request_key.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let (resources, _) = self
+            .platform
+            .snapshot(&[], "resources")
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        let existing = resources
+            .into_iter()
+            .filter(|record| {
+                record.resource.authority == ResourceAuthority::Automonique
+                    && record.resource.kind == ResourceKind::Approval
+            })
+            .collect::<Vec<_>>();
+
+        for record in &pending {
+            let coordinate = ResourceCoordinate::new(
+                ResourceAuthority::Automonique,
+                ResourceKind::Approval,
+                ResourceId::new(record.request_key.clone())
+                    .map_err(|_| DaemonError::PlatformStoreFailed("approval_id_invalid"))?,
+            );
+            self.upsert_platform_observation(
+                coordinate,
+                FreshnessState::Fresh,
+                &format!("state=pending;expires_at={}", record.expires_at_ms),
+                now_ms,
+            )?;
+        }
+        for resource in existing
+            .into_iter()
+            .filter(|resource| !pending_ids.contains(resource.resource.id.as_str()))
+        {
+            let state = self
+                .approval_requests
+                .entry(resource.resource.id.as_str())
+                .map_err(|error| DaemonError::ApprovalRequestsFailed(error.category()))?
+                .map_or("unknown", |record| record.state.as_str());
+            self.upsert_platform_observation(
+                resource.resource,
+                FreshnessState::Stale,
+                &format!("state={state}"),
+                now_ms,
+            )?;
         }
         Ok(())
     }
@@ -3437,7 +3501,7 @@ impl Daemon {
         now_ms: i64,
     ) -> Result<(), DaemonError> {
         let summary = PlatformText::new(summary)
-            .map_err(|_| DaemonError::PlatformStoreFailed("model_summary_invalid"))?;
+            .map_err(|_| DaemonError::PlatformStoreFailed("platform_summary_invalid"))?;
         let current = self
             .platform
             .resource(&coordinate)
@@ -3492,10 +3556,20 @@ impl Daemon {
                 Revision::new(record.revision)
                     .map_err(|_| DaemonError::RunIndexFailed("revision_invalid"))?
             }
-            PlatformAction::DecideApproval => self
-                .platform
-                .revision()
-                .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?,
+            PlatformAction::DecideApproval => {
+                if request.target.kind != ResourceKind::Approval {
+                    return platform_refusal(ReceiptOutcome::Rejected, "target_kind_invalid");
+                }
+                let Some(record) = self
+                    .approval_requests
+                    .entry(request.target.id.as_str())
+                    .map_err(|error| DaemonError::ApprovalRequestsFailed(error.category()))?
+                else {
+                    return platform_refusal(ReceiptOutcome::Rejected, "unknown_approval");
+                };
+                Revision::new(record.revision)
+                    .map_err(|_| DaemonError::PlatformStoreFailed("revision_invalid"))?
+            }
             PlatformAction::SubmitJob
             | PlatformAction::ApproveRelease
             | PlatformAction::RegisterNode => {
