@@ -482,8 +482,10 @@ fn the_answer_path_is_the_workspace_the_lane_will_resolve() {
     );
     // The reviewed default is what a deployment that configured no argv gets.
     assert!(
-        DEFAULT_ARGV.contains(&"--ephemeral") && DEFAULT_ARGV.contains(&ANSWER_PLACEHOLDER),
-        "the reviewed invocation must be a pure completion that names its answer file"
+        DEFAULT_ARGV.contains(&"--json")
+            && DEFAULT_ARGV.contains(&"--ephemeral")
+            && DEFAULT_ARGV.contains(&ANSWER_PLACEHOLDER),
+        "the reviewed invocation must stream JSONL and name its answer file"
     );
 }
 

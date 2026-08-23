@@ -86,10 +86,14 @@ sandbox/credential admission, provider sessions, ordered events, local action
 receipts and controller leases. Cross-authority projections always name their
 source; neither side infers the other's state from transport or presentation.
 
-The maintained JCode fork supplies a dual-mode terminal client and provider
-engine. Managed mode speaks only through the shared Automonique client for
-control. ShellDeck and `monique.1clic.pro` consume the same services and view
-models; ShellDeck does not retain a second provider-job executor. The complete
+The maintained JCode fork supplies both the standalone client and the target
+production provider-execution engine. Its managed terminal cockpit speaks only
+through the shared Automonique client for control, while Automonique hosts the
+engine through a pinned, conformance-tested adapter. Production still uses a
+direct Codex CLI JSONL fallback while that JCode adapter is completed; this is
+an explicit deployment deviation, not a change in architecture. ShellDeck and
+`monique.1clic.pro` consume the same services and view models; ShellDeck does
+not retain a second provider-job executor. The complete
 migration and repository ownership plan is in
 [`unified-client-platform.md`](unified-client-platform.md).
 

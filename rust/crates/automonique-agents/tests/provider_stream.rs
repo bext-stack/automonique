@@ -27,6 +27,16 @@ const SUCCESS_FIXTURE: &str = concat!(
     "{\"type\":\"turn.completed\",\"usage\":{\"cached_input_tokens\":1,\"input_tokens\":2,\"output_tokens\":3}}\n",
 );
 
+/// Sanitized from a bounded `codex-cli 0.149.0 exec --json` canary on
+/// 2026-08-23. Current Codex emits the completed assistant item without a
+/// separate start record and includes two supplemental usage counters.
+const CURRENT_CLI_SUCCESS_FIXTURE: &str = concat!(
+    "{\"type\":\"thread.started\",\"thread_id\":\"fixture-session\"}\n",
+    "{\"type\":\"turn.started\"}\n",
+    "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"final answer\"}}\n",
+    "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":2,\"cached_input_tokens\":1,\"cache_write_input_tokens\":0,\"output_tokens\":3,\"reasoning_output_tokens\":0}}\n",
+);
+
 /// The prefix every ordering-sensitive fixture needs before its own line.
 const OPEN_TURN: &str = concat!(
     "{\"type\":\"thread.started\",\"thread_id\":\"fixture-session\"}\n",
@@ -114,6 +124,45 @@ fn fixture_lines_become_exactly_these_normalized_events() {
         "fixture-session"
     );
     assert_eq!(summaries(transcript.events()), expected_success_events());
+}
+
+#[test]
+fn current_cli_completion_and_usage_shape_normalize_without_weakening_bounds() {
+    let coordinates = coordinates();
+    let mode = ExecutionMode::NewSession;
+    let mut stream = ProviderEventStream::new(&coordinates, &mode);
+    assert_eq!(
+        stream
+            .push_bytes(CURRENT_CLI_SUCCESS_FIXTURE.as_bytes())
+            .expect("current CLI fixture accepted"),
+        5
+    );
+    let transcript = stream.finish().expect("current CLI transcript");
+    assert_eq!(transcript.disposition(), ProviderDisposition::Succeeded);
+    assert_eq!(transcript.events().len(), 5);
+    assert_eq!(transcript.usage().expect("usage").cached_input_tokens(), 1);
+
+    let unknown_usage = CURRENT_CLI_SUCCESS_FIXTURE.replace(
+        "\"reasoning_output_tokens\":0",
+        "\"reasoning_output_tokens\":0,\"unreviewed_counter\":1",
+    );
+    assert_eq!(
+        parse_all(unknown_usage.as_bytes())
+            .expect_err("unknown usage field refused")
+            .category(),
+        "unknown_schema"
+    );
+
+    let invalid_usage = CURRENT_CLI_SUCCESS_FIXTURE.replace(
+        "\"cache_write_input_tokens\":0",
+        "\"cache_write_input_tokens\":\"zero\"",
+    );
+    assert_eq!(
+        parse_all(invalid_usage.as_bytes())
+            .expect_err("non-numeric supplemental counter refused")
+            .category(),
+        "unknown_schema"
+    );
 }
 
 #[test]

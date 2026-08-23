@@ -111,6 +111,14 @@ An adapter without an approval response channel can run only in an externally sa
 
 ## Jcode
 
+### Production target and current gap
+
+The maintained JCode fork is the target production provider-execution engine.
+The ACP adapter and its execution-boundary conformance remain required before
+cutover. Until then, production uses the pinned direct Codex JSONL path as a
+degraded fallback; improving that fallback does not supersede the JCode
+integration.
+
 ### Preferred surface
 
 Run `jcode acp --socket <explicit-socket>` as the runner's ACP bridge to the already managed Jcode daemon. The installed command explicitly describes this adapter as backed by the Jcode daemon. ACP is preferred over Jcode's debug socket because ACP is the public interoperability boundary; the debug socket remains diagnostics-only.
@@ -180,6 +188,17 @@ Claude Code has no required shared daemon in this design. The long-lived CLI pro
 Use one-shot `claude -p --output-format stream-json --verbose` and resume by captured session ID. This retains session continuation but loses bidirectional in-process steering and may have narrower event visibility. Jobs requiring live steering or provider approval pause cannot silently use this fallback.
 
 ## Codex
+
+### Current production status
+
+Production temporarily uses the pinned Codex CLI `exec --json` fallback at
+version 0.149.0. The fallback preserves durable new/resumed thread identity,
+the answer-file contract and normalized JSONL progress. It does not advertise
+App Server-only steering, provider approval/input RPCs, model/account RPCs or
+authoritative item-history reconciliation. This fallback remains available for
+truthfully degraded operation after the JCode cutover; the preferred App Server
+surface below is Codex-specific future capability, not a replacement for the
+JCode production target or a claim about the deployed adapter.
 
 ### Preferred surface
 
