@@ -758,10 +758,6 @@ fn external_lease_deadlines_ignore_every_wall_clock_value() {
 #[test]
 fn a_sigstopped_old_holder_cannot_commit_after_its_epoch_is_replaced() {
     let database = PrivateDatabase::new();
-    // Open the successor before stopping the old process. `Store::open` also
-    // establishes WAL mode, which is setup work rather than part of the lease
-    // takeover this test is exercising.
-    let mut successor_store = Store::open(database.path()).expect("successor opens store");
     let ready = database
         .path()
         .parent()
@@ -789,6 +785,11 @@ fn a_sigstopped_old_holder_cannot_commit_after_its_epoch_is_replaced() {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+
+    // The helper publishes readiness only after closing its database handle.
+    // Open the successor now so it cannot retain a pre-takeover WAL snapshot
+    // while the old holder performs its final write before SIGSTOP.
+    let mut successor_store = Store::open(database.path()).expect("successor opens store");
 
     // A loaded CI filesystem can briefly retain SQLite's WAL writer lock after
     // the helper closes its connection. That lock is not authority and the
