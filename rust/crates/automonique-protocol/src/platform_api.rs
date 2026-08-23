@@ -634,6 +634,16 @@ fn response_body(response: &PlatformResponse) -> Result<JsonValue, PlatformApiEr
     match response {
         PlatformResponse::Capabilities(capabilities) => Ok(object(vec![
             (
+                "actions",
+                JsonValue::Array(
+                    capabilities
+                        .actions
+                        .iter()
+                        .map(|value| JsonValue::String(value.as_str().to_owned()))
+                        .collect(),
+                ),
+            ),
+            (
                 "methods",
                 JsonValue::Array(
                     capabilities
@@ -763,7 +773,10 @@ fn response_from_message(message: &Message) -> Result<PlatformResponse, Platform
     let body = message.body();
     match message.envelope().kind().as_str() {
         "capabilities_result" => {
-            exact_fields(body, &["methods", "protocol", "schema", "transports"])?;
+            exact_fields(
+                body,
+                &["actions", "methods", "protocol", "schema", "transports"],
+            )?;
             if string(body, "protocol")? != PLATFORM_PROTOCOL
                 || string(body, "schema")? != PLATFORM_SCHEMA_V1
             {
@@ -778,6 +791,15 @@ fn response_from_message(message: &Message) -> Result<PlatformResponse, Platform
                         .and_then(|value| PlatformMethod::parse(value).map_err(Into::into))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let actions = array(body, "actions")?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or(PlatformApiError::InvalidBody)
+                        .and_then(|value| PlatformAction::parse(value).map_err(Into::into))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let transports = array(body, "transports")?
                 .iter()
                 .map(|value| {
@@ -787,13 +809,14 @@ fn response_from_message(message: &Message) -> Result<PlatformResponse, Platform
                         .and_then(|value| PlatformTransport::parse(value).map_err(Into::into))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if methods.len() > MAX_CAPABILITY_METHODS {
+            if methods.len() > MAX_CAPABILITY_METHODS || actions.len() > PlatformAction::ALL.len() {
                 return Err(PlatformApiError::InvalidBody);
             }
             Ok(PlatformResponse::Capabilities(Capabilities {
                 protocol: PLATFORM_PROTOCOL,
                 schema: PLATFORM_SCHEMA_V1,
                 methods,
+                actions,
                 transports,
             }))
         }

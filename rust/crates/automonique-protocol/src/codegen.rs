@@ -6027,8 +6027,10 @@ fn platform_module() -> GeneratedModule {
             },
             Interface {
                 name: "Capabilities".to_owned(),
-                doc: "Methods and transport projections supported by an endpoint.".to_owned(),
+                doc: "Methods, exact typed actions, and transport projections supported by an endpoint."
+                    .to_owned(),
                 fields: vec![
+                    required("actions", "readonly PlatformAction[]"),
                     required("methods", "readonly PlatformMethod[]"),
                     required("protocol", "typeof PLATFORM_PROTOCOL"),
                     required("schema", "typeof PLATFORM_SCHEMA_V1"),

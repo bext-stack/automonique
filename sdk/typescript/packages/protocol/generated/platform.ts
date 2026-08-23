@@ -134,8 +134,8 @@ export function decodeFreshnessState(value: string): FreshnessState {
   return value as FreshnessState;
 }
 
-export type PlatformAction = "approve_release" | "decide_approval" | "register_node" | "start_run" | "stop_run" | "submit_job";
-export const PlatformAction_VALUES: readonly PlatformAction[] = ["approve_release", "decide_approval", "register_node", "start_run", "stop_run", "submit_job"];
+export type PlatformAction = "approve_release" | "decide_approval" | "follow_up" | "register_node" | "start_run" | "stop_run" | "submit_job" | "submit_request";
+export const PlatformAction_VALUES: readonly PlatformAction[] = ["approve_release", "decide_approval", "follow_up", "register_node", "start_run", "stop_run", "submit_job", "submit_request"];
 /** Security-sensitive: an undefined value is refused. */
 export function decodePlatformAction(value: string): PlatformAction {
   if (!(PlatformAction_VALUES as readonly string[]).includes(value)) {
@@ -226,14 +226,16 @@ export const Attachment_FIELDS: readonly string[] = [
   "session",
 ];
 
-/** Methods and transport projections supported by an endpoint. */
+/** Methods, exact typed actions, and transport projections supported by an endpoint. */
 export interface Capabilities {
+  readonly actions: readonly PlatformAction[];
   readonly methods: readonly PlatformMethod[];
   readonly protocol: typeof PLATFORM_PROTOCOL;
   readonly schema: typeof PLATFORM_SCHEMA_V1;
   readonly transports: readonly PlatformTransport[];
 }
 export const Capabilities_FIELDS: readonly string[] = [
+  "actions",
   "methods",
   "protocol",
   "schema",

@@ -30,6 +30,7 @@ fn authorities_remain_distinct_in_resource_identity() {
 fn every_transport_advertises_one_semantic_method_set() {
     let capabilities = Capabilities::platform_v1();
     assert_eq!(capabilities.methods, PlatformMethod::ALL);
+    assert_eq!(capabilities.actions, PlatformAction::ALL);
     assert_eq!(capabilities.transports, PlatformTransport::ALL);
     assert_eq!(capabilities.protocol, PLATFORM_PROTOCOL);
     assert_eq!(capabilities.schema, PLATFORM_SCHEMA_V1);

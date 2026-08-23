@@ -14,9 +14,10 @@ use automonique_daemon::{Daemon, DaemonConfig};
 use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_protocol::platform::{
-    ClaimControlRequest, ClientId, ExecuteRequest, IdempotencyKey, ListSessionsRequest,
-    PlatformAction, PlatformRequest, PlatformResponse, PlatformText, ReceiptOutcome,
-    ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind, SnapshotRequest,
+    ClaimControlRequest, ClientId, ExecuteRequest, GetReceiptRequest, IdempotencyKey,
+    ListSessionsRequest, PlatformAction, PlatformRequest, PlatformResponse, PlatformText,
+    ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
+    SnapshotRequest,
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
 use automonique_store::approval_requests::{ApprovalContext, ApprovalProposal, ApprovalRequests};
@@ -231,6 +232,16 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
         panic!("capabilities response")
     };
     assert_eq!(capabilities.methods.len(), 10);
+    assert_eq!(
+        capabilities.actions,
+        [
+            PlatformAction::StartRun,
+            PlatformAction::StopRun,
+            PlatformAction::DecideApproval,
+            PlatformAction::SubmitRequest,
+            PlatformAction::FollowUp,
+        ]
+    );
     assert_eq!(capabilities.transports.len(), 1);
 
     let PlatformResponse::Snapshot(snapshot) = platform(
@@ -326,6 +337,33 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
             .as_str(),
         "platform-live-session"
     );
+
+    let follow_up_key = IdempotencyKey::new("follow-up-live-1").expect("key");
+    let PlatformResponse::Receipt(follow_up) = platform(
+        &config,
+        "follow-up",
+        PlatformRequest::Execute(
+            ExecuteRequest::new(
+                PlatformAction::FollowUp,
+                sessions.sessions[0].session.resource.clone(),
+                follow_up_key.clone(),
+                Some(sessions.sessions[0].session.freshness.revision),
+                Some(PlatformText::new("continue with the verified next step").expect("body")),
+            )
+            .expect("follow-up action"),
+        ),
+    ) else {
+        panic!("follow-up receipt")
+    };
+    assert_eq!(follow_up.outcome, ReceiptOutcome::Accepted);
+    let PlatformResponse::Receipt(reconciled_follow_up) = platform(
+        &config,
+        "follow-up-reconcile",
+        PlatformRequest::GetReceipt(GetReceiptRequest::by_idempotency_key(follow_up_key)),
+    ) else {
+        panic!("reconciled follow-up receipt")
+    };
+    assert_eq!(reconciled_follow_up, follow_up);
 
     let request = ClaimControlRequest {
         session: session(),

@@ -343,16 +343,22 @@ pub enum PlatformAction {
     StartRun,
     StopRun,
     DecideApproval,
+    /// Submit a new free-form request into the node's durable intake.
+    SubmitRequest,
+    /// Submit a new turn explicitly bound to one retained provider session.
+    FollowUp,
     SubmitJob,
     ApproveRelease,
     RegisterNode,
 }
 
 impl PlatformAction {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::StartRun,
         Self::StopRun,
         Self::DecideApproval,
+        Self::SubmitRequest,
+        Self::FollowUp,
         Self::SubmitJob,
         Self::ApproveRelease,
         Self::RegisterNode,
@@ -363,6 +369,8 @@ impl PlatformAction {
             Self::StartRun => "start_run",
             Self::StopRun => "stop_run",
             Self::DecideApproval => "decide_approval",
+            Self::SubmitRequest => "submit_request",
+            Self::FollowUp => "follow_up",
             Self::SubmitJob => "submit_job",
             Self::ApproveRelease => "approve_release",
             Self::RegisterNode => "register_node",
@@ -376,7 +384,11 @@ impl PlatformAction {
             Self::SubmitJob | Self::ApproveRelease | Self::RegisterNode => {
                 ResourceAuthority::AiOperations
             }
-            Self::StartRun | Self::StopRun | Self::DecideApproval => ResourceAuthority::Automonique,
+            Self::StartRun
+            | Self::StopRun
+            | Self::DecideApproval
+            | Self::SubmitRequest
+            | Self::FollowUp => ResourceAuthority::Automonique,
         }
     }
 
@@ -428,6 +440,10 @@ pub struct Capabilities {
     pub protocol: &'static str,
     pub schema: &'static str,
     pub methods: Vec<PlatformMethod>,
+    /// Exact typed mutations this endpoint is authorized and implemented to
+    /// accept. Advertising `execute` alone never implies every vocabulary
+    /// member is available on this authority.
+    pub actions: Vec<PlatformAction>,
     pub transports: Vec<PlatformTransport>,
 }
 
@@ -439,6 +455,7 @@ impl Capabilities {
             protocol: PLATFORM_PROTOCOL,
             schema: PLATFORM_SCHEMA_V1,
             methods: PlatformMethod::ALL.to_vec(),
+            actions: PlatformAction::ALL.to_vec(),
             transports: PlatformTransport::ALL.to_vec(),
         }
     }

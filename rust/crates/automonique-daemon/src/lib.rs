@@ -3044,6 +3044,13 @@ impl Daemon {
                 protocol: automonique_protocol::platform::PLATFORM_PROTOCOL,
                 schema: automonique_protocol::platform::PLATFORM_SCHEMA_V1,
                 methods: PlatformMethod::ALL.to_vec(),
+                actions: vec![
+                    PlatformAction::StartRun,
+                    PlatformAction::StopRun,
+                    PlatformAction::DecideApproval,
+                    PlatformAction::SubmitRequest,
+                    PlatformAction::FollowUp,
+                ],
                 transports: vec![PlatformTransport::LocalUnix],
             }),
             PlatformRequest::Snapshot(request) => {
@@ -3570,6 +3577,35 @@ impl Daemon {
                 Revision::new(record.revision)
                     .map_err(|_| DaemonError::PlatformStoreFailed("revision_invalid"))?
             }
+            PlatformAction::SubmitRequest => {
+                if request.target.kind != ResourceKind::Node {
+                    return platform_refusal(ReceiptOutcome::Rejected, "target_kind_invalid");
+                }
+                let Some(record) = self
+                    .platform
+                    .resource(&request.target)
+                    .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?
+                else {
+                    return platform_refusal(ReceiptOutcome::Rejected, "unknown_node");
+                };
+                record.freshness.revision
+            }
+            PlatformAction::FollowUp => {
+                if request.target.kind != ResourceKind::Session {
+                    return platform_refusal(ReceiptOutcome::Rejected, "target_kind_invalid");
+                }
+                if !self.platform_session_is_open(&request.target)? {
+                    return platform_refusal(ReceiptOutcome::Rejected, "session_not_controllable");
+                }
+                let Some(record) = self
+                    .platform
+                    .resource(&request.target)
+                    .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?
+                else {
+                    return platform_refusal(ReceiptOutcome::Rejected, "unknown_session");
+                };
+                record.freshness.revision
+            }
             PlatformAction::SubmitJob
             | PlatformAction::ApproveRelease
             | PlatformAction::RegisterNode => {
@@ -3626,6 +3662,40 @@ impl Daemon {
                 self.record_decision(request.target.id.as_str(), decision, "platform-v1", now_ms)
                     .map(|_| ReceiptOutcome::Completed)
                     .map_err(|error| error.category())
+            }
+            PlatformAction::SubmitRequest | PlatformAction::FollowUp => {
+                if self.disconnected_recovery {
+                    Err("disconnected_recovery")
+                } else if self.reconciliation_run_id.is_some()
+                    || snapshot_requires_reconciliation(status)
+                {
+                    Err(DaemonError::ReconciliationRequired.category())
+                } else if self.store.intake_paused(GENERATION_ID, now_ms)?.is_some() {
+                    Err(INTAKE_PAUSED_CATEGORY)
+                } else {
+                    let Some(parameter) = request.parameter.as_ref() else {
+                        return self.finalize_platform_rejection(
+                            request,
+                            "request_text_required",
+                            now_ms,
+                        );
+                    };
+                    let transport = match request.action {
+                        PlatformAction::SubmitRequest => "local.tui",
+                        PlatformAction::FollowUp => "local.tui.follow_up",
+                        _ => unreachable!(),
+                    };
+                    self.store
+                        .submit_inbox(InboxSubmission {
+                            transport,
+                            transport_key: request.idempotency_key.as_str(),
+                            scope: request.target.id.as_str(),
+                            payload: parameter.as_str().as_bytes(),
+                            received_ms: now_ms,
+                        })
+                        .map(|_| ReceiptOutcome::Accepted)
+                        .map_err(|error| error.category())
+                }
             }
             PlatformAction::SubmitJob
             | PlatformAction::ApproveRelease
