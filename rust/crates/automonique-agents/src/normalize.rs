@@ -26,8 +26,8 @@ pub(crate) struct Normalizer {
     mode: ExecutionMode,
     session: Option<String>,
     turn_started: bool,
-    active_item: Option<String>,
-    final_seen: bool,
+    active_item: Option<(String, ProviderItemKind)>,
+    assistant_seen: bool,
     disposition: Option<ProviderDisposition>,
     usage: Option<ProviderUsage>,
     events: Vec<NormalizedEvent>,
@@ -41,7 +41,7 @@ impl Normalizer {
             session: None,
             turn_started: false,
             active_item: None,
-            final_seen: false,
+            assistant_seen: false,
             disposition: None,
             usage: None,
             events: Vec::new(),
@@ -131,15 +131,24 @@ impl Normalizer {
     fn item_started(&mut self, object: &Map<String, Value>) -> Result<(), AdapterError> {
         exact(object, &["item", "type"])?;
         self.require_active()?;
-        if self.active_item.is_some() || self.final_seen {
+        if self.active_item.is_some() {
             return Err(AdapterError::EventOrder);
         }
         let item = item(object)?;
-        exact(item, &["id", "type"])?;
         let item_id = string(item, "id")?;
         validate_coordinate(item_id, "provider_item_id")?;
-        require_agent_message(item)?;
-        self.active_item = Some(item_id.to_owned());
+        let kind = provider_item_kind(item)?;
+        match kind {
+            ProviderItemKind::AgentMessage => exact(item, &["id", "type"]),
+            ProviderItemKind::CommandExecution => {
+                validate_command_execution(item, "in_progress", false)?;
+                self.record(
+                    RecordedKind::ToolCallStarted,
+                    Some(kind.as_str().to_owned()),
+                )
+            }
+        }?;
+        self.active_item = Some((item_id.to_owned(), kind));
         Ok(())
     }
 
@@ -150,10 +159,12 @@ impl Normalizer {
         exact(item, &["id", "text", "type"])?;
         let item_id = string(item, "id")?;
         validate_coordinate(item_id, "provider_item_id")?;
-        if self.active_item.as_deref() != Some(item_id) || self.final_seen {
+        if self.active_item.as_ref().map(|(id, _)| id.as_str()) != Some(item_id) {
             return Err(AdapterError::EventOrder);
         }
-        require_agent_message(item)?;
+        if provider_item_kind(item)? != ProviderItemKind::AgentMessage {
+            return Err(AdapterError::UnknownSchema);
+        }
         let text = bounded_text(item, "text")?.to_owned();
         let session = self.session.clone().ok_or(AdapterError::EventOrder)?;
         let sequence = self.next_sequence()?;
@@ -170,33 +181,50 @@ impl Normalizer {
     fn item_completed(&mut self, object: &Map<String, Value>) -> Result<(), AdapterError> {
         exact(object, &["item", "type"])?;
         self.require_active()?;
-        if self.final_seen {
-            return Err(AdapterError::EventOrder);
-        }
         let item = item(object)?;
-        exact(item, &["id", "text", "type"])?;
         let item_id = string(item, "id")?;
         validate_coordinate(item_id, "provider_item_id")?;
         // Codex CLI 0.149 may publish a terminal assistant item without a
         // separate `item.started`. An explicit start still fences the exact
         // provider item ID; only the absent-start form is treated as an
         // atomic item lifecycle.
-        if let Some(active_item) = self.active_item.as_deref()
+        if let Some((active_item, _)) = self.active_item.as_ref()
             && active_item != item_id
         {
             return Err(AdapterError::EventOrder);
         }
-        require_agent_message(item)?;
-        let text = bounded_text(item, "text")?.to_owned();
+        let kind = provider_item_kind(item)?;
+        if let Some((_, active_kind)) = self.active_item.as_ref()
+            && *active_kind != kind
+        {
+            return Err(AdapterError::EventOrder);
+        }
+        match kind {
+            ProviderItemKind::AgentMessage => {
+                exact(item, &["id", "text", "type"])?;
+                let text = bounded_text(item, "text")?.to_owned();
+                self.record(RecordedKind::AssistantMessageCompleted, Some(text))?;
+                self.assistant_seen = true;
+            }
+            ProviderItemKind::CommandExecution => {
+                let status = string(item, "status")?;
+                let recorded = match status {
+                    "completed" => RecordedKind::ToolCallCompleted,
+                    "failed" => RecordedKind::ToolCallFailed,
+                    _ => return Err(AdapterError::UnknownSchema),
+                };
+                validate_command_execution(item, status, true)?;
+                self.record(recorded, Some(kind.as_str().to_owned()))?;
+            }
+        }
         self.active_item = None;
-        self.final_seen = true;
-        self.record(RecordedKind::AssistantMessageCompleted, Some(text))
+        Ok(())
     }
 
     fn turn_completed(&mut self, object: &Map<String, Value>) -> Result<(), AdapterError> {
         exact(object, &["type", "usage"])?;
         self.require_active()?;
-        if !self.final_seen || self.active_item.is_some() {
+        if !self.assistant_seen || self.active_item.is_some() {
             return Err(AdapterError::EventOrder);
         }
         let usage = object
@@ -294,25 +322,50 @@ impl Normalizer {
     }
 }
 
-/// The only item type this vocabulary accepts.
-///
-/// Every other item type — a tool call, a reasoning summary, a patch — is a
-/// refusal naming that type, not a silently dropped item. Accepting a
-/// transcript while discarding the items it does not model would produce a
-/// normalized event list that is a strict, unannounced subset of what the
-/// provider actually did.
-///
-/// The admitted set is [`ProviderItemKind`] rather than a literal, so the
-/// vocabulary a consumer maps over and the vocabulary this grammar enforces are
-/// one declaration.
-fn require_agent_message(item: &Map<String, Value>) -> Result<(), AdapterError> {
+/// Resolve an item through the declared vocabulary. Unknown provider items are
+/// named and refused rather than disappearing from the normalized transcript.
+fn provider_item_kind(item: &Map<String, Value>) -> Result<ProviderItemKind, AdapterError> {
     let item_type = string(item, "type")?;
     match ProviderItemKind::from_spelling(item_type) {
-        Some(ProviderItemKind::AgentMessage) => Ok(()),
+        Some(kind) => Ok(kind),
         None => Err(AdapterError::UnknownEvent(UnknownEventKind::item(
             item_type,
         ))),
     }
+}
+
+/// Validate the complete Codex 0.149 command item even though the normalized
+/// projection deliberately carries only its non-sensitive kind label.
+fn validate_command_execution(
+    item: &Map<String, Value>,
+    expected_status: &str,
+    terminal: bool,
+) -> Result<(), AdapterError> {
+    exact(
+        item,
+        &[
+            "aggregated_output",
+            "command",
+            "exit_code",
+            "id",
+            "status",
+            "type",
+        ],
+    )?;
+    let _ = bounded_text(item, "command")?;
+    let _ = bounded_text(item, "aggregated_output")?;
+    if string(item, "status")? != expected_status {
+        return Err(AdapterError::UnknownSchema);
+    }
+    let exit_code = item.get("exit_code").ok_or(AdapterError::UnknownSchema)?;
+    if terminal {
+        if exit_code.as_i64().is_none() {
+            return Err(AdapterError::UnknownSchema);
+        }
+    } else if !exit_code.is_null() {
+        return Err(AdapterError::UnknownSchema);
+    }
+    Ok(())
 }
 
 fn item(object: &Map<String, Value>) -> Result<&Map<String, Value>, AdapterError> {

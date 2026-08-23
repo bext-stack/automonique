@@ -13,8 +13,8 @@
 
 use automonique_agents::{
     AdapterError, ExecutionMode, MAX_JSONL_LINE_BYTES, MAX_STREAM_EVENTS, NormalizedEvent,
-    ProviderDisposition, ProviderEventStream, RunCoordinates, SessionScope, StreamPolicy,
-    normalize_jsonl,
+    ProviderDisposition, ProviderEventStream, RecordedKind, RunCoordinates, SessionScope,
+    StreamPolicy, normalize_jsonl,
 };
 
 /// One complete successful turn, exactly as the normalizer accepts it.
@@ -34,6 +34,19 @@ const CURRENT_CLI_SUCCESS_FIXTURE: &str = concat!(
     "{\"type\":\"thread.started\",\"thread_id\":\"fixture-session\"}\n",
     "{\"type\":\"turn.started\"}\n",
     "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"final answer\"}}\n",
+    "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":2,\"cached_input_tokens\":1,\"cache_write_input_tokens\":0,\"output_tokens\":3,\"reasoning_output_tokens\":0}}\n",
+);
+
+/// Sanitized from a bounded Codex CLI 0.149 turn that emitted commentary,
+/// executed one command, and then emitted its final answer. Command payloads
+/// are synthetic fixture text; only their exact schema is provenance-derived.
+const CURRENT_CLI_TOOL_FIXTURE: &str = concat!(
+    "{\"type\":\"thread.started\",\"thread_id\":\"fixture-session\"}\n",
+    "{\"type\":\"turn.started\"}\n",
+    "{\"type\":\"item.completed\",\"item\":{\"id\":\"item-0\",\"type\":\"agent_message\",\"text\":\"I will inspect it.\"}}\n",
+    "{\"type\":\"item.started\",\"item\":{\"id\":\"item-1\",\"type\":\"command_execution\",\"command\":\"fixture-command\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}}\n",
+    "{\"type\":\"item.completed\",\"item\":{\"id\":\"item-1\",\"type\":\"command_execution\",\"command\":\"fixture-command\",\"aggregated_output\":\"fixture-output\",\"exit_code\":0,\"status\":\"completed\"}}\n",
+    "{\"type\":\"item.completed\",\"item\":{\"id\":\"item-2\",\"type\":\"agent_message\",\"text\":\"final answer\"}}\n",
     "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":2,\"cached_input_tokens\":1,\"cache_write_input_tokens\":0,\"output_tokens\":3,\"reasoning_output_tokens\":0}}\n",
 );
 
@@ -162,6 +175,41 @@ fn current_cli_completion_and_usage_shape_normalize_without_weakening_bounds() {
             .expect_err("non-numeric supplemental counter refused")
             .category(),
         "unknown_schema"
+    );
+}
+
+#[test]
+fn current_cli_multi_message_command_lifecycle_is_fully_projected() {
+    let coordinates = coordinates();
+    let mode = ExecutionMode::NewSession;
+    let mut stream = ProviderEventStream::new(&coordinates, &mode);
+    assert_eq!(
+        stream
+            .push_bytes(CURRENT_CLI_TOOL_FIXTURE.as_bytes())
+            .expect("current multi-item CLI fixture accepted"),
+        8
+    );
+    let transcript = stream.finish().expect("complete multi-item transcript");
+    let kinds = transcript
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            NormalizedEvent::Recorded(recorded) => Some(recorded.kind()),
+            NormalizedEvent::Preview { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            RecordedKind::SessionCreated,
+            RecordedKind::TurnStarted,
+            RecordedKind::AssistantMessageCompleted,
+            RecordedKind::ToolCallStarted,
+            RecordedKind::ToolCallCompleted,
+            RecordedKind::AssistantMessageCompleted,
+            RecordedKind::UsageUpdated,
+            RecordedKind::TurnCompleted,
+        ]
     );
 }
 
