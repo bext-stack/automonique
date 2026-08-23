@@ -4819,6 +4819,15 @@ mod tests {
     fn fleet_worker_reports_execution_proven_authentication() {
         assert!(MANAGE_WORKER.contains("/api/manage/automonique/platform"));
         assert!(MANAGE_WORKER.contains("--request PUT"));
+        assert!(MANAGE_WORKER.contains("register_runtime"));
+        assert!(
+            MANAGE_WORKER
+                .find("register_runtime ||")
+                .expect("registration call")
+                < MANAGE_WORKER
+                    .find("instance_root=$(load_instance_root)")
+                    .expect("workspace lookup")
+        );
         let superseded_path = ["/api/manage/", "shelldeck/fleet"].concat();
         assert!(!MANAGE_WORKER.contains(&superseded_path));
         assert!(MANAGE_WORKER.contains("configured_unverified"));

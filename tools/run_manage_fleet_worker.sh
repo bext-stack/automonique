@@ -326,6 +326,18 @@ fleet_snapshot() {
     platform_runtime "$body"
 }
 
+register_runtime() {
+    runtime_workdir=${AUTOMONIQUE_FLEET_WORKDIR:-$PWD}
+    runtime_workdir=$(realpath -e -- "$runtime_workdir") || return 1
+    body=$(jq -cn \
+        --arg id "$fleet_instance" \
+        --arg workdir "$runtime_workdir" \
+        --arg provider "$selected_provider" \
+        '{action:"register",id:$id,workdir:$workdir,provider:$provider}')
+    response=$(platform_runtime "$body") || return 1
+    jq -e '.ok == true and .instance.id != null' >/dev/null <<<"$response"
+}
+
 publish_process_snapshot() {
     snapshot=$1
     observed_at=$(date +%s%3N)
@@ -466,6 +478,11 @@ load_instance_root() {
     jq -er --arg id "$fleet_instance" \
         '[.instances[]? | select(.id == $id) | .workdir] | first | select(type == "string" and startswith("/"))' \
         <<<"$snapshot"
+}
+
+register_runtime || {
+    printf '%s\n' 'Manage refused the platform runtime registration' >&2
+    exit 1
 }
 
 instance_root=$(load_instance_root) || {
