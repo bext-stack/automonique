@@ -4858,6 +4858,7 @@ mod tests {
         assert!(MANAGE_WORKER.contains("platform-job"));
         assert!(MANAGE_WORKER.contains("--idempotency-key \"$command_id\""));
         assert!(MANAGE_WORKER.contains("local_platform_receipts"));
+        assert!(MANAGE_WORKER.contains("platform_execution_succeeded"));
         assert!(MANAGE_WORKER.contains("CLAUDE_CONFIG_DIR=\"$selected_home\""));
         assert!(MANAGE_WORKER.contains("--output-format stream-json"));
         assert!(MANAGE_WORKER.contains("unset OPENAI_API_KEY ANTHROPIC_API_KEY"));

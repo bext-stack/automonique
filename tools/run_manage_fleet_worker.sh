@@ -819,6 +819,9 @@ run_platform_command() {
         write_platform_receipt "$command_id" "$local_outcome" "$local_explanation" || true
         mv -f -- "$command" "$platform_pending_dir/$command_id.json"
     else
+        if [[ "$local_outcome" == completed ]] && probe_local_auth; then
+            write_auth_health authenticated platform_execution_succeeded "$(date +%s%3N)" || true
+        fi
         finish_platform_command "$command" "$command_id" "$local_outcome" "$local_explanation" || true
     fi
 }
