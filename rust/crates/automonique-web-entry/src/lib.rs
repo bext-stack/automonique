@@ -4830,6 +4830,8 @@ mod tests {
         assert!(MANAGE_WORKER.contains("/api/manage/automonique/platform"));
         assert!(MANAGE_WORKER.contains("--request PUT"));
         assert!(MANAGE_WORKER.contains("register_runtime"));
+        assert!(MANAGE_WORKER.contains("AUTOMONIQUE_PLATFORM_ENDPOINT"));
+        assert!(MANAGE_WORKER.contains("endpoint:$endpoint"));
         assert!(
             MANAGE_WORKER
                 .find("register_runtime ||")

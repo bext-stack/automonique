@@ -76,6 +76,12 @@ case "$provider_engine" in
 esac
 codex_worker_home=${AUTOMONIQUE_FLEET_CODEX_HOME:-$provider_home}
 platform_url=${fleet_base%/}/api/manage/automonique/platform
+platform_endpoint=${AUTOMONIQUE_PLATFORM_ENDPOINT:-}
+
+if [[ -z "$platform_endpoint" || "$platform_endpoint" == *$'\n'* || "$platform_endpoint" == *$'\r'* ]]; then
+    printf '%s\n' 'configured platform endpoint is missing or invalid' >&2
+    exit 2
+fi
 
 if [[ ! -x "$provider_binary" || ! -d "$provider_home" ]]; then
     printf '%s\n' 'configured provider engine is unavailable' >&2
@@ -426,7 +432,8 @@ register_runtime() {
         --arg id "$fleet_instance" \
         --arg workdir "$runtime_workdir" \
         --arg provider "$selected_provider" \
-        '{action:"register",id:$id,workdir:$workdir,provider:$provider}')
+        --arg endpoint "$platform_endpoint" \
+        '{action:"register",id:$id,workdir:$workdir,provider:$provider,endpoint:$endpoint}')
     response=$(platform_runtime "$body") || return 1
     jq -e '.ok == true and .instance.id != null' >/dev/null <<<"$response"
 }
