@@ -16140,7 +16140,26 @@ pub struct StoreControlSurface {
     provider_state_dir: Option<PathBuf>,
     pending_entity_sources: Option<(String, QuestionSources)>,
     pending_prism_inventory: Option<(String, crate::site_inventory::PrismSiteInventory)>,
+    snapshot_time_source: Arc<dyn SnapshotTimeSource>,
     facts: HostFacts,
+}
+
+/// Source of Unix wall time for one read-surface snapshot.
+///
+/// Production uses the host clock. Tests and other contained callers may
+/// inject a fixed source so relative-date filtering cannot depend on the day
+/// or midnight at which the process happens to run.
+pub trait SnapshotTimeSource: Send + Sync {
+    /// Current Unix milliseconds, or `None` when the clock is unavailable.
+    fn unix_millis(&self) -> Option<i64>;
+}
+
+struct HostSnapshotTimeSource;
+
+impl SnapshotTimeSource for HostSnapshotTimeSource {
+    fn unix_millis(&self) -> Option<i64> {
+        crate::unix_millis().ok()
+    }
 }
 
 /// This surface's handle on the durable member roster.
@@ -16271,8 +16290,17 @@ impl StoreControlSurface {
             provider_state_dir: None,
             pending_entity_sources: None,
             pending_prism_inventory: None,
+            snapshot_time_source: Arc::new(HostSnapshotTimeSource),
             facts,
         })
+    }
+
+    /// Override the wall clock used to timestamp and resolve relative dates in
+    /// read-only question snapshots.
+    #[must_use]
+    pub fn with_snapshot_time_source(mut self, source: Arc<dyn SnapshotTimeSource>) -> Self {
+        self.snapshot_time_source = source;
+        self
     }
 
     /// Point this surface at the host's durable member roster.
@@ -17088,7 +17116,7 @@ impl ControlSurface for StoreControlSurface {
             .take()
             .filter(|(pending_question, _)| pending_question == question)
             .map_or_else(|| question_sources(question), |(_, sources)| sources);
-        let snapshot_unix_ms = crate::unix_millis().ok();
+        let snapshot_unix_ms = self.snapshot_time_source.unix_millis();
         let snapshot_current_utc = snapshot_unix_ms
             .and_then(utc_rfc3339_from_unix_millis)
             .unwrap_or_else(|| String::from("unavailable"));

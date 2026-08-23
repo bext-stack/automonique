@@ -31,9 +31,9 @@ use automonique_daemon::telegram_bridge::{
     EmailActionSurface, HostFacts, MAX_PENDING_QUESTIONS, MAX_QUESTION_CONTEXT_BYTES,
     MAX_QUESTION_PROMPT_BYTES, MemberChange, MemorySurface, MemoryTenantSource,
     NO_TICKETS_RECORDED, OperatorRoster, QUESTION_ADMIN_ONLY, QUESTION_TICKETS_LISTED, RunFailure,
-    RunLane, SlackSurface, StoreControlSurface, StoreMemorySurface, TICKET_ACTION_UNAVAILABLE,
-    TICKET_NOT_FOUND, TICKETS_LISTED, TICKETS_NOT_ENABLED, TelegramControlBridge,
-    TicketActionSurface,
+    RunLane, SlackSurface, SnapshotTimeSource, StoreControlSurface, StoreMemorySurface,
+    TICKET_ACTION_UNAVAILABLE, TICKET_NOT_FOUND, TICKETS_LISTED, TICKETS_NOT_ENABLED,
+    TelegramControlBridge, TicketActionSurface,
 };
 use automonique_github_connector::IssueLocator;
 use automonique_protocol::admin::ExecutionState;
@@ -82,10 +82,20 @@ const TOPIC_B: i64 = 12;
 const TOKEN: &str = "123456:AAFixtureSecretNeverPrinted";
 /// A fixed poller clock. The read surface uses the real one; the two never meet.
 const NOW_MS: i64 = 1_700_000_000_000;
+/// 2026-08-22T12:00:00Z, fixing "yesterday" to 2026-08-21.
+const SNAPSHOT_NOW_MS: i64 = 1_787_400_000_000;
 /// Long enough that no fixture poll is refused for lease headroom.
 const LEASE_MS: i64 = NOW_MS + 600_000;
 /// The long poll a fixture asks for, in seconds.
 const LONG_POLL_SECONDS: u16 = 3;
+
+struct FixedSnapshotTimeSource;
+
+impl SnapshotTimeSource for FixedSnapshotTimeSource {
+    fn unix_millis(&self) -> Option<i64> {
+        Some(SNAPSHOT_NOW_MS)
+    }
+}
 
 // ---------------------------------------------------------------- fake seams
 
@@ -479,6 +489,7 @@ impl Fixture {
         .with_prism_sites(&self.prism_sites_path)
         .with_local_knowledge(&self.local_knowledge_path)
         .with_provider_state(&self.provider_state_path)
+        .with_snapshot_time_source(Arc::new(FixedSnapshotTimeSource))
     }
 
     fn seed_provider_runtime(&self) {
