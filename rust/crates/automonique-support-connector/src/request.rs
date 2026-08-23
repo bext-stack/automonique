@@ -37,7 +37,7 @@ pub const MAX_TICKET_DECISION_REASON_BYTES: usize = 500;
 /// The complete set of `action` strings this connector can render.
 ///
 /// Private on purpose: it is the target lock. A layer talked into asking for
-/// `job`, `claim`, `heartbeat`, or anything else on the same endpoint cannot
+/// Runtime, job, claim, heartbeat, or any unrelated operation cannot
 /// spell it, because no variant exists and no caller string reaches this field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WireAction {

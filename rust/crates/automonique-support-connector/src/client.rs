@@ -37,7 +37,7 @@ use crate::{
 /// Private and constant: with the origin locked by [`FleetBase`] and the action
 /// locked by the request enum, this is the last piece of the URL, and no caller
 /// string reaches any of the three.
-const FLEET_PATH: &str = "/api/manage/shelldeck/fleet";
+const SUPPORT_PATH: &str = "/api/manage/automonique/support";
 
 const MAX_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
 
@@ -104,7 +104,7 @@ impl FleetClient {
             .max_response_header_size(MAX_RESPONSE_HEADER_BYTES)
             .tls_config(tls)
             .build();
-        let url = format!("{}{FLEET_PATH}", base.origin());
+        let url = format!("{}{SUPPORT_PATH}", base.origin());
         Self {
             agent: config.new_agent(),
             url,
@@ -345,9 +345,9 @@ mod tests {
         let client = client("https://manage.example.com");
         assert_eq!(
             client.endpoint(),
-            "https://manage.example.com/api/manage/shelldeck/fleet"
+            "https://manage.example.com/api/manage/automonique/support"
         );
-        assert_eq!(FLEET_PATH, "/api/manage/shelldeck/fleet");
+        assert_eq!(SUPPORT_PATH, "/api/manage/automonique/support");
     }
 
     #[test]

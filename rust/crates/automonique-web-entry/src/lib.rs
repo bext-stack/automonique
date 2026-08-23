@@ -4817,6 +4817,10 @@ mod tests {
 
     #[test]
     fn fleet_worker_reports_execution_proven_authentication() {
+        assert!(MANAGE_WORKER.contains("/api/manage/automonique/platform"));
+        assert!(MANAGE_WORKER.contains("--request PUT"));
+        let superseded_path = ["/api/manage/", "shelldeck/fleet"].concat();
+        assert!(!MANAGE_WORKER.contains(&superseded_path));
         assert!(MANAGE_WORKER.contains("configured_unverified"));
         assert!(MANAGE_WORKER.contains("refresh_token_rejected"));
         assert!(MANAGE_WORKER.contains("latest_job_auth_failure_reason"));
