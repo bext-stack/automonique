@@ -11,14 +11,14 @@
 //!
 //! # The mapping is a projection, not a translation
 //!
-//! [`RecordedKind`] has seven members and the shared
+//! [`RecordedKind`] has ten members and the shared
 //! [`EventKind`](automonique_protocol::event::EventKind) has twenty-four, so
 //! [`frame_kind`] is total in one direction and deliberately partial in the
-//! other: a `tool_call_started` frame is a thing this normalizer cannot produce
-//! today, because the grammar it enforces refuses every item type but
-//! `agent_message`. The mapping is written as a closed `match` over both
+//! other: Codex command-execution items become tool-call frames, while shared
+//! kinds with no admitted provider schema remain impossible here. The mapping
+//! is written as a closed `match` over both
 //! published sets ([`RecordedKind::ALL`], [`ProviderItemKind::ALL`]) so that
-//! admitting a second item type is a compile error here rather than a kind that
+//! admitting another item type is a compile error here rather than a kind that
 //! silently never reaches a renderer.
 //!
 //! # Coalescing, and why previews replace rather than accumulate
@@ -83,6 +83,10 @@ pub const fn frame_kind(kind: RecordedKind) -> EventKind {
         RecordedKind::SessionLoaded => EventKind::SessionLoaded,
         RecordedKind::TurnStarted => EventKind::TurnStarted,
         RecordedKind::AssistantMessageCompleted => EventKind::AssistantMessageCompleted,
+        RecordedKind::ToolCallStarted => EventKind::ToolCallStarted,
+        RecordedKind::ToolCallCompleted | RecordedKind::ToolCallFailed => {
+            EventKind::ToolCallCompleted
+        }
         RecordedKind::UsageUpdated => EventKind::UsageUpdated,
         RecordedKind::ProviderFault => EventKind::ProviderFault,
         RecordedKind::TurnCompleted => EventKind::TurnCompleted,
@@ -98,6 +102,7 @@ pub const fn frame_kind(kind: RecordedKind) -> EventKind {
 pub const fn item_frame_kind(item: ProviderItemKind) -> EventKind {
     match item {
         ProviderItemKind::AgentMessage => EventKind::AssistantMessageDelta,
+        ProviderItemKind::CommandExecution => EventKind::ToolCallUpdated,
     }
 }
 
@@ -111,6 +116,7 @@ pub const fn item_frame_kind(item: ProviderItemKind) -> EventKind {
 pub const fn item_frame_authority(item: ProviderItemKind) -> Authority {
     match item {
         ProviderItemKind::AgentMessage => Authority::Synthetic,
+        ProviderItemKind::CommandExecution => Authority::Synthetic,
     }
 }
 
@@ -360,12 +366,11 @@ fn recorded_frame(event: &RecordedEvent) -> Option<CapturedFrame> {
             Some(RetryContext::new(RetryCategory::Rejected, false, None, 1).ok()?)
         }
     };
-    let step = match kind.step_rule() {
-        MemberRule::Forbidden => None,
-        // Unreachable for every kind this projection produces, and written
-        // rather than assumed: an item type admitted later reaches this arm
-        // with a truthful status instead of a panic.
-        MemberRule::Required | MemberRule::Optional => Some(StepStatus::Completed),
+    let step = match event.kind() {
+        RecordedKind::ToolCallStarted => Some(StepStatus::InProgress),
+        RecordedKind::ToolCallCompleted => Some(StepStatus::Completed),
+        RecordedKind::ToolCallFailed => Some(StepStatus::Error),
+        _ => None,
     };
     let body = ProgressBody::new(kind, ProgressBodyParts { text, step, retry }).ok()?;
     Some(CapturedFrame {

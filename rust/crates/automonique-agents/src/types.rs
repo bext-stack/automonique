@@ -248,6 +248,9 @@ pub enum RecordedKind {
     SessionLoaded,
     TurnStarted,
     AssistantMessageCompleted,
+    ToolCallStarted,
+    ToolCallCompleted,
+    ToolCallFailed,
     UsageUpdated,
     ProviderFault,
     TurnCompleted,
@@ -261,11 +264,14 @@ impl RecordedKind {
     /// consumer that projects these onto a rendering vocabulary needs a closed
     /// set to be exhaustive over, and a set it restated by hand would be a set
     /// that silently stopped covering a kind added here.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 10] = [
         Self::SessionCreated,
         Self::SessionLoaded,
         Self::TurnStarted,
         Self::AssistantMessageCompleted,
+        Self::ToolCallStarted,
+        Self::ToolCallCompleted,
+        Self::ToolCallFailed,
         Self::UsageUpdated,
         Self::ProviderFault,
         Self::TurnCompleted,
@@ -279,6 +285,9 @@ impl RecordedKind {
             Self::SessionLoaded => "session_loaded",
             Self::TurnStarted => "turn_started",
             Self::AssistantMessageCompleted => "assistant_message_completed",
+            Self::ToolCallStarted => "tool_call_started",
+            Self::ToolCallCompleted => "tool_call_completed",
+            Self::ToolCallFailed => "tool_call_failed",
             Self::UsageUpdated => "usage_updated",
             Self::ProviderFault => "provider_fault",
             Self::TurnCompleted => "turn_completed",
@@ -288,28 +297,26 @@ impl RecordedKind {
 
 /// The provider item types this normalizer admits.
 ///
-/// One member, and that is the fact rather than an oversight: the grammar
-/// accepts `agent_message` and refuses every other item type by name — a tool
-/// call, a reasoning summary, a patch — because a transcript that dropped the
-/// items it does not model would be a strict, unannounced subset of what the
-/// provider did. The enum exists so a consumer mapping items onto a rendering
-/// vocabulary is exhaustive over a *declared* set, and gains a compile error
-/// rather than a silent gap when a second item type is admitted here.
+/// Each admitted kind has an explicit schema and projection. Unknown kinds are
+/// still refused instead of being silently omitted from the transcript.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderItemKind {
     /// An assistant message.
     AgentMessage,
+    /// A command launched by the provider.
+    CommandExecution,
 }
 
 impl ProviderItemKind {
     /// Every admitted item type.
-    pub const ALL: [Self; 1] = [Self::AgentMessage];
+    pub const ALL: [Self; 2] = [Self::AgentMessage, Self::CommandExecution];
 
     /// The provider's own spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AgentMessage => "agent_message",
+            Self::CommandExecution => "command_execution",
         }
     }
 

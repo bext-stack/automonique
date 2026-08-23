@@ -49,6 +49,16 @@ const FIXTURE: &str = concat!(
     "{\"type\":\"turn.completed\",\"usage\":{\"cached_input_tokens\":1,\"input_tokens\":2,\"output_tokens\":3}}\n",
 );
 
+const TOOL_FIXTURE: &str = concat!(
+    "{\"type\":\"thread.started\",\"thread_id\":\"fixture-session\"}\n",
+    "{\"type\":\"turn.started\"}\n",
+    "{\"type\":\"item.completed\",\"item\":{\"id\":\"m-1\",\"type\":\"agent_message\",\"text\":\"working\"}}\n",
+    "{\"type\":\"item.started\",\"item\":{\"id\":\"c-1\",\"type\":\"command_execution\",\"command\":\"fixture-command\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}}\n",
+    "{\"type\":\"item.completed\",\"item\":{\"id\":\"c-1\",\"type\":\"command_execution\",\"command\":\"fixture-command\",\"aggregated_output\":\"fixture-output\",\"exit_code\":0,\"status\":\"completed\"}}\n",
+    "{\"type\":\"item.completed\",\"item\":{\"id\":\"m-2\",\"type\":\"agent_message\",\"text\":\"done\"}}\n",
+    "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":2,\"cached_input_tokens\":1,\"cache_write_input_tokens\":0,\"output_tokens\":3,\"reasoning_output_tokens\":0}}\n",
+);
+
 fn coordinates() -> RunCoordinates {
     RunCoordinates::new(
         RUN,
@@ -101,20 +111,22 @@ fn stamped(frames: &[CapturedFrame]) -> Vec<ProgressFrame> {
 mod mapping {
     use super::*;
 
-    /// Exhaustive over both published sets, and injective on each.
+    /// Exhaustive over both published sets. Completed and failed commands share
+    /// the stable completed kind and remain distinct through their step status.
     ///
     /// The `ALL` arrays are the domain, so a member added to either without a
     /// mapping fails to compile in `progress.rs` and is counted here.
     #[test]
     fn every_adapter_kind_and_item_kind_projects_onto_a_distinct_shared_kind() {
-        assert_eq!(RecordedKind::ALL.len(), 7);
-        assert_eq!(ProviderItemKind::ALL.len(), 1);
+        assert_eq!(RecordedKind::ALL.len(), 10);
+        assert_eq!(ProviderItemKind::ALL.len(), 2);
 
         let mut seen = BTreeSet::new();
         for kind in RecordedKind::ALL {
             let projected = frame_kind(kind);
+            let inserted = seen.insert(projected);
             assert!(
-                seen.insert(projected),
+                inserted || kind == RecordedKind::ToolCallFailed,
                 "{} projects onto {}, which is already taken",
                 kind.as_str(),
                 projected.as_str()
@@ -126,14 +138,11 @@ mod mapping {
                 seen.insert(projected),
                 "an item preview projects onto a kind a record already produces"
             );
-            // A preview may only ever be synthetic, and the shared vocabulary
-            // enforces it: this is the projection agreeing in advance.
-            assert!(projected.is_preview_only());
             assert_eq!(item_frame_authority(item), Authority::Synthetic);
         }
         assert_eq!(
             seen.len(),
-            RecordedKind::ALL.len() + ProviderItemKind::ALL.len()
+            RecordedKind::ALL.len() + ProviderItemKind::ALL.len() - 1
         );
     }
 
@@ -148,15 +157,18 @@ mod mapping {
             .map(frame_kind)
             .chain(ProviderItemKind::ALL.into_iter().map(item_frame_kind))
         {
-            // A step status is required only by the tool-call and subagent
-            // kinds, which this grammar cannot produce; if that ever changes the
-            // producer has to carry a real status rather than invent one.
-            assert_ne!(
-                kind.step_rule(),
-                MemberRule::Required,
-                "{} needs a step status this adapter cannot observe",
-                kind.as_str()
-            );
+            if kind.step_rule() == MemberRule::Required {
+                assert!(
+                    matches!(
+                        kind,
+                        EventKind::ToolCallStarted
+                            | EventKind::ToolCallUpdated
+                            | EventKind::ToolCallCompleted
+                    ),
+                    "{} needs a step status this adapter cannot observe",
+                    kind.as_str()
+                );
+            }
         }
     }
 
@@ -170,6 +182,10 @@ mod mapping {
         assert_eq!(
             frame_kind(RecordedKind::AssistantMessageCompleted),
             EventKind::AssistantMessageCompleted
+        );
+        assert_eq!(
+            item_frame_kind(ProviderItemKind::CommandExecution),
+            EventKind::ToolCallUpdated
         );
     }
 }
@@ -215,6 +231,33 @@ mod normalization {
         );
         // Every frame stamps and encodes: a projection that produced a body its
         // kind refuses would be caught here rather than at the spool.
+        for frame in stamped(&frames) {
+            frame.to_canonical_bytes().expect("a frame encodes");
+        }
+    }
+
+    #[test]
+    fn current_cli_command_items_become_typed_tool_frames() {
+        let frames = drive(&mut mapper(), TOOL_FIXTURE);
+        let tool_frames = frames
+            .iter()
+            .filter(|frame| {
+                matches!(
+                    frame.kind,
+                    EventKind::ToolCallStarted | EventKind::ToolCallCompleted
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_frames.len(), 2);
+        assert_eq!(tool_frames[0].kind, EventKind::ToolCallStarted);
+        assert_eq!(tool_frames[0].body.step(), Some(StepStatus::InProgress));
+        assert_eq!(tool_frames[1].kind, EventKind::ToolCallCompleted);
+        assert_eq!(tool_frames[1].body.step(), Some(StepStatus::Completed));
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.kind != EventKind::ProviderWarning)
+        );
         for frame in stamped(&frames) {
             frame.to_canonical_bytes().expect("a frame encodes");
         }
