@@ -246,6 +246,7 @@ pub enum StreamAuthority {
 pub enum RecordedKind {
     SessionCreated,
     SessionLoaded,
+    ProviderWarning,
     TurnStarted,
     AssistantMessageCompleted,
     ToolCallStarted,
@@ -264,9 +265,10 @@ impl RecordedKind {
     /// consumer that projects these onto a rendering vocabulary needs a closed
     /// set to be exhaustive over, and a set it restated by hand would be a set
     /// that silently stopped covering a kind added here.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::SessionCreated,
         Self::SessionLoaded,
+        Self::ProviderWarning,
         Self::TurnStarted,
         Self::AssistantMessageCompleted,
         Self::ToolCallStarted,
@@ -283,6 +285,7 @@ impl RecordedKind {
         match self {
             Self::SessionCreated => "session_created",
             Self::SessionLoaded => "session_loaded",
+            Self::ProviderWarning => "provider_warning",
             Self::TurnStarted => "turn_started",
             Self::AssistantMessageCompleted => "assistant_message_completed",
             Self::ToolCallStarted => "tool_call_started",

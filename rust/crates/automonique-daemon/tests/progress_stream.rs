@@ -118,7 +118,7 @@ mod mapping {
     /// mapping fails to compile in `progress.rs` and is counted here.
     #[test]
     fn every_adapter_kind_and_item_kind_projects_onto_a_distinct_shared_kind() {
-        assert_eq!(RecordedKind::ALL.len(), 10);
+        assert_eq!(RecordedKind::ALL.len(), 11);
         assert_eq!(ProviderItemKind::ALL.len(), 2);
 
         let mut seen = BTreeSet::new();
