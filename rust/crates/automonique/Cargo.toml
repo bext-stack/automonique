@@ -11,6 +11,8 @@ publish.workspace = true
 automonique-backup = { path = "../automonique-backup" }
 automonique-cli = { path = "../automonique-cli" }
 automonique-daemon = { path = "../automonique-daemon" }
+automonique-platform-client = { path = "../../../sdk/rust/platform-client" }
+automonique-protocol = { path = "../automonique-protocol" }
 serde_json.workspace = true
 
 [dev-dependencies]

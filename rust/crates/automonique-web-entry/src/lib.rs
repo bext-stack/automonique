@@ -4852,6 +4852,12 @@ mod tests {
         assert!(MANAGE_WORKER.contains("--no-selfdev run --ndjson -"));
         assert!(MANAGE_WORKER.contains("select(.type == \"done\") | .session_id"));
         assert!(MANAGE_WORKER.contains("select(.type == \"done\") | .text"));
+        assert!(MANAGE_WORKER.contains("enqueue_platform_commands"));
+        assert!(MANAGE_WORKER.contains("claim_platform_command"));
+        assert!(MANAGE_WORKER.contains("run_platform_command"));
+        assert!(MANAGE_WORKER.contains("platform-job"));
+        assert!(MANAGE_WORKER.contains("--idempotency-key \"$command_id\""));
+        assert!(MANAGE_WORKER.contains("local_platform_receipts"));
         assert!(MANAGE_WORKER.contains("CLAUDE_CONFIG_DIR=\"$selected_home\""));
         assert!(MANAGE_WORKER.contains("--output-format stream-json"));
         assert!(MANAGE_WORKER.contains("unset OPENAI_API_KEY ANTHROPIC_API_KEY"));
