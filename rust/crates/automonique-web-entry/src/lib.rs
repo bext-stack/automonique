@@ -1480,7 +1480,10 @@ impl WebIntegration {
         provider_configured: bool,
         worker_configured: bool,
     ) -> AgentAuthenticationView {
-        if let Some(manager) = &self.agent_auth
+        let (configured_provider_name, configured_provider) =
+            configured_provider_identity(&self.state_dir);
+        if configured_provider != "jcode"
+            && let Some(manager) = &self.agent_auth
             && let Ok(view) = manager.view()
         {
             let authenticated_accounts = view
@@ -1527,8 +1530,6 @@ impl WebIntegration {
                 remediation: authentication_remediation("not_configured"),
             };
         }
-        let (configured_provider_name, configured_provider) =
-            configured_provider_identity(&self.state_dir);
         let fallback = |status: &str, evidence: &str| AgentAuthenticationView {
             provider: configured_provider_name,
             surface: "AI Operations ticket worker",
@@ -4784,6 +4785,23 @@ mod tests {
         assert!(
             provider_auth_health_record(valid.replace("1787057000000", "1787058000000").as_bytes())
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn configured_provider_identity_reports_jcode() {
+        let root = tempfile::tempdir().expect("state root");
+        let provider = root.path().join("provider");
+        std::fs::write(
+            &provider,
+            "engine=jcode\nbinary=/opt/jcode/bin/jcode\nhome=/private/jcode\n",
+        )
+        .expect("provider config");
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o600))
+            .expect("private provider config");
+        assert_eq!(
+            configured_provider_identity(root.path()),
+            ("JCode", "jcode")
         );
     }
 
