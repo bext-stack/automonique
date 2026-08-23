@@ -4844,6 +4844,14 @@ mod tests {
         assert!(!MANAGE_WORKER.contains("auth_status:\"configured\""));
         assert!(MANAGE_WORKER.contains("[[ \"$(auth_health_status)\" != expired ]]"));
         assert!(MANAGE_WORKER.contains("automonique.agent-accounts/v1"));
+        assert!(MANAGE_WORKER.contains("provider_engine=$(sed -n 's/^engine=//p'"));
+        assert!(MANAGE_WORKER.contains("selected_provider=jcode"));
+        assert!(MANAGE_WORKER.contains("auth_method=jcode_native"));
+        assert!(MANAGE_WORKER.contains("JCODE_HOME=\"$selected_home\""));
+        assert!(MANAGE_WORKER.contains("JCODE_SERVER_EXECUTABLE=\"$selected_binary\""));
+        assert!(MANAGE_WORKER.contains("--no-selfdev run --ndjson -"));
+        assert!(MANAGE_WORKER.contains("select(.type == \"done\") | .session_id"));
+        assert!(MANAGE_WORKER.contains("select(.type == \"done\") | .text"));
         assert!(MANAGE_WORKER.contains("CLAUDE_CONFIG_DIR=\"$selected_home\""));
         assert!(MANAGE_WORKER.contains("--output-format stream-json"));
         assert!(MANAGE_WORKER.contains("unset OPENAI_API_KEY ANTHROPIC_API_KEY"));

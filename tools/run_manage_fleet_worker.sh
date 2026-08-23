@@ -58,14 +58,25 @@ fleet_instance=$(private_value instance "$fleet_config")
 fleet_token=$(private_value token "$fleet_config")
 provider_binary=$(private_value binary "$provider_config")
 provider_home=$(private_value home "$provider_config")
-worker_home=${AUTOMONIQUE_FLEET_CODEX_HOME:-$provider_home}
-platform_url=${fleet_base%/}/api/manage/automonique/platform
-
-if [[ ! -x "$provider_binary" || ! -d "$worker_home" ]]; then
-    printf '%s\n' 'configured Codex provider is unavailable' >&2
+provider_engine=$(sed -n 's/^engine=//p' "$provider_config")
+if [[ -z "$provider_engine" ]]; then
+    provider_engine=codex
+elif [[ $(sed -n 's/^engine=//p' "$provider_config" | wc -l) -ne 1 ]]; then
+    printf '%s\n' 'missing or duplicate engine in provider configuration' >&2
     exit 2
 fi
-if [[ -n "$agent_auth_dir" && ( ! -d "$agent_auth_dir" || ! -x "$claude_binary" ) ]]; then
+case "$provider_engine" in
+    codex|jcode) ;;
+    *) printf '%s\n' 'unsupported provider engine' >&2; exit 2 ;;
+esac
+codex_worker_home=${AUTOMONIQUE_FLEET_CODEX_HOME:-$provider_home}
+platform_url=${fleet_base%/}/api/manage/automonique/platform
+
+if [[ ! -x "$provider_binary" || ! -d "$provider_home" ]]; then
+    printf '%s\n' 'configured provider engine is unavailable' >&2
+    exit 2
+fi
+if [[ -n "$agent_auth_dir" && -e "$agent_auth_dir" && ( ! -d "$agent_auth_dir" || ! -x "$claude_binary" ) ]]; then
     printf '%s\n' 'configured native account directory or Claude provider is unavailable' >&2
     exit 2
 fi
@@ -75,21 +86,32 @@ mkdir -p -- "$runtime_dir"
 chmod 700 -- "$runtime_dir"
 mkdir -p -- "$output_dir"
 chmod 700 -- "$output_dir"
+mkdir -p -- "$runtime_dir/jcode-runtime"
+chmod 700 -- "$runtime_dir/jcode-runtime"
 
 auth_method=unknown
-selected_provider=codex
+selected_provider=$provider_engine
 selected_account=legacy
 selected_binary=$provider_binary
-selected_home=$worker_home
+selected_home=$provider_home
 auth_health_file=$aggregate_auth_health_file
 auth_revision_file=$runtime_dir/auth-revision-legacy
 
 load_selected_account() {
+    if [[ "$provider_engine" == jcode ]]; then
+        selected_provider=jcode
+        selected_account=legacy
+        selected_binary=$provider_binary
+        selected_home=$provider_home
+        auth_health_file=$aggregate_auth_health_file
+        auth_revision_file=$runtime_dir/auth-revision-jcode
+        return 0
+    fi
     if [[ -z "$account_registry" || ! -f "$account_registry" ]]; then
         selected_provider=codex
         selected_account=legacy
         selected_binary=$provider_binary
-        selected_home=$worker_home
+        selected_home=$codex_worker_home
         auth_health_file=$aggregate_auth_health_file
         auth_revision_file=$runtime_dir/auth-revision-legacy
         return 0
@@ -131,7 +153,7 @@ load_selected_account || {
 }
 
 credential_revision() {
-    if [[ "$selected_provider" == codex ]]; then
+    if [[ "$selected_provider" == codex || "$selected_provider" == jcode ]]; then
         auth_file=$selected_home/auth.json
     else
         auth_file=$selected_home/.credentials.json
@@ -144,7 +166,13 @@ credential_revision() {
 }
 
 probe_local_auth() {
-    if [[ "$selected_provider" == codex ]]; then auth_method=chatgpt; else auth_method=claude_ai; fi
+    if [[ "$selected_provider" == codex ]]; then
+        auth_method=chatgpt
+    elif [[ "$selected_provider" == jcode ]]; then
+        auth_method=jcode_native
+    else
+        auth_method=claude_ai
+    fi
     if [[ "$selected_provider" == codex ]]; then
         local_status=$(CODEX_HOME="$selected_home" "$selected_binary" login status 2>&1) || return 1
         case "$local_status" in
@@ -153,6 +181,12 @@ probe_local_auth() {
             *'Logged in using an access token'*) return 1 ;;
         esac
         return 1
+    fi
+    if [[ "$selected_provider" == jcode ]]; then
+        local_status=$(JCODE_HOME="$selected_home" JCODE_RUNTIME_DIR="$runtime_dir/jcode-runtime" \
+            "$selected_binary" --quiet --no-update --no-selfdev auth status --json 2>/dev/null) || return 1
+        jq -e '.any_available == true' >/dev/null <<<"$local_status"
+        return
     fi
     local_status=$(CLAUDE_CONFIG_DIR="$selected_home" "$selected_binary" auth status --json 2>/dev/null) || return 1
     if jq -e '.loggedIn == true and .authMethod == "claude.ai"' >/dev/null <<<"$local_status"; then
@@ -648,6 +682,15 @@ log_provider_line() {
             elif .type == "error" then (.message // "provider error")
             else empty end
         ' <<<"$line" 2>/dev/null) || text=
+    elif [[ "$selected_provider" == jcode ]]; then
+        text=$(jq -r '
+            if .type == "done" then (.text // empty)
+            elif .type == "tool_start" then ("started tool " + (.name // "unknown"))
+            elif .type == "tool_done" then
+                ((if .error == null then "completed tool " else "failed tool " end) + (.name // "unknown"))
+            elif .type == "error" then (.message // "provider error")
+            else empty end
+        ' <<<"$line" 2>/dev/null) || text=
     else
         text=$(jq -r '
             if .type == "assistant" then
@@ -762,6 +805,26 @@ run_job() {
                 log_provider_line "$job_id" "$line"
             done
         provider_status=${PIPESTATUS[1]:-1}
+    elif [[ "$selected_provider" == jcode ]]; then
+        cd -- "$cwd" || {
+            set -u
+            report_job "$job_id" failed 'JCode could not enter the selected workspace.' || true
+            return
+        }
+        printf '%s\n' "$provider_prompt" \
+            | JCODE_HOME="$selected_home" \
+                JCODE_RUNTIME_DIR="$runtime_dir/jcode-runtime" \
+                JCODE_SERVER_EXECUTABLE="$selected_binary" \
+                "$selected_binary" --quiet --no-update --no-selfdev run --ndjson - \
+                2> >(while IFS= read -r line; do
+                    printf '%s\n' "$line" >>"$error_output"
+                    post_job_log "$job_id" provider_stderr "$line"
+                done) \
+            | tee "$output" \
+            | while IFS= read -r line; do
+                log_provider_line "$job_id" "$line"
+            done
+        provider_status=${PIPESTATUS[1]:-1}
     else
         cd -- "$cwd" || {
             set -u
@@ -789,6 +852,9 @@ run_job() {
     if [[ "$selected_provider" == codex ]]; then
         session_id=$(jq -rs '[.[] | select(.type == "thread.started") | .thread_id] | first // ""' "$output" 2>/dev/null) || session_id=
         result=$(jq -rs '[.[] | select(.type == "item.completed" and .item.type == "agent_message") | .item.text] | last // ""' "$output" 2>/dev/null) || result=
+    elif [[ "$selected_provider" == jcode ]]; then
+        session_id=$(jq -rs '[.[] | select(.type == "done") | .session_id] | last // ""' "$output" 2>/dev/null) || session_id=
+        result=$(jq -rs '[.[] | select(.type == "done") | .text] | last // ""' "$output" 2>/dev/null) || result=
     else
         session_id=$(jq -rs '[.[] | select(.type == "result") | .session_id] | last // ""' "$output" 2>/dev/null) || session_id=
         result=$(jq -rs '[.[] | select(.type == "result") | .result] | last // ""' "$output" 2>/dev/null) || result=
