@@ -189,6 +189,8 @@ mod lease_identity;
 mod lease_time;
 pub mod local_knowledge;
 pub mod manage_config;
+pub mod managed_sessions;
+mod managed_tui;
 pub mod mcp_client;
 pub mod memory_config;
 pub mod model_inventory;
@@ -271,6 +273,9 @@ pub const RUN_INDEX_NAME: &str = concat!("run-index", ".sqlite3");
 /// Durable idempotency receipts, projections, cursors, and controller leases
 /// for the platform-v1 endpoint.
 pub const PLATFORM_STORE_NAME: &str = concat!("platform-v1", ".sqlite3");
+
+/// Durable normalized provider-session to Automonique-run bindings.
+pub const MANAGED_SESSIONS_NAME: &str = concat!("managed-sessions", ".sqlite3");
 
 /// Durable automation enablement registry, a sibling of [`DATABASE_NAME`].
 ///
@@ -562,6 +567,12 @@ impl DaemonConfig {
     #[must_use]
     pub fn platform_store_path(&self) -> PathBuf {
         self.state_dir().join(PLATFORM_STORE_NAME)
+    }
+
+    /// Durable normalized provider-session bindings.
+    #[must_use]
+    pub fn managed_sessions_path(&self) -> PathBuf {
+        self.state_dir().join(MANAGED_SESSIONS_NAME)
     }
 
     /// Durable automation enablement registry path.
@@ -1223,6 +1234,8 @@ pub struct Daemon {
     run_index: RunIndex,
     /// Durable platform-v1 action, cursor, attachment, and control state.
     platform: PlatformStore,
+    /// Durable normalized provider-session to latest-run bindings.
+    managed_sessions: managed_sessions::ManagedSessionStore,
     /// Wall-clock instant of the last provider model-catalog projection.
     /// `None` forces the first platform read after every daemon start to
     /// reconcile the durable projection with the live provider authority.
@@ -1351,6 +1364,8 @@ pub struct Daemon {
     /// [`ticket_intake::TicketIntakeHost::Disabled`]: no credential was read, no
     /// client was constructed and no ticket store file was created.
     ticket_intake: ticket_intake::TicketIntakeHost,
+    /// Durable managed-client intake and platform-receipt worker.
+    managed_tui: managed_tui::ManagedTuiHost,
     /// The live progress endpoint, bound beside the admin socket.
     ///
     /// `Option` for the reason [`Daemon::execution`] is one: it owns threads
@@ -1665,6 +1680,9 @@ impl Daemon {
 
         let platform = PlatformStore::open(config.platform_store_path())
             .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        let managed_sessions =
+            managed_sessions::ManagedSessionStore::open(config.managed_sessions_path())
+                .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
 
         // The audit chain opens under the same fence and before the socket
         // guard is disarmed, for the reason every durable sibling does: a
@@ -1747,6 +1765,25 @@ impl Daemon {
             ),
         );
 
+        let database_path = config.database_path();
+        let platform_store_path = config.platform_store_path();
+        let managed_sessions_path = config.managed_sessions_path();
+        let admin_socket = config.admin_socket();
+        let run_index_path = config.run_index_path();
+        let managed_tui = managed_tui::ManagedTuiHost::open(&managed_tui::ManagedTuiParams {
+            database_path: &database_path,
+            platform_store_path: &platform_store_path,
+            managed_sessions_path: &managed_sessions_path,
+            state_dir: &state_dir,
+            admin_socket: &admin_socket,
+            run_index_path: &run_index_path,
+            generation_id: GENERATION_ID,
+            holder_id: instance_id.as_str(),
+            lease_epoch: lease.epoch,
+            lease_time_source: Arc::new(lease_time::BootTimeSource),
+        })
+        .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+
         // THE STREAM REACHES THE CHAT HERE, AND ONLY HERE. The Telegram host is
         // composed above, before the lane that owns the progress hub exists, so
         // the hub is handed over once the lane does — still inside `open`, and
@@ -1815,6 +1852,7 @@ impl Daemon {
             run_submissions,
             run_index,
             platform,
+            managed_sessions,
             platform_models_observed_ms: None,
             audit_chain,
             automations,
@@ -1830,6 +1868,7 @@ impl Daemon {
             approval_lifetime,
             execution: Some(execution),
             ticket_intake,
+            managed_tui,
             progress_endpoint: Some(progress_endpoint),
             disconnected_recovery,
             _control_lock: control_lock,
@@ -1942,6 +1981,11 @@ impl Daemon {
                 self.ticket_intake
                     .start()
                     .map_err(|error| DaemonError::TicketIntakeRefused(error.category()))
+            })
+            .and_then(|()| {
+                self.managed_tui
+                    .start()
+                    .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))
             })
             // LIVE PROGRESS FAN-OUT BEGINS HERE, AND NOWHERE ELSE. The endpoint
             // was bound in `open`; this is what puts its accept loop on a
@@ -2068,6 +2112,7 @@ impl Daemon {
         // disconnect is not a cancellation, here or anywhere else — see
         // [`progress_hub`] — and cancellation remains the explicit dispatcher
         // path through [`Daemon::cancel_run`].
+        self.managed_tui.shutdown();
         if let Some(progress_endpoint) = self.progress_endpoint.take() {
             progress_endpoint.shutdown();
         }
@@ -3200,6 +3245,37 @@ impl Daemon {
     }
 
     fn refresh_platform_sessions(&mut self, now_ms: i64) -> Result<(), DaemonError> {
+        for session in self
+            .managed_sessions
+            .list()
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?
+        {
+            let record = ResourceRecord {
+                resource: ResourceCoordinate::new(
+                    ResourceAuthority::Automonique,
+                    ResourceKind::Session,
+                    ResourceId::new(session.provider_session_id)
+                        .map_err(|_| DaemonError::PlatformStoreFailed("session_id_invalid"))?,
+                ),
+                freshness: Freshness {
+                    state: if session.open {
+                        FreshnessState::Fresh
+                    } else {
+                        FreshnessState::Unknown
+                    },
+                    observed_at: automonique_protocol::primitives::EpochMillis::from_millis(
+                        session.updated_ms,
+                    ),
+                    revision: Revision::new(session.revision)
+                        .map_err(|_| DaemonError::PlatformStoreFailed("revision_invalid"))?,
+                },
+                summary: PlatformText::new(if session.open { "open" } else { "lost" })
+                    .map_err(|_| DaemonError::PlatformStoreFailed("session_state_invalid"))?,
+            };
+            self.platform
+                .upsert_resource("sessions", &record)
+                .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        }
         let path = self.state_dir.join(PROVIDER_JOURNAL_NAME);
         if !path.exists() {
             return Ok(());
@@ -3266,6 +3342,19 @@ impl Daemon {
             || session.kind != ResourceKind::Session
         {
             return Ok(None);
+        }
+        if let Some(binding) = self
+            .managed_sessions
+            .by_id(session.id.as_str())
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?
+        {
+            let id = ResourceId::new(binding.run_id)
+                .map_err(|_| DaemonError::PlatformStoreFailed("run_id_invalid"))?;
+            return Ok(Some(ResourceCoordinate::new(
+                ResourceAuthority::Automonique,
+                ResourceKind::Run,
+                id,
+            )));
         }
         let records = self
             .run_index
@@ -3662,6 +3751,14 @@ impl Daemon {
                 if !self.platform_session_is_open(&request.target)? {
                     return platform_refusal(ReceiptOutcome::Rejected, "session_not_controllable");
                 }
+                if !self
+                    .managed_sessions
+                    .by_id(request.target.id.as_str())
+                    .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?
+                    .is_some_and(|session| session.open)
+                {
+                    return platform_refusal(ReceiptOutcome::Rejected, "session_not_resumable");
+                }
                 let Some(record) = self
                     .platform
                     .resource(&request.target)
@@ -3745,10 +3842,10 @@ impl Daemon {
                             now_ms,
                         );
                     };
-                    let transport = match request.action {
-                        PlatformAction::SubmitRequest => "local.tui",
-                        PlatformAction::FollowUp => "local.tui.follow_up",
-                        _ => unreachable!(),
+                    let transport = if request.action == PlatformAction::SubmitRequest {
+                        managed_tui::NEW_REQUEST_TRANSPORT
+                    } else {
+                        managed_tui::FOLLOW_UP_TRANSPORT
                     };
                     self.store
                         .submit_inbox(InboxSubmission {
@@ -3764,7 +3861,9 @@ impl Daemon {
             }
             PlatformAction::SubmitJob
             | PlatformAction::ApproveRelease
-            | PlatformAction::RegisterNode => unreachable!(),
+            | PlatformAction::RegisterNode => {
+                return self.finalize_platform_rejection(request, "authority_not_local", now_ms);
+            }
         };
 
         match action_result {

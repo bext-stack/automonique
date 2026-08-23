@@ -198,6 +198,15 @@ pub enum ProviderRunProfile {
     AgenticScratchpad,
 }
 
+/// Provider-session behavior for a managed operator request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedSessionMode<'a> {
+    /// Persist the provider session and expose its normalized identifier.
+    New,
+    /// Resume this exact normalized provider session.
+    Resume(&'a str),
+}
+
 /// Codex's per-invocation override for latency-sensitive read-only Q&A.
 pub const QUESTION_REASONING_CONFIG: &str = "model_reasoning_effort=\"none\"";
 
@@ -634,6 +643,29 @@ pub fn compose_with_profile(
     inputs: &CompositionInputs<'_>,
     profile: ProviderRunProfile,
 ) -> Result<Composition, ComposeRefusal> {
+    compose_inner(task, inputs, profile, None)
+}
+
+/// Compose a managed request whose normalized provider session remains
+/// resumable by an exact later follow-up.
+pub fn compose_managed(
+    task: &str,
+    inputs: &CompositionInputs<'_>,
+    mode: ManagedSessionMode<'_>,
+) -> Result<Composition, ComposeRefusal> {
+    if let ManagedSessionMode::Resume(session_id) = mode {
+        automonique_protocol::platform::ResourceId::new(session_id)
+            .map_err(|_| ComposeRefusal::IdentityRejected)?;
+    }
+    compose_inner(task, inputs, ProviderRunProfile::Standard, Some(mode))
+}
+
+fn compose_inner(
+    task: &str,
+    inputs: &CompositionInputs<'_>,
+    profile: ProviderRunProfile,
+    managed_session: Option<ManagedSessionMode<'_>>,
+) -> Result<Composition, ComposeRefusal> {
     if !inputs.egress_configured {
         return Err(ComposeRefusal::NotConfigured);
     }
@@ -672,6 +704,7 @@ pub fn compose_with_profile(
         workspace: workspace_text,
         answer: answer_text,
         profile,
+        managed_session,
     })?;
 
     Ok(Composition {
@@ -754,6 +787,7 @@ struct DocumentParts<'a> {
     workspace: &'a str,
     answer: &'a str,
     profile: ProviderRunProfile,
+    managed_session: Option<ManagedSessionMode<'a>>,
 }
 
 /// Every constructor in this module refuses the same way.
@@ -790,6 +824,7 @@ fn document(parts: &DocumentParts<'_>) -> Result<Vec<u8>, ComposeRefusal> {
             parts.workspace,
             parts.answer,
             parts.profile,
+            parts.managed_session,
         ),
         // Opaque by construction: the resolution is the workspace registry's,
         // and this daemon is the registry. What it resolves to is
@@ -835,6 +870,7 @@ fn argv(
     workspace: &str,
     answer: &str,
     profile: ProviderRunProfile,
+    managed_session: Option<ManagedSessionMode<'_>>,
 ) -> Vec<OsString> {
     let mut arguments: Vec<OsString> = configured
         .iter()
@@ -846,6 +882,43 @@ fn argv(
             )
         })
         .collect();
+    match managed_session {
+        Some(ManagedSessionMode::New) => {
+            arguments.retain(|argument| argument != "--ephemeral");
+            if !arguments.iter().any(|argument| argument == "--json") {
+                arguments.push(OsString::from(crate::execute::PROVIDER_JSON_STREAM_ARG));
+            }
+        }
+        Some(ManagedSessionMode::Resume(session_id)) => {
+            let sandbox = configured
+                .windows(2)
+                .find(|pair| pair[0] == "-s")
+                .map_or("read-only", |pair| pair[1].as_str());
+            let mut resumed = vec![
+                OsString::from("-s"),
+                OsString::from(sandbox),
+                OsString::from("-C"),
+                OsString::from(workspace),
+                OsString::from("exec"),
+                OsString::from("resume"),
+            ];
+            if configured
+                .iter()
+                .any(|argument| argument == "--skip-git-repo-check")
+            {
+                resumed.push(OsString::from("--skip-git-repo-check"));
+            }
+            resumed.extend([
+                OsString::from("-o"),
+                OsString::from(answer),
+                OsString::from(crate::execute::PROVIDER_JSON_STREAM_ARG),
+                OsString::from(session_id),
+                OsString::from("-"),
+            ]);
+            arguments = resumed;
+        }
+        None => {}
+    }
     if arguments.first().is_some_and(|arg| arg == "exec")
         && profile == ProviderRunProfile::WebResearch
     {

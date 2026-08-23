@@ -45,6 +45,7 @@
 //! warning frame carrying the refusal's *category* (never the line, which is
 //! provider output) and then nothing.
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use automonique_agents::{
@@ -126,6 +127,10 @@ pub struct ProviderProgressMapper {
     finished: bool,
     /// Session-policy malformed lines already surfaced as warning frames.
     projected_warnings: u64,
+    /// Optional durable-owner handoff for the provider session observed by
+    /// this exact run. The mapper writes only the normalized identifier; the
+    /// execution worker decides whether a terminal run may persist it.
+    session_capture: Option<Arc<Mutex<Option<String>>>>,
 }
 
 impl ProviderProgressMapper {
@@ -139,6 +144,7 @@ impl ProviderProgressMapper {
             last_preview: Instant::now(),
             finished: false,
             projected_warnings: 0,
+            session_capture: None,
         }
     }
 
@@ -152,7 +158,15 @@ impl ProviderProgressMapper {
             last_preview: Instant::now(),
             finished: false,
             projected_warnings: 0,
+            session_capture: None,
         }
+    }
+
+    /// Capture the exact provider session observed by this normalized stream.
+    #[must_use]
+    pub fn with_session_capture(mut self, capture: Arc<Mutex<Option<String>>>) -> Self {
+        self.session_capture = Some(capture);
+        self
     }
 
     /// Project every event the stream has accepted since the last call.
@@ -176,6 +190,17 @@ impl ProviderProgressMapper {
                     }
                 }
                 NormalizedEvent::Recorded(recorded) => {
+                    if matches!(
+                        recorded.kind(),
+                        RecordedKind::SessionCreated | RecordedKind::SessionLoaded
+                    ) && let Some(capture) = self.session_capture.as_ref()
+                        && let Ok(mut captured) = capture.lock()
+                        && captured
+                            .as_deref()
+                            .is_none_or(|value| value == recorded.provider_session_id())
+                    {
+                        *captured = Some(recorded.provider_session_id().to_owned());
+                    }
                     // Ordering matters more than the byte bound here: a preview
                     // shown *after* the message it previewed would redraw a
                     // finished answer as an unfinished one.
