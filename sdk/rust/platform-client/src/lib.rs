@@ -738,8 +738,14 @@ impl PlatformView {
     /// Start or resume the independent stream represented by an attachment.
     pub fn track_attachment(&mut self, attachment: &Attachment) {
         let key = AttachmentKey::of(attachment);
-        self.attachment_cursors
-            .insert(key.clone(), attachment.cursor.clone());
+        let replace = self.attachment_cursors.get(&key).is_none_or(|existing| {
+            CursorKey::of(existing) != CursorKey::of(&attachment.cursor)
+                || attachment.cursor.sequence >= existing.sequence
+        });
+        if replace {
+            self.attachment_cursors
+                .insert(key.clone(), attachment.cursor.clone());
+        }
         self.attachment_resync_required.remove(&key);
     }
 

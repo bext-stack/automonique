@@ -310,6 +310,13 @@ fn platform_view_tracks_independent_attachments_and_reconciles_receipts() {
             .sequence,
         revision(11)
     );
+    view.track_attachment(&attachment_a);
+    assert_eq!(
+        view.attachment_cursor(&attachment_a)
+            .expect("stale registration cannot rewind the cursor")
+            .sequence,
+        revision(11)
+    );
     assert_eq!(
         view.attachment_cursor(&attachment_b)
             .expect("independent cursor")
