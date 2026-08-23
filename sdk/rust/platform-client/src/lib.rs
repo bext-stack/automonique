@@ -765,7 +765,10 @@ fn stage_subscription(
         if event_sequence <= sequence {
             if staged
                 .get(&resource_key(&event.resource.resource))
-                .is_some_and(|existing| existing == &event.resource)
+                .is_some_and(|existing| {
+                    existing == &event.resource
+                        || existing.freshness.revision > event.resource.freshness.revision
+                })
             {
                 continue;
             }
@@ -774,11 +777,17 @@ fn stage_subscription(
         if event_sequence != sequence.saturating_add(1) {
             return Err(());
         }
-        if staged
-            .get(&resource_key(&event.resource.resource))
-            .is_some_and(|existing| event.resource.freshness.revision < existing.freshness.revision)
-        {
-            return Err(());
+        if let Some(existing) = staged.get(&resource_key(&event.resource.resource)) {
+            if existing.freshness.revision > event.resource.freshness.revision {
+                sequence = event_sequence;
+                applied += 1;
+                continue;
+            }
+            if existing.freshness.revision == event.resource.freshness.revision
+                && existing != &event.resource
+            {
+                return Err(());
+            }
         }
         staged.insert(resource_key(&event.resource.resource), event.resource);
         sequence = event_sequence;

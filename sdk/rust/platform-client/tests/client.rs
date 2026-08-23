@@ -288,6 +288,31 @@ fn platform_view_tracks_independent_attachments_and_reconciles_receipts() {
             .sequence,
         revision(20)
     );
+    assert_eq!(
+        view.apply_attachment_subscription(
+            &attachment_b,
+            Subscription {
+                events: vec![PlatformEvent {
+                    cursor: cursor("sessions", 21),
+                    resource: running.clone(),
+                }],
+                cursor: cursor("sessions", 21),
+            },
+        ),
+        SubscriptionApply::Applied { events: 1 }
+    );
+    assert_eq!(
+        view.attachment_cursor(&attachment_a)
+            .expect("first attachment remains independent")
+            .sequence,
+        revision(11)
+    );
+    assert_eq!(
+        view.attachment_cursor(&attachment_b)
+            .expect("second attachment advances")
+            .sequence,
+        revision(21)
+    );
 
     let receipt = ActionReceipt {
         id: ReceiptId::new("receipt-1").expect("receipt id"),
