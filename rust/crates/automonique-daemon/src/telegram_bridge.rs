@@ -2527,6 +2527,22 @@ impl QuestionRuntime {
         }
     }
 
+    /// Contained JCode harness API selected as the primary execution engine.
+    #[must_use]
+    pub const fn jcode(profile: QuestionProfile) -> Self {
+        Self {
+            route: match profile {
+                QuestionProfile::Conversation => "conversation_jcode",
+                QuestionProfile::OperationalLookup => "operational_lookup_jcode",
+                QuestionProfile::Operational => "operational_jcode",
+                QuestionProfile::WebResearch => "permissioned_web_research_jcode",
+            },
+            harness: "jcode_api_stdio_v1",
+            model: "configured_jcode",
+            reasoning: "configured",
+        }
+    }
+
     /// Direct, no-tools DeepSeek Flash adapter inside the supervised run.
     #[must_use]
     pub const fn deepseek_flash(profile: QuestionProfile) -> Self {

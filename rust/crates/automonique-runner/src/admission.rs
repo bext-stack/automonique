@@ -75,7 +75,7 @@ use crate::filesystem::PathIntent;
 use crate::{
     ContainmentLimits, LaunchPlan, LaunchPlanError, MAX_RUN_ID_BYTES, PortabilityPolicy,
     PromptDeliveryPlan, ProtectedPromptReference, RemoteAttestationPolicy, RunSpec, RunSpecDigest,
-    RunSpecEncodeError, WorkspaceRegistryId,
+    RunSpecEncodeError, SocketGrant, WorkspaceRegistryId,
 };
 use automonique_protocol::models::ExecutorClass;
 use automonique_protocol::provider::BinaryProvenance;
@@ -157,6 +157,13 @@ pub const BROKER_PROXY_VARIABLES: [&str; 2] = ["HTTPS_PROXY", "HTTP_PROXY"];
 pub const LOCAL_IPC_IS_NOT_EGRESS: &str =
     "a brokered launch may create AF_UNIX sockets; an unbrokered one may create none";
 
+/// Reviewed integration mode whose client supervises a child server.
+///
+/// Rust's Unix process launcher uses a private `SOCK_SEQPACKET` socketpair to
+/// return pre-exec errors from that child. This is local process plumbing, not
+/// provider egress, and only this declared integration receives the grant.
+pub const JCODE_API_STDIO_INTEGRATION_MODE: &str = "jcode-api-stdio-v1";
+
 /// Spec fields this bridge deliberately does not consult, and why.
 ///
 /// This list is closed and asserted by the module's tests. A field is on it
@@ -180,8 +187,8 @@ pub const LOCAL_IPC_IS_NOT_EGRESS: &str =
 /// - `admission.io_reservation`, `admission.workspace_reservation`,
 ///   `admission.scheduler_reservation` — scheduler accounting. They record
 ///   what was promised to the run, not a ceiling any mechanism here applies.
-/// - `admission.integration_mode` — how the provider is driven, which the
-///   executable and argv already spell out concretely.
+/// `admission.integration_mode` is intentionally absent: the JCode harness
+/// mode maps to the local seqpacket capability its supervised child requires.
 /// - `admission.context_manifest` — context composition, resolved before the
 ///   prompt reaches this bridge as bytes.
 /// - `admission.profile_digest`, `admission.model_routing_digest`,
@@ -191,7 +198,7 @@ pub const LOCAL_IPC_IS_NOT_EGRESS: &str =
 ///   inside the provider, which this launch neither builds nor inspects.
 /// - `admission.origin` — provenance of the request.
 /// - `admission.event_dialect` — the spool's record format.
-pub const INFORMATIONAL_FIELDS: [&str; 30] = [
+pub const INFORMATIONAL_FIELDS: [&str; 29] = [
     "work_id",
     "attempt_id",
     "host_id",
@@ -211,7 +218,6 @@ pub const INFORMATIONAL_FIELDS: [&str; 30] = [
     "admission.io_reservation",
     "admission.workspace_reservation",
     "admission.scheduler_reservation",
-    "admission.integration_mode",
     "admission.context_manifest",
     "admission.origin",
     "admission.event_dialect",
@@ -1337,6 +1343,14 @@ fn build_plan(
             .environment(name, value.as_encoded_bytes())
             .map_err(|error| AdmissionRefusal::Plan {
                 field: "environment",
+                error,
+            })?;
+    }
+    if spec.admission().integration_mode().as_str() == JCODE_API_STDIO_INTEGRATION_MODE {
+        plan = plan
+            .socket_grant(SocketGrant::UnixSeqPacket)
+            .map_err(|error| AdmissionRefusal::Plan {
+                field: "admission.integration_mode",
                 error,
             })?;
     }

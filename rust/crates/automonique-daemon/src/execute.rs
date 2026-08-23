@@ -127,42 +127,59 @@
 //!   enforces, identified by a digest over *how* it enforces it, and nothing
 //!   signs that statement. See [`offered_host_features`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read as _;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{Read as _, Write as _};
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use automonique_egress_broker::{BrokerConfig, EgressBroker};
 use automonique_protocol::digest::{ALGORITHM, Sha256};
+use automonique_protocol::event::{Authority as FrameAuthority, RetryCategory, RetryContext};
 use automonique_protocol::execute_api::ExecuteRefusal;
+use automonique_protocol::primitives::EpochMillis;
+use automonique_protocol::progress_api::{
+    ProgressBody, ProgressBodyParts, ProgressFrame, ProgressFrameParts, ProgressText,
+};
 use automonique_protocol::provider::BinaryProvenance;
 use automonique_protocol::sandbox::{
     Digest, ExecutionBackendId, HostFeature, ImplementationDigest,
 };
+use automonique_protocol::tools::RunId as FrameRunId;
 use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmittedLaunch, BrokeredDestination, PromptSource,
     ResolvedPrompt, UnenforcedBudget, admit,
 };
 use automonique_runner::backend::{
-    DirectProcessBackend, ObservedSequence, PreparedRun, ProgressCapture,
+    CapturedFrame, DirectProcessBackend, ObservedSequence, PROGRESS_BUDGET_WARNING,
+    PROGRESS_PREVIEW_RESERVE_BYTES, PROGRESS_TERMINAL_RESERVE_BYTES, PreparedRun, ProgressCapture,
+    ProgressPublisher, STARTED_PAYLOAD_PREFIX, TERMINAL_CANCELLED, TERMINAL_COMPLETED,
+    TERMINAL_FAILED, TERMINAL_TIMED_OUT,
 };
 use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
 use automonique_runner::control::{CancelDelivery, CancelSink, CancelSinkError};
 use automonique_runner::dispatch::RegistrationHandle;
 use automonique_runner::{
-    CancellationToken, ContainmentDomain, Controller, PromptDeliveryPlan, RunSpec, Spool,
+    Authority as SpoolAuthority, CancellationToken, ContainmentDomain, Controller,
+    EventKind as SpoolEventKind, LaunchPlan, PromptDeliveryPlan, RunContainment, RunSpec, Spool,
     WorkspaceRegistryId,
 };
+use automonique_store::approval_requests::{
+    ApprovalContext, ApprovalProposal, ApprovalRequests, ApprovalState, REQUEST_KEY_HEX_BYTES,
+    REQUEST_KEY_PREFIX,
+};
 use automonique_store::run_index::{RunIndex, RunSpoolState, StateAdvance};
+use nix::libc;
 use sha2::Digest as _;
 
 use crate::attempt_host::DaemonAttemptHost;
-use crate::progress::ProviderProgressMapper;
+use crate::jcode_session_host::{JcodeSessionHost, JcodeTurnOutcome};
+use crate::progress::{JcodeProgressMapper, ProviderProgressMapper};
 use crate::progress_hub::ProgressHub;
 
 /// Environment variable naming the launch entry helper binary.
@@ -395,6 +412,8 @@ pub const PROMPTS_DIRECTORY: &str = "prompts";
 /// the workspace directory, so a spool inside it would be a durable lifecycle
 /// record the workload could rewrite.
 const WORKSPACE_LEAF: &str = "workspace";
+const PROVIDER_APPROVAL_KEY_DOMAIN: &[u8] = b"automonique.provider-approval/v1/key\0";
+const PROVIDER_APPROVAL_PROPOSER: &str = "automonique.jcode";
 /// The run's authoritative spool directory, outside every grant.
 const SPOOL_LEAF: &str = "spool";
 
@@ -474,6 +493,121 @@ pub struct ExecutionLane {
     /// and with whatever renders progress, which polls it. See
     /// [`crate::progress_hub`].
     progress: Arc<ProgressHub>,
+    /// Lease-authorized input queues for currently attached JCode sessions.
+    jcode_controls: Arc<JcodeControlRegistry>,
+}
+
+const MAX_PENDING_JCODE_STEERS: usize = 16;
+const JCODE_STEER_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SteerRefusal {
+    SessionNotLive,
+    QueueFull,
+    ProviderRefused,
+    Unavailable,
+}
+
+impl SteerRefusal {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionNotLive => "session_not_live",
+            Self::QueueFull => "steering_queue_full",
+            Self::ProviderRefused => "provider_steering_refused",
+            Self::Unavailable => "steering_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct JcodeControlRegistry {
+    live: Mutex<BTreeMap<String, LiveJcodeControl>>,
+}
+
+#[derive(Debug)]
+struct LiveJcodeControl {
+    run_id: String,
+    sender: SyncSender<JcodeSteerCommand>,
+}
+
+#[derive(Debug)]
+struct JcodeSteerCommand {
+    content: String,
+    urgent: bool,
+    response: SyncSender<Result<(), SteerRefusal>>,
+}
+
+struct JcodeControlRegistration {
+    registry: Arc<JcodeControlRegistry>,
+    session_id: String,
+    run_id: String,
+    receiver: Receiver<JcodeSteerCommand>,
+}
+
+impl JcodeControlRegistry {
+    fn register(
+        self: &Arc<Self>,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<JcodeControlRegistration, SteerRefusal> {
+        let (sender, receiver) = sync_channel(MAX_PENDING_JCODE_STEERS);
+        let mut live = self.live.lock().map_err(|_| SteerRefusal::Unavailable)?;
+        if live.contains_key(session_id) {
+            return Err(SteerRefusal::Unavailable);
+        }
+        live.insert(
+            session_id.to_owned(),
+            LiveJcodeControl {
+                run_id: run_id.to_owned(),
+                sender,
+            },
+        );
+        Ok(JcodeControlRegistration {
+            registry: Arc::clone(self),
+            session_id: session_id.to_owned(),
+            run_id: run_id.to_owned(),
+            receiver,
+        })
+    }
+
+    fn steer(&self, session_id: &str, content: &str) -> Result<(), SteerRefusal> {
+        if content.is_empty() {
+            return Err(SteerRefusal::ProviderRefused);
+        }
+        let sender = self
+            .live
+            .lock()
+            .map_err(|_| SteerRefusal::Unavailable)?
+            .get(session_id)
+            .map(|control| control.sender.clone())
+            .ok_or(SteerRefusal::SessionNotLive)?;
+        let (response, received) = sync_channel(1);
+        match sender.try_send(JcodeSteerCommand {
+            content: content.to_owned(),
+            urgent: false,
+            response,
+        }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Err(SteerRefusal::QueueFull),
+            Err(TrySendError::Disconnected(_)) => return Err(SteerRefusal::SessionNotLive),
+        }
+        received
+            .recv_timeout(JCODE_STEER_ACK_TIMEOUT)
+            .map_err(|_| SteerRefusal::Unavailable)?
+    }
+}
+
+impl Drop for JcodeControlRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut live) = self.registry.live.lock()
+            && live
+                .get(&self.session_id)
+                .is_some_and(|control| control.run_id == self.run_id)
+        {
+            live.remove(&self.session_id);
+        }
+    }
 }
 
 impl ExecutionLane {
@@ -516,7 +650,13 @@ impl ExecutionLane {
             live: Arc::new(Mutex::new(BTreeSet::new())),
             workers: Vec::new(),
             progress: Arc::new(ProgressHub::new()),
+            jcode_controls: Arc::new(JcodeControlRegistry::default()),
         }
+    }
+
+    /// Deliver one lease-authorized input to a currently active JCode turn.
+    pub fn steer_session(&self, session_id: &str, content: &str) -> Result<(), SteerRefusal> {
+        self.jcode_controls.steer(session_id, content)
     }
 
     /// Live progress replay for the attempts this lane is running.
@@ -666,8 +806,13 @@ impl ExecutionLane {
         let workspace = self.workspace_root(run_id);
         let spool_root = run_root.join(SPOOL_LEAF);
 
-        let prompt = self.resolve_prompt(spec)?;
+        let (prompt, prompt_bytes) = self.resolve_prompt(spec)?;
         let observed = self.observe_provider_binary(spec)?;
+        let provider_program_sha256 = observed
+            .digest()
+            .strip_prefix("sha256:")
+            .ok_or(ExecuteRefusal::ProviderBinaryUnverified)?
+            .to_owned();
 
         let context = AdmissionContext::new(AdmissionContextParts {
             backend: ExecutionBackendId::new(DAEMON_BACKEND_ID)
@@ -748,33 +893,76 @@ impl ExecutionLane {
 
         let spool = Spool::open(&spool_root, run_id, admitted.spool_budget_bytes())
             .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
-        // `prepare` creates the run cgroup and applies the document's ceilings
-        // before any workload can enter it. Dropping the result — which the
-        // error path and a failed spawn both do — removes that cgroup and
-        // leaves the spool empty, so a refusal here records nothing.
-        let prepared = backend
-            .prepare(
-                &domain,
-                run_id,
-                admitted.limits(),
-                admitted.plan().clone(),
-                spool,
-            )
-            .map_err(|_| ExecuteRefusal::ContainmentUnavailable)?;
-
-        // Progress capture attaches to the documents that asked for it and to
-        // no others. A workload writing prose to stdout would poison the
-        // refusal-first normalizer on its first line — costing the run nothing
-        // and the operator a stream that never says anything — so the presence
-        // of the flag that makes stdout the normalized grammar is the gate.
         let session_capture = Arc::new(Mutex::new(None));
-        let prepared = if emits_normalized_stream(spec) {
-            match progress_capture(spec, run_id, &self.progress, Arc::clone(&session_capture)) {
-                Some(capture) => prepared.with_progress(capture),
-                None => prepared,
-            }
+        let prepared = if jcode_session_mode(spec)? {
+            let containment = RunContainment::create(&domain, run_id, admitted.limits())
+                .map_err(|_| ExecuteRefusal::ContainmentUnavailable)?;
+            let prompt_sha256 = Sha256::digest(&prompt_bytes).to_hex();
+            let prompt =
+                String::from_utf8(prompt_bytes).map_err(|_| ExecuteRefusal::PromptUnresolvable)?;
+            PreparedAttempt::Jcode(
+                JcodePreparedRun::new(JcodePreparedParts {
+                    helper: backend.helper().to_path_buf(),
+                    run_id,
+                    plan: admitted.plan().clone().into_session_plan(),
+                    containment,
+                    spool,
+                    prompt,
+                    resume_session_id: jcode_resume_session(spec)?,
+                    journal_path: self.state_dir.join(crate::PROVIDER_JOURNAL_NAME),
+                    answer_path: workspace.join(crate::compose::ANSWER_LEAF),
+                    publisher: self.progress.publisher(run_id),
+                    session_capture: Arc::clone(&session_capture),
+                    controls: Arc::clone(&self.jcode_controls),
+                    approval: ProviderApprovalContext {
+                        store_path: self.state_dir.join(crate::APPROVAL_REQUESTS_NAME),
+                        spec_digest: admitted
+                            .spec_digest()
+                            .as_str()
+                            .strip_prefix("sha256:")
+                            .ok_or(ExecuteRefusal::AdmissionRefused)?
+                            .to_owned(),
+                        program_path: spec
+                            .executable()
+                            .to_str()
+                            .ok_or(ExecuteRefusal::ProviderBinaryUnverified)?
+                            .to_owned(),
+                        program_sha256: provider_program_sha256,
+                        prompt_sha256,
+                        cwd_token: spec.cwd_token().as_str().to_owned(),
+                        expires_after_ms:
+                            crate::approval_policy::ApprovalPolicyConfig::lifetime_or_default(
+                                &self.state_dir,
+                            )
+                            .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?
+                            .ttl_ms(),
+                    },
+                })
+                .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?,
+            )
         } else {
-            prepared
+            // `prepare` creates the run cgroup and applies the document's
+            // ceilings before any workload can enter it. Dropping the result
+            // removes that cgroup and leaves the spool empty.
+            let prepared = backend
+                .prepare(
+                    &domain,
+                    run_id,
+                    admitted.limits(),
+                    admitted.plan().clone(),
+                    spool,
+                )
+                .map_err(|_| ExecuteRefusal::ContainmentUnavailable)?;
+            // Capture only a stdout grammar the document explicitly selected.
+            let prepared = if emits_normalized_stream(spec) {
+                match progress_capture(spec, run_id, &self.progress, Arc::clone(&session_capture)) {
+                    Some(capture) => prepared.with_progress(capture),
+                    None => prepared,
+                }
+            } else {
+                prepared
+            };
+            PreparedAttempt::Direct(prepared)
         };
         let observed = prepared.observed_sequence();
 
@@ -876,7 +1064,7 @@ impl ExecutionLane {
     /// `admission` is built to make, and it is weaker for a stated reason: the
     /// slot directory asserts no digest of its own. When a store that does
     /// lands, its assertion is what belongs here.
-    fn resolve_prompt(&self, spec: &RunSpec) -> Result<ResolvedPrompt, ExecuteRefusal> {
+    fn resolve_prompt(&self, spec: &RunSpec) -> Result<(ResolvedPrompt, Vec<u8>), ExecuteRefusal> {
         let slot = match spec.prompt_delivery() {
             PromptDeliveryPlan::ProtectedReference(reference) => reference.as_str().to_owned(),
             PromptDeliveryPlan::Stdin | PromptDeliveryPlan::BackendSession(_) => {
@@ -895,15 +1083,16 @@ impl ExecutionLane {
         }
         let declared = Digest::parse(&format!("{ALGORITHM}:{}", Sha256::digest(&bytes).to_hex()))
             .map_err(|_| ExecuteRefusal::PromptUnresolvable)?;
-        ResolvedPrompt::new(
+        let resolved = ResolvedPrompt::new(
             PromptSource::ProtectedReference(
                 automonique_runner::ProtectedPromptReference::new(slot)
                     .map_err(|_| ExecuteRefusal::PromptUnresolvable)?,
             ),
-            bytes,
+            bytes.clone(),
             declared,
         )
-        .map_err(|_| ExecuteRefusal::PromptUnresolvable)
+        .map_err(|_| ExecuteRefusal::PromptUnresolvable)?;
+        Ok((resolved, bytes))
     }
 
     /// Hash the program the document pins, and report it as observed
@@ -1032,6 +1221,610 @@ struct LiveClaim {
     run_id: String,
 }
 
+enum PreparedAttempt {
+    Direct(PreparedRun),
+    Jcode(JcodePreparedRun),
+}
+
+impl PreparedAttempt {
+    fn observed_sequence(&self) -> ObservedSequence {
+        match self {
+            Self::Direct(prepared) => prepared.observed_sequence(),
+            Self::Jcode(prepared) => prepared.observed.clone(),
+        }
+    }
+
+    fn execute(self, cancellation: &CancellationToken, timeout: Duration) -> AttemptExecution {
+        match self {
+            Self::Direct(prepared) => match prepared.execute(cancellation, timeout) {
+                Ok(report) => AttemptExecution {
+                    state: spool_state(report.status().state()),
+                    last_sequence: report.status().last_sequence(),
+                },
+                Err(_) => AttemptExecution {
+                    state: RunSpoolState::Failed,
+                    last_sequence: 0,
+                },
+            },
+            Self::Jcode(prepared) => prepared.execute(cancellation, timeout),
+        }
+    }
+}
+
+struct AttemptExecution {
+    state: RunSpoolState,
+    last_sequence: u64,
+}
+
+struct JcodePreparedParts<'a> {
+    helper: PathBuf,
+    run_id: &'a str,
+    plan: LaunchPlan,
+    containment: RunContainment,
+    spool: Spool,
+    prompt: String,
+    resume_session_id: Option<String>,
+    journal_path: PathBuf,
+    answer_path: PathBuf,
+    publisher: Box<dyn ProgressPublisher>,
+    session_capture: Arc<Mutex<Option<String>>>,
+    controls: Arc<JcodeControlRegistry>,
+    approval: ProviderApprovalContext,
+}
+
+struct ProviderApprovalContext {
+    store_path: PathBuf,
+    spec_digest: String,
+    program_path: String,
+    program_sha256: String,
+    prompt_sha256: String,
+    cwd_token: String,
+    expires_after_ms: i64,
+}
+
+impl ProviderApprovalContext {
+    fn propose(
+        &self,
+        run_id: &str,
+        request: &crate::jcode_session_host::JcodeApprovalRequest,
+        now_ms: i64,
+    ) -> Result<(ApprovalRequests, String), ()> {
+        let mut material = Vec::from(PROVIDER_APPROVAL_KEY_DOMAIN);
+        for coordinate in [run_id, request.request_id()] {
+            material.extend_from_slice(coordinate.as_bytes());
+            material.push(0);
+        }
+        let digest = Sha256::digest(&material).to_hex();
+        let request_key = format!("{REQUEST_KEY_PREFIX}{}", &digest[..REQUEST_KEY_HEX_BYTES]);
+        let subject = format!("provider-permission:{}", &digest[..REQUEST_KEY_HEX_BYTES]);
+        let mut approvals = ApprovalRequests::open(&self.store_path).map_err(|_| ())?;
+        approvals
+            .propose(ApprovalProposal {
+                request_key: &request_key,
+                subject: &subject,
+                run_id,
+                context: ApprovalContext {
+                    spec_digest: &self.spec_digest,
+                    program_path: &self.program_path,
+                    program_sha256: &self.program_sha256,
+                    prompt_sha256: &self.prompt_sha256,
+                    cwd_token: &self.cwd_token,
+                },
+                requested_by: PROVIDER_APPROVAL_PROPOSER,
+                requested_at_ms: now_ms,
+                expires_at_ms: now_ms.saturating_add(self.expires_after_ms),
+            })
+            .map_err(|_| ())?;
+        Ok((approvals, request_key))
+    }
+}
+
+struct JcodePreparedRun {
+    helper: PathBuf,
+    run_id: String,
+    frame_run_id: FrameRunId,
+    plan: LaunchPlan,
+    containment: RunContainment,
+    spool: Spool,
+    prompt: String,
+    resume_session_id: Option<String>,
+    journal_path: PathBuf,
+    answer_path: PathBuf,
+    publisher: Box<dyn ProgressPublisher>,
+    session_capture: Arc<Mutex<Option<String>>>,
+    controls: Arc<JcodeControlRegistry>,
+    approval: ProviderApprovalContext,
+    observed: ObservedSequence,
+}
+
+impl JcodePreparedRun {
+    fn new(parts: JcodePreparedParts<'_>) -> Result<Self, ()> {
+        let status = parts.spool.status();
+        if status.run_id() != parts.run_id
+            || status.last_sequence() != 0
+            || parts.spool.is_terminal()
+            || parts.prompt.is_empty()
+        {
+            return Err(());
+        }
+        parts.plan.encode().map_err(|_| ())?;
+        let frame_run_id = FrameRunId::new(parts.run_id).map_err(|_| ())?;
+        Ok(Self {
+            helper: parts.helper,
+            run_id: parts.run_id.to_owned(),
+            frame_run_id,
+            plan: parts.plan,
+            containment: parts.containment,
+            spool: parts.spool,
+            prompt: parts.prompt,
+            resume_session_id: parts.resume_session_id,
+            journal_path: parts.journal_path,
+            answer_path: parts.answer_path,
+            publisher: parts.publisher,
+            session_capture: parts.session_capture,
+            controls: parts.controls,
+            approval: parts.approval,
+            observed: ObservedSequence::default(),
+        })
+    }
+
+    fn execute(self, cancellation: &CancellationToken, timeout: Duration) -> AttemptExecution {
+        let Self {
+            helper,
+            run_id,
+            frame_run_id,
+            plan,
+            containment,
+            spool,
+            prompt,
+            resume_session_id,
+            journal_path,
+            answer_path,
+            publisher,
+            session_capture,
+            controls,
+            approval,
+            observed,
+        } = self;
+        let mut writer = JcodeSpoolWriter {
+            spool,
+            frame_run_id,
+            publisher,
+            observed: observed.clone(),
+            progress_stopped: false,
+        };
+        if cancellation.is_cancelled() {
+            return writer.finish(RunSpoolState::Cancelled);
+        }
+        let started_at = Instant::now();
+        let now_ms = crate::unix_millis().unwrap_or(0);
+        let mut host = match JcodeSessionHost::spawn(
+            &helper,
+            &plan,
+            containment,
+            &journal_path,
+            &format!("{run_id}-attempt"),
+            answer_path.parent().unwrap_or_else(|| Path::new("/")),
+            resume_session_id.as_deref(),
+            None,
+            now_ms,
+            Duration::from_secs(30),
+        ) {
+            Ok(host) => host,
+            Err(_) => return writer.finish(RunSpoolState::Failed),
+        };
+        if writer.started(host.operating_system_process_id()).is_err() {
+            let _ = host.close(crate::unix_millis().unwrap_or(now_ms));
+            return writer.finish(RunSpoolState::Failed);
+        }
+        if let Ok(mut captured) = session_capture.lock() {
+            *captured = Some(host.provider_session_id().to_owned());
+        }
+        let control = match controls.register(host.provider_session_id(), &run_id) {
+            Ok(control) => control,
+            Err(_) => {
+                let _ = host.close(crate::unix_millis().unwrap_or(now_ms));
+                return writer.finish(RunSpoolState::Failed);
+            }
+        };
+        let mut pending_steers: BTreeMap<u64, SyncSender<Result<(), SteerRefusal>>> =
+            BTreeMap::new();
+        let mut mapper = JcodeProgressMapper::new(resume_session_id.is_some());
+        writer.project(&mut mapper, host.take_events());
+        if host
+            .start_turn(&format!("{run_id}-turn"), &prompt, now_ms)
+            .is_err()
+        {
+            let _ = host.close(crate::unix_millis().unwrap_or(now_ms));
+            return writer.finish(RunSpoolState::Failed);
+        }
+
+        let mut cancellation_sent = false;
+        let final_state = 'run: loop {
+            loop {
+                match control.receiver.try_recv() {
+                    Ok(command) => {
+                        let request_id = host.soft_interrupt(
+                            &command.content,
+                            command.urgent,
+                            crate::unix_millis().unwrap_or(now_ms),
+                        );
+                        match request_id {
+                            Ok(request_id) => {
+                                pending_steers.insert(request_id, command.response);
+                            }
+                            Err(_) => {
+                                let _ = command.response.send(Err(SteerRefusal::ProviderRefused));
+                            }
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
+            let elapsed = started_at.elapsed();
+            if cancellation.is_cancelled() && !cancellation_sent {
+                cancellation_sent = true;
+                let cancelled = host.cancel(
+                    crate::unix_millis().unwrap_or(now_ms),
+                    Duration::from_millis(100),
+                );
+                writer.project(&mut mapper, host.take_events());
+                match cancelled {
+                    Ok(JcodeTurnOutcome::Cancelled | JcodeTurnOutcome::Completed(_)) => {
+                        break RunSpoolState::Cancelled;
+                    }
+                    Ok(JcodeTurnOutcome::Pending | JcodeTurnOutcome::ApprovalRequired(_)) => {}
+                    Err(_) => break RunSpoolState::Failed,
+                }
+            }
+            if elapsed >= timeout {
+                break RunSpoolState::TimedOut;
+            }
+            let outcome = host.poll_turn(
+                crate::unix_millis().unwrap_or(now_ms),
+                Duration::from_millis(100),
+            );
+            let events = host.take_events();
+            for event in &events {
+                match event {
+                    automonique_agents::JcodeEvent::Ok { reply_to } => {
+                        if let Some(response) = pending_steers.remove(reply_to) {
+                            let _ = response.send(Ok(()));
+                            writer.steered();
+                        }
+                    }
+                    automonique_agents::JcodeEvent::Error {
+                        reply_to: Some(reply_to),
+                        ..
+                    } => {
+                        if let Some(response) = pending_steers.remove(reply_to) {
+                            let _ = response.send(Err(SteerRefusal::ProviderRefused));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            writer.project(&mut mapper, events);
+            match outcome {
+                Ok(JcodeTurnOutcome::Pending) => {}
+                Ok(JcodeTurnOutcome::Completed(result)) => {
+                    if write_jcode_answer(&answer_path, result.text()).is_err() {
+                        break RunSpoolState::Failed;
+                    }
+                    break if cancellation_sent {
+                        RunSpoolState::Cancelled
+                    } else {
+                        RunSpoolState::Completed
+                    };
+                }
+                Ok(JcodeTurnOutcome::Cancelled) => break RunSpoolState::Cancelled,
+                Ok(JcodeTurnOutcome::ApprovalRequired(request)) => {
+                    let requested_at = crate::unix_millis().unwrap_or(now_ms);
+                    let (approvals, approval_key) =
+                        match approval.propose(&run_id, &request, requested_at) {
+                            Ok(proposal) => proposal,
+                            Err(()) => break RunSpoolState::Failed,
+                        };
+                    writer.approval_waiting(
+                        &approval_key,
+                        request.tool_name(),
+                        request.description(),
+                    );
+                    let (decision, forced_state) = loop {
+                        loop {
+                            match control.receiver.try_recv() {
+                                Ok(command) => {
+                                    // Provider permission is a serialized protocol pause.
+                                    // Refuse concurrent steering immediately instead of
+                                    // leaving the lease holder to time out ambiguously.
+                                    let _ =
+                                        command.response.send(Err(SteerRefusal::ProviderRefused));
+                                }
+                                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                            }
+                        }
+                        if cancellation.is_cancelled() {
+                            break (
+                                automonique_agents::PermissionDecision::Deny,
+                                Some(RunSpoolState::Cancelled),
+                            );
+                        }
+                        if started_at.elapsed() >= timeout {
+                            break (
+                                automonique_agents::PermissionDecision::Deny,
+                                Some(RunSpoolState::TimedOut),
+                            );
+                        }
+                        let record = match approvals.entry(&approval_key) {
+                            Ok(Some(record)) => record,
+                            Ok(None) | Err(_) => break 'run RunSpoolState::Failed,
+                        };
+                        match record.state {
+                            ApprovalState::Granted => {
+                                break (automonique_agents::PermissionDecision::Allow, None);
+                            }
+                            ApprovalState::Denied | ApprovalState::Expired => {
+                                break (automonique_agents::PermissionDecision::Deny, None);
+                            }
+                            ApprovalState::Pending => {
+                                std::thread::sleep(Duration::from_millis(100));
+                            }
+                        }
+                    };
+                    let decided = host.decide_permission(
+                        request.request_id(),
+                        decision,
+                        "automonique-approval",
+                        crate::unix_millis().unwrap_or(now_ms),
+                        Duration::from_millis(100),
+                    );
+                    writer.project(&mut mapper, host.take_events());
+                    if let Some(state) = forced_state {
+                        if state == RunSpoolState::Cancelled
+                            && matches!(decided, Ok(JcodeTurnOutcome::Pending))
+                        {
+                            let _ = host.cancel(
+                                crate::unix_millis().unwrap_or(now_ms),
+                                Duration::from_millis(100),
+                            );
+                            writer.project(&mut mapper, host.take_events());
+                        }
+                        break state;
+                    }
+                    match decided {
+                        Ok(JcodeTurnOutcome::Completed(result)) => {
+                            if write_jcode_answer(&answer_path, result.text()).is_err() {
+                                break RunSpoolState::Failed;
+                            }
+                            break RunSpoolState::Completed;
+                        }
+                        Ok(JcodeTurnOutcome::Cancelled) => break RunSpoolState::Cancelled,
+                        Ok(JcodeTurnOutcome::Pending | JcodeTurnOutcome::ApprovalRequired(_)) => {}
+                        Err(_) => break RunSpoolState::Failed,
+                    }
+                }
+                Err(_) => break RunSpoolState::Failed,
+            }
+        };
+        for (_, response) in pending_steers {
+            let _ = response.send(Err(SteerRefusal::SessionNotLive));
+        }
+        drop(control);
+        let final_state = if host.close(crate::unix_millis().unwrap_or(now_ms)).is_err() {
+            RunSpoolState::Failed
+        } else {
+            final_state
+        };
+        writer.finish(final_state)
+    }
+}
+
+struct JcodeSpoolWriter {
+    spool: Spool,
+    frame_run_id: FrameRunId,
+    publisher: Box<dyn ProgressPublisher>,
+    observed: ObservedSequence,
+    progress_stopped: bool,
+}
+
+impl JcodeSpoolWriter {
+    fn started(&mut self, pid: u32) -> Result<(), ()> {
+        let recorded = self
+            .spool
+            .append(
+                SpoolEventKind::Started,
+                SpoolAuthority::Authoritative,
+                format!("{STARTED_PAYLOAD_PREFIX}{pid}").as_bytes(),
+            )
+            .map_err(|_| ())?;
+        self.observed.observe(recorded.sequence());
+        Ok(())
+    }
+
+    fn approval_waiting(&mut self, key: &str, tool: &str, description: &str) {
+        let text = format!("approval {key}: {tool} — {description}");
+        let Some(text) = ProgressText::sanitized(&text) else {
+            return;
+        };
+        let Ok(body) = ProgressBody::new(
+            automonique_protocol::event::EventKind::ApprovalRequested,
+            ProgressBodyParts {
+                text: Some(text),
+                step: None,
+                retry: None,
+            },
+        ) else {
+            return;
+        };
+        if self
+            .append_frame(&CapturedFrame {
+                authority: FrameAuthority::Authoritative,
+                kind: automonique_protocol::event::EventKind::ApprovalRequested,
+                body,
+            })
+            .is_err()
+        {
+            self.stop_progress();
+        }
+    }
+
+    fn steered(&mut self) {
+        let Ok(body) = ProgressBody::new(
+            automonique_protocol::event::EventKind::TurnSteered,
+            ProgressBodyParts {
+                text: None,
+                step: None,
+                retry: None,
+            },
+        ) else {
+            return;
+        };
+        if self
+            .append_frame(&CapturedFrame {
+                authority: FrameAuthority::Authoritative,
+                kind: automonique_protocol::event::EventKind::TurnSteered,
+                body,
+            })
+            .is_err()
+        {
+            self.stop_progress();
+        }
+    }
+
+    fn project(
+        &mut self,
+        mapper: &mut JcodeProgressMapper,
+        events: Vec<automonique_agents::JcodeEvent>,
+    ) {
+        for event in events {
+            if let Some(frame) = mapper.project_event(event) {
+                if self.append_frame(&frame).is_err() {
+                    self.stop_progress();
+                }
+            }
+        }
+    }
+
+    fn stop_progress(&mut self) {
+        if self.progress_stopped {
+            return;
+        }
+        let body = ProgressBody::new(
+            automonique_protocol::event::EventKind::ProviderWarning,
+            ProgressBodyParts {
+                text: ProgressText::new(PROGRESS_BUDGET_WARNING).ok(),
+                step: None,
+                retry: RetryContext::new(RetryCategory::Internal, false, None, 1).ok(),
+            },
+        );
+        if self.spool.remaining_bytes() > PROGRESS_TERMINAL_RESERVE_BYTES
+            && let Ok(body) = body
+        {
+            let _ = self.append_frame(&CapturedFrame {
+                authority: FrameAuthority::Synthetic,
+                kind: automonique_protocol::event::EventKind::ProviderWarning,
+                body,
+            });
+        }
+        self.progress_stopped = true;
+    }
+
+    fn append_frame(&mut self, frame: &CapturedFrame) -> Result<(), ()> {
+        if self.progress_stopped {
+            return Err(());
+        }
+        let remaining = self.spool.remaining_bytes();
+        if remaining <= PROGRESS_TERMINAL_RESERVE_BYTES
+            || (frame.authority == FrameAuthority::Synthetic
+                && remaining <= PROGRESS_PREVIEW_RESERVE_BYTES)
+        {
+            return Err(());
+        }
+        let sequence = self
+            .spool
+            .status()
+            .last_sequence()
+            .checked_add(1)
+            .ok_or(())?;
+        let at_ms = crate::unix_millis().map_err(|_| ())?;
+        let payload = ProgressFrame::new(ProgressFrameParts {
+            run_id: self.frame_run_id.clone(),
+            sequence,
+            at_ms: EpochMillis::from_millis(at_ms),
+            authority: frame.authority,
+            kind: frame.kind,
+            body: frame.body.clone(),
+        })
+        .and_then(|frame| frame.to_canonical_bytes())
+        .map_err(|_| ())?;
+        let recorded = self
+            .spool
+            .append(
+                SpoolEventKind::AdapterEvent,
+                match frame.authority {
+                    FrameAuthority::Authoritative => SpoolAuthority::Authoritative,
+                    FrameAuthority::Synthetic => SpoolAuthority::Synthetic,
+                },
+                &payload,
+            )
+            .map_err(|_| ())?;
+        self.observed.observe(recorded.sequence());
+        self.publisher.publish(recorded.sequence(), &payload);
+        Ok(())
+    }
+
+    fn finish(mut self, state: RunSpoolState) -> AttemptExecution {
+        let payload = match state {
+            RunSpoolState::Completed => TERMINAL_COMPLETED,
+            RunSpoolState::Cancelled => TERMINAL_CANCELLED,
+            RunSpoolState::TimedOut => TERMINAL_TIMED_OUT,
+            RunSpoolState::Failed | RunSpoolState::Ready | RunSpoolState::Running => {
+                TERMINAL_FAILED
+            }
+        };
+        if self
+            .spool
+            .append(
+                SpoolEventKind::Terminal,
+                SpoolAuthority::Authoritative,
+                payload,
+            )
+            .is_err()
+        {
+            return AttemptExecution {
+                state: RunSpoolState::Failed,
+                last_sequence: self.observed.get(),
+            };
+        }
+        let status = self.spool.status();
+        self.observed.observe(status.last_sequence());
+        AttemptExecution {
+            state,
+            last_sequence: status.last_sequence(),
+        }
+    }
+}
+
+fn write_jcode_answer(path: &Path, text: &str) -> Result<(), ()> {
+    if text.is_empty()
+        || u64::try_from(text.len())
+            .map_or(true, |length| length > crate::compose::MAX_ANSWER_BYTES)
+    {
+        return Err(());
+    }
+    let mut options = fs::OpenOptions::new();
+    options
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options.open(path).map_err(|_| ())?;
+    file.write_all(text.as_bytes()).map_err(|_| ())?;
+    file.sync_all().map_err(|_| ())
+}
+
 impl Drop for LiveClaim {
     fn drop(&mut self) {
         if let Ok(mut live) = self.live.lock() {
@@ -1057,7 +1850,7 @@ struct Attempt {
     /// Owns the cancellation registration. Dropping it — on any path out,
     /// including a panic — releases the attempt from the host's registry.
     registration: RegistrationHandle,
-    prepared: PreparedRun,
+    prepared: PreparedAttempt,
     /// The spool position this attempt has actually reached, readable after a
     /// supervision failure has taken the report away.
     observed: ObservedSequence,
@@ -1125,22 +1918,11 @@ impl Attempt {
         // The spool was dropped inside `execute`, so its exclusive lock is
         // free by the time the row moves. That ordering is what lets the Runs
         // lane read the lifecycle of a run its listing calls terminal.
-        let (state, last_sequence) = match &report {
-            Ok(report) => (
-                spool_state(report.status().state()),
-                report.status().last_sequence(),
-            ),
-            // A supervisor failure still left exactly one terminal event in the
-            // spool — `execute` guarantees it on every path — and that event is
-            // `failed`. The row says the same rather than staying open.
-            //
-            // At *which* sequence is the question this arm used to answer with
-            // a literal 2, which assumed the spool held a `started` and a
-            // terminal and nothing else. That assumption is gone: an attempt
-            // that streamed progress reached a much higher position, and a row
-            // claiming sequence 2 would tell a reader the log ends where it does
-            // not. The supervisor publishes the position it actually reached.
-            Err(_) => (RunSpoolState::Failed, observed.get()),
+        let state = report.state;
+        let last_sequence = if report.last_sequence == 0 {
+            observed.get()
+        } else {
+            report.last_sequence
         };
         if state == RunSpoolState::Completed
             && let Ok(captured) = session_capture.lock()
@@ -1167,6 +1949,38 @@ impl Attempt {
 /// has one member and says nothing about stdout, and the program is an opaque
 /// pinned path.
 pub const PROVIDER_JSON_STREAM_ARG: &str = "--json";
+pub const JCODE_API_STDIO_ARG: &str = "api-stdio";
+pub const JCODE_INTEGRATION_MODE: &str = "jcode-api-stdio-v1";
+pub const JCODE_RESUME_ENV: &str = "AUTOMONIQUE_JCODE_SESSION_ID";
+
+fn jcode_session_mode(spec: &RunSpec) -> Result<bool, ExecuteRefusal> {
+    let declared = spec.admission().integration_mode().as_str() == JCODE_INTEGRATION_MODE;
+    let invoked = spec
+        .arguments()
+        .iter()
+        .any(|argument| argument == JCODE_API_STDIO_ARG);
+    if declared != invoked {
+        return Err(ExecuteRefusal::AdmissionRefused);
+    }
+    Ok(declared)
+}
+
+fn jcode_resume_session(spec: &RunSpec) -> Result<Option<String>, ExecuteRefusal> {
+    let Some((_, value)) = spec
+        .environment()
+        .iter()
+        .find(|(name, _)| name == JCODE_RESUME_ENV)
+    else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .filter(|value| !value.is_empty())
+        .ok_or(ExecuteRefusal::AdmissionRefused)?;
+    automonique_protocol::platform::ResourceId::new(value)
+        .map_err(|_| ExecuteRefusal::AdmissionRefused)?;
+    Ok(Some(value.to_owned()))
+}
 
 /// Whether this document's workload writes a stream this daemon can normalize.
 ///

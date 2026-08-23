@@ -134,8 +134,8 @@ export function decodeFreshnessState(value: string): FreshnessState {
   return value as FreshnessState;
 }
 
-export type PlatformAction = "approve_release" | "decide_approval" | "follow_up" | "register_node" | "start_run" | "stop_run" | "submit_job" | "submit_request";
-export const PlatformAction_VALUES: readonly PlatformAction[] = ["approve_release", "decide_approval", "follow_up", "register_node", "start_run", "stop_run", "submit_job", "submit_request"];
+export type PlatformAction = "approve_release" | "decide_approval" | "follow_up" | "register_node" | "start_run" | "steer" | "stop_run" | "submit_job" | "submit_request";
+export const PlatformAction_VALUES: readonly PlatformAction[] = ["approve_release", "decide_approval", "follow_up", "register_node", "start_run", "steer", "stop_run", "submit_job", "submit_request"];
 /** Security-sensitive: an undefined value is refused. */
 export function decodePlatformAction(value: string): PlatformAction {
   if (!(PlatformAction_VALUES as readonly string[]).includes(value)) {

@@ -530,6 +530,17 @@ impl LaunchPlan {
         Ok(self)
     }
 
+    /// Convert an admitted one-shot plan into an interactive session plan.
+    ///
+    /// The caller must retain the resolved prompt and deliver it through the
+    /// negotiated session protocol. This removes only fd-0 prompt staging; it
+    /// preserves the exact executable, argv, environment, grants and limits.
+    #[must_use]
+    pub fn into_session_plan(mut self) -> Self {
+        self.prompt = None;
+        self
+    }
+
     /// Bound the workload's open descriptors with `RLIMIT_NOFILE`.
     ///
     /// The limit counts the three standard streams the launch deliberately
@@ -959,6 +970,16 @@ impl SandboxedSession {
     }
 }
 
+impl Drop for SandboxedSession {
+    fn drop(&mut self) {
+        // A session owns a process, not merely its control socket. This is the
+        // startup-failure path as well as the caller-forgot-to-close path; in
+        // both cases leaving the child behind would outlive its journal owner.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Spawn a session-scoped workload under the same entry helper and containment
 /// policy as a one-shot launch, while retaining a full-duplex stdin/stdout
 /// stream for serialized NDJSON turns.
@@ -1168,13 +1189,16 @@ fn read_session_launch_frame() -> Result<Vec<u8>, String> {
     let terminator = format!("{FRAME_TERMINATOR}\n");
     let mut frame = Vec::new();
     let mut line = Vec::new();
-    let stdin = std::io::stdin();
-    let mut locked = stdin.lock();
     while frame.len() <= MAX_FRAME_BYTES {
         let mut byte = [0_u8; 1];
-        locked
-            .read_exact(&mut byte)
-            .map_err(|_| "plan frame unreadable".to_owned())?;
+        loop {
+            match nix::unistd::read(0, &mut byte) {
+                Ok(1) => break,
+                Ok(_) => return Err("plan frame unreadable".to_owned()),
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(_) => return Err("plan frame unreadable".to_owned()),
+            }
+        }
         frame.push(byte[0]);
         line.push(byte[0]);
         if byte[0] == b'\n' {

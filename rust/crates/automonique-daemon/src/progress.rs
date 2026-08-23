@@ -49,8 +49,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use automonique_agents::{
-    AdapterError, ExecutionMode, NormalizedEvent, ProviderEventStream, ProviderItemKind,
-    RecordedEvent, RecordedKind, RunCoordinates, StreamPolicy,
+    AdapterError, ExecutionMode, JcodeEvent, JcodeFrameDecoder, JcodeProtocolError,
+    NormalizedEvent, ProviderEventStream, ProviderItemKind, RecordedEvent, RecordedKind,
+    RunCoordinates, StreamPolicy,
 };
 use automonique_protocol::event::{
     Authority, EventKind, MemberRule, RetryCategory, RetryContext, StepStatus,
@@ -70,6 +71,7 @@ pub const PREVIEW_FLUSH_INTERVAL: Duration = Duration::from_millis(PREVIEW_FLUSH
 /// The text of the one warning a refused provider stream emits.
 pub const STREAM_REFUSED_PREFIX: &str = "progress stream refused: ";
 pub const STREAM_WARNING_TEXT: &str = "progress stream warning: malformed provider line skipped";
+pub const JCODE_STREAM_REFUSED_PREFIX: &str = "JCode progress stream refused: ";
 
 /// The shared kind one adapter record projects onto.
 ///
@@ -341,6 +343,212 @@ impl ProgressMapper for ProviderProgressMapper {
         self.project(&mut frames);
         self.flush_preview(&mut frames);
         frames
+    }
+}
+
+/// JCode protocol-v1 events projected onto the shared progress vocabulary.
+pub struct JcodeProgressMapper {
+    decoder: Option<JcodeFrameDecoder>,
+    resume: bool,
+    session_capture: Option<Arc<Mutex<Option<String>>>>,
+}
+
+impl JcodeProgressMapper {
+    #[must_use]
+    pub fn new(resume: bool) -> Self {
+        Self {
+            decoder: Some(JcodeFrameDecoder::new()),
+            resume,
+            session_capture: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_session_capture(mut self, capture: Arc<Mutex<Option<String>>>) -> Self {
+        self.session_capture = Some(capture);
+        self
+    }
+
+    fn refusal(error: &JcodeProtocolError) -> Vec<CapturedFrame> {
+        let text = format!("{JCODE_STREAM_REFUSED_PREFIX}{}", error.category());
+        let Ok(body) = ProgressBody::new(
+            EventKind::ProviderWarning,
+            ProgressBodyParts {
+                text: ProgressText::sanitized(&text),
+                step: None,
+                retry: RetryContext::new(RetryCategory::Internal, false, None, 1).ok(),
+            },
+        ) else {
+            return Vec::new();
+        };
+        vec![CapturedFrame {
+            authority: Authority::Synthetic,
+            kind: EventKind::ProviderWarning,
+            body,
+        }]
+    }
+
+    /// Project one already-decoded JCode event. Session hosts use this path so
+    /// provider bytes are parsed exactly once at the authority boundary.
+    pub fn project_event(&mut self, event: JcodeEvent) -> Option<CapturedFrame> {
+        let (kind, authority, text, step, retry) = match event {
+            JcodeEvent::HelloOk { .. } => (
+                EventKind::ProviderConnected,
+                Authority::Authoritative,
+                None,
+                None,
+                None,
+            ),
+            JcodeEvent::Attached { session_id, .. } => {
+                if let Some(capture) = self.session_capture.as_ref()
+                    && let Ok(mut captured) = capture.lock()
+                {
+                    *captured = Some(session_id);
+                }
+                (
+                    if self.resume {
+                        EventKind::SessionLoaded
+                    } else {
+                        EventKind::SessionCreated
+                    },
+                    Authority::Authoritative,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            JcodeEvent::MessageAccepted { .. } => (
+                EventKind::TurnQueued,
+                Authority::Authoritative,
+                None,
+                None,
+                None,
+            ),
+            JcodeEvent::TextDelta { text, .. } => (
+                EventKind::AssistantMessageDelta,
+                Authority::Synthetic,
+                ProgressText::sanitized(&text),
+                None,
+                None,
+            ),
+            JcodeEvent::ToolStart { name, .. } => (
+                EventKind::ToolCallStarted,
+                Authority::Authoritative,
+                ProgressText::sanitized(&name),
+                Some(StepStatus::InProgress),
+                None,
+            ),
+            JcodeEvent::ToolInputDelta { .. } => (
+                EventKind::ToolCallUpdated,
+                Authority::Authoritative,
+                None,
+                Some(StepStatus::InProgress),
+                None,
+            ),
+            JcodeEvent::ToolExec { name, .. } => (
+                EventKind::ToolCallUpdated,
+                Authority::Authoritative,
+                ProgressText::sanitized(&name),
+                Some(StepStatus::InProgress),
+                None,
+            ),
+            JcodeEvent::ToolDone { name, failed, .. } => (
+                EventKind::ToolCallCompleted,
+                Authority::Authoritative,
+                ProgressText::sanitized(&name),
+                Some(if failed {
+                    StepStatus::Error
+                } else {
+                    StepStatus::Completed
+                }),
+                None,
+            ),
+            JcodeEvent::TokenUsage { .. } => (
+                EventKind::UsageUpdated,
+                Authority::Authoritative,
+                None,
+                None,
+                None,
+            ),
+            JcodeEvent::PermissionRequest { .. } => (
+                EventKind::ApprovalRequested,
+                Authority::Authoritative,
+                None,
+                None,
+                None,
+            ),
+            JcodeEvent::SessionStatus { status, .. } => (
+                if status == "generating" {
+                    EventKind::TurnStarted
+                } else {
+                    EventKind::SessionUpdated
+                },
+                Authority::Authoritative,
+                None,
+                None,
+                None,
+            ),
+            JcodeEvent::ConnectionPhase { .. } | JcodeEvent::ModelInfo { .. } => (
+                EventKind::SessionUpdated,
+                Authority::Authoritative,
+                None,
+                None,
+                None,
+            ),
+            JcodeEvent::TurnDone { .. } => (
+                EventKind::TurnCompleted,
+                Authority::Authoritative,
+                None,
+                None,
+                None,
+            ),
+            JcodeEvent::Error { .. } => (
+                EventKind::ProviderFault,
+                Authority::Authoritative,
+                None,
+                None,
+                RetryContext::new(RetryCategory::Rejected, false, None, 1).ok(),
+            ),
+            JcodeEvent::ReasoningDelta { .. }
+            | JcodeEvent::ReasoningDone { .. }
+            | JcodeEvent::Ok { .. }
+            | JcodeEvent::Pong { .. }
+            | JcodeEvent::Unknown { .. } => return None,
+        };
+        let body = ProgressBody::new(kind, ProgressBodyParts { text, step, retry }).ok()?;
+        Some(CapturedFrame {
+            authority,
+            kind,
+            body,
+        })
+    }
+}
+
+impl ProgressMapper for JcodeProgressMapper {
+    fn push(&mut self, chunk: &[u8]) -> Vec<CapturedFrame> {
+        let Some(decoder) = self.decoder.as_mut() else {
+            return Vec::new();
+        };
+        match decoder.push(chunk) {
+            Ok(events) => events
+                .into_iter()
+                .filter_map(|event| self.project_event(event))
+                .collect(),
+            Err(error) => {
+                self.decoder = None;
+                Self::refusal(&error)
+            }
+        }
+    }
+
+    fn finish(&mut self) -> Vec<CapturedFrame> {
+        let Some(decoder) = self.decoder.take() else {
+            return Vec::new();
+        };
+        decoder
+            .finish()
+            .err()
+            .map_or_else(Vec::new, |error| Self::refusal(&error))
     }
 }
 

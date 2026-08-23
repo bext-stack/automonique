@@ -19,8 +19,8 @@ use automonique_agents::{
     ExecutionMode, ProviderItemKind, RecordedKind, RunCoordinates, SessionScope,
 };
 use automonique_daemon::progress::{
-    PREVIEW_FLUSH_BYTES, ProviderProgressMapper, STREAM_REFUSED_PREFIX, STREAM_WARNING_TEXT,
-    frame_kind, item_frame_authority, item_frame_kind,
+    JcodeProgressMapper, PREVIEW_FLUSH_BYTES, ProviderProgressMapper, STREAM_REFUSED_PREFIX,
+    STREAM_WARNING_TEXT, frame_kind, item_frame_authority, item_frame_kind,
 };
 use automonique_daemon::progress_hub::{
     HUB_ATTEMPT_FRAMES, HUB_ATTEMPTS, HUB_TERMINAL_RETENTION, ProgressHub,
@@ -340,6 +340,78 @@ mod normalization {
                 .all(|frame| frame.kind != EventKind::TurnCompleted),
             "a fragment was completed into a turn"
         );
+    }
+}
+
+mod jcode_normalization {
+    use super::*;
+
+    const JCODE_FIXTURE: &str = concat!(
+        "{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/fixture\",\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",\"permission_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}\n",
+        "{\"v\":1,\"reply_to\":2,\"ev\":\"attached\",\"session\":{\"session_id\":\"session-1\",\"status\":\"idle\"}}\n",
+        "{\"v\":1,\"ev\":\"message_accepted\",\"session_id\":\"session-1\"}\n",
+        "{\"v\":1,\"ev\":\"session_status\",\"session_id\":\"session-1\",\"status\":\"generating\"}\n",
+        "{\"v\":1,\"ev\":\"text_delta\",\"session_id\":\"session-1\",\"text\":\"hello\"}\n",
+        "{\"v\":1,\"ev\":\"tool_start\",\"session_id\":\"session-1\",\"call_id\":\"call-1\",\"name\":\"read\"}\n",
+        "{\"v\":1,\"ev\":\"tool_done\",\"session_id\":\"session-1\",\"call_id\":\"call-1\",\"name\":\"read\",\"output\":\"fixture\",\"error\":null}\n",
+        "{\"v\":1,\"ev\":\"token_usage\",\"session_id\":\"session-1\",\"input\":10,\"output\":2}\n",
+        "{\"v\":1,\"ev\":\"turn_done\",\"session_id\":\"session-1\"}\n",
+    );
+
+    #[test]
+    fn harness_v1_events_project_without_vendor_payload_leakage() {
+        let capture = Arc::new(std::sync::Mutex::new(None));
+        let mut mapper = JcodeProgressMapper::new(false).with_session_capture(Arc::clone(&capture));
+        let frames = drive_jcode(&mut mapper, JCODE_FIXTURE);
+        assert_eq!(
+            frames.iter().map(|frame| frame.kind).collect::<Vec<_>>(),
+            vec![
+                EventKind::ProviderConnected,
+                EventKind::SessionCreated,
+                EventKind::TurnQueued,
+                EventKind::TurnStarted,
+                EventKind::AssistantMessageDelta,
+                EventKind::ToolCallStarted,
+                EventKind::ToolCallCompleted,
+                EventKind::UsageUpdated,
+                EventKind::TurnCompleted,
+            ]
+        );
+        assert_eq!(capture.lock().unwrap().as_deref(), Some("session-1"));
+        assert_eq!(
+            frames[5].body.text().map(ProgressText::as_str),
+            Some("read")
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|frame| { frame.body.text().map(ProgressText::as_str) != Some("fixture") })
+        );
+        for frame in stamped(&frames) {
+            frame.to_canonical_bytes().expect("a frame encodes");
+        }
+    }
+
+    #[test]
+    fn incompatible_jcode_stream_emits_one_safe_warning() {
+        let mut mapper = JcodeProgressMapper::new(false);
+        let frames = mapper.push(b"{\"v\":2,\"ev\":\"turn_done\",\"session_id\":\"secret\"}\n");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].kind, EventKind::ProviderWarning);
+        assert_eq!(
+            frames[0].body.text().map(ProgressText::as_str),
+            Some("JCode progress stream refused: unsupported_version")
+        );
+        assert!(mapper.push(JCODE_FIXTURE.as_bytes()).is_empty());
+    }
+
+    fn drive_jcode(mapper: &mut JcodeProgressMapper, transcript: &str) -> Vec<CapturedFrame> {
+        let mut frames = Vec::new();
+        for byte in transcript.as_bytes() {
+            frames.extend(mapper.push(&[*byte]));
+        }
+        frames.extend(mapper.finish());
+        frames
     }
 }
 

@@ -671,6 +671,59 @@ impl PlatformStore {
         transaction.commit()?;
         Ok(())
     }
+
+    /// Resolve one unexpired exclusive control lease to the session it owns.
+    ///
+    /// The lease identifier is a bearer capability returned only by
+    /// `claim_control`. Steering targets this capability directly, so the
+    /// session cannot be substituted between authorization and delivery.
+    pub fn active_control(
+        &self,
+        lease: &ControlLeaseId,
+        now_ms: i64,
+    ) -> Stored<Option<ControlLease>> {
+        validate_time(now_ms)?;
+        let raw: Option<(String, String, String, String, i64, i64)> = self
+            .connection
+            .query_row(
+                "SELECT session_authority,session_kind,session_id,client_id,expires_at_ms,revision
+                 FROM platform_control_leases WHERE lease_id=?1",
+                [lease.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((authority_name, kind_name, session_id, client_id, expires_at_ms, revision_value)) =
+            raw
+        else {
+            return Ok(None);
+        };
+        if expires_at_ms <= now_ms {
+            return Ok(None);
+        }
+        let session = ResourceCoordinate::new(
+            authority(&authority_name)?,
+            kind(&kind_name)?,
+            ResourceId::new(session_id).map_err(|_| PlatformStoreError::Corrupt("session_id"))?,
+        );
+        validate_session(&session)?;
+        Ok(Some(ControlLease {
+            id: lease.clone(),
+            session,
+            client: ClientId::new(client_id)
+                .map_err(|_| PlatformStoreError::Corrupt("client_id"))?,
+            expires_at: EpochMillis::from_millis(expires_at_ms),
+            revision: revision(revision_value)?,
+        }))
+    }
 }
 
 #[derive(Debug)]

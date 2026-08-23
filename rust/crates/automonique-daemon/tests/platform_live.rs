@@ -271,6 +271,7 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
             "platform-action-decide_approval",
             "platform-action-follow_up",
             "platform-action-start_run",
+            "platform-action-steer",
             "platform-action-stop_run",
             "platform-action-submit_request",
         ]

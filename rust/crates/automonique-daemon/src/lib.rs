@@ -185,6 +185,7 @@ pub mod improvement_github;
 pub mod improvement_publish;
 pub mod improvement_worker;
 pub mod improvements;
+pub mod jcode_session_host;
 mod lease_identity;
 mod lease_time;
 pub mod local_knowledge;
@@ -236,12 +237,13 @@ const PLATFORM_MODEL_REFRESH_MILLIS: i64 = 30_000;
 /// ordinary v1 resources so strict existing clients remain wire-compatible
 /// while newer clients can build action surfaces without guessing from the
 /// generic `execute` method.
-const PLATFORM_LOCAL_ACTIONS: [PlatformAction; 5] = [
+const PLATFORM_LOCAL_ACTIONS: [PlatformAction; 6] = [
     PlatformAction::StartRun,
     PlatformAction::StopRun,
     PlatformAction::DecideApproval,
     PlatformAction::SubmitRequest,
     PlatformAction::FollowUp,
+    PlatformAction::Steer,
 ];
 
 /// Database filename inside the private product state directory.
@@ -3245,6 +3247,51 @@ impl Daemon {
     }
 
     fn refresh_platform_sessions(&mut self, now_ms: i64) -> Result<(), DaemonError> {
+        let path = self.state_dir.join(PROVIDER_JOURNAL_NAME);
+        if path.exists() {
+            let journal = ProviderJournal::open(path)
+                .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+            let sessions = journal
+                .sessions(automonique_protocol::platform::MAX_SNAPSHOT_RESOURCES)
+                .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+            for session in sessions {
+                let (freshness, summary) = match session.state {
+                    automonique_store::provider_journal::SessionState::Open => {
+                        (FreshnessState::Fresh, "open")
+                    }
+                    automonique_store::provider_journal::SessionState::Closed => {
+                        (FreshnessState::Stale, "closed")
+                    }
+                    automonique_store::provider_journal::SessionState::Lost => {
+                        (FreshnessState::Unknown, "lost")
+                    }
+                };
+                let record = ResourceRecord {
+                    resource: ResourceCoordinate::new(
+                        ResourceAuthority::Automonique,
+                        ResourceKind::Session,
+                        ResourceId::new(session.provider_session_key)
+                            .map_err(|_| DaemonError::PlatformStoreFailed("session_id_invalid"))?,
+                    ),
+                    freshness: Freshness {
+                        state: freshness,
+                        observed_at: automonique_protocol::primitives::EpochMillis::from_millis(
+                            session.closed_ms.unwrap_or(now_ms),
+                        ),
+                        revision: Revision::new(session.revision)
+                            .map_err(|_| DaemonError::PlatformStoreFailed("revision_invalid"))?,
+                    },
+                    summary: PlatformText::new(summary)
+                        .map_err(|_| DaemonError::PlatformStoreFailed("session_state_invalid"))?,
+                };
+                self.platform
+                    .upsert_resource("sessions", &record)
+                    .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+            }
+        }
+        // A retained managed binding is the authority on resumability after
+        // the attempt-scoped provider host closes. Apply it last so a normal
+        // JCode host teardown does not make a resumable session look closed.
         for session in self
             .managed_sessions
             .list()
@@ -3270,49 +3317,6 @@ impl Daemon {
                         .map_err(|_| DaemonError::PlatformStoreFailed("revision_invalid"))?,
                 },
                 summary: PlatformText::new(if session.open { "open" } else { "lost" })
-                    .map_err(|_| DaemonError::PlatformStoreFailed("session_state_invalid"))?,
-            };
-            self.platform
-                .upsert_resource("sessions", &record)
-                .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
-        }
-        let path = self.state_dir.join(PROVIDER_JOURNAL_NAME);
-        if !path.exists() {
-            return Ok(());
-        }
-        let journal = ProviderJournal::open(path)
-            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
-        let sessions = journal
-            .sessions(automonique_protocol::platform::MAX_SNAPSHOT_RESOURCES)
-            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
-        for session in sessions {
-            let (freshness, summary) = match session.state {
-                automonique_store::provider_journal::SessionState::Open => {
-                    (FreshnessState::Fresh, "open")
-                }
-                automonique_store::provider_journal::SessionState::Closed => {
-                    (FreshnessState::Stale, "closed")
-                }
-                automonique_store::provider_journal::SessionState::Lost => {
-                    (FreshnessState::Unknown, "lost")
-                }
-            };
-            let record = ResourceRecord {
-                resource: ResourceCoordinate::new(
-                    ResourceAuthority::Automonique,
-                    ResourceKind::Session,
-                    ResourceId::new(session.provider_session_key)
-                        .map_err(|_| DaemonError::PlatformStoreFailed("session_id_invalid"))?,
-                ),
-                freshness: Freshness {
-                    state: freshness,
-                    observed_at: automonique_protocol::primitives::EpochMillis::from_millis(
-                        session.closed_ms.unwrap_or(now_ms),
-                    ),
-                    revision: Revision::new(session.revision)
-                        .map_err(|_| DaemonError::PlatformStoreFailed("revision_invalid"))?,
-                },
-                summary: PlatformText::new(summary)
                     .map_err(|_| DaemonError::PlatformStoreFailed("session_state_invalid"))?,
             };
             self.platform
@@ -3489,6 +3493,7 @@ impl Daemon {
                 PlatformAction::DecideApproval => ("approval", "enum:grant|deny", "required"),
                 PlatformAction::SubmitRequest => ("node", "text", "required"),
                 PlatformAction::FollowUp => ("session", "text", "required"),
+                PlatformAction::Steer => ("control_lease", "text", "required"),
                 PlatformAction::SubmitJob
                 | PlatformAction::ApproveRelease
                 | PlatformAction::RegisterNode => continue,
@@ -3589,8 +3594,9 @@ impl Daemon {
             })
             .collect();
 
-        match model_inventory::configured_codex_catalog(&self.state_dir) {
+        match model_inventory::configured_provider_catalog(&self.state_dir) {
             model_inventory::ModelCatalogRead::Available(catalog) => {
+                let source = catalog.source.as_str();
                 let routes = model_inventory::configured_model_routes(&self.state_dir);
                 let configured_routes = [
                     routes.conversation_primary.as_str(),
@@ -3611,7 +3617,7 @@ impl Daemon {
                     );
                     let configured = configured_routes.contains(&model.id.as_str());
                     let summary = format!(
-                        "source=codex_model_list; scope=configured_account; available=true; default={}; configured_route={configured}",
+                        "source={source}; scope=configured_account; available=true; default={}; configured_route={configured}",
                         model.is_default
                     );
                     self.upsert_platform_observation(
@@ -3628,7 +3634,7 @@ impl Daemon {
                     self.upsert_platform_observation(
                         record.resource.clone(),
                         FreshnessState::Stale,
-                        "source=codex_model_list; scope=configured_account; available=false",
+                        &format!("source={source}; scope=configured_account; available=false"),
                         now_ms,
                     )?;
                 }
@@ -3699,6 +3705,7 @@ impl Daemon {
         if request.target.authority != ResourceAuthority::Automonique {
             return platform_refusal(ReceiptOutcome::Rejected, "authority_not_local");
         }
+        let mut steer_session_id = None;
         let authoritative_revision = match request.action {
             PlatformAction::StartRun | PlatformAction::StopRun => {
                 if request.target.kind != ResourceKind::Run {
@@ -3767,6 +3774,23 @@ impl Daemon {
                     return platform_refusal(ReceiptOutcome::Rejected, "unknown_session");
                 };
                 record.freshness.revision
+            }
+            PlatformAction::Steer => {
+                if request.target.kind != ResourceKind::ControlLease {
+                    return platform_refusal(ReceiptOutcome::Rejected, "target_kind_invalid");
+                }
+                let lease =
+                    automonique_protocol::platform::ControlLeaseId::new(request.target.id.as_str())
+                        .map_err(|_| DaemonError::ProtocolRefused("platform_control_lease_id"))?;
+                let Some(control) = self
+                    .platform
+                    .active_control(&lease, now_ms)
+                    .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?
+                else {
+                    return platform_refusal(ReceiptOutcome::Rejected, "control_lease_not_active");
+                };
+                steer_session_id = Some(control.session.id.as_str().to_owned());
+                control.revision
             }
             PlatformAction::SubmitJob
             | PlatformAction::ApproveRelease
@@ -3858,6 +3882,28 @@ impl Daemon {
                         .map(|_| ReceiptOutcome::Accepted)
                         .map_err(|error| error.category())
                 }
+            }
+            PlatformAction::Steer => {
+                let Some(parameter) = request.parameter.as_ref() else {
+                    return self.finalize_platform_rejection(
+                        request,
+                        "request_text_required",
+                        now_ms,
+                    );
+                };
+                let Some(session_id) = steer_session_id.as_deref() else {
+                    return self.finalize_platform_rejection(
+                        request,
+                        "control_lease_not_active",
+                        now_ms,
+                    );
+                };
+                self.execution
+                    .as_ref()
+                    .ok_or(crate::execute::SteerRefusal::Unavailable)
+                    .and_then(|execution| execution.steer_session(session_id, parameter.as_str()))
+                    .map(|()| ReceiptOutcome::Completed)
+                    .map_err(crate::execute::SteerRefusal::as_str)
             }
             PlatformAction::SubmitJob
             | PlatformAction::ApproveRelease

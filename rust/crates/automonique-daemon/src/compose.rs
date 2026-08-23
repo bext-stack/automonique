@@ -297,6 +297,7 @@ const COMPOSE_PATH: &str = "/usr/bin:/bin";
 /// CA directory is already a read-only grant for every provider run.
 const SCRATCHPAD_RUNTIME_BIN: &str = "/usr/bin";
 const SCRATCHPAD_RUNTIME_LIB: &str = "/usr/lib";
+const JCODE_NULL_DEVICE: &str = "/dev/null";
 const SCRATCHPAD_RUNTIME_SHARE: &str = "/usr/share";
 
 /// Why a task could not be composed into a document.
@@ -406,10 +407,29 @@ impl std::error::Error for ComposeRefusal {}
 /// program the owner already chose to execute what to do.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderConfig {
+    engine: ProviderEngine,
     binary: PathBuf,
     home: PathBuf,
     version: String,
     argv: Vec<String>,
+}
+
+/// Protocol owner behind one configured executable. Omitted legacy configs
+/// remain the explicitly supported Codex fallback; production JCode configs
+/// opt into its supervised harness protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderEngine {
+    Codex,
+    Jcode,
+}
+
+impl ProviderEngine {
+    const fn integration_mode(self) -> &'static str {
+        match self {
+            Self::Codex => "codex-jsonl",
+            Self::Jcode => "jcode-api-stdio-v1",
+        }
+    }
 }
 
 impl ProviderConfig {
@@ -434,6 +454,7 @@ impl ProviderConfig {
         let mut binary: Option<PathBuf> = None;
         let mut home: Option<PathBuf> = None;
         let mut version: Option<String> = None;
+        let mut engine: Option<ProviderEngine> = None;
         let mut argv: Vec<String> = Vec::new();
         for line in text.lines() {
             let line = line.trim();
@@ -446,6 +467,17 @@ impl ProviderConfig {
                 return Err(rejected());
             }
             let slot = match key.trim() {
+                "engine" => {
+                    let parsed = match value {
+                        "codex" => ProviderEngine::Codex,
+                        "jcode" => ProviderEngine::Jcode,
+                        _ => return Err(rejected()),
+                    };
+                    if engine.replace(parsed).is_some() {
+                        return Err(rejected());
+                    }
+                    continue;
+                }
                 "binary" => &mut binary,
                 "home" => &mut home,
                 "version" => {
@@ -469,13 +501,25 @@ impl ProviderConfig {
         }
         let binary = binary.ok_or_else(rejected)?;
         let home = home.ok_or_else(rejected)?;
+        let engine = engine.unwrap_or(ProviderEngine::Codex);
         let argv = if argv.is_empty() {
+            if engine == ProviderEngine::Jcode {
+                return Err(rejected());
+            }
             DEFAULT_ARGV.iter().map(|arg| (*arg).to_owned()).collect()
         } else {
             // A run whose invocation never names the answer file can never
             // reply, so an override that omits it is a configuration error
             // rather than a provider that happens to say nothing.
-            if !argv.iter().any(|arg| arg.contains(ANSWER_PLACEHOLDER)) {
+            if engine == ProviderEngine::Codex
+                && !argv.iter().any(|arg| arg.contains(ANSWER_PLACEHOLDER))
+            {
+                return Err(rejected());
+            }
+            if engine == ProviderEngine::Jcode
+                && (!argv.iter().any(|arg| arg == "api-stdio")
+                    || argv.iter().any(|arg| arg.contains(ANSWER_PLACEHOLDER)))
+            {
                 return Err(rejected());
             }
             argv
@@ -492,6 +536,7 @@ impl ProviderConfig {
             }
         }
         Ok(Some(Self {
+            engine,
             binary,
             home,
             version: version.unwrap_or_else(|| String::from("provider")),
@@ -503,6 +548,11 @@ impl ProviderConfig {
     #[must_use]
     pub fn binary(&self) -> &Path {
         &self.binary
+    }
+
+    #[must_use]
+    pub const fn engine(&self) -> ProviderEngine {
+        self.engine
     }
 
     /// The provider's isolated home directory, granted read-write.
@@ -827,12 +877,18 @@ fn document(parts: &DocumentParts<'_>) -> Result<Vec<u8>, ComposeRefusal> {
             parts.answer,
             parts.profile,
             parts.managed_session,
+            parts.provider.engine(),
         ),
         // Opaque by construction: the resolution is the workspace registry's,
         // and this daemon is the registry. What it resolves to is
         // `run_workspace`, which is what the argv above already names.
         cwd_token: CwdToken::new(format!("{}-cwd", parts.run_id)).map_err(rejected)?,
-        environment: environment(home, parts.workspace),
+        environment: environment(
+            home,
+            parts.workspace,
+            parts.provider.engine(),
+            parts.managed_session,
+        ),
         // The transport, not the bytes. `execute` reads the slot and hands the
         // bytes to admission, which delivers them on the workload's stdin —
         // which is what `exec -` reads its prompt from.
@@ -854,7 +910,7 @@ fn document(parts: &DocumentParts<'_>) -> Result<Vec<u8>, ComposeRefusal> {
         .map_err(rejected)?,
         provider_binary: parts.provider_binary.clone(),
         sandbox: sandbox(parts, home)?,
-        admission: admission_fields(),
+        admission: admission_fields(parts.provider.engine()),
     })
     .map_err(rejected)?;
     spec.to_canonical_bytes().map_err(rejected)
@@ -873,6 +929,7 @@ fn argv(
     answer: &str,
     profile: ProviderRunProfile,
     managed_session: Option<ManagedSessionMode<'_>>,
+    engine: ProviderEngine,
 ) -> Vec<OsString> {
     let mut arguments: Vec<OsString> = configured
         .iter()
@@ -884,14 +941,14 @@ fn argv(
             )
         })
         .collect();
-    match managed_session {
-        Some(ManagedSessionMode::New) => {
+    match (engine, managed_session) {
+        (ProviderEngine::Codex, Some(ManagedSessionMode::New)) => {
             arguments.retain(|argument| argument != "--ephemeral");
             if !arguments.iter().any(|argument| argument == "--json") {
                 arguments.push(OsString::from(crate::execute::PROVIDER_JSON_STREAM_ARG));
             }
         }
-        Some(ManagedSessionMode::Resume(session_id)) => {
+        (ProviderEngine::Codex, Some(ManagedSessionMode::Resume(session_id))) => {
             let sandbox = configured
                 .windows(2)
                 .find(|pair| pair[0] == "-s")
@@ -919,7 +976,7 @@ fn argv(
             ]);
             arguments = resumed;
         }
-        None => {}
+        (ProviderEngine::Codex, None) | (ProviderEngine::Jcode, _) => {}
     }
     if arguments.first().is_some_and(|arg| arg == "exec")
         && profile == ProviderRunProfile::WebResearch
@@ -981,9 +1038,25 @@ fn argv(
 /// [`automonique_runner::admission::AdmittedLaunch::with_broker`] to this run's
 /// own broker, and a document that bound either itself would be refused a
 /// broker outright — a plan refuses one name bound twice.
-fn environment(home: &str, workspace: &str) -> Vec<(OsString, OsString)> {
-    vec![
-        (OsString::from("CODEX_HOME"), OsString::from(home)),
+fn environment(
+    home: &str,
+    workspace: &str,
+    engine: ProviderEngine,
+    managed_session: Option<ManagedSessionMode<'_>>,
+) -> Vec<(OsString, OsString)> {
+    let mut environment = vec![
+        (
+            OsString::from(match engine {
+                ProviderEngine::Codex => "CODEX_HOME",
+                ProviderEngine::Jcode => "JCODE_HOME",
+            }),
+            OsString::from(home),
+        ),
+        // Admission clears the ambient environment, including
+        // XDG_RUNTIME_DIR. Keep JCode's shared server socket beneath the same
+        // already-authorized private home instead of letting it fall back to
+        // an ungranted host /tmp path.
+        (OsString::from("JCODE_RUNTIME_DIR"), OsString::from(home)),
         // Provider-neutral coordinate used by small contained adapters. The
         // credential remains a file below this already-granted home; no secret
         // is copied into the environment or the run document.
@@ -998,7 +1071,19 @@ fn environment(home: &str, workspace: &str) -> Vec<(OsString, OsString)> {
         (OsString::from("TERM"), OsString::from("dumb")),
         (OsString::from("SSL_CERT_FILE"), OsString::from(CA_BUNDLE)),
         (OsString::from("SSL_CERT_DIR"), OsString::from(CA_DIRECTORY)),
-    ]
+    ];
+    if engine == ProviderEngine::Codex {
+        environment.retain(|(name, _)| name != "JCODE_RUNTIME_DIR");
+    }
+    if engine == ProviderEngine::Jcode
+        && let Some(ManagedSessionMode::Resume(session_id)) = managed_session
+    {
+        environment.push((
+            OsString::from("AUTOMONIQUE_JCODE_SESSION_ID"),
+            OsString::from(session_id),
+        ));
+    }
+    environment
 }
 
 /// The sandbox this composition declares.
@@ -1025,7 +1110,7 @@ fn sandbox(parts: &DocumentParts<'_>, home: &str) -> Result<SandboxSpec, Compose
         // document naming either again would collide, because two grants for
         // one path have no single meaning. What is left is the provider's own
         // home and the CA trust store.
-        path_grants: scratchpad_path_grants(parts.profile, home)?,
+        path_grants: scratchpad_path_grants(parts.profile, parts.provider.engine(), home)?,
         // Named execution allowlists remain empty because this launch has no
         // registry that maps those names. Exact executable authority is carried
         // by the provider path plus any explicit read_execute path grants.
@@ -1078,18 +1163,39 @@ fn sandbox(parts: &DocumentParts<'_>, home: &str) -> Result<SandboxSpec, Compose
 /// admission from the run's opaque workspace registration.
 fn scratchpad_path_grants(
     profile: ProviderRunProfile,
+    engine: ProviderEngine,
     home: &str,
 ) -> Result<PathGrants, ComposeRefusal> {
     let mut grants = vec![
         PathGrant::new(home, PathAccess::ReadWrite).map_err(rejected)?,
         PathGrant::new(CA_DIRECTORY, PathAccess::ReadOnly).map_err(rejected)?,
     ];
-    if profile == ProviderRunProfile::AgenticScratchpad {
+    // The installed JCode engine is dynamically linked and must start its
+    // pinned server child after Landlock is active. Codex's current fallback
+    // binary is self-contained, so this additional runtime grant belongs only
+    // to the JCode execution mode.
+    if engine == ProviderEngine::Jcode {
         grants.extend([
-            PathGrant::new(SCRATCHPAD_RUNTIME_BIN, PathAccess::ReadExecute).map_err(rejected)?,
             PathGrant::new(SCRATCHPAD_RUNTIME_LIB, PathAccess::ReadExecute).map_err(rejected)?,
-            PathGrant::new(SCRATCHPAD_RUNTIME_SHARE, PathAccess::ReadOnly).map_err(rejected)?,
+            // The contained client opens no ambient descriptors, but JCode's
+            // supervised server child deliberately directs stdout to the null
+            // device after Landlock is active.
+            PathGrant::new(JCODE_NULL_DEVICE, PathAccess::ReadWrite).map_err(rejected)?,
         ]);
+    }
+    if profile == ProviderRunProfile::AgenticScratchpad {
+        grants.push(
+            PathGrant::new(SCRATCHPAD_RUNTIME_BIN, PathAccess::ReadExecute).map_err(rejected)?,
+        );
+        if engine != ProviderEngine::Jcode {
+            grants.push(
+                PathGrant::new(SCRATCHPAD_RUNTIME_LIB, PathAccess::ReadExecute)
+                    .map_err(rejected)?,
+            );
+        }
+        grants.push(
+            PathGrant::new(SCRATCHPAD_RUNTIME_SHARE, PathAccess::ReadOnly).map_err(rejected)?,
+        );
     }
     PathGrants::declare(&grants).map_err(rejected)
 }
@@ -1118,8 +1224,9 @@ fn features_requiring(offered: &[HostFeature]) -> Result<RequiredFeatures, Compo
 /// requirement, each because it names a subsystem this build does not have. A
 /// composer that set any of them would be writing a document it knows will be
 /// refused.
-fn admission_fields() -> AdmissionFields {
-    let mode = IntegrationMode::new("native").expect("a fixed, bounded integration mode");
+fn admission_fields(engine: ProviderEngine) -> AdmissionFields {
+    let mode =
+        IntegrationMode::new(engine.integration_mode()).expect("a fixed, bounded integration mode");
     AdmissionFields::new(AdmissionFieldsParts {
         io_reservation: IoReservation::new(1024, 1024).expect("a fixed, bounded reservation"),
         workspace_reservation: WorkspaceReservation::new(8_192).expect("a fixed reservation"),
