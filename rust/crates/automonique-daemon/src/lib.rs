@@ -3385,7 +3385,7 @@ impl Daemon {
                 PlatformAction::FollowUp => ("session", "text", "required"),
                 PlatformAction::SubmitJob
                 | PlatformAction::ApproveRelease
-                | PlatformAction::RegisterNode => unreachable!(),
+                | PlatformAction::RegisterNode => continue,
             };
             let coordinate = ResourceCoordinate::new(
                 ResourceAuthority::Automonique,
