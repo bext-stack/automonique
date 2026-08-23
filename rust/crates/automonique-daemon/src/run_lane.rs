@@ -471,7 +471,10 @@ impl SocketRunLane {
             && deployments
                 .register(DeploymentRegistration {
                     deployment_id: PRIMARY_DEPLOYMENT,
-                    provider_kind: "codex",
+                    provider_kind: match provider.as_ref().map(ProviderConfig::engine) {
+                        Some(crate::compose::ProviderEngine::Jcode) => "jcode",
+                        Some(crate::compose::ProviderEngine::Codex) | None => "codex",
+                    },
                     primary_rank: Some(1),
                     context_window_rank: Some(0),
                 })
@@ -994,7 +997,10 @@ impl RunLane for SocketRunLane {
                 return QuestionRuntime::deepseek_flash(profile);
             }
         }
-        QuestionRuntime::codex(profile)
+        match self.provider.as_ref().map(ProviderConfig::engine) {
+            Some(crate::compose::ProviderEngine::Jcode) => QuestionRuntime::jcode(profile),
+            Some(crate::compose::ProviderEngine::Codex) | None => QuestionRuntime::codex(profile),
+        }
     }
 }
 

@@ -232,7 +232,8 @@ Keep these layers separate:
 The fork pins its upstream base, retains MIT notices on directly adapted files
 and passes both standalone JCode tests and Automonique semantic conformance.
 
-The deployed managed execution path consumes `SubmitRequest` and `FollowUp`
+The deployed managed execution path consumes `SubmitRequest`, `FollowUp` and
+lease-targeted `Steer`
 through Automonique's fenced scheduler and authenticated local execution lane.
 It captures the normalized provider session identifier from the event stream,
 persists the exact session-to-run binding, resumes only that binding, and

@@ -347,18 +347,21 @@ pub enum PlatformAction {
     SubmitRequest,
     /// Submit a new turn explicitly bound to one retained provider session.
     FollowUp,
+    /// Inject input into the active turn named by an exclusive control lease.
+    Steer,
     SubmitJob,
     ApproveRelease,
     RegisterNode,
 }
 
 impl PlatformAction {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::StartRun,
         Self::StopRun,
         Self::DecideApproval,
         Self::SubmitRequest,
         Self::FollowUp,
+        Self::Steer,
         Self::SubmitJob,
         Self::ApproveRelease,
         Self::RegisterNode,
@@ -371,6 +374,7 @@ impl PlatformAction {
             Self::DecideApproval => "decide_approval",
             Self::SubmitRequest => "submit_request",
             Self::FollowUp => "follow_up",
+            Self::Steer => "steer",
             Self::SubmitJob => "submit_job",
             Self::ApproveRelease => "approve_release",
             Self::RegisterNode => "register_node",
@@ -388,7 +392,8 @@ impl PlatformAction {
             | Self::StopRun
             | Self::DecideApproval
             | Self::SubmitRequest
-            | Self::FollowUp => ResourceAuthority::Automonique,
+            | Self::FollowUp
+            | Self::Steer => ResourceAuthority::Automonique,
         }
     }
 

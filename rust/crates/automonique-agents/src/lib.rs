@@ -30,12 +30,18 @@
 //! that needs the reviewed release manifest described in [`spawn_plan`].
 
 mod codex;
+mod jcode;
 mod normalize;
 pub mod spawn_plan;
 mod stream;
 mod types;
 
 pub use codex::{CodexAdapter, CodexInvocationPlan, ExecutableInspection, normalize_jsonl};
+pub use jcode::{
+    JCODE_API_VERSION, JcodeEvent, JcodeFrameDecoder, JcodeProtocolError, JcodeRequest,
+    JcodeTurnCollector, JcodeTurnResult, PermissionDecision, REQUIRED_JCODE_CAPABILITIES,
+    encode_jcode_request,
+};
 pub use spawn_plan::{
     MAX_LOADER_GRANTS, PromptDelivery, ProviderExecutable, ProviderKind, ProviderLaunchPlan,
     ProviderNetwork, ProviderSpawnRequest, SHA256_HEX_BYTES, SpawnPlanError,

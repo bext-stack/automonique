@@ -287,7 +287,9 @@ impl ObservedSequence {
         self.0.load(Ordering::Acquire)
     }
 
-    fn observe(&self, sequence: u64) {
+    /// Advance the observed durable position for a supervisor implemented by
+    /// another crate over the same spool contract.
+    pub fn observe(&self, sequence: u64) {
         self.0.store(sequence, Ordering::Release);
     }
 }

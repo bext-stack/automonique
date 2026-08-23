@@ -19,7 +19,7 @@ automonique daemon
   └─ Automonique work/session API
        └─ execution-host control protocol
             └─ automonique-runner (attempt- or session-scoped provider proxy)
-                 ├─ Jcode ACP adapter -> Jcode daemon
+                 ├─ JCode protocol-v1 adapter -> contained `jcode api-stdio`
                  ├─ Claude stream-json adapter -> Claude Code process
                  ├─ Codex app-server adapter -> Codex App Server process
                  └─ opencode HTTP/SSE adapter -> opencode server process
@@ -111,44 +111,49 @@ An adapter without an approval response channel can run only in an externally sa
 
 ## Jcode
 
-### Production target and current gap
+### Production target and rollout state
 
-The maintained JCode fork is the target production provider-execution engine.
-The ACP adapter and its execution-boundary conformance remain required before
-cutover. Until then, production uses the pinned direct Codex JSONL path as a
-degraded fallback; improving that fallback does not supersede the JCode
-integration.
+The maintained JCode fork is the production provider-execution engine target.
+Its version-one supervised stdio adapter passes local protocol and containment
+conformance. Production selection and the federated live canary remain the
+rollout gates; the direct Codex JSONL path is rollback-only during that canary.
 
 ### Preferred surface
 
-Run `jcode acp --socket <explicit-socket>` as the runner's ACP bridge to the already managed Jcode daemon. The installed command explicitly describes this adapter as backed by the Jcode daemon. ACP is preferred over Jcode's debug socket because ACP is the public interoperability boundary; the debug socket remains diagnostics-only.
+Run the exact configured binary as `jcode api-stdio` inside the same
+attempt-scoped sandbox and cgroup as the provider turn. Automonique owns the
+process, protocol stream, session journal, approval bridge, controller queues
+and termination. JCode may supervise its internal server child only inside
+that same execution boundary; no shared external daemon or debug socket is a
+production dependency.
 
-The Jcode daemon lifecycle is separate from Automonique:
-
-- `jcode server start` ensures it exists;
-- `jcode server reload --json` performs Jcode's own graceful handoff;
-- `jcode server stop` is never part of ordinary Automonique reload;
-- Automonique records daemon socket identity, version and reload generation where exposed.
-
-The ACP bridge is not itself a sandbox boundary. Before a shared Jcode daemon is eligible for more than one tenant, provider account or workspace context, the integration must attest where tool processes execute and prove that every session is immutably bound to the requested UID, canonical workspace, filesystem/network policy, credential set and cgroup. If Jcode cannot enforce and expose that binding, Automonique runs a dedicated daemon per compatible security context (or restricts the shared daemon to one trusted tenant with a no-tools/read-only profile). Sandboxing only the ACP bridge while an external daemon executes tools elsewhere is forbidden.
+The adapter negotiates protocol version one and a closed capability set before
+opening or attaching a session. It uses newline-delimited typed requests and
+events over inherited stdio, with bounded frames and no terminal scraping.
+Every process, session, turn, provider request and terminal settlement is
+committed to the provider journal before it is projected.
 
 ### Integration work
 
-- Implement ACP initialize/capability negotiation and pin the observed protocol.
-- Prove new/load session, prompt, streaming updates, permission requests and cancel.
-- Bind each Automonique session key to a Jcode session ID and daemon socket identity.
-- Persist and verify the daemon's tenant/account/workspace security-context hash and boot/reload identity before create, load or resume.
-- Reconnect the ACP bridge after Jcode daemon reload and reconcile the active session.
-- Project `version --json`, `auth status`, `model list`, `usage --json` and daemon/socket canary into Automonique health.
-- Preserve provider, provider profile, model, tool profile, explicit tool allow/deny lists and remote cwd.
-- Test Jcode reload while the runner, Automonique reload and an agent turn overlap.
-- Test cross-tenant/cross-workspace resume rejection and prove daemon-spawned tool descendants remain in the declared execution boundary or an equivalently enforced dedicated daemon unit.
+- Pin the executable digest, reported build revision and protocol version.
+- Prove create/attach, prompt, streaming, exact resume, permission response,
+  lease-authorized steering, cancellation and terminal settlement.
+- Bind each Automonique session key to the exact JCode session ID and contained
+  process identity; a mismatched resume fails closed.
+- Project fixed read-only `model list --json`, `provider current --json` and
+  `usage --json` results without account identity or credentials.
+- Reject duplicate, reordered, cross-session or post-terminal records unless
+  the journal can reconcile them deterministically.
+- Prove every JCode descendant remains inside the declared execution boundary
+  and that close/cancel leaves no process, control queue or ambiguous request.
 
 ### Fallback
 
-Use `jcode run --ndjson --quiet --no-update` only after a native ACP conformance failure is classified as safely degradable. Deliver the message through a protected non-argv mechanism if/when Jcode exposes one; until then the existing private argv file is a compatibility mechanism with explicit size and ownership checks.
-
-Fallback loses live ACP control and may have weaker replay/adoption. Automonique must display the degraded mode in its dashboard and TUI and reject jobs that require unsupported steering/approval behavior.
+No JCode terminal, `run --ndjson`, shared-daemon or debug-socket fallback may
+claim production equivalence. During the canary only, the separately pinned
+direct Codex JSONL compatibility path may handle explicitly eligible work and
+must report its reduced capability set. It is removed from production
+selection once the JCode live vertical slice passes.
 
 ## Claude Code
 

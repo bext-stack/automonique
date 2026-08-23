@@ -2465,10 +2465,10 @@ impl WebIntegration {
 }
 
 fn model_capability_answer(state_dir: &Path) -> ModelCapabilityAnswer {
-    use automonique_daemon::model_inventory::configured_codex_catalog;
+    use automonique_daemon::model_inventory::configured_provider_catalog;
 
     let routes = automonique_daemon::model_inventory::configured_model_routes(state_dir);
-    render_model_capability_answer(routes, configured_codex_catalog(state_dir))
+    render_model_capability_answer(routes, configured_provider_catalog(state_dir))
 }
 
 fn render_model_capability_answer(
@@ -2489,6 +2489,12 @@ fn render_model_capability_answer(
     );
     match catalog {
         ModelCatalogRead::Available(catalog) => {
+            let source = match catalog.source {
+                automonique_daemon::model_inventory::ModelCatalogSource::CodexAppServer => {
+                    "Codex App Server"
+                }
+                automonique_daemon::model_inventory::ModelCatalogSource::JcodeCli => "JCode",
+            };
             let models = catalog
                 .models
                 .iter()
@@ -2502,8 +2508,8 @@ fn render_model_capability_answer(
                 .collect::<Vec<_>>()
                 .join(", ");
             text.push_str(&format!(
-                "\n\nThe connected Codex account currently exposes: {models}.\n\
-                 Account-visible models are not automatically active Monique routes."
+                "\n\nThe connected provider account currently exposes: {models}.\n\
+                 Catalog source: {source}. Account-visible models are not automatically active Monique routes."
             ));
             ModelCapabilityAnswer {
                 text,
@@ -2512,7 +2518,7 @@ fn render_model_capability_answer(
         }
         ModelCatalogRead::Unavailable(_) => {
             text.push_str(
-                "\n\nThe connected Codex account’s live model catalog is temporarily unavailable. The configured routes above remain authoritative for what Monique will select.",
+                "\n\nThe connected provider account’s live model catalog is temporarily unavailable. The configured routes above remain authoritative for what Monique will select.",
             );
             ModelCapabilityAnswer {
                 text,
@@ -5730,8 +5736,8 @@ mod tests {
     #[test]
     fn dashboard_model_capability_answer_separates_routes_from_account_catalog() {
         use automonique_daemon::model_inventory::{
-            AvailableModel, CodexModelCatalog, ConfiguredModelRoutes, ModelCatalogRead,
-            ModelCatalogUnavailable,
+            AvailableModel, ConfiguredModelRoutes, ModelCatalogRead, ModelCatalogSource,
+            ModelCatalogUnavailable, ProviderModelCatalog,
         };
 
         let routes = ConfiguredModelRoutes {
@@ -5743,7 +5749,7 @@ mod tests {
         };
         let available = render_model_capability_answer(
             routes.clone(),
-            ModelCatalogRead::Available(CodexModelCatalog {
+            ModelCatalogRead::Available(ProviderModelCatalog {
                 models: vec![
                     AvailableModel {
                         id: String::from("gpt-5.6-sol"),
@@ -5754,6 +5760,7 @@ mod tests {
                         is_default: false,
                     },
                 ],
+                source: ModelCatalogSource::JcodeCli,
             }),
         );
         assert!(available.catalog_available);
@@ -5770,6 +5777,7 @@ mod tests {
         );
         assert!(available.text.contains("`gpt-5.6-sol` (default)"));
         assert!(available.text.contains("`gpt-5.6-terra`"));
+        assert!(available.text.contains("Catalog source: JCode"));
         assert!(
             available
                 .text

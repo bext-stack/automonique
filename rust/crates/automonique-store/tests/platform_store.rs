@@ -288,6 +288,18 @@ fn controller_is_exclusive_retryable_expiring_and_releasable() {
         panic!("retry must replay");
     };
     assert_eq!(replay_a, lease_a);
+    assert_eq!(
+        store
+            .active_control(&lease_a.id, 1_001)
+            .expect("active control"),
+        Some(lease_a.clone())
+    );
+    assert!(
+        store
+            .active_control(&lease_a.id, lease_a.expires_at.as_millis())
+            .expect("expired control")
+            .is_none()
+    );
 
     let key_b = IdempotencyKey::new("claim-b").expect("key");
     assert_eq!(
@@ -324,4 +336,10 @@ fn controller_is_exclusive_retryable_expiring_and_releasable() {
             lease_b.expires_at.as_millis(),
         )
         .expect("idempotent release");
+    assert!(
+        store
+            .active_control(&lease_b.id, lease_b.expires_at.as_millis() - 1)
+            .expect("released control")
+            .is_none()
+    );
 }

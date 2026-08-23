@@ -206,9 +206,9 @@ binary rule above.
 - remains operational with no daemon connected; a session-scoped host hibernates or expires only under its recorded policy;
 - never calls Slack, Telegram, GitHub, Fleet, or Support.
 
-See [Agent integrations](agent-integrations.md) for the provider-specific contracts. The target native modes are Jcode ACP backed by its reloadable daemon, Claude Code bidirectional stream JSON, Codex App Server over pinned stdio schemas, and an authenticated session-host-scoped opencode HTTP/OpenAPI/SSE server.
+See [Agent integrations](agent-integrations.md) for the provider-specific contracts. The target native modes are supervised JCode `api-stdio` protocol v1 inside the execution host, Claude Code bidirectional stream JSON, Codex App Server over pinned stdio schemas, and an authenticated session-host-scoped opencode HTTP/OpenAPI/SSE server.
 
-An active execution host is pinned to its provider executable digest, integration mode, schema hash and credential descriptors. The executable is opened/verified at launch to close selection/use races. Provider upgrades normally affect new hosts only. Jcode is the exception when its own explicit graceful daemon reload has passed compatibility checks.
+An active execution host is pinned to its provider executable digest, integration mode, schema hash and credential descriptors. The executable is opened/verified at launch to close selection/use races. Provider upgrades affect new hosts only; a live JCode process is never replaced behind an attached Automonique session.
 
 The sandbox boundary is pinned in the same way. A host records profile/policy/attestation digests and cannot gain filesystem, network, credential, tool or resource authority through a follow-up or daemon reload. Destination-aware networking uses the reviewed egress broker; seccomp is used for syscall/address-family denial, not domain allowlisting. See [Sandbox management](sandbox-management.md).
 

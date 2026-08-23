@@ -86,20 +86,31 @@ use std::time::{Duration, Instant};
 use automonique_daemon::compose::{
     ANSWER_LEAF, ANSWER_PLACEHOLDER, COMPOSE_MEMORY_BYTES, ComposeRefusal, Composition,
     CompositionInputs, DEFAULT_ARGV, ManagedSessionMode, PROVIDER_CONFIG_NAME, ProviderConfig,
-    ProviderRunProfile, QUESTION_MEMORY_BYTES, QUESTION_MODEL_CONFIG, QUESTION_REASONING_CONFIG,
-    WORKSPACE_PLACEHOLDER, compose, compose_managed, compose_with_profile,
+    ProviderEngine, ProviderRunProfile, QUESTION_MEMORY_BYTES, QUESTION_MODEL_CONFIG,
+    QUESTION_REASONING_CONFIG, WORKSPACE_PLACEHOLDER, compose, compose_managed,
+    compose_with_profile,
 };
 use automonique_daemon::execute::{
-    DAEMON_BACKEND_ID, DAEMON_WORKSPACE_REGISTRY, locate_launch_helper, offered_host_features,
-    run_workspace,
+    DAEMON_BACKEND_ID, DAEMON_WORKSPACE_REGISTRY, JCODE_INTEGRATION_MODE, JCODE_RESUME_ENV,
+    locate_launch_helper, offered_host_features, run_workspace,
 };
 use automonique_daemon::run_lane::{CONVERSATION_PROVIDER_CONFIG_NAME, SocketRunLane};
 use automonique_daemon::telegram_bridge::{QuestionProfile, QuestionRuntime, RunFailure, RunLane};
 use automonique_daemon::{Daemon, DaemonConfig, RUN_INDEX_NAME};
 use automonique_egress_broker::{BrokerConfig, EgressBroker};
 use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse};
+use automonique_protocol::approval_api::{
+    ApprovalDecision, ApprovalKey, ApprovalRequest, ApprovalResponse, DecideRequest, Decider,
+};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_protocol::digest::Sha256;
+use automonique_protocol::platform::{
+    ClaimControlRequest, ClientId, ExecuteRequest as PlatformExecuteRequest, IdempotencyKey,
+    PlatformAction, PlatformRequest, PlatformResponse, PlatformText, ReceiptOutcome,
+    ReleaseControlRequest, ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
+};
+use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
+use automonique_protocol::progress_api::ProgressFrame;
 use automonique_protocol::sandbox::{
     Digest, ExecutionBackendId, HostFeature, ImplementationDigest, PathAccess,
 };
@@ -112,6 +123,7 @@ use automonique_runner::{
     ContainmentDomain, LaunchPlan, PromptDeliveryPlan, ProtectedPromptReference, RunSpec,
     WorkspaceRegistryId,
 };
+use automonique_store::approval_requests::{ApprovalRequests, ApprovalState};
 
 const BUSYBOX: &str = "/usr/bin/busybox";
 const REQUIRE_ENFORCED_ENV: &str = "AUTOMONIQUE_REQUIRE_ENFORCED_CONTAINMENT";
@@ -559,6 +571,73 @@ fn managed_new_and_follow_up_argv_preserve_and_resume_one_exact_session() {
             "018f0000-0000-7000-8000-000000000001",
             "-",
         ]
+    );
+}
+
+#[test]
+fn jcode_composition_selects_the_supervised_protocol_and_exact_resume_binding() {
+    let fixture = Fixture::new(None, None);
+    let home = fixture.provider_home();
+    write_private(
+        &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
+        &format!(
+            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode-fixture\narg=--quiet\narg=api-stdio\n",
+            home.display()
+        ),
+    );
+    let provider = fixture.provider();
+    assert_eq!(provider.engine(), ProviderEngine::Jcode);
+    let offered = features();
+    let new = compose_managed(
+        "first JCode turn",
+        &CompositionInputs {
+            state_dir: &fixture.state_dir(),
+            run_id: "jcode-new-1",
+            provider: &provider,
+            offered_features: &offered,
+            egress_configured: true,
+        },
+        ManagedSessionMode::New,
+    )
+    .expect("new JCode session composes");
+    let new_spec = RunSpec::from_canonical_bytes(new.document()).expect("new JCode spec");
+    assert_eq!(
+        new_spec.admission().integration_mode().as_str(),
+        JCODE_INTEGRATION_MODE
+    );
+    assert!(new_spec.arguments().iter().any(|arg| arg == "api-stdio"));
+    assert!(
+        new_spec
+            .environment()
+            .iter()
+            .any(|(name, value)| name == "JCODE_HOME" && value == home.as_os_str())
+    );
+    assert!(
+        !new_spec
+            .environment()
+            .iter()
+            .any(|(name, _)| name == JCODE_RESUME_ENV)
+    );
+
+    let session = "018f0000-0000-7000-8000-000000000001";
+    let follow = compose_managed(
+        "second JCode turn",
+        &CompositionInputs {
+            state_dir: &fixture.state_dir(),
+            run_id: "jcode-follow-1",
+            provider: &provider,
+            offered_features: &offered,
+            egress_configured: true,
+        },
+        ManagedSessionMode::Resume(session),
+    )
+    .expect("JCode follow-up composes");
+    let follow_spec = RunSpec::from_canonical_bytes(follow.document()).expect("follow-up spec");
+    assert_eq!(follow_spec.arguments(), new_spec.arguments());
+    assert!(
+        follow_spec.environment().iter().any(|(name, value)| {
+            name == JCODE_RESUME_ENV && value.to_string_lossy() == session
+        })
     );
 }
 
@@ -1014,6 +1093,18 @@ fn exchange(config: &DaemonConfig, payload: &[u8]) -> Vec<u8> {
     payload.to_vec()
 }
 
+fn platform(config: &DaemonConfig, label: &str, request: PlatformRequest) -> PlatformResponse {
+    let request_id = RequestId::new(label).expect("request ID");
+    let payload = PlatformRequestMessage::new(request_id.clone(), request)
+        .to_message()
+        .expect("platform request")
+        .to_canonical_bytes();
+    let response = PlatformResponseMessage::from_canonical_bytes(&exchange(config, &payload))
+        .expect("platform response");
+    assert_eq!(response.request_id(), &request_id);
+    response.response().clone()
+}
+
 /// A fixture whose provider is busybox running `argv`, with a destination policy
 /// pointing at one unused loopback port.
 fn contained_fixture(argv: &[String]) -> Fixture {
@@ -1094,6 +1185,497 @@ fn a_contained_run_answers_through_the_real_lane() {
         "operator content must not outlive the run that consumed it"
     );
 
+    serving.shutdown(&fixture.config);
+}
+
+#[test]
+fn a_contained_jcode_protocol_turn_answers_through_the_production_lane() {
+    let test = "a_contained_jcode_protocol_turn_answers_through_the_production_lane";
+    if let Some(reason) = first_failing_gate() {
+        not_proven(test, reason);
+        return;
+    }
+    let fixture = Fixture::new(
+        None,
+        Some(&format!("127.0.0.1 {} loopback\n", unused_loopback_port())),
+    );
+    let home = fixture.provider_home();
+    let script = concat!(
+        "IFS= read -r request; printf '%s\\n' '",
+        "{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/production-fixture\",",
+        "\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",",
+        "\"permission_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}'; ",
+        "IFS= read -r request; printf '%s\\n' '",
+        "{\"v\":1,\"reply_to\":2,\"ev\":\"attached\",\"session\":{\"session_id\":\"jcode-production-session\",\"status\":\"idle\"}}'; ",
+        "IFS= read -r request; printf '%s\\n' ",
+        "'{\"v\":1,\"ev\":\"message_accepted\",\"session_id\":\"jcode-production-session\"}' ",
+        "'{\"v\":1,\"ev\":\"session_status\",\"session_id\":\"jcode-production-session\",\"status\":\"generating\"}' ",
+        "'{\"v\":1,\"ev\":\"text_delta\",\"session_id\":\"jcode-production-session\",\"text\":\"JCODE-PRODUCTION-OK\"}' ",
+        "'{\"v\":1,\"ev\":\"token_usage\",\"session_id\":\"jcode-production-session\",\"input\":4,\"output\":1}' ",
+        "'{\"v\":1,\"ev\":\"turn_done\",\"session_id\":\"jcode-production-session\"}'; ",
+        "while IFS= read -r request; do :; done"
+    );
+    write_private(
+        &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
+        &format!(
+            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode-production-fixture\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
+            home.display()
+        ),
+    );
+
+    let serving = serve(&fixture.config);
+    let mut lane = open_lane(&fixture);
+    assert_eq!(
+        with_deadline(&mut lane, "exercise the JCode protocol"),
+        "JCODE-PRODUCTION-OK"
+    );
+    let sessions = automonique_daemon::managed_sessions::ManagedSessionStore::open(
+        fixture
+            .state_dir()
+            .join(automonique_daemon::MANAGED_SESSIONS_NAME),
+    )
+    .expect("managed sessions");
+    let observed = sessions
+        .by_id("jcode-production-session")
+        .expect("session lookup")
+        .expect("JCode session retained");
+    assert_eq!(observed.provider_session_id, "jcode-production-session");
+    serving.shutdown(&fixture.config);
+}
+
+#[test]
+fn a_jcode_provider_permission_waits_for_the_durable_operator_decision() {
+    let test = "a_jcode_provider_permission_waits_for_the_durable_operator_decision";
+    if let Some(reason) = first_failing_gate() {
+        not_proven(test, reason);
+        return;
+    }
+    let fixture = Fixture::new(
+        None,
+        Some(&format!("127.0.0.1 {} loopback\n", unused_loopback_port())),
+    );
+    let home = fixture.provider_home();
+    let script = concat!(
+        "IFS= read -r request; printf '%s\\n' '",
+        "{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/approval-fixture\",",
+        "\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",",
+        "\"permission_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}'; ",
+        "IFS= read -r request; printf '%s\\n' '",
+        "{\"v\":1,\"reply_to\":2,\"ev\":\"attached\",\"session\":{\"session_id\":\"jcode-approval-session\",\"status\":\"idle\"}}'; ",
+        "IFS= read -r request; printf '%s\\n' ",
+        "'{\"v\":1,\"ev\":\"message_accepted\",\"session_id\":\"jcode-approval-session\"}' ",
+        "'{\"v\":1,\"ev\":\"permission_request\",\"session_id\":\"jcode-approval-session\",\"request_id\":\"permission-1\",\"tool_name\":\"write\",\"description\":\"write the approved fixture\"}'; ",
+        "IFS= read -r request; printf '%s\\n' ",
+        "'{\"v\":1,\"reply_to\":4,\"ev\":\"ok\"}' ",
+        "'{\"v\":1,\"ev\":\"text_delta\",\"session_id\":\"jcode-approval-session\",\"text\":\"JCODE-APPROVAL-OK\"}' ",
+        "'{\"v\":1,\"ev\":\"turn_done\",\"session_id\":\"jcode-approval-session\"}'; ",
+        "while IFS= read -r request; do :; done"
+    );
+    write_private(
+        &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
+        &format!(
+            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode-approval-fixture\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
+            home.display()
+        ),
+    );
+
+    let serving = serve(&fixture.config);
+    let mut lane = open_lane(&fixture);
+    let run = std::thread::spawn(move || lane.run("exercise durable provider approval"));
+    let approvals_path = fixture
+        .state_dir()
+        .join(automonique_daemon::APPROVAL_REQUESTS_NAME);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let request_key = loop {
+        let approvals = ApprovalRequests::open(&approvals_path).expect("approval requests open");
+        let pending = approvals.pending(8).expect("pending approvals");
+        if let Some(record) = pending
+            .into_iter()
+            .find(|record| record.state == ApprovalState::Pending)
+        {
+            break record.request_key;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "provider approval was not projected"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let decision = ApprovalRequest::DecideRequest {
+        request_id: RequestId::new("provider-approval-decision").expect("request ID"),
+        decision: DecideRequest::new(
+            ApprovalKey::new(request_key).expect("approval key"),
+            ApprovalDecision::Granted,
+            Decider::new("test-operator").expect("decider"),
+        ),
+    };
+    let response = ApprovalResponse::from_canonical_bytes(&exchange(
+        &fixture.config,
+        &decision
+            .to_message()
+            .expect("approval request")
+            .to_canonical_bytes(),
+    ))
+    .expect("approval response");
+    assert!(matches!(response, ApprovalResponse::Recorded { .. }));
+    assert_eq!(
+        run.join().expect("run thread").expect("approved run"),
+        "JCODE-APPROVAL-OK"
+    );
+    serving.shutdown(&fixture.config);
+}
+
+#[test]
+fn a_live_jcode_turn_cancels_through_the_production_control_lane() {
+    let test = "a_live_jcode_turn_cancels_through_the_production_control_lane";
+    if let Some(reason) = first_failing_gate() {
+        not_proven(test, reason);
+        return;
+    }
+    let fixture = Fixture::new(
+        None,
+        Some(&format!("127.0.0.1 {} loopback\n", unused_loopback_port())),
+    );
+    let home = fixture.provider_home();
+    let script = concat!(
+        "IFS= read -r request; printf '%s\\n' '",
+        "{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/cancel-fixture\",",
+        "\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",",
+        "\"permission_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}'; ",
+        "IFS= read -r request; printf '%s\\n' '",
+        "{\"v\":1,\"reply_to\":2,\"ev\":\"attached\",\"session\":{\"session_id\":\"jcode-cancel-session\",\"status\":\"idle\"}}'; ",
+        "IFS= read -r request; printf '%s\\n' ",
+        "'{\"v\":1,\"ev\":\"message_accepted\",\"session_id\":\"jcode-cancel-session\"}' ",
+        "'{\"v\":1,\"ev\":\"tool_start\",\"session_id\":\"jcode-cancel-session\",\"call_id\":\"tool-1\",\"name\":\"wait\"}'; ",
+        "IFS= read -r request; printf '%s\\n' ",
+        "'{\"v\":1,\"reply_to\":4,\"ev\":\"ok\"}' ",
+        "'{\"v\":1,\"ev\":\"turn_done\",\"session_id\":\"jcode-cancel-session\"}'; ",
+        "while IFS= read -r request; do :; done"
+    );
+    write_private(
+        &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
+        &format!(
+            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode-cancel-fixture\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
+            home.display()
+        ),
+    );
+
+    let serving = serve(&fixture.config);
+    let mut run_lane = open_lane(&fixture);
+    let run = std::thread::spawn(move || run_lane.run("wait until cancelled"));
+    let index =
+        automonique_store::run_index::RunIndex::open(fixture.state_dir().join(RUN_INDEX_NAME))
+            .expect("run index");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let run_id =
+        loop {
+            let page = index.page(0, 8).expect("run page");
+            if let Some(record) = page.entries.into_iter().find(|record| {
+                record.spool_state == automonique_store::run_index::RunSpoolState::Ready
+            }) {
+                break record.run_id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "JCode turn did not become cancellable"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+    let events = fixture
+        .state_dir()
+        .join("runs")
+        .join(&run_id)
+        .join("spool")
+        .join("events.ndjson");
+    while std::fs::read_to_string(&events)
+        .map(|text| text.lines().count())
+        .unwrap_or_default()
+        < 5
+    {
+        assert!(
+            Instant::now() < deadline,
+            "JCode turn did not reach its live tool event"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut control = open_lane(&fixture);
+    control
+        .cancel_run(&run_id, "jcode-cancel-test-1")
+        .expect("cancellation delivered");
+    assert_eq!(run.join().expect("run thread"), Err(RunFailure::Cancelled));
+    let mut journal = automonique_store::provider_journal::ProviderJournal::open(
+        fixture
+            .state_dir()
+            .join(automonique_daemon::PROVIDER_JOURNAL_NAME),
+    )
+    .expect("provider journal");
+    let recovered = journal
+        .recover_attempt(&format!("{run_id}-attempt"))
+        .expect("recover JCode attempt");
+    let session = recovered.session.expect("provider session was opened");
+    let turns = journal
+        .session_turns(session.session_id)
+        .expect("provider turns");
+    assert!(
+        turns
+            .iter()
+            .any(|turn| turn.state == automonique_store::provider_journal::TurnState::Aborted),
+        "the cancellation must abort an actual JCode turn"
+    );
+    serving.shutdown(&fixture.config);
+}
+
+#[test]
+fn a_control_lease_steers_the_live_jcode_turn_and_nothing_after_it() {
+    let test = "a_control_lease_steers_the_live_jcode_turn_and_nothing_after_it";
+    if let Some(reason) = first_failing_gate() {
+        not_proven(test, reason);
+        return;
+    }
+    let fixture = Fixture::new(
+        None,
+        Some(&format!("127.0.0.1 {} loopback\n", unused_loopback_port())),
+    );
+    let home = fixture.provider_home();
+    let script = concat!(
+        "IFS= read -r request; printf '%s\\n' '",
+        "{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/steer-fixture\",",
+        "\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",",
+        "\"permission_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}'; ",
+        "IFS= read -r request; printf '%s\\n' '",
+        "{\"v\":1,\"reply_to\":2,\"ev\":\"attached\",\"session\":{\"session_id\":\"jcode-steer-session\",\"status\":\"idle\"}}'; ",
+        "IFS= read -r request; printf '%s\\n' ",
+        "'{\"v\":1,\"ev\":\"message_accepted\",\"session_id\":\"jcode-steer-session\"}' ",
+        "'{\"v\":1,\"ev\":\"tool_start\",\"session_id\":\"jcode-steer-session\",\"call_id\":\"tool-1\",\"name\":\"wait-for-steer\"}'; ",
+        "IFS= read -r request; case \"$request\" in ",
+        "*'\"req\":\"soft_interrupt\"'*'\"content\":\"replace-the-answer\"'*) : ;; ",
+        "*) exit 19 ;; esac; ",
+        "printf '%s\\n' ",
+        "'{\"v\":1,\"reply_to\":4,\"ev\":\"ok\"}' ",
+        "'{\"v\":1,\"ev\":\"tool_done\",\"session_id\":\"jcode-steer-session\",\"call_id\":\"tool-1\",\"name\":\"wait-for-steer\"}' ",
+        "'{\"v\":1,\"ev\":\"text_delta\",\"session_id\":\"jcode-steer-session\",\"text\":\"JCODE-STEERED-OK\"}' ",
+        "'{\"v\":1,\"ev\":\"turn_done\",\"session_id\":\"jcode-steer-session\"}'; ",
+        "while IFS= read -r request; do :; done"
+    );
+    write_private(
+        &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
+        &format!(
+            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode-steer-fixture\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
+            home.display()
+        ),
+    );
+
+    let serving = serve(&fixture.config);
+    let mut run_lane = open_lane(&fixture);
+    let run = std::thread::spawn(move || run_lane.run("wait for corrected live input"));
+    let index =
+        automonique_store::run_index::RunIndex::open(fixture.state_dir().join(RUN_INDEX_NAME))
+            .expect("run index");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let run_id =
+        loop {
+            let page = index.page(0, 8).expect("run page");
+            if let Some(record) = page.entries.into_iter().find(|record| {
+                record.spool_state == automonique_store::run_index::RunSpoolState::Ready
+            }) {
+                break record.run_id;
+            }
+            assert!(Instant::now() < deadline, "JCode turn did not become live");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+    let events = fixture
+        .state_dir()
+        .join("runs")
+        .join(&run_id)
+        .join("spool")
+        .join("events.ndjson");
+    while std::fs::read_to_string(&events)
+        .map(|text| text.lines().count())
+        .unwrap_or_default()
+        < 5
+    {
+        assert!(
+            Instant::now() < deadline,
+            "JCode turn did not reach its live tool event"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let session = ResourceCoordinate::new(
+        ResourceAuthority::Automonique,
+        ResourceKind::Session,
+        ResourceId::new("jcode-steer-session").expect("session ID"),
+    );
+    let client = ClientId::new("jcode-steer-client").expect("client ID");
+    let PlatformResponse::ControlClaimed(lease) = platform(
+        &fixture.config,
+        "jcode-steer-claim",
+        PlatformRequest::ClaimControl(ClaimControlRequest {
+            session: session.clone(),
+            client: client.clone(),
+            idempotency_key: IdempotencyKey::new("jcode-steer-claim-1").expect("claim key"),
+        }),
+    ) else {
+        panic!("live JCode session must grant control")
+    };
+    let lease_target = ResourceCoordinate::new(
+        ResourceAuthority::Automonique,
+        ResourceKind::ControlLease,
+        ResourceId::new(lease.id.as_str()).expect("lease resource ID"),
+    );
+    let PlatformResponse::Receipt(receipt) = platform(
+        &fixture.config,
+        "jcode-steer-execute",
+        PlatformRequest::Execute(
+            PlatformExecuteRequest::new(
+                PlatformAction::Steer,
+                lease_target.clone(),
+                IdempotencyKey::new("jcode-steer-execute-1").expect("steer key"),
+                Some(lease.revision),
+                Some(PlatformText::new("replace-the-answer").expect("steer text")),
+            )
+            .expect("steer action"),
+        ),
+    ) else {
+        panic!("accepted steer must return its durable receipt")
+    };
+    assert_eq!(receipt.outcome, ReceiptOutcome::Completed);
+    assert_eq!(
+        run.join().expect("run thread").expect("steered run"),
+        "JCODE-STEERED-OK"
+    );
+    let projected =
+        automonique_runner::read_events(events.parent().expect("spool directory"), &run_id)
+            .expect("verified spool events");
+    assert!(
+        projected.iter().any(|event| {
+            ProgressFrame::from_canonical_bytes(event.payload()).is_ok_and(|frame| {
+                frame.kind() == automonique_protocol::event::EventKind::TurnSteered
+                    && frame.authority() == automonique_protocol::event::Authority::Authoritative
+            })
+        }),
+        "provider acknowledgement must become an authoritative turn_steered event"
+    );
+
+    let PlatformResponse::Receipt(stale_host_receipt) = platform(
+        &fixture.config,
+        "jcode-steer-after-turn",
+        PlatformRequest::Execute(
+            PlatformExecuteRequest::new(
+                PlatformAction::Steer,
+                lease_target.clone(),
+                IdempotencyKey::new("jcode-steer-execute-2").expect("steer key"),
+                Some(lease.revision),
+                Some(PlatformText::new("must-not-be-delivered").expect("steer text")),
+            )
+            .expect("post-turn steer action"),
+        ),
+    ) else {
+        panic!("a post-turn steer must be durably rejected")
+    };
+    assert_eq!(stale_host_receipt.outcome, ReceiptOutcome::Rejected);
+    assert_eq!(
+        stale_host_receipt
+            .explanation
+            .as_ref()
+            .map(PlatformText::as_str),
+        Some("session_not_live")
+    );
+
+    let PlatformResponse::ControlReleased { .. } = platform(
+        &fixture.config,
+        "jcode-steer-release",
+        PlatformRequest::ReleaseControl(ReleaseControlRequest {
+            session,
+            client,
+            lease: lease.id.clone(),
+            idempotency_key: IdempotencyKey::new("jcode-steer-release-1").expect("release key"),
+        }),
+    ) else {
+        panic!("control release")
+    };
+    let PlatformResponse::Refused {
+        outcome,
+        explanation,
+    } = platform(
+        &fixture.config,
+        "jcode-steer-after-release",
+        PlatformRequest::Execute(
+            PlatformExecuteRequest::new(
+                PlatformAction::Steer,
+                lease_target,
+                IdempotencyKey::new("jcode-steer-execute-3").expect("steer key"),
+                Some(lease.revision),
+                Some(PlatformText::new("must-not-cross-released-lease").expect("steer text")),
+            )
+            .expect("released-lease steer action"),
+        ),
+    )
+    else {
+        panic!("released control must refuse steering")
+    };
+    assert_eq!(outcome, ReceiptOutcome::Rejected);
+    assert_eq!(explanation.as_str(), "control_lease_not_active");
+    serving.shutdown(&fixture.config);
+}
+
+#[test]
+fn managed_jcode_follow_up_attaches_the_exact_provider_session() {
+    let test = "managed_jcode_follow_up_attaches_the_exact_provider_session";
+    if let Some(reason) = first_failing_gate() {
+        not_proven(test, reason);
+        return;
+    }
+    let fixture = Fixture::new(
+        None,
+        Some(&format!("127.0.0.1 {} loopback\n", unused_loopback_port())),
+    );
+    let home = fixture.provider_home();
+    let script = concat!(
+        "IFS= read -r request; printf '%s\\n' '",
+        "{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/resume-fixture\",",
+        "\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",",
+        "\"permission_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}'; ",
+        "IFS= read -r request; case \"$request\" in ",
+        "*'\"req\":\"create_session\"'*) answer=JCODE-NEW-OK ;; ",
+        "*'\"req\":\"attach_session\"'*'jcode-resume-session'*) answer=JCODE-RESUME-OK ;; ",
+        "*) exit 9 ;; esac; ",
+        "printf '%s\\n' '",
+        "{\"v\":1,\"reply_to\":2,\"ev\":\"attached\",\"session\":{\"session_id\":\"jcode-resume-session\",\"status\":\"idle\"}}'; ",
+        "IFS= read -r request; printf '%s\\n' ",
+        "'{\"v\":1,\"ev\":\"message_accepted\",\"session_id\":\"jcode-resume-session\"}'; ",
+        "printf '{\"v\":1,\"ev\":\"text_delta\",\"session_id\":\"jcode-resume-session\",\"text\":\"%s\"}\\n' \"$answer\"; ",
+        "printf '%s\\n' '{\"v\":1,\"ev\":\"turn_done\",\"session_id\":\"jcode-resume-session\"}'; ",
+        "while IFS= read -r request; do :; done"
+    );
+    write_private(
+        &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
+        &format!(
+            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode-resume-fixture\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
+            home.display()
+        ),
+    );
+
+    let serving = serve(&fixture.config);
+    let mut lane = open_lane(&fixture);
+    assert_eq!(
+        lane.run_managed(
+            "managed-jcode-new-1",
+            "create the retained session",
+            ManagedSessionMode::New,
+        )
+        .expect("new managed JCode turn"),
+        "JCODE-NEW-OK"
+    );
+    assert_eq!(
+        lane.run_managed(
+            "managed-jcode-follow-1",
+            "continue the retained session",
+            ManagedSessionMode::Resume("jcode-resume-session"),
+        )
+        .expect("resumed managed JCode turn"),
+        "JCODE-RESUME-OK"
+    );
     serving.shutdown(&fixture.config);
 }
 

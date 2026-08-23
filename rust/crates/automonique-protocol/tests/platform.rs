@@ -181,6 +181,20 @@ fn every_platform_request_has_one_canonical_round_trip() {
             )
             .unwrap(),
         ),
+        PlatformRequest::Execute(
+            ExecuteRequest::new(
+                PlatformAction::Steer,
+                ResourceCoordinate::new(
+                    ResourceAuthority::Automonique,
+                    ResourceKind::ControlLease,
+                    ResourceId::new("lease-steer-1").unwrap(),
+                ),
+                IdempotencyKey::new("retry-steer-1").unwrap(),
+                Some(Revision::new(4).unwrap()),
+                Some(PlatformText::new("use the corrected input").unwrap()),
+            )
+            .unwrap(),
+        ),
         PlatformRequest::GetReceipt(GetReceiptRequest::by_id(
             ReceiptId::new("receipt-1").unwrap(),
         )),

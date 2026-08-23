@@ -467,8 +467,22 @@ impl RunContainment {
 
     /// Kill, drain, and remove the cgroup, leaving no kernel residue.
     pub fn dispose(mut self, deadline: Duration) -> Result<(), ContainmentError> {
+        let started = Instant::now();
         self.kill_and_drain(deadline)?;
-        self.remove_now()
+        // A descendant can leave `cgroup.procs` before the cgroup filesystem
+        // releases its final internal reference. A single immediate rmdir is
+        // therefore racy for short-lived supervised process trees. Retry only
+        // the bounded residue case; the same caller-supplied deadline still
+        // caps the complete disposal operation.
+        loop {
+            match self.remove_now() {
+                Ok(()) => return Ok(()),
+                Err(ContainmentError::Residue) if started.elapsed() < deadline => {
+                    std::thread::sleep(DRAIN_POLL);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn remove_now(&mut self) -> Result<(), ContainmentError> {

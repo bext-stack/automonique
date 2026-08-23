@@ -4,9 +4,9 @@
 //!
 //! Configured routes and account-visible models are deliberately separate. The
 //! route projection is credential-free and reports only models Automonique can
-//! actually select. The catalog projection asks the configured, pinned Codex
-//! App Server for its picker-visible `model/list`; it never opens an auth file
-//! and returns only bounded model identifiers.
+//! actually select. The catalog projection asks the configured, pinned
+//! provider through its documented read-only surface; it never opens an auth
+//! file and returns only bounded model identifiers.
 
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::compose::{PROVIDER_CONFIG_NAME, ProviderConfig, QUESTION_MODEL_CONFIG};
+use crate::compose::{PROVIDER_CONFIG_NAME, ProviderConfig, ProviderEngine, QUESTION_MODEL_CONFIG};
 use crate::run_lane::CONVERSATION_PROVIDER_CONFIG_NAME;
 
 const MAX_CODEX_CONFIG_BYTES: u64 = 16 * 1024;
@@ -41,8 +41,25 @@ pub struct AvailableModel {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CodexModelCatalog {
+pub struct ProviderModelCatalog {
     pub models: Vec<AvailableModel>,
+    pub source: ModelCatalogSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelCatalogSource {
+    CodexAppServer,
+    JcodeCli,
+}
+
+impl ModelCatalogSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexAppServer => "codex_model_list",
+            Self::JcodeCli => "jcode_model_list",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,7 +73,7 @@ pub enum ModelCatalogUnavailable {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ModelCatalogRead {
-    Available(CodexModelCatalog),
+    Available(ProviderModelCatalog),
     Unavailable(ModelCatalogUnavailable),
 }
 
@@ -101,7 +118,10 @@ pub fn configured_model_routes(state_dir: &Path) -> ConfiguredModelRoutes {
     let (operational_primary, operational_reasoning, operational_harness) =
         match ProviderConfig::load(&state_dir.join(PROVIDER_CONFIG_NAME)) {
             Ok(Some(provider)) => {
-                let (model, reasoning) = codex_model_config(provider.home());
+                let (model, reasoning) = match provider.engine() {
+                    ProviderEngine::Codex => codex_model_config(provider.home()),
+                    ProviderEngine::Jcode => jcode_runtime_config(&provider),
+                };
                 (
                     model.unwrap_or_else(|| String::from("configured_unknown")),
                     reasoning.unwrap_or_else(|| String::from("configured_unknown")),
@@ -130,14 +150,14 @@ pub fn configured_model_routes(state_dir: &Path) -> ConfiguredModelRoutes {
     }
 }
 
-/// Read the picker-visible model catalog from the configured Codex account.
+/// Read the picker-visible model catalog from the configured provider account.
 ///
 /// The provider binary and home come from the same owner-controlled provider
-/// configuration as execution. The child receives only the pinned App Server
-/// arguments and `CODEX_HOME`; user or model text never reaches its argv or
-/// environment.
+/// configuration as execution. The child receives only a fixed read-only
+/// invocation and its isolated provider home; user or model text never reaches
+/// its argv or environment.
 #[must_use]
-pub fn configured_codex_catalog(state_dir: &Path) -> ModelCatalogRead {
+pub fn configured_provider_catalog(state_dir: &Path) -> ModelCatalogRead {
     let provider = match ProviderConfig::load(&state_dir.join(PROVIDER_CONFIG_NAME)) {
         Ok(Some(provider)) => provider,
         Ok(None) => {
@@ -147,7 +167,10 @@ pub fn configured_codex_catalog(state_dir: &Path) -> ModelCatalogRead {
             return ModelCatalogRead::Unavailable(ModelCatalogUnavailable::ConfigurationRefused);
         }
     };
-    read_codex_catalog(&provider)
+    match provider.engine() {
+        ProviderEngine::Codex => read_codex_catalog(&provider),
+        ProviderEngine::Jcode => read_jcode_catalog(&provider),
+    }
 }
 
 fn read_codex_catalog(provider: &ProviderConfig) -> ModelCatalogRead {
@@ -221,7 +244,7 @@ fn read_codex_catalog(provider: &ProviderConfig) -> ModelCatalogRead {
             }
         });
     let result = match receiver.recv_timeout(CATALOG_READ_TIMEOUT) {
-        Ok(Some(value)) => decode_catalog_response(&value),
+        Ok(Some(value)) => decode_codex_catalog_response(&value),
         Ok(None) => ModelCatalogRead::Unavailable(ModelCatalogUnavailable::InvalidResponse),
         Err(mpsc::RecvTimeoutError::Timeout) => {
             ModelCatalogRead::Unavailable(ModelCatalogUnavailable::TimedOut)
@@ -239,7 +262,7 @@ fn read_codex_catalog(provider: &ProviderConfig) -> ModelCatalogRead {
     result
 }
 
-fn decode_catalog_response(value: &Value) -> ModelCatalogRead {
+fn decode_codex_catalog_response(value: &Value) -> ModelCatalogRead {
     let Some(result) = value.get("result").and_then(Value::as_object) else {
         return ModelCatalogRead::Unavailable(ModelCatalogUnavailable::InvalidResponse);
     };
@@ -257,7 +280,11 @@ fn decode_catalog_response(value: &Value) -> ModelCatalogRead {
         let Some(entry) = entry.as_object() else {
             return ModelCatalogRead::Unavailable(ModelCatalogUnavailable::InvalidResponse);
         };
-        let Some(id) = entry.get("id").and_then(Value::as_str).and_then(safe_token) else {
+        let Some(id) = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(safe_model_id)
+        else {
             return ModelCatalogRead::Unavailable(ModelCatalogUnavailable::InvalidResponse);
         };
         if entry.get("model").and_then(Value::as_str) != Some(id.as_str())
@@ -276,7 +303,107 @@ fn decode_catalog_response(value: &Value) -> ModelCatalogRead {
     if models.iter().filter(|model| model.is_default).count() > 1 {
         return ModelCatalogRead::Unavailable(ModelCatalogUnavailable::InvalidResponse);
     }
-    ModelCatalogRead::Available(CodexModelCatalog { models })
+    ModelCatalogRead::Available(ProviderModelCatalog {
+        models,
+        source: ModelCatalogSource::CodexAppServer,
+    })
+}
+
+fn read_jcode_catalog(provider: &ProviderConfig) -> ModelCatalogRead {
+    let Some(value) = read_jcode_json(provider, &["model", "list", "--json"]) else {
+        return ModelCatalogRead::Unavailable(ModelCatalogUnavailable::ProviderRefused);
+    };
+    decode_jcode_catalog_response(&value)
+}
+
+fn decode_jcode_catalog_response(value: &Value) -> ModelCatalogRead {
+    let Some(object) = value.as_object() else {
+        return ModelCatalogRead::Unavailable(ModelCatalogUnavailable::InvalidResponse);
+    };
+    let Some(selected) = object
+        .get("selected_model")
+        .and_then(Value::as_str)
+        .and_then(safe_model_id)
+    else {
+        return ModelCatalogRead::Unavailable(ModelCatalogUnavailable::InvalidResponse);
+    };
+    let Some(entries) = object.get("models").and_then(Value::as_array) else {
+        return ModelCatalogRead::Unavailable(ModelCatalogUnavailable::InvalidResponse);
+    };
+    if entries.is_empty() || entries.len() > MAX_CATALOG_MODELS {
+        return ModelCatalogRead::Unavailable(ModelCatalogUnavailable::InvalidResponse);
+    }
+    let mut models = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(id) = entry.as_str().and_then(safe_model_id) else {
+            return ModelCatalogRead::Unavailable(ModelCatalogUnavailable::InvalidResponse);
+        };
+        if models.iter().any(|model: &AvailableModel| model.id == id) {
+            return ModelCatalogRead::Unavailable(ModelCatalogUnavailable::InvalidResponse);
+        }
+        models.push(AvailableModel {
+            is_default: id == selected,
+            id,
+        });
+    }
+    if models.iter().filter(|model| model.is_default).count() != 1 {
+        return ModelCatalogRead::Unavailable(ModelCatalogUnavailable::InvalidResponse);
+    }
+    ModelCatalogRead::Available(ProviderModelCatalog {
+        models,
+        source: ModelCatalogSource::JcodeCli,
+    })
+}
+
+fn read_jcode_json(provider: &ProviderConfig, command: &[&str]) -> Option<Value> {
+    let mut child = Command::new(provider.binary())
+        .args(["--quiet", "--no-update", "--no-selfdev"])
+        .args(command)
+        .env_clear()
+        .env("JCODE_HOME", provider.home())
+        .env("JCODE_RUNTIME_DIR", provider.home())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader = std::thread::Builder::new()
+        .name(String::from("automonique-jcode-read"))
+        .spawn(move || {
+            let mut reader = BufReader::new(stdout).take(
+                u64::try_from(MAX_CATALOG_RESPONSE_BYTES)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1),
+            );
+            let mut bytes = Vec::new();
+            let result = reader
+                .read_to_end(&mut bytes)
+                .ok()
+                .filter(|_| bytes.len() <= MAX_CATALOG_RESPONSE_BYTES)
+                .and_then(|_| serde_json::from_slice::<Value>(&bytes).ok());
+            let _ = sender.send(result);
+        })
+        .ok()?;
+    let value = receiver.recv_timeout(CATALOG_READ_TIMEOUT).ok().flatten();
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+    value
+}
+
+fn jcode_runtime_config(provider: &ProviderConfig) -> (Option<String>, Option<String>) {
+    let Some(value) = read_jcode_json(provider, &["provider", "current", "--json"]) else {
+        return (None, None);
+    };
+    let model = value
+        .get("selected_model")
+        .and_then(Value::as_str)
+        .and_then(safe_model_id);
+    // The selected effort is session-scoped in JCode. A fresh provider route
+    // therefore truthfully has no single configured effort to project.
+    (model, Some(String::from("session_selected")))
 }
 
 fn codex_model_config(home: &Path) -> (Option<String>, Option<String>) {
@@ -342,6 +469,16 @@ fn safe_token(value: &str) -> Option<String> {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
+    .then(|| value.to_owned())
+}
+
+fn safe_model_id(value: &str) -> Option<String> {
+    (!value.is_empty()
+        && value.len() <= 80
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/' | b'[' | b']')
+        }))
     .then(|| value.to_owned())
 }
 
@@ -414,7 +551,7 @@ mod tests {
                 "nextCursor": null
             }
         });
-        let ModelCatalogRead::Available(catalog) = decode_catalog_response(&value) else {
+        let ModelCatalogRead::Available(catalog) = decode_codex_catalog_response(&value) else {
             panic!("catalog must decode");
         };
         assert_eq!(
@@ -430,6 +567,7 @@ mod tests {
                 }
             ]
         );
+        assert_eq!(catalog.source, ModelCatalogSource::CodexAppServer);
     }
 
     #[test]
@@ -459,7 +597,7 @@ mod tests {
         paginated["result"]["nextCursor"] = Value::String(String::from("more"));
         for value in [hidden, unsafe_id, duplicate, paginated] {
             assert_eq!(
-                decode_catalog_response(&value),
+                decode_codex_catalog_response(&value),
                 ModelCatalogRead::Unavailable(ModelCatalogUnavailable::InvalidResponse)
             );
         }
@@ -498,7 +636,7 @@ mod tests {
         fs::set_permissions(&provider_config, fs::Permissions::from_mode(0o600))
             .expect("private provider config");
 
-        let read = configured_codex_catalog(root.path());
+        let read = configured_provider_catalog(root.path());
         let ModelCatalogRead::Available(catalog) = &read else {
             panic!("fixture catalog must be available: {read:?}");
         };
@@ -513,6 +651,72 @@ mod tests {
         assert_eq!(
             fs::read_to_string(home.join("invocation")).expect("invocation marker"),
             "app-server --stdio"
+        );
+    }
+
+    #[test]
+    fn jcode_catalog_uses_the_pinned_read_only_cli_and_provider_home() {
+        let root = tempfile::tempdir().expect("root");
+        let home = root.path().join("jcode-home");
+        fs::create_dir(&home).expect("home");
+        let binary = root.path().join("fake-jcode");
+        fs::write(
+            &binary,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s\\n' \"$*\" >> \"$JCODE_HOME/invocation\"\n",
+                "test \"$JCODE_RUNTIME_DIR\" = \"$JCODE_HOME\" || exit 9\n",
+                "if test \"$4 $5 $6\" = 'model list --json'; then\n",
+                "  printf '%s\\n' '{\"provider\":\"OpenAI\",\"selected_model\":\"gpt-5.6-sol\",\"models\":[\"gpt-5.6-sol\",\"gpt-5.6-pro[web]\",\"anthropic/claude-sonnet-4\"],\"routes\":[]}'\n",
+                "elif test \"$4 $5 $6\" = 'provider current --json'; then\n",
+                "  printf '%s\\n' '{\"requested_provider\":\"auto\",\"requested_model\":null,\"resolved_provider\":\"openai\",\"selected_model\":\"gpt-5.6-sol\"}'\n",
+                "else exit 8; fi\n",
+            ),
+        )
+        .expect("fixture provider");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).expect("executable");
+        let provider_config = root.path().join(PROVIDER_CONFIG_NAME);
+        fs::write(
+            &provider_config,
+            format!(
+                "engine=jcode\nbinary={}\nhome={}\nversion=jcode-fixture\narg=api-stdio\n",
+                binary.display(),
+                home.display(),
+            ),
+        )
+        .expect("provider config");
+        fs::set_permissions(&provider_config, fs::Permissions::from_mode(0o600))
+            .expect("private provider config");
+
+        let read = configured_provider_catalog(root.path());
+        let ModelCatalogRead::Available(catalog) = read else {
+            panic!("fixture catalog must be available");
+        };
+        assert_eq!(catalog.source, ModelCatalogSource::JcodeCli);
+        assert_eq!(
+            catalog.models,
+            vec![
+                AvailableModel {
+                    id: String::from("gpt-5.6-sol"),
+                    is_default: true,
+                },
+                AvailableModel {
+                    id: String::from("gpt-5.6-pro[web]"),
+                    is_default: false,
+                },
+                AvailableModel {
+                    id: String::from("anthropic/claude-sonnet-4"),
+                    is_default: false,
+                },
+            ]
+        );
+        let routes = configured_model_routes(root.path());
+        assert_eq!(routes.operational_primary, "gpt-5.6-sol");
+        assert_eq!(routes.operational_reasoning, "session_selected");
+        assert_eq!(routes.operational_harness, "jcode-fixture");
+        assert_eq!(
+            fs::read_to_string(home.join("invocation")).expect("invocation marker"),
+            "--quiet --no-update --no-selfdev model list --json\n--quiet --no-update --no-selfdev provider current --json\n"
         );
     }
 }
