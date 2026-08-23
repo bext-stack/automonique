@@ -168,11 +168,37 @@ impl ProviderDeployments {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = read(&transaction, registration.deployment_id)?;
         if let Some(existing) = existing {
-            if existing.provider_kind != registration.provider_kind
-                || existing.primary_rank != registration.primary_rank
+            if existing.primary_rank != registration.primary_rank
                 || existing.context_window_rank != registration.context_window_rank
             {
                 return Err(DeploymentError::Conflict);
+            }
+            if existing.provider_kind != registration.provider_kind {
+                // A deployment id names one stable routing slot, not one
+                // provider implementation forever. Production cutovers replace
+                // the implementation behind that slot while preserving its
+                // rank topology. Carrying the old provider's failures,
+                // cooldown, or probe result into the replacement would make a
+                // healthy cutover unavailable; refusing the new kind would
+                // make the entire router fail closed at startup. Reset health
+                // atomically with the kind change so the replacement begins
+                // unevaluated and immediately eligible.
+                transaction.execute(
+                    "UPDATE provider_deployments
+                     SET provider_kind=?2,
+                         failure_count=0,
+                         failure_window_started_ms=NULL,
+                         cooldown_until_ms=0,
+                         last_probe_ms=NULL,
+                         last_probe_healthy=NULL,
+                         revision=revision+1
+                     WHERE deployment_id=?1",
+                    params![registration.deployment_id, registration.provider_kind],
+                )?;
+                let replaced = read(&transaction, registration.deployment_id)?
+                    .ok_or(DeploymentError::NotFound)?;
+                transaction.commit()?;
+                return Ok(replaced);
             }
             transaction.commit()?;
             return Ok(existing);

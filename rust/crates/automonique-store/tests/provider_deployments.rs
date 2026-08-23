@@ -4,7 +4,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
 use automonique_store::provider_deployments::{
-    COOLDOWN_MS, DeploymentRegistration, FAILURE_THRESHOLD, ProviderDeployments, RouteClass,
+    COOLDOWN_MS, DeploymentError, DeploymentRegistration, FAILURE_THRESHOLD, ProviderDeployments,
+    RouteClass,
 };
 
 fn store() -> (tempfile::TempDir, ProviderDeployments) {
@@ -109,4 +110,69 @@ fn a_success_clears_failure_state_without_touching_siblings() {
     assert_eq!(reset.failure_count, 0);
     assert_eq!(reset.failure_window_started_ms, None);
     assert_eq!(reset.cooldown_until_ms, 0);
+}
+
+#[test]
+fn replacing_the_provider_in_a_stable_slot_resets_old_health_atomically() {
+    let (_root, mut store) = store();
+    store
+        .register(DeploymentRegistration {
+            deployment_id: "primary",
+            provider_kind: "codex",
+            primary_rank: Some(0),
+            context_window_rank: Some(1),
+        })
+        .expect("register old provider");
+    for offset in 0..FAILURE_THRESHOLD {
+        store
+            .record_failure("primary", 1_000 + i64::from(offset))
+            .expect("record old-provider failure");
+    }
+    store
+        .record_probe("primary", false, 2_000)
+        .expect("record old-provider probe");
+    let old_revision = store.get("primary").unwrap().revision;
+
+    let replaced = store
+        .register(DeploymentRegistration {
+            deployment_id: "primary",
+            provider_kind: "jcode",
+            primary_rank: Some(0),
+            context_window_rank: Some(1),
+        })
+        .expect("replace provider in the same routing slot");
+
+    assert_eq!(replaced.provider_kind, "jcode");
+    assert_eq!(replaced.failure_count, 0);
+    assert_eq!(replaced.failure_window_started_ms, None);
+    assert_eq!(replaced.cooldown_until_ms, 0);
+    assert_eq!(replaced.last_probe_ms, None);
+    assert_eq!(replaced.last_probe_healthy, None);
+    assert_eq!(replaced.revision, old_revision + 1);
+    assert_eq!(
+        store
+            .select(RouteClass::Primary, 2_001)
+            .unwrap()
+            .unwrap()
+            .provider_kind,
+        "jcode"
+    );
+}
+
+#[test]
+fn replacement_cannot_silently_change_a_slots_rank_topology() {
+    let (_root, mut store) = store();
+    register(&mut store, "primary", 0, 1);
+
+    let error = store
+        .register(DeploymentRegistration {
+            deployment_id: "primary",
+            provider_kind: "jcode",
+            primary_rank: Some(1),
+            context_window_rank: Some(0),
+        })
+        .expect_err("rank changes require an explicit topology migration");
+
+    assert!(matches!(error, DeploymentError::Conflict));
+    assert_eq!(store.get("primary").unwrap().provider_kind, "fixture");
 }
